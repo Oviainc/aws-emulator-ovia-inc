@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end coverage of the ManagedBlockchain Query emulator's first slice —
-//! `ListTransactions`, `GetTransaction`, `ListTransactionEvents`, `GetTokenBalance` and
-//! `ListTokenBalances` — driven over HTTP through the same `MultiServiceRouter` the
-//! production front door serves.
+//! End-to-end coverage of the ManagedBlockchain Query emulator's transaction and
+//! balance operations — `ListTransactions`, `GetTransaction`, `ListTransactionEvents`,
+//! `ListFilteredTransactionEvents`, `GetTokenBalance` and `ListTokenBalances` — driven
+//! over HTTP through the same `MultiServiceRouter` the production front door serves.
 //!
 //! The service is READ-ONLY, so there is no create to round-trip through: the thing
 //! under test is that every operation's answer comes out of the SEEDED ledger and that
-//! the five answers agree with each other. Each test is therefore a TABLE whose rows
+//! the answers agree with each other. Each test is therefore a TABLE whose rows
 //! are generated from the ledger the service actually serves (every network, every
 //! transaction, every event, every holding) rather than from one record picked by hand,
 //! and the ledger is read out of the engine the router was built on — never from a
@@ -32,13 +32,35 @@ use smithy_server_runtime::MultiServiceRouter;
 /// never verified here — [`Emulator`] turns request authentication off.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/us-east-1/managedblockchain-query/aws4_request, SignedHeaders=host, Signature=not-verified";
 
-/// The three paginated operations of this slice: route and the response member carrying
+/// The paginated operations of this slice: route and the response member carrying
 /// the items (`@paginated(items=...)` on each operation).
-const PAGINATED: [(&str, &str); 3] = [
+const PAGINATED: [(&str, &str); 4] = [
     ("/list-transactions", "transactions"),
     ("/list-transaction-events", "events"),
+    ("/list-filtered-transaction-events", "events"),
     ("/list-token-balances", "tokenBalances"),
 ];
+
+/// The route `ListFilteredTransactionEvents` is bound to (`@http(uri:)`).
+const FILTERED_EVENTS: &str = "/list-filtered-transaction-events";
+
+/// Whether `network` is one of the model's two Bitcoin networks —
+/// `ListFilteredTransactionEvents` "is only supported on the Bitcoin networks".
+///
+/// Restated here from the model's `QueryNetwork` value names rather than borrowed from
+/// `crate::state::is_bitcoin`, deliberately: the expectation a test checks must not come
+/// from the implementation it is checking.
+fn is_bitcoin(network: &str) -> bool {
+    network.starts_with("BITCOIN_")
+}
+
+/// A `ListFilteredTransactionEvents` request for the events sent to one address.
+fn filtered_events_body(network: &str, address: &str) -> Value {
+    json!({
+        "network": network,
+        "addressIdentifierFilter": {"transactionEventToAddress": [address]},
+    })
+}
 
 /// The operations this slice deliberately leaves scaffolded, with a request that
 /// satisfies every modelled constraint so the answer can only be the scaffold's own.
@@ -59,19 +81,6 @@ fn scaffolded_operations(network: &str, address: &str) -> Vec<(&'static str, Val
                 "tokenStandard": "ERC20",
                 "deployerAddress": address,
             }}),
-        ),
-        (
-            "/list-filtered-transaction-events",
-            json!({
-                // This operation serves only the Bitcoin networks
-                // (`ListFilteredTransactionEventsInput$network`: "Valid Values:
-                // BITCOIN_MAINNET | BITCOIN_TESTNET"), so the row names one of them
-                // whatever ledger the caller of this helper is walking: any other value
-                // is refused with a 400 before the scaffold's 501 is reached, which
-                // `tests/all/error_contract.rs` covers.
-                "network": "BITCOIN_MAINNET",
-                "addressIdentifierFilter": {"transactionEventToAddress": [address]},
-            }),
         ),
     ]
 }
@@ -1408,6 +1417,11 @@ async fn a_next_token_this_service_never_issued_is_refused() {
                 "/list-transaction-events" => {
                     json!({"network": network.network, "transactionHash": hash, "nextToken": token})
                 }
+                FILTERED_EVENTS => {
+                    let mut body = filtered_events_body(&network.network, &address);
+                    body["nextToken"] = json!(token);
+                    body
+                }
                 _ => json!({
                     "tokenFilter": {"network": network.network, "tokenId": "eth"},
                     "nextToken": token,
@@ -1418,6 +1432,351 @@ async fn a_next_token_this_service_never_issued_is_refused() {
                 .await;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ListFilteredTransactionEvents
+// ---------------------------------------------------------------------------
+
+/// Every event the ledger holds whose RECIPIENT is `address`, in chain order, as
+/// `ListTransactionEvents` reports it.
+///
+/// Built by asking the per-transaction listing for each stored transaction in chain
+/// order and keeping the events sent to `address`, so the expectation comes from the
+/// OTHER operation's view of the same stored events rather than from a copy of the
+/// implementation.
+async fn events_sent_to(emulator: &Emulator, network: &NetworkFixture, address: &str) -> Vec<Value> {
+    let mut expected: Vec<Value> = Vec::new();
+    for transaction in &network.transactions {
+        let events = drain(
+            emulator,
+            "/list-transaction-events",
+            "events",
+            &json!({
+                "network": network.network,
+                "transactionHash": transaction.transaction_hash,
+            }),
+            None,
+        )
+        .await;
+        expected.extend(
+            events
+                .into_iter()
+                .filter(|event| event["to"].as_str() == Some(address)),
+        );
+    }
+    expected
+}
+
+/// The `blockchainInstant.time` one event reports.
+fn event_instant(event: &Value) -> i64 {
+    event["blockchainInstant"]["time"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("event carries no blockchainInstant.time: {event:?}"))
+}
+
+/// The `blockchainInstant.time` of each event, in the order the listing reported them.
+fn instants(events: &[Value]) -> Vec<i64> {
+    events.iter().map(event_instant).collect()
+}
+
+#[tokio::test]
+async fn list_filtered_transaction_events_returns_exactly_the_events_sent_to_the_address() {
+    let emulator = Emulator::new();
+
+    for network in emulator.fixture() {
+        if !is_bitcoin(&network.network) {
+            continue;
+        }
+        // Rows: every address the ledger knows — which spans addresses that received
+        // several events, one, and none — plus an address it does not know at all. The
+        // unknown row satisfies `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$` and is not a
+        // base58 digest the fixture could have produced.
+        let mut addresses: Vec<String> = network.addresses().into_iter().collect();
+        addresses.push("1".repeat(34));
+
+        for address in addresses {
+            let ascending = events_sent_to(&emulator, &network, &address).await;
+            let base = filtered_events_body(&network.network, &address);
+
+            // `ListFilteredTransactionEventsSortBy` declares exactly one value,
+            // `blockchainInstant`; `SortOrder` is ASCENDING | DESCENDING and defaults to
+            // ASCENDING when the request names none.
+            for order in [None, Some("ASCENDING"), Some("DESCENDING")] {
+                let mut body = base.clone();
+                if let Some(order) = order {
+                    body["sort"] = json!({"sortBy": "blockchainInstant", "sortOrder": order});
+                }
+                let mut want = ascending.clone();
+                if order == Some("DESCENDING") {
+                    want.reverse();
+                }
+
+                // `maxResults` carries `@range(min: 1, max: 250)`: the published
+                // minimum, sizes in between, the published maximum, and none at all.
+                for max in [Some(1), Some(2), Some(3), Some(250), None] {
+                    let got = drain(&emulator, FILTERED_EVENTS, "events", &body, max).await;
+                    assert_eq!(
+                        got, want,
+                        "case {}/{address} sortOrder={order:?} maxResults={max:?}: expected \
+                         {want:?}, got {got:?}",
+                        network.network
+                    );
+                }
+
+                let reported = instants(&want);
+                let mut sorted = reported.clone();
+                if order == Some("DESCENDING") {
+                    sorted.sort_unstable_by(|left, right| right.cmp(left));
+                } else {
+                    sorted.sort_unstable();
+                }
+                assert_eq!(
+                    reported, sorted,
+                    "case {}/{address} sortOrder={order:?}: the listing must be ordered by \
+                     blockchainInstant, got {reported:?}",
+                    network.network
+                );
+            }
+
+            for event in &ascending {
+                assert_eq!(
+                    event["to"].as_str(),
+                    Some(address.as_str()),
+                    "case {}/{address}: every event must name the filtered address as its \
+                     recipient, got {event:?}",
+                    network.network
+                );
+                assert_eq!(
+                    event["network"].as_str(),
+                    Some(network.network.as_str()),
+                    "case {}/{address}: every event must belong to the requested network, got \
+                     {event:?}",
+                    network.network
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_vout_filter_selects_the_outputs_in_the_spend_state_it_asks_for() {
+    let emulator = Emulator::new();
+    // `VoutFilter$voutSpent` "specifies if the transaction output is spent or unspent",
+    // so the two rows can only be told apart on a ledger that holds both.
+    let mut spent_seen = false;
+    let mut unspent_seen = false;
+
+    for network in emulator.fixture() {
+        if !is_bitcoin(&network.network) {
+            continue;
+        }
+        for address in network.addresses() {
+            let whole = events_sent_to(&emulator, &network, &address).await;
+
+            let mut partitioned: Vec<Value> = Vec::new();
+            for wanted in [true, false] {
+                let want: Vec<Value> = whole
+                    .iter()
+                    .filter(|event| event["voutSpent"].as_bool() == Some(wanted))
+                    .cloned()
+                    .collect();
+                spent_seen |= wanted && !want.is_empty();
+                unspent_seen |= !wanted && !want.is_empty();
+
+                let mut body = filtered_events_body(&network.network, &address);
+                body["voutFilter"] = json!({"voutSpent": wanted});
+                let got = drain(&emulator, FILTERED_EVENTS, "events", &body, None).await;
+                assert_eq!(
+                    got, want,
+                    "case {}/{address} voutSpent={wanted}: expected {want:?}, got {got:?}",
+                    network.network
+                );
+                partitioned.extend(want);
+            }
+
+            // The two rows partition the events that report a spend state at all: an
+            // event the filter cannot judge is on neither.
+            let judged: Vec<Value> = whole
+                .iter()
+                .filter(|event| event["voutSpent"].as_bool().is_some())
+                .cloned()
+                .collect();
+            partitioned.sort_by_key(Value::to_string);
+            let mut judged_sorted = judged.clone();
+            judged_sorted.sort_by_key(Value::to_string);
+            assert_eq!(
+                partitioned, judged_sorted,
+                "case {}/{address}: the two voutSpent rows must partition the outputs, \
+                 expected {judged_sorted:?}, got {partitioned:?}",
+                network.network
+            );
+        }
+    }
+
+    assert!(
+        spent_seen,
+        "case voutSpent=true: the ledger must hold a spent output, or the filter is untestable"
+    );
+    assert!(
+        unspent_seen,
+        "case voutSpent=false: the ledger must hold an unspent output, or the filter is untestable"
+    );
+}
+
+#[tokio::test]
+async fn the_confirmation_filter_narrows_the_listing_to_the_statuses_it_names() {
+    let emulator = Emulator::new();
+
+    for network in emulator.fixture() {
+        if !is_bitcoin(&network.network) {
+            continue;
+        }
+        let address = network.busiest_address();
+        let whole = events_sent_to(&emulator, &network, &address).await;
+
+        // Rows: each value of the model's `ConfirmationStatus` enum on its own, and both
+        // together.
+        for include in [vec!["FINAL"], vec!["NONFINAL"], vec!["FINAL", "NONFINAL"]] {
+            let want: Vec<Value> = whole
+                .iter()
+                .filter(|event| {
+                    include.contains(&event["confirmationStatus"].as_str().unwrap_or_default())
+                })
+                .cloned()
+                .collect();
+            let mut body = filtered_events_body(&network.network, &address);
+            body["confirmationStatusFilter"] = json!({"include": include});
+            let got = drain(&emulator, FILTERED_EVENTS, "events", &body, None).await;
+            assert_eq!(
+                got, want,
+                "case {}/{address} include={include:?}: expected {want:?}, got {got:?}",
+                network.network
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_time_filter_keeps_the_events_inside_the_window_it_names() {
+    let emulator = Emulator::new();
+
+    for network in emulator.fixture() {
+        if !is_bitcoin(&network.network) {
+            continue;
+        }
+        let address = network.busiest_address();
+        let whole = events_sent_to(&emulator, &network, &address).await;
+        let times: BTreeSet<i64> = instants(&whole).into_iter().collect();
+        let earliest = *times
+            .iter()
+            .next()
+            .unwrap_or_else(|| panic!("case {}: no event to bound", network.network));
+        let latest = *times
+            .iter()
+            .next_back()
+            .unwrap_or_else(|| panic!("case {}: no event to bound", network.network));
+
+        // Rows: no window, the whole window, each of its published bounds alone, a
+        // single instant, and a window one second past each bound (which the ledger has
+        // nothing in).
+        let windows: [(Option<i64>, Option<i64>); 8] = [
+            (None, None),
+            (Some(earliest), Some(latest)),
+            (Some(earliest), None),
+            (None, Some(latest)),
+            (Some(earliest), Some(earliest)),
+            (Some(latest), Some(latest)),
+            (Some(latest + 1), None),
+            (None, Some(earliest - 1)),
+        ];
+
+        for (from, to) in windows {
+            let want: Vec<Value> = whole
+                .iter()
+                .filter(|event| {
+                    let time = event_instant(event);
+                    from.is_none_or(|earliest| time >= earliest)
+                        && to.is_none_or(|latest| time <= latest)
+                })
+                .cloned()
+                .collect();
+
+            let mut body = filtered_events_body(&network.network, &address);
+            let mut filter = json!({});
+            if let Some(from) = from {
+                filter["from"] = json!({"time": from});
+            }
+            if let Some(to) = to {
+                filter["to"] = json!({"time": to});
+            }
+            body["timeFilter"] = filter;
+
+            let got = drain(&emulator, FILTERED_EVENTS, "events", &body, None).await;
+            assert_eq!(
+                got, want,
+                "case {}/{address} timeFilter=({from:?},{to:?}): expected {want:?}, got {got:?}",
+                network.network
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn list_filtered_transaction_events_refuses_a_request_it_cannot_answer() {
+    let emulator = Emulator::new();
+    let networks = emulator.fixture();
+    let bitcoin = networks
+        .iter()
+        .find(|network| is_bitcoin(&network.network))
+        .expect("a seeded Bitcoin network");
+    let address = bitcoin.busiest_address();
+    let other_address = bitcoin
+        .addresses()
+        .into_iter()
+        .find(|candidate| *candidate != address)
+        .expect("a second seeded address");
+
+    // Rows: a network outside the model's `QueryNetwork` enum, every network the
+    // operation does not support (its documentation: "This operation is only supported
+    // on the Bitcoin networks"), a filter naming no address and one naming two
+    // (`transactionEventToAddress` is `@length(min: 1, max: 1)`), and a window that ends
+    // before it starts.
+    let mut refused: Vec<Value> = vec![
+        filtered_events_body("BITCOIN_REGTEST", &address),
+        filtered_events_body("bitcoin_mainnet", &address),
+        filtered_events_body("", &address),
+        json!({
+            "network": bitcoin.network,
+            "addressIdentifierFilter": {"transactionEventToAddress": []},
+        }),
+        json!({
+            "network": bitcoin.network,
+            "addressIdentifierFilter": {
+                "transactionEventToAddress": [address, other_address],
+            },
+        }),
+    ];
+    for network in &networks {
+        if !is_bitcoin(&network.network) {
+            refused.push(filtered_events_body(&network.network, &address));
+        }
+    }
+    let mut inverted = filtered_events_body(&bitcoin.network, &address);
+    inverted["timeFilter"] = json!({"from": {"time": 2_000_000_000}, "to": {"time": 1}});
+    refused.push(inverted);
+
+    for body in &refused {
+        emulator
+            .fails(FILTERED_EVENTS, body, 400, "ValidationException")
+            .await;
+    }
+
+    // And the request the rows above vary from is answered, so each refusal is about the
+    // member it changed.
+    emulator
+        .ok(FILTERED_EVENTS, &filtered_events_body(&bitcoin.network, &address))
+        .await;
 }
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,12 @@
 //! The fixture is built so the operations are mutually consistent:
 //!
 //! * a transaction `ListTransactions` returns is fetchable by `GetTransaction`;
-//! * its events are exactly what `ListTransactionEvents` returns;
+//! * its events are exactly what `ListTransactionEvents` returns, and the subset of
+//!   them sent to one address is what `ListFilteredTransactionEvents` returns;
+//! * whether a Bitcoin output is spent — `TransactionEvent$voutSpent`, which
+//!   `ListFilteredTransactionEvents`'s `voutFilter` selects on — is DERIVED from the
+//!   inputs that spend it ([`build_ledger`]), so no output can report a spend state the
+//!   ledger's own transactions contradict;
 //! * every balance `GetTokenBalance`/`ListTokenBalances` reports is DERIVED from the
 //!   opening balances plus those events ([`derive_holdings`]) rather than written down
 //!   beside them, so a reported balance can never disagree with the transfers that
@@ -25,7 +30,7 @@
 //! `TokenBalance`) is PROJECTED from it by the methods below, so no handler assembles a
 //! response member by hand.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
@@ -1212,9 +1217,29 @@ fn seed_ethereum_ledger(network: &str) -> NetworkLedger {
     build_ledger(network, seeds, opening, contracts)
 }
 
+/// Where one fixture Bitcoin transaction's single input comes from.
+///
+/// A Bitcoin transaction spends an earlier transaction's OUTPUT, so the fixture's
+/// transactions form a chain: half of them spend an output a fixture transaction created
+/// (which is what makes that output spent), and the rest spend an output of a
+/// transaction outside the fixture.
+enum BitcoinInput {
+    /// Output 0 of a transaction this ledger does not hold, worth this many satoshi.
+    Funding(i128),
+    /// Output 0 of the fixture transaction with this label, worth whatever that
+    /// transaction's output is worth.
+    Output(&'static str),
+}
+
 /// The Bitcoin fixture: three wallets and four transactions, each spending one input
 /// and creating one output, so every balance moves through a `BITCOIN_VIN` /
 /// `BITCOIN_VOUT` pair.
+///
+/// Two of the four spend an output an earlier fixture transaction created, so the ledger
+/// holds both spent and unspent outputs — the distinction
+/// `TransactionEvent$voutSpent` reports and `ListFilteredTransactionEvents`'s
+/// `voutFilter` selects on. Which outputs are spent is DERIVED by [`build_ledger`] from
+/// the inputs that name them, never written down beside the output.
 fn seed_bitcoin_ledger(network: &str) -> NetworkLedger {
     let wallet_a = bitcoin_address(network, "wallet-a");
     let wallet_b = bitcoin_address(network, "wallet-b");
@@ -1232,18 +1257,63 @@ fn seed_bitcoin_ledger(network: &str) -> NetworkLedger {
         (native_btc(&wallet_c), 0),
     ];
 
-    // (label, from, to, value sent, fee)
-    let transfers: [(&str, &String, &String, i128, i128); 4] = [
-        ("vin-vout-1", &wallet_a, &wallet_b, 3 * BTC / 2, 10_000),
-        ("vin-vout-2", &wallet_b, &wallet_c, BTC / 2, 12_000),
-        ("vin-vout-3", &wallet_a, &wallet_c, BTC / 4, 8_000),
-        ("vin-vout-4", &wallet_c, &wallet_a, BTC / 10, 9_000),
+    // (label, from, to, where the input comes from, fee in satoshi). What the
+    // transaction transfers is COMPUTED, not declared: a Bitcoin output is worth what
+    // the input it spends was worth, less the fee.
+    let transfers: [(&str, &String, &String, BitcoinInput, i128); 4] = [
+        (
+            "vin-vout-1",
+            &wallet_a,
+            &wallet_b,
+            BitcoinInput::Funding(3 * BTC / 2 + 10_000),
+            10_000,
+        ),
+        (
+            "vin-vout-2",
+            &wallet_b,
+            &wallet_c,
+            BitcoinInput::Output("vin-vout-1"),
+            12_000,
+        ),
+        (
+            "vin-vout-3",
+            &wallet_a,
+            &wallet_c,
+            BitcoinInput::Funding(BTC / 4 + 8_000),
+            8_000,
+        ),
+        (
+            "vin-vout-4",
+            &wallet_c,
+            &wallet_a,
+            BitcoinInput::Output("vin-vout-2"),
+            9_000,
+        ),
     ];
 
-    let seeds = transfers
-        .iter()
-        .enumerate()
-        .map(|(index, (label, from, to, value, fee))| SeedTx {
+    // What each transaction's output is worth, so a later transaction that spends it
+    // spends exactly that amount.
+    let mut output_value: BTreeMap<&str, i128> = BTreeMap::new();
+    let mut seeds: Vec<SeedTx> = Vec::new();
+    for (index, (label, from, to, input, fee)) in transfers.iter().enumerate() {
+        let (spent_value, spent_hash, spent_id) = match input {
+            BitcoinInput::Funding(amount) => (
+                *amount,
+                hash(&format!("{label}/funding")),
+                txid(&format!("{label}/funding")),
+            ),
+            BitcoinInput::Output(spent_label) => (
+                *output_value
+                    .get(spent_label)
+                    .expect("the fixture's inputs name only outputs it created earlier"),
+                hash(spent_label),
+                txid(spent_label),
+            ),
+        };
+        let value = spent_value - fee;
+        output_value.insert(label, value);
+
+        seeds.push(SeedTx {
             hash: hash(label),
             transaction_id: Some(txid(label)),
             block: index as i64 / 2,
@@ -1264,24 +1334,25 @@ fn seed_bitcoin_ledger(network: &str) -> NetworkLedger {
                 StoredEvent {
                     event_type: "BITCOIN_VIN".to_string(),
                     from: Some((*from).clone()),
-                    // The input spends the whole previous output, fee included.
-                    value: Some(value + fee),
-                    spent_vout_transaction_hash: Some(hash(&format!("{label}/funding"))),
-                    spent_vout_transaction_id: Some(txid(&format!("{label}/funding"))),
+                    // The input spends the whole output it names, fee included.
+                    value: Some(spent_value),
+                    spent_vout_transaction_hash: Some(spent_hash),
+                    spent_vout_transaction_id: Some(spent_id),
                     spent_vout_index: Some(0),
                     ..StoredEvent::default()
                 },
                 StoredEvent {
                     event_type: "BITCOIN_VOUT".to_string(),
                     to: Some((*to).clone()),
-                    value: Some(*value),
+                    value: Some(value),
                     vout_index: Some(0),
-                    vout_spent: Some(false),
+                    // `voutSpent` is derived by `build_ledger` from the inputs that
+                    // spend this output.
                     ..StoredEvent::default()
                 },
             ],
-        })
-        .collect();
+        });
+    }
 
     // The Bitcoin networks have no asset contracts: `GetAssetContract`'s documentation
     // is explicit that "the Bitcoin blockchain networks do not support this operation".
@@ -1357,6 +1428,20 @@ fn build_ledger(
         *per_block.entry(seed.block).or_default() += 1;
     }
 
+    // Which outputs this ledger's own inputs spend. `TransactionEvent$voutSpent`
+    // "specifies if the transaction output is spent or unspent", so it is DERIVED from
+    // the inputs that name an outpoint rather than declared on the output: an output no
+    // transaction in this ledger spends is unspent, and one some transaction spends
+    // cannot report otherwise.
+    let spent_outputs: HashSet<(String, i32)> = seeds
+        .iter()
+        .flat_map(|seed| seed.events.iter())
+        .filter_map(|event| {
+            let hash = event.spent_vout_transaction_hash.as_deref()?;
+            Some((normalize_hash(hash), event.spent_vout_index?))
+        })
+        .collect();
+
     let mut index_in_block: BTreeMap<i64, i64> = BTreeMap::new();
     let mut cumulative_gas: BTreeMap<i64, i128> = BTreeMap::new();
 
@@ -1386,6 +1471,17 @@ fn build_ledger(
         };
         let signature = |part: &str| format!("0x{}", digest_hex(&format!("{}/sig/{part}", seed.hash)));
 
+        // An event that carries an output index IS an output, so it reports whether the
+        // ledger holds an input spending it.
+        let outpoint_prefix = normalize_hash(&seed.hash);
+        let mut events = seed.events;
+        for event in &mut events {
+            if let Some(vout_index) = event.vout_index {
+                event.vout_spent =
+                    Some(spent_outputs.contains(&(outpoint_prefix.clone(), vout_index)));
+            }
+        }
+
         ledger.insert_transaction(StoredTransaction {
             network: network.to_string(),
             transaction_hash: seed.hash.clone(),
@@ -1409,7 +1505,7 @@ fn build_ledger(
             signature_s: (!bitcoin).then(|| signature("s")),
             confirmation_status: seed.confirmation_status.to_string(),
             execution_status: seed.execution_status.map(str::to_string),
-            events: seed.events,
+            events,
         });
     }
 

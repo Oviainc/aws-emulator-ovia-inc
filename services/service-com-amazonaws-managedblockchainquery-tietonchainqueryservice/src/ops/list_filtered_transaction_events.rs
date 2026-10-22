@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFilteredTransactionEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFilteredTransactionEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the transaction events a Bitcoin network's ledger
+//! (`crate::state::NetworkLedger`) holds whose RECIPIENT is the one address the
+//! request's `addressIdentifierFilter` names, narrowed by each filter the request
+//! carries and ordered by the event's `blockchainInstant`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFilteredTransactionEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every event is projected from the STORED record by
+//! `crate::state::StoredTransaction::events`, exactly as `ListTransactionEvents`
+//! projects it, so the two operations can never disagree about one event.
 //!
-//! The one rule this stub DOES enforce is the operation's Bitcoin-only `network` value
-//! set (see [`ListFilteredTransactionEvents::handle`]): a request naming any other
-//! network is refused with the modelled 400 `ValidationException` rather than reaching
-//! the 501, because that refusal is what the operation does with such a request whether
-//! or not the listing behind it is written yet.
+//! Two rules this operation enforces that the model cannot:
+//!
+//! * `network` is modelled as a bare `String` here (every other operation targets the
+//!   `QueryNetwork` enum), so the boundary validator passes any string through and this
+//!   handler is what holds the member to its documented value set ("Valid Values:
+//!   BITCOIN_MAINNET | BITCOIN_TESTNET") and to the operation's own documentation,
+//!   "This operation is only supported on the Bitcoin networks". Anything else is a
+//!   modelled `ValidationException`, never an empty page.
+//! * a `timeFilter` whose `from` is later than its `to` names no window a caller could
+//!   have meant, so it is refused the way `ListTransactions` refuses an inverted
+//!   `fromBlockchainInstant`/`toBlockchainInstant` pair.
 //!
 //! ## Shape of an operation
 //!
@@ -176,9 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        let _ = ctx;
 
         // This operation is Bitcoin-only: "Lists all the transaction events for an
         // address on the blockchain. This operation is only supported on the Bitcoin
@@ -202,15 +205,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Implement `ListFilteredTransactionEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFilteredTransactionEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFilteredTransactionEvents"))
+        // `AddressIdentifierFilter$transactionEventToAddress` is
+        // `@length(min: 1, max: 1)`, so the filter names exactly ONE address, "the
+        // container for the recipient address of the transaction".
+        let addresses = input
+            .address_identifier_filter
+            .transaction_event_to_address
+            .as_slice();
+        let [address] = addresses else {
+            return Err(ListFilteredTransactionEventsErrorModeled::ValidationException(
+                crate::state::field_validation_exception(
+                    "addressIdentifierFilter.transactionEventToAddress",
+                    format!(
+                        "exactly one recipient address must be specified, got {}",
+                        addresses.len()
+                    ),
+                ),
+            )
+            .into());
+        };
+
+        // The window the listing covers, measured on the event's own
+        // `blockchainInstant` — which is the instant of the transaction that emitted it.
+        let from = crate::state::instant_to_secs(
+            input
+                .time_filter
+                .as_ref()
+                .and_then(|filter| filter.from.as_ref()),
+        );
+        let to = crate::state::instant_to_secs(
+            input
+                .time_filter
+                .as_ref()
+                .and_then(|filter| filter.to.as_ref()),
+        );
+        if let (Some(earliest), Some(latest)) = (from, to) {
+            if earliest > latest {
+                return Err(ListFilteredTransactionEventsErrorModeled::ValidationException(
+                    crate::state::field_validation_exception(
+                        "timeFilter.from",
+                        "timeFilter.from must not be later than timeFilter.to",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // `ListFilteredTransactionEventsSortBy` declares exactly one value,
+        // `blockchainInstant`, which is the order the ledger is already keyed in, and
+        // `SortOrder` is ASCENDING when the request names none.
+        let descending = input
+            .sort
+            .as_ref()
+            .and_then(|sort| sort.sort_order.as_deref())
+            .is_some_and(|order| order == crate::state::SORT_DESCENDING);
+
+        let wanted_statuses = input
+            .confirmation_status_filter
+            .as_ref()
+            .map(|filter| filter.include.clone());
+        // `VoutFilter$voutSpent` "specifies if the transaction output is spent or
+        // unspent", so the filter keeps the events that REPORT a spend state — the
+        // transaction outputs — in the state it asks for, and drops the rest.
+        let wanted_vout_spent = input.vout_filter.as_ref().map(|filter| filter.vout_spent);
+
+        // An event has no identifier of its own, so what names it within the listing is
+        // the transaction it belongs to plus its position in that transaction's emission
+        // order: stable across pages, and the same key in either sort order.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListFilteredTransactionEventsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let state = state.lock();
+        let mut matching: Vec<(String, TransactionEvent)> = Vec::new();
+        for transaction in state
+            .ledger(&input.network)
+            .map(|ledger| ledger.for_address(address))
+            .unwrap_or_default()
+        {
+            let instant = transaction.transaction_timestamp;
+            if from.is_some_and(|earliest| instant < earliest)
+                || to.is_some_and(|latest| instant > latest)
+                || wanted_statuses
+                    .as_ref()
+                    .is_some_and(|wanted| !wanted.contains(&transaction.confirmation_status))
+            {
+                continue;
+            }
+
+            let hash = crate::state::normalize_hash(&transaction.transaction_hash);
+            for (position, (stored, event)) in transaction
+                .events
+                .iter()
+                .zip(transaction.events())
+                .enumerate()
+            {
+                if stored.to.as_deref() != Some(address.as_str())
+                    || wanted_vout_spent.is_some_and(|wanted| stored.vout_spent != Some(wanted))
+                {
+                    continue;
+                }
+                matching.push((format!("{hash}:{position}"), event));
+            }
+        }
+        // `for_address` walks the ledger in chain order, which is ascending
+        // `blockchainInstant`.
+        if descending {
+            matching.reverse();
+        }
+
+        let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListFilteredTransactionEventsErrorModeled::ValidationException(
+                    crate::state::invalid_page_token(&error),
+                )
+            })?;
+
+        Ok(ListFilteredTransactionEventsOutput {
+            events: page.items,
+            next_token: page.next_token,
+        })
     }
 }
+
