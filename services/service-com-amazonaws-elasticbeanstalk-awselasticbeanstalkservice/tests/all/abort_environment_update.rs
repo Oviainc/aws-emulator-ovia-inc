@@ -370,17 +370,19 @@ async fn an_abort_with_nothing_to_cancel_is_refused_with_the_services_own_error_
         },
         RefusalRow {
             // The modelled maximum length for `EnvironmentName` is 40, so 41
-            // characters is one past the published bound.
+            // characters is one past the published bound. A value the MODEL
+            // refuses is a request-shape failure, so it carries the
+            // request-validation code rather than `InvalidParameterValue`.
             case: "an EnvironmentName one over the modelled maximum of 40",
             params: vec![("EnvironmentName", "e".repeat(41))],
             status: 400,
-            code: "InvalidParameterValue",
+            code: "ValidationError",
         },
         RefusalRow {
             case: "an EnvironmentName one under the modelled minimum of 4",
             params: vec![("EnvironmentName", "env".to_string())],
             status: 400,
-            code: "InvalidParameterValue",
+            code: "ValidationError",
         },
         RefusalRow {
             case: "a Ready environment with no update in progress",

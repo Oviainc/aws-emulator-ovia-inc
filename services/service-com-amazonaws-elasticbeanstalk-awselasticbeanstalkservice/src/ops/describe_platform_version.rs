@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePlatformVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePlatformVersion`'s real behaviour. Implement it here — this is
+//! Implemented: reports the platform version the `PlatformArn` names — a custom version
+//! this account created, or one of the managed versions this service publishes. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePlatformVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePlatformVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePlatformVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePlatformVersion"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribePlatformVersionError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // A build the clock has already completed is reported as `Ready`.
+        store.materialize_due_transitions();
+
+        // The model leaves `PlatformArn` optional, but there is no other member to
+        // name a platform version by, so a request that carries none names nothing.
+        let Some(platform_arn) = input.platform_arn.as_ref() else {
+            return Err(DescribePlatformVersionError::missing_required_parameter(
+                "Must specify a PlatformArn.",
+            ));
+        };
+        // A CUSTOM version is one this account created; a MANAGED one is a version
+        // this service publishes. Both are described, from the one place each is
+        // held, so a `PlatformArn` an environment can be launched on is also one
+        // this operation reports.
+        let description = match store.platform_versions.get(platform_arn) {
+            Some(platform_version) => platform_version.to_description(),
+            None => crate::state::managed_platform_version(&region, platform_arn)
+                .ok_or_else(|| {
+                    DescribePlatformVersionError::invalid_parameter_value(format!(
+                        "No Platform named '{platform_arn}' found."
+                    ))
+                })?
+                .to_description(&region),
+        };
+
+        Ok(DescribePlatformVersionOutput {
+            platform_description: Some(description),
+        })
     }
 }

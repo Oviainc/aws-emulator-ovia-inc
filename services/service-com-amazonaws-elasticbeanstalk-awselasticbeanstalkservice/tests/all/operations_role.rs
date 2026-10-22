@@ -264,14 +264,16 @@ async fn disassociate_refuses_a_name_that_names_no_live_environment() {
             code: "InvalidParameterValue",
         },
         RefusalCase {
+            // A value the MODEL refuses is a request-shape failure, so it carries
+            // the request-validation code rather than `InvalidParameterValue`.
             case: "EnvironmentName under the modelled minimum of 4",
             params: vec![("EnvironmentName", "abc".to_string())],
-            code: "InvalidParameterValue",
+            code: "ValidationError",
         },
         RefusalCase {
             case: "EnvironmentName over the modelled maximum of 40",
             params: vec![("EnvironmentName", "e".repeat(41))],
-            code: "InvalidParameterValue",
+            code: "ValidationError",
         },
         RefusalCase {
             case: "the required EnvironmentName absent",

@@ -12,6 +12,29 @@ Issue-Commit: 659e25b97046a77449047daf7fe310a5a83846e1
 
 > _Note: this issue was identified against the code base at commit `659e25b97046a77449047daf7fe310a5a83846e1`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+Causes 1 and 2 are fixed in the Elastic Beanstalk service: a value outside a modelled
+constraint is now refused with HTTP 400 `ValidationError` in AWS's
+`"<N> validation error(s) detected: …"` envelope (`src/service.rs`,
+`Service::override_refusal`), and `DeleteApplication` on a name no application exists
+under is a repeatable no-op success (`src/ops/delete_application.rs`).
+
+Cause 3 is fixed in this service and DECLINED at the CloudFormation level. A
+`PlatformArn` is now resolved before an environment is created — against the account's
+custom platform versions and against the managed versions the service publishes — and
+an ARN that resolves to neither is refused with `InvalidParameterValue`, persisting no
+environment (`src/ops/create_environment.rs`, `src/state.rs`). The recorded check
+`elasticbeanstalk.deploy-cloudformation-invalid-platform-arn-rejected` still FAILS,
+because it asserts a stack status: CloudFormation in this emulator has no
+resource-provisioning layer at all (see the module docs of
+`services/service-com-amazonaws-cloudformation-cloudformation/src/state/template.rs` and
+`template::provision`), so a stack never calls Elastic Beanstalk and cannot propagate a
+resource failure from one. That gap is tracked by its own open issues — e.g.
+`issues/things-that-do-not-work/20261022T031509Z-xray-cloudformation-never-provisions-aws-xray-group-aws-xray.md`
+and the Firehose and FIS equivalents — and whichever of those builds the provisioner
+makes this check pass with no further Elastic Beanstalk change.
+
 ## Operation
 DescribeInstancesHealth
 
