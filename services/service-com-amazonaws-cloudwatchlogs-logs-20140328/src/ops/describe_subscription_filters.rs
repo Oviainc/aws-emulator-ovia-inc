@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSubscriptionFilters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSubscriptionFilters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSubscriptionFilters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: lists the subscription filters stored on the named log group,
+//! ASCII-sorted by filter name, optionally narrowed to a filter-name prefix and paged.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +107,46 @@ impl From<DescribeSubscriptionFiltersErrorModeled> for DescribeSubscriptionFilte
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeSubscriptionFilters";
+
+/// Where the next page resumes: the filter name the last page ended on, plus the
+/// enumeration it belongs to. A continuation that changes the log group or the prefix is
+/// refused, because the token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    log_group_name: String,
+    filter_name_prefix: Option<String>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "logGroupName": self.log_group_name,
+            "filterNamePrefix": self.filter_name_prefix,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            log_group_name: value.get("logGroupName")?.as_str()?.to_string(),
+            filter_name_prefix: value
+                .get("filterNamePrefix")
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string),
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// The `DescribeSubscriptionFilters` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +183,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSubscriptionFilters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSubscriptionFiltersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSubscriptionFilters"))
+        // `ctx` carries only request metadata, and this operation reports: it reads the
+        // store and writes nothing.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeSubscriptionFiltersError::from(
+                DescribeSubscriptionFiltersErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeSubscriptionFiltersError::from(
+                DescribeSubscriptionFiltersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        // "Lists the subscription filters for the specified log group": a group that does
+        // not exist has no filters to list, and is not an empty page.
+        let Some(group) = store.log_groups.get(&input.log_group_name) else {
+            return Err(
+                DescribeSubscriptionFiltersErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some("The specified log group does not exist".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.log_group_name != input.log_group_name
+                    || cursor.filter_name_prefix != input.filter_name_prefix
+                {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeSubscriptionFilters request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // "You can list all the subscription filters or filter the results by prefix. The
+        // results are ASCII-sorted by filter name" — which is the order the store holds
+        // them in, so the enumeration needs no re-sorting.
+        let matching: Vec<&crate::state::SubscriptionFilterRecord> = group
+            .subscription_filters
+            .values()
+            .filter(|filter| {
+                input
+                    .filter_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| filter.filter_name.starts_with(prefix))
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => {
+                matching.partition_point(|filter| filter.filter_name <= cursor.after)
+            }
+            None => 0,
+        };
+        // `limit` is modelled `range 1..50`, so the boundary validator has already
+        // refused a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        let next_token = page.last().filter(|_| last < matching.len()).map(|filter| {
+            Cursor {
+                log_group_name: input.log_group_name.clone(),
+                filter_name_prefix: input.filter_name_prefix.clone(),
+                after: filter.filter_name.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeSubscriptionFiltersOutput {
+            subscription_filters: Some(
+                page.iter()
+                    .map(|filter| SubscriptionFilter {
+                        filter_name: Some(filter.filter_name.clone()),
+                        // The group the filter is associated with, which is the group it
+                        // is stored on.
+                        log_group_name: Some(group.name.clone()),
+                        filter_pattern: Some(filter.filter_pattern.clone()),
+                        destination_arn: Some(filter.destination_arn.clone()),
+                        role_arn: filter.role_arn.clone(),
+                        distribution: filter.distribution.clone(),
+                        apply_on_transformed_logs: filter.apply_on_transformed_logs,
+                        creation_time: Some(filter.creation_time_ms),
+                        // "Returns the fieldSelectionCriteria value if it was specified
+                        // when the subscription filter was created" — and nothing when it
+                        // was not. The same for `emitSystemFields`.
+                        field_selection_criteria: filter.field_selection_criteria.clone(),
+                        emit_system_fields: filter.emit_system_fields.clone(),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

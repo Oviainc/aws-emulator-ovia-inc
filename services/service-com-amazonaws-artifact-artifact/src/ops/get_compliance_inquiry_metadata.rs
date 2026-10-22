@@ -12,6 +12,14 @@
 //! instant, which was due whether or not anybody called. Two reads after that instant
 //! therefore report the same record, including the same `updatedAt`.
 //!
+//! The stored inquiry set IS the account's entitlement: AWS Artifact is served through a
+//! gateway that authorizes the resource the request targets BEFORE the service is
+//! reached, so a `complianceInquiryId` this account holds no inquiry for is answered with
+//! the front door's 401 `UnauthorizedException`
+//! (`crate::scaffolded::Scaffolded::unauthorized`) and never with the modelled 404 — the
+//! same answer every report operation gives a `reportId` the catalog does not publish.
+//! Existence is not confirmed for a resource the caller may not read.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -165,12 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(inquiry) = store.inquiries.get_mut(&input.compliance_inquiry_id) else {
-            return Err(
-                GetComplianceInquiryMetadataErrorModeled::ResourceNotFoundException(
-                    crate::state::inquiry_not_found(&input.compliance_inquiry_id),
-                )
-                .into(),
-            );
+            // Authorization of the targeted inquiry precedes the state lookup as far as a
+            // caller can tell: a well-formed id this account holds no inquiry for names no
+            // inquiry it may read, so the front door's refusal is what it sees — not the
+            // modelled not-found, which would confirm the resource's absence.
+            return Err(crate::scaffolded::Scaffolded::unauthorized());
         };
 
         // The only write a read may make: the transition the clock had already made due.

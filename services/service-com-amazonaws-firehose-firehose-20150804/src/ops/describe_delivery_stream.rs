@@ -153,8 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // Reporting only: this applies the transitions the clock has ALREADY made due
-        // (`CREATING` -> `ACTIVE`, the removal of a deleted stream), which were owed at
-        // this instant whether or not anybody described the stream.
+        // (`CREATING` -> `ACTIVE`, a settled encryption change, the removal of a deleted
+        // stream), which were owed at this instant whether or not anybody described the
+        // stream.
         store.materialise_due(::std::time::SystemTime::now());
 
         let Some(stream) = store.streams.get(&input.delivery_stream_name) else {

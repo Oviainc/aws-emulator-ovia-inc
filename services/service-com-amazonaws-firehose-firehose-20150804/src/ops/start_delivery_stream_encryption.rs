@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDeliveryStreamEncryption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDeliveryStreamEncryption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDeliveryStreamEncryption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables server-side encryption for a Firehose stream: it records the requested CMK
+//! against the stream with the transient `ENABLING` status and leaves the settled
+//! `ENABLED` to the clock, so `DescribeDeliveryStream` reports the change this call
+//! started.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDeliveryStreamEncryption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDeliveryStreamEncryptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDeliveryStreamEncryption"))
+        // Mounted on an engine that holds no state this service can reach. Unreachable
+        // through the router (which mounts every service on one `InMemoryEngine`), and
+        // this operation models no server-side error to report it with, so the scaffold
+        // channel carries it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartDeliveryStreamEncryption",
+            ));
+        };
+
+        // `DeliveryStreamEncryptionConfigurationInput` is optional, and its `KeyType`
+        // "default setting is AWS_OWNED_CMK": a request that names no configuration asks
+        // for SSE under the service-account CMK.
+        let requested = input
+            .delivery_stream_encryption_configuration_input
+            .clone()
+            .unwrap_or_else(|| DeliveryStreamEncryptionConfigurationInput {
+                key_arn: None,
+                key_type: crate::state::DEFAULT_KEY_TYPE.to_string(),
+            });
+        let region = crate::state::request_region(ctx);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialise_due(now);
+
+        let Some(stream) = store.streams.get_mut(&input.delivery_stream_name) else {
+            return Err(
+                StartDeliveryStreamEncryptionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Firehose stream {} not found",
+                            input.delivery_stream_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "You can enable SSE for a Firehose stream only if it's a Firehose stream that
+        // uses DirectPut as its source."
+        if stream.stream_type != crate::state::DIRECT_PUT_STREAM_TYPE {
+            return Err(
+                StartDeliveryStreamEncryptionErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "server-side encryption cannot be enabled for Firehose stream {} \
+                             because its type is {}; only a stream that uses {} as its source \
+                             supports it",
+                            stream.name,
+                            stream.stream_type,
+                            crate::state::DIRECT_PUT_STREAM_TYPE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The stream has to be settled before its encryption can be changed: a stream
+        // still being created or already being deleted, and one whose own encryption
+        // change has not settled yet, are both "already in use and not available for this
+        // operation".
+        if stream.status != crate::state::StreamStatus::Active {
+            return Err(in_use(format!(
+                "Firehose stream {} is {} and server-side encryption cannot be changed \
+                 until it is {}",
+                stream.name,
+                stream.status.as_wire(),
+                crate::state::StreamStatus::Active.as_wire()
+            )));
+        }
+        if stream.encryption_change_in_flight() {
+            return Err(in_use(format!(
+                "server-side encryption for Firehose stream {} is {} and cannot be \
+                 changed until that change settles",
+                stream.name,
+                stream.encryption_status().unwrap_or_default()
+            )));
+        }
+
+        // The CMK the request asks for is judged only once the stream it would be
+        // recorded against has been found, so a request naming no stream is answered as
+        // the missing stream it is.
+        crate::state::check_encryption_configuration_input(&requested, &region)
+            .map_err(refusal_error)?;
+
+        // "The StartDeliveryStreamEncryption and StopDeliveryStreamEncryption operations
+        // have a combined limit of 25 calls per Firehose stream per 24 hours." Charged
+        // here, after the refusals above: a call that changes nothing has not spent one
+        // of the stream's encryption changes, so a client cannot be locked out of SSE for
+        // 24 hours by requests the service never acted on.
+        if !stream.charge_encryption_call(now) {
+            return Err(
+                StartDeliveryStreamEncryptionErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "the limit of {} combined StartDeliveryStreamEncryption and \
+                             StopDeliveryStreamEncryption calls per Firehose stream per \
+                             24 hours has been reached for {}",
+                            crate::state::MAX_ENCRYPTION_CALLS_PER_WINDOW,
+                            stream.name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Firehose first sets the encryption status of the stream to ENABLING, and then
+        // to ENABLED." The call returns immediately; the clock owes `ENABLED`. Invoking
+        // this on a stream that is already encrypted replaces the CMK it records, which
+        // is what "you can still invoke this operation on it to change the ARN of the CMK
+        // or both its type and ARN" asks for.
+        stream.begin_encryption_change(
+            DeliveryStreamEncryptionConfiguration {
+                key_arn: requested.key_arn.clone(),
+                key_type: Some(requested.key_type.clone()),
+                status: Some(crate::state::ENCRYPTION_ENABLING.to_string()),
+                // Nothing in this emulator fails an encryption change, so no attempt
+                // leaves a KMS failure description behind.
+                failure_description: None,
+            },
+            crate::state::ENCRYPTION_ENABLED,
+            now,
+        );
+
+        Ok(StartDeliveryStreamEncryptionOutput {})
+    }
+}
+
+/// `ResourceInUseException`: "The resource is already in use and not available for this
+/// operation."
+fn in_use(message: String) -> StartDeliveryStreamEncryptionError {
+    StartDeliveryStreamEncryptionErrorModeled::ResourceInUseException(ResourceInUseException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's modelled error for a configuration
+/// [`crate::state::check_encryption_configuration_input`] refused.
+fn refusal_error(
+    refusal: crate::state::EncryptionConfigRefusal,
+) -> StartDeliveryStreamEncryptionError {
+    match refusal {
+        crate::state::EncryptionConfigRefusal::InvalidArgument(message) => {
+            StartDeliveryStreamEncryptionErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::EncryptionConfigRefusal::InvalidKmsResource { code, message } => {
+            StartDeliveryStreamEncryptionErrorModeled::InvalidKMSResourceException(
+                InvalidKMSResourceException {
+                    code: Some(code),
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }

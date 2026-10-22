@@ -7,6 +7,9 @@
 //! log-group identifier resolution and the opaque pagination tokens
 //! `GetLogEvents` / `DescribeLogStreams` / `DescribeLogGroups` hand back.
 //!
+//! A log group's subscription filters live on the group they are "associated with"
+//! ([`LogGroupRecord::subscription_filters`]), so deleting the group removes them too.
+//!
 //! The account's resource policies live here too: an account-scoped one in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::account_resource_policies`], a
 //! resource-scoped one on the log group it is attached to
@@ -55,6 +58,29 @@ pub const POLICY_SCOPE_ACCOUNT: &str = "ACCOUNT";
 /// The scope of a policy attached to one CloudWatch Logs resource, from the model's
 /// `PolicyScope` enum (`ACCOUNT` | `RESOURCE`).
 pub const POLICY_SCOPE_RESOURCE: &str = "RESOURCE";
+
+/// AWS's documented subscription-filter quota, from `PutSubscriptionFilter`: "Each log
+/// group can have up to two subscription filters associated with it." A put naming a
+/// filter the group already holds is an update of that filter, so it does not count
+/// against this.
+pub const MAX_SUBSCRIPTION_FILTERS_PER_GROUP: usize = 2;
+
+/// The destinations `PutSubscriptionFilter` documents as supported, as the service
+/// segment of the `destinationArn` naming each: "An Amazon Kinesis stream", "A logical
+/// destination (specified using an ARN)" created with `PutDestination` (a CloudWatch
+/// Logs `destination` resource), "A Kinesis Data Firehose delivery stream" and "A Lambda
+/// function". The resource prefix is the one each of those services' ARNs carries.
+pub const SUBSCRIPTION_DESTINATIONS: [(&str, &str); 4] = [
+    ("kinesis", "stream/"),
+    ("firehose", "deliverystream/"),
+    ("lambda", "function:"),
+    ("logs", "destination:"),
+];
+
+/// The system fields a subscription filter can emit, from
+/// `PutSubscriptionFilter$emitSystemFields`: "Valid values are @aws.account,
+/// @aws.region, and @source.log".
+pub const SUBSCRIPTION_SYSTEM_FIELDS: [&str; 3] = ["@aws.account", "@aws.region", "@source.log"];
 
 /// THE EMULATOR'S OWN CEILING on the log streams one group holds, not an AWS quota:
 /// CloudWatch Logs documents no limit on log streams, but this emulator keeps every
@@ -156,6 +182,11 @@ pub struct LogGroupRecord {
     pub tags: BTreeMap<String, String>,
     /// The group's log streams, keyed by `logStreamName`.
     pub streams: BTreeMap<String, LogStreamRecord>,
+    /// The group's subscription filters, keyed by `filterName`. A `BTreeMap` so
+    /// `DescribeSubscriptionFilters` enumerates them ASCII-sorted by filter name
+    /// without re-sorting, and so a put under a name already stored updates that
+    /// filter in place.
+    pub subscription_filters: BTreeMap<String, SubscriptionFilterRecord>,
     /// The resource-scoped policy attached to this group, if one has been put: AWS
     /// allows "one per LogGroup resourceARN", so at most one.
     pub resource_policy: Option<ResourcePolicyRecord>,
@@ -177,9 +208,26 @@ impl LogGroupRecord {
             metric_filter_count: 0,
             tags: BTreeMap::new(),
             streams: BTreeMap::new(),
+            subscription_filters: BTreeMap::new(),
             resource_policy: None,
         }
     }
+}
+
+/// One subscription filter — "a real-time stream of log events ingested through
+/// PutLogEvents" delivered to one destination — as it is stored. It lives on the log
+/// group it is "associated with", so deleting that group removes its filters with it.
+#[derive(Debug, Clone)]
+pub struct SubscriptionFilterRecord {
+    pub filter_name: String,
+    pub filter_pattern: String,
+    pub destination_arn: String,
+    pub role_arn: Option<String>,
+    pub distribution: Option<String>,
+    pub apply_on_transformed_logs: bool,
+    pub field_selection_criteria: Option<String>,
+    pub emit_system_fields: Option<Vec<String>>,
+    pub creation_time_ms: i64,
 }
 
 /// One created log stream and its events.
@@ -336,6 +384,21 @@ pub fn log_stream_arn(region: &str, group_name: &str, stream_name: &str) -> Stri
     )
 }
 
+/// The service and resource segments of an ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`), or `None` for anything
+/// that is not an ARN. The resource segment is whatever follows the account, colons and
+/// slashes included, because a resource id carries its own separators.
+pub fn arn_service_and_resource(arn: &str) -> Option<(&str, &str)> {
+    let rest = arn.strip_prefix("arn:")?;
+    // partition, service, region, account, then the whole resource segment.
+    let mut segments = rest.splitn(5, ':');
+    let _partition = segments.next()?;
+    let service = segments.next()?;
+    let _region = segments.next()?;
+    let _account = segments.next()?;
+    Some((service, segments.next().unwrap_or_default()))
+}
+
 /// Whether an ARN names a CloudWatch Logs log group — the only resource type a resource
 /// policy can be attached to (`PutResourcePolicy$resourceArn`: "Currently only supports
 /// LogGroup ARN").
@@ -345,17 +408,25 @@ pub fn log_stream_arn(region: &str, group_name: &str, stream_name: &str) -> Stri
 /// also names a log group, so it is excluded here: it names a stream, which cannot carry
 /// a resource policy.
 pub fn is_log_group_arn(arn: &str) -> bool {
-    let Some(rest) = arn.strip_prefix("arn:") else {
-        return false;
-    };
-    // partition, service, region, account, then the whole resource segment.
-    let mut segments = rest.splitn(5, ':');
-    let (_partition, service) = (segments.next(), segments.next());
-    let (_region, _account) = (segments.next(), segments.next());
-    let resource = segments.next().unwrap_or_default();
-    service == Some("logs")
-        && resource.starts_with("log-group:")
-        && !resource.contains(":log-stream:")
+    arn_service_and_resource(arn).is_some_and(|(service, resource)| {
+        service == "logs"
+            && resource.starts_with("log-group:")
+            && !resource.contains(":log-stream:")
+    })
+}
+
+/// Whether an ARN names a destination `PutSubscriptionFilter` supports delivering to:
+/// one of the services in [`SUBSCRIPTION_DESTINATIONS`], naming a resource of the kind
+/// that service's entry there gives.
+///
+/// A CloudWatch Logs ARN qualifies only when it names a logical `destination` (the
+/// resource `PutDestination` creates), never a log group or a log stream.
+pub fn is_subscription_destination_arn(arn: &str) -> bool {
+    arn_service_and_resource(arn).is_some_and(|(service, resource)| {
+        SUBSCRIPTION_DESTINATIONS
+            .iter()
+            .any(|(name, prefix)| service == *name && resource.starts_with(prefix))
+    })
 }
 
 /// The log group name a `logGroupIdentifier` names: the identifier itself when it is a

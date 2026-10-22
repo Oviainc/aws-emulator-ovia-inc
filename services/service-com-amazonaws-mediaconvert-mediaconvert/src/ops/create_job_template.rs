@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJobTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJobTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJobTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +173,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJobTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJobTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateJobTemplateErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The name is the resource's KEY and is stored exactly as the caller sent it:
+        // nothing in the model or in AWS's documentation normalises it, so the template a
+        // later Get/Update/Delete addresses is the one whose name matches byte for byte.
+        // A nameless resource is the one thing that cannot be stored, and that is the
+        // modelled bad request.
+        let name = input.name.clone();
+        if name.is_empty() {
+            return Err(CreateJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some("Name must not be empty.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "Optional. The queue that jobs created from this template are assigned to. If
+        // you don't specify this, jobs will go to the default queue." A queue the caller
+        // DID name is a reference to a queue resource — by name or by ARN, as every queue
+        // reference in this service is — so an unknown one is the modelled 404 rather
+        // than a template pointing at nothing, and an EMPTY one is the modelled 400
+        // rather than a value quietly dropped. An absent queue stays absent: the default
+        // is applied by `CreateJob`, so nothing is invented here.
+        let queue = match input.queue.as_deref().map(str::trim) {
+            Some("") => {
+                return Err(CreateJobTemplateErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some("Queue must not be empty.".to_string()),
+                    },
+                )
+                .into())
+            }
+            Some(reference) => Some(crate::state::queue_name_from_reference(reference).to_string()),
+            None => None,
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // No `settle` here: this path neither reads nor writes job state, and settling is
+        // the job lifecycle's business.
+        let mut state = state.lock();
+
+        if let Some(queue) = queue.as_deref() {
+            if !state.queues.contains_key(queue) {
+                return Err(CreateJobTemplateErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::not_found_message("queue")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "A name you create for each job template. Each name must be unique within your
+        // account."
+        if state.job_templates.contains_key(&name) {
+            return Err(CreateJobTemplateErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!("Job template {name} already exists.")),
+                },
+            )
+            .into());
+        }
+        // Bounded growth: the store holds at most `MAX_JOB_TEMPLATES` templates, and a
+        // create past that is the quota refusal the model declares rather than more state.
+        if state.job_templates_at_capacity() {
+            return Err(CreateJobTemplateErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "You have reached the maximum of {} job templates.",
+                        crate::state::MAX_JOB_TEMPLATES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::JobTemplateRecord {
+            name: name.clone(),
+            category: input.category,
+            description: input.description,
+            settings: input.settings,
+            queue,
+            priority: input.priority,
+            status_update_interval: input.status_update_interval,
+            acceleration_settings: input.acceleration_settings,
+            hop_destinations: input.hop_destinations.unwrap_or_default(),
+            // A template a caller creates is custom; only built-in templates are SYSTEM.
+            template_type: crate::state::TYPE_CUSTOM.to_string(),
+            created_at: now,
+            // Nothing has updated it yet, so it was last updated when it was created.
+            last_updated: now,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        let view = record.view(&region);
+        state.job_templates.insert(name, record);
+
+        Ok(CreateJobTemplateOutput {
+            job_template: Some(view),
+        })
     }
 }

@@ -13,10 +13,9 @@
 //! `maxResults` with an opaque `nextToken` that resumes immediately after the last item of
 //! the page just returned.
 //!
-//! The account's own templates are seeded straight into the store by [`seed_custom`]:
-//! `CreateJobTemplate` is still a scaffold stub
-//! (`issues/things-that-do-not-work/20261022T040904Z-mediaconvert-createjobtemplate-stub.md`),
-//! so the write side is another issue's. Nothing else here reaches past HTTP.
+//! The account's own templates are seeded straight into the store by [`seed_custom`] in
+//! the cases that are about listing alone; the write side's own coverage lives in
+//! `tests/all/job_template_crud.rs`. Nothing else here reaches past HTTP.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -182,8 +181,9 @@ fn epoch_secs(at: SystemTime) -> u64 {
 
 /// Put one of the account's own ([`TYPE_CUSTOM`]) templates in the store.
 ///
-/// This is the write side `CreateJobTemplate` will own once its own stub issue is fixed;
-/// until then a case seeds the records whose listing it is about.
+/// The cases in this suite are about the LISTING, so they seed the records whose listing
+/// they assert; `CreateJobTemplate`'s own coverage lives in
+/// `tests/all/job_template_crud.rs`.
 fn seed_custom(emulator: &Emulator, name: &str, category: Option<&str>, created_at: SystemTime) {
     emulator
         .engine
