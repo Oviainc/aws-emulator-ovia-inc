@@ -2806,6 +2806,7 @@ pub struct SdiSource {
     pub mode: Option<String>,
     pub name: Option<String>,
     pub state: Option<String>,
+    pub tags: Option<std::collections::HashMap<String, String>>,
     pub r#type: Option<String>,
 }
 

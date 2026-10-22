@@ -170,7 +170,7 @@ async fn create_resource(
         "sdiSource" => (
             "/prod/sdiSources".to_string(),
             with_tags(json!({ "name": name, "type": "SINGLE" })),
-            200,
+            201,
             vec!["sdiSource", "arn"],
         ),
         "signal-map" => {

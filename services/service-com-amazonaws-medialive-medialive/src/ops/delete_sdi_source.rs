@@ -2,6 +2,12 @@
 
 //! @op DeleteSdiSource
 //!
+//! Answers `200 OK` — the RECORDED success status of this delete, which the
+//! model's `@http` code 202 disagrees with. The deletion is complete when this
+//! call returns (the source is already in the terminal `DELETED` state in the
+//! response body), so there is nothing for a caller to poll and nothing an
+//! `202 Accepted` would mean. See `SUCCESS_STATUS` below.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -136,7 +142,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteSdiSource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_SDI_SOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_SDI_SOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 202u16;
+    // The RECORDED status of a successful `DeleteSdiSource` is `200 OK`; the
+    // model declares `@http` code 202. The wire recording governs, and 200 is
+    // what this synchronous delete is: the body already reports the source in
+    // its terminal `DELETED` state, so a client that tells a completed delete
+    // from an accepted-but-pending one must not be told to poll. MediaLive's
+    // genuinely asynchronous deletes (`DeleteCluster`, `DeleteNode`,
+    // `DeleteNetwork`, `DeleteMultiplex`) keep their 202.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,

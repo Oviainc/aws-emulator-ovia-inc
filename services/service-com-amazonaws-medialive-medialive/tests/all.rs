@@ -50,6 +50,9 @@ mod resource_tags;
 #[path = "all/sdi_source_lifecycle.rs"]
 mod sdi_source_lifecycle;
 
+#[path = "all/sdi_source_tags_and_statuses.rs"]
+mod sdi_source_tags_and_statuses;
+
 #[path = "all/signal_map_listing.rs"]
 mod signal_map_listing;
 

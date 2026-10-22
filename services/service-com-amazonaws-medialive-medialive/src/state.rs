@@ -1081,6 +1081,16 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// The full `SdiSource` description of one stored source, or `None` when no
     /// source has that id.
+    ///
+    /// The ONE projection every operation that reports an SdiSource
+    /// (`CreateSdiSource`, `DescribeSdiSource`, `UpdateSdiSource`,
+    /// `DeleteSdiSource`) answers from, so none of them can drift from the
+    /// others. `Tags` is always a map — the source's stored tag set, empty when
+    /// it carries none — exactly as every other taggable MediaLive resource
+    /// projection reports it ([`Self::input_description`],
+    /// [`Self::channel_description`]): an absent member would make a caller that
+    /// iterates the returned source's tags dereference null instead of reading
+    /// an empty map.
     pub fn sdi_source_description(&self, id: &str) -> Option<SdiSource> {
         let source = self.sdi_sources.get(id)?;
         let inputs = self.inputs_using_sdi_source(id);
@@ -1091,6 +1101,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             inputs: Some(inputs),
             mode: source.mode.clone(),
             name: source.name.clone(),
+            tags: Some(source.tags.clone()),
             r#type: source.r#type.clone(),
         })
     }
