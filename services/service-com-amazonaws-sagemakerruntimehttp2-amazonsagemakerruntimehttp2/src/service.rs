@@ -52,6 +52,13 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The hand-written event-stream operation this service serves, held here
+    /// because [`Service::override_operation`] hands back a borrow of `&self`.
+    ///
+    /// Built once in [`EmulatedService::new`] from the same shared engine the
+    /// generated entry gets, so it reaches the same store.
+    bidirectional_stream:
+        crate::ops::invoke_endpoint_with_bidirectional_stream::BidirectionalStreamEntry<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,6 +67,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            bidirectional_stream:
+                crate::ops::invoke_endpoint_with_bidirectional_stream::BidirectionalStreamEntry::new(
+                    Arc::clone(&engine),
+                ),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -91,8 +102,38 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // This service's ONE modeled operation,
+        // `InvokeEndpointWithBidirectionalStream`, binds a `@streaming` union to
+        // both its input `@httpPayload` and its output `@httpPayload`. The
+        // generated surface declines such an operation — its routing-table entry
+        // answers the framework's "modeled but not served" signal — so the
+        // hand-written entry in `ops/invoke_endpoint_with_bidirectional_stream.rs`
+        // is returned here instead, and that entry does the event-stream framing
+        // the generator does not emit. The generated table entry is still what the
+        // router reads the model's AUTH SCHEMES off, so this operation stays
+        // SigV4-signed exactly as the model declares.
+        //
+        // The match is the operation's own route (`POST
+        // /endpoints/{EndpointName}/invocations-bidirectional-stream`), applied by
+        // the same function the handler uses to read the `@httpLabel`, so routing
+        // and handling cannot disagree about which requests this claims. That
+        // function checks the METHOD as well as the path shape, so a non-POST
+        // request to the same path is not claimed here and falls through to the
+        // generated routing table. Any other request does too.
+        let claimed =
+            crate::ops::invoke_endpoint_with_bidirectional_stream::endpoint_name_label(req)
+                .map(|_| &self.bidirectional_stream as &dyn ErasedOperation);
+        if claimed.is_some() {
+            // The accepted path leaves a trace too, not only the refusal paths
+            // below. Value-free: the resolved operation, never the label.
+            tracing::debug!(
+                service = self.entry.identity().signing_name(),
+                operation = "InvokeEndpointWithBidirectionalStream",
+                "claimed a request for the hand-written event-stream operation"
+            );
+        }
+        claimed
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -105,7 +146,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // for the rest. Replace BOTH the code and the message: a client branches
         // on the code, so a message without its matching code is worse than
         // leaving both alone.
-        let _ = refusal;
+        //
+        // The framework's wording is kept, but the refusal is RECORDED: a request
+        // refused before any handler ran otherwise leaves no trace attributable
+        // to the caller. Debug level, and only the refusal's own code — never a
+        // request value.
+        tracing::debug!(
+            service = self.entry.identity().signing_name(),
+            refusal = match refusal {
+                Refusal::Invalid(violations) => {
+                    // The member paths that failed, never the values they held.
+                    let paths: Vec<&str> =
+                        violations.iter().map(|v| v.path.as_str()).collect();
+                    format!("invalid: {}", paths.join(", "))
+                }
+                Refusal::Unauthenticated => "unauthenticated".to_string(),
+                // `Refusal` is `#[non_exhaustive]`, so a variant added later lands
+                // here. Labelled neutrally rather than as one of the known kinds,
+                // which would mis-attribute it.
+                _ => "refused".to_string(),
+            },
+            "refused a request before any handler ran"
+        );
         None
     }
 
@@ -119,7 +181,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
+        //
+        // The default rendering is kept, and the unroutable request is recorded so
+        // it is not silent. No body or header value is logged.
+        tracing::debug!(
+            service = self.entry.identity().signing_name(),
+            method = req.method(),
+            "a request reached this service but named no modeled operation"
+        );
         None
     }
 
@@ -133,7 +202,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // rendering. Return `Some(resp)` to reword that failure in your own
         // envelope. The error is borrowed, so the default renderer can still
         // consume it on `None`.
-        let _ = error;
+        //
+        // The entry's rendering is kept, and the transport-level failure is
+        // recorded so it is not silent. A `ProtocolError` for a transport failure
+        // can embed fragments of the request, so its rendering goes through the
+        // one log sanitiser this crate has.
+        let rendered =
+            crate::ops::invoke_endpoint_with_bidirectional_stream::printable(&error.to_string());
+        tracing::debug!(
+            service = self.entry.identity().signing_name(),
+            error = %rendered,
+            "a transport-level failure was detected before an operation was named"
+        );
         None
     }
 }
