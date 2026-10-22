@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a WebACL under `(Scope, Name)` and persists the whole thing — rules
+//! included — so `GetWebACL` hands back exactly what was created. A second create
+//! with the same `(Scope, Name)` is `WAFDuplicateItemException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -272,18 +266,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWebACL"))
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(CreateWebACLErrorModeled::WAFInvalidParameterException(
+                WAFInvalidParameterException {
+                    message: Some(format!(
+                        "Scope {:?} is not one of CLOUDFRONT or REGIONAL",
+                        input.scope
+                    )),
+                    field: Some("SCOPE_VALUE".to_string()),
+                    parameter: Some(input.scope.clone()),
+                    reason: Some(
+                        "the scope names the namespace the web ACL lives in".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The rule tree comes straight off the wire and nests, so its depth is
+        // bounded here, before anything walks or stores it.
+        if let Err(reason) =
+            crate::state::validate_statement_nesting(input.rules.as_deref().unwrap_or_default())
+        {
+            return Err(CreateWebACLErrorModeled::WAFInvalidParameterException(
+                WAFInvalidParameterException {
+                    message: Some(reason.clone()),
+                    field: Some("STATEMENT".to_string()),
+                    parameter: Some("Rules".to_string()),
+                    reason: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateWebACLErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        // Every reference the rule tree carries must name an entity this service
+        // holds, in this scope: a dangling reference is refused, not stored.
+        if let Some(reason) =
+            state.unresolvable_rule_reference(&input.scope, input.rules.as_deref().unwrap_or_default())
+        {
+            crate::state::audit(
+                "CreateWebACL",
+                &input.scope,
+                &input.name,
+                "",
+                "WAFNonexistentItemException",
+            );
+            return Err(CreateWebACLErrorModeled::WAFNonexistentItemException(
+                WAFNonexistentItemException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        let name_key = (input.scope.clone(), input.name.clone());
+        if state.web_acl_names.contains_key(&name_key) {
+            crate::state::audit(
+                "CreateWebACL",
+                &input.scope,
+                &input.name,
+                "",
+                "WAFDuplicateItemException",
+            );
+            return Err(CreateWebACLErrorModeled::WAFDuplicateItemException(
+                WAFDuplicateItemException {
+                    message: Some(format!(
+                        "A WebACL named {:?} already exists in scope {}",
+                        input.name, input.scope
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if state.web_acls_in_scope(&input.scope) >= crate::state::MAX_WEB_ACLS_PER_SCOPE {
+            crate::state::audit(
+                "CreateWebACL",
+                &input.scope,
+                &input.name,
+                "",
+                "WAFLimitsExceededException",
+            );
+            return Err(CreateWebACLErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(format!(
+                        "You have reached the maximum of {} WebACLs in scope {}",
+                        crate::state::MAX_WEB_ACLS_PER_SCOPE, input.scope
+                    )),
+                    source_type: None,
+                },
+            )
+            .into());
+        }
+
+        let id = crate::state::new_uuid();
+        let lock_token = crate::state::new_uuid();
+        let arn = crate::state::resource_arn(&input.scope, &region, "webacl", &input.name, &id);
+        let rules = input.rules.clone().unwrap_or_default();
+        let web_acl = WebACL {
+            name: input.name.clone(),
+            id: id.clone(),
+            arn: arn.clone(),
+            default_action: input.default_action.clone(),
+            description: input.description.clone(),
+            rules: input.rules.clone(),
+            visibility_config: input.visibility_config.clone(),
+            data_protection_config: input.data_protection_config.clone(),
+            capacity: crate::state::web_acl_capacity(&rules),
+            // Firewall Manager cannot reach this emulator, so a web ACL created
+            // through the API carries neither of its rule-group sets and neither of
+            // its ownership flags.
+            pre_process_firewall_manager_rule_groups: None,
+            post_process_firewall_manager_rule_groups: None,
+            managed_by_firewall_manager: false,
+            label_namespace: Some(crate::state::web_acl_label_namespace(&input.name)),
+            custom_response_bodies: input.custom_response_bodies.clone(),
+            captcha_config: input.captcha_config.clone(),
+            challenge_config: input.challenge_config.clone(),
+            token_domains: input.token_domains.clone(),
+            association_config: input.association_config.clone(),
+            retrofitted_by_firewall_manager: false,
+            on_source_d_do_s_protection_config: input.on_source_d_do_s_protection_config.clone(),
+            application_config: input.application_config.clone(),
+            monetization_config: input.monetization_config.clone(),
+        };
+        let summary = WebACLSummary {
+            name: Some(web_acl.name.clone()),
+            id: Some(web_acl.id.clone()),
+            description: web_acl.description.clone(),
+            lock_token: Some(lock_token.clone()),
+            arn: Some(web_acl.arn.clone()),
+        };
+
+        state.arn_index.insert(
+            arn,
+            crate::state::ResourceRef::WebAcl {
+                scope: input.scope.clone(),
+                id: id.clone(),
+            },
+        );
+        state.web_acl_names.insert(name_key, id.clone());
+        state.web_acls.insert(
+            (input.scope.clone(), id.clone()),
+            crate::state::WebAclEntry {
+                scope: input.scope.clone(),
+                web_acl,
+                lock_token,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+        crate::state::audit(
+            "CreateWebACL",
+            &input.scope,
+            &input.name,
+            &id,
+            "created",
+        );
+
+        Ok(CreateWebACLOutput {
+            summary: Some(summary),
+        })
     }
 }

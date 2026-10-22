@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWebACLs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWebACLs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWebACLs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the WebACLs stored under the requested `Scope`, ordered by name, one
+//! page at a time: at most `Limit` summaries, resuming after `NextMarker`, and
+//! answering a `NextMarker` only while a further page remains.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +120,10 @@ impl From<ListWebACLsErrorModeled> for ListWebACLsError {
     }
 }
 
+/// The largest page `ListWebACLs` answers with when the request names no `Limit`:
+/// the upper bound of the model's `PaginationLimit` (`range 1..100`).
+const MAX_PAGE_SIZE: i32 = 100;
+
 /// The `ListWebACLs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +160,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWebACLs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWebACLsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWebACLs"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(ListWebACLsErrorModeled::WAFInvalidParameterException(
+                WAFInvalidParameterException {
+                    message: Some(format!(
+                        "Scope {:?} is not one of CLOUDFRONT or REGIONAL",
+                        input.scope
+                    )),
+                    field: Some("SCOPE_VALUE".to_string()),
+                    parameter: Some(input.scope.clone()),
+                    reason: Some(
+                        "the scope names the namespace the web ACLs live in".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListWebACLsErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Only this scope's web ACLs, in a stable order so a marker names the same
+        // position on every call.
+        let mut entries: Vec<&crate::state::WebAclEntry> = state
+            .web_acls
+            .values()
+            .filter(|entry| entry.scope == input.scope)
+            .collect();
+        entries.sort_by(|left, right| left.web_acl.name.cmp(&right.web_acl.name));
+
+        // `NextMarker` is the name of the last summary of the previous page, so this
+        // page starts at the first name after it.
+        if let Some(marker) = input.next_marker.as_deref() {
+            entries.retain(|entry| entry.web_acl.name.as_str() > marker);
+        }
+
+        // Absent `Limit`, a page holds as many as the model's `PaginationLimit` range
+        // allows (`range 1..100`); a `Limit` outside that range is refused rather
+        // than clamped, so no caller gets a silently empty terminal page.
+        let page_size = match input.limit {
+            None => MAX_PAGE_SIZE,
+            Some(limit) if (1..=MAX_PAGE_SIZE).contains(&limit) => limit,
+            Some(limit) => {
+                return Err(ListWebACLsErrorModeled::WAFInvalidParameterException(
+                    WAFInvalidParameterException {
+                        message: Some(format!(
+                            "Limit {limit} is outside the range 1 to {MAX_PAGE_SIZE}"
+                        )),
+                        field: Some("ENTITY_LIMIT".to_string()),
+                        parameter: Some(limit.to_string()),
+                        reason: Some(format!(
+                            "a page holds between 1 and {MAX_PAGE_SIZE} summaries"
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+        let page_size = usize::try_from(page_size).unwrap_or(0);
+        let has_more = entries.len() > page_size;
+        entries.truncate(page_size);
+
+        let next_marker = has_more
+            .then(|| entries.last().map(|entry| entry.web_acl.name.clone()))
+            .flatten();
+        let web_ac_ls = entries
+            .into_iter()
+            .map(|entry| WebACLSummary {
+                name: Some(entry.web_acl.name.clone()),
+                id: Some(entry.web_acl.id.clone()),
+                description: entry.web_acl.description.clone(),
+                lock_token: Some(entry.lock_token.clone()),
+                arn: Some(entry.web_acl.arn.clone()),
+            })
+            .collect();
+
+        Ok(ListWebACLsOutput {
+            next_marker,
+            web_ac_ls: Some(web_ac_ls),
+        })
     }
 }

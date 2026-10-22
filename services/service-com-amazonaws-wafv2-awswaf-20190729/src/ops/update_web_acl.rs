@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Overwrites the stored WebACL once its `LockToken` still matches, then rotates the
+//! token and answers the new one as `NextLockToken`. A stale token is
+//! `WAFOptimisticLockException` and leaves the stored web ACL untouched; an unknown
+//! `(Scope, Name, Id)` is `WAFNonexistentItemException` (both HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -299,18 +294,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWebACL"))
+        // `ctx` carries only request metadata, which this operation does not need: an
+        // update never re-mints the ARN, so it needs no region.
+        let _ = ctx;
+        // The rule tree comes straight off the wire and nests, so its depth is
+        // bounded here, before anything walks, stores or measures it.
+        if let Err(reason) =
+            crate::state::validate_statement_nesting(input.rules.as_deref().unwrap_or_default())
+        {
+            return Err(UpdateWebACLErrorModeled::WAFInvalidParameterException(
+                WAFInvalidParameterException {
+                    message: Some(reason.clone()),
+                    field: Some("STATEMENT".to_string()),
+                    parameter: Some("Rules".to_string()),
+                    reason: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateWebACLErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let Some(entry) = state.web_acl(&input.scope, &input.name, &input.id) else {
+            crate::state::audit(
+                "UpdateWebACL",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFNonexistentItemException",
+            );
+            return Err(UpdateWebACLErrorModeled::WAFNonexistentItemException(
+                WAFNonexistentItemException {
+                    message: Some(format!(
+                        "No WebACL named {:?} with id {:?} exists in scope {}",
+                        input.name, input.id, input.scope
+                    )),
+                },
+            )
+            .into());
+        };
+        // Checked BEFORE anything is written, so a stale token leaves the stored web
+        // ACL exactly as it was.
+        if entry.lock_token != input.lock_token {
+            crate::state::audit(
+                "UpdateWebACL",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFOptimisticLockException",
+            );
+            return Err(UpdateWebACLErrorModeled::WAFOptimisticLockException(
+                WAFOptimisticLockException {
+                    message: Some(
+                        "The WebACL has changed since you last retrieved it; get it again and \
+                         retry with the new LockToken"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Every reference the new rule tree carries must name an entity this service
+        // holds, in this scope: a dangling reference is refused, and the stored web
+        // ACL and its lock token are left untouched.
+        if let Some(reason) = state
+            .unresolvable_rule_reference(&input.scope, input.rules.as_deref().unwrap_or_default())
+        {
+            crate::state::audit(
+                "UpdateWebACL",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFNonexistentItemException",
+            );
+            return Err(UpdateWebACLErrorModeled::WAFNonexistentItemException(
+                WAFNonexistentItemException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        // The checks above hold an immutable borrow, so the entry is resolved again —
+        // by the same triple, under the same lock — to write through.
+        let Some(entry) = state.web_acl_mut(&input.scope, &input.name, &input.id) else {
+            return Err(UpdateWebACLErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // `Name`, `Id` and `ARN` are immutable; everything the request carries
+        // replaces what was stored, and a member the request omits is cleared — an
+        // update is a whole-resource overwrite, not a merge.
+        let rules = input.rules.clone().unwrap_or_default();
+        entry.web_acl.default_action = input.default_action;
+        entry.web_acl.description = input.description;
+        entry.web_acl.rules = input.rules;
+        entry.web_acl.visibility_config = input.visibility_config;
+        entry.web_acl.data_protection_config = input.data_protection_config;
+        entry.web_acl.capacity = crate::state::web_acl_capacity(&rules);
+        entry.web_acl.custom_response_bodies = input.custom_response_bodies;
+        entry.web_acl.captcha_config = input.captcha_config;
+        entry.web_acl.challenge_config = input.challenge_config;
+        entry.web_acl.token_domains = input.token_domains;
+        entry.web_acl.association_config = input.association_config;
+        entry.web_acl.on_source_d_do_s_protection_config = input.on_source_d_do_s_protection_config;
+        entry.web_acl.application_config = input.application_config;
+        entry.web_acl.monetization_config = input.monetization_config;
+
+        // The token rotates on every successful mutation, so the one the caller just
+        // used stops working.
+        let next_lock_token = crate::state::new_uuid();
+        entry.lock_token = next_lock_token.clone();
+        crate::state::audit(
+            "UpdateWebACL",
+            &input.scope,
+            &input.name,
+            &input.id,
+            "updated",
+        );
+
+        Ok(UpdateWebACLOutput {
+            next_lock_token: Some(next_lock_token),
+        })
     }
 }

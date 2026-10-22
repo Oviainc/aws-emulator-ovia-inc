@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers the stored WebACL, resolved either by `(Scope, Name, Id)` or by `ARN`,
+//! together with its current `LockToken`. A resource that is not stored is
+//! `WAFNonexistentItemException`; a request that names neither form is
+//! `WAFInvalidParameterException` (both HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +172,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWebACL"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetWebACLErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Two addressing forms, as the model declares: every member is optional, and
+        // a web ACL is named EITHER by its ARN or by the (Scope, Name, Id) triple.
+        let entry = if let Some(arn) = input.arn.as_deref() {
+            // The model names two different ARN failures: malformed, and naming
+            // nothing that exists.
+            if !crate::state::is_wafv2_resource_arn(arn) {
+                return Err(GetWebACLErrorModeled::WAFInvalidParameterException(
+                    WAFInvalidParameterException {
+                        message: Some(format!("{arn:?} is not a well-formed wafv2 ARN")),
+                        field: Some("RESOURCE_ARN".to_string()),
+                        parameter: Some(arn.to_string()),
+                        reason: Some(
+                            "a wafv2 ARN reads \
+                             arn:<partition>:wafv2:<region>:<account>:<global|regional>/<type>/<name>/<id>"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            match state.arn_index.get(arn) {
+                Some(crate::state::ResourceRef::WebAcl { scope, id }) => {
+                    state.web_acls.get(&(scope.clone(), id.clone()))
+                }
+                // An ARN that resolves to something else is not a web ACL ARN.
+                Some(crate::state::ResourceRef::IpSet { .. }) | None => None,
+            }
+        } else {
+            match (
+                input.scope.as_deref(),
+                input.name.as_deref(),
+                input.id.as_deref(),
+            ) {
+                (Some(scope), Some(name), Some(id)) => state.web_acl(scope, name, id),
+                _ => {
+                    return Err(GetWebACLErrorModeled::WAFInvalidParameterException(
+                        WAFInvalidParameterException {
+                            message: Some(
+                                "Specify either ARN, or all of Name, Scope and Id".to_string(),
+                            ),
+                            field: Some("WEB_ACL".to_string()),
+                            parameter: Some("ARN".to_string()),
+                            reason: Some(
+                                "a web ACL is addressed by its ARN or by its name, scope and id"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
+        };
+
+        let Some(entry) = entry else {
+            return Err(GetWebACLErrorModeled::WAFNonexistentItemException(
+                WAFNonexistentItemException {
+                    message: Some(match input.arn.as_deref() {
+                        Some(arn) => format!("No WebACL exists with the ARN {arn}"),
+                        None => format!(
+                            "No WebACL named {:?} with id {:?} exists in scope {:?}",
+                            input.name.as_deref().unwrap_or_default(),
+                            input.id.as_deref().unwrap_or_default(),
+                            input.scope.as_deref().unwrap_or_default()
+                        ),
+                    }),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetWebACLOutput {
+            web_acl: Some(entry.web_acl.clone()),
+            lock_token: Some(entry.lock_token.clone()),
+            // WAF returns an application integration URL only for a web ACL that uses
+            // the CAPTCHA or challenge JavaScript integrations, which this emulator
+            // does not host.
+            application_integration_url: None,
+        })
     }
 }
