@@ -6,6 +6,11 @@
 //! `GetChannelGroup` reads them back unchanged. A name that already exists is refused
 //! with `ConflictException` and the group it names is left exactly as it was.
 //!
+//! The operation is `@idempotent` and binds `ClientToken` with `@idempotencyToken`: a
+//! repeat under a token that already created a group replays that group's response when
+//! the request is unchanged, and is refused with `ConflictException` /
+//! `IDEMPOTENT_PARAMETER_MISMATCH` when any member differs.
+//!
 //! `handle` below is the implementation; `crate::state` holds the store it reads and
 //! writes.
 //!
@@ -148,6 +153,22 @@ impl From<CreateChannelGroupErrorModeled> for CreateChannelGroupError {
     }
 }
 
+/// The response for a stored channel group. Both the create and its idempotent replay
+/// answer from the SAME stored record through here, so a retry cannot report anything
+/// the original did not.
+fn group_output(group: &crate::state::ChannelGroup) -> CreateChannelGroupOutput {
+    CreateChannelGroupOutput {
+        channel_group_name: group.name.clone(),
+        arn: group.arn.clone(),
+        egress_domain: group.egress_domain.clone(),
+        created_at: group.created_at,
+        modified_at: group.modified_at,
+        e_tag: Some(group.etag.clone()),
+        description: group.description.clone(),
+        tags: Some(group.tags.clone()),
+    }
+}
+
 /// The `CreateChannelGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -195,6 +216,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
+        // The request's own fingerprint: every member it carried EXCEPT the token that
+        // identifies the attempt. A retry of this create has the same fingerprint; a
+        // different create under the same token does not.
+        let tags = input.tags.unwrap_or_default();
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.channel_group_name.clone(),
+            input.description.clone().unwrap_or_default(),
+            crate::state::tag_fingerprint(&tags),
+        ]);
+
+        // `CreateChannelGroup` is `@idempotent` and binds `ClientToken` with
+        // `@idempotencyToken`, so a repeat under the same token is not a second create:
+        // an identical one replays the first result, and a changed one is the conflict
+        // the model's `IDEMPOTENT_PARAMETER_MISMATCH` names.
+        match crate::state::match_client_token(
+            input.client_token.as_deref(),
+            &fingerprint,
+            store
+                .channel_groups
+                .values()
+                .map(|group| {
+                    (
+                        group.name.as_str(),
+                        group.client_token.as_deref(),
+                        group.fingerprint.as_str(),
+                    )
+                }),
+        ) {
+            crate::state::TokenMatch::Replay(name) => {
+                return Ok(group_output(&store.channel_groups[&name]));
+            }
+            crate::state::TokenMatch::Mismatch => {
+                return Err(CreateChannelGroupErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::idempotent_parameter_mismatch_message(
+                            input.client_token.as_deref().unwrap_or_default(),
+                        )),
+                        conflict_exception_type: Some(
+                            "IDEMPOTENT_PARAMETER_MISMATCH".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            crate::state::TokenMatch::Fresh => {}
+        }
+
         // One channel group per name per account and region: a repeat create conflicts
         // rather than replacing the group that is already there.
         if store.channel_groups.contains_key(&input.channel_group_name) {
@@ -228,7 +296,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = input.channel_group_name.clone();
         let created_at = crate::state::now();
-        let tags = input.tags.unwrap_or_default();
         let arn = crate::state::channel_group_arn(&region, &name);
         let egress_domain = crate::state::egress_domain(&region, &name);
         let etag = crate::state::etag(&[
@@ -249,22 +316,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: created_at,
             etag,
             tags,
+            client_token: input.client_token,
+            fingerprint,
             channels: ::std::collections::BTreeMap::new(),
         };
         store.channel_groups.insert(name.clone(), group);
         // Answer from what was stored, so the response can only carry what a later
         // `GetChannelGroup` will read.
-        let group = &store.channel_groups[&name];
-
-        Ok(CreateChannelGroupOutput {
-            channel_group_name: group.name.clone(),
-            arn: group.arn.clone(),
-            egress_domain: group.egress_domain.clone(),
-            created_at: group.created_at,
-            modified_at: group.modified_at,
-            e_tag: Some(group.etag.clone()),
-            description: group.description.clone(),
-            tags: Some(group.tags.clone()),
-        })
+        Ok(group_output(&store.channel_groups[&name]))
     }
 }

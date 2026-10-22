@@ -122,13 +122,6 @@ impl From<ListOriginEndpointsErrorModeled> for ListOriginEndpointsError {
     }
 }
 
-/// The smallest `MaxResults` the model's `ListResourceMaxResults` range allows.
-const MAX_RESULTS_MIN: usize = 1;
-/// The largest `MaxResults` the model's `ListResourceMaxResults` range allows.
-const MAX_RESULTS_MAX: usize = 100;
-/// The page size the model declares as `MaxResults`'s default.
-const MAX_RESULTS_DEFAULT: usize = 10;
-
 /// The list projection of a persisted origin endpoint: its identity, its container type
 /// and the name, child name and URL of each of its manifests. The list form omits the
 /// per-manifest packaging detail a `Get` reports, so this is a narrowing of what is
@@ -266,16 +259,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The model bounds `MaxResults` to 1..100 and defaults it to 10, and the
-        // boundary validator has already refused anything outside that range, so a value
-        // outside it here means the member was absent: fall back to the modelled default.
-        let page_size = match usize::try_from(input.max_results) {
-            Ok(size) if (MAX_RESULTS_MIN..=MAX_RESULTS_MAX).contains(&size) => size,
-            _ => MAX_RESULTS_DEFAULT,
-        };
+        // The model bounds `MaxResults` and declares its default; the shared resolver
+        // this service's lists share decides the page size.
+        let page_size = crate::state::page_size(input.max_results);
 
-        // A token names the endpoint the previous page stopped after, so this page starts
-        // strictly beyond it: no endpoint is returned twice and none is skipped.
+        // A token names the endpoint the previous page stopped after.
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => match crate::state::page_resume_after(token) {
@@ -283,10 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListOriginEndpointsErrorModeled::ValidationException(
                         ValidationException {
-                            message: Some(
-                                "The pagination token is not one this service issued"
-                                    .to_string(),
-                            ),
+                            message: Some(crate::state::invalid_pagination_token_message()),
                             validation_exception_type: Some(
                                 "INVALID_PAGINATION_TOKEN".to_string(),
                             ),
@@ -297,23 +282,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        let mut remaining = channel
-            .origin_endpoints
-            .iter()
-            .filter(|(name, _)| {
-                resume_after
-                    .as_deref()
-                    .is_none_or(|after| name.as_str() > after)
-            })
-            .map(|(_, endpoint)| endpoint);
-        let page: Vec<&crate::state::OriginEndpoint> =
-            remaining.by_ref().take(page_size).collect();
-        // A token is issued only when an endpoint is actually left over, so the last page
-        // of a list ends without one.
-        let next_token = page
-            .last()
-            .filter(|_| remaining.next().is_some())
-            .map(|last| crate::state::page_token(&last.name));
+        let (page, next_token) = crate::state::page(
+            channel.origin_endpoints.iter(),
+            resume_after.as_deref(),
+            page_size,
+        );
 
         Ok(ListOriginEndpointsOutput {
             items: Some(page.into_iter().map(list_configuration).collect()),

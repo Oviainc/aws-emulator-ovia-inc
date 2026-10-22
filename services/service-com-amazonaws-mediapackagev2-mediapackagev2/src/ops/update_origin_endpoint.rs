@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOriginEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOriginEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Replaces the packaging configuration of an origin endpoint persisted in
+//! [`crate::state`] and rotates its ETag, leaving the endpoint's identity (its name, ARN
+//! and creation instant) alone.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOriginEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it refuses, before anything is written:
+//!
+//! * a member the model documents as immutable after creation, when the request carries
+//!   a different value — `ContainerType` (`CONTAINER_TYPE_IMMUTABLE`) and
+//!   `StreamNameOutputMode` (`STREAM_NAME_OUTPUT_MODE_IMMUTABLE`), each a 400
+//!   `ValidationException` naming the member, with the stored endpoint untouched;
+//! * a manifest set the new `ContainerType` cannot serve, no manifest at all, or more
+//!   manifests than [`crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT`] — the same rules
+//!   `CreateOriginEndpoint` applies, because an update carries the whole manifest set;
+//! * an `ETag` precondition (`x-amzn-update-if-match`) that is not the endpoint's current
+//!   tag, which the model's doc says rejects the request.
+//!
+//! A group, channel or endpoint that does not resolve is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -201,6 +209,91 @@ impl From<UpdateOriginEndpointErrorModeled> for UpdateOriginEndpointError {
     }
 }
 
+/// How many manifests the request carries per family, in
+/// [`crate::state::ManifestFamily::ALL`] order. An update carries the WHOLE manifest set
+/// ("This replaces the existing MSS manifest configurations"), so the counts are the
+/// counts the endpoint will have.
+fn manifest_counts(input: &UpdateOriginEndpointInput) -> [usize; 4] {
+    [
+        input.hls_manifests.as_ref().map_or(0, Vec::len),
+        input.low_latency_hls_manifests.as_ref().map_or(0, Vec::len),
+        input.dash_manifests.as_ref().map_or(0, Vec::len),
+        input.mss_manifests.as_ref().map_or(0, Vec::len),
+    ]
+}
+
+/// A member of an origin endpoint the model documents as fixed once the endpoint exists:
+/// the member path a message names, the `ValidationExceptionType` that names its
+/// refusal, and the sentence the refusal states.
+struct ImmutableMember {
+    member: &'static str,
+    exception_type: &'static str,
+    detail: &'static str,
+}
+
+/// `ContainerType`: "You can't change the container type after you create an origin
+/// endpoint" — the rule the model's `CONTAINER_TYPE_IMMUTABLE` names.
+const CONTAINER_TYPE: ImmutableMember = ImmutableMember {
+    member: "containerType",
+    exception_type: "CONTAINER_TYPE_IMMUTABLE",
+    detail: "You can't change the container type after you create an origin endpoint. \
+             To use a different container type, you'll need to create a new origin endpoint",
+};
+
+/// `StreamNameOutputMode`: the model's member doc says "If you provide a value, it must
+/// match the current value. You can't change the stream name output mode after you create
+/// the endpoint", and `ValidationExceptionType` names
+/// `STREAM_NAME_OUTPUT_MODE_IMMUTABLE` for it.
+const STREAM_NAME_OUTPUT_MODE: ImmutableMember = ImmutableMember {
+    member: "streamNameOutputMode",
+    exception_type: "STREAM_NAME_OUTPUT_MODE_IMMUTABLE",
+    detail: "You can't change the stream name output mode after you create an origin \
+             endpoint. To use a different stream name output mode, you'll need to create \
+             a new origin endpoint",
+};
+
+/// The `ValidationException` for an attempt to change an immutable member: the service's
+/// own message form, naming the member and restating the rule, plus the discriminator.
+fn immutable_violation(member: &ImmutableMember) -> ValidationException {
+    ValidationException {
+        message: Some(crate::state::validation_message(
+            Some(member.member),
+            member.detail,
+        )),
+        validation_exception_type: Some(member.exception_type.to_string()),
+    }
+}
+
+/// The response for the stored endpoint, answered from the record the update left behind
+/// so nothing is reported that a later `GetOriginEndpoint` will not read.
+fn endpoint_output(
+    endpoint: &crate::state::OriginEndpoint,
+) -> UpdateOriginEndpointOutput {
+    UpdateOriginEndpointOutput {
+        arn: endpoint.arn.clone(),
+        channel_group_name: endpoint.group_name.clone(),
+        channel_name: endpoint.channel_name.clone(),
+        origin_endpoint_name: endpoint.name.clone(),
+        container_type: endpoint.container_type.clone(),
+        segment: endpoint.segment.clone(),
+        created_at: endpoint.created_at,
+        modified_at: endpoint.modified_at,
+        description: endpoint.description.clone(),
+        startover_window_seconds: endpoint.startover_window_seconds,
+        hls_manifests: Some(endpoint.hls_manifests.clone()),
+        low_latency_hls_manifests: Some(endpoint.low_latency_hls_manifests.clone()),
+        dash_manifests: Some(endpoint.dash_manifests.clone()),
+        mss_manifests: Some(endpoint.mss_manifests.clone()),
+        force_endpoint_error_configuration: endpoint
+            .force_endpoint_error_configuration
+            .clone(),
+        uri_separator: endpoint.uri_separator.clone(),
+        stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
+        e_tag: Some(endpoint.etag.clone()),
+        tags: Some(endpoint.tags.clone()),
+    }
+}
+
 /// The `UpdateOriginEndpoint` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -237,18 +330,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateOriginEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOriginEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOriginEndpoint"))
+        // Every derived value this update reports (ARN, manifest URLs) is a function of
+        // the stored resource, so nothing is needed from the request's own metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateOriginEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The manifest-set rules are about the request alone, so they are decided first
+        // and before anything is written.
+        if let Some(violation) = crate::state::manifest_set_violation(
+            &input.container_type,
+            manifest_counts(&input),
+            crate::state::ManifestSetOn::Update,
+        ) {
+            return Err(UpdateOriginEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(violation.message),
+                    validation_exception_type: Some(
+                        violation.validation_exception_type.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        // An update REPLACES the whole manifest set, each manifest persisted with its
+        // computed URL, so it is bounded by the same ceiling the create is: without this
+        // an endpoint's stored record size would be caller-chosen again.
+        if let Some(message) = crate::state::manifest_ceiling_exceeded(manifest_counts(&input)) {
+            return Err(
+                UpdateOriginEndpointErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(UpdateOriginEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel group {} not found",
+                        input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                },
+            )
+            .into());
+        };
+        let egress_domain = group.egress_domain.clone();
+        let group_name = group.name.clone();
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(UpdateOriginEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel {} not found in channel group {}",
+                        input.channel_name, group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL".to_string()),
+                },
+            )
+            .into());
+        };
+        let channel_name = channel.name.clone();
+        let Some(endpoint) = channel
+            .origin_endpoints
+            .get_mut(&input.origin_endpoint_name)
+        else {
+            return Err(UpdateOriginEndpointErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Origin endpoint {} not found on channel {} in channel group {}",
+                        input.origin_endpoint_name, channel_name, group_name
+                    )),
+                    resource_type_not_found: Some("ORIGIN_ENDPOINT".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The immutable members: `ContainerType` is required on every update, so it is
+        // compared always; `StreamNameOutputMode` only when the request provides one AND
+        // the endpoint already has one, because an absent request value means "keep what
+        // is there" and an endpoint created without the member has no value to change.
+        // Both are refused BEFORE a single field is written, so a rejected update leaves
+        // the endpoint — and its ETag — exactly as it was.
+        if input.container_type != endpoint.container_type {
+            return Err(UpdateOriginEndpointErrorModeled::ValidationException(
+                immutable_violation(&CONTAINER_TYPE),
+            )
+            .into());
+        }
+        if let (Some(requested), Some(stored)) = (
+            input.stream_name_output_mode.as_ref(),
+            endpoint.stream_name_output_mode.as_ref(),
+        ) {
+            if requested != stored {
+                return Err(UpdateOriginEndpointErrorModeled::ValidationException(
+                    immutable_violation(&STREAM_NAME_OUTPUT_MODE),
+                )
+                .into());
+            }
+        }
+        // `ETag` is the precondition the caller read from an earlier response: "If the
+        // specified ETag does not match the resource's current entity tag, the update
+        // request will be rejected". The model declares no precondition error for this
+        // operation, and the resource having moved on under the caller is what
+        // `ConflictException` / `CONFLICTING_OPERATION` describes.
+        if input
+            .e_tag
+            .as_ref()
+            .is_some_and(|expected| expected != &endpoint.etag)
+        {
+            return Err(UpdateOriginEndpointErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        "The ETag in the request does not match the origin endpoint's \
+                         current ETag. Read the endpoint again and retry the update"
+                            .to_string(),
+                    ),
+                    conflict_exception_type: Some("CONFLICTING_OPERATION".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The URLs of the replacement manifests are rooted exactly where the endpoint's
+        // own are: the parent group's egress domain and this resource path.
+        let at = crate::state::ManifestLocation {
+            egress_domain: &egress_domain,
+            group: &group_name,
+            channel: &channel_name,
+            endpoint: &input.origin_endpoint_name,
+        };
+        endpoint.hls_manifests = input
+            .hls_manifests
+            .unwrap_or_default()
+            .into_iter()
+            .map(|manifest| crate::state::stored_hls_manifest(manifest, at))
+            .collect();
+        endpoint.low_latency_hls_manifests = input
+            .low_latency_hls_manifests
+            .unwrap_or_default()
+            .into_iter()
+            .map(|manifest| crate::state::stored_low_latency_hls_manifest(manifest, at))
+            .collect();
+        endpoint.dash_manifests = input
+            .dash_manifests
+            .unwrap_or_default()
+            .into_iter()
+            .map(|manifest| crate::state::stored_dash_manifest(manifest, at))
+            .collect();
+        endpoint.mss_manifests = input
+            .mss_manifests
+            .unwrap_or_default()
+            .into_iter()
+            .map(|manifest| crate::state::stored_mss_manifest(manifest, at))
+            .collect();
+        // An update carries the whole packaging configuration, so a member the request
+        // omits is cleared rather than kept — except the two the model says are preserved
+        // when absent (`UriSeparator`: "If you don't specify a value in the update
+        // request, the current value is preserved") or cannot be changed at all.
+        endpoint.segment = input.segment.unwrap_or_default();
+        endpoint.description = input.description;
+        endpoint.startover_window_seconds = input.startover_window_seconds;
+        endpoint.force_endpoint_error_configuration = input.force_endpoint_error_configuration;
+        if let Some(separator) = input.uri_separator {
+            endpoint.uri_separator = Some(separator);
+        }
+        // The immutability check above has already established that a provided mode
+        // equals the stored one, or that there was none stored to change: an endpoint
+        // created without the member takes the one this update names.
+        if let Some(mode) = input.stream_name_output_mode {
+            endpoint.stream_name_output_mode = Some(mode);
+        }
+        endpoint.modified_at = crate::state::now();
+        // The ETag covers everything the endpoint is made of, so it rotates exactly when
+        // this update changed something — which is what a conditional update needs of it.
+        let rotated = crate::state::origin_endpoint_etag(endpoint);
+        endpoint.etag = rotated;
+
+        Ok(endpoint_output(endpoint))
     }
 }

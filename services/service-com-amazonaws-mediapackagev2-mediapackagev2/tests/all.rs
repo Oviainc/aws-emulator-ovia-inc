@@ -17,5 +17,7 @@ mod channel_lifecycle;
 mod channel_policy;
 #[path = "all/channel_reset.rs"]
 mod channel_reset;
+#[path = "all/control_plane_validation.rs"]
+mod control_plane_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

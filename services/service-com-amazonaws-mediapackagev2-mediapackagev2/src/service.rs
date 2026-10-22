@@ -96,17 +96,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // mediapackagev2 does NOT word a refused request the way the framework does.
+        // Every input failure this service reports — whether the request boundary found
+        // it from the model's own `@range`/`@length`/`@pattern`/enum constraints, or a
+        // handler found a cross-member rule the model cannot express — is a 400
+        // `ValidationException` whose message reads
+        // `Validation error encountered at request.<member>: <the violated rule>`.
+        // Leaving the framework's `N validation errors detected: Value '..' at '..'
+        // failed to satisfy constraint: ..` sentence here would give one service two
+        // unrelated validation-text families, so a client matching this service's
+        // documented wording would not recognise half of its rejections.
+        //
+        // The code stays `ValidationException` (what the framework already chose and
+        // what the model declares), so code and message move together.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "ValidationException".to_string(),
+                message: crate::state::refusal_message(violations),
+            }),
+            // Authentication is the emulator's, not this service's: leave its wording.
+            Refusal::Unauthenticated => None,
+            // `Refusal` is `#[non_exhaustive]`: a refusal class added later keeps the
+            // framework's wording until this service has a form for it.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

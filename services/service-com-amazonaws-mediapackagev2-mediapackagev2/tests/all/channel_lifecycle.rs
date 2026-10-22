@@ -33,7 +33,8 @@ const REGION: &str = "us-west-2";
 /// A MediaPackageV2 emulator plus a tiny restJson1 client for it.
 ///
 /// `pub(crate)` so the crate's other suites drive the emulator through this one client
-/// rather than each growing its own copy of it (see `tests/all/channel_reset.rs`).
+/// rather than each growing its own copy of it (see `tests/all/channel_reset.rs` and
+/// `tests/all/control_plane_validation.rs`).
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
@@ -53,8 +54,20 @@ impl Emulator {
     /// Send one request and return its status and parsed JSON body (`Value::Null` for an
     /// empty body).
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        self.call_with_headers(method, path, body, &[]).await
+    }
+
+    /// As [`Emulator::call`], with extra request headers — a request-header-bound member
+    /// such as `ClientToken` (`x-amzn-client-token`) travels through here.
+    pub(crate) async fn call_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value) {
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
-        let request = http::Request::builder()
+        let mut builder = http::Request::builder()
             .method(method)
             .uri(path)
             .header("host", format!("mediapackagev2.{REGION}.amazonaws.com"))
@@ -65,7 +78,11 @@ impl Emulator {
                      aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
                 ),
             )
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder
             .body(bytes::Bytes::from(payload))
             .expect("a well-formed test request");
         let response = self.router.dispatch(request).await;
@@ -90,11 +107,11 @@ impl Emulator {
         self.call("POST", "/channelGroup", Some(body)).await
     }
 
-    async fn get_group(&self, name: &str) -> (u16, Value) {
+    pub(crate) async fn get_group(&self, name: &str) -> (u16, Value) {
         self.call("GET", &format!("/channelGroup/{name}"), None).await
     }
 
-    async fn delete_group(&self, name: &str) -> (u16, Value) {
+    pub(crate) async fn delete_group(&self, name: &str) -> (u16, Value) {
         self.call("DELETE", &format!("/channelGroup/{name}"), None)
             .await
     }
@@ -124,7 +141,7 @@ impl Emulator {
         .await
     }
 
-    async fn create_endpoint(
+    pub(crate) async fn create_endpoint(
         &self,
         group: &str,
         channel: &str,
@@ -141,7 +158,7 @@ impl Emulator {
         .await
     }
 
-    async fn get_endpoint(&self, group: &str, channel: &str, name: &str) -> (u16, Value) {
+    pub(crate) async fn get_endpoint(&self, group: &str, channel: &str, name: &str) -> (u16, Value) {
         self.call(
             "GET",
             &format!("/channelGroup/{group}/channel/{channel}/originEndpoint/{name}"),
@@ -159,7 +176,12 @@ impl Emulator {
         .await
     }
 
-    async fn list_endpoints(&self, group: &str, channel: &str, query: &str) -> (u16, Value) {
+    pub(crate) async fn list_endpoints(
+        &self,
+        group: &str,
+        channel: &str,
+        query: &str,
+    ) -> (u16, Value) {
         self.call(
             "GET",
             &format!("/channelGroup/{group}/channel/{channel}/originEndpoint{query}"),
@@ -167,11 +189,46 @@ impl Emulator {
         )
         .await
     }
+
+    /// `UpdateOriginEndpoint` — `PUT` on the endpoint's own path.
+    pub(crate) async fn update_endpoint(
+        &self,
+        group: &str,
+        channel: &str,
+        name: &str,
+        body: Value,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value) {
+        self.call_with_headers(
+            "PUT",
+            &format!("/channelGroup/{group}/channel/{channel}/originEndpoint/{name}"),
+            Some(body),
+            headers,
+        )
+        .await
+    }
+
+    /// `ListChannelGroups` — `GET /channelGroup`, with `query` carrying `maxResults` /
+    /// `nextToken` when the case needs them.
+    pub(crate) async fn list_groups(&self, query: &str) -> (u16, Value) {
+        self.call("GET", &format!("/channelGroup{query}"), None).await
+    }
 }
 
 /// The `__type` discriminator of an error envelope.
 pub(crate) fn error_type(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
+}
+
+/// The smallest ACCEPTABLE `CreateOriginEndpoint` body for a container type: an origin
+/// endpoint needs at least one manifest (`NUM_MANIFESTS_LOW`), in a family the container
+/// serves — ISM serves MSS, the others the HLS families.
+pub(crate) fn minimal_endpoint(container: &str) -> Value {
+    let manifest = json!([{"ManifestName": "index"}]);
+    match container {
+        "ISM" => json!({"ContainerType": "ISM", "MssManifests": manifest}),
+        _ => json!({"ContainerType": container, "HlsManifests": manifest}),
+    }
 }
 
 /// One row of the create-and-read-back table: a whole hierarchy, differing from the
@@ -196,14 +253,14 @@ struct LifecycleCase {
 fn lifecycle_cases() -> Vec<LifecycleCase> {
     vec![
         LifecycleCase {
-            label: "minimal: no description, no tags, no manifests",
+            label: "minimal: no description, no tags, one HLS manifest",
             group: "g1",
             channel: "c1",
             endpoint: "e1",
             group_body: || json!({}),
             channel_body: || json!({}),
-            endpoint_body: || json!({"ContainerType": "TS"}),
-            manifests: &[],
+            endpoint_body: || minimal_endpoint("TS"),
+            manifests: &[("HlsManifests", "index", ".m3u8")],
         },
         LifecycleCase {
             label: "described and tagged, one HLS manifest",
@@ -459,7 +516,7 @@ async fn a_repeat_create_conflicts_and_changes_nothing() {
     );
     assert_eq!(
         emulator
-            .create_endpoint("grp", "chan", "ep", json!({"ContainerType": "TS"}))
+            .create_endpoint("grp", "chan", "ep", minimal_endpoint("TS"))
             .await
             .0,
         200
@@ -491,7 +548,11 @@ async fn a_repeat_create_conflicts_and_changes_nothing() {
                     "grp",
                     "chan",
                     "ep",
-                    json!({"ContainerType": "CMAF", "Description": "different"}),
+                    json!({
+                        "ContainerType": "CMAF",
+                        "Description": "different",
+                        "HlsManifests": [{"ManifestName": "index"}],
+                    }),
                 )
                 .await,
         ),
@@ -540,13 +601,13 @@ async fn an_unresolvable_parent_chain_is_not_found() {
         (
             "create an endpoint under a missing group",
             emulator
-                .create_endpoint("ghost", "real", "e", json!({"ContainerType": "TS"}))
+                .create_endpoint("ghost", "real", "e", minimal_endpoint("TS"))
                 .await,
         ),
         (
             "create an endpoint under a missing channel",
             emulator
-                .create_endpoint("real", "ghost", "e", json!({"ContainerType": "TS"}))
+                .create_endpoint("real", "ghost", "e", minimal_endpoint("TS"))
                 .await,
         ),
         ("get a missing group", emulator.get_group("ghost").await),
@@ -609,7 +670,7 @@ async fn listing_pages_over_every_endpoint_of_the_channel_exactly_once() {
         );
         assert_eq!(
             emulator
-                .create_endpoint("grp", "other", "not-mine", json!({"ContainerType": "TS"}))
+                .create_endpoint("grp", "other", "not-mine", minimal_endpoint("TS"))
                 .await
                 .0,
             200
@@ -620,7 +681,7 @@ async fn listing_pages_over_every_endpoint_of_the_channel_exactly_once() {
             let name = format!("ep-{index:03}");
             assert_eq!(
                 emulator
-                    .create_endpoint("grp", "chan", &name, json!({"ContainerType": "TS"}))
+                    .create_endpoint("grp", "chan", &name, minimal_endpoint("TS"))
                     .await
                     .0,
                 200,
@@ -729,7 +790,7 @@ async fn deletes_refuse_non_empty_parents_are_effective_and_are_idempotent() {
     );
     assert_eq!(
         emulator
-            .create_endpoint("grp", "chan", "ep", json!({"ContainerType": "TS"}))
+            .create_endpoint("grp", "chan", "ep", minimal_endpoint("TS"))
             .await
             .0,
         200
@@ -898,12 +959,7 @@ async fn a_create_at_a_store_ceiling_is_refused_and_stores_nothing() {
     );
     for index in 0..MAX_ORIGIN_ENDPOINTS_PER_CHANNEL {
         let (status, body) = emulator
-            .create_endpoint(
-                "grp",
-                "chan",
-                &format!("e-{index}"),
-                json!({"ContainerType": "TS"}),
-            )
+            .create_endpoint("grp", "chan", &format!("e-{index}"), minimal_endpoint("TS"))
             .await;
         assert_eq!(
             status, 200,
@@ -912,12 +968,7 @@ async fn a_create_at_a_store_ceiling_is_refused_and_stores_nothing() {
         );
     }
     let (status, body) = emulator
-        .create_endpoint(
-            "grp",
-            "chan",
-            "one-too-many",
-            json!({"ContainerType": "TS"}),
-        )
+        .create_endpoint("grp", "chan", "one-too-many", minimal_endpoint("TS"))
         .await;
     assert_eq!(
         status, 402,
@@ -947,7 +998,9 @@ async fn a_create_at_a_store_ceiling_is_refused_and_stores_nothing() {
         status, 200,
         "case \"manifests setup\": CreateChannel expected 200, got {status} {body}"
     );
-    let spread = MAX_MANIFESTS_PER_ORIGIN_ENDPOINT / 4;
+    // Spread over the three families a CMAF container serves: MSS belongs to ISM, so
+    // adding it here would be refused on the container rule rather than the ceiling.
+    let spread = MAX_MANIFESTS_PER_ORIGIN_ENDPOINT / 3;
     let manifests = |count: usize, prefix: &str| -> Value {
         (0..count)
             .map(|index| json!({"ManifestName": format!("{prefix}-{index}")}))
@@ -962,8 +1015,7 @@ async fn a_create_at_a_store_ceiling_is_refused_and_stores_nothing() {
                 "ContainerType": "CMAF",
                 "HlsManifests": manifests(spread, "hls"),
                 "LowLatencyHlsManifests": manifests(spread, "llhls"),
-                "DashManifests": manifests(spread, "dash"),
-                "MssManifests": manifests(MAX_MANIFESTS_PER_ORIGIN_ENDPOINT - 3 * spread, "mss"),
+                "DashManifests": manifests(MAX_MANIFESTS_PER_ORIGIN_ENDPOINT - 2 * spread, "dash"),
             }),
         )
         .await;

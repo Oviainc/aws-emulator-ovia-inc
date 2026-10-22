@@ -7,6 +7,14 @@
 //! that manifest. An unknown group or channel is a `ResourceNotFoundException`; an
 //! endpoint name already used on that channel is a `ConflictException`.
 //!
+//! Two rules the model states but cannot express as a member constraint are enforced
+//! before anything is stored, both through [`crate::state::manifest_set_violation`]:
+//! an endpoint needs at least one manifest (`NUM_MANIFESTS_LOW`), and no manifest family
+//! its `ContainerType` cannot serve. The operation is also `@idempotent` and binds
+//! `ClientToken` with `@idempotencyToken`: an unchanged repeat under the same token
+//! replays the endpoint it created, and a changed one is a `ConflictException` /
+//! `IDEMPOTENT_PARAMETER_MISMATCH`.
+//!
 //! `handle` below is the implementation; `crate::state` holds the store it reads and
 //! writes.
 //!
@@ -208,6 +216,47 @@ impl From<CreateOriginEndpointErrorModeled> for CreateOriginEndpointError {
     }
 }
 
+/// How many manifests the request carries per family, in
+/// [`crate::state::ManifestFamily::ALL`] order.
+fn manifest_counts(input: &CreateOriginEndpointInput) -> [usize; 4] {
+    [
+        input.hls_manifests.as_ref().map_or(0, Vec::len),
+        input.low_latency_hls_manifests.as_ref().map_or(0, Vec::len),
+        input.dash_manifests.as_ref().map_or(0, Vec::len),
+        input.mss_manifests.as_ref().map_or(0, Vec::len),
+    ]
+}
+
+/// The response for a stored origin endpoint. Both the create and its idempotent replay
+/// answer from the SAME stored record through here.
+fn endpoint_output(
+    endpoint: &crate::state::OriginEndpoint,
+) -> CreateOriginEndpointOutput {
+    CreateOriginEndpointOutput {
+        arn: endpoint.arn.clone(),
+        channel_group_name: endpoint.group_name.clone(),
+        channel_name: endpoint.channel_name.clone(),
+        origin_endpoint_name: endpoint.name.clone(),
+        container_type: endpoint.container_type.clone(),
+        segment: endpoint.segment.clone(),
+        created_at: endpoint.created_at,
+        modified_at: endpoint.modified_at,
+        description: endpoint.description.clone(),
+        startover_window_seconds: endpoint.startover_window_seconds,
+        hls_manifests: Some(endpoint.hls_manifests.clone()),
+        low_latency_hls_manifests: Some(endpoint.low_latency_hls_manifests.clone()),
+        dash_manifests: Some(endpoint.dash_manifests.clone()),
+        mss_manifests: Some(endpoint.mss_manifests.clone()),
+        force_endpoint_error_configuration: endpoint
+            .force_endpoint_error_configuration
+            .clone(),
+        uri_separator: endpoint.uri_separator.clone(),
+        stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
+        e_tag: Some(endpoint.etag.clone()),
+        tags: Some(endpoint.tags.clone()),
+    }
+}
+
 /// The `CreateOriginEndpoint` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -255,6 +304,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
+        // The manifest-set rules are about the request alone, so they are decided before
+        // the store is consulted and before anything is written: an endpoint with no
+        // manifest can serve nothing, and a manifest family its container type cannot
+        // carry would be published as an unplayable URL.
+        if let Some(violation) = crate::state::manifest_set_violation(
+            &input.container_type,
+            manifest_counts(&input),
+            crate::state::ManifestSetOn::Create,
+        ) {
+            return Err(CreateOriginEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(violation.message),
+                    validation_exception_type: Some(
+                        violation.validation_exception_type.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
             return Err(CreateOriginEndpointErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -281,6 +350,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The request's own fingerprint: every member it carried EXCEPT the token that
+        // identifies the attempt.
+        let tags = input.tags.clone().unwrap_or_default();
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.channel_group_name.clone(),
+            input.channel_name.clone(),
+            input.origin_endpoint_name.clone(),
+            input.container_type.clone(),
+            input.description.clone().unwrap_or_default(),
+            input.startover_window_seconds.unwrap_or_default().to_string(),
+            format!("{:?}", input.segment),
+            format!("{:?}", input.hls_manifests),
+            format!("{:?}", input.low_latency_hls_manifests),
+            format!("{:?}", input.dash_manifests),
+            format!("{:?}", input.mss_manifests),
+            format!("{:?}", input.force_endpoint_error_configuration),
+            input.uri_separator.clone().unwrap_or_default(),
+            input.stream_name_output_mode.clone().unwrap_or_default(),
+            crate::state::tag_fingerprint(&tags),
+        ]);
+
+        // `CreateOriginEndpoint` is `@idempotent` and binds `ClientToken` with
+        // `@idempotencyToken`: an unchanged repeat under the same token replays the
+        // endpoint it created, while a changed one is the modeled parameter mismatch.
+        match crate::state::match_client_token(
+            input.client_token.as_deref(),
+            &fingerprint,
+            channel.origin_endpoints.values().map(|endpoint| {
+                (
+                    endpoint.name.as_str(),
+                    endpoint.client_token.as_deref(),
+                    endpoint.fingerprint.as_str(),
+                )
+            }),
+        ) {
+            crate::state::TokenMatch::Replay(name) => {
+                return Ok(endpoint_output(&channel.origin_endpoints[&name]));
+            }
+            crate::state::TokenMatch::Mismatch => {
+                return Err(CreateOriginEndpointErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::idempotent_parameter_mismatch_message(
+                            input.client_token.as_deref().unwrap_or_default(),
+                        )),
+                        conflict_exception_type: Some(
+                            "IDEMPOTENT_PARAMETER_MISMATCH".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            crate::state::TokenMatch::Fresh => {}
+        }
+
         if channel
             .origin_endpoints
             .contains_key(&input.origin_endpoint_name)
@@ -312,19 +435,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         // Every submitted manifest is persisted with its computed URL, so the record's
-        // size is bounded too, not just the number of records.
-        let manifest_count = input.hls_manifests.as_ref().map_or(0, Vec::len)
-            + input.low_latency_hls_manifests.as_ref().map_or(0, Vec::len)
-            + input.dash_manifests.as_ref().map_or(0, Vec::len)
-            + input.mss_manifests.as_ref().map_or(0, Vec::len);
-        if manifest_count > crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT {
+        // size is bounded too, not just the number of records. The same ceiling bounds
+        // the update path, so an endpoint's record size cannot be grown past it later.
+        if let Some(message) = crate::state::manifest_ceiling_exceeded(manifest_counts(&input)) {
             return Err(
                 CreateOriginEndpointErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "An origin endpoint accepts at most {} manifests; the request has {manifest_count}",
-                            crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into(),
@@ -366,18 +483,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         let created_at = crate::state::now();
-        let tags = input.tags.unwrap_or_default();
         let arn =
             crate::state::origin_endpoint_arn(&region, &group_name, &channel.name, &name);
-        let etag = crate::state::etag(&[
-            arn.clone(),
-            input.container_type.clone(),
-            input.description.clone().unwrap_or_default(),
-            input.startover_window_seconds.unwrap_or_default().to_string(),
-            crate::state::tag_fingerprint(&tags),
-        ]);
 
-        let endpoint = crate::state::OriginEndpoint {
+        let mut endpoint = crate::state::OriginEndpoint {
             name: name.clone(),
             channel_name: channel.name.clone(),
             group_name: group_name.clone(),
@@ -399,36 +508,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at,
             modified_at: created_at,
             reset_at: None,
-            etag,
+            // Computed from the finished record below, so the tag covers everything the
+            // endpoint is made of.
+            etag: String::new(),
             tags,
+            client_token: input.client_token,
+            fingerprint,
         };
+        endpoint.etag = crate::state::origin_endpoint_etag(&endpoint);
         channel.origin_endpoints.insert(name.clone(), endpoint);
         // Answer from what was stored, so the response can only carry what a later
         // `GetOriginEndpoint` will read.
-        let endpoint = &channel.origin_endpoints[&name];
-
-        Ok(CreateOriginEndpointOutput {
-            arn: endpoint.arn.clone(),
-            channel_group_name: endpoint.group_name.clone(),
-            channel_name: endpoint.channel_name.clone(),
-            origin_endpoint_name: endpoint.name.clone(),
-            container_type: endpoint.container_type.clone(),
-            segment: endpoint.segment.clone(),
-            created_at: endpoint.created_at,
-            modified_at: endpoint.modified_at,
-            description: endpoint.description.clone(),
-            startover_window_seconds: endpoint.startover_window_seconds,
-            hls_manifests: Some(endpoint.hls_manifests.clone()),
-            low_latency_hls_manifests: Some(endpoint.low_latency_hls_manifests.clone()),
-            dash_manifests: Some(endpoint.dash_manifests.clone()),
-            mss_manifests: Some(endpoint.mss_manifests.clone()),
-            force_endpoint_error_configuration: endpoint
-                .force_endpoint_error_configuration
-                .clone(),
-            uri_separator: endpoint.uri_separator.clone(),
-            stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
-            e_tag: Some(endpoint.etag.clone()),
-            tags: Some(endpoint.tags.clone()),
-        })
+        Ok(endpoint_output(&channel.origin_endpoints[&name]))
     }
 }

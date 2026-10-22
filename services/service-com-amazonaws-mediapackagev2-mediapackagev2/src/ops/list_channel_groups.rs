@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannelGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannelGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Pages over the channel groups persisted in [`crate::state`], in name
+//! order, reporting one list configuration per group. Purely reporting: it writes
+//! nothing. A `NextToken` this service did not issue is a modeled 400
+//! `ValidationException` with `ValidationExceptionType` `INVALID_PAGINATION_TOKEN` —
+//! never a server fault, which an SDK would retry forever.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannelGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `handle` below is the implementation; `crate::state` holds the store it reads.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +115,19 @@ impl From<ListChannelGroupsErrorModeled> for ListChannelGroupsError {
     }
 }
 
+/// The list projection of a persisted channel group: its identity, its description and
+/// its timestamps. The list form omits the egress domain, ETag and tags a `Get` reports,
+/// so this is a narrowing of what is stored, never a recomputation of it.
+fn list_configuration(group: &crate::state::ChannelGroup) -> ChannelGroupListConfiguration {
+    ChannelGroupListConfiguration {
+        channel_group_name: group.name.clone(),
+        arn: group.arn.clone(),
+        created_at: group.created_at,
+        modified_at: group.modified_at,
+        description: group.description.clone(),
+    }
+}
+
 /// The `ListChannelGroups` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +164,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannelGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannelGroups"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListChannelGroupsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // The model bounds `MaxResults` and declares its default; the shared resolver
+        // this service's lists share decides the page size.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // A token names the group the previous page stopped after. A token this service
+        // did not issue does not decode, and is the modeled 400 the
+        // `INVALID_PAGINATION_TOKEN` discriminator names — not a 501, which would tell an
+        // SDK to retry a request that can never succeed.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::page_resume_after(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(ListChannelGroupsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::invalid_pagination_token_message()),
+                            validation_exception_type: Some(
+                                "INVALID_PAGINATION_TOKEN".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let (page, next_token) = crate::state::page(
+            store.channel_groups.iter(),
+            resume_after.as_deref(),
+            page_size,
+        );
+
+        Ok(ListChannelGroupsOutput {
+            items: Some(page.into_iter().map(list_configuration).collect()),
+            next_token,
+        })
     }
 }

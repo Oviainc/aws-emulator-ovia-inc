@@ -6,6 +6,16 @@
 //! group's egress domain. An unknown parent is a `ResourceNotFoundException`; a channel
 //! name already used in that group is a `ConflictException`.
 //!
+//! Two rules the model states but cannot express as a member constraint are enforced
+//! here, before anything is stored:
+//!
+//! * a member the docs restrict to particular `InputType`s is refused on any other
+//!   input type, with the `ValidationExceptionType` the model names for it (see
+//!   [`INPUT_TYPE_RULES`]);
+//! * `@idempotency`: a repeat under a `ClientToken` that already created a channel
+//!   replays that channel when the request is unchanged, and is a `ConflictException` /
+//!   `IDEMPOTENT_PARAMETER_MISMATCH` when any member differs.
+//!
 //! `handle` below is the implementation; `crate::state` holds the store it reads and
 //! writes.
 //!
@@ -207,6 +217,140 @@ impl From<CreateChannelErrorModeled> for CreateChannelError {
     }
 }
 
+/// A channel member the service only lets a particular set of input types carry.
+struct InputTypeRule {
+    /// The member, as a validation message names it (lowerCamel, as on the wire).
+    member: &'static str,
+    /// The `InputType` values that may carry it, from the model's `InputType` enum.
+    allowed: &'static [&'static str],
+    /// The `ValidationExceptionType` the model declares for this combination.
+    exception_type: &'static str,
+    /// What the member is called in the sentence the refusal states.
+    label: &'static str,
+    /// Whether the request carries the member at all.
+    present: fn(&CreateChannelInput) -> bool,
+}
+
+/// Every `InputType` restriction the model states for a `CreateChannel` member, one row
+/// per `ValidationExceptionType` that names one.
+///
+/// The rows are read off the model, not guessed: each member's own doc says which input
+/// types may carry it (`OutputLockingMode` — "only configurable when the channel
+/// InputType is CMAF or MULTIVIEW"; `MQCSInputSwitching` / `PublishMQCS` — "valid only
+/// when InputType is CMAF"; `MultiviewConfiguration` — "required when InputType is
+/// MULTIVIEW, and can't be set for any other input type"), and
+/// `ValidationExceptionType` carries exactly one discriminator per row.
+const INPUT_TYPE_RULES: &[InputTypeRule] = &[
+    InputTypeRule {
+        member: "outputLockingMode",
+        allowed: &["CMAF", "MULTIVIEW"],
+        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE",
+        label: "OutputLockingMode",
+        present: |input| input.output_locking_mode.is_some(),
+    },
+    InputTypeRule {
+        member: "inputSwitchConfiguration.mqcsInputSwitching",
+        allowed: &["CMAF"],
+        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_INPUT_SWITCHING",
+        label: "MQCS input switching",
+        present: |input| {
+            input
+                .input_switch_configuration
+                .as_ref()
+                .is_some_and(|switch| switch.mqcs_input_switching.is_some())
+        },
+    },
+    InputTypeRule {
+        member: "inputSwitchConfiguration.preferredInput",
+        allowed: &["CMAF"],
+        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_PREFERRED_INPUT_CONFIGURATION",
+        label: "PreferredInput",
+        present: |input| {
+            input
+                .input_switch_configuration
+                .as_ref()
+                .is_some_and(|switch| switch.preferred_input.is_some())
+        },
+    },
+    InputTypeRule {
+        member: "outputHeaderConfiguration.publishMqcs",
+        allowed: &["CMAF"],
+        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_OUTPUT_CONFIGURATION",
+        label: "PublishMQCS",
+        present: |input| {
+            input
+                .output_header_configuration
+                .as_ref()
+                .is_some_and(|header| header.publish_mqcs.is_some())
+        },
+    },
+    InputTypeRule {
+        member: "multiviewConfiguration",
+        allowed: &["MULTIVIEW"],
+        exception_type: "MULTIVIEW_CONFIGURATION_NOT_ALLOWED",
+        label: "MultiviewConfiguration",
+        present: |input| input.multiview_configuration.is_some(),
+    },
+];
+
+/// The input type a channel is created with: the request's own, or the HLS the model's
+/// `InputType` doc declares for an unprovided value ("If unprovided, the value defaults
+/// to HLS"). A cross-member rule is checked against this, so omitting `InputType` cannot
+/// slip a member past the restriction its default input type refuses.
+fn effective_input_type(input: &CreateChannelInput) -> &str {
+    input
+        .input_type
+        .as_deref()
+        .unwrap_or(crate::state::DEFAULT_INPUT_TYPE)
+}
+
+/// The first `InputType` restriction this request breaks, as the modeled
+/// `ValidationException` to answer it with.
+fn input_type_violation(input: &CreateChannelInput) -> Option<ValidationException> {
+    let input_type = effective_input_type(input);
+    INPUT_TYPE_RULES
+        .iter()
+        .find(|rule| (rule.present)(input) && !rule.allowed.contains(&input_type))
+        .map(|rule| ValidationException {
+            message: Some(crate::state::validation_message(
+                Some(rule.member),
+                &format!(
+                    "{} can only be configured when the channel InputType is {}. To use \
+                     {}, create a channel with {} input type",
+                    rule.label,
+                    rule.allowed.join(" or "),
+                    rule.label,
+                    rule.allowed.join(" or ")
+                ),
+            )),
+            validation_exception_type: Some(rule.exception_type.to_string()),
+        })
+}
+
+/// The response for a stored channel. Both the create and its idempotent replay answer
+/// from the SAME stored record through here, so a retry cannot report anything the
+/// original did not.
+fn channel_output(channel: &crate::state::Channel) -> CreateChannelOutput {
+    CreateChannelOutput {
+        multiview_configuration: channel.multiview_configuration.clone(),
+        // Creating a channel attaches no multiview source channels to it.
+        attached_multiview_channels: None,
+        arn: channel.arn.clone(),
+        channel_name: channel.name.clone(),
+        channel_group_name: channel.group_name.clone(),
+        created_at: channel.created_at,
+        modified_at: channel.modified_at,
+        description: channel.description.clone(),
+        ingest_endpoints: Some(channel.ingest_endpoints.clone()),
+        input_type: channel.input_type.clone(),
+        e_tag: Some(channel.etag.clone()),
+        tags: Some(channel.tags.clone()),
+        input_switch_configuration: channel.input_switch_configuration.clone(),
+        output_header_configuration: channel.output_header_configuration.clone(),
+        output_locking_mode: channel.output_locking_mode.clone(),
+    }
+}
+
 /// The `CreateChannel` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -254,6 +398,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
+        // The cross-member input rules first: they are about the request alone, so they
+        // are decided before the store is consulted and before anything is written.
+        if let Some(violation) = input_type_violation(&input) {
+            return Err(CreateChannelErrorModeled::ValidationException(violation).into());
+        }
+
         // A channel only exists inside a channel group, so the parent has to be there.
         let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
             return Err(CreateChannelErrorModeled::ResourceNotFoundException(
@@ -267,6 +417,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The request's own fingerprint: every member it carried EXCEPT the token that
+        // identifies the attempt.
+        let tags = input.tags.clone().unwrap_or_default();
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.channel_group_name.clone(),
+            input.channel_name.clone(),
+            input.description.clone().unwrap_or_default(),
+            input.input_type.clone().unwrap_or_default(),
+            input.output_locking_mode.clone().unwrap_or_default(),
+            format!("{:?}", input.input_switch_configuration),
+            format!("{:?}", input.output_header_configuration),
+            format!("{:?}", input.multiview_configuration),
+            crate::state::tag_fingerprint(&tags),
+        ]);
+
+        // `CreateChannel` is `@idempotent` and binds `ClientToken` with
+        // `@idempotencyToken`: a repeat of the same request under the same token replays
+        // the channel it created, while a changed one is the modeled parameter mismatch.
+        match crate::state::match_client_token(
+            input.client_token.as_deref(),
+            &fingerprint,
+            group.channels.values().map(|channel| {
+                (
+                    channel.name.as_str(),
+                    channel.client_token.as_deref(),
+                    channel.fingerprint.as_str(),
+                )
+            }),
+        ) {
+            crate::state::TokenMatch::Replay(name) => {
+                return Ok(channel_output(&group.channels[&name]));
+            }
+            crate::state::TokenMatch::Mismatch => {
+                return Err(CreateChannelErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::idempotent_parameter_mismatch_message(
+                            input.client_token.as_deref().unwrap_or_default(),
+                        )),
+                        conflict_exception_type: Some(
+                            "IDEMPOTENT_PARAMETER_MISMATCH".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            crate::state::TokenMatch::Fresh => {}
+        }
+
         if group.channels.contains_key(&input.channel_name) {
             return Err(CreateChannelErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
@@ -295,7 +494,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = input.channel_name.clone();
         let created_at = crate::state::now();
-        let tags = input.tags.unwrap_or_default();
         let arn = crate::state::channel_arn(&region, &group.name, &name);
         // The ingest URLs are a function of the parent group's egress domain and this
         // channel's name, computed once and stored: a later read returns these bytes.
@@ -326,6 +524,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             reset_at: None,
             etag,
             tags,
+            client_token: input.client_token,
+            fingerprint,
             // No resource policy is attached until `PutChannelPolicy` attaches one.
             policy: None,
             origin_endpoints: ::std::collections::BTreeMap::new(),
@@ -333,25 +533,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         group.channels.insert(name.clone(), channel);
         // Answer from what was stored, so the response can only carry what a later
         // `GetChannel` will read.
-        let channel = &group.channels[&name];
-
-        Ok(CreateChannelOutput {
-            multiview_configuration: channel.multiview_configuration.clone(),
-            // Creating a channel attaches no multiview source channels to it.
-            attached_multiview_channels: None,
-            arn: channel.arn.clone(),
-            channel_name: channel.name.clone(),
-            channel_group_name: channel.group_name.clone(),
-            created_at: channel.created_at,
-            modified_at: channel.modified_at,
-            description: channel.description.clone(),
-            ingest_endpoints: Some(channel.ingest_endpoints.clone()),
-            input_type: channel.input_type.clone(),
-            e_tag: Some(channel.etag.clone()),
-            tags: Some(channel.tags.clone()),
-            input_switch_configuration: channel.input_switch_configuration.clone(),
-            output_header_configuration: channel.output_header_configuration.clone(),
-            output_locking_mode: channel.output_locking_mode.clone(),
-        })
+        Ok(channel_output(&group.channels[&name]))
     }
 }
