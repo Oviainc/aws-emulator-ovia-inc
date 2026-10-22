@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteStatement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteStatement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteStatement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Submits one SQL statement to the database the request names and answers with the
+//! statement's `Id`. The statement runs on this emulator's in-process SQL engine (see
+//! [`crate::state`]); the Data API's own lifecycle is asynchronous, so the response
+//! reports `SUBMITTED` and the clock owes the terminal status
+//! [`crate::state::COMPLETION_SPAN`] later. A caller that supplies `WaitTimeSeconds`
+//! has asked to wait longer than that span, so for that caller the statement is
+//! already complete when the response is built.
 //!
 //! ## Shape of an operation
 //!
@@ -157,6 +155,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{non_empty, to_timestamp, ConnectionTarget, NoDatabase, Statement, Submission};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -231,18 +230,255 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteStatement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteStatementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+
+        // A statement runs against exactly one data warehouse: the documented
+        // authorization combinations name either a provisioned cluster
+        // (`ClusterIdentifier`) or a serverless workgroup (`WorkgroupName`),
+        // never both and never neither.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteStatement"))
+        // The session-reuse form, where a caller that already holds a
+        // `SessionId` names neither, is a VALID request this slice cannot serve
+        // faithfully: the warehouse and database such a call runs against are
+        // the ones its session was opened with, and no session store exists yet
+        // (`ListSessions` is still scaffolded), so the only way to answer it
+        // would be to invent a connection target. It is answered with the
+        // scaffold's `NotImplemented` — the gap is this emulator's, not the
+        // caller's, so it is not dressed up as a malformed request — while a
+        // request that names no warehouse AND no session really is missing a
+        // required member and gets the modelled `ValidationException`.
+        let cluster_identifier = non_empty(input.cluster_identifier.as_ref());
+        let workgroup_name = non_empty(input.workgroup_name.as_ref());
+        let target = match (cluster_identifier, workgroup_name) {
+            (Some(cluster), None) => ConnectionTarget::Cluster(cluster),
+            (None, Some(workgroup)) => ConnectionTarget::Workgroup(workgroup),
+            (Some(_), Some(_)) => {
+                return Err(validation(
+                    "ClusterIdentifier and WorkgroupName cannot both be supplied: a statement \
+                     runs against either a provisioned cluster or a serverless workgroup",
+                ))
+            }
+            (None, None) if non_empty(input.session_id.as_ref()).is_some() => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "ExecuteStatement with only a SessionId as its connection target",
+                ))
+            }
+            (None, None) => {
+                return Err(validation(
+                    "one of ClusterIdentifier (a provisioned cluster) or WorkgroupName (a \
+                     serverless workgroup) is required",
+                ))
+            }
+        };
+
+        // Every documented authorization combination also supplies the database.
+        let Some(database) = non_empty(input.database.as_ref()) else {
+            return Err(validation("Database is required"));
+        };
+
+        // `SecretArn` selects Secrets Manager authorization and `DbUser` selects
+        // temporary credentials; they are alternatives, so supplying both names
+        // two authorization methods for one statement.
+        let db_user = non_empty(input.db_user.as_ref());
+        let secret_arn = non_empty(input.secret_arn.as_ref());
+        if db_user.is_some() && secret_arn.is_some() {
+            return Err(validation(
+                "DbUser and SecretArn cannot both be supplied: DbUser authenticates with \
+                 temporary credentials and SecretArn with Secrets Manager",
+            ));
+        }
+
+        if input.sql.trim().is_empty() {
+            return Err(validation("Sql must contain a SQL statement"));
+        }
+
+        let client_token = non_empty(input.client_token.as_ref());
+
+        // An idempotent replay answers with the statement the first call
+        // submitted, read back out of state — it never submits a second one.
+        if let Some(token) = client_token.as_deref() {
+            let mut store = state.lock();
+            store.materialise_due_transitions();
+            let replayed = store.statement_id_for_client_token(token).map(str::to_string);
+            if let Some(output) = replayed
+                .as_deref()
+                .and_then(|id| store.statement(id))
+                .map(output_for)
+            {
+                return Ok(output);
+            }
+        }
+
+        // `SessionKeepAliveSeconds` asks for a session, which the Data API
+        // identifies with a UUID the caller passes back on later statements.
+        //
+        // A `SessionId` the caller supplies is recorded as given and reported
+        // back unchanged: session identity is NOT modelled in this slice (no
+        // session store, `ListSessions` still scaffolded), so this operation
+        // cannot tell a live session from an unknown one and does not pretend
+        // to — it neither validates it against state nor derives anything from
+        // it beyond what it was sent.
+        let session_id = non_empty(input.session_id.as_ref()).or_else(|| {
+            input
+                .session_keep_alive_seconds
+                .map(|_| crate::state::new_uuid())
+        });
+
+        let submission = Submission {
+            sql: input.sql.clone(),
+            target,
+            database,
+            db_user,
+            secret_arn,
+            statement_name: non_empty(input.statement_name.as_ref()),
+            parameters: input.parameters.unwrap_or_default(),
+            with_event: input.with_event.unwrap_or(false),
+            // "If no format is specified, the default is JSON."
+            result_format: non_empty(input.result_format.as_ref())
+                .unwrap_or_else(|| "JSON".to_string()),
+            session_id,
+            client_token,
+            wait_for_completion: input.wait_time_seconds.is_some(),
+        };
+
+        // Resolve the engine under the state lock, then RELEASE it: the SQL runs
+        // on a blocking pool with only its own database's lock held, so a slow
+        // statement starves no async worker and serialises no other caller.
+        let (handle, pid) =
+            match state.lock().reserve_database(&submission.target, &submission.database) {
+                Ok(reserved) => reserved,
+                // A capacity limit of this emulator, not a malformed request, so
+                // it is answered with the modelled capacity error rather than a
+                // ValidationException that would tell the client its
+                // ClusterIdentifier or Database was wrong.
+                Err(NoDatabase::TooManyOpen(limit)) => {
+                    return Err(
+                        ExecuteStatementErrorModeled::ActiveStatementsExceededException(
+                            ActiveStatementsExceededException {
+                                message: Some(format!(
+                                    "this emulator holds at most {limit} databases at once; no \
+                                     further ClusterIdentifier/WorkgroupName and Database \
+                                     combination can be opened"
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+                Err(NoDatabase::EngineUnavailable(reason)) => {
+                    return Err(ExecuteStatementErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: format!(
+                                "the SQL engine could not open the database for this statement: \
+                                 {reason}"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            };
+
+        let sql = submission.sql.clone();
+        let parameters = submission.parameters.clone();
+        // The engine bounds its own execution (a wall-clock deadline and a step
+        // budget, enforced by its progress handler), and THIS bounds how long the
+        // request waits for it: a statement queued behind another on the same
+        // database, or behind a saturated blocking pool, must not pin this
+        // request — or a blocking-pool thread — for longer than a caller could
+        // ever ask to wait. The modelled ceiling for `WaitTimeSeconds` is 30
+        // seconds, so the wait is that ceiling at most.
+        let budget = crate::state::wait_budget(input.wait_time_seconds);
+        let engine_timeout = crate::state::engine_timeout(budget);
+        // The bound belongs to THIS execution, and the handler keeps the handle
+        // that abandons it, so giving up on the wait abandons this statement and
+        // never another request's.
+        let bound = crate::state::ExecutionBound::new();
+        let interrupt = bound.interrupt();
+        let joined = tokio::time::timeout(
+            budget,
+            tokio::task::spawn_blocking(move || {
+                crate::state::run_on(&handle, &sql, &parameters, engine_timeout, &bound)
+            }),
+        )
+        .await;
+        let execution = match joined {
+            Ok(Ok(execution)) => execution,
+            // The wait expired. The engine is told to abandon the statement at
+            // its next progress callback, so a statement that was running cannot
+            // commit behind this error response, and the caller is told the
+            // service could not take on another running statement right now.
+            Err(_elapsed) => {
+                interrupt.now();
+                return Err(
+                    ExecuteStatementErrorModeled::ActiveStatementsExceededException(
+                        ActiveStatementsExceededException {
+                            message: Some(format!(
+                                "the statement was abandoned after {} seconds; too many \
+                                 statements are already running on this database",
+                                budget.as_secs()
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Ok(Err(_panicked)) => {
+                return Err(ExecuteStatementErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the SQL engine did not return a result for this statement"
+                            .to_string(),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let mut store = state.lock();
+        let id = store.record(submission, pid, execution);
+        let Some(statement) = store.statement(&id) else {
+            return Err(unavailable());
+        };
+        Ok(output_for(statement))
     }
+}
+
+/// The response, assembled from the stored statement — never from the request.
+fn output_for(statement: &Statement) -> ExecuteStatementOutput {
+    ExecuteStatementOutput {
+        id: Some(statement.id.clone()),
+        created_at: Some(to_timestamp(statement.created_at)),
+        cluster_identifier: statement.target.cluster_identifier(),
+        db_user: statement.db_user.clone(),
+        // Redshift derives `DbGroups` from the database user's group
+        // membership, which this emulator does not model, so no groups are
+        // reported rather than an invented list.
+        db_groups: None,
+        database: statement.database.clone(),
+        secret_arn: statement.secret_arn.clone(),
+        workgroup_name: statement.target.workgroup_name(),
+        session_id: statement.session_id.clone(),
+        status: Some(statement.status.as_str().to_string()),
+        redshift_pid: Some(statement.redshift_pid),
+        has_result_set: statement.has_result_set(),
+    }
+}
+
+/// Refuse the request as invalid, with the `ValidationException` this operation
+/// models.
+fn validation(message: &str) -> ExecuteStatementError {
+    ExecuteStatementErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The state store could not be reached — a server fault, not a client error.
+fn unavailable() -> ExecuteStatementError {
+    ExecuteStatementErrorModeled::InternalServerException(InternalServerException {
+        message: "the Redshift Data API state store is unavailable".to_string(),
+    })
+    .into()
 }

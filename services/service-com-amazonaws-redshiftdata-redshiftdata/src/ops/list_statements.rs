@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStatements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStatements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStatements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the statements held in [`crate::state`], newest submission first,
+//! honouring the request's filters and paging with an opaque `NextToken` that names
+//! the submission the previous page stopped at. A reporting operation, so the only
+//! thing it writes is the status transition the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +112,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    decode_cursor, encode_cursor, non_empty, to_timestamp, Statement, CURSOR_STATEMENTS,
+    DEFAULT_LIST_PAGE_SIZE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -188,18 +187,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStatements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStatementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStatements"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListStatementsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Redshift Data API state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The cursor is the submission sequence number the previous page stopped
+        // at; the next page continues strictly before it. Naming the submission
+        // rather than an index means a statement submitted between two pages
+        // cannot shift the boundary.
+        let cursor = match input.next_token.as_deref() {
+            None => u64::MAX,
+            Some(token) => match decode_cursor(CURSOR_STATEMENTS, token) {
+                Some(cursor) => cursor,
+                None => {
+                    return Err(validation(
+                        "NextToken is not a continuation token this operation issued",
+                    ))
+                }
+            },
+        };
+
+        // `MaxResults` is modelled with a default of 0, which names no page
+        // size; the page then holds as much as the modelled maximum allows.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(DEFAULT_LIST_PAGE_SIZE);
+
+        // "Data API does a case-sensitive match of SQL statement names to the
+        // prefix value you provide."
+        let name_prefix = non_empty(input.statement_name.as_ref());
+        // ALL "includes all query statuses", so it filters nothing.
+        let status = non_empty(input.status.as_ref()).filter(|status| status != "ALL");
+        let database = non_empty(input.database.as_ref());
+        let cluster_identifier = non_empty(input.cluster_identifier.as_ref());
+        let workgroup_name = non_empty(input.workgroup_name.as_ref());
+        // `RoleLevel` chooses between every statement run by the caller's IAM
+        // role and only those run in the current IAM session. This emulator
+        // serves one caller in one session, so both selections are the same set
+        // and the member changes nothing it could change —
+        // `tests/all/statement_lifecycle.rs::list_statements_honours_each_filter`
+        // pins both selections to the same, non-empty set.
+        let _ = input.role_level;
+
+        let mut store = state.lock();
+        store.materialise_due_transitions();
+        let matching: Vec<&Statement> = store
+            .statements_newest_first()
+            .into_iter()
+            .filter(|statement| statement.seq < cursor)
+            .filter(|statement| {
+                name_prefix.as_deref().is_none_or(|prefix| {
+                    statement
+                        .statement_name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with(prefix))
+                })
+            })
+            .filter(|statement| {
+                status
+                    .as_deref()
+                    .is_none_or(|status| statement.status.as_str() == status)
+            })
+            .filter(|statement| {
+                database
+                    .as_deref()
+                    .is_none_or(|database| statement.database.as_deref() == Some(database))
+            })
+            .filter(|statement| {
+                cluster_identifier.as_deref().is_none_or(|cluster| {
+                    statement.target.cluster_identifier().as_deref() == Some(cluster)
+                })
+            })
+            .filter(|statement| {
+                workgroup_name.as_deref().is_none_or(|workgroup| {
+                    statement.target.workgroup_name().as_deref() == Some(workgroup)
+                })
+            })
+            .collect();
+
+        let page = &matching[..page_size.min(matching.len())];
+        Ok(ListStatementsOutput {
+            statements: page.iter().copied().map(statement_data).collect(),
+            // A token only when the filtered set has more statements than this
+            // page returned, pointing at the last one returned so the next page
+            // resumes exactly where this one stopped.
+            next_token: (matching.len() > page.len()).then(|| {
+                encode_cursor(
+                    CURSOR_STATEMENTS,
+                    page.last().map_or(0, |statement| statement.seq),
+                )
+            }),
+        })
     }
+}
+
+/// One entry of `Statements`, assembled from the stored statement.
+fn statement_data(statement: &Statement) -> StatementData {
+    StatementData {
+        id: statement.id.clone(),
+        query_string: Some(statement.sql.clone()),
+        // `QueryStrings` carries a batch request's statements;
+        // `ExecuteStatement` submits exactly one, reported as `QueryString`.
+        query_strings: None,
+        secret_arn: statement.secret_arn.clone(),
+        status: Some(statement.status.as_str().to_string()),
+        statement_name: statement.statement_name.clone(),
+        created_at: Some(to_timestamp(statement.created_at)),
+        updated_at: Some(to_timestamp(statement.updated_at)),
+        // `SqlParametersList` has a modelled minimum length of 1, so a statement
+        // with no parameters reports the member absent.
+        query_parameters: (!statement.parameters.is_empty()).then(|| statement.parameters.clone()),
+        is_batch_statement: Some(false),
+        result_format: Some(statement.result_format.clone()),
+        session_id: statement.session_id.clone(),
+    }
+}
+
+/// Refuse the request as invalid, with the `ValidationException` this operation
+/// models.
+fn validation(message: &str) -> ListStatementsError {
+    ListStatementsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

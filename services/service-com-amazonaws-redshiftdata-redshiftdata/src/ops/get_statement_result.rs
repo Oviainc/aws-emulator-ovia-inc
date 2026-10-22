@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStatementResult
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStatementResult`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStatementResult::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the rows the statement named by `Id` actually produced, paged with an
+//! opaque `NextToken`. A reporting operation, so the only thing it writes is the
+//! status transition the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +94,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{decode_cursor, encode_cursor, StatementStatus, CURSOR_ROWS, RESULT_PAGE_ROWS};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -172,18 +167,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStatementResult` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStatementResultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStatementResult"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetStatementResultErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Redshift Data API state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.materialise_due_transitions();
+        let Some(statement) = store.statement(&input.id) else {
+            return Err(GetStatementResultErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Query does not exist: {}", input.id),
+                    resource_id: input.id.clone(),
+                },
+            )
+            .into());
+        };
+
+        // Only a statement that ran to completion has rows to fetch. One that is
+        // still running, or that failed or was aborted, is refused rather than
+        // answered with an empty page a client would read as "no rows".
+        if statement.status != StatementStatus::Finished {
+            return Err(validation(format!(
+                "Query {} did not finish successfully; its status is {}",
+                input.id,
+                statement.status.as_str()
+            )));
+        }
+
+        // A statement whose `HasResultSet` was recorded false — DDL, or DML such
+        // as INSERT — produced no result set, so its page holds no rows and no
+        // column metadata, consistently with that flag. It is still a page of
+        // this statement's result, so the continuation token is validated for it
+        // exactly as for a statement that did produce rows.
+        let (rows, column_metadata) = match statement.result() {
+            Some(result) => (result.rows.as_slice(), result.column_metadata.clone()),
+            None => (&[][..], Vec::new()),
+        };
+
+        // The cursor kind names the statement as well as the operation, so a
+        // token issued while paging one statement's rows is refused for any
+        // other statement rather than silently resolving to the same offset in
+        // a different result set.
+        let cursor_kind = format!("{CURSOR_ROWS}:{}", statement.id);
+        let offset = match input.next_token.as_deref() {
+            None => 0_usize,
+            Some(token) => {
+                let position = decode_cursor(&cursor_kind, token)
+                    .and_then(|position| usize::try_from(position).ok())
+                    .filter(|position| *position <= rows.len());
+                match position {
+                    Some(position) => position,
+                    None => {
+                        return Err(validation(
+                            "NextToken is not a continuation token this operation issued for \
+                             this statement"
+                                .to_string(),
+                        ))
+                    }
+                }
+            }
+        };
+
+        let end = offset.saturating_add(RESULT_PAGE_ROWS).min(rows.len());
+        Ok(GetStatementResultOutput {
+            records: rows[offset..end].to_vec(),
+            column_metadata: Some(column_metadata),
+            total_num_rows: i64::try_from(rows.len()).unwrap_or(i64::MAX),
+            // A token only when rows remain, so a client stops paging when it
+            // has seen the whole result set.
+            next_token: (end < rows.len())
+                .then(|| encode_cursor(&cursor_kind, u64::try_from(end).unwrap_or(u64::MAX))),
+        })
     }
+}
+
+/// Refuse the request as invalid, with the `ValidationException` this operation
+/// models.
+fn validation(message: String) -> GetStatementResultError {
+    GetStatementResultErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }
