@@ -531,6 +531,17 @@ pub fn new_operation_id() -> String {
     new_identifier("operation")
 }
 
+/// Mint the request id one response carries — the `<RequestId>` element of an awsQuery
+/// `<ErrorResponse>` envelope, the counterpart of the `ResponseMetadata/RequestId` a
+/// successful response carries.
+///
+/// Same 8-4-4-4-12 lowercase-hex form and the same per-response freshness as every other
+/// identifier this service mints: it names ONE request for correlation, so two responses
+/// must be distinguishable, and it is not a secret (nothing authenticates with it).
+pub fn new_request_id() -> String {
+    new_identifier("request")
+}
+
 /// The message CloudFormation answers when a request names a stack that is not
 /// addressable: no live stack has that name and no stack has that id.
 pub fn stack_does_not_exist(name_or_id: &str) -> String {

@@ -24,7 +24,7 @@ const ACCOUNT_ID: &str = "000000000000";
 /// The region the test's requests are signed for.
 const REGION: &str = "us-east-1";
 
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     router_with_engine().0
 }
 
@@ -83,7 +83,11 @@ fn form_encode(value: &str) -> String {
 
 /// Call one operation: `Action` plus the request's members, form-encoded exactly as an
 /// AWS SDK sends them, answered with the HTTP status and the XML body.
-async fn call(router: &MultiServiceRouter, action: &str, members: &[(String, String)]) -> (u16, String) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    action: &str,
+    members: &[(String, String)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-15");
     for (key, value) in members {
         body.push('&');
@@ -110,7 +114,7 @@ async fn call(router: &MultiServiceRouter, action: &str, members: &[(String, Str
     (status, body)
 }
 
-fn member(key: &str, value: &str) -> (String, String) {
+pub(crate) fn member(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
@@ -125,7 +129,7 @@ fn xml_unescape(text: &str) -> String {
 }
 
 /// Every `<tag>` text in document order.
-fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
+pub(crate) fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let mut found = Vec::new();
@@ -140,11 +144,11 @@ fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
 }
 
 /// The first `<tag>` text, or `None` when the response carries none.
-fn xml_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     xml_texts(xml, tag).into_iter().next()
 }
 
-async fn create_stack(
+pub(crate) async fn create_stack(
     router: &MultiServiceRouter,
     name: &str,
     template: &str,
