@@ -69,13 +69,25 @@
 //! per-operation telemetry the centralized sequence records — a request the gate
 //! refuses never enters that sequence, so it is counted nowhere, exactly as a request
 //! refused before dispatch is.
+//!
+//! ## The one rendering difference from the framework's own
+//!
+//! A `@pattern` requirement is stated as the EXPRESSION a value has to satisfy, without
+//! the `^` / `$` pair a model writes to turn Smithy's unanchored find into a whole-string
+//! match ([`unanchored`]): that anchoring is how the model spells the rule, not part of
+//! the rule the service reports, and it is this service's recorded behaviour — a rejected
+//! `TagResource` ARN is reported against `arn:(aws[a-zA-Z-]*)?:synthetics:…` and not
+//! against `^arn:…$`. The difference is in the REQUIREMENT half only, so a caller still
+//! sees its own value echoed and the clause, the count and the envelope stay the
+//! framework's. It holds for every pattern-constrained member of this service, because the
+//! rendering is single-homed in [`as_stated`] rather than keyed to an operation.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
-use aws_smithy_schema_server::{envelope, validate, ProtocolError, Violation};
+use aws_smithy_schema_server::{envelope, validate, ProtocolError, Violation, ViolationKind};
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
     Refused, ServerHttpProtocol, Service,
@@ -88,6 +100,87 @@ const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 /// `ValidationException`'s wire error code — the shape name, which restJson1 puts in
 /// `x-amzn-errortype` and in the body's `__type`.
 const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+
+/// A `@pattern` expression without the anchors a model may spell it with.
+///
+/// Smithy's `@pattern` is an unanchored FIND, so a model that means "the whole value
+/// matches" writes `^…$` around the expression; the requirement the service reports is
+/// the expression itself. The pair is dropped only when BOTH ends carry it AND the pair
+/// wraps the WHOLE expression: a `^` alone, or a `$` alone, is an expression anchored at
+/// one end — a different language, not an anchored spelling of this one — and in an
+/// alternation (`^a$|^b$`, `^a|b$`) the outer `^` and `$` govern only their own branch, so
+/// dropping them would state an expression the service never evaluated. A `$` that is
+/// ESCAPED is a literal dollar, not an anchor, so it stays.
+///
+/// The same rule is inlined in many service crates (`grep -rln 'fn unanchored'
+/// services/*/src`) because none is reachable from another;
+/// `services/common/src/validation.rs` names it under "Still to migrate here" and stages
+/// it for one migration of its own, which is to DELETE these copies rather than add
+/// another. This one is pinned by the unit tests below and by this crate's
+/// `tests/all/server_side_validation.rs`.
+fn unanchored(pattern: &str) -> &str {
+    let Some(body) = pattern.strip_prefix('^') else {
+        return pattern;
+    };
+    match body.strip_suffix('$') {
+        Some(inner) if !ends_with_escape(inner) && wraps_whole_expression(inner) => inner,
+        _ => pattern,
+    }
+}
+
+/// Whether a `^`/`$` pair around `expression` anchors the WHOLE expression, which is what
+/// a whole-value pattern's pair does.
+///
+/// It does not when `expression` carries an anchor of its own (so the outer pair belongs
+/// to the branches of an alternation, `^a$|^b$`), nor when it alternates at the top level
+/// (`^a|b$`, where the `^` governs only the first branch and the `$` only the last). A
+/// `^`, `$` or `|` inside a character class is a literal or a negation marker rather than
+/// an anchor or an alternation, and one inside a group alternates only within that group
+/// (`^(canary|group)$` IS wrapped), so the scan tracks class and group context. Escapes
+/// are honoured throughout.
+fn wraps_whole_expression(expression: &str) -> bool {
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut depth = 0_usize;
+    for character in expression.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            _ if in_class => {}
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '^' | '$' => return false,
+            '|' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether `expression` ends in an escape — an odd number of trailing backslashes, so the
+/// character that followed them was escaped.
+fn ends_with_escape(expression: &str) -> bool {
+    expression.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
+}
+
+/// The same violation with a `@pattern` requirement stated [`unanchored`]; every other
+/// violation class is returned untouched, so the requirement each one words — and the
+/// value every clause echoes — stays the framework's.
+fn as_stated(violation: &Violation) -> Violation {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => Violation {
+            path: violation.path.clone(),
+            kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
+            value: violation.value.clone(),
+        },
+        _ => violation.clone(),
+    }
+}
 
 /// The `com-amazonaws-synthetics-synthetics` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -223,9 +316,12 @@ fn refuse_invalid_input<Op: Operation>(svc: &dyn Service, req: &RtRequest) -> Op
     let violations = model_violations::<Op>(protocol, req)?;
     // The envelope AWS itself returns for a constraint failure, built from the member
     // path, the offending value and the violated constraint by the framework's own
-    // renderer — the same text the generic 400 carried, now in the modelled member.
+    // renderer — the same text the generic 400 carried, now in the modelled member. The
+    // one difference is `as_stated`: a `@pattern` is quoted as the expression a value has
+    // to satisfy, without the anchors the model spells it with.
+    let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
     let error = crate::ops::types::ValidationException {
-        message: envelope(&violations),
+        message: envelope(&stated),
     };
     protocol
         .serialize_error(
@@ -363,6 +459,92 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
 #[cfg(test)]
 mod tests {
+    use aws_smithy_schema_server::{Violation, ViolationKind};
+
+    /// A whole-expression `^…$` pair is dropped and nothing else is, so an expression a
+    /// model anchors at one end — or that anchors each branch of an alternation — is
+    /// reported exactly as the model spells it. The anchored rows span this service's own
+    /// patterns (`ResourceArn`, `CanaryName`) plus the forms that must survive untouched.
+    #[test]
+    fn a_pattern_loses_only_a_whole_expression_anchor_pair() {
+        let cases = [
+            (
+                "the resource ARN pattern",
+                r"^arn:(aws[a-zA-Z-]*)?:synthetics:[a-z]{2,4}(-[a-z]{2,4})?-[a-z]+-\d{1}:\d{12}:(canary|group):[0-9a-z_\-]+$",
+                r"arn:(aws[a-zA-Z-]*)?:synthetics:[a-z]{2,4}(-[a-z]{2,4})?-[a-z]+-\d{1}:\d{12}:(canary|group):[0-9a-z_\-]+",
+            ),
+            ("an anchored character class", r"^[0-9a-z_\-]+$", r"[0-9a-z_\-]+"),
+            ("anchored at the start only", "^arn:aws:", "^arn:aws:"),
+            ("anchored at the end only", r"[0-9]+$", r"[0-9]+$"),
+            ("no anchor at all", r"\d{3}", r"\d{3}"),
+            // Each branch carries its own pair, so the outer `^`/`$` are not the whole
+            // expression's: stripping them would change the language.
+            ("a fully anchored alternation", "^a$|^b$", "^a$|^b$"),
+            ("a half-anchored alternation", "^a|b$", "^a|b$"),
+            // An escaped dollar is a literal character, not the end anchor.
+            ("an escaped trailing dollar", r"^costs\$", r"^costs\$"),
+            // Two backslashes escape the backslash, so the `$` is still the anchor.
+            ("an escaped backslash before the anchor", r"^costs\\$", r"costs\\"),
+            // A `|` inside a group alternates only within it, so the pair still wraps.
+            ("an alternation inside a group", "^(canary|group)$", "(canary|group)"),
+            // A `^` inside a character class is a negation, not an anchor.
+            ("a negated class", "^[^/]+$", "[^/]+"),
+        ];
+        for (case, modelled, expected) in cases {
+            let actual = super::unanchored(modelled);
+            assert_eq!(
+                actual, expected,
+                "case {case}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// Only the `@pattern` class is restated: every other requirement, and every clause's
+    /// echoed value and member path, stays exactly what the framework produced.
+    #[test]
+    fn only_a_pattern_requirement_is_restated() {
+        let pattern = Violation {
+            path: "resourceArn".to_string(),
+            kind: ViolationKind::Pattern(r"^arn:aws:synthetics:.+$".to_string()),
+            value: Some("not-an-arn".to_string()),
+        };
+        let stated = super::as_stated(&pattern);
+        assert_eq!(
+            stated.kind,
+            ViolationKind::Pattern(r"arn:aws:synthetics:.+".to_string()),
+            "expected the pattern requirement unanchored, got {:?}",
+            stated.kind
+        );
+        assert_eq!(
+            stated.value.as_deref(),
+            Some("not-an-arn"),
+            "expected the submitted value to be echoed unchanged, got {:?}",
+            stated.value
+        );
+        assert_eq!(
+            stated.path, pattern.path,
+            "expected the member path unchanged, got {:?}",
+            stated.path
+        );
+
+        for other in [
+            ViolationKind::MaxValue("20".to_string()),
+            ViolationKind::MinLength(1),
+            ViolationKind::MissingRequiredMember,
+        ] {
+            let violation = Violation {
+                path: "maxResults".to_string(),
+                kind: other.clone(),
+                value: Some("21".to_string()),
+            };
+            assert_eq!(
+                super::as_stated(&violation),
+                violation,
+                "case {other:?}: expected the framework's own violation, unchanged"
+            );
+        }
+    }
+
     /// Every operation the model declares has an input-validation gate.
     ///
     /// The gate set is written out by name in `input_validation_gates` — the operation

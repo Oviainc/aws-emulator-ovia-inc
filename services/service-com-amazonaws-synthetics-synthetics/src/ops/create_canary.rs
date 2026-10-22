@@ -149,9 +149,10 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::state::{
-    default_run_timeout_in_seconds, engine_arn, is_s3_artifact_location, source_location_arn,
-    CanaryState, StoredArtifactConfig, StoredCanary, StoredCode, StoredDependency,
-    StoredRunConfig, StoredSchedule, StoredVpcConfig, ARTIFACT_S3_LOCATION_MALFORMED,
+    default_run_timeout_in_seconds, engine_arn, is_published_runtime_version,
+    is_s3_artifact_location, source_location_arn, unknown_runtime_version, CanaryState,
+    StoredArtifactConfig, StoredCanary, StoredCode, StoredDependency, StoredRunConfig,
+    StoredSchedule, StoredVpcConfig, ARTIFACT_S3_LOCATION_MALFORMED,
     CREATE_IN_PROGRESS_REASON_CODE, DEFAULT_PROVISIONED_RESOURCE_CLEANUP,
     DEFAULT_RETENTION_PERIOD_IN_DAYS, DEFAULT_SCHEDULE_DURATION_IN_SECONDS, MAX_CANARIES,
     PROVISIONING_SETTLE, STORE_UNAVAILABLE,
@@ -248,6 +249,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // canary could ever write to, so it is refused here rather than stored verbatim.
         if !is_s3_artifact_location(&input.artifact_s3_location) {
             return Err(validation(ARTIFACT_S3_LOCATION_MALFORMED));
+        }
+        // `CreateCanaryRequest$RuntimeVersion` is "the runtime version to use for the
+        // canary. For a list of valid runtime versions … see Canary Runtime Versions":
+        // the model constrains only the value's LENGTH, so the set of values the service
+        // accepts is its own runtime catalogue (`crate::state::RUNTIME_VERSIONS`, what
+        // `DescribeRuntimeVersions` reports). A version outside it names no runtime the
+        // canary could ever be provisioned on, so it is refused here — before any state
+        // is written, so a refused create leaves nothing behind.
+        if !is_published_runtime_version(&input.runtime_version) {
+            return Err(validation(unknown_runtime_version(&input.runtime_version)));
         }
         if input.resources_to_replicate_tags.is_some()
             && input.tags.as_ref().is_none_or(|tags| tags.is_empty())

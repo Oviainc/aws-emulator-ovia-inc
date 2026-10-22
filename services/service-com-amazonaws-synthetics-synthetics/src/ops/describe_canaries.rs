@@ -85,11 +85,26 @@ use super::types::*;
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 
+use aws_smithy_schema_server::{constraints::path, envelope, Violation, ViolationKind};
+
 use crate::state::STORE_UNAVAILABLE;
 
 /// `DescribeCanariesRequest$MaxResults`: "If you omit this parameter, the default of 20
 /// is used." (which is also the member's modelled maximum).
 const DEFAULT_MAX_RESULTS: usize = 20;
+
+/// The smallest page size this operation accepts, which the model and the service agree
+/// on: `MaxCanaryResults`' `@range` minimum.
+const MIN_MAX_RESULTS: i32 = 1;
+
+/// The largest page size this operation accepts.
+///
+/// NOT the modelled `MaxCanaryResults` maximum of 20: the recorded service answers 200
+/// with a `Canaries` member for page sizes far above that trait's maximum and refuses only
+/// values past this ceiling, so the trait is kept off the generated schema
+/// (`skip_validation` on `DescribeCanariesInput`, see `super::types::describe_canaries_types`)
+/// and this is the bound the operation applies.
+const MAX_MAX_RESULTS: i32 = 1000;
 
 /// The modelled maximum length of `Token`, which both the input and the output
 /// `NextToken` target.
@@ -113,6 +128,35 @@ enum PageStart {
     Name(String),
     /// Resume at this position.
     Offset(usize),
+}
+
+/// The refusal of a page size outside `MIN_MAX_RESULTS..=MAX_MAX_RESULTS`.
+///
+/// Worded by the framework's own constraint renderer, from the bound the value actually
+/// broke, so the clause this operation states for a page size is the same sentence the
+/// boundary walk states for every other out-of-range member — `Value '<value>' at
+/// '<member>' failed to satisfy constraint: Member must have value less than or equal to
+/// <bound>` — with the member path spelled by the framework's own path module rather than
+/// written out here.
+fn out_of_range(requested: i32) -> DescribeCanariesError {
+    let kind = if requested < MIN_MAX_RESULTS {
+        ViolationKind::MinValue(MIN_MAX_RESULTS.to_string())
+    } else {
+        ViolationKind::MaxValue(MAX_MAX_RESULTS.to_string())
+    };
+    let violation = Violation {
+        path: path::member("MaxResults"),
+        kind,
+        value: Some(requested.to_string()),
+    };
+    let message = envelope(std::slice::from_ref(&violation)).unwrap_or_else(|| {
+        // Unreachable: `envelope` answers `None` only for an empty slice.
+        violation.message()
+    });
+    DescribeCanariesErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }
 
 /// The token that resumes the next page after `offset` entries, whose first entry is
@@ -232,14 +276,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?,
         };
-        let page_size = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS)
-            // At least one entry per page, independently of the boundary validator: a
-            // page size of zero would return nothing while still emitting a token, so a
-            // client loop would never terminate.
-            .max(1);
+        // `MaxResults` is the one member of this input the boundary walk does not judge
+        // (`skip_validation`), so the page size is checked here, against the ceiling the
+        // service applies rather than the modelled one. A size ON either bound is honoured
+        // as asked, never clamped.
+        let page_size = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(requested) if (MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&requested) => {
+                usize::try_from(requested).unwrap_or(DEFAULT_MAX_RESULTS)
+            }
+            Some(outside) => return Err(out_of_range(outside)),
+        };
         let filter: Option<BTreeSet<&str>> = input
             .names
             .as_ref()

@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-synthetics-synthetics.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.synthetics#DescribeCanariesRequest")]
+// `MaxResults` carries the modelled `@range(min: 1, max: 20)` of `MaxCanaryResults`, which
+// the recorded service does NOT enforce: it answers 200 for page sizes well above that
+// maximum and refuses only values past its own ceiling of 1000. `skip_validation` drops
+// only that member's constraint traits off the generated schema, so the boundary walk
+// cannot apply the modelled maximum; the OPERATION judges the member instead, against the
+// ceiling the service actually applies (see `ops::describe_canaries`). Every other member
+// of this input is still refused at the boundary by the model's own constraints.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.synthetics#DescribeCanariesRequest",
+    skip_validation = ["MaxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeCanariesInput {
     pub next_token: Option<String>,
