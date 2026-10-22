@@ -33,3 +33,5 @@ mod session_termination;
 mod state_roundtrip;
 #[path = "all/update_application.rs"]
 mod update_application;
+#[path = "all/update_application_while_started.rs"]
+mod update_application_while_started;

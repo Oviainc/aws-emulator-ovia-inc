@@ -205,10 +205,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stopped or created state in order to be updated." As everywhere in this
         // service it is judged against the state the application has SETTLED on, so a
         // transition the clock still owes it never refuses an update the settled
-        // application admits. This operation models no conflict error, so the refusal is
-        // its modelled `ValidationException`.
+        // application admits. This operation models no conflict error, so every refusal
+        // here is its modelled `ValidationException`.
+        //
+        // A RUNNING application is not refused outright: EMR Serverless accepts a
+        // documented subset of configuration members on one
+        // (`crate::state::STARTED_UPDATABLE_MEMBER_PATHS`), so the precondition is
+        // judged per member path the request NAMES rather than per request — an update
+        // naming only members of that subset is applied and leaves the application
+        // running, and one naming any other member is refused with the enumeration of
+        // the subset.
         let application_state = record.settled_state().to_string();
-        if !crate::state::UPDATABLE_APPLICATION_STATES.contains(&application_state.as_str()) {
+        // Computed ONCE here: the same judgement decides both the precondition above and
+        // how a sub-member path of the carve-out is applied below, so the two cannot
+        // drift apart.
+        let running = application_state == crate::state::STARTED_APPLICATION_STATE;
+        if running {
+            if names_a_member_outside_the_running_carve_out(&input) {
+                return Err(UpdateApplicationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::started_update_refusal_message(),
+                    },
+                )
+                .into());
+            }
+        } else if !crate::state::UPDATABLE_APPLICATION_STATES.contains(&application_state.as_str())
+        {
             return Err(UpdateApplicationErrorModeled::ValidationException(
                 ValidationException {
                     message: format!(
@@ -246,6 +268,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one member, not a tree to merge), with the defaults the model documents filled
         // in by the same `adopt_*` helpers the create uses — so an application reads back
         // the same way however it came to carry that block.
+        //
+        // The ONE exception is a member path the running-application carve-out names
+        // inside a block (`schedulerConfiguration.maxConcurrentRuns`): on a running
+        // application only that path is updatable, so every OTHER member of the block —
+        // including the one the carve-out names, when the request does not name it —
+        // keeps what the application has stored instead of being replaced along with it.
+        let stored_scheduler_configuration = record.application.scheduler_configuration.clone();
         let application = &mut record.application;
         if let Some(release_label) = input.release_label {
             application.release_label = release_label;
@@ -269,7 +298,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             application.interactive_configuration = Some(interactive_configuration);
         }
         if let Some(scheduler_configuration) = input.scheduler_configuration {
-            application.scheduler_configuration = Some(scheduler_configuration);
+            application.scheduler_configuration = Some(if running {
+                let stored = stored_scheduler_configuration.unwrap_or_default();
+                SchedulerConfiguration {
+                    max_concurrent_runs: scheduler_configuration
+                        .max_concurrent_runs
+                        .or(stored.max_concurrent_runs),
+                    queue_timeout_minutes: stored.queue_timeout_minutes,
+                }
+            } else {
+                scheduler_configuration
+            });
         }
         if let Some(disk_encryption_configuration) = input.disk_encryption_configuration {
             application.disk_encryption_configuration = Some(disk_encryption_configuration);
@@ -314,4 +353,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             application: application.clone(),
         })
     }
+}
+
+/// Whether this request NAMES a configuration member path that a RUNNING application
+/// does not admit an update of — one that is not among
+/// [`crate::state::STARTED_UPDATABLE_MEMBER_PATHS`].
+///
+/// Each path the request names is judged AGAINST that catalog, which is the single
+/// statement of the rule: a path the catalog does not hold is refused, so a member is
+/// admitted on a running application only because the service's documented set names
+/// it. The input is destructured exhaustively on purpose — a configuration member the
+/// model later adds to `UpdateApplicationRequest` stops this file compiling rather than
+/// being silently admitted while the application runs.
+///
+/// An update that names no configuration member at all names no path outside the set,
+/// so it is the no-op a running application admits.
+fn names_a_member_outside_the_running_carve_out(input: &UpdateApplicationInput) -> bool {
+    let UpdateApplicationInput {
+        // Not configuration: the resource the update addresses and its idempotency
+        // token, which every update carries whatever it names.
+        application_id: _,
+        client_token: _,
+        architecture,
+        auto_start_configuration,
+        auto_stop_configuration,
+        disk_encryption_configuration,
+        identity_center_configuration,
+        image_configuration,
+        initial_capacity,
+        interactive_configuration,
+        job_level_cost_allocation_configuration,
+        maximum_capacity,
+        monitoring_configuration,
+        network_configuration,
+        release_label,
+        runtime_configuration,
+        scheduler_configuration,
+        worker_type_specifications,
+    } = input;
+
+    // Every configuration member of `UpdateApplicationRequest`
+    // (`smithy_query(query="operation",operation="UpdateApplication")`), with the member
+    // PATH naming it would be judged by. `workerTypeSpecifications` is judged by
+    // `workerTypeSpecifications.imageConfiguration` because
+    // `WorkerTypeSpecificationInput` declares only that member, so a map value can name
+    // nothing else; `schedulerConfiguration` is judged per sub-member, since the set
+    // names one of the two the block carries.
+    [
+        (architecture.is_some(), "architecture"),
+        (auto_start_configuration.is_some(), "autoStartConfiguration"),
+        (auto_stop_configuration.is_some(), "autoStopConfiguration"),
+        (
+            disk_encryption_configuration.is_some(),
+            "diskEncryptionConfiguration",
+        ),
+        (
+            identity_center_configuration.is_some(),
+            "identityCenterConfiguration",
+        ),
+        (image_configuration.is_some(), "imageConfiguration"),
+        (initial_capacity.is_some(), "initialCapacity"),
+        (
+            interactive_configuration.is_some(),
+            "interactiveConfiguration",
+        ),
+        (
+            job_level_cost_allocation_configuration.is_some(),
+            "jobLevelCostAllocationConfiguration",
+        ),
+        (maximum_capacity.is_some(), "maximumCapacity"),
+        (monitoring_configuration.is_some(), "monitoringConfiguration"),
+        (network_configuration.is_some(), "networkConfiguration"),
+        (release_label.is_some(), "releaseLabel"),
+        (runtime_configuration.is_some(), "runtimeConfiguration"),
+        (
+            scheduler_configuration
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.max_concurrent_runs.is_some()),
+            "schedulerConfiguration.maxConcurrentRuns",
+        ),
+        (
+            scheduler_configuration
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.queue_timeout_minutes.is_some()),
+            "schedulerConfiguration.queueTimeoutMinutes",
+        ),
+        (
+            worker_type_specifications.is_some(),
+            "workerTypeSpecifications.imageConfiguration",
+        ),
+    ]
+    .into_iter()
+    .any(|(named, path)| named && !crate::state::STARTED_UPDATABLE_MEMBER_PATHS.contains(&path))
 }
