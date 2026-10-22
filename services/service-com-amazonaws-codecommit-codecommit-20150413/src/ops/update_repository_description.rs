@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRepositoryDescription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRepositoryDescription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRepositoryDescription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: sets the stored repository's description to the one the request
+//! carries, so a later `GetRepository` reports it, and stamps the repository's
+//! `lastModifiedDate` with the instant of the change. The output is modelled as
+//! `Unit`, so the whole observable effect is in state.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +175,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRepositoryDescription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRepositoryDescriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRepositoryDescription"))
+        // `repositoryName`'s length and pattern and `repositoryDescription`'s
+        // length 0..1000 are modelled, so the boundary validator already refused
+        // anything outside them — as `RepositoryNameRequiredException`,
+        // `InvalidRepositoryNameException` and `InvalidRepositoryDescriptionException`
+        // respectively (`crate::service::refusal_for`). What is left here is the
+        // repository's existence and the write itself.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                UpdateRepositoryDescriptionErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(format!(
+                            "the repository {} does not exist",
+                            input.repository_name
+                        )),
+                    },
+                )
+            })?;
+
+        // "Sets or changes the comment or description": the stored description
+        // becomes exactly what the request carried, and a request that carries none
+        // leaves the repository without one. The text is stored verbatim — the
+        // description accepts all HTML and all valid Unicode characters, so nothing
+        // here escapes or rewrites it.
+        repository.description = input.repository_description;
+        // The repository changed, so the instant of this change is its new
+        // lastModifiedDate (the key `ListRepositories` can sort on). It is stamped
+        // for every accepted call, including one that sets the description it
+        // already holds: this operation documents no idempotent case (unlike
+        // `UpdateDefaultBranch`, whose doc text is about the branch a repository
+        // already points at), so the clock at the call is what the rule uses.
+        repository.last_modified_date = std::time::SystemTime::now();
+
+        Ok(UpdateRepositoryDescriptionOutput)
     }
 }

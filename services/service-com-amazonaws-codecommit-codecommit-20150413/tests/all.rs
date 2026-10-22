@@ -29,6 +29,10 @@ mod differences;
 mod file_commit_history;
 #[path = "all/folder_listing.rs"]
 mod folder_listing;
+#[path = "all/harness.rs"]
+mod harness;
+#[path = "all/repository_description.rs"]
+mod repository_description;
 #[path = "all/repository_lifecycle.rs"]
 mod repository_lifecycle;
 #[path = "all/repository_rename.rs"]

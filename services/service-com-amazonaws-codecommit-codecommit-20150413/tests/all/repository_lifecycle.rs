@@ -82,19 +82,7 @@ pub(crate) async fn error(
     .await
 }
 
-/// A UUID in its canonical textual form: 8-4-4-4-12 hex characters.
-pub(crate) fn is_uuid(value: &str) -> bool {
-    let groups: Vec<&str> = value.split('-').collect();
-    groups.len() == 5
-        && [8usize, 4, 4, 4, 12]
-            .iter()
-            .zip(&groups)
-            .all(|(len, group)| group.len() == *len)
-        && groups
-            .iter()
-            .all(|group| group.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
+/// The base64 form the wire carries file content in.
 pub(crate) fn base64(content: &[u8]) -> String {
     aws_smithy_types::base64::encode(content)
 }
@@ -124,6 +112,19 @@ pub(crate) fn git_blob_id(content: &[u8]) -> String {
 
 pub(crate) fn is_object_id(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A UUID in its canonical textual form: 8-4-4-4-12 hex characters.
+pub(crate) fn is_uuid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && [8usize, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(len, group)| group.len() == *len)
+        && groups
+            .iter()
+            .all(|group| group.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// One row of the lifecycle table: a repository and the single file written into it.

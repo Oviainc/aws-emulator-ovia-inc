@@ -14,7 +14,7 @@
 //! other files in between, path depth and leading separator, content kind and size,
 //! page size, and which commit specifier bounds the history — rather than one
 //! recorded request. The wire harness (`emulator`, `ok`, `error`, the base64 and
-//! object-name helpers) is the one already used by the repository-lifecycle suite.
+//! object-name helpers) is the shared one in [`crate::repository_lifecycle`].
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
