@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProposal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProposal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProposal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a proposal id, persists the proposal against the network the
+//! request names (with the actions, description and tags it carried, the proposing
+//! member, `IN_PROGRESS` as its status and the expiry the network's voting policy fixes),
+//! and returns the id read back out of the store. `GetProposal` projects the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +173,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProposal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProposalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProposal"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateProposalErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        // "The types of Actions in a proposal are mutually exclusive. For example, a
+        // proposal with Invitations actions cannot also contain Removals actions"
+        // (`CreateProposal$Actions`), and an `Actions` that names neither asks for
+        // nothing to be carried out if the proposal is approved: both are refused rather
+        // than stored. `Actions` is `@required`, so the boundary validator has already
+        // refused a request that omits it altogether.
+        let invitations = input.actions.invitations.as_ref().map_or(0, Vec::len);
+        let removals = input.actions.removals.as_ref().map_or(0, Vec::len);
+        if invitations > 0 && removals > 0 {
+            return Err(CreateProposalErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "the types of Actions in a proposal are mutually exclusive, but this \
+                         proposal carries {invitations} Invitations and {removals} Removals"
+                    )),
+                },
+            )
+            .into());
+        }
+        if invitations == 0 && removals == 0 {
+            return Err(CreateProposalErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "Actions must name at least one Invitations or Removals action for the \
+                         proposal to carry out"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        guard.settle(now);
+
+        // "An idempotent operation completes no more than one time"
+        // (`CreateProposal$ClientRequestToken`): a token already used replays the
+        // proposal id its first call minted instead of creating a second proposal.
+        let token = crate::state::idempotency_key(Self::NAME, &input.client_request_token);
+        if let Some(created) = guard.replay_idempotent(&token) {
+            return Ok(CreateProposalOutput {
+                proposal_id: created.proposal_id.clone(),
+            });
+        }
+
+        let Some(network) = guard.networks.get(&input.network_id) else {
+            return Err(CreateProposalErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "network {} does not exist on this account",
+                        input.network_id
+                    )),
+                    resource_name: Some(input.network_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // "The requested resource exists but isn't in a status that can complete the
+        // operation" (`ResourceNotReadyException`): a network still `CREATING` has no
+        // settled membership to put a proposal to, and a member still `CREATING` cannot
+        // make one.
+        if network.status != crate::state::STATUS_AVAILABLE {
+            return Err(CreateProposalErrorModeled::ResourceNotReadyException(
+                ResourceNotReadyException {
+                    message: Some(format!(
+                        "network {} is {} and cannot take a proposal until it is {}",
+                        network.id,
+                        network.status,
+                        crate::state::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `MemberId` is "the unique identifier of the member that is creating the
+        // proposal", and "any member can create a proposal": the member must be one of
+        // this network's own.
+        let Some(member) = network.members.get(&input.member_id) else {
+            return Err(CreateProposalErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "member {} does not exist on network {}",
+                        input.member_id, input.network_id
+                    )),
+                    resource_name: Some(input.member_id.clone()),
+                },
+            )
+            .into());
+        };
+        if member.status != crate::state::STATUS_AVAILABLE {
+            return Err(CreateProposalErrorModeled::ResourceNotReadyException(
+                ResourceNotReadyException {
+                    message: Some(format!(
+                        "member {} is {} and cannot create a proposal until it is {}",
+                        member.id,
+                        member.status,
+                        crate::state::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if network.proposals.len() >= crate::state::MAX_PROPOSALS_PER_NETWORK {
+            // This operation models no limit error; `ThrottlingException`'s own doc names
+            // this cause ("creating resources that exceed your service limit for this
+            // resource type") and that shape carries no message member.
+            return Err(
+                CreateProposalErrorModeled::ThrottlingException(ThrottlingException {}).into(),
+            );
+        }
+
+        // "This is the CreationDate plus the ProposalDurationInHours that is specified in
+        // the ProposalThresholdPolicy" (`Proposal$ExpirationDate`): the duration is the
+        // one the network was created with, kept exactly as it was specified.
+        let expiration_date =
+            crate::state::proposal_duration(&network.voting_policy).map(|duration| now + duration);
+
+        let proposal_id = guard.mint_proposal_id(&input.network_id);
+        let proposal = crate::state::StoredProposal {
+            id: proposal_id.clone(),
+            network_id: input.network_id.clone(),
+            description: input.description,
+            actions: input.actions,
+            proposed_by_member_id: input.member_id.clone(),
+            // "IN_PROGRESS - The proposal is active and open for member voting"
+            // (`Proposal$Status`): a created proposal is open, and no vote has been cast
+            // on it yet.
+            status: crate::state::PROPOSAL_IN_PROGRESS.to_string(),
+            creation_date: now,
+            expiration_date,
+            votes: ::std::collections::BTreeMap::new(),
+            tags: crate::state::map_in(input.tags),
+            arn: crate::state::proposal_arn(&region, &proposal_id),
+        };
+
+        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+            return Err(CreateProposalErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+        network.proposals.insert(proposal_id.clone(), proposal);
+        guard.remember_idempotent(
+            token,
+            crate::state::CreatedIds {
+                network_id: Some(input.network_id.clone()),
+                member_id: Some(input.member_id.clone()),
+                node_id: None,
+                proposal_id: Some(proposal_id.clone()),
+                accessor_id: None,
+            },
+        );
+
+        // Answer from the STORED record, so this is the id every later read of the
+        // proposal answers to.
+        let stored = guard
+            .networks
+            .get(&input.network_id)
+            .and_then(|network| network.proposals.get(&proposal_id));
+        let Some(stored) = stored else {
+            return Err(CreateProposalErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+        Ok(CreateProposalOutput {
+            proposal_id: Some(stored.id.clone()),
+        })
     }
 }

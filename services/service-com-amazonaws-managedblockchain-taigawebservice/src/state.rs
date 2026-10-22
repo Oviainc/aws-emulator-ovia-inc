@@ -18,7 +18,8 @@ use crate::ops::types::{
     Accessor, Invitation, Member, MemberFabricAttributes, MemberFrameworkAttributes,
     MemberLogPublishingConfiguration, Network, NetworkFabricAttributes,
     NetworkFrameworkAttributes, NetworkSummary, Node, NodeFabricAttributes,
-    NodeFrameworkAttributes, NodeLogPublishingConfiguration, NodeSummary, VotingPolicy,
+    NodeFrameworkAttributes, NodeLogPublishingConfiguration, NodeSummary, Proposal,
+    ProposalActions, VotingPolicy,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service (the model's
@@ -53,6 +54,25 @@ pub const STATUS_CREATING: &str = "CREATING";
 
 /// The settled status the clock owes a created network, member or node.
 pub const STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The `ProposalStatus` a freshly created proposal is reported in: "`IN_PROGRESS` - The
+/// proposal is active and open for member voting" (`Proposal$Status`). It is NOT a
+/// transition the clock owes a settled value — only member votes or the proposal's own
+/// expiry close it.
+pub const PROPOSAL_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `ProposalStatus` of a proposal whose expiration date passed before the votes that
+/// would decide it were cast: "`EXPIRED` - Members didn't cast the number of votes
+/// required to determine the proposal outcome before the proposal expired. The specified
+/// `ProposalActions` aren't carried out" (`Proposal$Status`).
+pub const PROPOSAL_EXPIRED: &str = "EXPIRED";
+
+/// A `YES` vote on a proposal (`VoteValue` = `YES` | `NO`), counted into
+/// `Proposal$YesVoteCount`.
+pub const VOTE_YES: &str = "YES";
+
+/// A `NO` vote on a proposal, counted into `Proposal$NoVoteCount`.
+pub const VOTE_NO: &str = "NO";
 
 /// The `InvitationStatus` a minted invitation starts in: "`PENDING` - The invitee hasn't
 /// created a member to join the network, and the invitation hasn't yet expired"
@@ -139,6 +159,18 @@ pub const MAX_NETWORKS: usize = 1_000;
 /// [`MAX_NETWORKS`]; `CreateNode` models `ResourceLimitExceededException` for it.
 pub const MAX_NODES_PER_NETWORK: usize = 1_000;
 
+/// How many proposals this emulator will hold on one network.
+///
+/// `CreateProposal` models no limit error (the model declares no
+/// `ResourceLimitExceededException` for it, unlike `CreateNetwork` and `CreateNode`), but
+/// it does model `ThrottlingException`, whose own doc names the cause: "The most common
+/// source of throttling errors is creating resources that exceed your service limit for
+/// this resource type." That is the error `CreateProposal` raises at this ceiling. The
+/// number is NOT a fidelity claim about any published quota: it is this emulator's own
+/// ceiling, set generously so no realistic workflow meets it, so that a caller looping on
+/// create cannot grow this process's memory without bound.
+pub const MAX_PROPOSALS_PER_NETWORK: usize = 1_000;
+
 /// How many invitations this emulator will hold, for the same reason as [`MAX_NETWORKS`]:
 /// an invitation record is minted per approved `InviteAction` and outlives the proposal
 /// that minted it, so the store needs a ceiling of its own.
@@ -160,6 +192,7 @@ pub struct CreatedIds {
     pub network_id: Option<String>,
     pub member_id: Option<String>,
     pub node_id: Option<String>,
+    pub proposal_id: Option<String>,
     pub accessor_id: Option<String>,
 }
 
@@ -195,6 +228,9 @@ pub struct StoredNetwork {
     pub members: BTreeMap<String, StoredMember>,
     /// The nodes on this network, keyed by node id.
     pub nodes: BTreeMap<String, StoredNode>,
+    /// The proposals made on this network, keyed by proposal id — which also orders the
+    /// listings, so a page cursor keys on the ordering itself.
+    pub proposals: BTreeMap<String, StoredProposal>,
 }
 
 impl StoredNetwork {
@@ -216,6 +252,9 @@ impl StoredNetwork {
             if node.status == STATUS_CREATING && now >= node.available_at {
                 node.status = STATUS_AVAILABLE.to_string();
             }
+        }
+        for proposal in self.proposals.values_mut() {
+            proposal.settle(now);
         }
     }
 
@@ -375,6 +414,83 @@ impl StoredNode {
             creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
             availability_zone: self.availability_zone.clone(),
             instance_type: Some(self.instance_type.clone()),
+            arn: Some(self.arn.clone()),
+        }
+    }
+}
+
+/// One stored proposal on a network: a change to the network that the network's members
+/// vote on, as `CreateProposal` recorded it.
+#[derive(Debug, Clone)]
+pub struct StoredProposal {
+    pub id: String,
+    pub network_id: String,
+    pub description: Option<String>,
+    /// "The actions to perform on the network if the proposal is `APPROVED`"
+    /// (`Proposal$Actions`), stored exactly as the create named them.
+    pub actions: ProposalActions,
+    /// The member that created the proposal; its name is read from the member record, so
+    /// a rename is reflected rather than frozen into the proposal.
+    pub proposed_by_member_id: String,
+    /// A `ProposalStatus` value.
+    pub status: String,
+    pub creation_date: SystemTime,
+    /// "This is the `CreationDate` plus the `ProposalDurationInHours` that is specified in
+    /// the `ProposalThresholdPolicy`" (`Proposal$ExpirationDate`); `None` when the
+    /// network's voting policy names no duration, which fixes no expiry to report.
+    pub expiration_date: Option<SystemTime>,
+    /// The `VoteValue` each member cast, keyed by the voting member's id. The vote counts
+    /// are COUNTED from this map rather than kept as separate totals, so no counter can
+    /// drift from the votes actually cast.
+    pub votes: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+    pub arn: String,
+}
+
+impl StoredProposal {
+    /// Materialise the expiry the clock already owes this proposal.
+    ///
+    /// Like [`StoredNetwork::settle`] this is the only write a reporting operation makes:
+    /// the change was owed at this instant whether or not anybody called.
+    fn settle(&mut self, now: SystemTime) {
+        if self.status == PROPOSAL_IN_PROGRESS
+            && self.expiration_date.is_some_and(|expires| now >= expires)
+        {
+            self.status = PROPOSAL_EXPIRED.to_string();
+        }
+    }
+
+    /// How many members cast `vote` on this proposal.
+    pub fn vote_count(&self, vote: &str) -> i32 {
+        i32::try_from(self.votes.values().filter(|cast| *cast == vote).count()).unwrap_or(i32::MAX)
+    }
+
+    /// The modelled `Proposal` for this record, as `GetProposal` returns it.
+    ///
+    /// `network` is the network this proposal belongs to: the proposing member's name and
+    /// the outstanding-vote count are read from its current membership, which is what
+    /// `Proposal$OutstandingVoteCount` describes — "the number of members minus the sum of
+    /// `YES` votes and `NO` votes".
+    pub fn to_proposal(&self, network: &StoredNetwork) -> Proposal {
+        let members = i32::try_from(network.members.len()).unwrap_or(i32::MAX);
+        let cast = i32::try_from(self.votes.len()).unwrap_or(i32::MAX);
+        Proposal {
+            proposal_id: Some(self.id.clone()),
+            network_id: Some(self.network_id.clone()),
+            description: self.description.clone(),
+            actions: Some(self.actions.clone()),
+            proposed_by_member_id: Some(self.proposed_by_member_id.clone()),
+            proposed_by_member_name: network
+                .members
+                .get(&self.proposed_by_member_id)
+                .map(|member| member.name.clone()),
+            status: Some(self.status.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            expiration_date: self.expiration_date.map(::aws_smithy_types::DateTime::from),
+            yes_vote_count: Some(self.vote_count(VOTE_YES)),
+            no_vote_count: Some(self.vote_count(VOTE_NO)),
+            outstanding_vote_count: Some((members - cast).max(0)),
+            tags: Some(map_out(&self.tags)),
             arn: Some(self.arn.clone()),
         }
     }
@@ -581,6 +697,20 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         }
     }
 
+    /// Mint a proposal id no proposal on `network_id` holds.
+    pub fn mint_proposal_id(&mut self, network_id: &str) -> String {
+        loop {
+            let id = self.mint_id("p");
+            let taken = self
+                .networks
+                .get(network_id)
+                .is_some_and(|network| network.proposals.contains_key(&id));
+            if !taken {
+                return id;
+            }
+        }
+    }
+
     /// Mint an accessor id no stored accessor holds (`ac-` is the prefix Managed
     /// Blockchain writes an accessor id with).
     pub fn mint_accessor_id(&mut self) -> String {
@@ -657,18 +787,16 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         if self.invitations.len() >= MAX_INVITATIONS {
             return None;
         }
-        let hours = self
-            .networks
-            .get(network_id)?
-            .voting_policy
-            .approval_threshold_policy
-            .as_ref()
-            .and_then(|policy| policy.proposal_duration_in_hours)
-            .unwrap_or(DEFAULT_PROPOSAL_DURATION_IN_HOURS)
-            // `ProposalDurationInt` is `@range(1, 168)`, which the boundary validator
-            // already enforced on the create; the clamp keeps the arithmetic below sound
-            // whatever a stored record holds.
-            .clamp(1, 168) as u64;
+        let duration = proposal_duration(&self.networks.get(network_id)?.voting_policy)
+            // Both `Invitation$ExpirationDate` and `Proposal$ExpirationDate` are the
+            // creation date plus the policy's `ProposalDurationInHours`, so both read it
+            // through the one helper. Where they part is a policy that names NO duration:
+            // an invitation must still report an expiry, so it falls back to
+            // [`DEFAULT_PROPOSAL_DURATION_IN_HOURS`], while `Proposal$ExpirationDate` is
+            // optional and is simply not reported (see `proposal_duration`).
+            .unwrap_or_else(|| {
+                Duration::from_secs(DEFAULT_PROPOSAL_DURATION_IN_HOURS as u64 * 3_600)
+            });
         let id = self.mint_invitation_id();
         let invitation = StoredInvitation {
             arn: invitation_arn(region, &id),
@@ -677,7 +805,7 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
             network_id: network_id.to_string(),
             status: INVITATION_STATUS_PENDING.to_string(),
             creation_date: now,
-            expiration_date: now + Duration::from_secs(hours * 3_600),
+            expiration_date: now + duration,
         };
         self.invitations.insert(id.clone(), invitation);
         Some(id)
@@ -722,6 +850,41 @@ pub fn accessor_arn(region: &str, accessor_id: &str) -> String {
 /// The ARN of a node: `arn:aws:managedblockchain:<region>:<account>:nodes/<id>`.
 pub fn node_arn(region: &str, node_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("nodes/{node_id}"))
+}
+
+/// The ARN of a proposal:
+/// `arn:aws:managedblockchain:<region>:<account>:proposals/<id>`, the same
+/// `<resource-type>/<id>` shape as the network, member and node ARNs above, and within
+/// `ArnString`'s pattern `^arn:.+:.+:.+:.+:.+$`.
+pub fn proposal_arn(region: &str, proposal_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("proposals/{proposal_id}"))
+}
+
+/// How long a proposal on a network with this voting policy stays open — and, through
+/// [`ComAmazonawsManagedblockchainTaigawebserviceState::record_invitation`], how long an
+/// invitation minted on it stays `PENDING`: both
+/// `Proposal$ExpirationDate` and `Invitation$ExpirationDate` are documented as "the
+/// `CreationDate` plus the `ProposalDurationInHours` that is specified in the
+/// `ProposalThresholdPolicy`".
+///
+/// `ApprovalThresholdPolicy$ProposalDurationInHours` is "the duration from the time that a
+/// proposal is created until it expires", so the value the network was created with is
+/// kept exactly: this emulator chooses nothing here. `None` when the policy names no
+/// duration, which fixes no expiry — `Proposal$ExpirationDate` then goes unreported, while
+/// an invitation, whose expiry is not optional, falls back to
+/// [`DEFAULT_PROPOSAL_DURATION_IN_HOURS`].
+pub fn proposal_duration(policy: &VotingPolicy) -> Option<Duration> {
+    let hours = policy
+        .approval_threshold_policy
+        .as_ref()
+        .and_then(|threshold| threshold.proposal_duration_in_hours)?
+        // `ProposalDurationInt` is `@range(1, 168)`, which the boundary validator already
+        // enforced on the create; the clamp keeps the arithmetic sound whatever a stored
+        // record holds.
+        .clamp(1, 168);
+    u64::try_from(hours)
+        .ok()
+        .map(|hours| Duration::from_secs(hours * 60 * 60))
 }
 
 /// The ARN of an invitation
