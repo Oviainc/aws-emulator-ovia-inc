@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints `arn:aws:forecast:<region>:<account>:dataset/<DatasetName>` and
+//! stores the whole submitted record under it, so `DescribeDataset` and `ListDatasets`
+//! report what this call wrote. Forecast resource names are unique per account, so a
+//! second create with the same name answers `ResourceAlreadyExistsException` (403).
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +189,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataset"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which mounts every service on the one
+            // shared `InMemoryEngine`: this build cannot serve the operation at all on
+            // the engine it was handed, which is exactly what 501 states.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataset"));
+        };
+
+        // "This parameter is required for RELATED_TIME_SERIES datasets."
+        // (`DataFrequency`: smithy_query(query="doc",shape="CreateDatasetRequest",member="DataFrequency")).
+        if input.dataset_type == "RELATED_TIME_SERIES" && input.data_frequency.is_none() {
+            return Err(CreateDatasetErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(
+                    "DataFrequency is required for a RELATED_TIME_SERIES dataset.".to_string(),
+                ),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::dataset_arn(&region, &input.dataset_name);
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Bound the store BEFORE allocating a record: every create a caller drives is a
+        // growth site, and the modelled `LimitExceededException` is exactly the error a
+        // per-account resource limit answers with.
+        if state.datasets.len() >= crate::state::MAX_DATASETS {
+            return Err(CreateDatasetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} datasets for this account.",
+                        crate::state::MAX_DATASETS
+                    )),
+                },
+            )
+            .into());
+        }
+        // The ARN carries the region and the name, so the key IS the uniqueness
+        // constraint: Forecast datasets are regional, and the same name signed for
+        // another region is another dataset with another ARN.
+        if state.datasets.contains_key(&arn) {
+            return Err(CreateDatasetErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "A dataset already exists with the name {}.",
+                        input.dataset_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        state.datasets.insert(
+            arn.clone(),
+            crate::state::Dataset {
+                arn: arn.clone(),
+                name: input.dataset_name,
+                domain: input.domain,
+                dataset_type: input.dataset_type,
+                data_frequency: input.data_frequency,
+                schema: input.schema,
+                encryption_config: input.encryption_config,
+                status: crate::state::ACTIVE.to_string(),
+                // Both set at write time: a dataset nothing has modified reports
+                // `LastModificationTime` equal to `CreationTime`.
+                creation_time: now,
+                last_modification_time: now,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateDatasetOutput {
+            dataset_arn: Some(arn),
+        })
     }
 }

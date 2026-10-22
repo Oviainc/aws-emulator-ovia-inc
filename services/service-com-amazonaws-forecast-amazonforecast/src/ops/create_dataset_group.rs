@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDatasetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDatasetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDatasetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints `arn:aws:forecast:<region>:<account>:dataset-group/<name>` and
+//! stores the group, including the membership `DatasetArns` names. Every member ARN must
+//! already resolve to a dataset (`ResourceNotFoundException`, 404) whose `Domain` matches
+//! the group's; a duplicate group name is `ResourceAlreadyExistsException` (403).
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +168,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDatasetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDatasetGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDatasetGroup",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::dataset_group_arn(&region, &input.dataset_group_name);
+        let members = input.dataset_arns.unwrap_or_default();
+        // `ArnList` carries no modelled length, so clamp the caller-sized list BEFORE
+        // the per-member walk below, which runs under the shared state lock.
+        if members.len() > crate::state::MAX_DATASET_ARNS_PER_GROUP {
+            return Err(CreateDatasetGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "DatasetArns names {} datasets, more than the limit of {} per dataset group.",
+                        members.len(),
+                        crate::state::MAX_DATASET_ARNS_PER_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Bound the store before allocating a record, as CreateDataset does.
+        if state.dataset_groups.len() >= crate::state::MAX_DATASET_GROUPS {
+            return Err(CreateDatasetGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} dataset groups for this account.",
+                        crate::state::MAX_DATASET_GROUPS
+                    )),
+                },
+            )
+            .into());
+        }
+        // As on CreateDataset: the ARN key carries the region and the name, so it is the
+        // uniqueness constraint a repeated create trips over.
+        if state.dataset_groups.contains_key(&arn) {
+            return Err(CreateDatasetGroupErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "A dataset group already exists with the name {}.",
+                        input.dataset_group_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        for member in &members {
+            let Some(dataset) = state.datasets.get(member) else {
+                return Err(CreateDatasetGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No resource found {member}")),
+                    },
+                )
+                .into());
+            };
+            // "When you add a dataset to a dataset group, this value and the value
+            // specified for the Domain parameter of the CreateDatasetGroup operation must
+            // match." (`Domain`:
+            // smithy_query(query="doc",shape="CreateDatasetRequest",member="Domain")).
+            if dataset.domain != input.domain {
+                return Err(CreateDatasetGroupErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "The dataset {} has domain {}, which does not match the dataset group domain {}.",
+                            dataset.arn, dataset.domain, input.domain
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        state.dataset_groups.insert(
+            arn.clone(),
+            crate::state::DatasetGroup {
+                arn: arn.clone(),
+                name: input.dataset_group_name,
+                domain: input.domain,
+                dataset_arns: members,
+                status: crate::state::ACTIVE.to_string(),
+                creation_time: now,
+                last_modification_time: now,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateDatasetGroupOutput {
+            dataset_group_arn: Some(arn),
+        })
     }
 }

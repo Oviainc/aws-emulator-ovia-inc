@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination cursors: the `NextToken` the List operations mint is a
+# hex-encoded cursor, so a client cannot read a state key out of it.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDatasetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDatasetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDatasetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: REPLACES the group's membership with the submitted `DatasetArns` (it is
+//! not an append) and bumps `LastModificationTime`, leaving `CreationTime` alone. An
+//! unknown group or member dataset is `ResourceNotFoundException` (404); a member whose
+//! `Domain` differs from the group's is `InvalidInputException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +136,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDatasetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDatasetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDatasetGroup"))
+        // A write keyed entirely by the request's ARN; no request metadata is needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateDatasetGroup",
+            ));
+        };
+
+        // `ArnList` carries no modelled length, so clamp the caller-sized list BEFORE
+        // taking the shared state lock and walking it member by member.
+        // `UpdateDatasetGroup` models no `LimitExceededException`, so the refusal is the
+        // modelled `InvalidInputException` ("a value that exceeds the valid range"),
+        // naming the member and the limit it crossed.
+        if input.dataset_arns.len() > crate::state::MAX_DATASET_ARNS_PER_GROUP {
+            return Err(UpdateDatasetGroupErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "DatasetArns names {} datasets, more than the limit of {} per dataset group.",
+                        input.dataset_arns.len(),
+                        crate::state::MAX_DATASET_ARNS_PER_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut guard = state.lock();
+        // Borrow the two stores as DISJOINT fields of one state: the group is held
+        // mutably from the start, so the record validated against is the record written
+        // and a missing group can never become a silent success.
+        let state = &mut *guard;
+        let Some(group) = state.dataset_groups.get_mut(&input.dataset_group_arn) else {
+            return Err(UpdateDatasetGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("No resource found {}", input.dataset_group_arn)),
+                },
+            )
+            .into());
+        };
+
+        // Validate the WHOLE new membership before writing any of it, so a rejected
+        // update leaves the group exactly as it was.
+        for member in &input.dataset_arns {
+            let Some(dataset) = state.datasets.get(member) else {
+                return Err(UpdateDatasetGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No resource found {member}")),
+                    },
+                )
+                .into());
+            };
+            // Same domain rule as CreateDatasetGroup: a dataset's `Domain` and its
+            // group's must match (smithy_query(query="doc",shape="CreateDatasetRequest",member="Domain")).
+            if dataset.domain != group.domain {
+                return Err(UpdateDatasetGroupErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "The dataset {} has domain {}, which does not match the dataset group domain {}.",
+                            dataset.arn, dataset.domain, group.domain
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The write is the last thing the handler does, on the record borrowed above.
+        group.dataset_arns = input.dataset_arns;
+        group.last_modification_time = ::std::time::SystemTime::now();
+
+        Ok(UpdateDatasetGroupOutput {})
     }
 }

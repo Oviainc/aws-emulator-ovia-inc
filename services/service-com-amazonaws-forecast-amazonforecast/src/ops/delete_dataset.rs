@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored dataset, so a later `DescribeDataset` is
+//! `ResourceNotFoundException` (404) and `ListDatasets` no longer carries it. A dataset a
+//! dataset group still lists IS deleted — the documentation below says Forecast does not
+//! update those groups and tells the caller to drop the ARN with `UpdateDatasetGroup`, so
+//! the group keeps reporting the now-stale ARN until it does. An ARN with no record is
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +157,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataset"))
+        // A write keyed entirely by the request's ARN; no request metadata is needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataset"));
+        };
+
+        let mut state = state.lock();
+        // Group membership is deliberately NOT consulted: "Forecast does not automatically
+        // update any dataset groups that contain the deleted dataset. In order to update
+        // the dataset group, use the UpdateDatasetGroup operation, omitting the deleted
+        // dataset's ARN." (this operation's modelled documentation, quoted in the header).
+        // That remedy only exists because the delete SUCCEEDS and leaves the group holding
+        // a stale ARN, so refusing here would make the documented sequence unreachable.
+        if state.datasets.remove(&input.dataset_arn).is_none() {
+            return Err(DeleteDatasetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("No resource found {}", input.dataset_arn)),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteDatasetOutput)
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatasetGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatasetGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatasetGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the stored dataset groups as `DatasetGroupSummary` entries in
+//! ARN order, at most `MaxResults` per page, handing back an opaque `NextToken` only
+//! while more remain. A token this operation did not mint is
+//! `InvalidNextTokenException` (400). Reporting only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +140,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatasetGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatasetGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatasetGroups"))
+        // A pure read; no request metadata is needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListDatasetGroups",
+            ));
+        };
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(key) =
+                    crate::state::decode_next_token(crate::state::DATASET_GROUP_CURSOR, token)
+                else {
+                    return Err(ListDatasetGroupsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some("Invalid next token.".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                Some(key)
+            }
+            None => None,
+        };
+
+        let state = state.lock();
+        let (page, next_key) = crate::state::page(
+            &state.dataset_groups,
+            after,
+            crate::state::page_size(input.max_results),
+        );
+
+        Ok(ListDatasetGroupsOutput {
+            dataset_groups: Some(
+                page.into_iter()
+                    .map(|group| DatasetGroupSummary {
+                        dataset_group_arn: Some(group.arn.clone()),
+                        dataset_group_name: Some(group.name.clone()),
+                        creation_time: Some(::aws_smithy_types::DateTime::from(
+                            group.creation_time,
+                        )),
+                        last_modification_time: Some(::aws_smithy_types::DateTime::from(
+                            group.last_modification_time,
+                        )),
+                    })
+                    .collect(),
+            ),
+            next_token: next_key.map(|key| {
+                crate::state::encode_next_token(crate::state::DATASET_GROUP_CURSOR, &key)
+            }),
+        })
     }
 }
