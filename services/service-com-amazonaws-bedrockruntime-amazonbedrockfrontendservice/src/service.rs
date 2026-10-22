@@ -74,26 +74,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // This service signs as `bedrock` — a signing name it SHARES with every other
-        // emulated Bedrock-family service (the Bedrock control plane, Bedrock Agent,
-        // Bedrock Agent Runtime, Bedrock Data Automation and Bedrock Data Automation
-        // Runtime), while its own endpoint is `bedrock-runtime`. The router resolves
-        // the routing key from the SigV4 credential scope first, so all six see the key
-        // `bedrock`: claiming on the signing name ALONE makes each of them claim every
-        // sibling's traffic, and the router — which refuses rather than guesses —
-        // answers `500 AmbiguousService` for ALL of it.
+        // This service signs as `bedrock` — the signing name the WHOLE Bedrock family
+        // shares (the control plane, this data plane, `bedrock-agent`,
+        // `bedrock-agent-runtime`, `bedrock-data-automation` and
+        // `bedrock-data-automation-runtime`), while AWS separates them by endpoint host
+        // (`bedrock-runtime` here). The router keys on the SigV4 credential scope first,
+        // so all six resolve to `bedrock`: claiming on that name alone makes every one of
+        // them claim every Bedrock request and the router answers `500 AmbiguousService`
+        // — an error code no AWS model declares — instead of serving any of them.
         //
-        // So the claim is narrowed to this service's own modelled wire surface, by the
-        // one rule `service-common` states for every service under a shared signing
-        // name. This model is `restJson1` and binds every operation to a URI whose
-        // first segment is a literal, so that surface is its path space (`model`,
-        // `async-invoke`, `guardrail`, `guardrail-checks`), which the generated
-        // `ROUTE_PATH_SEGMENTS` carries and the rule matches by EXACT segment equality —
-        // never by prefix, which is what keeps `model` out of the control plane's
-        // `model-copy-jobs`, `model-import-jobs` and the rest.
-        service_common::claims_request(
+        // The claim is therefore this service's own modelled path space, through the one
+        // rule `service_common::bedrock` states for the family (which narrows
+        // `service_common::claims_request` with the family's shared-segment split):
+        // `async-invoke`, `guardrail`, `guardrail-checks` and `model` — the segments this
+        // `restJson1` model binds, none of which another member publishes, matched by
+        // EXACT segment equality, never by prefix, which is what keeps `model` out of the
+        // control plane's `model-copy-jobs`, `model-import-jobs` and the rest. `None` for
+        // the RPC argument: every operation here is bound to a URI.
+        service_common::bedrock::claims_request(
             parts,
-            self.entry.identity().signing_name(),
+            self.definition(),
             crate::ROUTE_PATH_SEGMENTS,
             None,
         )

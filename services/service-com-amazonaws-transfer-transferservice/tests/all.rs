@@ -51,5 +51,7 @@ mod user_properties_and_keys;
 mod user_state_persistence;
 #[path = "all/web_app_lifecycle.rs"]
 mod web_app_lifecycle;
+#[path = "all/web_app_listing.rs"]
+mod web_app_listing;
 #[path = "all/workflow_lifecycle.rs"]
 mod workflow_lifecycle;

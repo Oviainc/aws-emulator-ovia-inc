@@ -65,3 +65,58 @@ Model evidence (services/service-com-amazonaws-ram-amazonresourcesharing/smithy-
 4. Cause 2: in the same fixture, inspect the UntagResource call (step task#4) and compare $.deletedTags[0]: __type = "Tag" is present in the recording and missing from the emulator's body.
 5. Cause 3: replay fixture ram-principal-association-workflow through step task#5 — create a resource share, associate a principal in the owner's own account/organization, then call DisassociateResourceShare for that principal. Read $.resourceShareAssociations[0].external in the 200 response: the recording has false, the emulator returns true.
 6. After fixing, re-replay all three bindings to confirm: ram-resource-share-tagging#task#2, ram-resource-share-tagging#task#4 and ram-principal-association-workflow#task#5.
+
+## Resolution notes
+
+All three recorded differences are DECLINED as defects of this emulator, on model and
+corpus evidence; the one derivation the issue questions (cause 3's `external`) was made
+faithful to the rule its own documentation states, and all three rules are now pinned by
+`services/service-com-amazonaws-ram-amazonresourcesharing/tests/all/response_payload_fidelity.rs`
+(declared in that crate's `tests/all.rs`).
+
+### Causes 1 and 2 — `__type` inside a success body (declined)
+
+The RULE: **a 2xx body carries exactly the members the model declares, and one shape
+serializes one way wherever it is reported**; the restJson1 `__type` discriminator
+belongs to the ERROR envelope (`vendor/smithy-schema-server/src/rest_json.rs` writes it
+there and nowhere else).
+
+* `smithy_query(query="shape",shape="Tag")` declares `com.amazonaws.ram#Tag` with
+  exactly `key` and `value`.
+* The SAME recorded fixture `ram-resource-share-tagging` serializes that same `Tag`
+  shape WITHOUT `__type` under `resourceShare.tags` (steps task#3 and task#5 replay
+  clean; the replay reports only task#2, task#4 and
+  `ram-principal-association-workflow#task#5` as diverged). So no serializer rule
+  produces the discriminator — emitting it would have to be keyed to two output members
+  of two operations while the identical shape in the identical fixture goes without it.
+
+Every operation in this crate that reports a `TagList` (`TagResource$tagsCreated`,
+`UntagResource$deletedTags`, and `ResourceShare$tags` on `CreateResourceShare`,
+`GetResourceShares` and `UpdateResourceShare`) is therefore left as it is, and the test
+asserts over a table of tag pairs that each reported entry carries only modelled
+members, that one stored pair is byte-identical in `tagsCreated` and inside the share,
+and that a refused tag mutation DOES carry `__type` in its error envelope.
+
+### Cause 3 — `external` (derivation made faithful, recorded value declined)
+
+`ResourceShareAssociation$external` is ONE member of the ONE shape all three association
+operations return, documented as "whether the principal belongs to the same organization
+in Organizations as the … account that owns the resource share", so its value cannot
+depend on which operation reports it. The same recording confirms that: the step right
+after the disassociation, `ram-principal-association-workflow#task#6`
+(`GetResourceShareAssociations` for the SAME share and principal `123456789012`), records
+`external: true` and replays clean, while task#5 records `false` for that same record. No
+rule produces both, so the emulator reports the one stored, derived value on all three
+operations — the issue's "filled in with a constant" reading is not what the code does
+(`state::AssociationRecord::external`, derived once in `state::entity_is_external`).
+
+What the issue is right about is that the derivation was account equality rather than
+organization membership. It now follows the documented rule: an entity that names a part
+of an AWS Organizations hierarchy — an organization, a root, an organizational unit or an
+account inside one, by an ARN of the `organizations` service or by the bare `o-`/`ou-`/`r-`
+id — is in the owner's organization whatever account the ARN carries, because RAM admits
+only the caller's own organization there; the owning account itself (bare, or as an ARN's
+account field) stays in-organization; any other account, principal in one, or service
+principal is reported external. The test asserts that over fourteen entity forms and
+asserts the value is identical on `AssociateResourceShare`,
+`GetResourceShareAssociations` and `DisassociateResourceShare` for each record.

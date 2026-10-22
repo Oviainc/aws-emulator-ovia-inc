@@ -63,9 +63,18 @@ impl Answer {
         self.body["id"].as_str().unwrap_or_default().to_string()
     }
 
-    /// The wire error code (`__type`), or the empty string on a success.
+    /// The error-type discriminator the body carries — `__type`, or the `code` / `Code`
+    /// spellings the same JSON error parsers also accept — or the empty string when it
+    /// carries none.
+    ///
+    /// Every refusal of one of this service's own modelled exceptions must carry NONE of
+    /// them: AmplifyUIBuilder names no exception on the wire, so a client classifies a
+    /// failure by HTTP status (see `component_refusals.rs`).
     fn error_code(&self) -> &str {
-        self.body["__type"].as_str().unwrap_or_default()
+        ["__type", "code", "Code"]
+            .iter()
+            .find_map(|member| self.body[*member].as_str())
+            .unwrap_or_default()
     }
 
     /// The `entities` the answer carries, as a list of JSON values.
@@ -602,8 +611,8 @@ async fn export_components_refuses_a_token_it_never_issued() {
         );
         assert_eq!(
             refused.error_code(),
-            "InvalidParameterException",
-            "case nextToken={token:?}: expected the modelled InvalidParameterException, got {:?}",
+            "",
+            "case nextToken={token:?}: a refusal must name no error type, got {:?}",
             refused.body
         );
     }

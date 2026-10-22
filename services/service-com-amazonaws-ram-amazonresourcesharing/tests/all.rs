@@ -17,6 +17,8 @@ mod harness;
 mod mutation_reports;
 #[path = "all/resource_shares.rs"]
 mod resource_shares;
+#[path = "all/response_payload_fidelity.rs"]
+mod response_payload_fidelity;
 #[path = "all/share_tags_and_configuration.rs"]
 mod share_tags_and_configuration;
 #[path = "all/state_roundtrip.rs"]
