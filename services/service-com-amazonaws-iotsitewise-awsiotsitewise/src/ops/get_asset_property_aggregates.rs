@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAssetPropertyAggregates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAssetPropertyAggregates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAssetPropertyAggregates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation computes the aggregates of an asset property's stored
+//! time series from the shared engine store (`crate::state`); this is the ONLY file to
+//! touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +175,277 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAssetPropertyAggregates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAssetPropertyAggregatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAssetPropertyAggregatesError::Modeled(
+                GetAssetPropertyAggregatesErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        // `resolution` is "the time interval over which to aggregate data"; the window
+        // length it names comes from the shared `crate::state::RESOLUTIONS` table, the
+        // one place this crate defines what a window covers. The query below is built
+        // by the one constructor that checks it, so a resolution this crate has no
+        // definition for is refused there rather than reaching the series.
+
+        // `aggregateTypes` is modelled `len 1..`: a minimum with no maximum, so the
+        // caller chooses the length. Every entry must be an `AggregateType` the model
+        // declares — the accepted values come from the generated
+        // `AGGREGATE_TYPE_VALUES`, so a model refresh cannot leave this check behind —
+        // and the list is DEDUPLICATED, so a type repeated in it is computed once and
+        // the per-window work is bounded by the six modelled functions rather than by
+        // the length of the list.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAssetPropertyAggregates"))
+        // The length guard below is this EMULATOR's own bound, not modelled behaviour:
+        // the model states no maximum, so a list that repeats a type past the number of
+        // types that exist may well be accepted by the real service. It is kept because
+        // a generated emulator must bound every caller-chosen size, and a list longer
+        // than the six functions can only be naming one of them twice — it asks for
+        // nothing the longest meaningful list does not already ask for.
+        if input.aggregate_types.len() > AGGREGATE_TYPE_VALUES.len() {
+            return Err(invalid_request(format!(
+                "aggregateTypes carries {} entries, but only {} aggregate types exist.",
+                input.aggregate_types.len(),
+                AGGREGATE_TYPE_VALUES.len()
+            )));
+        }
+        if let Some(unknown) = input
+            .aggregate_types
+            .iter()
+            .find(|requested| !AGGREGATE_TYPE_VALUES.contains(&requested.as_str()))
+        {
+            return Err(invalid_request(format!(
+                "aggregateTypes carries {unknown}, which is not one of {}.",
+                AGGREGATE_TYPE_VALUES.join(", ")
+            )));
+        }
+        let mut aggregate_types: Vec<String> = Vec::with_capacity(input.aggregate_types.len());
+        for aggregate in &input.aggregate_types {
+            if !aggregate_types.contains(aggregate) {
+                aggregate_types.push(aggregate.clone());
+            }
+        }
+
+        // "The exclusive start of the range" and "the inclusive end", so the queried
+        // range is `(startDate, endDate]`. An INVERTED range is a malformed request and
+        // is refused — the same refusal `BatchGetAssetPropertyAggregates` reports for an
+        // entry whose `startDate` follows its `endDate`. An EMPTY one (the two bounds
+        // equal) is well formed and simply holds no reading, so it is answered with no
+        // window rather than refused, which is what that operation answers too.
+        let start_exclusive_nanos = crate::state::date_time_nanos(&input.start_date);
+        let end_inclusive_nanos = crate::state::date_time_nanos(&input.end_date);
+        if start_exclusive_nanos > end_inclusive_nanos {
+            return Err(invalid_request(
+                "startDate must not follow endDate.".to_string(),
+            ));
+        }
+
+        // The modelled `maxResults` range carries only a minimum, so the documented
+        // ceiling ("The maximum value of maxResults is 2500") is enforced here, as a
+        // refusal naming the member and its bound.
+        let max_results = match input.max_results {
+            Some(requested) if requested > MAX_RESULTS_CEILING => {
+                return Err(invalid_request(format!(
+                    "maxResults is at most {MAX_RESULTS_CEILING}, but this request asks \
+                     for {requested}."
+                )))
+            }
+            // `maxResults` carries the modelled range minimum of 1, which the runtime
+            // validates BEFORE this handler runs, so a value that arrives here is
+            // already at least 1 and nothing is being coerced.
+            Some(requested) => requested as usize,
+            None => DEFAULT_MAX_RESULTS as usize,
+        };
+
+        // `timeOrdering` is "the chronological sorting order of the requested
+        // information", defaulting to ASCENDING. The accepted values come from the
+        // generated `TIME_ORDERING_VALUES`.
+        let descending = match input.time_ordering.as_deref() {
+            None => false,
+            Some(ORDER_DESCENDING) => true,
+            Some(ordering) if TIME_ORDERING_VALUES.contains(&ordering) => false,
+            Some(other) => {
+                return Err(invalid_request(format!(
+                    "timeOrdering {other} is not one of {}.",
+                    TIME_ORDERING_VALUES.join(", ")
+                )))
+            }
+        };
+
+        // `qualities` is "the quality by which to filter asset data" and is bounded at
+        // exactly one value, so an aggregate always covers ONE quality — which is what
+        // `AggregatedValue$quality` then reports. With no filter the aggregated data is
+        // the GOOD data — `crate::state::DEFAULT_QUALITY`, the quality a reading
+        // written without one carries, and the same default the quality-aware write
+        // compares against. The model documents no default for `qualities`, so
+        // GOOD-by-default is this emulator's inference from those two modelled facts
+        // rather than a documented or recorded behaviour;
+        // `GetAssetPropertyValueHistory`, whose samples each carry their own quality,
+        // reasonably reads an absent filter as "every quality" instead. The filter must
+        // be a modelled `Quality`, from the generated `QUALITY_VALUES`: an unmodelled
+        // one is refused rather than degraded to an empty answer.
+        let quality = input
+            .qualities
+            .as_ref()
+            .and_then(|qualities| qualities.first())
+            .map_or(crate::state::DEFAULT_QUALITY, String::as_str)
+            .to_string();
+        if !QUALITY_VALUES.contains(&quality.as_str()) {
+            return Err(invalid_request(format!(
+                "qualities carries {quality}, which is not one of {}.",
+                QUALITY_VALUES.join(", ")
+            )));
+        }
+
+        let store = state.lock();
+
+        // A property is named either by its asset and property ids or by its alias;
+        // exactly one of the two forms identifies it. Resolved exactly as
+        // `GetAssetPropertyValue` resolves it — the asset label through the shared
+        // `resolve_asset_id`, the property through `AssetRecord::property_position` —
+        // so a property is named one way across the service.
+        let (asset_id, property_id) = match (
+            input.asset_id.as_deref(),
+            input.property_id.as_deref(),
+            input.property_alias.as_deref(),
+        ) {
+            (Some(asset_label), Some(property_label), None) => {
+                let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
+                    not_found(format!("The asset {asset_label} could not be found."))
+                })?;
+                let resolved = store.assets.get(&asset_id).and_then(|asset| {
+                    asset
+                        .property_position(property_label)
+                        .map(|at| asset.properties[at].id.clone())
+                });
+                let property_id = resolved.ok_or_else(|| {
+                    not_found(format!(
+                        "The asset {asset_label} has no property {property_label}."
+                    ))
+                })?;
+                (asset_id, property_id)
+            }
+            (None, None, Some(alias)) => {
+                store.property_alias_index.get(alias).cloned().ok_or_else(|| {
+                    not_found(format!("The property alias {alias} could not be found."))
+                })?
+            }
+            _ => {
+                return Err(invalid_request(
+                    "Specify either assetId and propertyId, or propertyAlias.".to_string(),
+                ))
+            }
+        };
+
+        // The aggregates themselves come from the ONE engine this crate has for them,
+        // `crate::state::aggregated_values`, which `BatchGetAssetPropertyAggregates`
+        // reads its series through too: the two operations cannot disagree about what a
+        // window covers, which samples it counts, or what it reduces to. A window no
+        // in-range sample of the filtered quality falls in is absent rather than
+        // reported as a zero, and DESCENDING is the same windows read the other way.
+        let query = crate::state::AggregateQuery::new(
+            &input.resolution,
+            start_exclusive_nanos,
+            end_inclusive_nanos,
+            &quality,
+            &aggregate_types,
+            descending,
+        )
+        .ok_or_else(|| {
+            invalid_request(format!(
+                "resolution {} is none of {}.",
+                input.resolution,
+                crate::state::RESOLUTIONS
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<&str>>()
+                    .join(", ")
+            ))
+        })?;
+        let aggregated = crate::state::aggregated_values(&store, &asset_id, &property_id, &query);
+        drop(store);
+
+        // `nextToken` is this enumeration's resume point: the window start of the first
+        // aggregate of the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
+        // refused rather than answered with an empty page.
+        let first = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                aggregated
+                    .iter()
+                    .position(|value| value.timestamp.secs() == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        let last = first.saturating_add(max_results).min(aggregated.len());
+        let next_token = aggregated
+            .get(last)
+            .map(|value| encode_token(value.timestamp.secs()));
+        let aggregated_values = aggregated[first..last].to_vec();
+
+        Ok(GetAssetPropertyAggregatesOutput {
+            aggregated_values,
+            next_token,
+        })
     }
+}
+
+/// The one `TimeOrdering` value that reverses the enumeration; the other value the
+/// model declares (and the absent member) leaves it ascending, which is the default
+/// the model documents for `timeOrdering`.
+const ORDER_DESCENDING: &str = "DESCENDING";
+
+/// The ceiling the model doc on `GetAssetPropertyAggregatesRequest$maxResults`
+/// states: "The maximum value of maxResults is 2500." The modelled `@range` carries
+/// only the minimum, so the handler enforces this one.
+const MAX_RESULTS_CEILING: i32 = 2_500;
+
+/// How many aggregates one page carries when the request names no `maxResults`.
+///
+/// The emulator's own default: AWS documents only the ceiling above and a 1 MB
+/// response bound, neither of which fixes a default page size.
+const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// A `nextToken` resuming at the window starting `window_start` seconds after the
+/// epoch.
+fn encode_token(window_start: i64) -> String {
+    ::hex::encode(window_start.to_string().as_bytes())
+}
+
+/// Decode a `nextToken` back into the window start it resumes from.
+fn decode_token(token: &str) -> Result<i64, GetAssetPropertyAggregatesError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.parse::<i64>().ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> GetAssetPropertyAggregatesError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> GetAssetPropertyAggregatesError {
+    GetAssetPropertyAggregatesError::Modeled(
+        GetAssetPropertyAggregatesErrorModeled::InvalidRequestException(InvalidRequestException {
+            message,
+        }),
+    )
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> GetAssetPropertyAggregatesError {
+    GetAssetPropertyAggregatesError::Modeled(
+        GetAssetPropertyAggregatesErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException { message },
+        ),
+    )
 }
