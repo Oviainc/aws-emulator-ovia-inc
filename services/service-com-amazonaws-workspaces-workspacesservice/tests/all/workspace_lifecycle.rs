@@ -43,6 +43,32 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
 }
 
 
+/// Register `directory_id` through the wire, the way a client would, so a create
+/// request naming it can resolve it.
+///
+/// `CreateWorkspaces` refuses an element whose `DirectoryId` is not registered with
+/// WorkSpaces, so every case below that creates a WorkSpace registers its directory
+/// first. The subnet ids match the model's `SubnetId` pattern
+/// `^(subnet-([0-9a-f]{8}|[0-9a-f]{17}))$`.
+///
+/// `pub(crate)`: see [`emulator_with_engine`].
+pub(crate) async fn register_directory(router: &MultiServiceRouter, directory_id: &str) {
+    let request = json!({
+        "DirectoryId": directory_id,
+        "SubnetIds": ["subnet-11111111", "subnet-22222222"],
+    });
+    let (status, body) = call(router, "RegisterWorkspaceDirectory", &request).await;
+    assert_eq!(
+        status, 200,
+        "case {directory_id}: RegisterWorkspaceDirectory must answer 200, body {body:?}"
+    );
+    assert_eq!(
+        body["DirectoryId"].as_str(),
+        Some(directory_id),
+        "case {directory_id}: the registration reports the directory it registered, body {body:?}"
+    );
+}
+
 /// Call one operation on `router` and return `(status, body)`.
 ///
 /// The `Authorization` credential scope is what routes the request: it names the signing
@@ -85,6 +111,8 @@ pub(crate) async fn call(
 /// Asking the store about a future instant is deterministic, so the suite asserts the
 /// rule instead of racing a wall clock on a loaded runner. The handlers themselves
 /// always settle against the real clock.
+///
+/// `pub(crate)`: see [`emulator_with_engine`].
 pub(crate) fn settle(engine: &Arc<engine::InMemoryEngine>) {
     let state = service_state(&**engine).expect("the WorkSpaces state store");
     state
@@ -199,12 +227,12 @@ fn create_request_table() -> Vec<Value> {
         json!({
             "DirectoryId": "d-1234567890",
             "UserName": "alice",
-            "BundleId": "wsb-12345678",
+            "BundleId": "wsb-amznstandard",
         }),
         json!({
             "DirectoryId": "d-1234567890",
             "UserName": "bob",
-            "BundleId": "wsb-abcdef01",
+            "BundleId": "wsb-amznvalue",
             "VolumeEncryptionKey": "arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555",
             "UserVolumeEncryptionEnabled": true,
             "RootVolumeEncryptionEnabled": false,
@@ -214,7 +242,7 @@ fn create_request_table() -> Vec<Value> {
             // RunningMode, Compute and Protocol enums.
             "DirectoryId": "d-00000000ab",
             "UserName": "carol",
-            "BundleId": "wsb-99999999",
+            "BundleId": "wsb-amznperformance",
             "WorkspaceProperties": {
                 "RunningMode": "AUTO_STOP",
                 "RunningModeAutoStopTimeoutInMinutes": 60,
@@ -227,14 +255,14 @@ fn create_request_table() -> Vec<Value> {
         json!({
             "DirectoryId": "wsd-abcdef0123",
             "UserName": "DAVE",
-            "BundleId": "wsb-12345678",
+            "BundleId": "wsb-amznstandard",
             "Tags": [{ "Key": "team", "Value": "research" }, { "Key": "cost-center" }],
             "Ipv6Address": "2001:db8::1",
         }),
         json!({
             "DirectoryId": "d-1234567890",
             "UserName": "[UNDEFINED]",
-            "BundleId": "wsb-12345678",
+            "BundleId": "wsb-amznstandard",
             "WorkspaceName": "shared_station_1",
         }),
     ]
@@ -243,6 +271,9 @@ fn create_request_table() -> Vec<Value> {
 #[tokio::test]
 async fn created_workspaces_are_persisted_and_described_back() {
     let (router, engine) = emulator_with_engine();
+    for directory_id in ["d-1234567890", "d-00000000ab", "wsd-abcdef0123"] {
+        register_directory(&router, directory_id).await;
+    }
     let mut created: Vec<(Value, String)> = Vec::new();
 
     for request in create_request_table() {
@@ -320,12 +351,13 @@ async fn created_workspaces_are_persisted_and_described_back() {
 #[tokio::test]
 async fn lifecycle_transitions_are_persisted_through_describe() {
     let (router, engine) = emulator_with_engine();
+    register_directory(&router, "d-1234567890").await;
     let workspace_id = create_one(
         &router,
         &json!({
             "DirectoryId": "d-1234567890",
             "UserName": "alice",
-            "BundleId": "wsb-12345678",
+            "BundleId": "wsb-amznstandard",
         }),
     )
     .await;
@@ -404,12 +436,13 @@ async fn lifecycle_transitions_are_persisted_through_describe() {
 #[tokio::test]
 async fn unknown_and_wrong_state_ids_are_reported_per_item() {
     let (router, engine) = emulator_with_engine();
+    register_directory(&router, "d-1234567890").await;
     let available = create_one(
         &router,
         &json!({
             "DirectoryId": "d-1234567890",
             "UserName": "alice",
-            "BundleId": "wsb-12345678",
+            "BundleId": "wsb-amznstandard",
         }),
     )
     .await;
@@ -418,7 +451,7 @@ async fn unknown_and_wrong_state_ids_are_reported_per_item() {
         &json!({
             "DirectoryId": "d-1234567890",
             "UserName": "bob",
-            "BundleId": "wsb-12345678",
+            "BundleId": "wsb-amznstandard",
         }),
     )
     .await;
@@ -507,10 +540,11 @@ async fn unknown_and_wrong_state_ids_are_reported_per_item() {
 #[tokio::test]
 async fn create_reports_per_item_failures_without_a_top_level_error() {
     let (router, engine) = emulator_with_engine();
+    register_directory(&router, "d-1234567890").await;
     let taken = json!({
         "DirectoryId": "d-1234567890",
         "UserName": "Alice",
-        "BundleId": "wsb-12345678",
+        "BundleId": "wsb-amznstandard",
     });
     let first = create_one(&router, &taken).await;
     settle(&engine);
@@ -518,28 +552,33 @@ async fn create_reports_per_item_failures_without_a_top_level_error() {
     // (the request, the expected ErrorCode). A directory user holds at most one
     // WorkSpace, and the model's `UserName` doc states the user name is not
     // case-sensitive, so a differently-cased name is the same user. A user-decoupled
-    // request (`UserName` = `[UNDEFINED]`) must carry `WorkspaceName`.
+    // request (`UserName` = `[UNDEFINED]`) must carry `WorkspaceName`. The codes are
+    // the per-item `ErrorType` vocabulary, not exception shape names.
     let cases: Vec<(Value, &str)> = vec![
-        (taken.clone(), "ResourceAlreadyExistsException"),
+        (taken.clone(), "ResourceExists.WorkspaceUser"),
         (
             json!({
                 "DirectoryId": "d-1234567890",
                 "UserName": "alice",
-                "BundleId": "wsb-abcdef01",
+                "BundleId": "wsb-amznvalue",
             }),
-            "ResourceAlreadyExistsException",
+            "ResourceExists.WorkspaceUser",
         ),
         (
             json!({
                 "DirectoryId": "d-1234567890",
                 "UserName": "[UNDEFINED]",
-                "BundleId": "wsb-12345678",
+                "BundleId": "wsb-amznstandard",
             }),
-            "InvalidParameterValuesException",
+            "InvalidParameterValues",
         ),
     ];
 
     for (request, expected_code) in cases {
+        // The echo carries the submitted request, with `Tags` reported as a list even
+        // for a request that sent none (see `create_workspaces_validation`).
+        let mut echoed = request.clone();
+        echoed["Tags"] = json!([]);
         let (status, body) =
             call(&router, "CreateWorkspaces", &json!({ "Workspaces": [request] })).await;
         assert_eq!(
@@ -565,7 +604,7 @@ async fn create_reports_per_item_failures_without_a_top_level_error() {
             "case {request:?}: expected ErrorCode {expected_code}, got {failures:?}"
         );
         assert_eq!(
-            &failures[0]["WorkspaceRequest"], &request,
+            &failures[0]["WorkspaceRequest"], &echoed,
             "case {request:?}: the failure echoes the request it refused, got {failures:?}"
         );
     }
@@ -581,12 +620,15 @@ async fn create_reports_per_item_failures_without_a_top_level_error() {
 #[tokio::test]
 async fn describe_filters_select_only_matching_workspaces() {
     let (router, engine) = emulator_with_engine();
+    for directory_id in ["d-1234567890", "wsd-abcdef0123"] {
+        register_directory(&router, directory_id).await;
+    }
     let alice = create_one(
         &router,
         &json!({
             "DirectoryId": "d-1234567890",
             "UserName": "alice",
-            "BundleId": "wsb-12345678",
+            "BundleId": "wsb-amznstandard",
             "WorkspaceName": "alice_station",
         }),
     )
@@ -596,7 +638,7 @@ async fn describe_filters_select_only_matching_workspaces() {
         &json!({
             "DirectoryId": "d-1234567890",
             "UserName": "bob",
-            "BundleId": "wsb-abcdef01",
+            "BundleId": "wsb-amznvalue",
         }),
     )
     .await;
@@ -605,7 +647,7 @@ async fn describe_filters_select_only_matching_workspaces() {
         &json!({
             "DirectoryId": "wsd-abcdef0123",
             "UserName": "carol",
-            "BundleId": "wsb-12345678",
+            "BundleId": "wsb-amznstandard",
         }),
     )
     .await;
@@ -643,7 +685,7 @@ async fn describe_filters_select_only_matching_workspaces() {
             vec![bob.clone()],
         ),
         (
-            json!({ "BundleId": "wsb-12345678" }),
+            json!({ "BundleId": "wsb-amznstandard" }),
             vec![alice.clone(), carol.clone()],
         ),
         (json!({ "BundleId": "wsb-00000000" }), vec![]),
@@ -666,6 +708,7 @@ async fn describe_filters_select_only_matching_workspaces() {
 #[tokio::test]
 async fn describe_paginates_over_a_stable_creation_order() {
     let (router, engine) = emulator_with_engine();
+    register_directory(&router, "d-1234567890").await;
     let mut expected = Vec::new();
     for user in ["u1", "u2", "u3", "u4", "u5"] {
         expected.push(
@@ -674,7 +717,7 @@ async fn describe_paginates_over_a_stable_creation_order() {
                 &json!({
                     "DirectoryId": "d-1234567890",
                     "UserName": user,
-                    "BundleId": "wsb-12345678",
+                    "BundleId": "wsb-amznstandard",
                 }),
             )
             .await,
@@ -747,6 +790,7 @@ async fn describe_paginates_over_a_stable_creation_order() {
 #[tokio::test]
 async fn the_workspace_store_refuses_to_grow_past_its_bound() {
     let (router, engine) = emulator_with_engine();
+    register_directory(&router, "d-1234567890").await;
     // Fill the store to its bound through the same state API the handler uses, so the
     // case costs one wire call rather than MAX_STORED_WORKSPACES of them.
     {
@@ -756,7 +800,7 @@ async fn the_workspace_store_refuses_to_grow_past_its_bound() {
             let request = WorkspaceRequest {
                 directory_id: "d-1234567890".to_string(),
                 user_name: format!("user{index}"),
-                bundle_id: "wsb-12345678".to_string(),
+                bundle_id: "wsb-amznstandard".to_string(),
                 ..WorkspaceRequest::default()
             };
             state
@@ -773,7 +817,7 @@ async fn the_workspace_store_refuses_to_grow_past_its_bound() {
     let request = json!({
         "DirectoryId": "d-1234567890",
         "UserName": "one-too-many",
-        "BundleId": "wsb-12345678",
+        "BundleId": "wsb-amznstandard",
     });
     let (status, body) =
         call(&router, "CreateWorkspaces", &json!({ "Workspaces": [request] })).await;
@@ -796,8 +840,8 @@ async fn the_workspace_store_refuses_to_grow_past_its_bound() {
     );
     assert_eq!(
         failures[0]["ErrorCode"].as_str(),
-        Some("ResourceLimitExceededException"),
-        "an exceeded limit is reported as ResourceLimitExceededException, got {failures:?}"
+        Some("ResourceLimitExceeded"),
+        "an exceeded limit is reported as the per-item ResourceLimitExceeded code, got {failures:?}"
     );
 
     let state = service_state(&*engine).expect("the WorkSpaces state store");
@@ -811,12 +855,13 @@ async fn the_workspace_store_refuses_to_grow_past_its_bound() {
 #[tokio::test]
 async fn describe_refuses_filter_combinations_the_service_forbids() {
     let (router, engine) = emulator_with_engine();
+    register_directory(&router, "d-1234567890").await;
     create_one(
         &router,
         &json!({
             "DirectoryId": "d-1234567890",
             "UserName": "alice",
-            "BundleId": "wsb-12345678",
+            "BundleId": "wsb-amznstandard",
             "WorkspaceName": "alice_station",
         }),
     )
@@ -829,9 +874,9 @@ async fn describe_refuses_filter_combinations_the_service_forbids() {
     // with DirectoryId", and a NextToken this service never minted names no page.
     let cases: Vec<Value> = vec![
         json!({ "WorkspaceIds": ["ws-00000000"], "DirectoryId": "d-1234567890" }),
-        json!({ "WorkspaceIds": ["ws-00000000"], "BundleId": "wsb-12345678" }),
-        json!({ "DirectoryId": "d-1234567890", "BundleId": "wsb-12345678" }),
-        json!({ "BundleId": "wsb-12345678", "WorkspaceName": "alice_station" }),
+        json!({ "WorkspaceIds": ["ws-00000000"], "BundleId": "wsb-amznstandard" }),
+        json!({ "DirectoryId": "d-1234567890", "BundleId": "wsb-amznstandard" }),
+        json!({ "BundleId": "wsb-amznstandard", "WorkspaceName": "alice_station" }),
         json!({ "DirectoryId": "d-1234567890", "WorkspaceName": "alice_station" }),
         json!({ "UserName": "alice" }),
         json!({ "NextToken": "not-a-token" }),
@@ -867,6 +912,7 @@ async fn paging_resumes_after_the_last_reported_workspace_when_the_store_changes
 
     for (limit, terminated) in cases {
         let (router, engine) = emulator_with_engine();
+        register_directory(&router, "d-1234567890").await;
         let mut created = Vec::new();
         for index in 0..6 {
             created.push(
@@ -875,7 +921,7 @@ async fn paging_resumes_after_the_last_reported_workspace_when_the_store_changes
                     &json!({
                         "DirectoryId": "d-1234567890",
                         "UserName": format!("user{index}"),
-                        "BundleId": "wsb-12345678",
+                        "BundleId": "wsb-amznstandard",
                     }),
                 )
                 .await,

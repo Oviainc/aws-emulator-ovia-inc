@@ -20,6 +20,9 @@ mod account_links;
 #[path = "all/connection_alias_lifecycle.rs"]
 mod connection_alias_lifecycle;
 
+#[path = "all/create_workspaces_validation.rs"]
+mod create_workspaces_validation;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

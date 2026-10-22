@@ -2,9 +2,15 @@
 
 //! @op CreateWorkspaces
 //!
-//! Implemented: each accepted `WorkspaceRequest` is persisted in this service's state
-//! with a freshly minted `WorkspaceId` and reported in `PendingRequests`; a request that
-//! cannot be created is reported per item in `FailedRequests`.
+//! Implemented: each `WorkspaceRequest` in the batch is judged on its own against this
+//! service's persisted state — the registered directory its `DirectoryId` names and the
+//! stored bundle its `BundleId` names — and an element that cannot be satisfied is
+//! reported, in the position it was submitted in, as a `FailedRequests` entry that
+//! echoes the submitted request verbatim and carries the per-item `ErrorType` code for
+//! what could not be resolved. Nothing is persisted for a refused element. An accepted
+//! element is persisted with a freshly minted `WorkspaceId` and reported in
+//! `PendingRequests`. Either way the response is a 200: the operation models no
+//! missing-resource error.
 //!
 //! ## Shape of an operation
 //!
@@ -171,8 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match state.create_workspace(request) {
                 Ok(record) => pending_requests.push(record.to_workspace()),
                 Err((error_code, error_message)) => {
+                    // The refused element is echoed back as submitted: a client
+                    // matches a failure to the request it sent by reading it
+                    // here. The one member not echoed as-is is `Tags`, which a
+                    // recorded AWS echo carries as a list even for a request
+                    // that sent none, so an absent `Tags` is reported as the
+                    // empty list rather than dropped.
+                    let mut echoed = request.clone();
+                    echoed.tags = Some(echoed.tags.unwrap_or_default());
                     failed_requests.push(FailedCreateWorkspaceRequest {
-                        workspace_request: Some(request.clone()),
+                        workspace_request: Some(echoed),
                         error_code: Some(error_code.to_string()),
                         error_message: Some(error_message),
                     });

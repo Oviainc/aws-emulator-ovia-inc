@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterWorkspaceDirectory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterWorkspaceDirectory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterWorkspaceDirectory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the directory the request names (or one this service mints a `wsd-` id
+//! for, when the request names none) is persisted in this service's directory registry
+//! and reported back with the registration state it is in. Registration is asynchronous,
+//! so the call answers `REGISTERING` and the clock owes `REGISTERED`.
+//!
+//! The registry is what `CreateWorkspaces` resolves a `WorkspaceRequest`'s `DirectoryId`
+//! against, so this is the operation that makes a directory usable.
 //!
 //! ## Shape of an operation
 //!
@@ -136,7 +135,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `RegisterWorkspaceDirectoryError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#RegisterWorkspaceDirectory")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#RegisterWorkspaceDirectory",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum RegisterWorkspaceDirectoryErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -148,6 +150,7 @@ pub enum RegisterWorkspaceDirectoryErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     UnsupportedNetworkConfigurationException(UnsupportedNetworkConfigurationException),
     WorkspacesDefaultRoleNotFoundException(WorkspacesDefaultRoleNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -201,18 +204,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterWorkspaceDirectory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterWorkspaceDirectoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterWorkspaceDirectory"))
+        // Request metadata decides nothing here; the input members do.
+        let _ = ctx;
+
+        // `DirectoryId` is OPTIONAL in the model: a request that names none asks
+        // WorkSpaces to register a directory of its own, which the model's
+        // `WorkspaceDirectoryName` ("The name of the directory to register") is
+        // then the only thing identifying — there is no Directory Service
+        // directory to take a name from, so a request with neither cannot be
+        // satisfied.
+        if input.directory_id.is_none() && input.workspace_directory_name.is_none() {
+            return Err(
+                RegisterWorkspaceDirectoryErrorModeled::InvalidParameterValuesException(
+                    InvalidParameterValuesException {
+                        message: Some(
+                            "WorkspaceDirectoryName must be specified when no DirectoryId is \
+                             specified."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterWorkspaceDirectoryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the WorkSpaces state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+        // Clear any transition the clock already owes before judging whether this
+        // directory is already registered.
+        state.settle();
+
+        let requested = crate::state::NewDirectory {
+            directory_id: input.directory_id.clone(),
+            subnet_ids: input.subnet_ids.clone().unwrap_or_default(),
+            tenancy: input.tenancy.clone(),
+            workspace_type: input.workspace_type.clone(),
+            user_identity_type: input.user_identity_type.clone(),
+            directory_name: input.workspace_directory_name.clone(),
+            directory_description: input.workspace_directory_description.clone(),
+            self_service_enabled: input.enable_self_service,
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let record = state.register_directory(&requested).map_err(|refusal| {
+            let message = Some(refusal.message().to_string());
+            match refusal {
+                crate::state::DirectoryRefusal::AlreadyRegistered(_) => {
+                    RegisterWorkspaceDirectoryErrorModeled::ResourceAlreadyExistsException(
+                        ResourceAlreadyExistsException { message },
+                    )
+                }
+                crate::state::DirectoryRefusal::LimitExceeded(_) => {
+                    RegisterWorkspaceDirectoryErrorModeled::ResourceLimitExceededException(
+                        ResourceLimitExceededException { message },
+                    )
+                }
+            }
+        })?;
+        drop(state);
+
+        Ok(RegisterWorkspaceDirectoryOutput {
+            directory_id: Some(record.directory_id.clone()),
+            // Registration is asynchronous ("returns before the WorkSpace
+            // directory is registered"), so what is reported is the state the
+            // stored record is in right now.
+            state: Some(record.state.as_wire().to_string()),
+        })
     }
 }

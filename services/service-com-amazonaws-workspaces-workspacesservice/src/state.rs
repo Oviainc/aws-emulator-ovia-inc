@@ -27,6 +27,12 @@
 //! the Amazon-provided catalog every account can create WorkSpaces from, which
 //! exists before any caller arrives and so is seeded when the store is built,
 //! plus the bundles an account owns.
+//!
+//! It also owns the DIRECTORY REGISTRY `RegisterWorkspaceDirectory` writes: the
+//! directories this account has registered with WorkSpaces, which is what a
+//! `CreateWorkspaces` request's `DirectoryId` resolves against. Unlike the
+//! bundle catalog it starts empty — a directory exists in WorkSpaces only once
+//! it has been registered.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime};
@@ -67,17 +73,67 @@ pub const DEFAULT_DESCRIBE_PAGE_SIZE: usize = 25;
 /// Per-item error code for a WorkSpace id that names no stored WorkSpace.
 ///
 /// The batch operations report per-item failures inside a 200 response, so the
-/// code is a string rather than a modelled error; each of the three below names
-/// one of THIS service's own modelled error shapes.
+/// code is a string rather than a modelled error. These four spell one of THIS
+/// service's own modelled error SHAPE names, and are what `StartWorkspaces`,
+/// `StopWorkspaces`, `TerminateWorkspaces` and the bundle store still report
+/// (that those three should report the dotted `ErrorType` vocabulary instead is
+/// its own open issue); the `ERROR_CODE_*` constants below them are the
+/// `ErrorType` codes `CreateWorkspaces` reports.
 pub const ERROR_CODE_NOT_FOUND: &str = "ResourceNotFoundException";
 /// Per-item error code for a WorkSpace whose current state forbids the change.
 pub const ERROR_CODE_INVALID_STATE: &str = "InvalidResourceStateException";
-/// Per-item error code for a create request that collides with a stored WorkSpace.
+/// Per-item error code for a create request that collides with a stored resource.
 pub const ERROR_CODE_ALREADY_EXISTS: &str = "ResourceAlreadyExistsException";
 /// Per-item error code for a create request whose member combination is invalid.
 pub const ERROR_CODE_INVALID_PARAMETERS: &str = "InvalidParameterValuesException";
 /// Per-item error code for a create request the store has no room for.
 pub const ERROR_CODE_LIMIT_EXCEEDED: &str = "ResourceLimitExceededException";
+
+/// Per-item `ErrorType` code for a create request naming a directory that is not
+/// registered with WorkSpaces.
+///
+/// `FailedCreateWorkspaceRequest$ErrorCode` targets the model's `ErrorType`
+/// ("The error code that is returned if the WorkSpace cannot be created") — a
+/// per-item code VOCABULARY, not one of this service's exception shape names.
+/// The model spells its other per-item code lists the same `Category.Resource`
+/// way (`ASSOCIATION_ERROR_CODE_VALUES` in `ops::types` is
+/// `DeploymentError.WorkspaceUnreachable`, `ValidationError.InsufficientMemory`,
+/// …). `ResourceNotFound.Directory` and `ResourceNotFound.Bundle` are the codes
+/// AWS answers an unresolvable directory and an unresolvable bundle with; the
+/// three below them follow the same vocabulary for the refusals this store can
+/// also report per element, none of which AWS publishes a spelling for.
+pub const ERROR_CODE_DIRECTORY_NOT_FOUND: &str = "ResourceNotFound.Directory";
+/// Per-item `ErrorType` code for a create request naming a bundle that is not stored.
+pub const ERROR_CODE_BUNDLE_NOT_FOUND: &str = "ResourceNotFound.Bundle";
+/// Per-item `ErrorType` code for a create request whose directory user already
+/// holds a WorkSpace.
+pub const ERROR_CODE_WORKSPACE_EXISTS: &str = "ResourceExists.WorkspaceUser";
+/// Per-item `ErrorType` code for a create request whose member combination is
+/// invalid. No resource is missing, so the code names no resource.
+pub const ERROR_CODE_CREATE_INVALID_PARAMETERS: &str = "InvalidParameterValues";
+/// Per-item `ErrorType` code for a create request the store has no room for.
+pub const ERROR_CODE_CREATE_LIMIT_EXCEEDED: &str = "ResourceLimitExceeded";
+
+/// The `ErrorMessage` reported beside [`ERROR_CODE_DIRECTORY_NOT_FOUND`].
+///
+/// AWS publishes no wording for this member; this is the text a recorded AWS
+/// response carried, kept because it describes the refusal. What is load-bearing
+/// is the CODE beside it.
+pub const MESSAGE_DIRECTORY_NOT_FOUND: &str =
+    "The specified directory could not be found in the specified region.";
+/// The `ErrorMessage` reported beside [`ERROR_CODE_BUNDLE_NOT_FOUND`]. See
+/// [`MESSAGE_DIRECTORY_NOT_FOUND`].
+pub const MESSAGE_BUNDLE_NOT_FOUND: &str =
+    "The specified bundle could not be found in the specified region.";
+
+/// The most WorkSpace directories this emulator keeps registered at once.
+///
+/// AWS caps the directories an account registers with a service quota and
+/// reports an exceeded cap as `ResourceLimitExceededException`, which
+/// `RegisterWorkspaceDirectory` models. The NUMBER is this emulator's own bound
+/// on an in-memory store, and sits far above anything a test or client script
+/// registers.
+pub const MAX_REGISTERED_DIRECTORIES: usize = 50;
 
 /// The most WorkSpaces this emulator stores at once.
 ///
@@ -361,6 +417,31 @@ fn occupancy_key(directory_id: &str, user_name: &str, workspace_name: Option<&st
     }
 }
 
+/// The registration state of a stored WorkSpace directory.
+///
+/// Both variants render to a value of the model's `WorkspaceDirectoryState`
+/// (`WORKSPACE_DIRECTORY_STATE_VALUES` in `ops::types`). Registration is the
+/// only directory lifecycle this emulator stores, so `DEREGISTERING`,
+/// `DEREGISTERED` and `ERROR` are not reachable: `DeregisterWorkspaceDirectory`
+/// is still a scaffold stub, and nothing here fails a registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryRegistrationState {
+    /// The directory is being registered.
+    Registering,
+    /// The directory is registered and WorkSpaces can be created in it.
+    Registered,
+}
+
+impl DirectoryRegistrationState {
+    /// The `WorkspaceDirectoryState` value this state serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Registering => "REGISTERING",
+            Self::Registered => "REGISTERED",
+        }
+    }
+}
+
 /// The most connection aliases this emulator stores at once.
 ///
 /// AWS caps connection aliases with an adjustable service quota and reports an
@@ -399,6 +480,109 @@ impl ConnectionAliasLifecycleState {
             Self::Created => Some("CREATED"),
             Self::Deleting => Some("DELETING"),
             Self::Removed => None,
+        }
+    }
+}
+
+/// A registration the clock owes: the state to move to, and when it is due.
+#[derive(Debug, Clone, Copy)]
+struct PendingRegistration {
+    to: DirectoryRegistrationState,
+    due: Instant,
+}
+
+/// One registered WorkSpace directory.
+///
+/// This is the resource a `WorkspaceRequest`'s `DirectoryId` resolves against:
+/// the model points that member at "the Directory Service directory for the
+/// WorkSpace. You can use DescribeWorkspaceDirectories to list the available
+/// directories", so a WorkSpace can only be created in a directory this account
+/// has registered.
+#[derive(Debug, Clone)]
+pub struct WorkspaceDirectoryRecord {
+    /// Registration sequence number: the stable order
+    /// [`ComAmazonawsWorkspacesWorkspacesserviceState::ordered_directories`]
+    /// reports, and what a minted `wsd-` id is derived from.
+    pub seq: u64,
+    pub directory_id: String,
+    pub state: DirectoryRegistrationState,
+    pub subnet_ids: Vec<String>,
+    /// One of the model's `Tenancy` values, when the request named one.
+    pub tenancy: Option<String>,
+    /// One of the model's `WorkspaceType` values, when the request named one.
+    pub workspace_type: Option<String>,
+    /// One of the model's `UserIdentityType` values, when the request named one.
+    pub user_identity_type: Option<String>,
+    pub directory_name: Option<String>,
+    pub directory_description: Option<String>,
+    pub self_service_enabled: Option<bool>,
+    pub tags: Vec<Tag>,
+    pub registered: SystemTime,
+    pending: Option<PendingRegistration>,
+}
+
+impl WorkspaceDirectoryRecord {
+    /// Enter `transient` now and owe `settled` once [`TRANSITION_DELAY`] elapses.
+    fn begin(&mut self, transient: DirectoryRegistrationState, settled: DirectoryRegistrationState) {
+        self.state = transient;
+        self.pending = Some(PendingRegistration {
+            to: settled,
+            due: Instant::now() + TRANSITION_DELAY,
+        });
+    }
+
+    /// Apply the owed transition if `now` has reached its due instant.
+    fn settle(&mut self, now: Instant) {
+        let Some(pending) = self.pending else {
+            return;
+        };
+        if now < pending.due {
+            return;
+        }
+        self.state = pending.to;
+        self.pending = None;
+    }
+}
+
+/// What a directory registration carries: the members
+/// `RegisterWorkspaceDirectory` takes that this store holds.
+///
+/// `DirectoryId` is OPTIONAL in the model; a request that omits it registers a
+/// directory WorkSpaces itself identifies, and the store mints the `wsd-` id for
+/// it (`DirectoryId` is `^(d-[0-9a-f]{8,63}$)|(wsd-[0-9a-z]{8,63}$)$`).
+#[derive(Debug, Clone, Default)]
+pub struct NewDirectory {
+    pub directory_id: Option<String>,
+    pub subnet_ids: Vec<String>,
+    pub tenancy: Option<String>,
+    pub workspace_type: Option<String>,
+    pub user_identity_type: Option<String>,
+    pub directory_name: Option<String>,
+    pub directory_description: Option<String>,
+    pub self_service_enabled: Option<bool>,
+    pub tags: Vec<Tag>,
+}
+
+/// Why a directory registration was refused, as the modelled error the handler
+/// answers with.
+///
+/// A registration is a single resource, not a batch element, so a refusal is a
+/// top-level modelled error rather than an [`ItemFailure`].
+#[derive(Debug, Clone)]
+pub enum DirectoryRefusal {
+    /// The `DirectoryId` names a directory that is already registered —
+    /// `ResourceAlreadyExistsException`.
+    AlreadyRegistered(String),
+    /// The store has no room for another registration —
+    /// `ResourceLimitExceededException`.
+    LimitExceeded(String),
+}
+
+impl DirectoryRefusal {
+    /// The refusal's message, for the modelled error's `Message` member.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::AlreadyRegistered(message) | Self::LimitExceeded(message) => message,
         }
     }
 }
@@ -731,6 +915,11 @@ fn catalog_user_capacity_gib(compute: &str) -> u32 {
 /// built store already holds the Amazon-provided catalog (see [`Self::default`]),
 /// because those bundles exist in every account before any caller arrives —
 /// `DescribeWorkspaceBundles` reports them, it does not create them.
+///
+/// The directory registry, by contrast, starts EMPTY: a directory exists in
+/// WorkSpaces only once `RegisterWorkspaceDirectory` has registered it, which is
+/// why a `CreateWorkspaces` request naming an unregistered `DirectoryId` cannot
+/// be satisfied.
 #[derive(Debug)]
 pub struct ComAmazonawsWorkspacesWorkspacesserviceState {
     /// Every stored WorkSpace, keyed by its `WorkspaceId`. Never larger than
@@ -789,6 +978,15 @@ pub struct ComAmazonawsWorkspacesWorkspacesserviceState {
     /// Monotonic counter behind both the minted `BundleId` and the order
     /// [`Self::ordered_bundles`] reports.
     next_bundle_seq: u64,
+    /// Every directory this account has registered, keyed by its `DirectoryId`.
+    /// Never larger than [`MAX_REGISTERED_DIRECTORIES`]. A directory is REACHED
+    /// through [`Self::directory`] and written only by
+    /// [`Self::register_directory`]: it is the resource `CreateWorkspaces`
+    /// resolves a request's `DirectoryId` against, so nothing else may add one.
+    directories: HashMap<String, WorkspaceDirectoryRecord>,
+    /// Monotonic counter behind both a minted `wsd-` `DirectoryId` and the
+    /// registration order [`Self::ordered_directories`] reports.
+    next_directory_seq: u64,
 }
 
 impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
@@ -819,6 +1017,8 @@ impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
             bundles: BTreeMap::new(),
             bundle_ids: HashMap::new(),
             next_bundle_seq: 0,
+            directories: HashMap::new(),
+            next_directory_seq: 0,
         };
         state.seed_amazon_bundle_catalog(SystemTime::now());
         state
@@ -826,9 +1026,10 @@ impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
 }
 
 impl ComAmazonawsWorkspacesWorkspacesserviceState {
-    /// Materialise every lifecycle transition the clock already owes, and drop
-    /// the WorkSpaces whose termination and the connection aliases whose
-    /// deletion have completed.
+    /// Materialise every lifecycle transition the clock already owes — of a
+    /// WorkSpace, of a connection alias and of a directory registration alike —
+    /// and drop the WorkSpaces whose termination and the connection aliases
+    /// whose deletion have completed.
     ///
     /// Due at the same instant whether or not anybody called, so a reporting
     /// operation may run it.
@@ -842,6 +1043,9 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     /// test can state the instant it is asking about instead of sleeping.
     pub fn settle_at(&mut self, now: Instant) {
         for record in self.workspaces.values_mut() {
+            record.settle(now);
+        }
+        for record in self.directories.values_mut() {
             record.settle(now);
         }
         let completed: Vec<String> = self
@@ -884,6 +1088,88 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     /// The stored WorkSpace `workspace_id` names, if any.
     pub fn workspace(&self, workspace_id: &str) -> Option<&WorkspaceRecord> {
         self.workspaces.get(workspace_id)
+    }
+
+    /// The registered directory `directory_id` names, if any.
+    ///
+    /// A directory is reported from the instant `RegisterWorkspaceDirectory`
+    /// registered it, whether the registration has settled to `REGISTERED` or is
+    /// still `REGISTERING`: registration completing is a transition the clock
+    /// owes, and AWS documents no rule that refuses a create while it is under
+    /// way.
+    pub fn directory(&self, directory_id: &str) -> Option<&WorkspaceDirectoryRecord> {
+        self.directories.get(directory_id)
+    }
+
+    /// How many directories are registered.
+    pub fn directory_count(&self) -> usize {
+        self.directories.len()
+    }
+
+    /// Every registered directory in registration order.
+    pub fn ordered_directories(&self) -> Vec<&WorkspaceDirectoryRecord> {
+        let mut directories: Vec<&WorkspaceDirectoryRecord> = self.directories.values().collect();
+        directories.sort_by_key(|record| record.seq);
+        directories
+    }
+
+    /// Register one directory, or report why it could not be registered.
+    ///
+    /// `RegisterWorkspaceDirectory` is the only caller. Registration is
+    /// documented as asynchronous ("returns before the WorkSpace directory is
+    /// registered"), so the stored record starts `REGISTERING` and the clock owes
+    /// it `REGISTERED`. A request that names no `DirectoryId` gets one minted
+    /// from the registration sequence number, which cannot repeat within a run.
+    pub fn register_directory(
+        &mut self,
+        request: &NewDirectory,
+    ) -> Result<WorkspaceDirectoryRecord, DirectoryRefusal> {
+        if let Some(directory_id) = request.directory_id.as_deref() {
+            if self.directories.contains_key(directory_id) {
+                return Err(DirectoryRefusal::AlreadyRegistered(format!(
+                    "The directory {directory_id} is already registered with Amazon WorkSpaces."
+                )));
+            }
+        }
+        if self.directories.len() >= MAX_REGISTERED_DIRECTORIES {
+            return Err(DirectoryRefusal::LimitExceeded(format!(
+                "Your resource limits have been exceeded: at most {MAX_REGISTERED_DIRECTORIES} directories can be registered."
+            )));
+        }
+
+        let seq = self.next_directory_seq();
+        let directory_id = request
+            .directory_id
+            .clone()
+            .unwrap_or_else(|| format!("wsd-{seq:08x}"));
+        let mut record = WorkspaceDirectoryRecord {
+            seq,
+            directory_id: directory_id.clone(),
+            state: DirectoryRegistrationState::Registering,
+            subnet_ids: request.subnet_ids.clone(),
+            tenancy: request.tenancy.clone(),
+            workspace_type: request.workspace_type.clone(),
+            user_identity_type: request.user_identity_type.clone(),
+            directory_name: request.directory_name.clone(),
+            directory_description: request.directory_description.clone(),
+            self_service_enabled: request.self_service_enabled,
+            tags: request.tags.clone(),
+            registered: SystemTime::now(),
+            pending: None,
+        };
+        record.begin(
+            DirectoryRegistrationState::Registering,
+            DirectoryRegistrationState::Registered,
+        );
+        self.directories.insert(directory_id, record.clone());
+        Ok(record)
+    }
+
+    /// The next registration sequence number. Strictly increasing and never
+    /// reset, as [`Self::next_seq`] is for WorkSpaces.
+    fn next_directory_seq(&mut self) -> u64 {
+        self.next_directory_seq += 1;
+        self.next_directory_seq
     }
 
     /// The account-wide BYOL configuration `DescribeAccount` reports.
@@ -934,6 +1220,13 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
 
     /// Create one WorkSpace from `request`, or report why it could not be created.
     ///
+    /// Every element of a `CreateWorkspaces` batch is judged here on its own, and
+    /// a request this refuses persists NOTHING. The order of the checks is the
+    /// order the refusals are reported in: the request's member combination
+    /// first (it can be judged without touching the store), then the resources it
+    /// names — the directory, then the bundle — then the directory slot it would
+    /// occupy, then the store's own bound.
+    ///
     /// The returned record is a snapshot of what was persisted, so the caller can
     /// serialize it into `PendingRequests` without holding the map borrow.
     pub fn create_workspace(
@@ -942,10 +1235,36 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     ) -> Result<WorkspaceRecord, ItemFailure> {
         if request.user_name == USER_DECOUPLED_USER_NAME && request.workspace_name.is_none() {
             return Err((
-                ERROR_CODE_INVALID_PARAMETERS,
+                ERROR_CODE_CREATE_INVALID_PARAMETERS,
                 format!(
                     "WorkspaceName is required when UserName is {USER_DECOUPLED_USER_NAME}."
                 ),
+            ));
+        }
+
+        // A WorkSpace lives in a directory registered with WorkSpaces: the model
+        // points `WorkspaceRequest$DirectoryId` at "the Directory Service
+        // directory for the WorkSpace. You can use DescribeWorkspaceDirectories
+        // to list the available directories", so an id naming nothing registered
+        // names no directory this account can create in. The directory is
+        // resolved BEFORE the bundle because it is the resource the WorkSpace
+        // lives in: an element naming neither is reported against it.
+        if !self.directories.contains_key(&request.directory_id) {
+            return Err((
+                ERROR_CODE_DIRECTORY_NOT_FOUND,
+                MESSAGE_DIRECTORY_NOT_FOUND.to_string(),
+            ));
+        }
+
+        // ... and is created FROM a bundle: `WorkspaceRequest$BundleId` is "the
+        // identifier of the bundle for the WorkSpace. You can use
+        // DescribeWorkspaceBundles to list the available bundles", which is this
+        // store's bundles — the Amazon-provided catalog plus the ones this
+        // account created.
+        if !self.bundle_ids.contains_key(&request.bundle_id) {
+            return Err((
+                ERROR_CODE_BUNDLE_NOT_FOUND,
+                MESSAGE_BUNDLE_NOT_FOUND.to_string(),
             ));
         }
 
@@ -960,7 +1279,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
             .and_then(|workspace_id| self.workspaces.get(workspace_id))
         {
             return Err((
-                ERROR_CODE_ALREADY_EXISTS,
+                ERROR_CODE_WORKSPACE_EXISTS,
                 format!(
                     "WorkSpace {} already exists for user {} in directory {}.",
                     existing.workspace_id, existing.user_name, existing.directory_id
@@ -971,7 +1290,7 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         // The store is bounded: refuse rather than grow without end.
         if self.workspaces.len() >= MAX_STORED_WORKSPACES {
             return Err((
-                ERROR_CODE_LIMIT_EXCEEDED,
+                ERROR_CODE_CREATE_LIMIT_EXCEEDED,
                 format!(
                     "Your resource limits have been exceeded: at most {MAX_STORED_WORKSPACES} WorkSpaces can exist."
                 ),
