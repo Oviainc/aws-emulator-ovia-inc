@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The deleted portfolio can no longer be replayed, so its idempotency tokens
         // are dropped with it: a create repeating one of them creates a new portfolio.
         let deleted = input.id;
-        state.idempotency.retain(|_, id| id != &deleted);
+        state.forget_portfolio_tokens(&deleted);
 
         // `ResourceInUseException` is the refusal for a portfolio that still has
         // products, shares or constraints attached. Nothing can attach any of those

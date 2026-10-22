@@ -4,8 +4,9 @@
 //! IMPLEMENTED: overwrites the stored feed's name, outputs and access role, so a
 //! later GetFeed/ListFeeds reports the new values. PUT overwrite semantics: the
 //! payload replaces the existing one, so an omitted `accessRoleArn` clears the role.
-//! The reconfiguration is accepted into the transient `UPDATING` status, which the
-//! clock moves back to `AVAILABLE`.
+//! The overwrite is complete when the call answers (HTTP 200), so the response
+//! reports the feed's settled status — `AVAILABLE` with no resource associated,
+//! `ACTIVE` while one holds it — rather than a transient one.
 //!
 //! ## Shape of an operation
 //!
@@ -256,9 +257,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
         feed.access_role_arn = input.access_role_arn;
-        // The feed is being reconfigured: UPDATING is the modelled transient status,
-        // and the clock moves it back to AVAILABLE.
-        let due = feed.enter_transient(crate::state::FeedStatus::Updating, now);
+        // The feed's LIFECYCLE status is not what an update moves: UpdateFeed answers
+        // HTTP 200, not 202, so the overwrite is complete when the call answers and the
+        // feed reports the status it HOLDS — AVAILABLE with no resource associated,
+        // ACTIVE while one holds it. An update never parks the feed in a transient
+        // status the caller would have to wait out, and it neither cancels nor
+        // accelerates a transition the clock already owes (a feed accepted moments ago
+        // is still CREATING until its creation falls due). AssociateFeed, also a 200,
+        // already works this way.
 
         let output = UpdateFeedOutput {
             arn: feed.arn.clone(),
@@ -271,7 +277,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             association: feed.association.clone(),
             tags: Some(feed.tag_map()),
         };
-        state.note_due(due);
         Ok(output)
     }
 }

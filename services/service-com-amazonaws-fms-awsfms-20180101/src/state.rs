@@ -31,19 +31,80 @@ const ARN_NAMESPACE: &str = "fms";
 /// returned ready, so it is `READY` from the moment it is written.
 ///
 /// `associated_at` is recorded here but not yet reported by any implemented
-/// operation: it is what the later `DisassociateAdminAccount` /
-/// `ListAdminAccountsForOrganization` slice reads, so it is stored now rather
-/// than being a derivation a reader computes.
+/// operation: it is what the later `ListAdminAccountsForOrganization` slice
+/// reads, so it is stored now rather than being a derivation a reader computes.
+///
+/// `removal_due` is the instant a requested disassociation completes — see
+/// [`ComAmazonawsFmsAwsfms20180101State::settle_admin_account`]. It is `None`
+/// for an association no caller has asked to tear down.
 #[derive(Debug, Clone)]
 pub struct AdminAccountRecord {
     pub account_id: String,
     pub role_status: String,
     pub associated_at: SystemTime,
+    pub removal_due: Option<SystemTime>,
+}
+
+impl AdminAccountRecord {
+    /// Whether this association still makes its account the organisation's
+    /// default administrator AT `now`.
+    ///
+    /// A `DELETED` role is the terminal state of a completed disassociation: the
+    /// record is kept so `GetAdminAccount` can report what became of the account,
+    /// but the administrator slot is free again. A disassociation whose
+    /// completion instant ([`Self::removal_due`]) has passed is already the same
+    /// thing — the transition is owed whether or not anybody has materialised it
+    /// — so this predicate is derived from the CLOCK rather than from waiting for
+    /// a writer, and no reader of the store can disagree with another about
+    /// whether an administrator exists.
+    /// [`ComAmazonawsFmsAwsfms20180101State::settle_admin_account_at`] is what
+    /// persists the status that follows from it.
+    ///
+    /// It takes `now` so one request decides from ONE reading of a clock that is
+    /// not monotonic: an operation that checks the association and then writes to
+    /// it must not be able to see it active and then gone.
+    pub fn is_active_at(&self, now: SystemTime) -> bool {
+        self.role_status != ROLE_STATUS_DELETED && self.removal_due.is_none_or(|due| now < due)
+    }
+
+    /// [`Self::is_active_at`] at the current instant, for a caller that makes ONE
+    /// decision from it.
+    pub fn is_active(&self) -> bool {
+        self.is_active_at(SystemTime::now())
+    }
+
+    /// Whether a disassociation of this association has been requested and has
+    /// not completed yet.
+    pub fn removal_pending(&self) -> bool {
+        self.removal_due.is_some()
+    }
 }
 
 /// `AccountRoleStatus` of an administrator account whose role exists and is
 /// usable. One of [`crate::ops::types::ACCOUNT_ROLE_STATUS_VALUES`].
 pub const ROLE_STATUS_READY: &str = "READY";
+
+/// `AccountRoleStatus` of an administrator account whose role deletion has been
+/// requested (by `DisassociateAdminAccount`) and has not completed yet. One of
+/// [`crate::ops::types::ACCOUNT_ROLE_STATUS_VALUES`].
+pub const ROLE_STATUS_PENDING_DELETION: &str = "PENDING_DELETION";
+
+/// `AccountRoleStatus` of an administrator account whose role deletion has
+/// completed: the account is no longer the default administrator. One of
+/// [`crate::ops::types::ACCOUNT_ROLE_STATUS_VALUES`].
+pub const ROLE_STATUS_DELETED: &str = "DELETED";
+
+/// How long a requested disassociation stays `PENDING_DELETION` before the role
+/// is `DELETED`.
+///
+/// A CHOSEN span, not a documented one: neither the model nor the Firewall
+/// Manager documentation states how long tearing the administrator role down
+/// takes, only that the role passes through the non-terminal
+/// `PENDING_DELETION` / `DELETING` statuses of `AccountRoleStatus` on the way.
+/// It is deliberately non-zero, so a caller reading the association straight
+/// after asking for the disassociation still observes that transient status,
+/// and short enough that a caller that waits does not wait long.
+pub const DISASSOCIATION_SPAN: Duration = Duration::from_millis(500);
 
 /// The `CustomerPolicyScopeIdType` key under which a policy's `IncludeMap` /
 /// `ExcludeMap` holds ACCOUNT IDS (the only other key, `ORG_UNIT`, holds
@@ -354,6 +415,54 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
 /// The administrator gate every organisation-scoped Firewall Manager operation
 /// runs FIRST lives beside the state it reads: see [`require_administrator`].
 impl ComAmazonawsFmsAwsfms20180101State {
+    /// Materialise, as of `now`, the disassociation the CLOCK has already made
+    /// due: once [`AdminAccountRecord::removal_due`] has passed the administrator
+    /// role IS `DELETED` ([`AdminAccountRecord::is_active_at`] already reads it
+    /// that way), and this writes that status into the record so a reader reports
+    /// it.
+    ///
+    /// It is the one write a reporting operation (`GetAdminAccount`) may make:
+    /// the transition was owed at this instant whether or not anybody called, so
+    /// performing it here changes nothing a later caller could not have derived
+    /// itself. An operation that only needs to know WHETHER an administrator
+    /// exists need not call it at all — the predicate is clock-derived, so
+    /// [`require_administrator`] answers the same before and after.
+    pub fn settle_admin_account_at(&mut self, now: SystemTime) {
+        let Some(admin) = self.admin_account.as_mut() else {
+            return;
+        };
+        if !admin.is_active_at(now) && admin.role_status != ROLE_STATUS_DELETED {
+            admin.role_status = ROLE_STATUS_DELETED.to_string();
+            admin.removal_due = None;
+        }
+    }
+
+    /// [`Self::settle_admin_account_at`] at the current instant.
+    pub fn settle_admin_account(&mut self) {
+        self.settle_admin_account_at(SystemTime::now());
+    }
+
+    /// The association that currently makes an account the organisation's
+    /// default administrator, after settling what the clock owes. `None` when no
+    /// association was ever made and when the last one has been torn down.
+    pub fn active_admin_account(&mut self) -> Option<&AdminAccountRecord> {
+        let now = SystemTime::now();
+        self.settle_admin_account_at(now);
+        self.admin_account.as_ref().filter(|a| a.is_active_at(now))
+    }
+
+    /// [`Self::active_admin_account`] as of `now`, mutably: the association an
+    /// operation that CHANGES the administrator slot works on, so the write site
+    /// neither re-derives the active-association predicate nor re-reads the clock
+    /// after deciding.
+    pub fn active_admin_account_mut_at(
+        &mut self,
+        now: SystemTime,
+    ) -> Option<&mut AdminAccountRecord> {
+        self.settle_admin_account_at(now);
+        self.admin_account.as_mut().filter(|a| a.is_active_at(now))
+    }
+
     /// The `PolicyId` of the stored policy whose ARN is `arn`, or `None` when no
     /// stored Firewall Manager resource carries that ARN.
     ///
@@ -377,10 +486,15 @@ impl ComAmazonawsFmsAwsfms20180101State {
     /// account in that organisation — including the caller. With no association
     /// there is no administrator to enumerate at all, which the caller is told
     /// with the modelled `ResourceNotFoundException` rather than an empty page.
+    ///
+    /// An association `DisassociateAdminAccount` has torn down
+    /// ([`AdminAccountRecord::is_active`] is false) manages nothing any more, so
+    /// it is left out.
     pub fn managing_admin_accounts(&self) -> Vec<String> {
         let mut accounts: Vec<String> = self
             .admin_account
             .iter()
+            .filter(|admin| admin.is_active())
             .map(|admin| admin.account_id.clone())
             .collect();
         accounts.sort();
@@ -409,9 +523,13 @@ impl ComAmazonawsFmsAwsfms20180101State {
     ///
     /// A `BTreeSet` so the order is total and an account named by two policies
     /// is reported once: a page boundary is then a key, not a cursor.
+    ///
+    /// An association `DisassociateAdminAccount` has torn down is not an
+    /// administrator of the organization any more, so its account is only
+    /// recorded here while the association is active.
     pub fn member_accounts(&self) -> BTreeSet<String> {
         let mut accounts = BTreeSet::new();
-        if let Some(admin) = self.admin_account.as_ref() {
+        if let Some(admin) = self.admin_account.as_ref().filter(|a| a.is_active()) {
             accounts.insert(admin.account_id.clone());
         }
         for record in self.policies.values() {
@@ -508,6 +626,12 @@ pub fn is_account_id(value: &str) -> bool {
 /// `AccessDeniedException`, which this service's model declares for no
 /// operation (hence [`crate::scaffolded::Scaffolded::access_denied`], HTTP 400).
 ///
+/// It answers through [`AdminAccountRecord::is_active`], so an association
+/// `DisassociateAdminAccount` has torn down is no administrator: the gate closes
+/// again once the tear-down the clock owed has completed, whether or not any
+/// operation has materialised the `DELETED` status yet. It therefore takes the
+/// store immutably and writes nothing.
+///
 /// The refusal's message is BUILT FROM THE REQUEST — it names the calling
 /// account and the Region the request was signed for, the two things that decide
 /// which administrator association was looked for — so `region` is the caller's
@@ -521,16 +645,29 @@ pub fn is_account_id(value: &str) -> bool {
 /// refusal: an authorization decision that leaked whether the resource exists would
 /// tell an unauthorized caller what the organization holds. A refused call therefore
 /// also writes nothing.
+/// The refusal [`require_administrator`] states when the organization has no
+/// Firewall Manager administrator: HTTP 400 `AccessDeniedException`, naming the
+/// calling account and the Region the request was signed for.
+///
+/// Separate from the gate so an operation that resolves the association itself —
+/// one that must hold it MUTABLY to change it, and so cannot take the gate's
+/// shared borrow — states the SAME refusal instead of wording its own.
+pub fn no_administrator_refusal<E>(region: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::access_denied(format!(
+        "No default admin could be found for account {} in Region {region}",
+        ::engine::emulator_account_id()
+    ))
+}
+
 pub fn require_administrator<'store, E>(
     store: &'store ComAmazonawsFmsAwsfms20180101State,
     region: &str,
 ) -> Result<&'store AdminAccountRecord, crate::scaffolded::Scaffolded<E>> {
-    store.admin_account.as_ref().ok_or_else(|| {
-        crate::scaffolded::Scaffolded::access_denied(format!(
-            "No default admin could be found for account {} in Region {region}",
-            ::engine::emulator_account_id()
-        ))
-    })
+    store
+        .admin_account
+        .as_ref()
+        .filter(|admin| admin.is_active())
+        .ok_or_else(|| no_administrator_refusal(region))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

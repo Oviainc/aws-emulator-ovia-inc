@@ -105,3 +105,29 @@ State lives in the SINGLE shared engine, keyed by type. Reach it through
 Do not add a second engine crate — the router and every service must share
 one `InMemoryEngine` type or the engine the router injects cannot be handed to this
 service's operations.
+
+## Seeding the event trackers and datasets this service ingests into
+
+This service is pure ingestion and models no control-plane operation: a `trackingId`
+comes from `CreateEventTracker` and a `datasetArn` from `CreateDataset`, both in the
+*Amazon Personalize* service (`service-com-amazonaws-personalize-amazonpersonalize`),
+not here. So all five operations serve only a target that is in this crate's registry,
+and refuse anything else — `ResourceNotFoundException` (404) where the operation models
+it, `InvalidInputException` (400) for `PutEvents`, which does not.
+
+A test, or a sibling Personalize emulator sharing the same engine, seeds the registry
+through the two seam methods on the state struct:
+
+```rust
+let state = engine.state::<ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState>();
+state.lock().register_event_tracker("tracker-1", None);
+state.lock().register_dataset("arn:aws:personalize:us-east-1:123456789012:dataset/demo/ITEMS");
+```
+
+Both are idempotent and never discard what was already ingested; each answers `None`
+once the store holds its documented maximum. Until the Personalize control-plane crate
+calls them from `CreateEventTracker` / `CreateDataset` (a follow-up this crate cannot
+make, since it cannot reach that service's handlers — filed as
+`issues/things-that-do-not-work/20261022T000000Z-personalize-control-plane-does-not-register-event-trackers-or-datasets-for-ingestion.md`),
+an SDK client talking to the running emulator has no wire path to register a target, so
+seeding is in-process only. `tests/all/ingestion.rs` shows the whole flow.

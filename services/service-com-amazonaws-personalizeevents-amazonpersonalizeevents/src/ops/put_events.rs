@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Ingests a batch of item-interaction events into the event stream of the tracker the
+//! request names, stamping each one with the call's session and user. The response body
+//! is empty (the modelled output is `Unit`), so the stored stream in
+//! [`crate::state`] is the whole result of the call — nothing is echoed back.
+//!
+//! Two rules come from the model's own documentation:
+//!
+//! * `eventId` — "If an event ID is not provided, Amazon Personalize generates a unique
+//!   ID for the event. Amazon Personalize uses the event ID to distinguish unique
+//!   events. Any subsequent events after the first with the same event ID are not
+//!   used": an omitted id is generated, and an id the tracker has already seen is
+//!   ingested once, not twice.
+//! * `properties` — a JSON string map whose keys may not be one of the six names the
+//!   member's documentation reserves (case insensitive). Both are refused with
+//!   `InvalidInputException` (400), the only error this operation models.
+//!
+//! Like its four siblings this operation serves only a tracker this emulator knows: a
+//! `trackingId` is minted by `CreateEventTracker` in the Personalize control plane, so
+//! one that names no registered tracker is refused rather than created. This operation
+//! models NO `ResourceNotFoundException`, so the refusal is its one modelled error,
+//! `InvalidInputException` (400) — see `crate::state` for the registry a test or a
+//! sibling Personalize emulator seeds.
+//!
+//! A tracker marked in use still ingests here: this operation models no
+//! `ResourceInUseException`, and answering a client-fault 400 for a busy resource would
+//! misreport whose fault it is.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +181,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEvents"))
+        // `ctx` carries request metadata only; this operation needs none of it (its
+        // target is named in the body, and it mints no ARN).
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| invalid_input(crate::state::STORE_UNAVAILABLE))?;
+
+        let received_at = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // The stream being appended to lives in the store's `event_trackers`, while the
+        // counter behind a generated `eventId` is a field of the store itself, and one
+        // pass needs both at once: splitting the borrow by field is what lets it hold
+        // the tracker and mint an id without a second lookup per event.
+        let crate::state::ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState {
+            event_trackers,
+            generated_event_ids,
+            ..
+        } = &mut *state;
+
+        // The target is resolved FIRST, as it is for this service's other four
+        // operations: a request wrong about both its tracker and an event answers for
+        // the tracker.
+        let tracker = event_trackers.get_mut(&input.tracking_id).ok_or_else(|| {
+            invalid_input(format!(
+                "No event tracker with the tracking ID {} exists.",
+                input.tracking_id
+            ))
+        })?;
+
+        // Validate every event BEFORE storing any of it: the call has one status, so a
+        // batch carrying one unusable event ingests none of the batch.
+        let mut validated = Vec::with_capacity(input.event_list.len());
+        for event in &input.event_list {
+            let properties = match event.properties.as_deref() {
+                Some(raw) => Some(
+                    crate::state::parse_properties("Event.properties", raw, true)
+                        .map_err(invalid_input)?,
+                ),
+                None => None,
+            };
+            validated.push((event, properties));
+        }
+
+        for (event, properties) in validated {
+            let event_id = event
+                .event_id
+                .clone()
+                .unwrap_or_else(|| crate::state::generate_event_id(generated_event_ids));
+            if !tracker.claim_event_id(&event_id) {
+                // An event this tracker already holds under that id: the first one
+                // stands, this one is not a second record.
+                continue;
+            }
+            tracker.push_event(crate::state::StoredEvent {
+                event_id,
+                event_type: event.event_type.clone(),
+                sent_at: event.sent_at,
+                received_at,
+                session_id: input.session_id.clone(),
+                user_id: input.user_id.clone(),
+                item_id: event.item_id.clone(),
+                event_value: event.event_value,
+                properties,
+                recommendation_id: event.recommendation_id.clone(),
+                impression: event.impression.clone().unwrap_or_default(),
+                metric_attribution: event.metric_attribution.as_ref().map(|attribution| {
+                    crate::state::StoredMetricAttribution {
+                        event_attribution_source: attribution.event_attribution_source.clone(),
+                    }
+                }),
+            });
+        }
+
+        Ok(PutEventsOutput)
     }
+}
+
+/// This operation's one modelled failure, carrying `message`.
+///
+/// It is also what an unreachable store answers with: `PutEvents` models no server
+/// fault, and [`crate::state::service_state`] only answers `None` for an engine that is
+/// not the shared `InMemoryEngine` the router builds.
+fn invalid_input(message: impl Into<String>) -> PutEventsError {
+    PutEventsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
 }

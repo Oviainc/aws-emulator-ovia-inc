@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateServiceAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateServiceAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateServiceAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateServiceAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateServiceAction"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        // `IdempotencyToken` is `@idempotencyToken`: "If multiple requests differ only
+        // by the idempotency token, the same response is returned for each repeated
+        // request" — so a token already seen REPLAYS the action it created rather than
+        // minting a second one. A token whose action has since been deleted is no longer
+        // a replay and falls through to a fresh create.
+        if let Some(action) = state.replayed_service_action(&input.idempotency_token) {
+            return Ok(CreateServiceActionOutput {
+                service_action_detail: Some(action.detail()),
+            });
+        }
+
+        // The account's self-service-action quota. Refused before anything is stored, so
+        // a caller cannot grow the store past it by repeating the call.
+        if state.service_actions.len() >= crate::state::MAX_SERVICE_ACTIONS {
+            return Err(CreateServiceActionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "An account cannot hold more than {} self-service actions.",
+                        crate::state::MAX_SERVICE_ACTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.next_service_action_id();
+        let action = crate::state::ServiceAction {
+            id: id.clone(),
+            name: input.name,
+            description: input.description,
+            definition_type: input.definition_type,
+            // The modelled `ServiceActionDefinitionMap` bounds and key enum are already
+            // enforced by the time this handler runs; it is stored in key order so every
+            // read reports the same map.
+            definition: input.definition.into_iter().collect(),
+        };
+
+        let detail = action.detail();
+        state.service_actions.insert(id.clone(), action);
+        state.remember_service_action_token(input.idempotency_token, id);
+
+        Ok(CreateServiceActionOutput {
+            service_action_detail: Some(detail),
+        })
     }
 }

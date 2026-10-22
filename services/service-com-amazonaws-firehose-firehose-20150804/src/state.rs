@@ -203,6 +203,9 @@ pub struct DeliveryStream {
     pub last_update_timestamp: SystemTime,
     pub source: Option<SourceDescription>,
     pub destinations: Vec<Destination>,
+    /// The stream's SSE state, as the last encryption call left it. `None` for a stream
+    /// SSE was never configured on, which `DescribeDeliveryStream` reports as the
+    /// documented disabled state ([`disabled_encryption`]).
     pub encryption: Option<DeliveryStreamEncryptionConfiguration>,
     /// The `DeliveryStreamEncryptionStatus` the clock owes this stream's encryption
     /// configuration, with the instant it comes due. Enabling and disabling SSE are
@@ -332,6 +335,24 @@ impl DeliveryStream {
             Some((PendingTransition::Remove, due)) if now >= due => false,
             _ => true,
         }
+    }
+}
+
+/// The SSE state `DescribeDeliveryStream` reports for a stream SSE was never configured
+/// on: the documented disabled status and nothing else — with SSE off there is no CMK, so
+/// `KeyType` and `KeyARN` are unset ("If KeyType is Amazon Web Services_OWNED_CMK,
+/// DeliveryStreamEncryptionConfiguration doesn't contain a value for KeyARN").
+///
+/// A stream ALWAYS has an SSE state to report: `DeliveryStreamEncryptionConfiguration` is
+/// "the server-side encryption (SSE) status for the delivery stream ... You can get
+/// DeliveryStreamEncryptionConfiguration by invoking the DescribeDeliveryStream
+/// operation", and [`ENCRYPTION_DISABLED`] is the modelled status for "not encrypted".
+pub fn disabled_encryption() -> DeliveryStreamEncryptionConfiguration {
+    DeliveryStreamEncryptionConfiguration {
+        key_arn: None,
+        key_type: None,
+        status: Some(ENCRYPTION_DISABLED.to_string()),
+        failure_description: None,
     }
 }
 
