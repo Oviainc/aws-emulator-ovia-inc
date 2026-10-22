@@ -7,6 +7,9 @@
 //! so the wire protocol, the route table, the boundary validator and the handlers are all
 //! exercised exactly as a signed SDK request would exercise them. Each table row states
 //! its own case so a failure names the input that produced it.
+//!
+//! The request helpers below are `pub(crate)` so the sibling suites of this one test
+//! target (`tests/all/*.rs`) drive the service through the same harness.
 
 use std::sync::Arc;
 
@@ -32,7 +35,7 @@ const RETENTION_VALUE_MAX: i64 = 3650;
 /// Source: smithy_query(query="shape", shape="UnlockDelay") — range {min: 7, max: 30}.
 const UNLOCK_DELAY_MIN: i64 = 7;
 
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     // The single shared engine the production router builds and hands to every
     // operation of this service.
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -54,7 +57,7 @@ fn authorization() -> String {
 
 /// Dispatch one request through the router and return its status and parsed JSON body
 /// (`Null` for an empty body, as a 204 has).
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -87,14 +90,14 @@ async fn call(
     (status, parsed)
 }
 
-async fn create_rule(
+pub(crate) async fn create_rule(
     router: &MultiServiceRouter,
     body: serde_json::Value,
 ) -> (u16, serde_json::Value) {
     call(router, "POST", "/rules", Some(body)).await
 }
 
-async fn get_rule(router: &MultiServiceRouter, identifier: &str) -> (u16, serde_json::Value) {
+pub(crate) async fn get_rule(router: &MultiServiceRouter, identifier: &str) -> (u16, serde_json::Value) {
     call(router, "GET", &format!("/rules/{identifier}"), None).await
 }
 
@@ -105,7 +108,7 @@ async fn list_rules(
     call(router, "POST", "/list-rules", Some(body)).await
 }
 
-async fn update_rule(
+pub(crate) async fn update_rule(
     router: &MultiServiceRouter,
     identifier: &str,
     body: serde_json::Value,
@@ -119,7 +122,7 @@ async fn update_rule(
     .await
 }
 
-async fn delete_rule(router: &MultiServiceRouter, identifier: &str) -> (u16, serde_json::Value) {
+pub(crate) async fn delete_rule(router: &MultiServiceRouter, identifier: &str) -> (u16, serde_json::Value) {
     call(router, "DELETE", &format!("/rules/{identifier}"), None).await
 }
 
@@ -137,11 +140,11 @@ fn is_next_token(candidate: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
 }
 
-fn retention(value: i64) -> serde_json::Value {
+pub(crate) fn retention(value: i64) -> serde_json::Value {
     serde_json::json!({ "RetentionPeriodValue": value, "RetentionPeriodUnit": "DAYS" })
 }
 
-fn lock_configuration(unlock_delay: i64) -> serde_json::Value {
+pub(crate) fn lock_configuration(unlock_delay: i64) -> serde_json::Value {
     serde_json::json!({
         "UnlockDelay": { "UnlockDelayValue": unlock_delay, "UnlockDelayUnit": "DAYS" }
     })

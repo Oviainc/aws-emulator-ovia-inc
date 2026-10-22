@@ -41,10 +41,10 @@
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
 //!
-//! This service uses that channel for the three awsQuery service-level errors its
-//! model declares no shape for but its own documentation names:
-//! `InvalidParameterValue`, `MissingRequiredParameter` and `InternalFailure`. See
-//! [`Scaffolded::Service`].
+//! This service uses that channel for the awsQuery service-level errors its
+//! model declares no shape for but its own documentation (or its recorded
+//! behaviour) names: `InvalidParameterValue`, `MissingRequiredParameter`,
+//! `MissingParameter` and `InternalFailure`. See [`Scaffolded::Service`].
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -228,6 +228,21 @@ pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 /// awsQuery error with no shape in the model.
 pub const MISSING_REQUIRED_PARAMETER: &str = "MissingRequiredParameter";
 
+/// `MissingParameter`: a parameter this operation needs for the combination of
+/// values supplied was absent, on an operation whose model documents NO code for
+/// that case.
+///
+/// The awsQuery family carries two codes for an absent parameter and Elastic
+/// Beanstalk uses both: [`MISSING_REQUIRED_PARAMETER`] where its own model names
+/// it (`TerminateEnvironment`, `RebuildEnvironment` and `RestartAppServer` all
+/// document "If you do not specify either, Elastic Beanstalk returns
+/// MissingRequiredParameter error"), and this generic query code where the model
+/// documents nothing — which is what the recorded responses of
+/// `ApplyEnvironmentManagedAction`, `DescribeEnvironmentHealth` and
+/// `DescribeInstancesHealth` carry for a request that names no environment. Like
+/// the two above it is a service-level error with no shape in the model.
+pub const MISSING_PARAMETER: &str = "MissingParameter";
+
 /// `InternalFailure`: the request failed for a reason internal to the emulator —
 /// the one 5xx of the awsQuery family's service-level errors. Reached only when
 /// the per-service store cannot be resolved, which cannot happen behind the
@@ -239,7 +254,8 @@ pub const INTERNAL_FAILURE: &str = "InternalFailure";
 #[derive(Debug, Clone)]
 pub struct ServiceError {
     /// The wire error code — [`INVALID_PARAMETER_VALUE`],
-    /// [`MISSING_REQUIRED_PARAMETER`] or [`INTERNAL_FAILURE`].
+    /// [`MISSING_REQUIRED_PARAMETER`], [`MISSING_PARAMETER`] or
+    /// [`INTERNAL_FAILURE`].
     /// `'static` because [`OperationError::shape_name`] returns a `&'static str`.
     pub code: &'static str,
     /// The HTTP status the code is returned with (400 for both of the above).
@@ -326,6 +342,16 @@ impl<E> Scaffolded<E> {
     pub fn missing_required_parameter(message: impl Into<String>) -> Self {
         Self::Service(ServiceError {
             code: MISSING_REQUIRED_PARAMETER,
+            status: 400,
+            message: message.into(),
+        })
+    }
+
+    /// Refuse the request with HTTP 400 [`MISSING_PARAMETER`]: a parameter this
+    /// operation needs was absent and its model documents no code for that case.
+    pub fn missing_parameter(message: impl Into<String>) -> Self {
+        Self::Service(ServiceError {
+            code: MISSING_PARAMETER,
             status: 400,
             message: message.into(),
         })

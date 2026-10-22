@@ -15,5 +15,7 @@
 mod job_flow_lifecycle;
 #[path = "all/release_label_catalog.rs"]
 mod release_label_catalog;
+#[path = "all/release_labels.rs"]
+mod release_labels;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

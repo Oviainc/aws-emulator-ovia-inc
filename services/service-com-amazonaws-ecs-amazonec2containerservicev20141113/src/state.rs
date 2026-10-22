@@ -298,6 +298,43 @@ pub const MAX_CLIENT_TOKEN_LENGTH: usize = 36;
 /// may specify up to 10 services to describe in a single operation."
 pub const MAX_DESCRIBE_SERVICES: usize = 10;
 
+// The message of a refusal whose condition is that a NAMED resource does not exist.
+// Amazon ECS answers each of these with ONE fixed sentence that names no resource: the
+// same text for every request that meets the condition, whatever cluster, service, task
+// or task definition the request named. Every such refusal in this crate therefore
+// carries the constant below rather than a sentence built from the request — only a
+// refusal ECS derives from the request (a member that is blank, or outside its
+// documented constraint) names a member.
+
+/// `ClusterNotFoundException$message` for a `cluster` that names no stored cluster.
+pub const CLUSTER_NOT_FOUND_MESSAGE: &str = "Cluster not found.";
+
+/// `ServiceNotFoundException$message` for a `service` that names no stored service.
+pub const SERVICE_NOT_FOUND_MESSAGE: &str = "Service not found.";
+
+/// `InvalidParameterException$message` for a `task` that names no stored task.
+pub const TASK_NOT_FOUND_MESSAGE: &str = "The referenced task was not found";
+
+/// `ClientException$message` for a `taskDefinition` that names no stored revision — the
+/// refusal every operation that resolves a task-definition reference answers with.
+pub const TASK_DEFINITION_NOT_FOUND_MESSAGE: &str = "Unable to describe task definition.";
+
+/// `InvalidParameterException$message` for a `containerInstance` reference that names no
+/// instance registered in the cluster. No recording in the corpus fixes this sentence,
+/// so the wording follows [`TASK_NOT_FOUND_MESSAGE`]; what the rule fixes is that the
+/// sentence is the SAME for every request that meets the condition.
+pub const CONTAINER_INSTANCE_NOT_FOUND_MESSAGE: &str =
+    "The referenced container instance was not found";
+
+/// `ClusterContainsServicesException$message`: the shape's own doc sentence, which names
+/// no cluster (`smithy_query` query="shape" shape="ClusterContainsServicesException").
+pub const CLUSTER_CONTAINS_SERVICES_MESSAGE: &str =
+    "You can't delete a cluster that contains services.";
+
+/// `ClusterContainsTasksException$message`: the shape's own doc sentence, which names no
+/// cluster (`smithy_query` query="shape" shape="ClusterContainsTasksException").
+pub const CLUSTER_CONTAINS_TASKS_MESSAGE: &str = "You can't delete a cluster that has active tasks.";
+
 /// A cluster, as `CreateCluster` left it.
 #[derive(Debug, Clone)]
 pub struct ClusterRecord {

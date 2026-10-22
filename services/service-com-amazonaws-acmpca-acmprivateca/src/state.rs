@@ -48,6 +48,55 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_PENDING_CERTIFICATE: &str = "PENDING_CERTIFICATE";
 /// Private CA holds its certificate and may issue end-entity certificates.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
+/// Private CA was deleted; it is restorable while its restoration window is open.
+pub const STATUS_DELETED: &str = "DELETED";
+/// Private CA was disabled, so it issues nothing until it is enabled again.
+pub const STATUS_DISABLED: &str = "DISABLED";
+/// Private CA's certificate has expired.
+pub const STATUS_EXPIRED: &str = "EXPIRED";
+/// Private CA could not be created.
+pub const STATUS_FAILED: &str = "FAILED";
+
+/// The `CertificateAuthorityStatus` members a CA can be DELETED from: "A private CA can
+/// be deleted if it is in the PENDING_CERTIFICATE, CREATING, EXPIRED, DISABLED, or FAILED
+/// state. To delete a CA in the ACTIVE state, you must first disable it, or else the
+/// delete request results in an exception." (`DeleteCertificateAuthority` docs).
+pub const DELETABLE_STATUSES: &[&str] = &[
+    STATUS_PENDING_CERTIFICATE,
+    STATUS_CREATING,
+    STATUS_EXPIRED,
+    STATUS_DISABLED,
+    STATUS_FAILED,
+];
+
+/// The statuses a deletion opens NO restoration window from: "A private CA deleted in the
+/// CREATING or FAILED state has no assigned restoration period and cannot be restored."
+/// (`DeleteCertificateAuthority` docs).
+pub const UNRESTORABLE_DELETION_STATUSES: &[&str] = &[STATUS_CREATING, STATUS_FAILED];
+
+/// What Amazon Web Services Private CA answers when a CA is asked to be deleted in a
+/// status that does not allow deletion: one sentence about the statuses deletion is
+/// allowed from, naming no request of its own. The statuses are the ones
+/// [`DELETABLE_STATUSES`] quotes from the `DeleteCertificateAuthority` docs.
+pub const DELETE_INVALID_STATE_MESSAGE: &str =
+    "A private CA can be deleted only if it is in the PENDING_CERTIFICATE, CREATING, \
+     EXPIRED, DISABLED, or FAILED state. To delete a CA in the ACTIVE state, you must \
+     first disable it.";
+
+/// The restoration window a deletion opens when the request names none: "By default, if
+/// you do not set the PermanentDeletionTimeInDays parameter, the CA remains restorable
+/// for 30 days." (`DeleteCertificateAuthority` docs).
+pub const DEFAULT_PERMANENT_DELETION_TIME_IN_DAYS: i32 = 30;
+
+/// The bounds `PermanentDeletionTimeInDays` publishes: the member is modelled
+/// `range 7..30` — "You can set the parameter from 7 to 30 days."
+/// (`DeleteCertificateAuthority` docs).
+pub const MIN_PERMANENT_DELETION_TIME_IN_DAYS: i32 = 7;
+/// The upper bound of that range.
+pub const MAX_PERMANENT_DELETION_TIME_IN_DAYS: i32 = 30;
+
+/// The unit `PermanentDeletionTimeInDays` counts in.
+pub const ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 // `ResourceOwner` members a listing filters on (see `RESOURCE_OWNER_VALUES` in
 // `ops::types` for the whole enum).
@@ -354,6 +403,10 @@ pub struct CertificateAuthorityRecord {
     pub ca_certificate_chain_pem: Option<String>,
     /// How long a deleted CA can still be restored.
     pub restorable_until: Option<SystemTime>,
+    /// The status the CA held when it was deleted: "The status of a restored CA is set to
+    /// its pre-deletion status when the RestoreCertificateAuthority action returns."
+    /// (`RestoreCertificateAuthority` docs), so the deletion is what has to record it.
+    pub status_before_deletion: Option<String>,
     /// Tags attached to the CA.
     pub tags: Vec<Tag>,
     /// The resource-based policy attached to the CA, when one is (`PutPolicy` attaches
@@ -381,6 +434,61 @@ impl CertificateAuthorityRecord {
             self.status = STATUS_PENDING_CERTIFICATE.to_string();
             self.last_state_change_at = self.settles_at;
         }
+    }
+
+    /// Whether this CA's status allows `DeleteCertificateAuthority`
+    /// ([`DELETABLE_STATUSES`]).
+    pub fn is_deletable(&self) -> bool {
+        DELETABLE_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// The restoration window a deletion of this CA opens when the request asked for
+    /// `requested_days`: that many days, 30 when the request named none, and none at all
+    /// from a status a deletion assigns no restoration period to
+    /// ([`UNRESTORABLE_DELETION_STATUSES`]).
+    pub fn restoration_window(&self, requested_days: Option<i32>) -> Option<Duration> {
+        if UNRESTORABLE_DELETION_STATUSES.contains(&self.status.as_str()) {
+            return None;
+        }
+        // The member is modelled `range 7..30`, so a value outside it never reaches a
+        // handler; the assertion says so, and the clamp keeps the window inside the
+        // published bounds if that ever stops holding.
+        debug_assert!(
+            requested_days.is_none_or(|days| {
+                (MIN_PERMANENT_DELETION_TIME_IN_DAYS..=MAX_PERMANENT_DELETION_TIME_IN_DAYS)
+                    .contains(&days)
+            }),
+            "PermanentDeletionTimeInDays is modelled range 7..30: {requested_days:?}"
+        );
+        let days = requested_days
+            .unwrap_or(DEFAULT_PERMANENT_DELETION_TIME_IN_DAYS)
+            .clamp(
+                MIN_PERMANENT_DELETION_TIME_IN_DAYS,
+                MAX_PERMANENT_DELETION_TIME_IN_DAYS,
+            );
+        Some(ONE_DAY * days.unsigned_abs())
+    }
+
+    /// Move this CA into `DELETED`, opening the restoration window `window`.
+    ///
+    /// The status it held is remembered, because that is the status a restore inside the
+    /// window puts it back into.
+    pub fn delete(&mut self, now: SystemTime, window: Option<Duration>) {
+        self.status_before_deletion =
+            Some(::std::mem::replace(&mut self.status, STATUS_DELETED.to_string()));
+        self.last_state_change_at = now;
+        self.restorable_until = window.and_then(|window| now.checked_add(window));
+    }
+
+    /// Whether the restoration window of a deleted CA has closed as of `now`, so the CA
+    /// is permanently deleted: "the CA won't be permanently deleted until the restoration
+    /// period has passed" (`DeleteCertificateAuthority` docs), and "You cannot restore a
+    /// CA after the restoration period has ended" (`RestoreCertificateAuthority` docs).
+    ///
+    /// A CA deleted from a status that assigns no restoration period is never restorable
+    /// and never permanently deleted either: it keeps answering as `DELETED`.
+    pub fn is_permanently_deleted(&self, now: SystemTime) -> bool {
+        self.status == STATUS_DELETED && self.restorable_until.is_some_and(|until| now >= until)
     }
 
     /// The permission this CA holds for `principal` and `source_account`, when it holds
@@ -547,11 +655,16 @@ pub struct ComAmazonawsAcmpcaAcmprivatecaState {
 
 impl ComAmazonawsAcmpcaAcmprivatecaState {
     /// The CA named by `arn`, with any status change the clock owed already applied.
+    ///
+    /// A deleted CA whose restoration window has closed was permanently deleted at the
+    /// instant that window ended, whether or not anybody called, so it is dropped here
+    /// and answers as no resource at all.
     pub fn certificate_authority_mut(
         &mut self,
         arn: &str,
         now: SystemTime,
     ) -> Option<&mut CertificateAuthorityRecord> {
+        self.reap_permanently_deleted(now);
         let record = self.certificate_authorities.get_mut(arn)?;
         record.settle(now);
         Some(record)
@@ -564,9 +677,22 @@ impl ComAmazonawsAcmpcaAcmprivatecaState {
     /// applies the transitions that were due at the same instant whether or not anybody
     /// called, so no two readers disagree about a CA's current status.
     pub fn settle(&mut self, now: SystemTime) {
+        self.reap_permanently_deleted(now);
         for record in self.certificate_authorities.values_mut() {
             record.settle(now);
         }
+    }
+
+    /// Drop every CA whose restoration window has closed.
+    ///
+    /// The permanent deletion came due the instant that window ended, whatever is read
+    /// next, so both readers above sweep the whole store rather than only the resource
+    /// they were asked about: a listing and a describe can never disagree about whether a
+    /// CA is still there, and a reaped CA stops counting against
+    /// [`MAX_CERTIFICATE_AUTHORITIES`].
+    fn reap_permanently_deleted(&mut self, now: SystemTime) {
+        self.certificate_authorities
+            .retain(|_, record| !record.is_permanently_deleted(now));
     }
 }
 

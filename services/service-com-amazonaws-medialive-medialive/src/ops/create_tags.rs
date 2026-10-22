@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Tags are stored ON the resource the `ResourceArn` names — every resource
+//! record in [`crate::state`] carries its own tag map — so this operation adds
+//! or overwrites the keys the request supplies in that one map, which is the
+//! same map `ListTagsForResource` and the resource's own describe read. The
+//! write goes through [`crate::state::ComAmazonawsMedialiveMedialiveState::insert_resource_tags`],
+//! which owns the per-resource tag bounds, so a caller cannot grow a resource's
+//! tag map without limit.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +161,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // Request SYNTAX first: `ResourceArn` names a resource by ARN, so a value
+        // that is not an ARN at all cannot name one — a bad request rather than a
+        // missing resource.
+        if !crate::state::is_resource_arn(&input.resource_arn) {
+            return Err(CreateTagsErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "ResourceArn is not an AWS resource ARN: {}",
+                    input.resource_arn
+                )),
+            })
+            .into());
+        }
+
+        // Then resolution and the store's own bounds: the tags land on the
+        // resource that ARN names, in that resource's own tag map, and
+        // `insert_resource_tags` checks every refusal before the first write, so
+        // a refused request leaves the stored tags exactly as they were. An ARN
+        // naming no existing resource is the operation's modelled 404.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTags"))
+        // "Create tags for a resource": each key the request carries is added,
+        // and a key the resource already carries takes the request's value. Keys
+        // the request does not name are left alone — this is not a replacement of
+        // the resource's tag set, so a request carrying no tags changes nothing.
+        let requested = input.tags.unwrap_or_default();
+        state
+            .insert_resource_tags(&input.resource_arn, requested)
+            .map_err(|refusal| match refusal {
+                crate::state::TagRefusal::NoSuchResource => {
+                    CreateTagsErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(crate::state::not_found_message(
+                            "Resource",
+                            &input.resource_arn,
+                        )),
+                    })
+                }
+                crate::state::TagRefusal::TooManyTags { merged } => {
+                    CreateTagsErrorModeled::BadRequestException(BadRequestException {
+                        message: Some(format!(
+                            "Tags would leave {} with {merged} tags, more than the {} a resource carries",
+                            input.resource_arn,
+                            crate::state::MAX_RESOURCE_TAGS
+                        )),
+                    })
+                }
+                crate::state::TagRefusal::KeyTooLong { length } => {
+                    CreateTagsErrorModeled::BadRequestException(BadRequestException {
+                        message: Some(format!(
+                            "Tags carries a key of {length} characters, more than the {} a tag key allows",
+                            crate::state::MAX_TAG_KEY_LEN
+                        )),
+                    })
+                }
+                crate::state::TagRefusal::ValueTooLong { key, length } => {
+                    CreateTagsErrorModeled::BadRequestException(BadRequestException {
+                        message: Some(format!(
+                            "Tags[{key}] is {length} characters, more than the {} a tag value allows",
+                            crate::state::MAX_TAG_VALUE_LEN
+                        )),
+                    })
+                }
+            })?;
+
+        Ok(CreateTagsOutput)
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to write the tags to. A modelled server error, never a
+/// fresh engine (which would drop the tags on return).
+fn unavailable() -> CreateTagsError {
+    CreateTagsErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

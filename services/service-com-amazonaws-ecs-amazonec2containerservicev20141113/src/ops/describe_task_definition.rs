@@ -197,10 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = record else {
             return Err(DescribeTaskDefinitionErrorModeled::ClientException(
                 ClientException {
-                    message: Some(format!(
-                        "unable to describe task definition {:?}",
-                        input.task_definition
-                    )),
+                    message: Some(crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

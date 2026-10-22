@@ -106,7 +106,8 @@ pub(crate) async fn create_api(gateway: &Gateway, name: &str) -> (String, String
 }
 
 /// `CreateResource` for `path_part` under `parent`, asserting it was accepted. Shared
-/// with the sibling `patch_updates` suite, which renames the resources it builds.
+/// with the sibling `patch_updates` and `delete_lifecycle` suites, which rename and
+/// delete the resources they build.
 pub(crate) async fn create_resource(
     gateway: &Gateway,
     api: &str,
@@ -142,6 +143,25 @@ pub(crate) fn page_items(body: &Value, case: &str) -> Vec<Value> {
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: expected an item array, got {body:?}"))
         .clone()
+}
+
+/// Assert `answer` is the modelled failure `(status, code)` — the status and the
+/// `x-amzn-errortype` code, which is what a client's error handling keys off.
+///
+/// This crate's one modelled-failure assertion, so every suite checks a refusal the
+/// same way.
+pub(crate) fn assert_failure(answer: &Answer, status: u16, code: &str, case: &str) {
+    assert_eq!(
+        answer.status, status,
+        "case {case}: expected {status}, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error.as_deref(),
+        Some(code),
+        "case {case}: expected {code}, got {:?}",
+        answer.error
+    );
 }
 
 #[tokio::test]
@@ -805,7 +825,36 @@ async fn a_duplicate_path_part_under_one_parent_is_a_conflict() {
             "case {case}: expected ConflictException, got {:?}",
             answer.error
         );
+        // The refusal is built from the request: it names the segment that collides.
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some("Another resource with the same parent already has this name: pets"),
+            "case {case}: the refusal must name the colliding segment, got {:?}",
+            answer.body["message"]
+        );
     }
+
+    // A different colliding segment is named in its own refusal: the message follows
+    // the request, it is not one fixed sentence.
+    let owners = gateway
+        .call(
+            "POST",
+            &format!("/restapis/{api}/resources/{root}"),
+            Some(json!({ "pathPart": "owners" })),
+        )
+        .await;
+    assert_failure(
+        &owners,
+        409,
+        "ConflictException",
+        "CreateResource(duplicate owners under the root)",
+    );
+    assert_eq!(
+        owners.body["message"].as_str(),
+        Some("Another resource with the same parent already has this name: owners"),
+        "case CreateResource(duplicate owners under the root): the refusal must name the colliding segment, got {:?}",
+        owners.body["message"]
+    );
 
     // An empty path part names no segment at all.
     let empty = gateway

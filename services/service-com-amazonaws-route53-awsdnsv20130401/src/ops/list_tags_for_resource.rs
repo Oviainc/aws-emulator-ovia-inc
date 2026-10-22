@@ -74,7 +74,8 @@
 use super::types::*;
 
 use crate::state::{
-    normalize_zone_id, TAG_RESOURCE_TYPE_HEALTH_CHECK, TAG_RESOURCE_TYPE_HOSTED_ZONE,
+    no_such_hosted_zone, normalize_zone_id, TAG_RESOURCE_TYPE_HEALTH_CHECK,
+    TAG_RESOURCE_TYPE_HOSTED_ZONE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -165,12 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A pure read: nothing here writes to the store.
                 let store = state.lock();
                 let zone = store.zones.get(id).ok_or_else(|| {
-                    ListTagsForResourceErrorModeled::NoSuchHostedZone(NoSuchHostedZone {
-                        message: Some(format!(
-                            "no hosted zone exists with the ID {}",
-                            input.resource_id
-                        )),
-                    })
+                    ListTagsForResourceErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                        &input.resource_id,
+                    ))
                 })?;
                 Ok(ListTagsForResourceOutput {
                     resource_tag_set: ResourceTagSet {

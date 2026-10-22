@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTransformJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTransformJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTransformJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replays the transform job `CreateTransformJob` stored, and materialises the terminal
+//! status the clock has already made due (the one write this reporting call makes — the
+//! job was due to end whether or not anybody described it). A name no stored job answers
+//! to is refused with the modelled `ResourceNotFound`.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +192,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTransformJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTransformJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTransformJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(job) = store.transform_jobs.get_mut(&input.transform_job_name) else {
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "transform-job",
+                &input.transform_job_name,
+            );
+            return Err(DescribeTransformJobErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Could not find transform job \"{arn}\".")),
+            })
+            .into());
+        };
+
+        // The only write a reporting call makes: the terminal status the clock already
+        // owed. It was due at the stored instant whether or not anybody described the
+        // job, so a waiter terminates and no caller's read changes the outcome.
+        let settled = job.settle_status(::std::time::SystemTime::now());
+
+        let output = DescribeTransformJobOutput {
+            transform_job_name: job.name.clone(),
+            transform_job_arn: job.arn.clone(),
+            transform_job_status: job.status.clone(),
+            failure_reason: job.failure_reason.clone(),
+            model_name: job.model_name.clone(),
+            // Both are reported as the service resolved them at create: the request's
+            // value, or the default its model doc states when the request omitted it.
+            max_concurrent_transforms: Some(job.max_concurrent_transforms),
+            max_payload_in_mb: Some(job.max_payload_in_mb),
+            model_client_config: job.model_client_config.clone(),
+            batch_strategy: job.batch_strategy.clone(),
+            environment: job.environment.clone(),
+            transform_input: job.transform_input.clone(),
+            transform_output: Some(job.transform_output.clone()),
+            data_capture_config: job.data_capture_config.clone(),
+            transform_resources: job.transform_resources.clone(),
+            creation_time: crate::state::timestamp(job.creation_time),
+            // "Indicates when the transform job starts on ML compute instances. You are
+            // billed for the time interval between this time and the value of
+            // TransformEndTime" (`TransformStartTime`'s model doc). This emulator starts
+            // no ML compute instance and bills no interval, so there is no start time to
+            // report; `TransformEndTime` is the instant the job reached its terminal
+            // status, which the clock did make happen.
+            transform_start_time: None,
+            transform_end_time: job.transform_end_time.map(crate::state::timestamp),
+            // This slice of SageMaker runs neither Ground Truth labeling jobs nor AutoML
+            // jobs, so no transform job it holds was created by one.
+            labeling_job_arn: None,
+            auto_ml_job_arn: None,
+            data_processing: job.data_processing.clone(),
+            experiment_config: job.experiment_config.clone(),
+        };
+        let job_arn = job.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &job_arn, ctx);
+        }
+        Ok(output)
     }
 }

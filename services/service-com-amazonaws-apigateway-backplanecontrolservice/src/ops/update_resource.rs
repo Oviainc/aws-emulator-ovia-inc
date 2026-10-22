@@ -89,25 +89,6 @@ use crate::state::{Patch, PatchFailure, PatchOpKind, ResourceEntry, RestApiEntry
 /// operations.
 const SUPPORTED_PATHS: &[&str] = &["/parentId", "/pathPart"];
 
-/// Every resource of `api` that is a descendant of `resource_id`, the resource itself
-/// included — the set whose `path` a rename or a move recomputes, and the set a resource
-/// may not be moved into.
-fn descendants(api: &RestApiEntry, resource_id: &str) -> Vec<String> {
-    let mut found = vec![resource_id.to_string()];
-    let mut frontier = vec![resource_id.to_string()];
-    while let Some(parent) = frontier.pop() {
-        for child in api.resources.values() {
-            if child.parent_id.as_deref() == Some(parent.as_str())
-                && !found.contains(&child.id)
-            {
-                found.push(child.id.clone());
-                frontier.push(child.id.clone());
-            }
-        }
-    }
-    found
-}
-
 /// Refuse a path part that another child of `parent_id` already holds: two siblings with
 /// one segment would share a path, and a path is what routes a request.
 fn refuse_sibling_clash(
@@ -122,9 +103,9 @@ fn refuse_sibling_clash(
             && sibling.path_part.as_deref() == Some(path_part)
     });
     if taken {
-        return Err(PatchFailure::Conflict(format!(
-            "Another child resource with the path part '{path_part}' already exists for this resource"
-        )));
+        return Err(PatchFailure::Conflict(
+            super::create_resource::sibling_clash_message(path_part),
+        ));
     }
     Ok(())
 }
@@ -201,7 +182,7 @@ fn apply_patch(
             // A resource cannot be moved under itself or under one of its own
             // descendants: that would cut the subtree off the API's root and leave it
             // with no path at all.
-            if descendants(api, resource_id).contains(&parent_id) {
+            if api.descendant_ids(resource_id).contains(&parent_id) {
                 return Err(PatchFailure::BadRequest(format!(
                     "{} must not name the resource itself or one of its descendants: {parent_id}",
                     patch.path

@@ -473,6 +473,44 @@ pub fn validate_static_ipv4_addresses(addresses: &[String]) -> Result<(), String
     Ok(())
 }
 
+/// The message for a refusal that names an accelerator the store does not hold.
+///
+/// A refusal identifies the resource the request named, so the caller — commonly a
+/// cleanup loop over many accelerators — can attribute it: the ARN is interpolated
+/// from the request rather than left out of a constant sentence. One place for the
+/// wording so every operation that answers `AcceleratorNotFoundException` states it
+/// alike.
+pub fn accelerator_not_found_message(accelerator_arn: &str) -> String {
+    format!("Accelerator {accelerator_arn} not found.")
+}
+
+/// The message for a refusal that names a listener the store does not hold. The same
+/// rule as [`accelerator_not_found_message`], one level down.
+pub fn listener_not_found_message(listener_arn: &str) -> String {
+    format!("Listener {listener_arn} not found.")
+}
+
+/// The message for deleting an accelerator that is still enabled.
+///
+/// "Before you can delete an accelerator, you must disable it" (`DeleteAccelerator`
+/// doc), so the refusal tells the caller which accelerator to disable, by the ARN the
+/// request carried.
+pub fn accelerator_not_disabled_message(accelerator_arn: &str) -> String {
+    format!("Please disable accelerator {accelerator_arn} before deleting it.")
+}
+
+/// The message for deleting an accelerator that still has a listener.
+///
+/// "You must remove all dependent resources from an accelerator before you can delete
+/// it" (`AssociatedListenerFoundException` doc) — stated over the request's own ARN,
+/// for the same reason as [`accelerator_not_disabled_message`].
+pub fn associated_listener_found_message(accelerator_arn: &str) -> String {
+    format!(
+        "Accelerator {accelerator_arn} has a listener associated with it; delete its \
+         listeners before deleting it."
+    )
+}
+
 /// One page of keys, plus the token that resumes immediately after it.
 #[derive(Debug, Clone)]
 pub struct Page {

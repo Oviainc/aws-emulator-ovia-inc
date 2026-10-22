@@ -100,6 +100,34 @@ pub(crate) async fn refused(
     );
 }
 
+/// A call that must be refused with HTTP 400, returning the modelled error code (the
+/// short shape name the `__type` carries) and the `message` the refusal reports — the
+/// two things a client keys on.
+pub(crate) async fn refusal(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) -> (String, String) {
+    let (status, parsed) = call(router, operation, body).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected {operation} to answer 400, got {status} with {parsed}"
+    );
+    let code = parsed["__type"]
+        .as_str()
+        .unwrap_or_default()
+        .rsplit('#')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let message = parsed["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a message, got {parsed}"))
+        .to_string();
+    (code, message)
+}
+
 /// A required string member of a response body.
 pub(crate) fn string(body: &Value, member: &str, case: &str) -> String {
     body[member]
@@ -125,6 +153,20 @@ pub(crate) fn list(body: &Value, member: &str, case: &str) -> Vec<Value> {
         Value::Array(items) => items.clone(),
         other => panic!("case {case:?}: expected a list {member}, got {other}"),
     }
+}
+
+/// An EC2 instance identity document, as the agent reads it from
+/// `http://169.254.169.254/latest/dynamic/instance-identity/document/`. It carries the
+/// `accountId` and the `instanceId` a registration must supply.
+pub(crate) fn identity_document(instance_id: &str) -> String {
+    json!({
+        "accountId": ACCOUNT,
+        "instanceId": instance_id,
+        "region": SIGNED_REGION,
+        "instanceType": "m5.large",
+        "availabilityZone": format!("{SIGNED_REGION}a"),
+    })
+    .to_string()
 }
 
 /// Create a cluster and return its ARN.

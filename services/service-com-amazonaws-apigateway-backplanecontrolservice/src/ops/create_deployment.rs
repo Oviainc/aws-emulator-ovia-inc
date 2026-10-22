@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a `Deployment` of `restApiId` — a snapshot of the API's methods
+//! at this instant — and, when the request names a `stageName`, points that stage at it.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +95,108 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeMap, HashMap};
+
+use crate::state::{DeploymentEntry, RestApiEntry, StageEntry};
+
+/// The `apiSummary` of a deployment taken now: for every resource of `api`, by path,
+/// the methods on it as they stand, by verb.
+///
+/// This is what makes a deployment a SNAPSHOT: a method put on the API after this call
+/// is not in it, and one deleted afterwards is still in it.
+pub fn api_summary(api: &RestApiEntry) -> BTreeMap<String, BTreeMap<String, MethodSnapshot>> {
+    api.resources
+        .values()
+        .filter(|resource| !resource.methods.is_empty())
+        .map(|resource| {
+            let methods = resource
+                .methods
+                .iter()
+                .map(|(verb, method)| {
+                    (
+                        verb.clone(),
+                        MethodSnapshot {
+                            authorization_type: Some(method.authorization_type.clone()),
+                            api_key_required: method.api_key_required,
+                        },
+                    )
+                })
+                .collect();
+            (resource.path.clone(), methods)
+        })
+        .collect()
+}
+
+/// The `Deployment` body for a stored deployment — the one place this crate renders that
+/// shape, so `CreateDeployment` and `GetDeployment` cannot report a record differently.
+///
+/// `api_summary` is reported only when the caller asked for it with `embed=apisummary`,
+/// which is what that member documents; `CreateDeployment` takes no `embed`, so it never
+/// reports one.
+pub fn deployment_body(entry: &DeploymentEntry, embed_api_summary: bool) -> CreateDeploymentOutput {
+    CreateDeploymentOutput {
+        id: Some(entry.id.clone()),
+        description: entry.description.clone(),
+        created_date: entry.created_date,
+        api_summary: embed_api_summary.then(|| {
+            entry
+                .api_summary
+                .iter()
+                .map(|(path, methods)| {
+                    (
+                        path.clone(),
+                        methods
+                            .iter()
+                            .map(|(verb, snapshot)| (verb.clone(), snapshot.clone()))
+                            .collect::<HashMap<String, MethodSnapshot>>(),
+                    )
+                })
+                .collect()
+        }),
+    }
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all.
+fn bound_input(input: &CreateDeploymentInput) -> Result<(), String> {
+    use crate::state::{
+        bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+    };
+
+    for (member, value) in [
+        ("description", &input.description),
+        ("stageDescription", &input.stage_description),
+        ("cacheClusterSize", &input.cache_cluster_size),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(variables) = &input.variables {
+        bound_entries("variables", variables.len(), MAX_COLLECTION_ENTRIES)?;
+        for (key, value) in variables {
+            bound_chars("a variables key", key, MAX_STRING_CHARS)?;
+            bound_chars("a variables value", value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(canary) = &input.canary_settings {
+        if let Some(overrides) = &canary.stage_variable_overrides {
+            bound_entries(
+                "canarySettings.stageVariableOverrides",
+                overrides.len(),
+                MAX_COLLECTION_ENTRIES,
+            )?;
+            for (key, value) in overrides {
+                bound_chars("a stageVariableOverrides key", key, MAX_STRING_CHARS)?;
+                bound_chars("a stageVariableOverrides value", value, MAX_STRING_CHARS)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -176,18 +271,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeployment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let bad_request = |message: String| -> Self::Error {
+            CreateDeploymentErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // Nothing caller-sized reaches the store unchecked, and the checks run before
+        // the store lock is taken.
+        bound_input(&input).map_err(bad_request)?;
+        if let Some(stage_name) = input.stage_name.as_deref() {
+            super::create_stage::validate_stage_name(stage_name).map_err(bad_request)?;
+        }
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let mut store = state.lock();
+        {
+            let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+                CreateDeploymentErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                })
+            })?;
+            // Bound the growth a caller drives. A deployment is kept until it is
+            // deleted, and API Gateway publishes no quota for them, so the cap is this
+            // emulator's.
+            if api.deployments.len() >= crate::state::MAX_DEPLOYMENTS_PER_API {
+                return Err(CreateDeploymentErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        retry_after_seconds: None,
+                        message: Some(format!(
+                            "Maximum number of deployments exceeded for this API: {}",
+                            crate::state::MAX_DEPLOYMENTS_PER_API
+                        )),
+                    },
+                )
+                .into());
+            }
+            // A `stageName` the API has no stage for creates one, which is bounded at
+            // API Gateway's published per-API stage quota.
+            let creates_stage = input
+                .stage_name
+                .as_deref()
+                .is_some_and(|stage_name| !api.stages.contains_key(stage_name));
+            if creates_stage && api.stages.len() >= crate::state::MAX_STAGES_PER_API {
+                return Err(CreateDeploymentErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        retry_after_seconds: None,
+                        message: Some(format!(
+                            "Maximum number of stages exceeded for this API: {}",
+                            crate::state::MAX_STAGES_PER_API
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Minted only once the request is known to be servable, so a refused call burns
+        // no identifier. The store lock has been held since the checks above, so the
+        // API is still there.
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The deployment is the API's methods as they stand at this instant.
+        let entry = DeploymentEntry {
+            id: id.clone(),
+            description: input.description,
+            created_date: Some(now),
+            api_summary: api_summary(api),
+            sequence,
+        };
+        api.deployments.insert(id.clone(), entry);
+
+        // `stageName` is documented as "The name of the Stage resource for the
+        // Deployment resource to create", and `stageDescription`, `variables`,
+        // `cacheClusterEnabled`/`cacheClusterSize`, `tracingEnabled` and
+        // `canarySettings` as the settings "of the Stage resource ... to create": they
+        // configure a stage this call CREATES. A name the API already has a stage for
+        // is therefore re-pointed at the new deployment — that is how an API is
+        // redeployed — and keeps its own configuration, which `UpdateStage` is the call
+        // that changes.
+        if let Some(stage_name) = input.stage_name {
+            let cache_cluster_enabled = input.cache_cluster_enabled.unwrap_or(false);
+            let variables = input
+                .variables
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<String, String>>();
+            match api.stages.get_mut(&stage_name) {
+                Some(stage) => {
+                    stage.deployment_id = id.clone();
+                    stage.last_updated_date = Some(now);
+                }
+                None => {
+                    api.stages.insert(
+                        stage_name.clone(),
+                        StageEntry {
+                            stage_name,
+                            deployment_id: id.clone(),
+                            description: input.stage_description,
+                            cache_cluster_enabled,
+                            cache_cluster_size: input.cache_cluster_size,
+                            // A cache cluster the caller asked for is still coming up
+                            // when this answer is written; the span is stored, never
+                            // slept through.
+                            cache_cluster_ready_at: cache_cluster_enabled.then(|| {
+                                ::std::time::Instant::now()
+                                    + crate::state::CACHE_CLUSTER_CREATE_SPAN
+                            }),
+                            variables,
+                            documentation_version: None,
+                            canary_settings: input.canary_settings.map(|canary| CanarySettings {
+                                percent_traffic: canary.percent_traffic,
+                                // The canary serves the deployment this call created.
+                                deployment_id: Some(id.clone()),
+                                stage_variable_overrides: canary.stage_variable_overrides,
+                                use_stage_cache: canary.use_stage_cache,
+                            }),
+                            tracing_enabled: input.tracing_enabled.unwrap_or(false),
+                            method_settings: BTreeMap::new(),
+                            tags: BTreeMap::new(),
+                            created_date: Some(now),
+                            last_updated_date: Some(now),
+                        },
+                    );
+                }
+            }
+        }
+
+        let stored = api
+            .deployments
+            .get(&id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // This operation takes no `embed`, so it reports no `apiSummary`; `GetDeployment`
+        // is where a caller asks for one.
+        Ok(deployment_body(stored, false))
     }
 }

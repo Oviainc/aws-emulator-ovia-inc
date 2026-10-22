@@ -11,10 +11,12 @@
 //! minting every create needs.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::shared_types::{
-    ChangeInfo, DelegationSet, HostedZone, HostedZoneConfig, ResourceRecordSet, Tag, VPC,
+    ChangeInfo, DelegationSet, HostedZone, HostedZoneConfig, NoSuchHostedZone, ResourceRecordSet,
+    Tag, VPC,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -94,6 +96,31 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 10;
 pub const TAG_RESOURCE_TYPE_HOSTED_ZONE: &str = "hostedzone";
 /// The `TagResourceType` naming a health check (`TagResourceType` enum).
 pub const TAG_RESOURCE_TYPE_HEALTH_CHECK: &str = "healthcheck";
+
+/// The refusal text `CreateHostedZone` answers a `CallerReference` that already
+/// names a zone with (`HostedZoneAlreadyExists`, HTTP 409).
+///
+/// A CONSTANT, naming neither the caller reference nor the zone the reference
+/// already names: the shape's own documentation states the rule without either
+/// ("Amazon Route 53 returns this error when a hosted zone has already been
+/// created with the specified CallerReference"), and the zone's id is
+/// server-generated, so a refusal quoting it would differ on every run and tell
+/// a caller nothing it can act on. The zone the reference names is in state,
+/// where `ListHostedZones` reads it.
+pub const HOSTED_ZONE_ALREADY_EXISTS_MESSAGE: &str =
+    "A hosted zone has already been created with the specified caller reference.";
+
+/// The refusal text `DeleteHostedZone` answers a zone that still holds records
+/// of the caller's with (`HostedZoneNotEmpty`, HTTP 400).
+///
+/// A CONSTANT naming no zone, and it ends with what the caller has to do next —
+/// the operation's own documentation states both halves ("You can delete a
+/// hosted zone only if it contains only the default SOA and NS records" / "If
+/// the hosted zone contains other resource record sets, you must delete them
+/// before you can delete the hosted zone").
+pub const HOSTED_ZONE_NOT_EMPTY_MESSAGE: &str =
+    "The specified hosted zone contains resource record sets other than the default SOA and NS \
+     records and so cannot be deleted. Delete all non-default records and try again.";
 
 /// The `/hostedzone/` prefix the API wraps a hosted-zone id in.
 pub const HOSTED_ZONE_PREFIX: &str = "/hostedzone/";
@@ -477,6 +504,62 @@ pub fn apply_tag_changes(
 
     *tags = updated;
     Ok(())
+}
+
+/// The modelled `NoSuchHostedZone` (HTTP 404) for a zone id that names no zone
+/// in this store.
+///
+/// The ONE place this service words that refusal, so every zone-addressed
+/// operation answers a missing zone identically. The message is
+/// REQUEST-DERIVED — it names the id the request asked about, as the request
+/// wrote it — which is what lets a caller tell which of a batch of ids was the
+/// missing one: `No hosted zone found with ID: <the requested id>`.
+pub fn no_such_hosted_zone(requested_id: &str) -> NoSuchHostedZone {
+    NoSuchHostedZone {
+        message: Some(format!("No hosted zone found with ID: {requested_id}")),
+    }
+}
+
+/// Mint the request id ONE response names the request it answers with — the
+/// `RequestId` element of this service's `<ErrorResponse>` envelope (see
+/// [`crate::service::envelope`]).
+///
+/// 8-4-4-4-12 lowercase hex, the form an AWS request id takes. The VALUE is
+/// per-response and is not a requirement: nothing can predict it and no caller
+/// may depend on a particular one. What it must do is name ONE response, so it
+/// is drawn from a per-process counter mixed with the instant the response was
+/// answered through the maintained `sha2` digest — the counter is what makes two
+/// ids minted in the same nanosecond differ, and the instant is what keeps two
+/// runs of this emulator from minting the same sequence. It is an identifier for
+/// correlation, never a secret: nothing authenticates with it.
+///
+/// A free function rather than a mint on the store: a failure the request
+/// boundary refused never reaches a handler, so the envelope that answers it has
+/// no state to reach.
+pub fn new_request_id() -> String {
+    use sha2::{Digest, Sha256};
+
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+
+    let counter = MINTED.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+    let mut digest = Sha256::new();
+    digest.update(counter.to_be_bytes());
+    digest.update(nanos.to_be_bytes());
+    let hex: String = digest.finalize()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// A hosted-zone id with the `/hostedzone/` prefix stripped, so a caller may

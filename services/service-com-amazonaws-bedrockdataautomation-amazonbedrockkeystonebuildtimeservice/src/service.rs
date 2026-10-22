@@ -74,25 +74,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // This service signs as `bedrock` — a signing name it SHARES with every other
-        // emulated Bedrock-family service (the Bedrock control plane, Bedrock Runtime,
-        // Bedrock Agent, Bedrock Agent Runtime and Bedrock Data Automation Runtime),
-        // while its own endpoint is `bedrock-data-automation`. The router resolves the
-        // routing key from the SigV4 credential scope first, so all six see the key
-        // `bedrock`: claiming on the signing name ALONE makes each of them claim every
-        // sibling's traffic, and the router — which refuses rather than guesses —
-        // answers `500 AmbiguousService` for ALL of it.
+        // This service signs as `bedrock`, the signing name every Bedrock-family service
+        // shares while serving its own endpoint (`bedrock-data-automation` here).
+        // Claiming on that name alone makes all six claimants for every Bedrock request,
+        // which the router answers `500 AmbiguousService` — a code no AWS model carries —
+        // rather than serving one of them.
         //
-        // So the claim is narrowed to this service's own modelled wire surface, by the
-        // one rule `service-common` states for every service under a shared signing
-        // name. This model is `restJson1` and binds every operation to a URI whose
-        // first segment is a literal, so that surface is its path space
-        // (`data-automation-projects`, `blueprints`, `data-automation-libraries`, …),
-        // which the generated `ROUTE_PATH_SEGMENTS` carries and the rule matches by
-        // EXACT segment equality.
-        service_common::claims_request(
+        // So the claim is this model's own path space (`blueprints`,
+        // `data-automation-projects`, `data-automation-libraries`,
+        // `invokeBlueprintOptimizationAsync`, `getBlueprintOptimizationStatus`), through
+        // the one rule `service_common::bedrock` states for the family (which narrows
+        // `service_common::claims_request` with the family's shared-segment split). Its
+        // three tagging paths (`/tagResource`, `/untagResource`, `/listTagsForResource`)
+        // are bound IDENTICALLY by the Bedrock control plane, so nothing in such a request
+        // tells the two apart — AWS tells them apart by endpoint host, which is not on
+        // the wire here — and the family rule gives that segment to the control plane.
+        // `None` for the RPC argument: every operation here is bound to a URI.
+        service_common::bedrock::claims_request(
             parts,
-            self.entry.identity().signing_name(),
+            self.definition(),
             crate::ROUTE_PATH_SEGMENTS,
             None,
         )

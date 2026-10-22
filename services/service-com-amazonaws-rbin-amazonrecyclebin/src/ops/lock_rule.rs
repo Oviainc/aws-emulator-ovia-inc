@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op LockRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `LockRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`LockRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: locks the stored Region-level retention rule the request addresses —
+//! persisting the requested lock configuration and the `locked` lock state in
+//! [`crate::state`] — and answers with the STORED record (HTTP 200). This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +171,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `LockRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(LockRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("LockRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(LockRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the rbin retention-rule store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(rule) = store.rules.get_mut(&input.identifier) else {
+            return Err(LockRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Retention rule with ID {} not found",
+                        input.identifier
+                    )),
+                    reason: Some("RULE_NOT_FOUND".to_string()),
+                },
+            )
+            .into());
+        };
+        // An unlock delay that has already run out leaves the rule `unlocked` whether or
+        // not anybody called, so materialise that before the guards below read the lock
+        // state: they must decide on the state the clock has actually reached.
+        rule.settle_lock_state(now);
+
+        // "You can't lock tag-level retention rules, or Region-level retention rules
+        // that have exclusion tags." A rule carrying resource tags is tag-level; one
+        // carrying exclusion tags is a Region-level rule with exclusions. For neither
+        // can a lock request be completed.
+        if !rule.resource_tags.is_empty() {
+            return Err(LockRuleErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Retention rule with ID {} is a tag-level retention rule and can't be locked",
+                    rule.identifier
+                )),
+                reason: Some("INVALID_RULE_STATE".to_string()),
+            })
+            .into());
+        }
+        if !rule.exclude_resource_tags.is_empty() {
+            return Err(LockRuleErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Retention rule with ID {} has exclusion tags and can't be locked",
+                    rule.identifier
+                )),
+                reason: Some("INVALID_RULE_STATE".to_string()),
+            })
+            .into());
+        }
+        // A rule that is already `locked` "can't be modified", and a lock request
+        // carries a lock configuration, so locking it again would modify it.
+        if rule.lock_state.as_deref() == Some(crate::state::LOCK_STATE_LOCKED) {
+            return Err(LockRuleErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Retention rule with ID {} is already locked",
+                    rule.identifier
+                )),
+                reason: Some("INVALID_RULE_STATE".to_string()),
+            })
+            .into());
+        }
+
+        // Locking takes effect at once: the rule holds the requested lock configuration
+        // and its lock state becomes `locked`. Any unlock delay still being served is
+        // cancelled — locking during the unlock delay period returns the rule to
+        // `locked`, and a locked rule has no lock end time left to report.
+        rule.lock_configuration = Some(input.lock_configuration);
+        rule.lock_state = Some(crate::state::LOCK_STATE_LOCKED.to_string());
+        rule.lock_end_time = None;
+
+        // Answer out of the STORED record, so the caller sees what a later GetRule sees.
+        Ok(LockRuleOutput {
+            identifier: Some(rule.identifier.clone()),
+            description: rule.description.clone(),
+            resource_type: Some(rule.resource_type.clone()),
+            retention_period: Some(rule.retention_period.clone()),
+            resource_tags: Some(rule.resource_tags.clone()),
+            status: Some(rule.status.clone()),
+            lock_configuration: rule.lock_configuration.clone(),
+            lock_state: rule.lock_state.clone(),
+            rule_arn: Some(rule.rule_arn.clone()),
+            exclude_resource_tags: Some(rule.exclude_resource_tags.clone()),
+        })
     }
 }

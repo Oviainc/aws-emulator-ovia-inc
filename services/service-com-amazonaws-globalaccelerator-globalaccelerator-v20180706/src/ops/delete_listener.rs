@@ -168,7 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.listeners.remove(&input.listener_arn) else {
             return Err(DeleteListenerErrorModeled::ListenerNotFoundException(
                 ListenerNotFoundException {
-                    message: Some(format!("listener {} not found", input.listener_arn)),
+                    message: Some(crate::state::listener_not_found_message(
+                        &input.listener_arn,
+                    )),
                 },
             )
             .into());

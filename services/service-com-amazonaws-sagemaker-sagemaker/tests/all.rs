@@ -17,6 +17,8 @@ mod ai_workload_config_lifecycle;
 mod app_image_config_registry;
 #[path = "all/artifact_lineage.rs"]
 mod artifact_lineage;
+#[path = "all/batch_transform_jobs.rs"]
+mod batch_transform_jobs;
 #[path = "all/code_repositories.rs"]
 mod code_repositories;
 #[path = "all/endpoint_config_deletion.rs"]

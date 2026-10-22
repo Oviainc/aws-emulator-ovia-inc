@@ -362,7 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = guard.clusters.get(&cluster_name) else {
             return Err(RunTaskErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
-                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -377,10 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let Some(definition) = definition.cloned() else {
             return Err(RunTaskErrorModeled::ClientException(ClientException {
-                message: Some(format!(
-                    "unable to describe task definition {:?}",
-                    input.task_definition
-                )),
+                message: Some(crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         };

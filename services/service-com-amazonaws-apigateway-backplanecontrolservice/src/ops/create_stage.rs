@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a `Stage` of `restApiId` under `stageName`, pointing at the
+//! deployment `deploymentId` names, and answers from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +123,129 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeMap, HashMap};
+
+use crate::state::StageEntry;
+
+/// Refuse a `stageName` that is not one API Gateway accepts.
+///
+/// From the member's own documentation: "Stage names can only contain alphanumeric
+/// characters, hyphens, and underscores. Maximum length is 128 characters." An empty
+/// name is no name at all: a stage name is the first path segment of an invoke URL.
+pub fn validate_stage_name(stage_name: &str) -> Result<(), String> {
+    if stage_name.is_empty() {
+        return Err("stageName must not be empty".to_string());
+    }
+    crate::state::bound_chars("stageName", stage_name, crate::state::MAX_STAGE_NAME_CHARS)?;
+    if !stage_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "stageName may contain only alphanumeric characters, hyphens and underscores, got {stage_name:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The `Stage` body for a stored stage — the one place this crate renders that shape, so
+/// `CreateStage`, `CreateDeployment` and `GetStage` cannot report a record differently.
+///
+/// `methodSettings` is reported even when empty: every stage has the map, and it is what
+/// `UpdateStage` fills. `cacheClusterStatus` is computed from the stored record (see
+/// [`StageEntry::cache_cluster_status`]).
+pub fn stage_body(entry: &StageEntry) -> CreateStageOutput {
+    CreateStageOutput {
+        deployment_id: Some(entry.deployment_id.clone()),
+        // Set by `UpdateStage`, which is still a stub.
+        client_certificate_id: None,
+        stage_name: Some(entry.stage_name.clone()),
+        description: entry.description.clone(),
+        cache_cluster_enabled: entry.cache_cluster_enabled,
+        cache_cluster_size: entry.cache_cluster_size.clone(),
+        cache_cluster_status: Some(entry.cache_cluster_status().to_string()),
+        method_settings: Some(
+            entry
+                .method_settings
+                .iter()
+                .map(|(key, setting)| (key.clone(), setting.clone()))
+                .collect::<HashMap<String, MethodSetting>>(),
+        ),
+        variables: (!entry.variables.is_empty()).then(|| {
+            entry
+                .variables
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }),
+        documentation_version: entry.documentation_version.clone(),
+        // Set by `UpdateStage`, which is still a stub.
+        access_log_settings: None,
+        canary_settings: entry.canary_settings.clone(),
+        tracing_enabled: entry.tracing_enabled,
+        // Set by associating a WebACL through AWS WAF, which this service does not model.
+        web_acl_arn: None,
+        tags: (!entry.tags.is_empty()).then(|| {
+            entry
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }),
+        created_date: entry.created_date,
+        last_updated_date: entry.last_updated_date,
+    }
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all.
+fn bound_input(input: &CreateStageInput) -> Result<(), String> {
+    use crate::state::{
+        bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS, MAX_TAGS,
+        MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
+    };
+
+    for (member, value) in [
+        ("description", &input.description),
+        ("documentationVersion", &input.documentation_version),
+        ("cacheClusterSize", &input.cache_cluster_size),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(variables) = &input.variables {
+        bound_entries("variables", variables.len(), MAX_COLLECTION_ENTRIES)?;
+        for (key, value) in variables {
+            bound_chars("a variables key", key, MAX_STRING_CHARS)?;
+            bound_chars("a variables value", value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(canary) = &input.canary_settings {
+        if let Some(overrides) = &canary.stage_variable_overrides {
+            bound_entries(
+                "canarySettings.stageVariableOverrides",
+                overrides.len(),
+                MAX_COLLECTION_ENTRIES,
+            )?;
+            for (key, value) in overrides {
+                bound_chars("a stageVariableOverrides key", key, MAX_STRING_CHARS)?;
+                bound_chars("a stageVariableOverrides value", value, MAX_STRING_CHARS)?;
+            }
+        }
+    }
+    if let Some(tags) = &input.tags {
+        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        for (key, value) in tags {
+            bound_chars("a tag key", key, MAX_TAG_KEY_CHARS)?;
+            bound_chars("a tag value", value, MAX_TAG_VALUE_CHARS)?;
+        }
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -203,18 +319,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStage"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let bad_request = |message: String| -> Self::Error {
+            CreateStageErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // Nothing caller-sized reaches the store unchecked, and the checks run before
+        // the store lock is taken.
+        bound_input(&input).map_err(bad_request)?;
+        validate_stage_name(&input.stage_name).map_err(bad_request)?;
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let mut store = state.lock();
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            CreateStageErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+            })
+        })?;
+        // A stage references a PRE-EXISTING deployment of the same API, so every
+        // deployment id the request carries is resolved against that API's deployments
+        // before the stage is stored — `canarySettings.deploymentId`, the deployment a
+        // canary serves, included.
+        let canary_deployment = input
+            .canary_settings
+            .as_ref()
+            .and_then(|canary| canary.deployment_id.clone());
+        for deployment_id in [Some(input.deployment_id.clone()), canary_deployment]
+            .into_iter()
+            .flatten()
+        {
+            if !api.deployments.contains_key(&deployment_id) {
+                return Err(CreateStageErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_DEPLOYMENT.to_string()),
+                })
+                .into());
+            }
+        }
+        // A stage name names one stage of an API: re-creating it is a conflict, not an
+        // overwrite (re-pointing a stage at another deployment is what `UpdateStage` and
+        // `CreateDeployment`'s `stageName` are for).
+        if api.stages.contains_key(&input.stage_name) {
+            return Err(CreateStageErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Stage already exists for this API: {}",
+                    input.stage_name
+                )),
+            })
+            .into());
+        }
+        // Bound the growth a caller drives, at API Gateway's published quota.
+        if api.stages.len() >= crate::state::MAX_STAGES_PER_API {
+            return Err(CreateStageErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(format!(
+                        "Maximum number of stages exceeded for this API: {}",
+                        crate::state::MAX_STAGES_PER_API
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let entry = StageEntry {
+            stage_name: input.stage_name.clone(),
+            deployment_id: input.deployment_id,
+            description: input.description,
+            cache_cluster_enabled: input.cache_cluster_enabled,
+            cache_cluster_size: input.cache_cluster_size,
+            // A cache cluster the caller asked for is still coming up when this answer
+            // is written; the span is stored, never slept through.
+            cache_cluster_ready_at: input.cache_cluster_enabled.then(|| {
+                ::std::time::Instant::now() + crate::state::CACHE_CLUSTER_CREATE_SPAN
+            }),
+            variables: input
+                .variables
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<String, String>>(),
+            documentation_version: input.documentation_version,
+            canary_settings: input.canary_settings,
+            tracing_enabled: input.tracing_enabled,
+            // `UpdateStage` writes the method settings; it is still a stub, so a new
+            // stage carries none.
+            method_settings: BTreeMap::new(),
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<String, String>>(),
+            created_date: Some(now),
+            last_updated_date: Some(now),
+        };
+        api.stages.insert(input.stage_name.clone(), entry);
+        let stored = api
+            .stages
+            .get(&input.stage_name)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(stage_body(stored))
     }
 }

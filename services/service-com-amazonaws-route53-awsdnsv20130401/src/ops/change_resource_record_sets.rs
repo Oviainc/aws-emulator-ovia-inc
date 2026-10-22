@@ -107,19 +107,23 @@
 use super::types::*;
 
 use crate::state::{
-    dns_sort_key, name_is_in_zone, normalize_dns_name, normalize_zone_id, RecordKey,
-    MAX_CHANGES_PER_BATCH, MAX_RECORD_SETS_PER_ZONE, MAX_REPORTED_CHANGE_PROBLEMS,
+    dns_sort_key, name_is_in_zone, no_such_hosted_zone, normalize_dns_name, normalize_zone_id,
+    RecordKey, MAX_CHANGES_PER_BATCH, MAX_RECORD_SETS_PER_ZONE, MAX_REPORTED_CHANGE_PROBLEMS,
 };
 use std::collections::BTreeMap;
 
 /// An `InvalidChangeBatch` naming one problem per refused change.
 ///
-/// The shape carries both a `Messages` list (one entry per change the real
-/// service could not apply) and the single `message` an SDK surfaces, so both
-/// are filled from the same list.
+/// The shape carries both a `messages` LIST — "This exception contains a list of
+/// messages that might contain one or more error messages. Each error message
+/// indicates one error in the change batch" — and the single `message` an SDK
+/// surfaces, so both are filled from the same list: `messages` holds one entry
+/// per refused change, and `message` is that list rendered as a list, in
+/// brackets, so a caller that reads only the flat member still sees every entry
+/// and can tell one from several.
 fn invalid_change_batch(problems: Vec<String>) -> InvalidChangeBatch {
     InvalidChangeBatch {
-        message: Some(problems.join(" ")),
+        message: Some(format!("[{}]", problems.join(", "))),
         messages: Some(problems),
     }
 }
@@ -157,15 +161,16 @@ impl Problems {
     }
 }
 
-/// How a change names itself in an `InvalidChangeBatch` message: the same
-/// `[Action=…, Name=…, Type=…, SetIdentifier=…]` tuple Route 53 quotes back, so a
-/// caller with several changes in one batch can tell which one was refused.
-fn change_label(action: &str, record: &ResourceRecordSet) -> String {
-    let set_identifier = record.set_identifier.as_deref().unwrap_or("null");
-    format!(
-        "[Action={action}, Name={}, Type={}, SetIdentifier={set_identifier}]",
-        record.name, record.r#type
-    )
+/// How a change names the record set it was refused over: `[name='<name>',
+/// type='<type>']`, both values taken from the request.
+///
+/// The record is named by what IDENTIFIES it in DNS — the name it answers for
+/// and its record type — so a caller with several changes in one batch can tell
+/// which one was refused. Nothing internal to this handler goes in: the action
+/// is already stated by the sentence the label sits in, and a member the request
+/// did not give is not reported as a literal `null`.
+fn change_label(record: &ResourceRecordSet) -> String {
+    format!("[name='{}', type='{}']", record.name, record.r#type)
 }
 
 /// The record data values of a record set, sorted, for comparing two sets of
@@ -186,7 +191,7 @@ fn sorted_values(record: &ResourceRecordSet) -> Vec<String> {
 /// A record set routes either to record data of its own (`ResourceRecords`, with
 /// the `TTL` that data is cached for) or to an `AliasTarget`; one of the two has
 /// to be there for the record set to answer a query at all.
-fn rdata_problem(action: &str, record: &ResourceRecordSet) -> Option<String> {
+fn rdata_problem(record: &ResourceRecordSet) -> Option<String> {
     let has_records = record.resource_records.iter().flatten().next().is_some();
     if record.alias_target.is_some() {
         return None;
@@ -195,13 +200,13 @@ fn rdata_problem(action: &str, record: &ResourceRecordSet) -> Option<String> {
         return Some(format!(
             "Invalid request: Expected exactly one of [AliasTarget, all of [TTL, and \
              ResourceRecords]], but found none in Change with {}",
-            change_label(action, record)
+            change_label(record)
         ));
     }
     if record.ttl.is_none() {
         return Some(format!(
             "Invalid request: Expected a TTL alongside ResourceRecords in Change with {}",
-            change_label(action, record)
+            change_label(record)
         ));
     }
     None
@@ -336,12 +341,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let zone_id = normalize_zone_id(&input.hosted_zone_id).to_string();
         let mut store = state.lock();
         let zone = store.zones.get(&zone_id).ok_or_else(|| {
-            ChangeResourceRecordSetsErrorModeled::NoSuchHostedZone(NoSuchHostedZone {
-                message: Some(format!(
-                    "no hosted zone exists with the ID {}",
-                    input.hosted_zone_id
-                )),
-            })
+            ChangeResourceRecordSetsErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
         })?;
 
         // A health check has to exist to be referenced, and this emulator mints
@@ -407,9 +409,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if current.is_some() {
                         problems.push(format!(
                             "Tried to create resource record set {} but it already exists",
-                            change_label(action, &record)
+                            change_label(&record)
                         ));
-                    } else if let Some(problem) = rdata_problem(action, &record) {
+                    } else if let Some(problem) = rdata_problem(&record) {
                         problems.push(problem);
                     } else {
                         record_count += 1;
@@ -417,7 +419,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 "UPSERT" => {
-                    if let Some(problem) = rdata_problem(action, &record) {
+                    if let Some(problem) = rdata_problem(&record) {
                         problems.push(problem);
                     } else {
                         if current.is_none() {
@@ -429,7 +431,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "DELETE" => match &current {
                     None => problems.push(format!(
                         "Tried to delete resource record set {} but it was not found",
-                        change_label(action, &record)
+                        change_label(&record)
                     )),
                     // The zone's own delegation records are not the caller's to
                     // remove: deleting the apex NS or SOA record would leave a
@@ -444,7 +446,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         problems.push(format!(
                             "Tried to delete resource record set {} but it is one of the hosted \
                              zone's own default NS and SOA records, which cannot be deleted",
-                            change_label(action, &record)
+                            change_label(&record)
                         ));
                     }
                     // "To delete a resource record set, you must specify all the
@@ -452,12 +454,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // DELETE has to carry the record's data, and it has to be
                     // the data the zone holds.
                     Some(stored) => {
-                        if let Some(problem) = rdata_problem(action, &record) {
+                        if let Some(problem) = rdata_problem(&record) {
                             problems.push(problem);
                         } else if let Some(reason) = delete_mismatch(stored, &record) {
                             problems.push(format!(
                                 "Tried to delete resource record set {} but {reason}",
-                                change_label(action, &record)
+                                change_label(&record)
                             ));
                         } else {
                             record_count -= 1;

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ComposeEnvironments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ComposeEnvironments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ComposeEnvironments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented as a refusal, which is what this operation's own contract leaves reachable
+//! here: it names each environment it creates from an `env.yaml` manifest INSIDE the
+//! source bundle of each version label ("The name of each environment and other required
+//! information must be included in the source bundles in an environment manifest named
+//! env.yaml"). This emulator stores a source bundle as the S3 reference the caller passed
+//! and never reads its content, so no manifest exists to name an environment from, and the
+//! request is refused with the service's `MissingParameter` instead of composing an
+//! environment whose name was invented. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +153,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ComposeEnvironments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ComposeEnvironmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = (ctx, &self.engine);
+
+        // "Takes a list of version labels that specify application source
+        // bundles for each of the environments to create or update." Without one
+        // there is no environment to compose at all.
+        let version_labels = input.version_labels.clone().unwrap_or_default();
+        if version_labels.is_empty() {
+            return Err(ComposeEnvironmentsError::missing_parameter(
+                "Specify at least one VersionLabel: each one names the source bundle of an environment to compose.",
+            ));
+        }
+
+        // "Each source bundle must include an environment manifest that
+        // specifies the name of the environment and the name of the solution
+        // stack to use, and optionally can specify environment links to create."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ComposeEnvironments"))
+        // The manifest lives in the bundle, and a bundle is only ever an S3
+        // reference in this emulator (`CreateApplicationVersion` stores
+        // `SourceBundle` as the `S3Location` the caller passed; nothing reads the
+        // object). So the environment name, its solution stack and its links are
+        // all absent, and every validation that comes after resolving them —
+        // which application the versions belong to, which environments the group
+        // already has, the environment quota — is unreachable. Refusing names
+        // what is missing; composing would have to invent an environment name,
+        // and reporting an environment nothing created would be worse than the
+        // refusal.
+        Err(ComposeEnvironmentsError::missing_parameter(format!(
+            "The environment manifest (env.yaml) naming the environment to compose is not available from the source bundle of version label '{}'.",
+            version_labels.join("', '")
+        )))
     }
 }

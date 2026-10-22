@@ -121,9 +121,18 @@ impl Answer {
         self.body["status"].as_str().unwrap_or_default().to_string()
     }
 
-    /// The wire error code (`__type`), or the empty string on a success.
+    /// The error-type discriminator the body carries — `__type`, or the `code` / `Code`
+    /// spellings the same JSON error parsers also accept — or the empty string when it
+    /// carries none.
+    ///
+    /// Every refusal of one of this service's own modelled exceptions must carry NONE of
+    /// them: AmplifyUIBuilder names no exception on the wire, so a client classifies a
+    /// failure by HTTP status (see `component_refusals.rs`).
     fn error_code(&self) -> &str {
-        self.body["__type"].as_str().unwrap_or_default()
+        ["__type", "code", "Code"]
+            .iter()
+            .find_map(|member| self.body[*member].as_str())
+            .unwrap_or_default()
     }
 }
 
@@ -722,8 +731,8 @@ async fn an_id_naming_no_codegen_job_is_reported_as_missing() {
             answer.status, answer.body
         );
         assert!(
-            answer.error_code().contains("ResourceNotFoundException"),
-            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            answer.error_code().is_empty(),
+            "case {case:?}: a refusal must name no error type, got {:?}",
             answer.error_code()
         );
     }

@@ -500,6 +500,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             disable_execute_api_endpoint: input.disable_execute_api_endpoint,
             root_resource_id: root_resource_id.clone(),
             resources,
+            // A new API is created with no deployment, so it has no stage either;
+            // `CreateDeployment` and `CreateStage` are what add them. A clone copies the
+            // source's resource tree only, so a cloned API starts with neither.
+            stages: BTreeMap::new(),
+            deployments: BTreeMap::new(),
             sequence,
         };
 

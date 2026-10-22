@@ -22,7 +22,13 @@
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   generated routing table. Return `Some(op)` to route one yourself. THIS SERVICE
+//!   uses it to serve every routable request through
+//!   [`untyped_errors::UntypedErrorOperation`], which runs the operation the routing
+//!   table names and then removes the error-type discriminator from the response the
+//!   framework rendered, for the reason named in [`untyped_errors`]: AmplifyUIBuilder
+//!   names none of its exceptions on the wire, so a client classifies a refusal by
+//!   status.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -45,6 +51,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod untyped_errors;
+
 /// The `com-amazonaws-amplifyuibuilder-amplifyuibuilder` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -52,6 +60,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The wrapper `override_operation` hands back for every routable request,
+    /// built once because that seam returns a reference to it.
+    untyped: untyped_errors::UntypedErrorOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +72,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            untyped: untyped_errors::UntypedErrorOperation,
         }
     }
 }
@@ -87,12 +99,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every routable request is served through the wrapper: it runs the
+        // operation the generated routing table names — the framework still owns
+        // the whole walk and every status, message and member it answers with —
+        // and then removes the error-type discriminator from whatever it answered
+        // (see [`untyped_errors`]). A request the routing table cannot serve is
+        // left to the framework's own unroutable-request answer.
+        untyped_errors::routes(&self.entry, req).then_some(&self.untyped as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

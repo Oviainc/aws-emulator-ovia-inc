@@ -5,6 +5,10 @@
 //! same multi-service router the emulator boots.
 //!
 //! Every suite here builds its own engine, so one test's state is invisible to another.
+//!
+//! The harness below ([`Emulator`] and the helpers under it) is `pub(crate)`, so a
+//! sibling suite in `tests/all/` drives the same router through the same wire rather
+//! than growing a second copy of it.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -42,6 +46,7 @@ pub(crate) fn wait_for_the_clock() {
 /// One emulator with this service mounted.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -49,8 +54,18 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// This service's store inside the engine the router hands every handler — the same
+    /// store the operations read and write, reached the way a handler reaches it.
+    pub(crate) fn state(
+        &self,
+    ) -> engine::ServiceState<service_com_amazonaws_acmpca_acmprivateca::state::ComAmazonawsAcmpcaAcmprivatecaState>
+    {
+        service_com_amazonaws_acmpca_acmprivateca::state::service_state(&*self.engine)
+            .expect("the private CA store is reachable through the shared engine")
     }
 
     /// Call `operation` and return the HTTP status with the parsed JSON body.
@@ -156,7 +171,7 @@ fn rcgen_subject(common_name: &str) -> rcgen::DistinguishedName {
 ///
 /// Written by `rcgen`, so the bytes the service is fed are a certificate built by
 /// something other than the code under test.
-fn certificate_pem(common_name: &str) -> String {
+pub(crate) fn certificate_pem(common_name: &str) -> String {
     let key = rcgen::KeyPair::generate().expect("a key pair");
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("parameters");
     params.distinguished_name = rcgen_subject(common_name);
@@ -236,7 +251,7 @@ fn timestamp(time: &Time) -> String {
 }
 
 /// A blob member as awsJson1_1 carries it.
-fn blob(text: &str) -> Value {
+pub(crate) fn blob(text: &str) -> Value {
     Value::String(aws_smithy_types::base64::encode(text.as_bytes()))
 }
 
@@ -251,7 +266,7 @@ pub(crate) fn string(value: &Value, member: &str, case: &str) -> String {
 
 /// Create a CA and drive it all the way to ACTIVE, returning its ARN and the CA
 /// certificate imported into it.
-async fn active_ca(emulator: &Emulator, common_name: &str) -> (String, String) {
+pub(crate) async fn active_ca(emulator: &Emulator, common_name: &str) -> (String, String) {
     let created = emulator
         .ok(common_name, "CreateCertificateAuthority", &root_ca_request(common_name))
         .await;
@@ -1069,6 +1084,7 @@ async fn ca_arns_are_refused_by_form_and_then_by_existence() {
         ("DescribeCertificateAuthority", json!({})),
         ("GetCertificateAuthorityCsr", json!({})),
         ("GetCertificateAuthorityCertificate", json!({})),
+        ("DeleteCertificateAuthority", json!({})),
         ("ListTags", json!({})),
         (
             "ImportCertificateAuthorityCertificate",

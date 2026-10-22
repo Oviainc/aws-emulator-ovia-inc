@@ -15,6 +15,8 @@
 mod container_instances;
 #[path = "all/ecs_wire.rs"]
 mod ecs_wire;
+#[path = "all/error_messages.rs"]
+mod error_messages;
 #[path = "all/service_lifecycle.rs"]
 mod service_lifecycle;
 #[path = "all/service_projection.rs"]

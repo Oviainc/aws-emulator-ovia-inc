@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplicationResourceLifecycle
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplicationResourceLifecycle`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplicationResourceLifecycle::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores the resource lifecycle configuration on the named application and
+//! answers with what it stored; a version lifecycle configuration with no service role to
+//! apply it with is refused. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +134,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplicationResourceLifecycle` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationResourceLifecycleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplicationResourceLifecycle"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateApplicationResourceLifecycleError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+
+        let application = store
+            .applications
+            .get_mut(&input.application_name)
+            .ok_or_else(|| {
+                UpdateApplicationResourceLifecycleError::invalid_parameter_value(format!(
+                    "No Application named '{}' found.",
+                    input.application_name
+                ))
+            })?;
+
+        // "The `ServiceRole` property is required the first time that you
+        // provide a `VersionLifecycleConfig` for the application … After you
+        // provide it once … Elastic Beanstalk persists the Service Role with the
+        // application, and you don't need to specify it again."
+        if crate::state::version_lifecycle_service_role_missing(
+            application.resource_lifecycle_config.as_ref(),
+            &input.resource_lifecycle_config,
+        ) {
+            return Err(
+                UpdateApplicationResourceLifecycleError::invalid_parameter_value(
+                    "The ServiceRole property is required the first time that you provide a VersionLifecycleConfig for an application.",
+                ),
+            );
+        }
+
+        // The service role persists with the application, so a request that
+        // changes only the version lifecycle settings keeps the role already
+        // stored rather than clearing it.
+        let mut stored = input.resource_lifecycle_config.clone();
+        if stored.service_role.is_none() {
+            stored.service_role = application
+                .resource_lifecycle_config
+                .as_ref()
+                .and_then(|config| config.service_role.clone());
+        }
+        application.resource_lifecycle_config = Some(stored.clone());
+        application.date_updated = crate::state::now();
+
+        Ok(UpdateApplicationResourceLifecycleOutput {
+            application_name: Some(input.application_name.clone()),
+            resource_lifecycle_config: Some(stored),
+        })
     }
 }

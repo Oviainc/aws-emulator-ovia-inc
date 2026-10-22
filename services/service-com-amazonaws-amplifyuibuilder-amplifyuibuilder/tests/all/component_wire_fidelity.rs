@@ -205,8 +205,11 @@ fn tag_cases() -> Vec<(&'static str, Option<Value>, Value)> {
 async fn a_component_reports_date_time_timestamps_and_a_tag_map() {
     let router = emulator();
 
-    for (case, supplied, expected_tags) in tag_cases() {
-        let created = create(&router, create_data("Hero", supplied.clone())).await;
+    for (index, (case, supplied, expected_tags)) in tag_cases().into_iter().enumerate() {
+        // A name per row: a component name identifies a component within its app
+        // environment, so two rows may not share one.
+        let data = create_data(&format!("Hero{index}"), supplied.clone());
+        let created = create(&router, data).await;
         assert_eq!(
             created.status, 200,
             "case {case:?}: expected HTTP 200 from CreateComponent, got {} with {:?}",
@@ -285,8 +288,10 @@ async fn an_update_moves_modified_at_in_the_same_wire_form() {
     ];
 
     let router = emulator();
-    for (case, patch) in patches {
-        let created = create(&router, create_data("Baseline", Some(json!({"env": "test"})))).await;
+    for (index, (case, patch)) in patches.into_iter().enumerate() {
+        // A name per row, for the same reason as above.
+        let data = create_data(&format!("Baseline{index}"), Some(json!({"env": "test"})));
+        let created = create(&router, data).await;
         let id = at(&created.body, "/id")
             .as_str()
             .unwrap_or_default()
