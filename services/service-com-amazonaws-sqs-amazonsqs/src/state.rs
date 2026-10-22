@@ -3,30 +3,36 @@
 //! Engine state for the com-amazonaws-sqs-amazonsqs service.
 //!
 //! The queue is this service's primary resource: `CreateQueue` allocates one,
-//! `GetQueueUrl` resolves it by name, `GetQueueAttributes` reports it and
-//! `SetQueueAttributes` changes it, all against the SAME [`Queue`] record in
-//! [`ComAmazonawsSqsAmazonsqsState::queues`], so a create is observable by every
-//! later read and an attribute change by every later report.
+//! `GetQueueUrl` resolves it by name, `GetQueueAttributes` reports it,
+//! `SetQueueAttributes` changes it and `DeleteQueue` removes it, all against the SAME
+//! [`Queue`] record in [`ComAmazonawsSqsAmazonsqsState::queues`], so a create is
+//! observable by every later read and an attribute change by every later report.
 //!
 //! The record is the stored half; the wire half (the `Attributes` map
 //! `GetQueueAttributes` returns) is PROJECTED from it by
 //! [`Queue::reported_attributes`], so no handler assembles a response member by hand.
 //!
-//! # What this slice holds, and what it does not
+//! # The message plane
 //!
-//! The queue's identity (name, url, ARN) and its CONFIGURATION attributes. It holds no
-//! messages: `SendMessage`/`ReceiveMessage`/`DeleteMessage` are still scaffolded in
-//! this crate, so nothing can put a message in a queue. The three
-//! `ApproximateNumberOfMessages*` attributes are counts over that message plane, so
-//! they are reported by NO value here rather than by a made-up one — see
-//! [`MESSAGE_PLANE_ATTRIBUTES`].
+//! A queue also HOLDS its messages: [`Queue::messages`] is the arrival-order deque
+//! `SendMessage` appends to and `ReceiveMessage` hands out of, and [`Queue::handles`]
+//! maps the receipt handle a receive minted to the message it names, which is what
+//! `DeleteMessage` resolves. Visibility and retention are evaluated against the clock
+//! by [`Queue::materialise_due`], so the three `ApproximateNumberOfMessages*`
+//! attributes are counts over real state rather than made-up values.
+//!
+//! Everything a caller can make this in-memory store hold is bounded — see the
+//! "Store bounds" section — and a bound is REFUSED rather than enforced by eviction,
+//! because dropping a message a client was told had been accepted would lose it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::SystemTime;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::time::{Duration, SystemTime};
+
+use md5::{Digest, Md5};
 
 use crate::ops::types::{
-    InvalidAttributeName, InvalidAttributeValue, QueueDoesNotExist, UnsupportedOperation,
-    QUEUE_ATTRIBUTE_NAME_VALUES,
+    InvalidAttributeName, InvalidAttributeValue, MessageAttributeValue, QueueDoesNotExist,
+    ReceiptHandleIsInvalid, UnsupportedOperation, QUEUE_ATTRIBUTE_NAME_VALUES,
 };
 
 /// The region an ARN carries when the request names none (an unsigned call, which
@@ -38,13 +44,6 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// "service_info")` reports it (`arnNamespace: sqs`, `sigv4Name: sqs`) — the
 /// `service` segment of every queue ARN.
 pub const ARN_SERVICE: &str = "sqs";
-
-/// How many queues this emulator will hold.
-///
-/// NOT a fidelity claim about any published quota: it is the emulator's own ceiling,
-/// generous enough that no realistic workflow meets it, so a caller looping on
-/// `CreateQueue` cannot grow this process's memory without bound.
-pub const MAX_QUEUES: usize = 1_000;
 
 /// The longest queue name `CreateQueue` accepts: "A queue name can have up to 80
 /// characters" (`CreateQueueRequest$QueueName` docs).
@@ -81,13 +80,9 @@ pub const DERIVED_ATTRIBUTES: &[&str] = &["QueueArn", "CreatedTimestamp", "LastM
 /// Attributes that count MESSAGES ("the approximate number of messages available for
 /// retrieval", "... that are delayed", "... that are in flight").
 ///
-/// This crate has no message plane yet — `SendMessage`, `ReceiveMessage` and
-/// `DeleteMessage` all still answer HTTP 501 — so there is no store to count and these
-/// are reported by no value at all. A queue omits an attribute it has no value for
-/// (exactly as it omits `Policy` when no policy was ever set), which the model's own
-/// `AttributeNames` note tells a client to expect: "In the future, new attributes might
-/// be added. If you write code that calls this action, we recommend that you structure
-/// your code so that it can handle new attributes gracefully."
+/// [`Queue::reported_attributes`] derives each from the queue's own message deque, so
+/// they are reported but never settable — which is why they appear here and not in
+/// [`SETTABLE_ATTRIBUTES`].
 pub const MESSAGE_PLANE_ATTRIBUTES: &[&str] = &[
     "ApproximateNumberOfMessages",
     "ApproximateNumberOfMessagesDelayed",
@@ -157,7 +152,7 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     },
     AttributeSpec {
         // "Valid values: An integer from 0 to 900 seconds (15 minutes). Default: 0."
-        name: "DelaySeconds",
+        name: DELAY_SECONDS,
         kind: AttributeKind::Integer { min: 0, max: 900 },
         create_only: false,
         fifo_only: false,
@@ -206,7 +201,7 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     AttributeSpec {
         // "Valid values: An integer from 1,024 bytes (1 KiB) to 1,048,576 bytes
         // (1 MiB). Default: 1,048,576 bytes (1 MiB)."
-        name: "MaximumMessageSize",
+        name: MAXIMUM_MESSAGE_SIZE,
         kind: AttributeKind::Integer {
             min: 1_024,
             max: 1_048_576,
@@ -218,7 +213,7 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     AttributeSpec {
         // "Valid values: An integer from 60 seconds (1 minute) to 1,209,600 seconds
         // (14 days). Default: 345,600 (4 days)."
-        name: "MessageRetentionPeriod",
+        name: MESSAGE_RETENTION_PERIOD,
         kind: AttributeKind::Integer {
             min: 60,
             max: 1_209_600,
@@ -237,7 +232,7 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     },
     AttributeSpec {
         // "Valid values: An integer from 0 to 20 (seconds). Default: 0."
-        name: "ReceiveMessageWaitTimeSeconds",
+        name: RECEIVE_MESSAGE_WAIT_TIME_SECONDS,
         kind: AttributeKind::Integer { min: 0, max: 20 },
         create_only: false,
         fifo_only: false,
@@ -272,7 +267,7 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     },
     AttributeSpec {
         // "Valid values: An integer from 0 to 43,200 (12 hours). Default: 30."
-        name: "VisibilityTimeout",
+        name: VISIBILITY_TIMEOUT,
         kind: AttributeKind::Integer { min: 0, max: 43_200 },
         create_only: false,
         fifo_only: false,
@@ -285,6 +280,127 @@ pub fn settable_attribute(name: &str) -> Option<&'static AttributeSpec> {
     SETTABLE_ATTRIBUTES.iter().find(|spec| spec.name == name)
 }
 
+// The message-plane attributes the message handlers read, named once so a handler
+// never spells one as a literal.
+pub const DELAY_SECONDS: &str = "DelaySeconds";
+pub const MAXIMUM_MESSAGE_SIZE: &str = "MaximumMessageSize";
+pub const MESSAGE_RETENTION_PERIOD: &str = "MessageRetentionPeriod";
+pub const RECEIVE_MESSAGE_WAIT_TIME_SECONDS: &str = "ReceiveMessageWaitTimeSeconds";
+pub const VISIBILITY_TIMEOUT: &str = "VisibilityTimeout";
+
+/// The inclusive `(min, max)` the documentation gives integer attribute `name`, from
+/// [`SETTABLE_ATTRIBUTES`] — the one place those bounds are written.
+///
+/// A name that is not an integer attribute is unbounded, so no caller has to unwrap.
+pub fn integer_bounds(name: &str) -> (i64, i64) {
+    match settable_attribute(name).map(|spec| spec.kind) {
+        Some(AttributeKind::Integer { min, max }) => (min, max),
+        _ => (0, i64::MAX),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Store bounds
+// ---------------------------------------------------------------------------
+//
+// The store is in-memory and the emulator authenticates nobody, so everything a
+// caller can make it hold is bounded. NOT fidelity claims about any published quota:
+// each is the emulator's own ceiling, generous enough that no realistic workflow meets
+// it, so a caller looping on a request cannot grow this process's memory without
+// bound.
+
+/// How many queues this emulator will hold; `CreateQueue` refuses past it.
+pub const MAX_QUEUES: usize = 1_000;
+
+/// How many messages one queue holds. `MessageRetentionPeriod` is an AWS duration
+/// (4 days by default, up to 14), far longer than an emulator session, so it does not
+/// bound memory on its own: `SendMessage` refuses past this.
+pub const MAX_MESSAGES_PER_QUEUE: usize = 1_000;
+
+/// How many message bytes one queue holds, so a few large messages are bounded as well
+/// as many small ones.
+pub const MAX_RETAINED_MESSAGE_BYTES_PER_QUEUE: usize = 8 * 1024 * 1024;
+
+/// How many message bytes the whole store holds, across every queue: the per-queue
+/// caps alone would still scale with the number of queues.
+pub const MAX_RETAINED_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// The page size `ListQueues` uses when the caller gives no `MaxResults`, so one
+/// unparameterised request cannot materialise a response that grows with the stored
+/// queue count. A client walks past it with `NextToken`.
+pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
+
+// The per-queue tag bounds live with the other tag quotas above:
+// [`MAX_TAGS_PER_QUEUE`], [`MAX_TAG_KEY_LENGTH`] and [`MAX_TAG_VALUE_LENGTH`].
+
+/// How many attributes one message may carry. Amazon SQS Developer Guide: "Each message
+/// can have up to 10 attributes."
+pub const MAX_MESSAGE_ATTRIBUTES: usize = 10;
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+/// Where a stored message stands relative to the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    /// Its delay has not elapsed yet, so it is not available for retrieval.
+    Delayed,
+    /// It was handed to a consumer and its visibility timeout has not lapsed.
+    InFlight,
+    /// It is available for retrieval now.
+    Visible,
+}
+
+/// One message a queue holds.
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    /// The identifier minted when the message was sent.
+    pub message_id: String,
+    /// The body exactly as sent.
+    pub body: String,
+    /// MD5 hex digest of [`body`](Self::body).
+    pub md5_of_body: String,
+    /// The message attributes the sender supplied.
+    pub message_attributes: BTreeMap<String, MessageAttributeValue>,
+    /// When `SendMessage` accepted it.
+    pub sent_at: SystemTime,
+    /// `sent_at` + the effective `DelaySeconds`: before this instant the message is
+    /// [`Visibility::Delayed`].
+    pub available_at: SystemTime,
+    /// Set by a receive to `now + effective visibility timeout`; cleared once the clock
+    /// passes it.
+    pub invisible_until: Option<SystemTime>,
+    /// How many times the message has been handed to a consumer without being deleted.
+    pub receive_count: u32,
+    /// When it was first handed to a consumer.
+    pub first_received_at: Option<SystemTime>,
+}
+
+impl StoredMessage {
+    /// Everything this message retains, in bytes: the body plus the message attributes,
+    /// which hold caller-supplied names, data types, strings and blobs. Amazon SQS
+    /// counts message attributes toward a message's size, and this emulator's byte
+    /// budgets count them too, so the accounting covers every byte a sender can make
+    /// the store hold.
+    pub fn retained_bytes(&self) -> usize {
+        self.body
+            .len()
+            .saturating_add(message_attribute_bytes(&self.message_attributes))
+    }
+
+    /// Where this message stands at `now`.
+    pub fn visibility(&self, now: SystemTime) -> Visibility {
+        if now < self.available_at {
+            return Visibility::Delayed;
+        }
+        match self.invisible_until {
+            Some(until) if now < until => Visibility::InFlight,
+            _ => Visibility::Visible,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-sqs-amazonsqs. A handler reaches it through [`service_state`].
 ///
 /// `queues` is a `BTreeMap` rather than a `HashMap` so iteration is in name order:
@@ -295,7 +411,8 @@ pub struct ComAmazonawsSqsAmazonsqsState {
     pub queues: BTreeMap<String, Queue>,
 }
 
-/// A stored queue: the state the reported `Attributes` map is rebuilt from.
+/// A stored queue: the state the reported `Attributes` map is rebuilt from, plus the
+/// messages it holds.
 #[derive(Debug, Clone)]
 pub struct Queue {
     pub name: String,
@@ -313,6 +430,17 @@ pub struct Queue {
     /// (keys differing only in case are different tags), as the `TagQueue`
     /// documentation states.
     pub tags: BTreeMap<String, String>,
+    /// The messages this queue holds, in arrival order. Bounded: at most
+    /// [`MAX_MESSAGES_PER_QUEUE`] messages and [`MAX_RETAINED_MESSAGE_BYTES_PER_QUEUE`]
+    /// bytes, with the store-wide [`MAX_RETAINED_MESSAGE_BYTES`] budget bounding every
+    /// queue together.
+    pub messages: VecDeque<StoredMessage>,
+    /// Receipt handle -> message id, written only through
+    /// [`record_receipt_handle`](Self::record_receipt_handle). At most ONE live handle
+    /// per message: a later receive replaces the handle an earlier one minted, and a
+    /// handle is dropped with its message — so this map never holds more entries than
+    /// [`messages`](Self::messages), whatever the receive count.
+    pub handles: HashMap<String, String>,
     pub created_at: SystemTime,
     /// When an attribute of this queue last changed; equals `created_at` until a
     /// `SetQueueAttributes` changes something.
@@ -320,13 +448,13 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Every attribute this queue has a value for: its stored configuration plus the
-    /// three the record itself derives (`QueueArn`, `CreatedTimestamp`,
-    /// `LastModifiedTimestamp`).
+    /// Every attribute this queue has a value for: its stored configuration, the three
+    /// the record itself derives (`QueueArn`, `CreatedTimestamp`,
+    /// `LastModifiedTimestamp`) and the three that count the messages it holds.
     ///
     /// The two timestamps are reported "in seconds (epoch time)", per their own
     /// entries in the `AttributeNames` documentation.
-    pub fn reported_attributes(&self) -> BTreeMap<String, String> {
+    pub fn reported_attributes(&self, now: SystemTime) -> BTreeMap<String, String> {
         let mut reported = self.attributes.clone();
         reported.insert("QueueArn".to_string(), self.arn.clone());
         reported.insert(
@@ -336,6 +464,19 @@ impl Queue {
         reported.insert(
             "LastModifiedTimestamp".to_string(),
             epoch_seconds(self.last_modified_at),
+        );
+        let (visible, in_flight, delayed) = self.counts(now);
+        reported.insert(
+            "ApproximateNumberOfMessages".to_string(),
+            visible.to_string(),
+        );
+        reported.insert(
+            "ApproximateNumberOfMessagesNotVisible".to_string(),
+            in_flight.to_string(),
+        );
+        reported.insert(
+            "ApproximateNumberOfMessagesDelayed".to_string(),
+            delayed.to_string(),
         );
         reported
     }
@@ -347,6 +488,150 @@ impl Queue {
             .get(FIFO_QUEUE_ATTRIBUTE)
             .is_some_and(|value| value == "true")
     }
+
+    /// The configured value of integer attribute `name`, falling back to the
+    /// documented default when the queue carries no value (or an unparseable one).
+    pub fn integer(&self, name: &str) -> i64 {
+        let default = settable_attribute(name)
+            .and_then(|spec| spec.default)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        self.attributes
+            .get(name)
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .unwrap_or(default)
+    }
+
+    /// (visible, in flight, delayed) message counts at `now`.
+    pub fn counts(&self, now: SystemTime) -> (usize, usize, usize) {
+        let mut counts = (0usize, 0usize, 0usize);
+        for message in &self.messages {
+            match message.visibility(now) {
+                Visibility::Visible => counts.0 += 1,
+                Visibility::InFlight => counts.1 += 1,
+                Visibility::Delayed => counts.2 += 1,
+            }
+        }
+        counts
+    }
+
+    /// Materialise everything the CLOCK already made due on this queue: drop messages
+    /// whose retention period has elapsed, and return messages whose visibility
+    /// timeout has lapsed to the visible set. Both were owed at `now` whether or not
+    /// anybody called, which is why a reporting operation may apply them.
+    pub fn materialise_due(&mut self, now: SystemTime) {
+        let retention = seconds(self.integer(MESSAGE_RETENTION_PERIOD));
+        let mut expired: Vec<String> = Vec::new();
+        self.messages.retain(|message| {
+            let due = message
+                .sent_at
+                .checked_add(retention)
+                .is_some_and(|due| now >= due);
+            if due {
+                expired.push(message.message_id.clone());
+            }
+            !due
+        });
+        if !expired.is_empty() {
+            self.handles.retain(|_, id| !expired.contains(id));
+        }
+        for message in &mut self.messages {
+            if message.invisible_until.is_some_and(|until| now >= until) {
+                message.invisible_until = None;
+            }
+        }
+    }
+
+    /// Record the receipt handle a receive just minted for `message_id`, dropping the
+    /// handle an earlier receive minted for it.
+    ///
+    /// Amazon SQS documents exactly this behaviour: "If you receive a message more than
+    /// once, each time you receive it, you get a different receipt handle. You must
+    /// provide the most recently received receipt handle when you request to delete the
+    /// message." Replacing rather than accumulating is also what bounds
+    /// [`handles`](Self::handles) by the message count.
+    pub fn record_receipt_handle(&mut self, receipt_handle: String, message_id: &str) {
+        self.handles.retain(|_, id| id != message_id);
+        self.handles.insert(receipt_handle, message_id.to_string());
+    }
+
+    /// Drop a message and every receipt handle that referred to it.
+    pub fn remove_message(&mut self, message_id: &str) {
+        self.messages
+            .retain(|message| message.message_id != message_id);
+        self.handles.retain(|_, id| id != message_id);
+    }
+
+    /// Total bytes this queue holds, counting everything each message retains.
+    pub fn retained_message_bytes(&self) -> usize {
+        self.messages
+            .iter()
+            .map(StoredMessage::retained_bytes)
+            .sum()
+    }
+
+    /// Why this queue cannot take one more message retaining `message_bytes`, given the
+    /// store already holds `store_bytes` — or `None` when it can.
+    ///
+    /// The bounds are refused rather than enforced by eviction: silently dropping the
+    /// oldest message would lose a message a client was told had been accepted.
+    pub fn message_rejection(&self, message_bytes: usize, store_bytes: usize) -> Option<String> {
+        if self.messages.len() >= MAX_MESSAGES_PER_QUEUE {
+            return Some(format!(
+                "This emulator holds at most {MAX_MESSAGES_PER_QUEUE} messages per queue; \
+                 queue {} is full. Delete messages from it first.",
+                self.name
+            ));
+        }
+        if self.retained_message_bytes().saturating_add(message_bytes)
+            > MAX_RETAINED_MESSAGE_BYTES_PER_QUEUE
+        {
+            return Some(format!(
+                "This emulator holds at most {MAX_RETAINED_MESSAGE_BYTES_PER_QUEUE} message \
+                 bytes per queue; queue {} cannot take {message_bytes} more.",
+                self.name
+            ));
+        }
+        if store_bytes.saturating_add(message_bytes) > MAX_RETAINED_MESSAGE_BYTES {
+            return Some(format!(
+                "This emulator holds at most {MAX_RETAINED_MESSAGE_BYTES} message bytes in \
+                 total; it cannot take {message_bytes} more."
+            ));
+        }
+        None
+    }
+}
+
+impl ComAmazonawsSqsAmazonsqsState {
+    /// Total message bytes the whole store holds, across every queue.
+    pub fn retained_message_bytes(&self) -> usize {
+        self.queues.values().map(Queue::retained_message_bytes).sum()
+    }
+
+    /// Materialise everything the CLOCK already made due across every queue; see
+    /// [`Queue::materialise_due`].
+    pub fn materialise_due(&mut self, now: SystemTime) {
+        for queue in self.queues.values_mut() {
+            queue.materialise_due(now);
+        }
+    }
+
+    /// The queue a `QueueUrl` addresses, for reading.
+    pub fn queue_by_url(&self, queue_url: &str) -> Option<&Queue> {
+        self.queues.get(queue_name_from_url(queue_url)?)
+    }
+
+    /// The queue a `QueueUrl` addresses, for writing.
+    pub fn queue_by_url_mut(&mut self, queue_url: &str) -> Option<&mut Queue> {
+        let name = queue_name_from_url(queue_url)?.to_string();
+        self.queues.get_mut(&name)
+    }
+
+    /// Remove the queue a `QueueUrl` addresses, with every message and handle it held.
+    pub fn remove_queue_by_url(&mut self, queue_url: &str) -> Option<Queue> {
+        let name = queue_name_from_url(queue_url)?.to_string();
+        self.queues.remove(&name)
+    }
 }
 
 /// A `SystemTime` as the whole seconds since the Unix epoch, which is how SQS reports
@@ -354,6 +639,16 @@ impl Queue {
 fn epoch_seconds(at: SystemTime) -> String {
     at.duration_since(SystemTime::UNIX_EPOCH)
         .map(|since| since.as_secs())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A `SystemTime` as whole milliseconds since the Unix epoch, which is how SQS reports
+/// the `SentTimestamp`/`ApproximateFirstReceiveTimestamp` message system attributes
+/// ("epoch time in milliseconds").
+pub fn epoch_millis(at: SystemTime) -> String {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_millis())
         .unwrap_or_default()
         .to_string()
 }
@@ -421,6 +716,20 @@ pub fn queue_does_not_exist(queue_url: &str) -> QueueDoesNotExist {
     QueueDoesNotExist {
         message: Some(format!(
             "The queue referred to by {queue_url} does not exist. Ensure that the QueueUrl is correct and that the queue has not been deleted."
+        )),
+    }
+}
+
+/// The modelled refusal for a receipt handle this queue did not mint, or whose message
+/// is gone.
+///
+/// A handle is replaced by the next receive of the same message, so a superseded one is
+/// invalid too: "You must provide the most recently received receipt handle when you
+/// request to delete the message."
+pub fn receipt_handle_is_invalid(receipt_handle: &str) -> ReceiptHandleIsInvalid {
+    ReceiptHandleIsInvalid {
+        message: Some(format!(
+            "The input receipt handle {receipt_handle:?} is not a valid receipt handle for this queue."
         )),
     }
 }
@@ -608,4 +917,117 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsSqsAmazonsqsState>)
+}
+
+// ---------------------------------------------------------------------------
+// Message content: digests, sizes and identifiers
+// ---------------------------------------------------------------------------
+
+/// A non-negative second count as a [`Duration`]; a negative count is zero.
+pub fn seconds(value: i64) -> Duration {
+    Duration::from_secs(u64::try_from(value).unwrap_or(0))
+}
+
+/// `at` plus `value` seconds. Total: `SystemTime`'s `Add` PANICS on overflow and every
+/// instant computed here derives from a request value, so overflow yields `at` (the
+/// unreachable case — every span this is called with is a validated attribute bounded
+/// at 43 200 seconds).
+pub fn after(at: SystemTime, value: i64) -> SystemTime {
+    at.checked_add(seconds(value)).unwrap_or(at)
+}
+
+/// A fresh opaque identifier: a version-4 UUID, so two calls never collide. Used for a
+/// `MessageId` and for the receipt handle each receive mints.
+pub fn new_identifier() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// MD5 hex digest of `body` — the value SQS returns as `MD5OfMessageBody`/`MD5OfBody`.
+pub fn md5_hex(body: &[u8]) -> String {
+    hex::encode(Md5::digest(body))
+}
+
+/// MD5 hex digest of the message-attribute encoding SQS defines, or `None` when there
+/// are no attributes (SQS omits `MD5OfMessageAttributes` then).
+///
+/// The encoding is Amazon SQS's own, documented as "Calculating the MD5 message digest
+/// for message attributes" in the Amazon SQS Developer Guide, and no crate implements
+/// it, so it is written here over the `md-5` crate's digest: attributes are taken in
+/// name order, and each contributes
+///
+/// 1. its name, length-prefixed with a 4-byte big-endian length,
+/// 2. its `DataType`, length-prefixed the same way,
+/// 3. one transport-type byte — `1` for a `StringValue`, `2` for a `BinaryValue`,
+/// 4. the value itself, length-prefixed the same way.
+///
+/// `StringListValues`/`BinaryListValues` contribute NOTHING: the model documents both as
+/// "Not implemented. Reserved for future use.", so SQS defines no transport type for
+/// them and `SendMessage` refuses a message that carries one rather than guessing a byte.
+pub fn md5_of_message_attributes(
+    attributes: &BTreeMap<String, MessageAttributeValue>,
+) -> Option<String> {
+    if attributes.is_empty() {
+        return None;
+    }
+    let mut encoded = Vec::new();
+    for (name, value) in attributes {
+        append_length_prefixed(&mut encoded, name.as_bytes());
+        append_length_prefixed(&mut encoded, value.data_type.as_bytes());
+        if let Some(string_value) = &value.string_value {
+            encoded.push(1);
+            append_length_prefixed(&mut encoded, string_value.as_bytes());
+        } else if let Some(binary_value) = &value.binary_value {
+            encoded.push(2);
+            append_length_prefixed(&mut encoded, binary_value);
+        }
+    }
+    Some(md5_hex(&encoded))
+}
+
+/// Append `bytes` preceded by its length as a 4-byte big-endian integer.
+fn append_length_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// The bytes a message-attribute map holds: each attribute's name, data type and value.
+///
+/// Amazon SQS counts message attributes toward a message's size ("All parts of a
+/// message are included in the ... size limit: the message body, the message
+/// attributes"), so they are counted here too, both against the queue's
+/// `MaximumMessageSize` and against this emulator's retained-byte budgets.
+pub fn message_attribute_bytes(attributes: &BTreeMap<String, MessageAttributeValue>) -> usize {
+    attributes
+        .iter()
+        .map(|(name, value)| {
+            name.len()
+                .saturating_add(value.data_type.len())
+                .saturating_add(value.string_value.as_ref().map_or(0, String::len))
+                .saturating_add(value.binary_value.as_ref().map_or(0, Vec::len))
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+/// Why this message attribute cannot be accepted, or `None` when it can.
+///
+/// `StringListValues` and `BinaryListValues` are documented as "Not implemented.
+/// Reserved for future use.", and an attribute that carries no value at all has no
+/// SQS-defined digest encoding either (there is no transport-type byte for "nothing"),
+/// so either is refused rather than stored under a layout Amazon SQS does not define.
+pub fn message_attribute_refusal(name: &str, value: &MessageAttributeValue) -> Option<String> {
+    if value.string_value.is_none() && value.binary_value.is_none() {
+        return Some(format!(
+            "MessageAttributes.{name} must contain a non-empty StringValue or BinaryValue."
+        ));
+    }
+    let member = [
+        value.string_list_values.is_some().then_some("StringListValues"),
+        value.binary_list_values.is_some().then_some("BinaryListValues"),
+    ]
+    .into_iter()
+    .flatten()
+    .next()?;
+    Some(format!(
+        "MessageAttributes.{name}.{member} is not implemented and is reserved for future use."
+    ))
 }
