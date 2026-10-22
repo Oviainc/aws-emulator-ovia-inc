@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkflowRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkflowRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stores a new execution instance of a workflow definition under that definition and
+//! answers 201 with the run id it generated and the run's stored status. The id is a
+//! freshly generated lowercase UUID, the form the model's `UuidString` is constrained to.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkflowRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The run is a child resource, so its parent is resolved first: a definition this
+//! account does not hold answers `ResourceNotFoundException` (404), and one that is being
+//! deleted answers `ConflictException` (409). An `@idempotencyToken` already seen replays
+//! the run it created instead of starting a second one.
+//!
+//! NOTHING ENDS A RUN IN THIS SLICE. A created run is stored `RUNNING` because that is
+//! the status the create returns, and it stays `RUNNING` until a caller moves it: the
+//! operations that end one — `UpdateWorkflowRun`, `InvokeActStep`, `DeleteWorkflowRun` —
+//! are out of scope here and answer 501 `NotImplemented`, so nothing silently reports a
+//! run as finished, and no clock-owed transition is invented for work nothing ran.
+//! `GetWorkflowRun` therefore reports `RUNNING` with no `endedAt` for the life of the
+//! record, which is what the stored state says.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +169,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkflowRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkflowRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkflowRun"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWorkflowRunErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let not_found = |missing: crate::state::MissingResource| -> Self::Error {
+            CreateWorkflowRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: missing.message,
+                resource_id: missing.resource_id,
+                resource_type: missing.resource_type,
+            })
+            .into()
+        };
+
+        let mut state = state.lock();
+        state.complete_due_deletions(now);
+
+        let fingerprint = crate::state::fingerprint(&[
+            input.workflow_definition_name.clone(),
+            input.model_id.clone(),
+            crate::state::field(input.log_group_name.as_ref()),
+            crate::state::structural_field(&input.client_info),
+        ]);
+
+        let replay = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.idempotent_create(Self::NAME, token).cloned());
+        if let Some(record) = replay {
+            if record.fingerprint != fingerprint {
+                return Err(CreateWorkflowRunErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "clientToken was already used to create workflow run {} with different parameters",
+                            record.resource_id
+                        ),
+                        resource_id: record.resource_id,
+                        resource_type: "workflow-run".to_string(),
+                    },
+                )
+                .into());
+            }
+            let replayed = state
+                .definition(&input.workflow_definition_name)
+                .and_then(|definition| definition.run(&record.resource_id))
+                .map(|run| (run.run_id.clone(), run.status));
+            if let Ok((run_id, status)) = replayed {
+                return Ok(CreateWorkflowRunOutput {
+                    workflow_run_id: run_id,
+                    status: status.as_wire().to_string(),
+                });
+            }
+            // The run that token created is gone with its parent: create a new one.
+        }
+
+        let definition_status = state
+            .definition(&input.workflow_definition_name)
+            .map(|definition| definition.status)
+            .map_err(not_found)?;
+        if definition_status != crate::state::WorkflowDefinitionStatus::Active {
+            return Err(CreateWorkflowRunErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "workflow definition {} is {} and cannot start a workflow run",
+                    input.workflow_definition_name,
+                    definition_status.as_wire()
+                ),
+                resource_id: input.workflow_definition_name.clone(),
+                resource_type: "workflow-definition".to_string(),
+            })
+            .into());
+        }
+
+        // The run store is bounded, per definition and store-wide. `CreateWorkflowRun`
+        // does not model `ServiceQuotaExceededException`, so a create past the cap is
+        // stated as what it is: a conflict with the parent's current state.
+        state
+            .check_run_quota(&input.workflow_definition_name)
+            .map_err(|quota| -> Self::Error {
+                CreateWorkflowRunErrorModeled::ConflictException(ConflictException {
+                    message: quota.message(&input.workflow_definition_name),
+                    resource_id: input.workflow_definition_name.clone(),
+                    resource_type: quota.resource_type().to_string(),
+                })
+                .into()
+            })?;
+
+        let insertion_seq = state.next_insertion_seq();
+        let run_id = state.mint_uuid();
+        let run = crate::state::WorkflowRun {
+            run_id: run_id.clone(),
+            arn: crate::state::workflow_run_arn(
+                &region,
+                &input.workflow_definition_name,
+                &run_id,
+            ),
+            status: crate::state::WorkflowRunStatus::Running,
+            started_at: now,
+            // Only a finished run has an `endedAt`, and a run AWS has just started is
+            // not finished.
+            ended_at: None,
+            model_id: input.model_id.clone(),
+            log_group_name: input.log_group_name.clone(),
+            client_info: input.client_info.clone(),
+            create_fingerprint: fingerprint.clone(),
+            sessions: ::std::collections::BTreeMap::new(),
+            insertion_seq,
+        };
+        let status = run.status.as_wire().to_string();
+        state
+            .insert_run(&input.workflow_definition_name, run)
+            .map_err(not_found)?;
+        if let Some(token) = input.client_token.as_deref() {
+            state.record_idempotent_create(Self::NAME, token, fingerprint, run_id.clone());
+        }
+
+        Ok(CreateWorkflowRunOutput {
+            workflow_run_id: run_id,
+            status,
+        })
     }
 }
