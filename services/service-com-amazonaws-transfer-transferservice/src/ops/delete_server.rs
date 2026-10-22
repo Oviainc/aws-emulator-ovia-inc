@@ -3,8 +3,8 @@
 //! @op DeleteServer
 //!
 //! Removes the stored server AND everything that hangs off it — its users and their
-//! SSH keys — so `DescribeServer` answers 404 and `ListServers` no longer lists it. An
-//! unknown `ServerId` is a `ResourceNotFoundException` (404).
+//! SSH keys, and its host keys — so `DescribeServer` answers 404 and `ListServers` no
+//! longer lists it. An unknown `ServerId` is a `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!

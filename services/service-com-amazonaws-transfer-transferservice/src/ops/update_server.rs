@@ -17,7 +17,8 @@
 //! reports that key's own fingerprint. Material in a format it cannot read changes
 //! nothing — the server keeps the key it has and reports that key's genuine
 //! fingerprint rather than one invented for material nothing read (see
-//! `state::supplied_host_key_fingerprint`).
+//! `state::supplied_host_key_fingerprint`). A host key the HOST KEY operations manage
+//! as a resource arrives through `ImportHostKey`, not here.
 //!
 //! ## Shape of an operation
 //!

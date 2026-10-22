@@ -1151,7 +1151,7 @@ pub struct Server {
     ///
     /// Computed at create time from a host key the emulator GENERATES for the server
     /// (as the service does for a server whose host key it manages) — see
-    /// [`mint_host_key_fingerprint`]. Never invented: it is the real fingerprint of
+    /// [`mint_host_key`]. Never invented: it is the real fingerprint of
     /// real key material.
     pub host_key_fingerprint: String,
     /// The log group structured logging is configured to publish to, or `None` when
@@ -2143,8 +2143,9 @@ impl ComAmazonawsTransferTransferserviceState {
     /// Mint the next `<prefix>-<17 hex digits>` identifier.
     ///
     /// `ServerId` is `^s-([0-9a-f]{17})$`, `SshPublicKeyId` is `^key-[0-9a-f]{17}$`,
+    /// `HostKeyId` is `^hostkey-[0-9a-f]{17}$`,
     /// `ConnectorId` is `^c-([0-9a-f]{17})$` and `ProfileId` is `^p-([0-9a-f]{17})$`,
-    /// so all four are this shape;
+    /// so all of them are this shape;
     /// `{:017x}` is exactly 17 lowercase hex digits for every
     /// counter value below 16^17, which a counter incremented once per created
     /// resource cannot reach.
