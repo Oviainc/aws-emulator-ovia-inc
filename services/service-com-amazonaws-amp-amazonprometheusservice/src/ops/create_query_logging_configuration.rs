@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateQueryLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Workspace not found: {}", input.workspace_id),
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
                         resource_id: input.workspace_id.clone(),
                         resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                     },
@@ -203,17 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `ConflictException`.
             return Err(
                 CreateQueryLoggingConfigurationErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "a query logging configuration already exists for workspace {}; \
-                             use UpdateQueryLoggingConfiguration to change it",
-                            input.workspace_id,
-                        ),
-                        // No single field is at fault — the request conflicts with the
-                        // workspace's state — so the reason is the modelled `OTHER`.
-                        reason: "OTHER".to_string(),
-                        field_list: None,
-                    },
+                    // No single member is at fault — the request conflicts with the
+                    // workspace's state — so this is the request-level refusal, whose
+                    // sentence is constant and carries nothing from the request.
+                    crate::state::request_validation_failed(
+                        "A workspace holds one query logging configuration; use \
+                         UpdateQueryLoggingConfiguration to change it.",
+                    ),
                 )
                 .into(),
             );

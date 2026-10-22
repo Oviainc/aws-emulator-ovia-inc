@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Resource not found: {}", input.resource_arn),
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                     resource_id: input.resource_arn.clone(),
                     resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                 },

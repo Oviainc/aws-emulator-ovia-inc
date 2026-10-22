@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateQueryLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Workspace not found: {}", input.workspace_id),
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
                         resource_id: input.workspace_id.clone(),
                         resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                     },
@@ -211,8 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UpdateQueryLoggingConfigurationErrorModeled::ConflictException(
                     ConflictException {
                         message: format!(
-                            "the query logging configuration of workspace {} is {}",
-                            input.workspace_id,
+                            "The query logging configuration is {}",
                             crate::state::QUERY_LOGGING_STATUS_DELETING,
                         ),
                         resource_id: input.workspace_id.clone(),

@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Workspace not found: {}", input.workspace_id),
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
                         resource_id: input.workspace_id.clone(),
                         resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                     },
@@ -206,19 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This operation models no `ConflictException`, so the refusal is the
             // modelled `ValidationException` (400).
             return Err(CreateLoggingConfigurationErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "Workspace {} already has a logging configuration; \
-                         use UpdateLoggingConfiguration to change it",
-                        input.workspace_id,
-                    ),
-                    reason: "FIELD_VALIDATION_FAILED".to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "logGroupArn".to_string(),
-                        message: "a workspace holds one rules and alerting logging configuration"
-                            .to_string(),
-                    }]),
-                },
+                crate::state::member_validation_failed(
+                    "logGroupArn",
+                    "A workspace holds one rules and alerting logging configuration; use \
+                     UpdateLoggingConfiguration to change where it publishes.",
+                ),
             )
             .into());
         }

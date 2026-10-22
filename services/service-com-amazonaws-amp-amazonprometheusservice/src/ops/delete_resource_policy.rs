@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
             return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Workspace not found: {}", input.workspace_id),
+                    message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
                     resource_id: input.workspace_id.clone(),
                     resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                 },
@@ -203,10 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(policy) = workspace.policy.as_ref() else {
             return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Workspace {} has no resource-based policy",
-                        input.workspace_id
-                    ),
+                    message: crate::state::POLICY_NOT_FOUND_MESSAGE.to_string(),
                     resource_id: input.workspace_id.clone(),
                     resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
                 },
@@ -227,10 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(DeleteResourcePolicyErrorModeled::ConflictException(
                     ConflictException {
                         message: format!(
-                            "Workspace {} is {} and its resource-based policy is {}; a \
+                            "The workspace is {} and its resource-based policy is {}; a \
                              deletion is allowed only while the workspace is {} and the \
                              policy is {}",
-                            input.workspace_id,
                             workspace_status,
                             policy.status_code,
                             crate::state::STATUS_ACTIVE,
@@ -249,12 +245,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::revision_matches(Some(policy), input.revision_id.as_deref()) {
                 return Err(DeleteResourcePolicyErrorModeled::ConflictException(
                     ConflictException {
-                        message: format!(
-                            "revisionId {} does not name the current revision of the \
-                             resource-based policy of workspace {}",
-                            input.revision_id.clone().unwrap_or_default(),
-                            input.workspace_id,
-                        ),
+                        message: "The revisionId does not name the current revision of \
+                                  the resource-based policy"
+                            .to_string(),
                         resource_id: input.workspace_id.clone(),
                         resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
                     },
@@ -274,11 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // a future refactor cannot turn it into a success that persisted nothing.
                 return Err(DeleteResourcePolicyErrorModeled::InternalServerException(
                     InternalServerException {
-                        message: format!(
-                            "the resource-based policy of workspace {} went away while it \
-                             was being deleted",
-                            input.workspace_id
-                        ),
+                        message: "The resource-based policy went away while it was being \
+                                  deleted"
+                            .to_string(),
                         retry_after_seconds: None,
                     },
                 )

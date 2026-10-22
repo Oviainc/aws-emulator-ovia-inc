@@ -156,23 +156,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Keys must not begin with aws:" (`TagResource$tags`) — a rule the model
-        // cannot express, so it is refused here as a 400 ValidationException.
-        if let Some(reserved) = crate::state::reserved_tag_key(input.tags.keys()) {
+        // cannot express, so it is refused here as a 400 ValidationException, in the one
+        // form every aps refusal takes.
+        if crate::state::reserved_tag_key(input.tags.keys()).is_some() {
             return Err(TagResourceErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "tag key {reserved} is reserved: keys must not begin with {}",
-                        crate::state::RESERVED_TAG_KEY_PREFIX,
-                    ),
-                    reason: "FIELD_VALIDATION_FAILED".to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "tags".to_string(),
-                        message: format!(
-                            "keys must not begin with {}",
-                            crate::state::RESERVED_TAG_KEY_PREFIX
-                        ),
-                    }]),
-                },
+                crate::state::member_validation_failed(
+                    "tags",
+                    &crate::state::reserved_tag_key_requirement(),
+                ),
             )
             .into());
         }
@@ -185,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Resource not found: {}", input.resource_arn),
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                     resource_id: input.resource_arn.clone(),
                     resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                 },
@@ -205,20 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .len();
         if resulting_tags > crate::state::TAGS_PER_RESOURCE_LIMIT {
             return Err(TagResourceErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "a resource holds at most {} tags; this request would leave it with {resulting_tags}",
-                        crate::state::TAGS_PER_RESOURCE_LIMIT,
+                crate::state::member_validation_failed(
+                    "tags",
+                    &format!(
+                        "Member must not leave the resource holding more than {} tags",
+                        crate::state::TAGS_PER_RESOURCE_LIMIT
                     ),
-                    reason: "FIELD_VALIDATION_FAILED".to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "tags".to_string(),
-                        message: format!(
-                            "a resource holds at most {} tags",
-                            crate::state::TAGS_PER_RESOURCE_LIMIT
-                        ),
-                    }]),
-                },
+                ),
             )
             .into());
         }
