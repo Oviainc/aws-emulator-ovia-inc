@@ -29,3 +29,5 @@ mod service_claim;
 mod stage_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_message_rules.rs"]
+mod validation_message_rules;
