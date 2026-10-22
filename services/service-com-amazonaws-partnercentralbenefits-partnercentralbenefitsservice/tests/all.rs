@@ -15,6 +15,8 @@
 mod amend_benefit_application;
 #[path = "all/benefit_application_lifecycle.rs"]
 mod benefit_application_lifecycle;
+#[path = "all/entitlement_denial.rs"]
+mod entitlement_denial;
 #[path = "all/recall_benefit_application.rs"]
 mod recall_benefit_application;
 #[path = "all/resource_tagging.rs"]

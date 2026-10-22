@@ -35,8 +35,10 @@ const CONFLICT_MESSAGE: &str = "Provide either GroupName or GroupARN";
 /// `(GroupName, GroupARN)` pair, with its restJson1 path.
 ///
 /// `GetServiceGraph`, `GetTimeSeriesServiceStatistics` and `GetInsightSummaries`
-/// carry the same pair but still answer 501, so they have nothing to refuse
-/// here.
+/// carry the same pair and refuse it through the same `find_group`, but each
+/// also takes a required `[StartTime, EndTime]` window, so the rows below —
+/// which carry selectors only — would be refused for the absent window instead;
+/// their own suites own that refusal.
 const GROUP_OPERATIONS: [&str; 3] = ["/GetGroup", "/UpdateGroup", "/DeleteGroup"];
 
 /// A group seeded before the refusals, and the ARN minted for it.

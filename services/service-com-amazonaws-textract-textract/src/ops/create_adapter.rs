@@ -230,16 +230,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         // The adapter this request asks for. Its `adapter_id` is filled in below, from
         // the mint, for the call that actually creates it.
-        let requested = crate::state::AdapterRecord {
-            adapter_id: String::new(),
-            adapter_name: input.adapter_name,
-            description: input.description,
-            feature_types: input.feature_types,
-            auto_update,
-            tags: input.tags.unwrap_or_default(),
-            created_at: now,
-            client_request_token: input.client_request_token,
-        };
+        let requested = crate::state::AdapterRecord::created(
+            String::new(),
+            crate::state::AdapterConfiguration {
+                adapter_name: input.adapter_name,
+                description: input.description,
+                auto_update,
+            },
+            input.feature_types,
+            input.tags.unwrap_or_default(),
+            now,
+            input.client_request_token,
+        );
 
         // ONE lock spans the token check and the mint, so two concurrent creates carrying
         // the same token cannot both mint: the later one reads the earlier one's adapter.

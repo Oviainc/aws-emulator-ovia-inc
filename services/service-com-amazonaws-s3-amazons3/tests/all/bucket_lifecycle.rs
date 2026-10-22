@@ -159,7 +159,10 @@ pub(crate) async fn create_bucket(
 }
 
 /// `HEAD /<bucket>` — `HeadBucket`.
-async fn head_bucket(router: &MultiServiceRouter, bucket: &str) -> Answer {
+///
+/// `pub(crate)`, like the harness above: the object listing and deletion suite reads a
+/// bucket back through it rather than standing up its own request.
+pub(crate) async fn head_bucket(router: &MultiServiceRouter, bucket: &str) -> Answer {
     send(router, "HEAD", &format!("/{bucket}"), &[], "").await
 }
 

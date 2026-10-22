@@ -38,6 +38,10 @@ const ENTITLEMENT_MESSAGE: &str = "This action requires an active AWS partner be
 Register as an AWS partner if you haven't already, or contact AWS partner central \
 support.";
 
+/// The status this service serves its `AccessDeniedException` with (recorded; the model
+/// declares the shape `@httpError(403)`) — see `tests/all/entitlement_denial.rs`.
+const DENIED_STATUS: u16 = 400;
+
 /// The longest value `Name` accepts, from the modelled `BenefitApplicationName`
 /// `@length(min: 1, max: 255)`.
 const NAME_MAX_LEN: usize = 255;
@@ -157,11 +161,11 @@ fn details_path_of_length(length: usize) -> String {
 // The entitlement gate fronts this operation
 // ---------------------------------------------------------------------------
 
-/// From an account with no active AWS partner benefit, an amendment is refused 403
-/// `AccessDeniedException` whatever else is wrong with it — ahead of the empty-list, the
-/// field-path, the lookup and the revision checks — while a malformed `Identifier` is
-/// still the centralized walk's 400, and the same request from an entitled account gets
-/// past the gate.
+/// From an account with no active AWS partner benefit, an amendment is refused
+/// `AccessDeniedException` with [`DENIED_STATUS`] whatever else is wrong with it — ahead
+/// of the empty-list, the field-path, the lookup and the revision checks — while a
+/// malformed `Identifier` is still the centralized walk's 400, and the same request from
+/// an entitled account gets past the gate.
 #[tokio::test]
 async fn the_entitlement_gate_answers_ahead_of_every_check_this_operation_makes() {
     let harness = Harness::unentitled();
@@ -213,8 +217,9 @@ async fn the_entitlement_gate_answers_ahead_of_every_check_this_operation_makes(
     for (case, body) in &rows {
         let (status, out) = harness.call("AmendBenefitApplication", body).await;
         assert_eq!(
-            status, 403,
-            "case {case:?}: an un-entitled account must be refused with 403, got {status} {out:?}"
+            status, DENIED_STATUS,
+            "case {case:?}: an un-entitled account must be refused with {DENIED_STATUS}, \
+             got {status} {out:?}"
         );
         assert_eq!(
             error_code(&out),
@@ -250,9 +255,9 @@ async fn the_entitlement_gate_answers_ahead_of_every_check_this_operation_makes(
         "case \"a malformed identifier\": expected ValidationException, got {out:?}"
     );
 
-    // And the 403 is the gate's decision about the account, not a constant answer: with
-    // an active partner benefit the same request reaches the lookup it was refused ahead
-    // of.
+    // And the denial is the gate's decision about the account, not a constant answer:
+    // with an active partner benefit the same request reaches the lookup it was refused
+    // ahead of.
     let entitled = Harness::new();
     let (status, out) = entitled
         .call(

@@ -150,9 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.next_token.as_deref() {
             if !crate::state::is_minted_id(token, crate::state::TEMPLATE_ID_PREFIX) {
                 return Err(ListExperimentTemplatesErrorModeled::ValidationException(
-                    crate::state::invalid_input(
-                        "nextToken is not a token returned by ListExperimentTemplates",
-                    ),
+                    crate::state::invalid_next_token(),
                 )
                 .into());
             }

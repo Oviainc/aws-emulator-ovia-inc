@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAdapter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAdapter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes the configuration of one adapter in this service's store. A MUTATION: every
+//! member the request names is written to the stored adapter, so every later read of that
+//! adapter reports the written values. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAdapter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `FeatureTypes` is NOT updatable, and `CreationTime` does not move: the adapter is
+//! still the one that was created then.
 //!
 //! ## Shape of an operation
 //!
@@ -178,20 +175,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAdapter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAdapterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAdapter"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAdapterErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        // "At least one new parameter must be specified as an argument", and an
+        // `AutoUpdate` outside the modelled enum is not a configuration this service can
+        // store. Every member's length and pattern constraint was enforced before this
+        // handler ran.
+        if let Err(message) = crate::state::validate_adapter_update(
+            input.adapter_name.as_deref(),
+            input.description.as_deref(),
+            input.auto_update.as_deref(),
+        ) {
+            return Err(UpdateAdapterErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                    code: None,
+                },
+            )
+            .into());
+        }
+
+        // ONE lock spans the lookup and the write, so the record this call answers with is
+        // the record it stored.
+        let mut store = state.lock();
+        let Some(adapter) = store.adapters.get_mut(&input.adapter_id) else {
+            return Err(UpdateAdapterErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::ADAPTER_NOT_FOUND_MESSAGE.to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        adapter.apply_update(input.adapter_name, input.description, input.auto_update);
+
+        // The answer is read back OUT of the stored adapter rather than echoed from the
+        // request, so it cannot disagree with what a later read reports.
+        Ok(UpdateAdapterOutput {
+            adapter_id: Some(adapter.adapter_id.clone()),
+            adapter_name: Some(adapter.adapter_name.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(adapter.created_at)),
+            description: adapter.description.clone(),
+            feature_types: Some(adapter.feature_types.clone()),
+            auto_update: Some(adapter.auto_update.clone()),
+        })
     }
 }
+

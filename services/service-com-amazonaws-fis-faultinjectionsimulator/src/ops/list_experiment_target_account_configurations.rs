@@ -165,10 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(
                         ListExperimentTargetAccountConfigurationsErrorModeled::ValidationException(
-                            crate::state::invalid_input(
-                                "nextToken is not a token returned by \
-                                 ListExperimentTargetAccountConfigurations",
-                            ),
+                            crate::state::invalid_next_token(),
                         )
                         .into(),
                     )

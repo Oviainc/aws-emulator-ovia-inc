@@ -27,5 +27,7 @@ mod list_experiment_target_account_configurations;
 mod list_target_account_configurations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/target_account_configuration_errors.rs"]
+mod target_account_configuration_errors;
 #[path = "all/target_account_configurations.rs"]
 mod target_account_configurations;

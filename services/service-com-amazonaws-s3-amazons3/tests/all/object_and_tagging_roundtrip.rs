@@ -92,7 +92,11 @@ fn one_byte_object() -> Object {
 
 /// `PUT /<bucket>/<key>` — `PutObject`. No `x-id` query literal, which is what botocore
 /// puts on the wire.
-async fn put_object(
+///
+/// `pub(crate)`, like the four helpers below it: the object listing and deletion suite in
+/// this same test crate writes and reads its objects through these rather than standing up
+/// a second set.
+pub(crate) async fn put_object(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -103,7 +107,7 @@ async fn put_object(
 }
 
 /// `GET /<bucket>/<key>` — `GetObject`.
-async fn get_object(
+pub(crate) async fn get_object(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -121,7 +125,7 @@ async fn get_object(
 }
 
 /// A bucket to hold objects, created the way the bucket-lifecycle suite creates one.
-async fn bucket(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn bucket(router: &MultiServiceRouter, name: &str) {
     let created = create_bucket(router, name, None, None).await;
     assert_eq!(
         created.status, 200,
@@ -132,13 +136,13 @@ async fn bucket(router: &MultiServiceRouter, name: &str) {
 }
 
 /// The body as text, for error documents.
-fn text(answer: &Answer) -> String {
+pub(crate) fn text(answer: &Answer) -> String {
     String::from_utf8_lossy(&answer.body).to_string()
 }
 
 /// The entity tag an object of these bytes must report: the MD5 digest, lowercase hex,
 /// inside the quotes S3 wraps it in.
-fn expected_etag(body: &[u8]) -> String {
+pub(crate) fn expected_etag(body: &[u8]) -> String {
     format!("\"{}\"", hex::encode(Md5::digest(body)))
 }
 
