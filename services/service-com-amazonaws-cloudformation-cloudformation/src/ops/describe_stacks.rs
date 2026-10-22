@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStacks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStacks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStacks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads the stacks this service persisted. With a `StackName` it answers
+//! exactly that stack (a stack id resolves a deleted stack too); with none it answers
+//! every live stack in creation order. A name no live stack carries is refused with
+//! `ValidationError`.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +71,59 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{StoredStack, DRIFT_STATUS_NOT_CHECKED};
+
+/// One stored stack as the modelled `Stack` shape.
+///
+/// Every member is read back from what `CreateStack`/`UpdateStack`/`DeleteStack`
+/// persisted. The members this emulator has nothing to report for are absent rather
+/// than invented:
+///
+/// * `ChangeSetId`, `ParentId`, `RootId` — change sets and nested stacks are not
+///   implemented, so no stack here has any.
+/// * `Outputs` — a template's outputs come from the resources CloudFormation created and
+///   the intrinsic functions over them; this emulator creates no resources, so it has no
+///   output values to report and reports none.
+/// * `DetailedStatus`, `LastOperations` — nothing in this slice produces them.
+///
+/// `DriftInformation` is `NOT_CHECKED`, which is what it is for a stack drift detection
+/// has never run against.
+fn stack_view(stored: &StoredStack) -> Stack {
+    Stack {
+        stack_id: Some(stored.stack_id.clone()),
+        stack_name: stored.stack_name.clone(),
+        change_set_id: None,
+        description: stored.description(),
+        parameters: crate::state::parameter_views(&stored.parameters),
+        creation_time: crate::state::timestamp(stored.creation_time),
+        deletion_time: stored.deletion_time.map(crate::state::timestamp),
+        last_updated_time: stored.last_updated_time.map(crate::state::timestamp),
+        rollback_configuration: crate::state::rollback_configuration_view(
+            stored.rollback_configuration.as_ref(),
+        ),
+        stack_status: stored.status.clone(),
+        stack_status_reason: stored.status_reason.clone(),
+        disable_rollback: Some(stored.disable_rollback),
+        deployment_config: crate::state::deployment_config_view(stored.deployment_config.as_ref()),
+        notification_ar_ns: crate::state::non_empty(stored.notification_arns.clone()),
+        timeout_in_minutes: stored.timeout_in_minutes,
+        capabilities: crate::state::non_empty(stored.capabilities.clone()),
+        outputs: None,
+        role_arn: stored.role_arn.clone(),
+        tags: crate::state::tag_views(&stored.tags),
+        enable_termination_protection: Some(stored.enable_termination_protection),
+        parent_id: None,
+        root_id: None,
+        drift_information: Some(StackDriftInformation {
+            stack_drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
+            last_check_timestamp: None,
+        }),
+        retain_except_on_create: stored.retain_except_on_create,
+        deletion_mode: stored.deletion_mode.clone(),
+        detailed_status: None,
+        last_operations: None,
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -144,18 +192,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStacks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStacksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStacks"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack store to read, so this
+            // answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeStacks",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due, which was owed whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        let matching = match &input.stack_name {
+            // "The name or the unique stack ID that's associated with the stack …
+            // Running stacks: either. Deleted stacks: you must specify the unique stack
+            // ID." A name that resolves to nothing is a `ValidationError`, not an empty
+            // list: "If the stack doesn't exist, a ValidationError is returned."
+            Some(name_or_id) => {
+                let stack = store.resolve(name_or_id).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(name_or_id),
+                    )
+                })?;
+                vec![stack_view(stack)]
+            }
+            // "Deleted stacks don't show up in the DescribeStacks operation if the
+            // deletion has been completed successfully."
+            None => store.live_stacks().map(stack_view).collect(),
+        };
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Stacks)`: one
+        // response carries one bounded page, and the token resumes just past it.
+        let (stacks, next_token) = crate::state::paginate(
+            crate::state::PageOf::Stacks,
+            matching,
+            input.next_token.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(DescribeStacksOutput {
+            stacks: Some(stacks),
+            next_token,
+        })
     }
 }

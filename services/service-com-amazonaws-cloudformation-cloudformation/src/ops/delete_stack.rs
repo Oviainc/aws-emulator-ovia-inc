@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts the stored stack's deletion — `DELETE_IN_PROGRESS` now, then
+//! `DELETE_COMPLETE` with a `DeletionTime` once the clock makes it due, which takes the
+//! stack out of the live set. A stack with termination protection enabled is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +86,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::status;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -180,18 +175,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStack"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack to delete, and nothing
+            // was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStack"));
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // Deleting a stack that is not in the live set is a no-op that succeeds: the
+        // request asks for a state the store is already in.
+        let Some(previous) = store.resolve(&input.stack_name) else {
+            return Ok(DeleteStackOutput);
+        };
+        if !previous.is_live() {
+            return Ok(DeleteStackOutput);
+        }
+        // "If a user attempts to delete a stack with termination protection enabled, the
+        // operation fails and the stack remains unchanged."
+        if previous.enable_termination_protection {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Stack [{}] cannot be deleted while TerminationProtection is enabled",
+                input.stack_name
+            )));
+        }
+        // "For stacks in the DELETE_FAILED state, a list of resource logical IDs that are
+        // associated with the resources you want to retain." This emulator creates no
+        // stack resources, so no stack of its own can be DELETE_FAILED and a retain list
+        // has nothing it could apply to.
+        if input
+            .retain_resources
+            .as_deref()
+            .is_some_and(|retain| !retain.is_empty())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "RetainResources can only be specified for a stack in the DELETE_FAILED \
+                 state; stack [{}] is in {} state",
+                input.stack_name, previous.status
+            )));
+        }
+        // A deletion already in flight: the request asks for what is already happening,
+        // so it does not start a second one.
+        if previous.status == status::DELETE_IN_PROGRESS {
+            return Ok(DeleteStackOutput);
+        }
+
+        let operation_id = crate::state::new_operation_id();
+        let stack = store
+            .resolve_mut(&input.stack_name)
+            .expect("the stack resolved immediately above");
+        stack.deletion_mode = input.deletion_mode.clone();
+        if let Some(config) = input.deployment_config.as_ref() {
+            stack.deployment_config = crate::state::stored_deployment_config(Some(config));
+        }
+        if let Some(role_arn) = &input.role_arn {
+            stack.role_arn = Some(role_arn.clone());
+        }
+        if let Some(token) = &input.client_request_token {
+            stack.client_request_token = Some(token.clone());
+        }
+        // "Once the call completes successfully, stack deletion starts": DELETE_IN_PROGRESS
+        // now, DELETE_COMPLETE (with its DeletionTime) once the clock makes it due.
+        stack.begin_transition(
+            now,
+            status::DELETE_IN_PROGRESS,
+            status::DELETE_COMPLETE,
+            Some(operation_id),
+            input.client_request_token.clone(),
+        );
+
+        Ok(DeleteStackOutput)
     }
 }
