@@ -41,6 +41,9 @@ mod input_update;
 #[path = "all/multiplex_lifecycle.rs"]
 mod multiplex_lifecycle;
 
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
+
 #[path = "all/sdi_source_lifecycle.rs"]
 mod sdi_source_lifecycle;
 

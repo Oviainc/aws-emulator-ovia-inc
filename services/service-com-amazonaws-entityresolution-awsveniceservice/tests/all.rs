@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/id_mapping_workflow_lifecycle.rs"]
 mod id_mapping_workflow_lifecycle;
+#[path = "all/matching_workflow_update.rs"]
+mod matching_workflow_update;
 #[path = "all/response_messages.rs"]
 mod response_messages;
 #[path = "all/schema_mapping_workflow_lifecycle.rs"]

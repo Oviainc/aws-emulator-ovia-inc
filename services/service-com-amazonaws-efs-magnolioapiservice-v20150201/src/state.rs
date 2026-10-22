@@ -94,8 +94,10 @@ pub const MAX_MOUNT_TARGETS: usize = MAX_FILE_SYSTEMS_PER_REGION * AZ_SUFFIXES.l
 pub const DEFAULT_FILE_SYSTEM_PAGE_SIZE: usize = 100;
 /// `DescribeMountTargets$MaxItems`: "Currently, this number is automatically set to 10."
 pub const DEFAULT_MOUNT_TARGET_PAGE_SIZE: usize = 10;
-/// Both describe operations are "paginated at 100 per page", so a larger `MaxItems` is
-/// clamped rather than letting one request walk the whole store.
+/// The page every paginated describe in this service "paginate[s] at 100 per page" at
+/// (`DescribeFileSystems$MaxItems`, `DescribeMountTargets$MaxItems`,
+/// `DescribeTags$MaxItems`), so a larger `MaxItems` is clamped rather than letting one
+/// request walk the whole store.
 pub const MAX_PAGE_SIZE: usize = 100;
 
 /// How long a resource this service creates stays in `creating` before the clock owes

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMatchingWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMatchingWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMatchingWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the CONFIGURATION of a matching workflow `CreateMatchingWorkflow` already
+//! persisted in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::matching_workflows`],
+//! in place, and re-stamps its `updatedAt`. The workflow's IDENTITY is not touched:
+//! the `workflowName` key, the `workflowArn` minted at create time, the `createdAt`
+//! stamp and the tags all survive the update, so `GetMatchingWorkflow` reads the new
+//! configuration on the same resource. Every configuration member is REPLACED by what
+//! the request carries — this is a `PUT` of the whole configuration — so an optional
+//! member the request omits (`description`, `incrementalRunConfig`) is cleared rather
+//! than kept. "The workflow must already exist for this operation to succeed", so an
+//! unknown name answers the modelled `ResourceNotFoundException` (HTTP 404) and
+//! persists nothing; a request pairing an `incrementalRunConfig` with the `PROVIDER`
+//! `resolutionType` answers the modelled `ValidationException` (HTTP 400), the rule
+//! [`crate::state::incremental_run_conflict`] states.
 //!
 //! ## Shape of an operation
 //!
@@ -175,20 +180,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMatchingWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMatchingWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMatchingWorkflow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateMatchingWorkflowErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        // The documented cross-member refusal is decided BEFORE the store is touched,
+        // so a refused update leaves the workflow exactly as it was.
+        if let Some(message) = crate::state::incremental_run_conflict(
+            &input.resolution_techniques.resolution_type,
+            input.incremental_run_config.as_ref(),
+        ) {
+            return Err(UpdateMatchingWorkflowErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let updated = crate::state::now();
+
+        let mut store = state.lock();
+        let stored = store
+            .matching_workflows
+            .get_mut(&input.workflow_name)
+            .ok_or_else(|| {
+                UpdateMatchingWorkflowErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::messages::UPDATE_MATCHING_WORKFLOW_NOT_FOUND.to_string(),
+                        ),
+                    },
+                )
+            })?;
+
+        // The configuration members this operation models are replaced wholesale; the
+        // identity members (`workflowName`, `workflowArn`, `createdAt`) and the tags
+        // are NOT members of this request, so they stay as `CreateMatchingWorkflow`
+        // and `TagResource` left them.
+        stored.description = input.description;
+        stored.input_source_config = input.input_source_config;
+        stored.output_source_config = input.output_source_config;
+        stored.resolution_techniques = input.resolution_techniques;
+        stored.incremental_run_config = input.incremental_run_config;
+        stored.role_arn = input.role_arn;
+        stored.updated_at = updated;
+
+        // Answered from the STORED record, not from the request object: this response
+        // and a later `GetMatchingWorkflow` therefore cannot disagree.
+        Ok(UpdateMatchingWorkflowOutput {
+            workflow_name: stored.workflow_name.clone(),
+            description: stored.description.clone(),
+            input_source_config: stored.input_source_config.clone(),
+            output_source_config: stored.output_source_config.clone(),
+            resolution_techniques: stored.resolution_techniques.clone(),
+            incremental_run_config: stored.incremental_run_config.clone(),
+            role_arn: stored.role_arn.clone(),
+        })
     }
 }

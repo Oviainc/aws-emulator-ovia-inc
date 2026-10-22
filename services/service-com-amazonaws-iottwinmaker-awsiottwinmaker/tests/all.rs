@@ -14,6 +14,9 @@
 #[path = "all/component_type_lifecycle.rs"]
 mod component_type_lifecycle;
 
+#[path = "all/execute_query.rs"]
+mod execute_query;
+
 #[path = "all/harness.rs"]
 mod harness;
 

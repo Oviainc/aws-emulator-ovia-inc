@@ -76,7 +76,7 @@
 use super::types::*;
 
 use crate::state::{
-    apply_tag_changes, normalize_zone_id, TAG_RESOURCE_TYPE_HEALTH_CHECK,
+    apply_tag_changes, no_such_hosted_zone, normalize_zone_id, TAG_RESOURCE_TYPE_HEALTH_CHECK,
     TAG_RESOURCE_TYPE_HOSTED_ZONE,
 };
 
@@ -167,12 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let id = normalize_zone_id(&input.resource_id);
                 let mut store = state.lock();
                 let zone = store.zones.get_mut(id).ok_or_else(|| {
-                    ChangeTagsForResourceErrorModeled::NoSuchHostedZone(NoSuchHostedZone {
-                        message: Some(format!(
-                            "no hosted zone exists with the ID {}",
-                            input.resource_id
-                        )),
-                    })
+                    ChangeTagsForResourceErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                        &input.resource_id,
+                    ))
                 })?;
                 apply_tag_changes(
                     &mut zone.tags,
