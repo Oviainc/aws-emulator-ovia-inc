@@ -26,7 +26,7 @@ const ACCOUNT: &str = "000000000000";
 const ONE_SPAN: Duration = Duration::from_millis(900);
 
 /// A router with just this service mounted on a fresh engine.
-fn service() -> MultiServiceRouter {
+pub(crate) fn service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -71,7 +71,12 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// A call that must succeed, returning its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &str) -> Value {
+pub(crate) async fn ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -128,7 +133,7 @@ fn list(body: &Value, member: &str, case: &str) -> Vec<Value> {
 }
 
 /// A minimal, valid container definition.
-fn container(name: &str, image: &str) -> Value {
+pub(crate) fn container(name: &str, image: &str) -> Value {
     json!({ "name": name, "image": image, "memory": 128 })
 }
 

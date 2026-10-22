@@ -212,6 +212,28 @@ pub struct TaskDefinitionRecord {
     pub deregistered_at: Option<DateTime>,
 }
 
+/// The container-definition collection members a task-definition projection always
+/// MATERIALISES: a registration that declared none of them reads back with each member
+/// present as an EMPTY LIST, never with the key omitted, so a client may index them
+/// unconditionally (`definition["environment"]` is `[]`, not a missing key).
+///
+/// Recorded ECS behavior, and what AWS's own published `DescribeTaskDefinition` example
+/// response shows for a container that declares none of them (`portMappings`,
+/// `environment`, `mountPoints`, `volumesFrom` each rendered as `[]`); `systemControls`
+/// is the same shape. Members with no empty form are NOT invented: a structure such as
+/// `logConfiguration` or a scalar such as `user` stays absent when it was not declared,
+/// and a declared value is reported exactly as it was stored.
+fn container_definition_view(stored: &ContainerDefinition) -> ContainerDefinition {
+    ContainerDefinition {
+        port_mappings: Some(stored.port_mappings.clone().unwrap_or_default()),
+        environment: Some(stored.environment.clone().unwrap_or_default()),
+        mount_points: Some(stored.mount_points.clone().unwrap_or_default()),
+        volumes_from: Some(stored.volumes_from.clone().unwrap_or_default()),
+        system_controls: Some(stored.system_controls.clone().unwrap_or_default()),
+        ..stored.clone()
+    }
+}
+
 impl TaskDefinitionRecord {
     /// The launch types this revision was validated against — `TaskDefinition$
     /// compatibilities`: "Amazon ECS validates the task definition parameters with
@@ -235,11 +257,18 @@ impl TaskDefinitionRecord {
     }
 
     /// The `TaskDefinition` every task-definition operation returns, built from what is
-    /// stored — never from the request asking for it.
+    /// stored — never from the request asking for it. The container definitions go
+    /// through [`container_definition_view`], so the collections ECS materialises come
+    /// back as empty lists rather than as missing keys.
     pub fn view(&self) -> TaskDefinition {
         TaskDefinition {
             task_definition_arn: Some(self.arn.clone()),
-            container_definitions: Some(self.container_definitions.clone()),
+            container_definitions: Some(
+                self.container_definitions
+                    .iter()
+                    .map(container_definition_view)
+                    .collect(),
+            ),
             family: Some(self.family.clone()),
             task_role_arn: self.task_role_arn.clone(),
             execution_role_arn: self.execution_role_arn.clone(),
