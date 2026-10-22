@@ -176,6 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The entitlement gate, ahead of everything else this handler does — see
+        // [`crate::state::entitlement_refusal`].
+        if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
+            return Err(
+                ListBenefitApplicationsErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ListBenefitApplicationsErrorModeled::InternalServerException(
@@ -201,7 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ListBenefitApplicationsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("catalog {} does not exist", input.catalog),
+                        message: crate::state::not_found_message(
+                            crate::state::CATALOG_KIND,
+                            &input.catalog,
+                        ),
                     },
                 )
                 .into(),

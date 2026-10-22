@@ -175,6 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The entitlement gate, ahead of everything else this handler does: a caller
+        // whose account holds no active AWS partner benefit is refused before any
+        // resource is looked up, so a 403 never leaks whether a resource exists. The
+        // modelled constraints were refused earlier still, by the centralized walk.
+        if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
+            return Err(
+                CreateBenefitApplicationErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateBenefitApplicationErrorModeled::InternalServerException(
                 InternalServerException {
@@ -217,7 +227,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateBenefitApplicationErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: format!("catalog {} does not exist", input.catalog),
+                            message: crate::state::not_found_message(
+                                crate::state::CATALOG_KIND,
+                                &input.catalog,
+                            ),
                         },
                     )
                     .into(),
@@ -249,9 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateBenefitApplicationErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: format!(
-                                "benefit {} does not exist in catalog {}",
-                                input.benefit_identifier, input.catalog
+                            message: crate::state::not_found_message(
+                                crate::state::BENEFIT_KIND,
+                                &input.benefit_identifier,
                             ),
                         },
                     )

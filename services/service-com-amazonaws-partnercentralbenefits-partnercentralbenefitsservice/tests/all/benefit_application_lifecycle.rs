@@ -24,8 +24,8 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
     BENEFIT_STATUS_VALUES, FILE_TYPE_VALUES, FULFILLMENT_TYPE_VALUES,
 };
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
-    APPLICATION_ID_PREFIX, APPLICATION_RESOURCE, BENEFIT_ID_PREFIX, BENEFIT_RESOURCE, ID_BODY_LEN,
-    MAX_PAGE_SIZE, SEEDED_CATALOGS,
+    service_state, APPLICATION_ID_PREFIX, APPLICATION_RESOURCE, BENEFIT_ID_PREFIX,
+    BENEFIT_RESOURCE, ID_BODY_LEN, MAX_PAGE_SIZE, SEEDED_CATALOGS,
 };
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -49,13 +49,39 @@ const TARGET_PREFIX: &str = "PartnerCentralBenefitsService";
 const CATALOG: &str = "AWS";
 
 /// One emulator holding this service on one shared engine.
-struct Harness {
+///
+/// Reused by `tests/all/service_error_rules.rs`, which needs the same wire path for an
+/// account that is NOT an entitled partner — hence [`Harness::unentitled`].
+pub(crate) struct Harness {
     router: MultiServiceRouter,
 }
 
 impl Harness {
-    fn new() -> Self {
+    /// An emulator whose account holds an active AWS partner benefit, so the service's
+    /// entitlement gate admits its requests.
+    pub(crate) fn new() -> Self {
+        Self::with_entitlement(true)
+    }
+
+    /// An emulator whose account holds NO active AWS partner benefit — the state this
+    /// service's store starts in, and what every caller from the wire is.
+    pub(crate) fn unentitled() -> Self {
+        Self::with_entitlement(false)
+    }
+
+    fn with_entitlement(entitled: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        // The lifecycle tests are about the lifecycle, so they call as an ENTITLED
+        // partner account: the service's entitlement gate refuses every request from an
+        // account with no active AWS partner benefit, and no operation grants one (the
+        // API models no partner registration), so the entitlement is recorded in process
+        // here. The gate itself is pinned in `tests/all/service_error_rules.rs`.
+        if entitled {
+            service_state(&*engine)
+                .expect("the in-memory engine carries this service's state")
+                .lock()
+                .grant_partner_entitlement(ACCOUNT);
+        }
         let mut router = MultiServiceRouter::new();
         // The signature itself is not under test here, and the fixed test credential
         // below is not this process's signing key.
@@ -65,7 +91,7 @@ impl Harness {
     }
 
     /// Call one operation and return `(http status, parsed body)`.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -141,7 +167,7 @@ impl Harness {
 }
 
 /// The wire error code of a failure body: the `__type` member, without its namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
