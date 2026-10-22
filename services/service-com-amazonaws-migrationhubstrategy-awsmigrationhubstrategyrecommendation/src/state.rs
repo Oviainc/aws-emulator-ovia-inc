@@ -6,7 +6,7 @@
 //! loop, and both live here:
 //!
 //! * an **import file task**, minted by `StartImportFileTask` and reported by
-//!   `GetImportFileTask` (and later by `ListImportFileTask`, still a stub);
+//!   `GetImportFileTask` one at a time and by `ListImportFileTask` a page at a time;
 //! * an **assessment**, minted by `StartAssessment`, reported by `GetAssessment` and
 //!   `GetLatestAssessmentId`, and moved to a terminal status by `StopAssessment`.
 //!
@@ -15,11 +15,12 @@
 //! reports is derived from the counters it stores, never canned.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AssessmentTarget, DataCollectionDetails, GetImportFileTaskOutput, Group,
-    ResourceNotFoundException, ValidationException,
+    ImportFileTaskInformation, ResourceNotFoundException, ValidationException,
 };
 
 /// `ImportFileTaskStatus`'s non-terminal import status: the status a task carries from
@@ -143,6 +144,67 @@ impl ImportFileTask {
             import_name: Some(self.import_name.clone()),
         }
     }
+
+    /// The `ListImportFileTask` entry for this task.
+    ///
+    /// The same record the single-task read reports, in the list shape: both answers
+    /// come from these fields, so a task cannot read one way through one operation and
+    /// another way through the other.
+    pub fn to_task_information(&self) -> ImportFileTaskInformation {
+        let reported = self.to_output();
+        ImportFileTaskInformation {
+            id: reported.id,
+            status: reported.status,
+            start_time: reported.start_time,
+            input_s3_bucket: reported.input_s3_bucket,
+            input_s3_key: reported.input_s3_key,
+            status_report_s3_bucket: reported.status_report_s3_bucket,
+            status_report_s3_key: reported.status_report_s3_key,
+            completion_time: reported.completion_time,
+            number_of_records_success: reported.number_of_records_success,
+            number_of_records_failed: reported.number_of_records_failed,
+            import_name: reported.import_name,
+        }
+    }
+}
+
+/// One page of import file tasks, as `ListImportFileTask` answers it.
+#[derive(Debug, Default)]
+pub struct ImportTaskPage {
+    /// The entries of this page, in the store's total order.
+    pub task_infos: Vec<ImportFileTaskInformation>,
+    /// The cursor the next call resumes from, set only when another task follows this
+    /// page.
+    pub next_token: Option<String>,
+}
+
+/// The largest page `ListImportFileTask` serves, and the page size it uses when the
+/// caller names none.
+///
+/// `ListImportFileTaskRequest$maxResults` documents "The total number of items to
+/// return. The maximum value is 100." The member carries no `@range`, so the boundary
+/// validator passes any integer and the bound is enforced where the page is taken.
+pub const MAX_LIST_PAGE_SIZE: i32 = 100;
+
+/// The marker every pagination token this service mints carries, so a token minted
+/// elsewhere (or invented by a caller) is recognised as foreign rather than resolved
+/// against this store.
+const PAGE_TOKEN_MARKER: &str = "migrationhubstrategy:import-file-task:";
+
+/// Encode the id a page stopped after as an opaque `nextToken`.
+///
+/// Hex round-trips exactly and is non-empty for a non-empty key, so the token satisfies
+/// the member's `@length(0, 1024)` and `.*\S.*`, and the next call resolves it against
+/// the same map — no server-side cursor table.
+pub fn encode_page_token(key: &str) -> String {
+    hex::encode(format!("{PAGE_TOKEN_MARKER}{key}").as_bytes())
+}
+
+/// The id an [`encode_page_token`] token names; `None` for anything this service did not
+/// mint, including well-formed hex carrying no [`PAGE_TOKEN_MARKER`].
+pub fn decode_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(PAGE_TOKEN_MARKER).map(str::to_string)
 }
 
 /// One assessment of an on-premises environment, as this emulator persists it.
@@ -241,7 +303,7 @@ impl Assessment {
 /// Per-service state for com-amazonaws-migrationhubstrategy-awsmigrationhubstrategyrecommendation. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState {
-    /// Every import file task, keyed by its id. A `BTreeMap` is what will give
+    /// Every import file task, keyed by its id. A `BTreeMap` is what gives
     /// `ListImportFileTask` a stable total order to paginate over.
     pub import_tasks: BTreeMap<String, ImportFileTask>,
     /// Every assessment, keyed by its id.
@@ -317,6 +379,62 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
         }
     }
 
+    /// One page of this store's import file tasks, continuing after the task a
+    /// `nextToken` names.
+    ///
+    /// The order is the store's own total order over the minted ids, which is the order
+    /// the tasks were started in: `BTreeMap` iterates its keys sorted and an id's
+    /// zero-padded counter suffix sorts the same way it counts. A token is emitted only
+    /// when another task actually follows the page, so a caller following tokens never
+    /// makes a call that returns nothing.
+    ///
+    /// Refused with the service's `ValidationException` when `max_results` is outside
+    /// the documented 1..=[`MAX_LIST_PAGE_SIZE`], or when the token names no task of this
+    /// store. Each task in the page gets the completion the clock already owed it first —
+    /// owed at this same instant even if nobody had called.
+    pub fn page_of_import_tasks(
+        &mut self,
+        next_token: Option<&str>,
+        max_results: Option<i32>,
+        now: SystemTime,
+    ) -> Result<ImportTaskPage, ValidationException> {
+        let limit = match max_results {
+            None => MAX_LIST_PAGE_SIZE,
+            Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
+            Some(_) => return Err(invalid_request_body()),
+        };
+        let limit = usize::try_from(limit).unwrap_or(1);
+
+        let after = match next_token {
+            Some(token) => {
+                let resume_after = decode_page_token(token).ok_or_else(page_token_not_accepted)?;
+                if !self.import_tasks.contains_key(&resume_after) {
+                    return Err(page_token_not_accepted());
+                }
+                Bound::Excluded(resume_after)
+            }
+            None => Bound::Unbounded,
+        };
+
+        let mut rest = self.import_tasks.range_mut((after, Bound::Unbounded));
+        let mut task_infos = Vec::new();
+        let mut last: Option<String> = None;
+        for (id, task) in rest.by_ref().take(limit) {
+            task.settle(now);
+            task_infos.push(task.to_task_information());
+            last = Some(id.clone());
+        }
+        let next_token = match (rest.next(), last) {
+            (Some(_), Some(key)) => Some(encode_page_token(&key)),
+            _ => None,
+        };
+
+        Ok(ImportTaskPage {
+            task_infos,
+            next_token,
+        })
+    }
+
     /// How many servers an assessment started now would cover.
     ///
     /// An import file task is the only way a server enters this service's state — the
@@ -344,6 +462,19 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
 /// `EmulatedService::override_refusal`).
 pub const INVALID_REQUEST_BODY: &str = "Invalid request body";
 
+/// The `ValidationException` (HTTP 400) this service answers for a request carrying a
+/// value outside a rule it enforces but the model does not express — a documented bound
+/// the boundary validator cannot refuse.
+///
+/// Worded with [`INVALID_REQUEST_BODY`], the same one sentence `EmulatedService::
+/// override_refusal` gives a modelled constraint violation, so a caller sees one refusal
+/// for one logical failure whichever side of the boundary decided it.
+pub fn invalid_request_body() -> ValidationException {
+    ValidationException {
+        message: Some(INVALID_REQUEST_BODY.to_string()),
+    }
+}
+
 /// This service's message for a request whose parameters it cannot resolve: an id that
 /// names no resource of this account.
 ///
@@ -360,6 +491,18 @@ pub const INVALID_OR_MISSING_PARAMETERS: &str =
 /// so there is nothing from the request to put in it.
 pub fn import_task_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
+        message: Some(INVALID_OR_MISSING_PARAMETERS.to_string()),
+    }
+}
+
+/// The refusal of a `nextToken` this service cannot resolve: one it never minted, or one
+/// naming a task the store no longer holds.
+///
+/// A pagination token is an unresolvable parameter, so it earns the same
+/// `ValidationException` (HTTP 400) and the same constant sentence
+/// ([`INVALID_OR_MISSING_PARAMETERS`]) as any other — the token is NOT echoed back.
+pub fn page_token_not_accepted() -> ValidationException {
+    ValidationException {
         message: Some(INVALID_OR_MISSING_PARAMETERS.to_string()),
     }
 }

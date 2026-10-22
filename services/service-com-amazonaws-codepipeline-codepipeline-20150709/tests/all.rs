@@ -19,6 +19,8 @@ mod custom_action_types;
 mod pipeline_lifecycle;
 #[path = "all/pipeline_state.rs"]
 mod pipeline_state;
+#[path = "all/rule_executions.rs"]
+mod rule_executions;
 #[path = "all/stage_transitions.rs"]
 mod stage_transitions;
 #[path = "all/state_roundtrip.rs"]
