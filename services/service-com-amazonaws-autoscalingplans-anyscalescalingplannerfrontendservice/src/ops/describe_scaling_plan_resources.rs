@@ -4,6 +4,9 @@
 //! Derives one `ScalingPlanResource` per stored `ScalingInstruction` of the named
 //! plan, read back from [`crate::state`] and paged by `MaxResults`/`NextToken`.
 //!
+//! This operation models no not-found error, so a plan this service does not hold is
+//! reported as an empty `ScalingPlanResources` page rather than refused.
+//!
 //! A read, except for the transitions the clock already owes: `settle_due` applies
 //! only what was due at this instant whether or not anybody called.
 //!
@@ -165,18 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| invalid_next_token("The NextToken provided is not valid"))?,
         };
 
-        // This operation models no not-found error, so an unknown plan (or a version
-        // this service does not have) is refused as a validation issue rather than
-        // answered with an empty 200 — carrying the same request-derived not-found
-        // wording as the operations that do model `ObjectNotFoundException`.
-        let plan = state
-            .plan(&input.scaling_plan_name, input.scaling_plan_version)
-            .ok_or_else(|| {
-                validation(crate::state::plan_not_found_message(
-                    &input.scaling_plan_name,
-                    input.scaling_plan_version,
-                ))
-            })?;
+        // This operation models NO not-found error: `ObjectNotFoundException` is
+        // modelled on `DeleteScalingPlan` and `UpdateScalingPlan` and deliberately not
+        // here, and `ScalingPlanResources` is not a required output member. A plan this
+        // service does not hold therefore has no scalable resources to report, which is
+        // an empty page — not a client error.
+        let Some(plan) = state.plan(&input.scaling_plan_name, input.scaling_plan_version) else {
+            return Ok(DescribeScalingPlanResourcesOutput {
+                scaling_plan_resources: Some(Vec::new()),
+                next_token: None,
+            });
+        };
 
         let scaling_status_code = plan.scaling_status_code();
         let total = plan.scaling_instructions.len();

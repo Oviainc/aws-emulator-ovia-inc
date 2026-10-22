@@ -164,6 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let source_key = crate::state::validate_application_source(&input.application_source)
             .map_err(validation)?;
 
+        // The scaling instructions have to hold together across their own members
+        // before anything is stored: a plan AWS refuses must not exist here either.
+        crate::state::validate_scaling_instructions(&input.scaling_instructions)
+            .map_err(validation)?;
+
         if state.scaling_plans.contains_key(&input.scaling_plan_name) {
             return Err(validation(format!(
                 "A scaling plan named '{}' already exists",

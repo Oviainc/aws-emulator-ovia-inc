@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
+#[path = "all/scaling_instruction_validation.rs"]
+mod scaling_instruction_validation;
 #[path = "all/scaling_plan_lifecycle.rs"]
 mod scaling_plan_lifecycle;
 #[path = "all/state_roundtrip.rs"]
