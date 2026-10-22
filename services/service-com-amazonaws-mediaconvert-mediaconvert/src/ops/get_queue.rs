@@ -167,7 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = input.name;
         let Some(record) = state.queues.get(&name).cloned() else {
             return Err(GetQueueErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Queue {name} not found.")),
+                // The refusal names the request member the lookup read, `Name`.
+                message: Some(crate::state::not_found_message("name")),
             })
             .into());
         };
