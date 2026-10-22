@@ -160,6 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Services Region where the request is made", so the region of the
         // request scopes the answer either way.
         let region = crate::state::request_region(ctx.parts());
+        // The URL this report announces must be the endpoint the caller reached
+        // this emulator on, so it is read off THIS request.
+        let endpoint = crate::state::request_endpoint(ctx.parts());
         let wanted = input.service_name;
 
         crate::state::with_state(&*self.engine, |store| match &wanted {
@@ -167,12 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // service's `DoesNotExist` rejection, never an empty 200.
             Some(name) => store
                 .container_service(&region, name)
-                .map(|service| vec![service.view()])
+                .map(|service| vec![service.view(endpoint.as_deref())])
                 .ok_or_else(|| not_found(name)),
             None => Ok(store
                 .container_services_in(&region)
                 .into_iter()
-                .map(crate::state::StoredContainerService::view)
+                .map(|service| service.view(endpoint.as_deref()))
                 .collect()),
         })
         .ok_or_else(unavailable)?

@@ -11,6 +11,12 @@
 //! no handling beyond its effect on `ConsumedCapacity`: this store has one copy of
 //! each item, so every read of it is strongly consistent.
 //!
+//! The `Key` is held to the same documented key-value limits the write path applies
+//! ([`crate::state::Table::check_key_limits`]): a key that could never be stored is
+//! refused with `ValidationException` rather than looked up. A table whose
+//! resource-based policy denies the caller `dynamodb:GetItem` is answered
+//! `AccessDeniedException` instead of its item.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -230,6 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.active_table(&region, &name, now).map_err(lift)?;
+        // A table whose resource-based policy denies the caller this action answers
+        // the denial, not the item: the deny is decided before anything is read.
+        if let Some(denial) = crate::state::policy_denial(table, "dynamodb:GetItem", now) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
         let key = table.key_of_key_map(&input.key).map_err(lift)?;
         let item = table.items.get(&key).cloned();
 
