@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePendingAggregationRequests
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePendingAggregationRequests`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the pending aggregation requests held in [`crate::state`] — the aggregator
+//! accounts that have asked to aggregate this account's data and are not authorized
+//! yet — paged over the stable (requester account, requester Region) ordering the store
+//! keeps, at the page size the request's `Limit` asks for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePendingAggregationRequests::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing a caller of THIS store can do mints one: the requester is another account's
+//! aggregator, and the `PutConfigurationAggregator` that creates the entry reaches that
+//! account's Config rather than this one, so an account nobody has asked to aggregate
+//! reports an empty list. See [`crate::state::PendingAggregationRequestEntry`].
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +148,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePendingAggregationRequests` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePendingAggregationRequestsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePendingAggregationRequests"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `Limit` is the page size, and 0 asks for the maximum (`Limit`: "The default
+        // is maximum. If you specify 0, Config uses the default"). The modelled range
+        // 0..20 is refused before this handler runs; a value outside it reaching here
+        // is still the limit error this operation models, never a page.
+        let max = crate::state::DESCRIBE_PENDING_AGGREGATION_REQUESTS_MAX_LIMIT;
+        let within_range = usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit <= max);
+        let page_size = match within_range {
+            Some(0) => max,
+            Some(limit) => limit,
+            None => {
+                // Defensive, and unreachable in the assembled emulator: the shared
+                // request validation refuses the modelled 0..20 range before this
+                // handler runs, so nothing reaches this arm.
+                return Err(
+                    DescribePendingAggregationRequestsErrorModeled::InvalidLimitException(
+                        InvalidLimitException {
+                            message: Some(format!(
+                                "The specified Limit {} is outside the allowable range of \
+                                 0 to {max}.",
+                                input.limit
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_pending_aggregation_request_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribePendingAggregationRequestsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken \
+                                     a previous DescribePendingAggregationRequests response \
+                                     returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // Page over the store's own (account, Region) ordering, so a token holds the KEY
+        // the next page resumes at and survives requests added or removed between pages.
+        // An absent token resumes at the empty key, which precedes every stored one.
+        let resume_at = resume_at.unwrap_or_default();
+        let store = state.lock();
+        let mut page = Vec::new();
+        let mut next_token = None;
+        for (key, entry) in store.pending_aggregation_requests.range(resume_at..) {
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_pending_aggregation_request_token(key));
+                break;
+            }
+            page.push(entry.to_shape());
+        }
+
+        Ok(DescribePendingAggregationRequestsOutput {
+            pending_aggregation_requests: Some(page),
+            next_token,
+        })
     }
 }
