@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOrderableDBInstanceOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOrderableDBInstanceOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the DB instance options a caller can order for an
+//! engine — the cross product of that engine's AVAILABLE versions (read from the engine
+//! catalogue `DescribeDBEngineVersions` owns, so the two reports cannot disagree), the DB
+//! instance classes this service offers for it and its license models — narrowed by the
+//! request's `EngineVersion`, `DBInstanceClass`, `LicenseModel`, `Vpc` and
+//! `AvailabilityZoneGroup` filters and paged by `MaxRecords` / `Marker`. This is the ONLY
+//! file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOrderableDBInstanceOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An option is reference data, not caller state, with one request-derived member: an
+//! option's `AvailabilityZones` are the zones of the region the request is signed for,
+//! which is where `CreateDBInstance` places an instance.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +161,353 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOrderableDBInstanceOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOrderableDBInstanceOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOrderableDBInstanceOptions"))
+        // The options are reference data, so this operation holds no records of its own;
+        // the engine is bound so the generated signature stays as it is. The REGION does
+        // come from the request: an option's Availability Zones are the zones of the
+        // region the request is signed for.
+        let _ = &self.engine;
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeOrderableDBInstanceOptionsError::validation)?;
+        let page_size = crate::state::check_max_records_in(input.max_records, &MAX_RECORDS_RANGE)
+            .map_err(DescribeOrderableDBInstanceOptionsError::validation)?;
+        // `Filters`: "This parameter isn't currently supported." Honouring it is not an
+        // option (there is no documented filter name to honour) and ignoring it would
+        // report options the caller tried to exclude, so a request carrying one is
+        // refused.
+        if input.filters.as_ref().is_some_and(|filters| !filters.is_empty()) {
+            return Err(DescribeOrderableDBInstanceOptionsError::validation(
+                "Filters isn't currently supported by DescribeOrderableDBInstanceOptions",
+            ));
+        }
+
+        // "Specifies whether to show only VPC or non-VPC offerings." Every option this
+        // service offers is a VPC offering, as every current RDS DB instance is, so a
+        // request for non-VPC offerings selects none of them. `AvailabilityZoneGroup`:
+        // "Specify this parameter to retrieve available options for the Local Zones in
+        // the group. Omit this parameter to show the available options in the specified
+        // Amazon Web Services Region" — this service offers Region options only, so
+        // naming a Local Zone group selects none either. Both are decided here, before
+        // the options are built.
+        if input.vpc == Some(false) || input.availability_zone_group.is_some() {
+            return Ok(DescribeOrderableDBInstanceOptionsOutput {
+                marker: None,
+                orderable_db_instance_options: Some(Vec::new()),
+            });
+        }
+
+        let mut matching: Vec<(String, OrderableDBInstanceOption)> = Vec::new();
+        // An option is offered for an engine VERSION this service reports, so the two
+        // reports cannot disagree: `DescribeDBEngineVersions` owns the engine catalogue
+        // and this operation reads it.
+        for (_, version, facts) in crate::ops::describe_db_engine_versions::catalogue() {
+            // Only a version that is still available can be ordered; a deprecated one is
+            // reported by `DescribeDBEngineVersions` under `IncludeAll` and ordered by
+            // nobody.
+            if version.status != crate::ops::describe_db_engine_versions::STATUS_AVAILABLE {
+                continue;
+            }
+            if !version.engine.eq_ignore_ascii_case(&input.engine) {
+                continue;
+            }
+            // "A filter to include only the available options for the specified engine
+            // version."
+            if input
+                .engine_version
+                .as_ref()
+                .is_some_and(|wanted| !version.engine_version.eq_ignore_ascii_case(wanted))
+            {
+                continue;
+            }
+            for class in instance_classes(version.engine) {
+                // "A filter to include only the available options for the specified DB
+                // instance class."
+                if input
+                    .db_instance_class
+                    .as_ref()
+                    .is_some_and(|wanted| !class.name.eq_ignore_ascii_case(wanted))
+                {
+                    continue;
+                }
+                for license_model in license_models(version.engine) {
+                    // "A filter to include only the available options for the specified
+                    // license model."
+                    if input
+                        .license_model
+                        .as_ref()
+                        .is_some_and(|wanted| !license_model.eq_ignore_ascii_case(wanted))
+                    {
+                        continue;
+                    }
+                    matching.push((
+                        format!(
+                            "{}#{}#{}#{license_model}",
+                            version.engine, version.engine_version, class.name
+                        ),
+                        to_wire(version, facts, class, license_model, &region),
+                    ));
+                }
+            }
+        }
+
+        matching.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        Ok(DescribeOrderableDBInstanceOptionsOutput {
+            marker: page.next_marker,
+            orderable_db_instance_options: Some(page.items),
+        })
+    }
+}
+
+/// The lowest and highest `MaxRecords` THIS operation documents: "Default: 100
+/// Constraints: Minimum 20, maximum 1000" — a different maximum from the 100 the other
+/// describe operations carry, which is why the shared check
+/// (`crate::state::check_max_records_in`) is given this range rather than its default.
+const MAX_RECORDS_RANGE: std::ops::RangeInclusive<i32> = 20..=1000;
+
+/// One DB instance class this service offers.
+struct InstanceClass {
+    /// `DBInstanceClass`.
+    name: &'static str,
+    /// Whether `SupportsPerformanceInsights`: Performance Insights is not offered on the
+    /// smallest burstable classes.
+    supports_performance_insights: bool,
+    /// Whether this class can back a Multi-AZ DB CLUSTER (`SupportsClusters`), which the
+    /// burstable classes cannot.
+    supports_clusters: bool,
+}
+
+/// The classes a non-Aurora DB instance can be ordered in.
+///
+/// This emulator's published set: a burstable, a general-purpose and a
+/// memory-optimised family, in both the Intel and the Graviton generation, so a caller
+/// choosing a class by family finds one. It is not AWS's full per-region matrix, which
+/// moves with every instance-type launch.
+const INSTANCE_CLASSES: &[InstanceClass] = &[
+    InstanceClass {
+        name: "db.m5.large",
+        supports_performance_insights: true,
+        supports_clusters: true,
+    },
+    InstanceClass {
+        name: "db.m5.xlarge",
+        supports_performance_insights: true,
+        supports_clusters: true,
+    },
+    InstanceClass {
+        name: "db.m6g.large",
+        supports_performance_insights: true,
+        supports_clusters: true,
+    },
+    InstanceClass {
+        name: "db.r5.large",
+        supports_performance_insights: true,
+        supports_clusters: true,
+    },
+    InstanceClass {
+        name: "db.r6g.large",
+        supports_performance_insights: true,
+        supports_clusters: true,
+    },
+    InstanceClass {
+        name: "db.t3.medium",
+        supports_performance_insights: true,
+        supports_clusters: false,
+    },
+    InstanceClass {
+        name: "db.t3.micro",
+        supports_performance_insights: false,
+        supports_clusters: false,
+    },
+    InstanceClass {
+        name: "db.t3.small",
+        supports_performance_insights: false,
+        supports_clusters: false,
+    },
+    InstanceClass {
+        name: "db.t4g.medium",
+        supports_performance_insights: true,
+        supports_clusters: false,
+    },
+    InstanceClass {
+        name: "db.t4g.micro",
+        supports_performance_insights: false,
+        supports_clusters: false,
+    },
+];
+
+/// The classes an Aurora DB instance can be ordered in: the Aurora subset of the classes
+/// above plus `db.serverless`, the Aurora Serverless v2 capacity class.
+const AURORA_INSTANCE_CLASSES: &[InstanceClass] = &[
+    InstanceClass {
+        name: "db.r5.large",
+        supports_performance_insights: true,
+        supports_clusters: false,
+    },
+    InstanceClass {
+        name: "db.r6g.large",
+        supports_performance_insights: true,
+        supports_clusters: false,
+    },
+    InstanceClass {
+        name: "db.serverless",
+        supports_performance_insights: true,
+        supports_clusters: false,
+    },
+    InstanceClass {
+        name: "db.t3.medium",
+        supports_performance_insights: true,
+        supports_clusters: false,
+    },
+    InstanceClass {
+        name: "db.t4g.medium",
+        supports_performance_insights: true,
+        supports_clusters: false,
+    },
+];
+
+/// The classes `engine` can be ordered in.
+fn instance_classes(engine: &str) -> &'static [InstanceClass] {
+    if crate::state::is_aurora(engine) {
+        AURORA_INSTANCE_CLASSES
+    } else {
+        INSTANCE_CLASSES
+    }
+}
+
+/// The license models `engine` can be ordered under, as `CreateDBInstance`'s
+/// `LicenseModel` member documents them per engine ("`license-included`",
+/// "`bring-your-own-license`", "`general-public-license`", "`postgresql-license`",
+/// "`marketplace-license`").
+fn license_models(engine: &str) -> &'static [&'static str] {
+    match engine {
+        "postgres" | "aurora-postgresql" => &["postgresql-license"],
+        "mysql" | "mariadb" | "aurora-mysql" => &["general-public-license"],
+        // Oracle Enterprise Edition is BYOL only; Standard Edition Two is offered both
+        // ways.
+        "oracle-ee" | "oracle-ee-cdb" => &["bring-your-own-license"],
+        "oracle-se2" | "oracle-se2-cdb" => &["license-included", "bring-your-own-license"],
+        // Db2 is ordered through a Marketplace subscription or BYOL.
+        "db2-ae" | "db2-ce" | "db2-se" => &["bring-your-own-license", "marketplace-license"],
+        // Every SQL Server edition RDS offers includes its licence.
+        _ => &["license-included"],
+    }
+}
+
+/// The storage type an option is offered with, and whether that type takes provisioned
+/// IOPS and provisioned throughput.
+///
+/// `gp3` is the type `CreateDBInstance`'s `StorageType` defaults to
+/// (`crate::state::default_storage_type`), and Aurora storage is managed by the cluster
+/// rather than ordered per instance, which is why an Aurora option reports `aurora` and
+/// neither provisioned IOPS nor provisioned throughput.
+fn storage(engine: &str) -> (&'static str, bool) {
+    if crate::state::is_aurora(engine) {
+        ("aurora", false)
+    } else {
+        ("gp3", true)
+    }
+}
+
+/// The lowest and highest `AllocatedStorage` an option accepts, in GiB, or `None` for an
+/// engine whose storage is cluster-managed rather than ordered (Aurora).
+///
+/// The bounds are the published General Purpose SSD ranges: 20–65,536 GiB for the MySQL,
+/// MariaDB, PostgreSQL and Oracle engines, 20–16,384 GiB for Microsoft SQL Server and
+/// 20–64,000 GiB for Db2.
+fn storage_size_range(engine: &str) -> Option<(i32, i32)> {
+    if crate::state::is_aurora(engine) {
+        return None;
+    }
+    if engine.starts_with("sqlserver") {
+        return Some((20, 16_384));
+    }
+    if engine.starts_with("db2") {
+        return Some((20, 64_000));
+    }
+    Some((20, 65_536))
+}
+
+/// Whether `engine` supports IAM database authentication
+/// (`SupportsIAMDatabaseAuthentication`): the MySQL, MariaDB and PostgreSQL engines do;
+/// the Oracle, SQL Server and Db2 engines do not.
+fn supports_iam_database_authentication(engine: &str) -> bool {
+    matches!(
+        engine,
+        "mysql" | "mariadb" | "postgres" | "aurora-mysql" | "aurora-postgresql"
+    )
+}
+
+/// The Availability Zones of `region` an option is offered in.
+///
+/// Every AWS Region has at least three zones, named `<region><letter>`, and
+/// `CreateDBInstance` in this emulator places an instance that names no zone in the
+/// region's FIRST zone, so the zones reported here are the ones an instance can land in.
+fn availability_zones(region: &str) -> Vec<AvailabilityZone> {
+    ["a", "b", "c"]
+        .into_iter()
+        .map(|letter| AvailabilityZone {
+            name: Some(format!("{region}{letter}")),
+        })
+        .collect()
+}
+
+/// Project one (engine version, DB instance class, license model) onto the modelled
+/// `OrderableDBInstanceOption` wire shape.
+fn to_wire(
+    version: &crate::ops::describe_db_engine_versions::CatalogVersion,
+    facts: &crate::ops::describe_db_engine_versions::EngineFacts,
+    class: &InstanceClass,
+    license_model: &str,
+    region: &str,
+) -> OrderableDBInstanceOption {
+    let (storage_type, provisioned_storage) = storage(version.engine);
+    let storage_size = storage_size_range(version.engine);
+    OrderableDBInstanceOption {
+        engine: Some(version.engine.to_string()),
+        engine_version: Some(version.engine_version.to_string()),
+        db_instance_class: Some(class.name.to_string()),
+        license_model: Some(license_model.to_string()),
+        availability_zones: Some(availability_zones(region)),
+        // A Multi-AZ deployment puts the standby in another zone of the same region, so
+        // every option offered in several zones is Multi-AZ capable.
+        multi_az_capable: Some(true),
+        read_replica_capable: Some(facts.supports_read_replica),
+        vpc: Some(true),
+        supports_storage_encryption: Some(true),
+        storage_type: Some(storage_type.to_string()),
+        supports_iops: Some(provisioned_storage),
+        supports_storage_throughput: Some(provisioned_storage),
+        supports_storage_autoscaling: Some(provisioned_storage),
+        min_storage_size: storage_size.map(|(min, _)| min),
+        max_storage_size: storage_size.map(|(_, max)| max),
+        supports_enhanced_monitoring: Some(true),
+        supports_performance_insights: Some(class.supports_performance_insights),
+        supports_iam_database_authentication: Some(supports_iam_database_authentication(
+            version.engine,
+        )),
+        supported_engine_modes: Some(
+            facts
+                .engine_modes
+                .iter()
+                .map(|mode| (*mode).to_string())
+                .collect(),
+        ),
+        supports_global_databases: Some(facts.supports_global_databases),
+        // "Whether DB instances can be configured as a Multi-AZ DB cluster": offered on
+        // the MySQL and PostgreSQL engines, and never on a burstable class.
+        supports_clusters: Some(
+            class.supports_clusters && matches!(version.engine, "mysql" | "postgres"),
+        ),
+        // This emulator's subnets are IPv4, so an option is offered for IPv4 only rather
+        // than reporting a dual-stack network it does not provide.
+        supported_network_types: Some(vec!["IPV4".to_string()]),
+        // `AvailabilityZoneGroup` names a Local Zone group and `OutpostCapable` an AWS
+        // Outpost; this service offers neither, so no option claims one.
+        outpost_capable: Some(false),
+        // The members that describe capacity this emulator does not model — processor
+        // features, activity stream modes, Kerberos authentication, a dedicated log
+        // volume, additional storage volumes, the Data API HTTP endpoint — are left
+        // absent rather than invented.
+        ..Default::default()
     }
 }

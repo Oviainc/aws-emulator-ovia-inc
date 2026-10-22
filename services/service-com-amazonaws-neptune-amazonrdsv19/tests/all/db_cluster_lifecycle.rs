@@ -3,10 +3,12 @@
 //! The Neptune DB cluster / DB instance lifecycle, end to end over the awsQuery wire.
 //!
 //! Every test here drives the real HTTP surface: a `MultiServiceRouter` with this one
-//! service mounted, fed form-urlencoded `Action=...` bodies signed into the `rds` signing
-//! name, and asserted against the XML response body — not against the handler's Rust
-//! types. That is the only way to prove the wire contract (status codes, awsQuery error
-//! codes, member names) rather than just the handler's internals.
+//! service mounted, fed form-urlencoded `Action=...` bodies whose credential scope names
+//! this service (`neptune` — the `rds` signing name Neptune's model carries is SHARED
+//! with Amazon RDS and Amazon DocumentDB and resolves to Amazon RDS; see `ROUTE_KEY` in
+//! `src/service.rs`), and asserted against the XML response body — not against the
+//! handler's Rust types. That is the only way to prove the wire contract (status codes,
+//! awsQuery error codes, member names) rather than just the handler's internals.
 //!
 //! The rule under test: every member of a `DBCluster` / `DBInstance` response is computed
 //! from the persisted record, so a create followed by a describe returns the same bytes.
@@ -236,7 +238,7 @@ impl Neptune {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{REGION}/rds/aws4_request, \
+                    "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{REGION}/neptune/aws4_request, \
                      SignedHeaders=host, Signature=not-verified"
                 ),
             )

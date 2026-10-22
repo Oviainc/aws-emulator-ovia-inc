@@ -53,6 +53,16 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// don't specify a value, the default is 60 seconds."
 pub const DEFAULT_IDLE_TIMEOUT_SECONDS: i32 = 60;
 
+/// `sharingConfig.enabled` a service network gets when its create sends no
+/// `sharingConfig` (or sends one that omits `enabled`).
+///
+/// `sharingConfig` is a member the service fills in itself: `CreateServiceNetwork` and
+/// `GetServiceNetwork` both report it for a create that never mentioned it, so the
+/// stored value is a real setting and not "absent". The recorded AWS answers for such a
+/// create report `{"enabled": true}` — sharing enabled is what a service network has
+/// always had — so that is the default here.
+pub const DEFAULT_SHARING_ENABLED: bool = true;
+
 /// The `@length` ceiling the model puts on `TagMap` (`len ..200`).
 ///
 /// Checked in the handlers: a map's cardinality is one of the modelled constraints the
@@ -132,9 +142,10 @@ pub struct ServiceNetwork {
     /// `AuthType`: `NONE` unless the create call asked for `AWS_IAM` (the model
     /// documents `NONE` as the default).
     pub auth_type: String,
-    /// `sharingConfig.enabled` exactly as the create call set it; `None` when it
-    /// did not send `sharingConfig` at all.
-    pub sharing_enabled: Option<bool>,
+    /// `sharingConfig.enabled` as the create call set it, or
+    /// [`DEFAULT_SHARING_ENABLED`] when it sent no value for it. Never "absent": the
+    /// service reports this member on every response that models it.
+    pub sharing_enabled: bool,
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
     pub last_updated_at: SystemTime,

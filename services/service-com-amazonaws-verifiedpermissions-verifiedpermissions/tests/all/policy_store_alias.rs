@@ -54,6 +54,20 @@ async fn create_alias(router: &MultiServiceRouter, alias_name: &str, store_id: &
     .await
 }
 
+/// The instant a `@timestampFormat("date-time")` member carries, in epoch seconds.
+///
+/// Such a member is an RFC 3339 STRING on the wire (see
+/// `tests/all/date_time_wire_format.rs`), so an ORDERING comparison parses it instead of
+/// reading a number; a value that is not a date-time string yields `NaN`, which fails
+/// every comparison rather than passing one.
+fn date_time_secs(value: &Value) -> f64 {
+    ::aws_smithy_types::DateTime::from_str(
+        value.as_str().unwrap_or_default(),
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .map_or(f64::NAN, |parsed| parsed.as_secs_f64())
+}
+
 // ---------------------------------------------------------------------------
 // Create, read back, resolve
 // ---------------------------------------------------------------------------
@@ -104,10 +118,17 @@ async fn alias_round_trips_every_name_the_model_admits() {
             expected_alias_arn(&alias_name),
             "case {case:?}: unexpected aliasArn, got {created}"
         );
-        let created_at = created["createdAt"].as_f64().unwrap_or_default();
+        // `createdAt` targets `TimestampFormat`, which carries
+        // `@timestampFormat("date-time")`, so the wire form is an RFC 3339 string
+        // (`tests/all/date_time_wire_format.rs` pins that for every such member).
+        let created_at = created["createdAt"].as_str().unwrap_or_default().to_string();
         assert!(
-            created_at > 0.0,
-            "case {case:?}: createdAt must be a real timestamp, got {created}"
+            ::aws_smithy_types::DateTime::from_str(
+                &created_at,
+                ::aws_smithy_types::date_time::Format::DateTime,
+            )
+            .is_ok(),
+            "case {case:?}: createdAt must be a date-time string, got {created}"
         );
 
         // The reader reports exactly what was persisted, plus the state.
@@ -122,14 +143,14 @@ async fn alias_round_trips_every_name_the_model_admits() {
                 read["aliasName"].as_str().unwrap_or_default(),
                 read["policyStoreId"].as_str().unwrap_or_default(),
                 read["aliasArn"].as_str().unwrap_or_default(),
-                read["createdAt"].as_f64().unwrap_or_default(),
+                read["createdAt"].as_str().unwrap_or_default(),
                 read["state"].as_str().unwrap_or_default(),
             ),
             (
                 alias_name.as_str(),
                 store_id.as_str(),
                 expected_alias_arn(&alias_name).as_str(),
-                created_at,
+                created_at.as_str(),
                 "Active",
             ),
             "case {case:?}: GetPolicyStoreAlias must report the created alias, got {read}"
@@ -214,12 +235,12 @@ async fn creating_an_alias_is_idempotent_on_its_name_and_store() {
             assert_eq!(
                 (
                     again["aliasArn"].as_str().unwrap_or_default(),
-                    again["createdAt"].as_f64().unwrap_or_default(),
+                    again["createdAt"].as_str().unwrap_or_default(),
                     again["policyStoreId"].as_str().unwrap_or_default(),
                 ),
                 (
                     first["aliasArn"].as_str().unwrap_or_default(),
-                    first["createdAt"].as_f64().unwrap_or_default(),
+                    first["createdAt"].as_str().unwrap_or_default(),
                     first["policyStoreId"].as_str().unwrap_or_default(),
                 ),
                 "case {case:?} repeat {repeat}: a duplicate must answer with the persisted alias, got {again}"
@@ -361,7 +382,7 @@ async fn soft_delete_pends_the_alias_and_hard_delete_removes_it() {
         let first_store = store(&router).await;
         let other_store = store(&router).await;
         let created = create_alias(&router, &alias_name, &first_store).await;
-        let created_at = created["createdAt"].as_f64().unwrap_or_default();
+        let created_at = created["createdAt"].as_str().unwrap_or_default().to_string();
 
         let mut delete = json!({ "aliasName": alias_name });
         if let Some(mode) = deletion_mode {
@@ -380,9 +401,9 @@ async fn soft_delete_pends_the_alias_and_hard_delete_removes_it() {
             (
                 pending["state"].as_str().unwrap_or_default(),
                 pending["policyStoreId"].as_str().unwrap_or_default(),
-                pending["createdAt"].as_f64().unwrap_or_default(),
+                pending["createdAt"].as_str().unwrap_or_default(),
             ),
-            ("PendingDeletion", first_store.as_str(), created_at),
+            ("PendingDeletion", first_store.as_str(), created_at.as_str()),
             "case {case:?}: a soft-deleted alias must report PendingDeletion, got {pending}"
         );
 
@@ -469,7 +490,7 @@ async fn soft_delete_pends_the_alias_and_hard_delete_removes_it() {
             "case {case:?}: the freed name must be re-usable, got {recreated}"
         );
         assert!(
-            recreated["createdAt"].as_f64().unwrap_or_default() >= created_at,
+            date_time_secs(&recreated["createdAt"]) >= date_time_secs(&created["createdAt"]),
             "case {case:?}: the re-created alias must carry its own timestamp, got {recreated}"
         );
     }

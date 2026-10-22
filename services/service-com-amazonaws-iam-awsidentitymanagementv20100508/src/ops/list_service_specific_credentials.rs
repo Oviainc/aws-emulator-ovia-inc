@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     let akid = ::engine::extract_akid(&ctx.parts().headers);
                     match store.access_keys.get(&akid) {
-                        Some(key) => Some(key.clone()),
+                        Some(record) => Some(record.user_key.clone()),
                         None => {
                             // Credentials that belong to no IAM user resolve to no
                             // user, and the call is refused rather than answered from

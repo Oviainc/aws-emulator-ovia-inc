@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
@@ -194,9 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        store.ensure_seeded(&region, now);
+        // The tagging operations are NOT behind the account-level device gate: the
+        // model declares no `AccessDeniedException` on them for it, and recorded
+        // behaviour has them answer their own not-found instead. Settling is still
+        // owed, because a tag read of a task has to see the state the clock gave
+        // it.
         store.settle(now);
 
         let resource = match crate::state::parse_tagged_resource_arn(&input.resource_arn) {

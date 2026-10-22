@@ -197,8 +197,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_at: Some(crate::state::timestamp(network.last_updated_at)),
             arn: Some(network.arn.clone()),
             auth_type: Some(network.auth_type.clone()),
-            sharing_config: network.sharing_enabled.map(|enabled| SharingConfig {
-                enabled: Some(enabled),
+            sharing_config: Some(SharingConfig {
+                enabled: Some(network.sharing_enabled),
             }),
             // Counted from the persisted associations, never from a stored counter. VPC
             // associations have no handler yet (CreateServiceNetworkVpcAssociation is

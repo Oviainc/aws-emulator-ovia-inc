@@ -27,8 +27,9 @@ pub(crate) const SETTLED: std::time::Duration = std::time::Duration::from_millis
 /// One emulator: a single shared engine behind the DataZone service, driven over HTTP.
 ///
 /// `pub(crate)` because every suite in this test target drives the service the same
-/// way: the sibling suites (`tests/all/update_project.rs`, `tests/all/glossary_lifecycle.rs`)
-/// reuse this harness instead of copying it.
+/// way: the sibling suites (`tests/all/update_project.rs`,
+/// `tests/all/glossary_lifecycle.rs`, `tests/all/project_memberships.rs`) reuse this
+/// harness instead of copying it.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }

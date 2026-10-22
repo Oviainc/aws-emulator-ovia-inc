@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccessKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccessKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccessKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +147,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccessKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccessKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use ::emulator_server::aws_credentials::{AWS_ACCESS_KEY, SECRET_ACCESS_KEY};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAccessKeyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A mutation: the operation "creates a new Amazon Web Services secret access
+        // key and corresponding Amazon Web Services access key ID for the specified
+        // user", so the lock is held for write across the quota check and the insert.
+        let mut store = state.lock();
+
+        // The access key id the request was signed with: the caller's identity when
+        // the request names no user, and the acting principal every audit record
+        // below is attributed to.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // With no `UserName` the key belongs to whoever signed the request, which is
+        // resolved from that access key id — the same resolution `GetUser` performs.
+        // A caller whose credentials belong to no IAM user is refused rather than
+        // having an identity invented for it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccessKey"))
+        // LIMITATION, stated so the refusal is not mistaken for IAM's behaviour: real
+        // IAM also serves a nameless call made with ACCOUNT ROOT credentials ("this
+        // operation works for access keys under the Amazon Web Services account …
+        // even if the Amazon Web Services account has no associated users"). This
+        // emulator has no root user entity to attribute such a key to, and inventing
+        // one would put a user name in the response that nothing minted, so a nameless
+        // call from credentials that are not an IAM user's is refused instead of
+        // served. That path is declined, not implemented.
+        let user_key = match &input.user_name {
+            Some(user_name) => crate::state::name_key(user_name),
+            None => match store.access_keys.get(&caller_akid) {
+                Some(record) => record.user_key.clone(),
+                None => {
+                    // Neither modelled client error fits: the request named no
+                    // entity to be missing and no quota was reached, so the
+                    // refusal goes through the crate's generic client-input
+                    // channel (HTTP 400, code `ValidationException`), exactly as
+                    // `GetUser` refuses the same request.
+                    ::tracing::info!(
+                        audit = true,
+                        operation = "CreateAccessKey",
+                        outcome = "refused_no_caller_identity",
+                        caller_akid = %caller_akid,
+                        "no access key was minted"
+                    );
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Must specify userName when calling with non-User credentials",
+                    ));
+                }
+            },
+        };
+
+        // The key belongs to an IAM user the account holds; `AccessKey$UserName` is
+        // reported in the case that user was created with, not the case the request
+        // happened to spell, since IAM names "are not distinguished by case".
+        let Some(user) = store.users.get(&user_key) else {
+            // Audit record for the refusal: the acting principal and the outcome,
+            // with nothing minted.
+            ::tracing::info!(
+                audit = true,
+                operation = "CreateAccessKey",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                "no access key was minted"
+            );
+            return Err(CreateAccessKeyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name.as_deref().unwrap_or(&user_key)
+                    )),
+                },
+            )
+            .into());
+        };
+        let user_name = user.user_name.clone();
+
+        // A user holds a bounded number of access keys, so a caller cannot mint
+        // credentials for one user without limit; past the quota IAM refuses the
+        // create and mints nothing.
+        if store.access_keys_held_by(&user_key) >= crate::state::MAX_ACCESS_KEYS_PER_USER {
+            ::tracing::info!(
+                audit = true,
+                operation = "CreateAccessKey",
+                outcome = "refused_quota_exceeded",
+                caller_akid = %caller_akid,
+                "no access key was minted"
+            );
+            return Err(CreateAccessKeyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for AccessKeysPerUser: {}",
+                        crate::state::MAX_ACCESS_KEYS_PER_USER
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The emulator's credential store is the only thing that creates credential
+        // material, so the id and the secret are minted there: the returned key is
+        // one a later signed request verifies against, never a value this handler
+        // made up. The secret is handed to the caller and not persisted — it "is
+        // returned only in response to CreateAccessKey".
+        let credentials = ctx.credential_store();
+        let minted = credentials.create(&AWS_ACCESS_KEY);
+        let Some(secret_access_key) = minted.secret(SECRET_ACCESS_KEY).map(str::to_string) else {
+            // A credential without its secret cannot be signed with, so it is
+            // forgotten again rather than recorded against the user. A failed rollback
+            // would leave an orphaned credential record, so say so rather than
+            // dropping the result silently.
+            if let Err(why) = credentials.delete(&minted.id) {
+                ::tracing::warn!(
+                    operation = "CreateAccessKey",
+                    reason = ?why,
+                    "a secretless access key could not be withdrawn from the credential store"
+                );
+            }
+            return Err(CreateAccessKeyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some(
+                        "the access key was minted without a secret access key".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let create_date = crate::state::now();
+        store.access_keys.insert(
+            minted.id.clone(),
+            crate::state::AccessKeyRecord {
+                user_key,
+                status: crate::state::ACCESS_KEY_ACTIVE_STATUS.to_string(),
+                create_date,
+            },
+        );
+
+        // Audit record for a state-changing, credential-minting operation: who asked,
+        // what was created, how it ended. Only wire metadata and the server-minted
+        // key id — NEVER the secret access key, which no log may carry.
+        ::tracing::info!(
+            audit = true,
+            operation = "CreateAccessKey",
+            outcome = "created",
+            caller_akid = %caller_akid,
+            access_key_id = %minted.id,
+            "access key created"
+        );
+
+        Ok(CreateAccessKeyOutput {
+            access_key: AccessKey {
+                user_name,
+                access_key_id: minted.id,
+                // "The default status for new keys is Active."
+                status: crate::state::ACCESS_KEY_ACTIVE_STATUS.to_string(),
+                secret_access_key,
+                create_date: Some(create_date),
+            },
+        })
     }
 }

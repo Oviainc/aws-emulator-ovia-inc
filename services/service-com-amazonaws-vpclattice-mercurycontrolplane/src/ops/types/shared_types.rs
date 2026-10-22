@@ -372,3 +372,104 @@ pub const VALIDATION_EXCEPTION_REASON_VALUES: &[&str] = &["cannotParse", "fieldV
 pub const VERIFICATION_STATUS_VALUES: &[&str] = &["PENDING", "VERIFICATION_TIMED_OUT", "VERIFIED"];
 
 
+// ---------------------------------------------------------------------------
+// Member-schema builders for the shapes whose schemas this service writes out
+// by hand instead of deriving.
+// ---------------------------------------------------------------------------
+//
+// WHY any shape here is hand-written: `com.amazonaws.vpclattice#Timestamp` — the target
+// of EVERY timestamp member this service models — carries
+// `@timestampFormat("date-time")` (`smithy_query(query="shape",shape="Timestamp")`
+// reports `"timestampFormat": "date-time"`), and `#[smithy_macros::smithy(shape = ...)]`
+// does not carry that trait onto the member schemas it emits (grep the tree: the only
+// `with_timestamp_format` call sites are hand-written service code). The restJson1 JSON
+// codec reads the format off the member schema and otherwise falls back to the protocol
+// default, epoch seconds (`vendor/smithy-schema-server/src/json.rs::timestamp_format`) —
+// a JSON NUMBER where the model, and every AWS SDK's generated deserializer for a
+// `date-time` member, requires an RFC 3339 string.
+//
+// The generator gap is filed as
+// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`;
+// the fix belongs in `vendor/smithy-macros`, which a service crate may not change. Until
+// then a shape of this service that serializes a timestamp writes its schema out with
+// these two builders, which differ from the macro's output in exactly one chain call —
+// [`date_time_member_schema`]'s `.with_timestamp_format(DateTime)`.
+//
+// This service's model carries NO `@jsonName` and no `@http*` binding on any output
+// member (`smithy_query(query="operation",...)`), so a member schema here needs nothing
+// beyond the shape id, the wire name, the shape type and the member index — exactly what
+// the macro emits for the same member.
+
+/// This service's Smithy namespace, the second argument of every `ShapeId::from_static`
+/// the generator emits.
+pub const NAMESPACE: &str = "com.amazonaws.vpclattice";
+
+/// One member schema, as `#[smithy_macros::smithy(shape = ...)]` emits it.
+///
+/// `absolute` is the member's shape id (`<namespace>#<Shape>$<member>`), `wire_name` the
+/// member name as the model spells it (which is also the JSON key, this service modelling
+/// no `@jsonName`), and `index` the member's position in the model's member list.
+pub const fn member_schema(
+    absolute: &'static str,
+    wire_name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(absolute, NAMESPACE, wire_name),
+        shape_type,
+        wire_name,
+        index,
+    )
+}
+
+/// One timestamp member's schema: [`member_schema`] plus the `@timestampFormat`
+/// the model declares on `Timestamp` and the macro drops.
+pub const fn date_time_member_schema(
+    absolute: &'static str,
+    wire_name: &'static str,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    member_schema(
+        absolute,
+        wire_name,
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        index,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime)
+}
+
+/// [`member_schema`] for one member of `$shape`, spelling the member's shape id out of
+/// the shape and member names the way the generator does.
+///
+/// `$shape_type` is the `aws_smithy_schema::ShapeType` variant the generator picks for
+/// the member's target; an `enum` shape is `String`, as `shape_type_ident` has it.
+macro_rules! member_of {
+    ($shape:literal, $wire:literal, $shape_type:ident, $index:literal) => {
+        $crate::ops::types::shared_types::member_schema(
+            concat!("com.amazonaws.vpclattice#", $shape, "$", $wire),
+            $wire,
+            ::aws_smithy_schema::ShapeType::$shape_type,
+            $index,
+        )
+    };
+}
+
+/// [`date_time_member_schema`] for one timestamp member of `$shape`; see
+/// [`member_of`].
+macro_rules! date_time_member_of {
+    ($shape:literal, $wire:literal, $index:literal) => {
+        $crate::ops::types::shared_types::date_time_member_schema(
+            concat!("com.amazonaws.vpclattice#", $shape, "$", $wire),
+            $wire,
+            $index,
+        )
+    };
+}
+
+// Re-exported as items so the hand-written shapes of this service can invoke them by
+// path (`shared_types::member_of!(..)`) from whichever `types/` module declares them,
+// without a copy of the macro per module.
+pub(crate) use date_time_member_of;
+pub(crate) use member_of;
+

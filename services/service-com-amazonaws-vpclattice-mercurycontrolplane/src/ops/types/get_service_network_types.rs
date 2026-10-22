@@ -17,7 +17,14 @@ pub struct GetServiceNetworkInput {
     pub service_network_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#GetServiceNetworkResponse")]
+/// `GetServiceNetworkResponse`, with its schema written out instead of derived
+/// because `createdAt` and `lastUpdatedAt` are `@timestampFormat("date-time")`; the
+/// note in `shared_types` says why that cannot be derived here. Member for member
+/// this is the model's shape: same ids, same order, same indices.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape
+/// is an operation OUTPUT, which the server only ever serializes
+/// (`Operation::Output` requires `SerializableStruct`; only `Input` is deserialized).
 #[derive(Debug, Clone, Default)]
 pub struct GetServiceNetworkOutput {
     pub id: Option<String>,
@@ -31,3 +38,88 @@ pub struct GetServiceNetworkOutput {
     pub number_of_associated_services: Option<i64>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetServiceNetworkOutput {
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkResponse", "id", String, 0);
+    const M_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkResponse", "name", String, 1);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetServiceNetworkResponse", "createdAt", 2);
+    const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetServiceNetworkResponse", "lastUpdatedAt", 3);
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkResponse", "arn", String, 4);
+    // `AuthType` is an enum shape, which the generator writes as `ShapeType::String`.
+    const M_AUTH_TYPE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkResponse", "authType", String, 5);
+    const M_SHARING_CONFIG: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkResponse", "sharingConfig", Structure, 6);
+    const M_NUMBER_OF_ASSOCIATED_VP_CS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkResponse", "numberOfAssociatedVPCs", Long, 7);
+    const M_NUMBER_OF_ASSOCIATED_SERVICES: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "GetServiceNetworkResponse",
+        "numberOfAssociatedServices",
+        Long,
+        8
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#GetServiceNetworkResponse",
+            shared_types::NAMESPACE,
+            "GetServiceNetworkResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_NAME,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_UPDATED_AT,
+            &Self::M_ARN,
+            &Self::M_AUTH_TYPE,
+            &Self::M_SHARING_CONFIG,
+            &Self::M_NUMBER_OF_ASSOCIATED_VP_CS,
+            &Self::M_NUMBER_OF_ASSOCIATED_SERVICES,
+        ],
+    );
+}
+
+pub static GET_SERVICE_NETWORK_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetServiceNetworkOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetServiceNetworkOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.name.as_ref() {
+            serializer.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.last_updated_at.as_ref() {
+            serializer.write_timestamp(&Self::M_LAST_UPDATED_AT, value)?;
+        }
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.auth_type.as_ref() {
+            serializer.write_string(&Self::M_AUTH_TYPE, value.as_str())?;
+        }
+        if let Some(value) = self.sharing_config.as_ref() {
+            serializer.write_struct(&Self::M_SHARING_CONFIG, value)?;
+        }
+        if let Some(value) = self.number_of_associated_vp_cs.as_ref() {
+            serializer.write_long(&Self::M_NUMBER_OF_ASSOCIATED_VP_CS, *value)?;
+        }
+        if let Some(value) = self.number_of_associated_services.as_ref() {
+            serializer.write_long(&Self::M_NUMBER_OF_ASSOCIATED_SERVICES, *value)?;
+        }
+        Ok(())
+    }
+}
