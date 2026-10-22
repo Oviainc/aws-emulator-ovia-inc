@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSuiteDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSuiteDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSuiteDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a suite definition and PERSISTS it in [`crate::state`]: a new UUID id, the ARN,
+//! the creation timestamps, the configuration snapshot as version `v1`, and the tags. The
+//! response is projected from the stored record, so `GetSuiteDefinition` and
+//! `ListSuiteDefinitions` answer from the same bytes.
+//!
+//! `clientToken` is an `@idempotencyToken`: a retry carrying a token this service already
+//! created a definition for returns THAT definition rather than minting a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +147,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSuiteDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSuiteDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSuiteDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSuiteDefinitionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+            })
+        })?;
+
+        let config = input.suite_definition_configuration;
+
+        // The one rule the model states in prose but cannot express as a constraint
+        // (`SuiteDefinitionConfiguration$rootGroup`): "if intendedForQualification is set
+        // to true, rootGroup can be an empty string. If intendedForQualification is false,
+        // rootGroup cannot be an empty string."
+        if config.root_group.is_empty() && config.intended_for_qualification != Some(true) {
+            return Err(CreateSuiteDefinitionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "suiteDefinitionConfiguration.rootGroup cannot be empty unless \
+                         intendedForQualification is true"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        let fingerprint = crate::state::create_request_fingerprint(&region, &config, &tags);
+        let mut store = state.lock();
+
+        // `clientToken` identifies a RETRY of this request. A token already accepted for
+        // the SAME request answers from the definition the first call stored; the same
+        // token offered for a different request is a client mistake, not a retry, and is
+        // refused with the modelled client-input error.
+        let accepted = input
+            .client_token
+            .as_ref()
+            .and_then(|token| store.create_definition_tokens.get(token).cloned());
+        if let Some(accepted) = accepted {
+            if accepted.fingerprint != fingerprint {
+                return Err(CreateSuiteDefinitionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "clientToken was already used to create a suite definition with \
+                             different parameters"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            if let Some(existing) = store.definitions.get(&accepted.suite_definition_id) {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx.parts(),
+                    &region,
+                    &existing.arn,
+                    "idempotent-replay",
+                );
+                return Ok(CreateSuiteDefinitionOutput {
+                    suite_definition_id: Some(existing.id.clone()),
+                    suite_definition_arn: Some(existing.arn.clone()),
+                    suite_definition_name: Some(existing.name().to_string()),
+                    created_at: Some(existing.created_at.into()),
+                });
+            }
+        }
+
+        // The store's occupancy bound: refuse a creation past it with the modelled
+        // client-input error, rather than letting caller requests grow it without limit.
+        if store.definitions.len() >= crate::state::MAX_SUITE_DEFINITIONS {
+            return Err(CreateSuiteDefinitionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Cannot create more than {} suite definitions for this account",
+                        crate::state::MAX_SUITE_DEFINITIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = crate::state::new_uuid();
+        let arn = crate::state::arn(&region, &format!("suitedefinition/{id}"));
+        let first_version = crate::state::version_label(1);
+
+        let definition = crate::state::SuiteDefinition {
+            id: id.clone(),
+            arn: arn.clone(),
+            latest_version: first_version.clone(),
+            versions: [(first_version, config)].into_iter().collect(),
+            created_at: now,
+            last_modified_at: now,
+        };
+
+        if !tags.is_empty() {
+            store.tags.insert(arn, tags);
+        }
+        if let Some(token) = input.client_token {
+            store.create_definition_tokens.insert(
+                token,
+                crate::state::AcceptedCreateRequest {
+                    suite_definition_id: id.clone(),
+                    fingerprint,
+                },
+            );
+        }
+        store.definitions.insert(id.clone(), definition);
+
+        // Every member is read back off the STORED record, never off the request.
+        let stored = store.definitions.get(&id).ok_or_else(|| {
+            CreateSuiteDefinitionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the created suite definition could not be read back".to_string()),
+            })
+        })?;
+        crate::state::audit(Self::NAME, ctx.parts(), &region, &stored.arn, "created");
+        Ok(CreateSuiteDefinitionOutput {
+            suite_definition_id: Some(stored.id.clone()),
+            suite_definition_arn: Some(stored.arn.clone()),
+            suite_definition_name: Some(stored.name().to_string()),
+            created_at: Some(stored.created_at.into()),
+        })
     }
 }

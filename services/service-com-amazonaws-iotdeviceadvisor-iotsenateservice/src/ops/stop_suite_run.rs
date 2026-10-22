@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopSuiteRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopSuiteRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopSuiteRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the persisted run to `STOPPING`, from which the clock owes it `STOPPED` with an
+//! `endTime`, so the following `GetSuiteRun` observes the new status. A run that already
+//! reached a terminal status is left exactly as it is — stopping never resurrects it.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +133,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopSuiteRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopSuiteRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopSuiteRun"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopSuiteRunErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let run = store
+            .run_mut(&input.suite_definition_id, &input.suite_run_id, now)
+            .ok_or_else(|| {
+                StopSuiteRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!(
+                        "No suite run with suiteRunId {} for suite definition {}",
+                        input.suite_run_id, input.suite_definition_id
+                    )),
+                })
+            })?;
+
+        // Only a run that has not been asked to stop and has not finished is moved: a
+        // second stop neither restarts the stop clock nor resurrects a finished run.
+        let outcome = if run.is_stoppable() {
+            run.status = "STOPPING".to_string();
+            run.next_transition_at = Some(now + crate::state::STATUS_TRANSITION);
+            "stopping"
+        } else {
+            "unchanged-already-stopping-or-finished"
+        };
+        let arn = run.arn.clone();
+        crate::state::audit(Self::NAME, ctx.parts(), &region, &arn, outcome);
+
+        Ok(StopSuiteRunOutput {})
     }
 }
