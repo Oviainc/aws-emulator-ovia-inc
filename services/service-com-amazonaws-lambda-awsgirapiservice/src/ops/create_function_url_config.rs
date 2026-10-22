@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFunctionUrlConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFunctionUrlConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFunctionUrlConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the one function URL of the qualifier the request names, persisting exactly
+//! the configuration the request described, and answers it.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +179,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFunctionUrlConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFunctionUrlConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFunctionUrlConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFunctionUrlConfigErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // A function URL belongs to the function's unpublished version or to one of its
+        // aliases, which is what the modelled qualifier pattern says: a published
+        // version number, or the unpublished version named explicitly, is not a
+        // qualifier a function URL can be created on.
+        if let Some(named) =
+            crate::state::named_qualifier(&input.function_name, input.qualifier.as_deref())
+        {
+            if !crate::state::is_function_url_qualifier(&named) {
+                return Err(
+                    CreateFunctionUrlConfigErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            r#type: None,
+                            message: Some(crate::state::function_url_qualifier_message(&named)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                CreateFunctionUrlConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                CreateFunctionUrlConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        // The function URL belongs to the qualifier it was created on, and that
+        // qualifier has at most one: "another operation is in progress" is not the only
+        // thing `ResourceConflictException` covers — an already existing resource is the
+        // other, and a second create never replaces the first.
+        let resource = record.versioned_arn(&version);
+        if record.url_configs.contains_key(&version) {
+            return Err(CreateFunctionUrlConfigErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Failed to create function URL config for {resource}. \
+                         FunctionUrlConfig exists for this Lambda function."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let created = crate::state::FunctionUrlConfigRecord {
+            url_id: crate::state::mint_function_url_id(),
+            auth_type: input.auth_type.clone(),
+            // Stored exactly as configured: a member the caller did not set is not
+            // reported with a value this emulator made up.
+            cors: input.cors.clone(),
+            invoke_mode: input
+                .invoke_mode
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_INVOKE_MODE.to_string()),
+            creation_time: crate::state::iso8601(now),
+            // Nothing has changed the configuration yet, so the last change to it is its
+            // creation.
+            last_modified_time: crate::state::iso8601(now),
+        };
+
+        let output = CreateFunctionUrlConfigOutput {
+            function_url: created.url(&record.region),
+            function_arn: resource,
+            auth_type: created.auth_type.clone(),
+            cors: created.cors.clone(),
+            creation_time: created.creation_time.clone(),
+            invoke_mode: Some(created.invoke_mode.clone()),
+        };
+        record.url_configs.insert(version, created);
+
+        Ok(output)
     }
 }

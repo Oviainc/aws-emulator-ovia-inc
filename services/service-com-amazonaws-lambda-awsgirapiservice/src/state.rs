@@ -39,7 +39,7 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 use crate::ops::types::{
-    AccountLimit, AccountUsage, CreateFunctionOutput, EnvironmentResponse, EphemeralStorage,
+    AccountLimit, AccountUsage, Cors, CreateFunctionOutput, EnvironmentResponse, EphemeralStorage,
     FunctionCodeLocation, PutFunctionConcurrencyOutput, ResolvedS3Object, TracingConfigResponse,
 };
 
@@ -465,6 +465,110 @@ impl PolicyRecord {
     }
 }
 
+/// The `InvokeMode` a function URL gets when the caller names none, which the model's
+/// own member documentation states: "BUFFERED – This is the default option. Lambda
+/// invokes your function using the Invoke API operation."
+pub const DEFAULT_INVOKE_MODE: &str = "BUFFERED";
+
+/// The host suffix every Lambda function URL carries. AWS documents the form in
+/// `CreateFunctionUrlConfig`'s guide ("Function URL endpoints have the following
+/// format: `https://<url-id>.lambda-url.<region>.on.aws`"), and it is what keeps the
+/// minted URL inside the model's 40..100 `FunctionUrl` length constraint.
+pub const FUNCTION_URL_HOST_SUFFIX: &str = "lambda-url";
+
+/// The URL of the function URL whose id is `url_id`, in the region it was created in.
+///
+/// The trailing `/` is part of the endpoint AWS vends, so the value a caller gets back
+/// is the URL they can address as-is.
+#[must_use]
+pub fn function_url(region: &str, url_id: &str) -> String {
+    format!("https://{url_id}.{FUNCTION_URL_HOST_SUFFIX}.{region}.on.aws/")
+}
+
+/// A fresh function-URL id: the opaque, per-URL subdomain label AWS mints for a
+/// function URL. AWS's are 32 lowercase alphanumeric characters, which the 32 hex
+/// digits of a random UUID satisfy. Minted once, at creation, and stored — so every
+/// later read of the same function URL reports the same URL.
+#[must_use]
+pub fn mint_function_url_id() -> String {
+    ::uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// The model's `FunctionUrlQualifier` pattern, which is the one every function-URL
+/// operation puts on the qualifier it accepts.
+pub const FUNCTION_URL_QUALIFIER_PATTERN: &str = r"^((?!^\d+$)^[0-9a-zA-Z-_]+$)$";
+
+/// Whether `qualifier` is one a function URL may be addressed by.
+///
+/// A function URL belongs to a function's unpublished version — addressed by naming no
+/// qualifier at all — or to one of its aliases, and the model says exactly that through
+/// [`FUNCTION_URL_QUALIFIER_PATTERN`]: an all-digit value (a published version number)
+/// does not match it, and neither does [`VERSION_LATEST`], whose `$` the pattern's
+/// character class does not admit.
+#[must_use]
+pub fn is_function_url_qualifier(qualifier: &str) -> bool {
+    !qualifier.is_empty()
+        && qualifier != VERSION_LATEST
+        && !qualifier.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The refusal for a qualifier a function URL cannot be addressed by: a validation
+/// message built from the request, naming the member and the constraint it failed.
+#[must_use]
+pub fn function_url_qualifier_message(qualifier: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{qualifier}' at 'qualifier' failed to satisfy \
+         constraint: Member must satisfy regular expression pattern: \
+         {FUNCTION_URL_QUALIFIER_PATTERN}"
+    )
+}
+
+/// The qualifier a `FunctionName`/`Qualifier` pair NAMES, as opposed to the
+/// [`VERSION_LATEST`] an unqualified request resolves to. It may come from either, and
+/// [`resolve_function`] refuses a pair that names two different ones.
+#[must_use]
+pub fn named_qualifier(function_name: &str, qualifier: Option<&str>) -> Option<String> {
+    qualifier
+        .map(str::to_string)
+        .or_else(|| parse_function_reference(function_name).and_then(|reference| reference.qualifier))
+        .filter(|named| !named.is_empty())
+}
+
+/// One Lambda function URL: "a dedicated HTTP(S) endpoint that you can use to invoke
+/// your function", with the configuration the caller gave it.
+///
+/// Held per qualifier on [`FunctionRecord::url_configs`], because a function URL is
+/// attached to the function's unpublished version or to one of its aliases, and each of
+/// those has at most one.
+#[derive(Debug, Clone)]
+pub struct FunctionUrlConfigRecord {
+    /// The subdomain label the URL is addressed by, minted once by
+    /// [`mint_function_url_id`].
+    pub url_id: String,
+    /// The `FunctionUrlAuthType` the URL enforces (`AWS_IAM` or `NONE`), as supplied.
+    pub auth_type: String,
+    /// The CORS settings, exactly as configured; absent when the caller configured
+    /// none, because nothing here invents settings the caller never asked for.
+    pub cors: Option<Cors>,
+    /// The `InvokeMode`, defaulted to [`DEFAULT_INVOKE_MODE`] when the caller named
+    /// none.
+    pub invoke_mode: String,
+    /// ISO-8601 instant the URL was created, "in ISO-8601 format
+    /// (YYYY-MM-DDThh:mm:ss.sTZD)" as the model's `CreationTime` member documents.
+    pub creation_time: String,
+    /// ISO-8601 instant of the last change to this configuration; equal to
+    /// [`Self::creation_time`] until one is made.
+    pub last_modified_time: String,
+}
+
+impl FunctionUrlConfigRecord {
+    /// The HTTP(S) endpoint of this function URL in `region`; see [`function_url`].
+    #[must_use]
+    pub fn url(&self, region: &str) -> String {
+        function_url(region, &self.url_id)
+    }
+}
+
 /// One Lambda function: its unpublished (`$LATEST`) configuration, its code, its
 /// lifecycle state, its tags and its published versions.
 #[derive(Debug, Clone)]
@@ -501,6 +605,12 @@ pub struct FunctionRecord {
     /// [`VERSION_LATEST`], and one per published version or alias. A policy is attached
     /// to the ARN the permission names, so two qualifiers never share one.
     pub policies: BTreeMap<String, PolicyRecord>,
+    /// The function URL of each qualifier that has one, keyed by the version label the
+    /// URL was created on: the unpublished version under [`VERSION_LATEST`], and one
+    /// per alias. A function URL is attached to the qualifier it was created on, and
+    /// each qualifier has at most one, so a second create on the same qualifier
+    /// conflicts rather than replacing it.
+    pub url_configs: BTreeMap<String, FunctionUrlConfigRecord>,
 }
 
 impl FunctionRecord {

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFunctionUrlConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFunctionUrlConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFunctionUrlConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the function URL of the qualifier the request names, from the record
+//! `CreateFunctionUrlConfig` persisted. A pure read: it changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFunctionUrlConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFunctionUrlConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFunctionUrlConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFunctionUrlConfigErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // Only the unpublished version and an alias can carry a function URL, so only
+        // those can be asked for one; see `state::is_function_url_qualifier`.
+        if let Some(named) =
+            crate::state::named_qualifier(&input.function_name, input.qualifier.as_deref())
+        {
+            if !crate::state::is_function_url_qualifier(&named) {
+                return Err(
+                    GetFunctionUrlConfigErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            r#type: None,
+                            message: Some(crate::state::function_url_qualifier_message(&named)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                GetFunctionUrlConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                GetFunctionUrlConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        let resource = record.versioned_arn(&version);
+        let Some(config) = record.url_configs.get(&version) else {
+            return Err(GetFunctionUrlConfigErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(format!(
+                        "The resource you requested does not exist. Resource: {resource}"
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetFunctionUrlConfigOutput {
+            function_url: config.url(&record.region),
+            function_arn: resource,
+            auth_type: config.auth_type.clone(),
+            cors: config.cors.clone(),
+            creation_time: config.creation_time.clone(),
+            last_modified_time: config.last_modified_time.clone(),
+            invoke_mode: Some(config.invoke_mode.clone()),
+        })
     }
 }

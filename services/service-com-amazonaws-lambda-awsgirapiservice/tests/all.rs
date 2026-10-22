@@ -17,6 +17,8 @@ mod account_settings;
 mod function_configuration;
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
+#[path = "all/function_url_config.rs"]
+mod function_url_config;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/signing_name_routing.rs"]
