@@ -177,6 +177,71 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `ServiceFailure` error shape.
+static SERVICE_FAILURE_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ServiceFailure$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `ServiceFailure` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`:
+/// the shape is not in any service's model. The wire error code is NOT this
+/// shape's name — it is the per-failure `code` [`ServiceFailure`] carries, which
+/// [`OperationError::shape_name`] returns.
+pub static SERVICE_FAILURE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#ServiceFailure",
+        "smithy.framework",
+        "ServiceFailure",
+    ),
+    ShapeType::Structure,
+    &[&SERVICE_FAILURE_MESSAGE],
+);
+
+/// A failure this service answers that its own model declares no shape for: the
+/// wire error code, the HTTP status AWS answers it with, and the message.
+///
+/// S3 Control's model declares no errors at all for most operations, yet the
+/// service answers the S3-style XML `<Code>`/`<Message>` envelope for every
+/// refusal a resource lifecycle has — a missing access point is `404`
+/// `NoSuchAccessPoint`, re-creating one is `409`
+/// `AccessPointAlreadyOwnedByYou`. A client branches on that code, so the code
+/// and the status are what this type carries; the message is prose for a human.
+#[derive(Debug, Clone)]
+pub struct ServiceFailure {
+    /// The wire error code (`<Code>`), which a client matches on. `&'static str`
+    /// because [`OperationError::shape_name`] hands the framework a `'static`
+    /// name: a code is one of this service's fixed set, never request text.
+    pub code: &'static str,
+    /// The HTTP status AWS answers this code with.
+    pub status: u16,
+    /// Why the request was refused.
+    pub message: String,
+}
+
+impl std::fmt::Display for ServiceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ServiceFailure {}
+
+impl SerializableStruct for ServiceFailure {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&SERVICE_FAILURE_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +250,9 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A failure the service answers that its model declares no shape for.
+    /// Renders with the code and status the failure carries.
+    Service(ServiceFailure),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -202,6 +270,21 @@ impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// Answer a failure this operation's model declares no shape for, with the
+    /// code and HTTP status the real service answers it with.
+    ///
+    /// Use this for a refusal the emulated service really has and the model
+    /// does not carry — S3 Control models no errors, so `NoSuchAccessPoint` can
+    /// only be answered here. Prefer a modeled error whenever the operation
+    /// lists one, and [`Self::validation`] for a malformed request.
+    pub fn service_failure(code: &'static str, status: u16, message: impl Into<String>) -> Self {
+        Self::Service(ServiceFailure {
+            code,
+            status,
+            message: message.into(),
+        })
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -228,6 +311,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::Service(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +324,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::Service(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +339,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::Service(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +348,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::Service(_) => &SERVICE_FAILURE_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +361,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::Service(e) => e.code,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +374,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::Service(e) => e.status,
             Self::ValidationException(_) => 400,
         }
     }
@@ -298,6 +387,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            // This service speaks restXml, which reads the code from
+            // `shape_name` anyway.
+            Self::Service(_) => None,
             Self::ValidationException(_) => None,
         }
     }

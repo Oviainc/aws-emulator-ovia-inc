@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SampleTrainingSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SampleTrainingSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Serves a synchronous inference request against the checkpoint a training session
+//! resolves to.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SampleTrainingSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Sends an inference request to the model associated with the specified training
+//! session and returns the response synchronously." No model runs inside this emulator,
+//! so the response body says exactly that, in the JSON envelope
+//! [`crate::state::sample_response_body`] builds, together with the facts about what was
+//! served: the session, the checkpoint the request resolved to and the size of the
+//! payload that arrived. It is never the request body echoed back as if a model had
+//! generated it. Which checkpoint the request resolves to, and every refusal around it,
+//! comes from persisted session state.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +158,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SampleTrainingSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SampleTrainingSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SampleTrainingSession"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SampleTrainingSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the training session runtime store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The response body is this emulator's own JSON envelope, whatever the caller's
+        // `Accept` names: the model's own response type is not knowable without the
+        // model, and the operation declares no error for a content type it cannot serve.
+        if let Some(arn) = input.model_package_arn.as_deref() {
+            if let Err(reason) = crate::state::validate_model_package_arn("modelPackageArn", arn) {
+                return Err(SampleTrainingSessionErrorModeled::ValidationException(
+                    ValidationException { message: reason },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let request_bytes = input.body.as_ref().map_or(0, Vec::len);
+        let mut store = state.lock();
+        // A session this emulator has never seen is NOT materialised by an inference
+        // call: only a submit brings a session's runtime record into existence.
+        let Some(session) = store.advance_session(&input.training_session_name, now) else {
+            return Err(SampleTrainingSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Training session {} does not exist.",
+                        input.training_session_name
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Which model serves the request: the checkpoint the caller named, else the one
+        // the session currently resolves to.
+        let model_package_arn = match input.model_package_arn.as_deref() {
+            Some(arn) if !session.checkpoints.contains_key(arn) => {
+                return Err(SampleTrainingSessionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Model package {arn} is not a checkpoint of training session {}.",
+                            input.training_session_name
+                        ),
+                    },
+                )
+                .into());
+            }
+            Some(arn) => arn.to_string(),
+            None => match session.current_checkpoint() {
+                Some(checkpoint) => checkpoint.model_package_arn.clone(),
+                None => {
+                    return Err(SampleTrainingSessionErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "Training session {} has no model checkpoint to sample \
+                                 from: write one with a saveWeights or saveState \
+                                 operation, or name a model package on the \
+                                 X-Amzn-SageMaker-Model-Package header.",
+                                input.training_session_name
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        Ok(SampleTrainingSessionOutput {
+            content_type: Some(crate::state::SAMPLE_RESPONSE_CONTENT_TYPE.to_string()),
+            body: crate::state::sample_response_body(
+                &session.name,
+                &model_package_arn,
+                request_bytes,
+            ),
+        })
     }
 }

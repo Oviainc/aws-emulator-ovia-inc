@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateControlPanel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateControlPanel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: validates the named cluster is stored, mints a control-panel ARN under
+//! it and persists it in [`crate::state`]; `DescribeControlPanel` projects the same
+//! stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateControlPanel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `RoutingControlCount` is COUNTED from the routing controls stored under this panel on
+//! every projection, so it is 0 here and tracks every later create and delete.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateControlPanel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateControlPanelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateControlPanel"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateControlPanelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let fingerprint = format!(
+            "{}|{}|{}",
+            input.cluster_arn,
+            input.control_panel_name,
+            crate::state::tags_fingerprint(input.tags.as_ref())
+        );
+        let mut guard = state.lock();
+
+        match guard.token_outcome(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenOutcome::Replay(arn) => {
+                if let Some(record) = guard.control_panels.get(&arn) {
+                    let count = guard.routing_control_count(&arn);
+                    return Ok(CreateControlPanelOutput {
+                        control_panel: Some(record.to_control_panel(count)),
+                    });
+                }
+            }
+            crate::state::TokenOutcome::Mismatch => {
+                return Err(CreateControlPanelErrorModeled::ConflictException(
+                    ConflictException {
+                        message: "ClientToken was already used for a CreateControlPanel request \
+                                  with different parameters"
+                            .to_string(),
+                    },
+                )
+                .into());
+            }
+            crate::state::TokenOutcome::Fresh => {}
+        }
+
+        // A control panel only exists inside a cluster, so the parent must be one this
+        // service actually stored.
+        if !guard.clusters.contains_key(&input.cluster_arn) {
+            return Err(CreateControlPanelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no cluster is stored under {}", input.cluster_arn),
+                },
+            )
+            .into());
+        }
+
+        // A control panel name identifies the panel within its cluster.
+        if guard
+            .ordered_control_panels(&input.cluster_arn)
+            .iter()
+            .any(|panel| panel.name == input.control_panel_name)
+        {
+            return Err(CreateControlPanelErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a control panel named \"{}\" already exists in {}",
+                        input.control_panel_name, input.cluster_arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded, so a repeated create cannot grow it without limit.
+        if guard.control_panels_full() {
+            return Err(CreateControlPanelErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account may hold at most {} control panels",
+                        crate::state::MAX_CONTROL_PANELS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let panel_id = guard.mint_id();
+        let panel_arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            crate::state::ARN_REGION,
+            &format!("controlpanel/{panel_id}"),
+        );
+        let seq = guard.next_seq();
+
+        guard.control_panels.insert(
+            panel_arn.clone(),
+            crate::state::ControlPanelRecord {
+                seq,
+                arn: panel_arn.clone(),
+                cluster_arn: input.cluster_arn,
+                name: input.control_panel_name,
+                owner: ::engine::emulator_account_id().to_string(),
+                // Only the panel a cluster is created with is the default one.
+                default_control_panel: false,
+                tags: crate::state::tags_map(input.tags),
+                deploy_due: crate::state::deploy_due(),
+            },
+        );
+
+        guard.remember_token(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &panel_arn,
+        );
+
+        // Answer from the STORED record, with the count read back out of state.
+        let count = guard.routing_control_count(&panel_arn);
+        Ok(CreateControlPanelOutput {
+            control_panel: guard
+                .control_panels
+                .get(&panel_arn)
+                .map(|record| record.to_control_panel(count)),
+        })
     }
 }

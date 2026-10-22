@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroupMemberships
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroupMemberships`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroupMemberships::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the memberships of one group, in creation order, a page at a time: the page
+//! is `MaxResults` long at most and an opaque `NextToken` carries the caller to the
+//! next one, so a paginating client walks every membership exactly once.
 //!
 //! ## Shape of an operation
 //!
@@ -109,11 +104,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `ListGroupMembershipsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#ListGroupMemberships")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#ListGroupMemberships",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListGroupMembershipsErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -165,20 +167,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroupMemberships` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupMembershipsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroupMemberships"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListGroupMembershipsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        // A read: it looks the store up rather than vivifying one, so listing a group's
+        // memberships can never change what a later caller sees.
+        let state = state.lock();
+        let not_found = || {
+            ListGroupMembershipsErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                crate::state::ResourceKind::Group,
+                &input.group_id,
+            ))
+        };
+        let store = state.store(&input.identity_store_id).ok_or_else(not_found)?;
+        let group_key = crate::state::resource_key(&input.group_id);
+        if !store.groups.contains_key(&group_key) {
+            return Err(not_found().into());
+        }
+
+        let memberships = store.memberships_in_order(&group_key);
+        // The model declares `MaxResults` `@default: 100` with range 1..100, so an
+        // absent member asks for the largest page the service answers with.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS)
+            .clamp(1, crate::state::MAX_MAX_RESULTS) as usize;
+
+        // A `NextToken` is this service's own opaque cursor: it names the membership
+        // the next page starts at. One this service did not mint, or one naming a
+        // membership this group no longer has, is refused rather than silently
+        // restarting the walk.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resume_at = crate::state::decode_cursor(token).and_then(|membership_id| {
+                    memberships
+                        .iter()
+                        .position(|membership| membership.membership_id == membership_id)
+                });
+                resume_at.ok_or_else(|| {
+                    ListGroupMembershipsErrorModeled::ValidationException(ValidationException {
+                        message: Some(
+                            "NextToken is not a cursor this service issued for this group"
+                                .to_string(),
+                        ),
+                        request_id: None,
+                        reason: None,
+                    })
+                })?
+            }
+        };
+
+        let group_memberships: Vec<GroupMembership> = memberships[start..]
+            .iter()
+            .take(page_size)
+            .map(|membership| membership.to_group_membership(&store.identity_store_id))
+            .collect();
+        // A `NextToken` only when something is left: the item the next page starts at.
+        let next_token = memberships
+            .get(start + group_memberships.len())
+            .map(|membership| crate::state::encode_cursor(&membership.membership_id));
+
+        Ok(ListGroupMembershipsOutput {
+            group_memberships,
+            next_token,
+        })
     }
 }

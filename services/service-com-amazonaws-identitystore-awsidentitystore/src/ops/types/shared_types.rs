@@ -36,6 +36,20 @@ pub struct ResourceNotFoundException {
     pub request_id: Option<String>,
 }
 
+/// This service's common SERVER error. The model declares it on the service's own
+/// `errors` list rather than on each operation, so the scaffold's per-operation enums
+/// do not carry it and an implemented handler widens it in with
+/// `#[operation_error(.., extra_errors = ["InternalServerException"])]`. It is what a
+/// handler answers when it cannot reach its store — a modelled 500, never a 501 (which
+/// would claim the operation is unwritten) and never an invented client error.
+#[smithy_macros::smithy(shape = "com.amazonaws.identitystore#InternalServerException")]
+#[derive(Debug, Clone, Default)]
+pub struct InternalServerException {
+    pub message: Option<String>,
+    pub request_id: Option<String>,
+    pub retry_after_seconds: i32,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.identitystore#ServiceQuotaExceededException")]
 #[derive(Debug, Clone, Default)]
 pub struct ServiceQuotaExceededException {

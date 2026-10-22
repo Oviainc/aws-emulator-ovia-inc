@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourceAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourceAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourceAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the addressed migration task's stored resource attribute list
+//! in the store held by [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +176,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourceAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourceAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourceAttributes"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourceAttributesErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "the Migration Hub progress update stream store is unavailable".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The attributes belong to an already registered task; an unknown stream or
+        // task is reported, never created.
+        let Some(task_record) =
+            state.task_mut(&input.progress_update_stream, &input.migration_task_name)
+        else {
+            return Err(PutResourceAttributesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "migration task {} does not exist in progress update stream {}",
+                        input.migration_task_name, input.progress_update_stream
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // An authorized dry run is answered with `DryRunOperation` and writes nothing
+        // — resolved target first, so a dry run against an absent task still reports
+        // the absence.
+        if input.dry_run {
+            return Err(PutResourceAttributesErrorModeled::DryRunOperation(
+                DryRunOperation {
+                    message: Some(format!(
+                        "dry run: putting resource attributes on migration task {} in progress update stream {} would have succeeded",
+                        input.migration_task_name, input.progress_update_stream
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The model documents the write as REPLACING: "subsequent calls to
+        // PutResourceAttributes will override previously stored attributes". The
+        // documented "VM" rule discards VM fields only from the Application Discovery
+        // Service MATCHING, which this service does not perform, so the stored list is
+        // the list the caller sent — nothing added, nothing dropped.
+        task_record.resource_attributes = input.resource_attribute_list;
+
+        Ok(PutResourceAttributesOutput {})
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRootFolders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRootFolders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRootFolders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Describes the caller's two special folders — the root folder and the recycle bin —
+//! as they were seeded and stored in [`crate::state`], so a client discovers a valid
+//! `ParentFolderId` instead of being told a literal id.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRootFolders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRootFoldersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRootFolders"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeRootFoldersErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("One or more of the dependencies is unavailable.".to_string()),
+                },
+            )
+            .into());
+        };
+        // The model requires an `AuthenticationToken`, which the boundary validator has
+        // already enforced. It selects no user: this emulator models one directory user
+        // (`crate::state::synthetic_user_id`), whose special folders were seeded at init.
+        let _ = &input.authentication_token;
+        let user = crate::state::synthetic_user_id();
+
+        let scope = format!("root-folders|{user}");
+        let offset = match input.marker.as_deref() {
+            None => 0,
+            Some(marker) => match crate::state::decode_marker(marker, &scope) {
+                Some(offset) => offset,
+                None => {
+                    return Err(DescribeRootFoldersErrorModeled::InvalidArgumentException(
+                        InvalidArgumentException {
+                            message: Some(
+                                "The pagination marker or limit fields are not valid.".to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        let limit = input
+            .limit
+            .map_or(crate::state::DEFAULT_PAGE_LIMIT, |limit| {
+                usize::try_from(limit).unwrap_or(crate::state::DEFAULT_PAGE_LIMIT)
+            })
+            .clamp(1, crate::state::MAX_PAGE_LIMIT);
+
+        // Under the guard: copy out the page, with the child ids each listed folder's
+        // `Signature` is hashed from. The relation is built ONCE and nothing is hashed
+        // while the store is locked; see `describe_folder_contents` for the same shape.
+        let (mut drafts, total) = {
+            // A reporting operation: read-only access to the store.
+            let state = state.lock();
+            // "RootFolder is the root of user's files and folders and RecycleBin is the
+            // root of recycled items" — in that order.
+            let special: Vec<&crate::state::Folder> = [
+                state.root_folders.get(&user),
+                state.recycle_bin_folders.get(&user),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|id| state.folders.get(id))
+            .collect();
+
+            let total = special.len();
+            let page_start = offset.min(total);
+            let page_end = page_start.saturating_add(limit).min(total);
+            let index = state.child_index();
+            let drafts: Vec<(FolderMetadata, Vec<String>)> = special[page_start..page_end]
+                .iter()
+                .map(|folder| {
+                    (
+                        crate::state::folder_metadata(folder, None),
+                        index.child_ids(&folder.id),
+                    )
+                })
+                .collect();
+            (drafts, total)
+        };
+
+        // The guard is released before the remaining per-item work.
+        ::tokio::task::yield_now().await;
+        let folders: Vec<FolderMetadata> = drafts
+            .iter_mut()
+            .map(|(metadata, child_ids)| {
+                metadata.signature = Some(crate::state::folder_signature(child_ids));
+                metadata.clone()
+            })
+            .collect();
+
+        let page_end = offset.min(total).saturating_add(folders.len());
+        Ok(DescribeRootFoldersOutput {
+            folders: Some(folders),
+            marker: (page_end < total).then(|| crate::state::encode_marker(page_end, &scope)),
+        })
     }
 }

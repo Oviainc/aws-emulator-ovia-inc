@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! MERGES `tags` onto the tag map of the one stored deployment parameter whose
+//! `resourceArn` the `@httpLabel` names, so a key already present takes the new
+//! value and every other stored key is left alone. An ARN that names no stored
+//! record is a modelled `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +141,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the deployment-parameter store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let Some(record) = store.parameters.get_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::parameter_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // The merge is computed before anything is stored, so a request the service
+        // could not report back leaves the record untouched.
+        let merged = match crate::state::merge_tags(&record.tags, &input.tags.unwrap_or_default()) {
+            Ok(merged) => merged,
+            Err(why) => {
+                return Err(TagResourceErrorModeled::ValidationException(why).into());
+            }
+        };
+        record.tags = merged;
+
+        Ok(TagResourceOutput {})
     }
 }

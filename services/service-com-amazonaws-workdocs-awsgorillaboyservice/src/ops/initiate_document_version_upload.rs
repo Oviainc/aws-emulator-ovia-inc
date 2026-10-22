@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InitiateDocumentVersionUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InitiateDocumentVersionUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InitiateDocumentVersionUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a document and its first version — or, when `Id` names an existing document,
+//! another version of that document — in state, with the version `INITIALIZED` until
+//! `UpdateDocumentVersion` commits it.
 //!
 //! ## Shape of an operation
 //!
@@ -188,17 +183,261 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InitiateDocumentVersionUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InitiateDocumentVersionUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InitiateDocumentVersionUpload"))
+        // request metadata.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        let mut state = state.lock();
+
+        let creator_id = crate::state::synthetic_user_id();
+
+        // `Id` is "optionally specified when creating a new version of an existing
+        // document" (this operation's own documentation), so it names the document the
+        // new version belongs to — not an id the client may invent.
+        if let Some(document_id) = input.id.clone() {
+            let Some(document) = state.documents.get(&document_id).cloned() else {
+                return Err(not_exists(&document_id));
+            };
+            // The previous upload has not been committed with `UpdateDocumentVersion`
+            // yet, so the version this call would create already exists.
+            if document
+                .latest_version()
+                .is_some_and(|version| version.status == crate::state::DOCUMENT_STATUS_INITIALIZED)
+            {
+                return Err(InitiateDocumentVersionUploadErrorModeled::EntityAlreadyExistsException(
+                    EntityAlreadyExistsException {
+                        message: Some("The resource already exists.".to_string()),
+                    },
+                )
+                .into());
+            }
+
+            // Another version is another stored record, so the store's total cap
+            // applies to it as well.
+            if state.total_resources() >= crate::state::MAX_STORED_RESOURCES {
+                return Err(limit_exceeded(crate::state::STORE_FULL_MESSAGE));
+            }
+
+            let now = state.now();
+            let version = new_version(&input, &document, now, &creator_id);
+            let output = {
+                let Some(stored) = state.documents.get_mut(&document_id) else {
+                    return Err(unavailable());
+                };
+                stored.latest_version_id = version.id.clone();
+                stored.versions.insert(version.id.clone(), version);
+                stored.modified = now;
+                stored.clone()
+            };
+            let version_id = output.latest_version_id.clone();
+            return Ok(InitiateDocumentVersionUploadOutput {
+                metadata: Some(output.metadata()),
+                upload_metadata: Some(upload_metadata(ctx, &document_id, &version_id, &input)),
+            });
+        }
+
+        // No `Id`: a new document, which needs the folder to put it in and a name.
+        let Some(parent_folder_id) = input.parent_folder_id.clone() else {
+            return Err(InitiateDocumentVersionUploadErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        "ParentFolderId is required when creating a document.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let Some(name) = input.name.clone() else {
+            return Err(InitiateDocumentVersionUploadErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some("Name is required when creating a document.".to_string()),
+                },
+            )
+            .into());
+        };
+        if !state.folders.contains_key(&parent_folder_id) {
+            return Err(not_exists(&parent_folder_id));
+        }
+        let children = state.child_index();
+        let siblings = children.children(&parent_folder_id);
+        // A document's name identifies it within its folder, so uploading the same name
+        // again names a document that already exists.
+        if siblings.iter().any(|child| {
+            child.content_type() == crate::state::FOLDER_CONTENT_DOCUMENT
+                && child.name() == Some(name.as_str())
+        }) {
+            return Err(InitiateDocumentVersionUploadErrorModeled::EntityAlreadyExistsException(
+                EntityAlreadyExistsException {
+                    message: Some("The resource already exists.".to_string()),
+                },
+            )
+            .into());
+        }
+        // `LimitExceededException`'s own documentation in this model: "The maximum of
+        // 100,000 files and folders under the parent folder has been exceeded." The
+        // store as a whole is capped too; see `crate::state::MAX_STORED_RESOURCES`.
+        let siblings = siblings.len();
+        drop(children);
+        if siblings >= crate::state::MAX_CHILDREN_PER_FOLDER {
+            return Err(limit_exceeded(crate::state::FOLDER_FULL_MESSAGE));
+        }
+        if state.total_resources() >= crate::state::MAX_STORED_RESOURCES {
+            return Err(limit_exceeded(crate::state::STORE_FULL_MESSAGE));
+        }
+
+        let document_id = state.mint_id("document");
+        let now = state.now();
+        let version_id = crate::state::ComAmazonawsWorkdocsAwsgorillaboyserviceState::mint_version_id(
+            now,
+            &::std::collections::BTreeMap::new(),
+        );
+        let version = crate::state::DocumentVersion {
+            id: version_id.clone(),
+            name: Some(name),
+            content_type: input.content_type.clone(),
+            size_in_bytes: input.document_size_in_bytes,
+            status: crate::state::DOCUMENT_STATUS_INITIALIZED.to_string(),
+            created: now,
+            modified: now,
+            content_created: input.content_created_timestamp.and_then(crate::state::system_time),
+            content_modified: input
+                .content_modified_timestamp
+                .and_then(crate::state::system_time),
+            creator_id: creator_id.clone(),
+            thumbnail: ::std::collections::HashMap::new(),
+            source: ::std::collections::HashMap::new(),
+        };
+        let mut versions = ::std::collections::BTreeMap::new();
+        versions.insert(version_id.clone(), version);
+        let parent_folder_id_for_stamp = parent_folder_id.clone();
+        state.documents.insert(
+            document_id.clone(),
+            crate::state::Document {
+                id: document_id.clone(),
+                creator_id,
+                parent_folder_id,
+                created: now,
+                modified: now,
+                resource_state: crate::state::RESOURCE_STATE_ACTIVE.to_string(),
+                latest_version_id: version_id.clone(),
+                versions,
+                labels: Vec::new(),
+                custom_metadata: ::std::collections::HashMap::new(),
+            },
+        );
+        // The parent's contents changed, so the parent was updated.
+        if let Some(parent) = state.folders.get_mut(&parent_folder_id_for_stamp) {
+            parent.modified = now;
+        }
+
+        // Describe the document as STORED, so this response is what `GetDocument` will
+        // report for the same id.
+        let Some(stored) = state.documents.get(&document_id) else {
+            return Err(unavailable());
+        };
+        Ok(InitiateDocumentVersionUploadOutput {
+            metadata: Some(stored.metadata()),
+            upload_metadata: Some(upload_metadata(ctx, &document_id, &version_id, &input)),
+        })
+    }
+}
+
+/// The modelled 503 for a request that cannot reach this service's store.
+fn unavailable() -> InitiateDocumentVersionUploadError {
+    InitiateDocumentVersionUploadErrorModeled::ServiceUnavailableException(
+        ServiceUnavailableException {
+            message: Some("One or more of the dependencies is unavailable.".to_string()),
+        },
+    )
+    .into()
+}
+
+/// The modelled 409 for a create that would pass a stored-resource ceiling, worded for
+/// the ceiling it actually hit.
+fn limit_exceeded(message: &str) -> InitiateDocumentVersionUploadError {
+    InitiateDocumentVersionUploadErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 404 naming the resource that does not exist.
+fn not_exists(entity_id: &str) -> InitiateDocumentVersionUploadError {
+    InitiateDocumentVersionUploadErrorModeled::EntityNotExistsException(EntityNotExistsException {
+        message: Some("The resource does not exist.".to_string()),
+        entity_ids: Some(vec![entity_id.to_string()]),
+    })
+    .into()
+}
+
+/// The next version of `document`, in `INITIALIZED` state. A member the request leaves
+/// out keeps the latest version's value: this is a new version of the SAME document.
+fn new_version(
+    input: &InitiateDocumentVersionUploadInput,
+    document: &crate::state::Document,
+    now: ::std::time::SystemTime,
+    creator_id: &str,
+) -> crate::state::DocumentVersion {
+    let previous = document.latest_version();
+    crate::state::DocumentVersion {
+        id: crate::state::ComAmazonawsWorkdocsAwsgorillaboyserviceState::mint_version_id(
+            now,
+            &document.versions,
+        ),
+        name: input
+            .name
+            .clone()
+            .or_else(|| previous.and_then(|version| version.name.clone())),
+        content_type: input
+            .content_type
+            .clone()
+            .or_else(|| previous.and_then(|version| version.content_type.clone())),
+        size_in_bytes: input.document_size_in_bytes,
+        status: crate::state::DOCUMENT_STATUS_INITIALIZED.to_string(),
+        created: now,
+        modified: now,
+        content_created: input
+            .content_created_timestamp
+            .and_then(crate::state::system_time),
+        content_modified: input
+            .content_modified_timestamp
+            .and_then(crate::state::system_time),
+        creator_id: creator_id.to_string(),
+        thumbnail: ::std::collections::HashMap::new(),
+        source: ::std::collections::HashMap::new(),
+    }
+}
+
+/// Where the client PUTs the version's content, and the headers that PUT must carry.
+///
+/// AWS answers an S3 presigned URL here. This emulator has no object data plane, so the
+/// URL names this version's content on the endpoint THIS REQUEST ARRIVED AT; no
+/// operation in this service serves it, and nothing downstream reads it back as
+/// content. It is a locator built from the request's own host and the stored ids, never
+/// a stand-in for content that was uploaded — and when the request names no host at all
+/// there is no endpoint to point at, so `UploadUrl` is omitted rather than filled with a
+/// baked-in one (a literal AWS endpoint here would send a following client's content to
+/// the real service).
+fn upload_metadata(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    document_id: &str,
+    version_id: &str,
+    input: &InitiateDocumentVersionUploadInput,
+) -> UploadMetadata {
+    let host = ctx
+        .parts()
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| ctx.parts().uri.authority().map(::http::uri::Authority::as_str));
+    let mut signed_headers = ::std::collections::HashMap::new();
+    if let Some(content_type) = input.content_type.clone() {
+        signed_headers.insert("Content-Type".to_string(), content_type);
+    }
+    UploadMetadata {
+        upload_url: host.map(|host| {
+            format!("https://{host}/api/v1/documents/{document_id}/versions/{version_id}/content")
+        }),
+        signed_headers: (!signed_headers.is_empty()).then_some(signed_headers),
     }
 }

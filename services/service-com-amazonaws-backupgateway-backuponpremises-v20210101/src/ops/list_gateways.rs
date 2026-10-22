@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGateways
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGateways`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGateways::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the gateways persisted in [`crate::state`], one `MaxResults`-sized page at a
+//! time. @readonly: it writes nothing. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -82,9 +76,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `ListGatewaysError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#ListGateways")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#ListGateways",
+    extra_errors = ["ValidationException", "InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListGatewaysErrorModeled {
+    ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -138,18 +137,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGateways` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGatewaysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGateways"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListGatewaysErrorModeled::InternalServerException(InternalServerException {
+                error_code: None,
+                message: Some("Backup gateway state is unavailable on this engine.".to_string()),
+            })
+        })?;
+
+        // A `NextToken` resumes after the page boundary it encodes. One this service did
+        // not issue is refused, never quietly treated as "start from the top".
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListGatewaysErrorModeled::ValidationException(ValidationException {
+                    error_code: None,
+                    message: Some(
+                        "Value at 'NextToken' failed to satisfy constraint: the token must be \
+                         one a previous ListGateways response returned"
+                            .to_string(),
+                    ),
+                })
+            })?),
+        };
+
+        // `MaxResults` caps the page, but the SERVER caps it too: the model gives
+        // `MaxResults` a minimum of 1 and no maximum and declares no default page size,
+        // so a request that names none gets `DEFAULT_PAGE_SIZE` and one that asks for
+        // more than `MAX_PAGE_SIZE` gets that — no single response carries the whole
+        // store, and the rest is reached through `NextToken`. The `max(1)` is
+        // belt-and-braces: the modelled range is refused before `handle` runs.
+        let limit = input.max_results.map_or(crate::state::DEFAULT_PAGE_SIZE, |max| {
+            (max.max(1) as usize).min(crate::state::MAX_PAGE_SIZE)
+        });
+
+        let page = state.lock().page_of_gateways(after.as_deref(), limit);
+
+        Ok(ListGatewaysOutput {
+            gateways: Some(
+                page.gateways
+                    .iter()
+                    .map(crate::state::StoredGateway::summary)
+                    .collect(),
+            ),
+            next_token: page.next_token,
+        })
     }
 }

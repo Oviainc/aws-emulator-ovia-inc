@@ -15,7 +15,10 @@ use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomations
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A router with one freshly-engined copy of this service mounted.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the other suites in this test binary drive the service through
+/// the same harness instead of each growing a copy of it.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Deterministic regardless of the process-wide default: these cases are
@@ -26,7 +29,11 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Call one operation and return `(http status, parsed body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("https://aco-automation.us-east-1.amazonaws.com/")
@@ -60,7 +67,12 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// Call one operation, requiring success.
-async fn call_ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &str) -> Value {
+pub(crate) async fn call_ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+    case: &str,
+) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -81,7 +93,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// Assert a call was refused with `expected_code` and `expected_status`.
-fn assert_refused(
+pub(crate) fn assert_refused(
     (status, body): (u16, Value),
     expected_status: u16,
     expected_code: &str,
@@ -99,7 +111,7 @@ fn assert_refused(
 }
 
 /// A create request with every required member and nothing else.
-fn minimal_rule(name: &str) -> Value {
+pub(crate) fn minimal_rule(name: &str) -> Value {
     json!({
         "name": name,
         "ruleType": "AccountRule",
@@ -113,11 +125,11 @@ fn minimal_rule(name: &str) -> Value {
     })
 }
 
-fn member<'a>(body: &'a Value, name: &str) -> &'a Value {
+pub(crate) fn member<'a>(body: &'a Value, name: &str) -> &'a Value {
     body.get(name).unwrap_or(&Value::Null)
 }
 
-fn string_member(body: &Value, name: &str) -> String {
+pub(crate) fn string_member(body: &Value, name: &str) -> String {
     member(body, name).as_str().unwrap_or_default().to_string()
 }
 

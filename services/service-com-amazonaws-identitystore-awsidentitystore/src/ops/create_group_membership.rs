@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGroupMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGroupMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGroupMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Makes the member the request names a member of the group it names, minting the
+//! `MembershipId` and `MembershipArn` and indexing the membership by group and by
+//! member, so a later `ListGroupMemberships` lists exactly what was created.
 //!
 //! ## Shape of an operation
 //!
@@ -112,13 +107,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `CreateGroupMembershipError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#CreateGroupMembership")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#CreateGroupMembership",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateGroupMembershipErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -170,20 +172,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGroupMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGroupMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGroupMembership"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGroupMembershipErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let mut state = state.lock();
+        // The store is looked up rather than vivified: this operation needs an existing
+        // group, so a store that holds nothing cannot satisfy it, and a failed create
+        // must not leave an identity store behind as a side effect.
+        let store_key = crate::state::identity_store_key(&input.identity_store_id);
+        let group_not_found = || {
+            CreateGroupMembershipErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                crate::state::ResourceKind::Group,
+                &input.group_id,
+            ))
+        };
+        let store = state.stores.get_mut(&store_key).ok_or_else(group_not_found)?;
+
+        // Both ends of the membership must already exist in this identity store. The
+        // modelled `MemberId` union declares exactly one variant, `UserId`, so the
+        // member is always a user of this store.
+        let group_key = crate::state::resource_key(&input.group_id);
+        if !store.groups.contains_key(&group_key) {
+            return Err(group_not_found().into());
+        }
+        let MemberId::UserId(member) = &input.member_id;
+        let member_key = crate::state::resource_key(member);
+        if !store.users.contains_key(&member_key) {
+            return Err(CreateGroupMembershipErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::ResourceKind::User, member),
+            )
+            .into());
+        }
+
+        // One membership per (group, member) pair: a repeat of a membership that
+        // already exists violates that uniqueness claim rather than minting a second
+        // id for the same pair.
+        if let Some(existing) = store.membership_of(&group_key, &member_key) {
+            return Err(CreateGroupMembershipErrorModeled::ConflictException(
+                crate::state::uniqueness_conflict(format!(
+                    "this member is already a member of group {group_key} (MembershipId {})",
+                    existing.membership_id
+                )),
+            )
+            .into());
+        }
+
+        // A group holds a bounded number of members, and the store a bounded number of
+        // memberships. The operation models `ServiceQuotaExceededException` for
+        // exceeding the maximum allowed, so the bound is reached through that error
+        // rather than by exhausting memory — and, because a group's membership ids are
+        // scanned linearly under the shared state lock, it also bounds the work one
+        // caller can impose on every other.
+        if !store.has_membership_capacity(&group_key) {
+            return Err(
+                CreateGroupMembershipErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(format!(
+                        "group {group_key} already holds {} of the {} members a group takes, \
+                         in a store holding {} of {} memberships",
+                        store.members_of(&group_key),
+                        crate::state::MAX_MEMBERSHIPS_PER_GROUP,
+                        store.memberships.len(),
+                        crate::state::MAX_MEMBERSHIPS_PER_STORE
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let membership_id = store.mint_resource_id();
+        let membership = crate::state::GroupMembershipRecord {
+            membership_arn: crate::state::resource_arn(
+                crate::state::ResourceKind::Membership,
+                &membership_id,
+            ),
+            membership_id: membership_id.clone(),
+            group_id: group_key,
+            member_user_id: member_key,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let output = CreateGroupMembershipOutput {
+            identity_store_id: store.identity_store_id.clone(),
+            membership_id: membership.membership_id.clone(),
+            membership_arn: membership.membership_arn.clone(),
+        };
+        store.insert_membership(membership);
+        Ok(output)
     }
 }

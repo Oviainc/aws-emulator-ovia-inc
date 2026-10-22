@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReplicationInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReplicationInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReplicationInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the replication instances persisted in [`crate::state`],
+//! narrowed by the documented `Filters` and paged with an opaque `Marker`. The notes
+//! below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReplicationInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReplicationInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReplicationInstances"))
+        // Reporting only: every answer comes from the store, so `ctx` carries nothing
+        // this operation needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the dms emulator is mounted on an engine that holds no state for it",
+            ));
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)?;
+        let size = crate::state::page_size(input.max_records)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let mut store = state.lock();
+        // A read reports what the clock has already made due: an instance whose
+        // `creating` span has elapsed reads `available` here, whether or not anybody
+        // called in between.
+        store.settle(::std::time::SystemTime::now());
+
+        let matching: Vec<&crate::state::ReplicationInstanceRecord> = store
+            .ordered_instances()
+            .into_iter()
+            .filter(|record| matches_filters(record, &filters))
+            .collect();
+
+        let (page, marker) = crate::state::paginate(
+            &matching,
+            input.marker.as_ref(),
+            size,
+            |record| record.arn.as_str(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        Ok(DescribeReplicationInstancesOutput {
+            replication_instances: Some(
+                matching[page]
+                    .iter()
+                    .map(|record| record.to_shape())
+                    .collect(),
+            ),
+            marker,
+        })
     }
+}
+
+/// The filter names the `Filters` member doc publishes: "Valid filter names:
+/// replication-instance-arn | replication-instance-id | replication-instance-class |
+/// engine-version".
+const DOCUMENTED_FILTERS: &[&str] = &[
+    "replication-instance-arn",
+    "replication-instance-id",
+    "replication-instance-class",
+    "engine-version",
+];
+
+/// Refuse a filter name this operation does not document, rather than ignoring it and
+/// answering with instances the caller asked to exclude.
+fn check_filter_names(filters: &[Filter]) -> Result<(), DescribeReplicationInstancesError> {
+    for filter in filters {
+        if !DOCUMENTED_FILTERS.contains(&filter.name.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "{} is not a supported filter name; the valid filter names are {}",
+                filter.name,
+                DOCUMENTED_FILTERS.join(" | ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` satisfies every filter the request carries: each filter narrows the
+/// answer to the instances whose matching attribute is one of that filter's values.
+fn matches_filters(
+    record: &crate::state::ReplicationInstanceRecord,
+    filters: &[Filter],
+) -> bool {
+    filters.iter().all(|filter| match filter.name.as_str() {
+        "replication-instance-arn" => filter.values.contains(&record.arn),
+        "replication-instance-id" => filter.values.contains(&record.identifier),
+        "replication-instance-class" => filter.values.contains(&record.instance_class),
+        "engine-version" => filter.values.contains(&record.engine_version),
+        // `check_filter_names` has already refused every other name.
+        _ => true,
+    })
 }
