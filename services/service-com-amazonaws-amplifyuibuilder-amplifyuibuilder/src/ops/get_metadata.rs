@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the UI-builder metadata of an app environment from [`crate::state`]: every
+//! feature in the catalogue the service holds, each with the value a `PutMetadataFlag`
+//! last wrote for it. Reporting only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +62,9 @@
 //!   for the input parameter.
 //! * `UnauthorizedException` (HTTP 401) — You don't have permission to perform this
 //!   operation.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   the shape is this service's own, and it is how an unreachable shared store is
+//!   reported, as in every sibling handler of this crate.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -83,9 +80,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplifyuibuilder-amplif
 // here — hence the `GetMetadataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplifyuibuilder#GetMetadata")]
+// `InternalServerException` is widened in through `extra_errors`: an unreachable
+// shared store is a server-side condition, not a malformed request, so it is
+// reported as the server failure every sibling handler in this crate reports it as
+// (`GetComponent` and `CreateComponent` both list the shape). It is this service's
+// own (`com.amazonaws.amplifyuibuilder#InternalServerException`, HTTP 500),
+// declared in `types/shared_types.rs`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplifyuibuilder#GetMetadata",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetMetadataErrorModeled {
+    InternalServerException(InternalServerException),
     InvalidParameterException(InvalidParameterException),
     UnauthorizedException(UnauthorizedException),
 }
@@ -141,18 +148,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMetadata"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable shared store is a server-side condition, reported as
+            // the server failure rather than as a refusal of a request that
+            // satisfied every constraint the model declares.
+            return Err(GetMetadataErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the amplifyuibuilder metadata store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `GetMetadataResponse$features` is `@required`, so the map is always
+        // reported: every feature of the catalogue, carrying what a
+        // `PutMetadataFlag` wrote for this app environment or the default for one
+        // nothing has written. An app environment nobody has touched is not an
+        // error — the metadata of an Amplify app exists before anything sets a
+        // flag on it.
+        let features = state
+            .lock()
+            .metadata_features(&input.app_id, &input.environment_name);
+
+        Ok(GetMetadataOutput { features })
     }
 }

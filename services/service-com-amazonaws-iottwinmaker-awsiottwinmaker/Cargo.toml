@@ -25,6 +25,8 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # `CreateEntity` mints a uuid `entityId` when the request names none.
 uuid = { version = "1", features = ["v4"] }
+# `ExecuteQuery` compiles a query's SQL `LIKE` pattern into a matcher.
+regex = "1.12"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
