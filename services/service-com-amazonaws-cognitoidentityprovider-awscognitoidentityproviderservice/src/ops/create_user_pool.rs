@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUserPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUserPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUserPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `UserPoolId`, stores the pool with every configuration default filled
+//! in, and answers with the STORED pool. `src/state.rs` owns the pool record and
+//! the configuration defaults; this file owns this request's own refusals.
 //!
 //! ## Shape of an operation
 //!
@@ -311,18 +305,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUserPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUserPool"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut pool = crate::state::new_user_pool(input.pool_name.clone(), &region, now);
+        pool.policies = crate::state::effective_policies(input.policies);
+        pool.schema = crate::state::effective_schema(input.schema);
+        pool.admin_create_user_config =
+            crate::state::effective_admin_create_user_config(input.admin_create_user_config);
+        pool.user_pool_tier = crate::state::effective_user_pool_tier(input.user_pool_tier);
+        if let Some(mfa_configuration) = input.mfa_configuration {
+            pool.mfa_configuration = mfa_configuration;
+        }
+        if let Some(deletion_protection) = input.deletion_protection {
+            pool.deletion_protection = deletion_protection;
+        }
+        pool.username_attributes = input.username_attributes.unwrap_or_default();
+        pool.alias_attributes = input.alias_attributes.unwrap_or_default();
+        pool.auto_verified_attributes = input.auto_verified_attributes.unwrap_or_default();
+        pool.lambda_config = input.lambda_config;
+        pool.username_configuration = input.username_configuration;
+        pool.device_configuration = input.device_configuration;
+        pool.email_configuration = input.email_configuration;
+        pool.sms_configuration = input.sms_configuration;
+        pool.verification_message_template = input.verification_message_template;
+        pool.account_recovery_setting = input.account_recovery_setting;
+        pool.user_attribute_update_settings = input.user_attribute_update_settings;
+        pool.user_pool_add_ons = input.user_pool_add_ons;
+        pool.key_configuration = input.key_configuration;
+        pool.issuer_configuration = input.issuer_configuration;
+        pool.acr_configuration = input.acr_configuration;
+        pool.sms_authentication_message = input.sms_authentication_message;
+        pool.tags = input.user_pool_tags.unwrap_or_default();
+
+        let mut guard = state.lock();
+        // This emulator holds its pools in memory, so the store is bounded.
+        if guard.user_pools.len() >= crate::state::MAX_USER_POOLS {
+            return Err(limit_exceeded(format!(
+                "This emulator holds at most {} user pools; delete one before creating another.",
+                crate::state::MAX_USER_POOLS
+            )));
+        }
+        // A minted id must name exactly one pool, so an id already in use is
+        // re-minted rather than overwriting the pool that holds it.
+        while guard.user_pools.contains_key(&pool.id) {
+            pool = pool.with_new_id(&region);
+        }
+        let user_pool_id = pool.id.clone();
+        guard.user_pools.insert(user_pool_id.clone(), pool);
+
+        // Rendered from the STORED pool, so the response is what a later read sees.
+        let stored = guard
+            .pool(&user_pool_id)
+            .ok_or_else(internal_error)?
+            .to_user_pool_type();
+        Ok(CreateUserPoolOutput {
+            user_pool: Some(stored),
+        })
     }
 }
+
+/// This operation's `LimitExceededException` for a store at its bound.
+fn limit_exceeded(message: String) -> CreateUserPoolError {
+    CreateUserPoolErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CreateUserPoolError {
+    CreateUserPoolErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+

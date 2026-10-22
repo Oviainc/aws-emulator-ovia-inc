@@ -96,17 +96,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Amazon Cognito states a request that breaks a modelled rule — an
+        // absent required member, a value outside an enumerated set, a length or
+        // range violation — as `InvalidParameterException`, the 400 every
+        // operation of this service declares for a bad parameter (OPERATIONS.md
+        // lists `InvalidParameterException (HTTP 400)` on each one). The
+        // framework's generic `ValidationException` is not a code this service
+        // models, and a client branches on the code, so only the code changes
+        // here: the message stays the framework's own rendering of the
+        // violations, which already names the member and the constraint it
+        // missed.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidParameterException".to_string(),
+                message: ::aws_smithy_schema_server::constraints::envelope(violations)
+                    .unwrap_or_else(|| "invalid request".to_string()),
+            }),
+            // An unauthenticated caller is the emulator's own refusal, not this
+            // service's, so it keeps the framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

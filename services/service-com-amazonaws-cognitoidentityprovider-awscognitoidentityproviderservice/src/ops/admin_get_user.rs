@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminGetUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminGetUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports a stored user: exactly what `AdminCreateUser` stored plus every later
+//! mutation. A reporting operation — it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminGetUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +189,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminGetUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminGetUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminGetUser"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // A read: this handler takes the lock to READ and writes nothing, so a
+        // later caller sees exactly what it saw.
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let user = pool
+            .user(&input.username)
+            .ok_or_else(|| user_not_found(&input.username))?;
+
+        Ok(AdminGetUserOutput {
+            username: user.username.clone(),
+            user_attributes: Some(user.attribute_list()),
+            user_create_date: Some(crate::state::to_date_time(user.user_create_date)),
+            user_last_modified_date: Some(crate::state::to_date_time(
+                user.user_last_modified_date,
+            )),
+            enabled: user.enabled,
+            user_status: Some(user.status.as_str().to_string()),
+            mfa_options: crate::state::non_empty(&user.mfa_options),
+            preferred_mfa_setting: user.preferred_mfa_setting.clone(),
+            user_mfa_setting_list: crate::state::non_empty(&user.mfa_setting_list),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminGetUserError {
+    AdminGetUserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user.
+fn user_not_found(username: &str) -> AdminGetUserError {
+    AdminGetUserErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(format!("User {username} does not exist.")),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminGetUserError {
+    AdminGetUserErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
