@@ -20,7 +20,8 @@
 //! 4. A request member outside a modelled constraint is refused with this service's
 //!    modelled `ValidationException`, which declares BOTH `message` and `reason`
 //!    `@required` — so the 400 carries a `ValidationExceptionReason` value
-//!    (`fieldValidationFailed`) and a `fieldList` naming the member, not a message alone.
+//!    (the `fieldValidationFailed` discriminator, which a response spells
+//!    `FIELD_VALIDATION_FAILED`) and a `fieldList` naming the member, not a message alone.
 //!
 //! Every case goes through the real router (see `tests/all/harness.rs`), so the restJson1
 //! routing, the boundary constraint validation, the handler and the response
@@ -39,9 +40,11 @@ use super::harness::{Emulator, Reply};
 /// From the model's own enumeration: `smithy_query(query="shape",
 /// shape="ValidationExceptionReason")` lists `unknownOperation | cannotParse |
 /// fieldValidationFailed | other | notSupported`, and AWS's API reference for this
-/// service publishes the same lowerCamel wire values — so a field that failed its
-/// declared constraint is `fieldValidationFailed`.
-const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+/// service publishes the same lowerCamel wire values as the DISCRIMINATORS, while the
+/// value a response carries is the SCREAMING_SNAKE name the model pairs with each one
+/// (see `harness::VALIDATION_REASONS`) — so a field that failed its
+/// declared constraint reports `FIELD_VALIDATION_FAILED`.
+const REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
 
 /// The `resourceType` an archive-rule-scoped refusal reports.
 const ARCHIVE_RULE_RESOURCE_TYPE: &str = "archive-rule";

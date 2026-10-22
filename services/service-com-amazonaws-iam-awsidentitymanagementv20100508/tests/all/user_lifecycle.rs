@@ -56,6 +56,24 @@ pub(crate) async fn call(
     action: &str,
     params: &[(&str, &str)],
 ) -> (u16, String) {
+    call_signed_by(router, None, action, params).await
+}
+
+/// One awsQuery call presented as signed by the access key id `akid`, for the
+/// operations that resolve the caller's identity from the signing key
+/// (`GetUser` and `CreateAccessKey` with no `UserName`).
+///
+/// The suite registers no authenticator, so the `Authorization` header is not
+/// verified here; it is the only place the signing key id appears on the wire, so
+/// it is what the service reads the caller's identity from
+/// (`emulator_server::extract_akid`). `None` sends no header at all, which is the
+/// unsigned request every other suite drives.
+pub(crate) async fn call_signed_by(
+    router: &MultiServiceRouter,
+    akid: Option<&str>,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -69,10 +87,26 @@ pub(crate) async fn call(
         // The route key the framework resolves for an unsigned request is the
         // endpoint host's first label, which is this service's signing name.
         .header("host", "iam.amazonaws.com")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
+        .header("content-type", "application/x-www-form-urlencoded");
+    let request = match akid {
+        // The SigV4 credential scope's first component is the access key id, which
+        // is all `extract_akid` reads out of the header.
+        Some(akid) => request.header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={akid}/20260101/us-east-1/iam/aws4_request, \
+                 SignedHeaders=host, Signature=0"
+            ),
+        ),
+        None => request,
+    };
+    let response = router
+        .dispatch(
+            request
+                .body(bytes::Bytes::from(body))
+                .expect("a well-formed request"),
+        )
+        .await;
     let status = response.status().as_u16();
     let body = String::from_utf8(response.body().to_vec()).expect("a UTF-8 response body");
     (status, body)

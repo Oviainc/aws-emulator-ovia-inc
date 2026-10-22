@@ -18,9 +18,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_snowdevicemanagement_snowdevicemanagement::state::service_state;
 use service_com_amazonaws_snowdevicemanagement_snowdevicemanagement::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -44,12 +46,24 @@ const MAX_TAGS: usize = 50;
 const MAX_TAG_KEY_LENGTH: usize = 128;
 const MAX_TAG_VALUE_LENGTH: usize = 256;
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// How many devices this suite activates Snow Device Management on, in
+/// [`SIGNED_REGION`]. The API models no device-creation operation — a device becomes
+/// manageable by being ORDERED — so the inventory enters state through the one
+/// activation seam; without it the account's inventory is empty and the device and task
+/// operations answer the account-level device gate (see `account_device_gate.rs`).
+const ACTIVATED_DEVICES: u64 = 3;
+
+/// One emulator: a router carrying only this service, over one shared engine, with Snow
+/// Device Management activated on [`ACTIVATED_DEVICES`] devices in [`SIGNED_REGION`].
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    service_state(&*engine)
+        .expect("the in-memory engine carries this service's state")
+        .lock()
+        .activate_devices(SIGNED_REGION, ACTIVATED_DEVICES, SystemTime::now());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router
 }
 

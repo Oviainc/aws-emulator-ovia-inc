@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIndexField
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIndexField`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes one index field out of the named domain's PENDING configuration and reports
+//! the entry it removed with `PendingDeletion=true`. A MUTATION.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIndexField::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Per the modelled `OptionStatus$PendingDeletion` doc the option "will be deleted once
+//! processing is complete", so the field stays visible in the DEPLOYED configuration
+//! until the next `IndexDocuments` rebuild retires it, and the domain needs that rebuild
+//! (`RequiresIndexDocuments` goes true). A name that is not in the pending configuration
+//! — never defined, or already awaiting deletion — is `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +153,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIndexField` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIndexFieldErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIndexField"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteIndexFieldErrorModeled::InternalException(InternalException {
+                code: None,
+                message: Some(
+                    "CloudSearch domain state is unavailable on this engine.".to_string(),
+                ),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let clock = ::std::time::Instant::now();
+        let wall = ::std::time::SystemTime::now();
+        state.advance(clock);
+
+        let Some(domain) = state.live_domain_mut(&input.domain_name) else {
+            return Err(DeleteIndexFieldErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    code: None,
+                    message: Some(format!("Domain not found: {}", input.domain_name)),
+                },
+            )
+            .into());
+        };
+
+        let Some(status) = domain.delete_index_field(&input.index_field_name, wall) else {
+            return Err(DeleteIndexFieldErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    code: None,
+                    message: Some(format!(
+                        "Field not found in domain '{}': {}",
+                        input.domain_name, input.index_field_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DeleteIndexFieldOutput {
+            index_field: status,
+        })
     }
 }

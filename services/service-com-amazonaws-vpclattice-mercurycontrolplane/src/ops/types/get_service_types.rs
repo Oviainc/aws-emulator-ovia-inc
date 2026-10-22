@@ -17,7 +17,13 @@ pub struct GetServiceInput {
     pub service_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#GetServiceResponse")]
+/// `GetServiceResponse`, with its schema written out instead of derived because
+/// `createdAt` and `lastUpdatedAt` are `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape: same ids, same order, same indices.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape
+/// is an operation OUTPUT, which the server only ever serializes.
 #[derive(Debug, Clone, Default)]
 pub struct GetServiceOutput {
     pub id: Option<String>,
@@ -35,3 +41,108 @@ pub struct GetServiceOutput {
     pub failure_message: Option<String>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetServiceOutput {
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "id", String, 0);
+    const M_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "name", String, 1);
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "arn", String, 2);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetServiceResponse", "createdAt", 3);
+    const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetServiceResponse", "lastUpdatedAt", 4);
+    const M_DNS_ENTRY: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "dnsEntry", Structure, 5);
+    const M_CUSTOM_DOMAIN_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "customDomainName", String, 6);
+    const M_CERTIFICATE_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "certificateArn", String, 7);
+    // `ServiceStatus` and `AuthType` are enum shapes, which the generator writes as
+    // `ShapeType::String`.
+    const M_STATUS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "status", String, 8);
+    const M_AUTH_TYPE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "authType", String, 9);
+    const M_IDLE_TIMEOUT_SECONDS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "idleTimeoutSeconds", Integer, 10);
+    const M_FAILURE_CODE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "failureCode", String, 11);
+    const M_FAILURE_MESSAGE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceResponse", "failureMessage", String, 12);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#GetServiceResponse",
+            shared_types::NAMESPACE,
+            "GetServiceResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_NAME,
+            &Self::M_ARN,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_UPDATED_AT,
+            &Self::M_DNS_ENTRY,
+            &Self::M_CUSTOM_DOMAIN_NAME,
+            &Self::M_CERTIFICATE_ARN,
+            &Self::M_STATUS,
+            &Self::M_AUTH_TYPE,
+            &Self::M_IDLE_TIMEOUT_SECONDS,
+            &Self::M_FAILURE_CODE,
+            &Self::M_FAILURE_MESSAGE,
+        ],
+    );
+}
+
+pub static GET_SERVICE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &GetServiceOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetServiceOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.name.as_ref() {
+            serializer.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.last_updated_at.as_ref() {
+            serializer.write_timestamp(&Self::M_LAST_UPDATED_AT, value)?;
+        }
+        if let Some(value) = self.dns_entry.as_ref() {
+            serializer.write_struct(&Self::M_DNS_ENTRY, value)?;
+        }
+        if let Some(value) = self.custom_domain_name.as_ref() {
+            serializer.write_string(&Self::M_CUSTOM_DOMAIN_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.certificate_arn.as_ref() {
+            serializer.write_string(&Self::M_CERTIFICATE_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.status.as_ref() {
+            serializer.write_string(&Self::M_STATUS, value.as_str())?;
+        }
+        if let Some(value) = self.auth_type.as_ref() {
+            serializer.write_string(&Self::M_AUTH_TYPE, value.as_str())?;
+        }
+        if let Some(value) = self.idle_timeout_seconds.as_ref() {
+            serializer.write_integer(&Self::M_IDLE_TIMEOUT_SECONDS, *value)?;
+        }
+        if let Some(value) = self.failure_code.as_ref() {
+            serializer.write_string(&Self::M_FAILURE_CODE, value.as_str())?;
+        }
+        if let Some(value) = self.failure_message.as_ref() {
+            serializer.write_string(&Self::M_FAILURE_MESSAGE, value.as_str())?;
+        }
+        Ok(())
+    }
+}

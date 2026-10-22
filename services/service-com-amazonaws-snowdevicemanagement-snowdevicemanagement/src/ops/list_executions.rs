@@ -160,6 +160,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The account-level device gate comes FIRST, before the task id and before
+        // the request's `nextToken` are judged: both are request-carried state,
+        // and a gated caller learns nothing about either.
+        if !store.has_activated_device(&region) {
+            return Err(ListExecutionsErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+        store.settle(now);
+
         // The token carries the device id the next page resumes at; a value this
         // service never issued is refused rather than silently serving page one.
         let resume_at = match input.next_token.as_deref() {
@@ -180,13 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let page_size = crate::state::page_size(input.max_results);
 
-        let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-        store.ensure_seeded(&region, now);
-        store.settle(now);
-
-        if !store.tasks.contains_key(&input.task_id) {
+        if store.task_in(&region, &input.task_id).is_none() {
             return Err(ListExecutionsErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::TASK_RESOURCE_TYPE, &input.task_id),
             )

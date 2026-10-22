@@ -19,5 +19,7 @@ mod job_lifecycle;
 mod job_templates;
 #[path = "all/policy_lifecycle.rs"]
 mod policy_lifecycle;
+#[path = "all/queue_deletion.rs"]
+mod queue_deletion;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

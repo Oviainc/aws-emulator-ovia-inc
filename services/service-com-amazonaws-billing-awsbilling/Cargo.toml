@@ -8,7 +8,7 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
-# Hex-encodes the opaque `nextToken` ListBillingViews hands out.
+# Hex-encodes the opaque `nextToken` the list operations hand out.
 hex = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

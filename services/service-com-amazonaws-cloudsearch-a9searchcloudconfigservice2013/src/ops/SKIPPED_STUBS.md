@@ -19,3 +19,10 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 handler returns an error, so it never has to construct a value.
 
 // SKIPPED: ListDomainNames — unsupported shape construct: operation 'ListDomainNames' has a Unit/absent input, which the generator does not emit yet
+//
+// RESOLVED by hand: `ListDomainNames` is now implemented in
+// `src/ops/list_domain_names.rs`, with its `Unit` input and its response shape
+// declared in `src/ops/types/list_domain_names_types.rs`. The generator still
+// declines to emit it, so this entry stays as the record of WHY that file is
+// hand-authored; the build script discovers it from its `//! @op` header like any
+// other operation, so it is routed and served normally.

@@ -50,28 +50,54 @@ fn refused(answer: &Answer, case: &str) -> Value {
 /// `FIELD_VALIDATION_FAILED`, one `Fields` entry naming the member and the published
 /// bounds, and `Message` stating that sentence.
 ///
-/// Rows differ along the operation (one implemented, one still scaffolded), along which
-/// bound is broken, and along how far past it the value is. Each published bound is also
-/// tested ON the bound and one step past it.
+/// Rows differ along the operation (two implemented, one still scaffolded), along how
+/// `MaxResults` reaches the service (a body member, or the `@httpQuery` binding
+/// `ListProfiles` gives it), along which bound is broken, and along how far past it the
+/// value is. Each published bound is also tested ON the bound and one step past it.
 #[tokio::test]
 async fn out_of_range_page_size_names_the_member_and_its_bounds() {
-    // `MaxResults` is `@range(min: 1, max: 50)` on both operations
-    // (`smithy_query(query="operation", operation="ListWorkloads,ListMilestones")`).
-    let paths = [
-        ("ListWorkloads", "/workloadsSummaries".to_string()),
+    let client = Client::new();
+    // `ListMilestones` RESOLVES its path `WorkloadId`, so its row needs a workload that
+    // exists: the refusals below are then about `MaxResults` and not about the id.
+    let workload_id = created_id(
+        &client
+            .create(minimal_create("page-size-host", "tok-page-size"))
+            .await,
+        "page-size-host",
+    );
+
+    // `MaxResults` is `@range(min: 1, max: 50)` on every paginated operation of this
+    // service — they all target the one modelled `MaxResults` shape
+    // (`smithy_query(query="operation", operation="ListWorkloads,ListMilestones,ListProfiles")`).
+    // `in_query` is whether that member is bound to the query string instead of the body.
+    let rows: Vec<(&str, &str, String, bool)> = vec![
+        (
+            "ListWorkloads",
+            "POST",
+            "/workloadsSummaries".to_string(),
+            false,
+        ),
         (
             "ListMilestones",
-            format!("/workloads/{WORKLOAD_ID}/milestonesSummaries"),
+            "POST",
+            format!("/workloads/{workload_id}/milestonesSummaries"),
+            false,
         ),
+        ("ListProfiles", "GET", "/profileSummaries".to_string(), true),
     ];
-    let client = Client::new();
+    let request_for = |max_results: i64, path: &str, in_query: bool| {
+        if in_query {
+            (format!("{path}?MaxResults={max_results}"), None)
+        } else {
+            (path.to_string(), Some(json!({ "MaxResults": max_results })))
+        }
+    };
 
-    for (operation, path) in &paths {
+    for (operation, method, path, in_query) in &rows {
         for max_results in [-1, 0, 51, 100, 1_000] {
             let case = format!("{operation} MaxResults {max_results}");
-            let answer = client
-                .send("POST", path, Some(json!({ "MaxResults": max_results })))
-                .await;
+            let (uri, body) = request_for(max_results, path, *in_query);
+            let answer = client.send(method, &uri, body).await;
             let body = refused(&answer, &case);
             assert_eq!(
                 body.get("Reason").and_then(Value::as_str),
@@ -94,13 +120,12 @@ async fn out_of_range_page_size_names_the_member_and_its_bounds() {
         }
 
         // ON each published bound the value is accepted, so the refusals above are about
-        // the value and not about the request. The implemented operation answers 200; the
+        // the value and not about the request. An implemented operation answers 200; a
         // scaffolded one answers its 501, which is what "accepted" means for it.
         for max_results in [1, 50] {
             let case = format!("{operation} MaxResults {max_results}");
-            let answer = client
-                .send("POST", path, Some(json!({ "MaxResults": max_results })))
-                .await;
+            let (uri, body) = request_for(max_results, path, *in_query);
+            let answer = client.send(method, &uri, body).await;
             assert!(
                 answer.status == 200 || answer.status == 501,
                 "case {case:?}: a value on the published bound must not be refused, got {answer:?}"
@@ -554,24 +579,24 @@ async fn a_scaffolded_operation_still_answers_501_for_a_valid_request() {
     let client = Client::new();
     for (case, method, path, body) in [
         (
-            "ListMilestones",
-            "POST",
-            format!("/workloads/{WORKLOAD_ID}/milestonesSummaries"),
-            json!({ "MaxResults": 10 }),
+            "ListProfiles",
+            "GET",
+            "/profileSummaries?MaxResults=10".to_string(),
+            None,
         ),
         (
             "CreateReviewTemplate",
             "POST",
             "/reviewTemplates".to_string(),
-            json!({
+            Some(json!({
                 "TemplateName": "a valid template name",
                 "Description": "a description the pattern accepts",
                 "Lenses": ["wellarchitected"],
                 "ClientRequestToken": "tok-tpl",
-            }),
+            })),
         ),
     ] {
-        let answer = client.send(method, &path, Some(body)).await;
+        let answer = client.send(method, &path, body).await;
         assert_eq!(
             answer.status, 501,
             "case {case:?}: a valid request to a scaffolded operation must be 501, got {answer:?}"

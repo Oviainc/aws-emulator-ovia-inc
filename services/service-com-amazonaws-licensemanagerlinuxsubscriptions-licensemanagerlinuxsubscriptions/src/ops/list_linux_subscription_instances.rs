@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLinuxSubscriptionInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLinuxSubscriptionInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLinuxSubscriptionInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the instances Linux subscription discovery has found for this account,
+//! straight from the discovered-instance store in `crate::state` — the same records
+//! `ListLinuxSubscriptions` aggregates into subscriptions, so the two lists cannot
+//! disagree. A pure read — nothing here writes.
+//!
+//! Every discovered record is reported, whatever its `Status`: the modelled
+//! `Instance$Status` member and the documented `Status` filter are what select an
+//! instance state, so the list itself cannot be restricted to one.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +152,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLinuxSubscriptionInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLinuxSubscriptionInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLinuxSubscriptionInstances"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLinuxSubscriptionInstancesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service state is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // An absent `Filters` selects every discovered instance.
+        let filters = input.filters.clone().unwrap_or_default();
+        crate::state::validate_filters(&filters, FILTER_NAMES).map_err(into_error)?;
+
+        // A pure read: the page is built from the stored records, and nothing is written.
+        let state = state.lock();
+        let selected: Vec<crate::state::DiscoveredInstanceRecord> = state
+            .discovered_instances_in_order()
+            .into_iter()
+            .filter(|record| {
+                // Several filters select what satisfies all of them.
+                filters.iter().all(|filter| {
+                    let name = filter.name.as_deref().unwrap_or_default();
+                    crate::state::filter_selects(filter, &filtered_member(record, name))
+                })
+            })
+            .collect();
+
+        let (page, next_token) = crate::state::paginate(
+            &selected,
+            // The cursor is a position in THIS list: the operation plus the filter
+            // selection, so a cursor minted for another selection is not accepted here.
+            &format!(
+                "linux-subscription-instances/{}",
+                crate::state::filter_signature(&filters)
+            ),
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(into_error)?;
+
+        Ok(ListLinuxSubscriptionInstancesOutput {
+            instances: Some(page.iter().map(instance).collect()),
+            next_token,
+        })
+    }
+}
+
+/// The `Filter$Name` values this list accepts, from the model's documentation for
+/// `ListLinuxSubscriptionInstancesRequest$Filters` ("you can specify one of the following
+/// values for the `Name` key": AccountID, AmiID, DualSubscription, InstanceID,
+/// InstanceType, ProductCode, Region, Status, UsageOperation).
+const FILTER_NAMES: &[&str] = &[
+    "AccountID",
+    "AmiID",
+    "DualSubscription",
+    "InstanceID",
+    "InstanceType",
+    "ProductCode",
+    "Region",
+    "Status",
+    "UsageOperation",
+];
+
+/// What the member a filter `Name` addresses holds on `record`: one value for a scalar
+/// member, every value for the list member `ProductCode`, and none for a member the
+/// record leaves unset (which no filter can then select on).
+///
+/// Only a name in [`FILTER_NAMES`] reaches here, so an unknown one holds nothing.
+fn filtered_member(record: &crate::state::DiscoveredInstanceRecord, name: &str) -> Vec<String> {
+    match name {
+        "AccountID" => vec![record.account_id.clone()],
+        "AmiID" => vec![record.ami_id.clone()],
+        "DualSubscription" => record.dual_subscription.clone().into_iter().collect(),
+        "InstanceID" => vec![record.instance_id.clone()],
+        "InstanceType" => vec![record.instance_type.clone()],
+        "ProductCode" => record.product_codes.clone(),
+        "Region" => vec![record.region.clone()],
+        "Status" => vec![record.status.clone()],
+        "UsageOperation" => vec![record.usage_operation.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// The `Instance` the model describes, built entirely from the stored record — every
+/// member is what discovery found.
+fn instance(record: &crate::state::DiscoveredInstanceRecord) -> Instance {
+    Instance {
+        ami_id: Some(record.ami_id.clone()),
+        instance_id: Some(record.instance_id.clone()),
+        instance_type: Some(record.instance_type.clone()),
+        account_id: Some(record.account_id.clone()),
+        status: Some(record.status.clone()),
+        region: Some(record.region.clone()),
+        usage_operation: Some(record.usage_operation.clone()),
+        product_code: Some(record.product_codes.clone()),
+        last_updated_time: record.last_updated_time.clone(),
+        subscription_name: Some(record.subscription_name.clone()),
+        os_version: record.os_version.clone(),
+        subscription_provider_create_time: record.subscription_provider_create_time.clone(),
+        subscription_provider_update_time: record.subscription_provider_update_time.clone(),
+        dual_subscription: record.dual_subscription.clone(),
+        registered_with_subscription_provider: record
+            .registered_with_subscription_provider
+            .clone(),
+    }
+}
+
+/// Map a state-layer refusal onto this operation's own modelled error enum. This
+/// operation models no `ResourceNotFoundException`, so a lookup failure cannot arise
+/// here: only the filters and the pagination cursor are refusable, as a
+/// `ValidationException`.
+fn into_error(error: crate::state::StateError) -> ListLinuxSubscriptionInstancesError {
+    match error {
+        crate::state::StateError::NotFound(message) => {
+            ListLinuxSubscriptionInstancesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::StateError::Validation(message) => {
+            ListLinuxSubscriptionInstancesErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }

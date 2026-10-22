@@ -28,6 +28,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The lifecycle tests wait past `state::PROVISIONING_DELAY` for a transition the clock
+# owes, which needs tokio's timer (the workspace feature set carries only the runtime).
+# No other dev-dependency: the tests read the awsQuery XML through the emulator's own
+# codec (`aws_smithy_schema_server::xml`), so this change locks no new crate.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

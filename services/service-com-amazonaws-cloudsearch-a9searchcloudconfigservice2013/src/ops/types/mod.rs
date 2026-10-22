@@ -35,6 +35,7 @@ pub mod describe_scaling_parameters_types;
 pub mod describe_service_access_policies_types;
 pub mod describe_suggesters_types;
 pub mod index_documents_types;
+pub mod list_domain_names_types;
 pub mod shared_types;
 pub mod update_availability_options_types;
 pub mod update_domain_endpoint_options_types;
@@ -83,6 +84,8 @@ pub use describe_service_access_policies_types::*;
 pub use describe_suggesters_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use index_documents_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use list_domain_names_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

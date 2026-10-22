@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Allocates a search domain and persists it in [`crate::state`], then reports the
+//! stored record's `DomainStatus`. A MUTATION: the spec says this call creates the
+//! domain.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Initialisation is not instantaneous — the modelled `DomainStatus$Created` doc says
+//! "It can take several minutes to initialize a domain when CreateDomain is called.
+//! Newly created search domains are returned from DescribeDomains with a false value
+//! for Created until domain creation is complete" — so the new domain is reported with
+//! `Created=false`, `Processing=true` and no service endpoints until the instant
+//! `crate::state::PROVISIONING_DELAY` makes initialisation due.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +151,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomain"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDomainErrorModeled::InternalException(InternalException {
+                code: None,
+                message: Some(
+                    "CloudSearch domain state is unavailable on this engine.".to_string(),
+                ),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // ONE instant answers the whole request: it materialises the transitions the
+        // clock already owed (initialisation, a rebuild, post-delete cleanup) and then
+        // decides whether this name is free.
+        let clock = ::std::time::Instant::now();
+        let wall = ::std::time::SystemTime::now();
+        state.advance(clock);
+
+        // A name is taken while ANY record holds it, including one whose post-delete
+        // cleanup is still in flight: those resources have not been released yet.
+        if let Some(existing) = state.domain(&input.domain_name) {
+            return Err(CreateDomainErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    code: None,
+                    message: Some(format!("Domain '{}' already exists.", existing.domain_name)),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::region_from_headers(&ctx.parts().headers);
+        let domain = crate::state::Domain::new(&input.domain_name, &region, wall, clock);
+        let status = match state.insert_domain(domain) {
+            Ok(stored) => stored.status(),
+            // The store is at its per-account domain cap. Nothing is evicted to make
+            // room, so the only honest answer is the limit the model already declares.
+            Err(limit) => {
+                return Err(CreateDomainErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        code: None,
+                        message: Some(format!(
+                            "Cannot create domain '{}': this account already holds the maximum \
+                             of {limit} search domains.",
+                            input.domain_name
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        Ok(CreateDomainOutput {
+            domain_status: Some(status),
+        })
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLinuxSubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLinuxSubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLinuxSubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Linux subscriptions discovery has found for this account, aggregated from
+//! the discovered instances held in `crate::state`: one `Subscription` per distinct
+//! (name, type) pair, counting the instances using it that are running. A pure read —
+//! nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLinuxSubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLinuxSubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLinuxSubscriptions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLinuxSubscriptionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the service state is unavailable".to_string()),
+            })
+        })?;
+
+        // An absent `Filters` selects every discovered subscription.
+        let filters = input.filters.clone().unwrap_or_default();
+        crate::state::validate_filters(&filters, FILTER_NAMES).map_err(into_error)?;
+
+        // A pure read: the page is aggregated from the instances already in state, and
+        // nothing is written.
+        let state = state.lock();
+        let selected: Vec<crate::state::DiscoveredSubscription> = state
+            .discovered_subscriptions()
+            .into_iter()
+            .filter(|subscription| {
+                // Several filters select what satisfies all of them; `Subscription` is
+                // the only name this list accepts, and it addresses the subscription's
+                // own name.
+                filters.iter().all(|filter| {
+                    crate::state::filter_selects(filter, std::slice::from_ref(&subscription.name))
+                })
+            })
+            .collect();
+
+        let (page, next_token) = crate::state::paginate(
+            &selected,
+            // The cursor is a position in THIS list: the operation plus the filter
+            // selection, so a cursor minted for another selection is not accepted here.
+            &format!(
+                "linux-subscriptions/{}",
+                crate::state::filter_signature(&filters)
+            ),
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(into_error)?;
+
+        Ok(ListLinuxSubscriptionsOutput {
+            subscriptions: Some(
+                page.iter()
+                    .map(|subscription| Subscription {
+                        name: Some(subscription.name.clone()),
+                        r#type: Some(subscription.subscription_type.clone()),
+                        instance_count: Some(subscription.instance_count),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The `Filter$Name` values this list accepts.
+///
+/// From the model's documentation for `ListLinuxSubscriptionsRequest$Filters`: "The valid
+/// names for this filter are: Subscription" — it addresses the subscription's name.
+const FILTER_NAMES: &[&str] = &["Subscription"];
+
+/// Map a state-layer refusal onto this operation's own modelled error enum. This
+/// operation models no `ResourceNotFoundException`, so a lookup failure cannot arise
+/// here: only the filters and the pagination cursor are refusable, as a
+/// `ValidationException`.
+fn into_error(error: crate::state::StateError) -> ListLinuxSubscriptionsError {
+    match error {
+        crate::state::StateError::NotFound(message) => {
+            ListLinuxSubscriptionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::StateError::Validation(message) => {
+            ListLinuxSubscriptionsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }

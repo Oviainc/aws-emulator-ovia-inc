@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: inserts the user into [`crate::state`] keyed by `UserName` and answers
+//! with the stored record, so `DescribeUsers` reports exactly what was persisted. The
+//! request's `AuthenticationMode` is checked against the password rules AWS documents
+//! (see [`crate::state::authentication_from_mode`]) and only the password COUNT is
+//! kept: the passwords themselves are secrets this emulator never stores or returns.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUser"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than answered with a fabricated user.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        // The authentication rules are checked BEFORE the store is locked and before
+        // anything is persisted, so a refused request leaves no trace. The shared
+        // helper is what `UpdateUser` must reuse, so both refuse the same values.
+        let (authentication_type, password_count) =
+            match crate::state::authentication_from_mode(&input.authentication_mode) {
+                Ok(authentication) => authentication,
+                Err(crate::state::AuthenticationModeRejection::Value(message)) => {
+                    return Err(CreateUserErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into());
+                }
+                Err(crate::state::AuthenticationModeRejection::Combination(message)) => {
+                    return Err(
+                        CreateUserErrorModeled::InvalidParameterCombinationException(
+                            InvalidParameterCombinationException {
+                                message: Some(message),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            };
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::Instant::now();
+        let mut state = state.lock();
+        state.settle(now);
+        // The users the account ALREADY HAD before any call (MemoryDB's built-in
+        // `default` user) are materialised on first touch, exactly as `DescribeUsers`
+        // does, so a create naming one of them collides with it instead of replacing
+        // it, and the quota below counts it.
+        state.ensure_builtin_users(&region);
+
+        if state.users.contains_key(&input.user_name) {
+            return Err(CreateUserErrorModeled::UserAlreadyExistsFault(
+                UserAlreadyExistsFault {
+                    message: Some(format!(
+                        "User with name {} already exists.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The store itself is bounded: one caller cannot grow it without end.
+        if state.users.len() >= crate::state::MAX_RESOURCES_PER_KIND {
+            return Err(CreateUserErrorModeled::UserQuotaExceededFault(
+                UserQuotaExceededFault {
+                    message: Some(format!(
+                        "The maximum number of users ({}) has been reached.",
+                        crate::state::MAX_RESOURCES_PER_KIND
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::user_arn(&region, &input.user_name);
+        let user = crate::state::StoredUser {
+            name: input.user_name.clone(),
+            // A user AWS has accepted is usable at once: `CreateUser` answers with it
+            // already `active`, so there is no transition for the clock to owe. Only
+            // a later `UpdateUser`/`DeleteUser` moves it off that status.
+            status: crate::state::user_status::ACTIVE.to_string(),
+            access_string: input.access_string,
+            authentication_type,
+            password_count,
+            arn: arn.clone(),
+        };
+
+        let tags = crate::state::tag_pairs(input.tags.as_ref());
+        if !tags.is_empty() {
+            state.tags.insert(arn, tags);
+        }
+        // An ACL created earlier may already list this user name, so the membership is
+        // derived rather than assumed empty: `User$ACLNames` comes from the ACLs that
+        // list the user, through the one rule `DescribeUsers` reads it with.
+        let acl_names = state
+            .user_membership()
+            .remove(input.user_name.as_str())
+            .unwrap_or_default();
+        let response = user.to_api(acl_names);
+        state.users.insert(input.user_name, user);
+        Ok(CreateUserOutput {
+            user: Some(response),
+        })
     }
 }

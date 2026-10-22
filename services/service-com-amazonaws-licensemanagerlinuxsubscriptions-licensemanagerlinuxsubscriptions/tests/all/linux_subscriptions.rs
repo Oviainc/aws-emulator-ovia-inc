@@ -1,0 +1,746 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the two discovery lists — `ListLinuxSubscriptions` and
+//! `ListLinuxSubscriptionInstances` — driven over the real wire path: every call goes
+//! through the router's `dispatch`, so the request is deserialized, constraint-checked,
+//! handled and serialized exactly as a client's would be.
+//!
+//! The rules under test, each asserted over a SET of inputs rather than one request:
+//!
+//! * both lists answer from the single shared store of discovered instances: an account
+//!   that has discovered nothing reports nothing, and what is in the store is what both
+//!   lists report;
+//! * `ListLinuxSubscriptions` reports one `Subscription` per distinct (name, type) pair
+//!   the discovered instances carry, with `InstanceCount` counting the instances using it
+//!   that are running;
+//! * a `Filter` selects on the member its `Name` addresses, with the comparison its
+//!   `Operator` names (`Equal`, `NotEqual`, `Contains`, and equality when absent), and
+//!   several filters select what satisfies all of them;
+//! * `MaxResults`/`NextToken` page each list exactly once over every element, with no
+//!   token on the last page, and a cursor minted for one selection is not honoured for
+//!   another;
+//! * a filter a list cannot apply — a `Name` it does not document, or one carrying no
+//!   value — is refused with `ValidationException` (HTTP 400) rather than silently
+//!   answering an empty page.
+
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
+
+use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::DiscoveredInstanceRecord;
+use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::{
+    ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState,
+    EmulatedService,
+};
+
+/// This service's sigv4 signing name (`OPERATIONS.md`, "Wire protocol").
+const SIGNING_NAME: &str = "license-manager-linux-subscriptions";
+/// The region the test requests are signed for.
+const REGION: &str = "us-west-2";
+
+/// `POST /subscription/ListLinuxSubscriptions` (`OPERATIONS.md`).
+const SUBSCRIPTIONS: &str = "/subscription/ListLinuxSubscriptions";
+/// `POST /subscription/ListLinuxSubscriptionInstances` (`OPERATIONS.md`).
+const INSTANCES: &str = "/subscription/ListLinuxSubscriptionInstances";
+
+/// The three ways a subscription can be licensed, from the model's documentation for
+/// `Subscription$Type`: "subscription-included with Amazon EC2, Bring Your Own
+/// Subscription model (BYOS), or from the Amazon Web Services Marketplace".
+const TYPE_INCLUDED: &str = "Subscription-included (Amazon EC2)";
+const TYPE_BYOS: &str = "Bring Your Own Subscription model (BYOS)";
+const TYPE_MARKETPLACE: &str = "Amazon Web Services Marketplace";
+
+/// One discovered instance for the fixture store: instance id, account, AMI, instance
+/// type, status, Region, usage operation, product codes, `DualSubscription` (empty =
+/// unset), subscription name, subscription type.
+type Row = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+/// The discovered instances every case below is asserted against: a table spanning what
+/// the rules generalise over — several subscriptions, ONE subscription name licensed two
+/// different ways, several instance states (so the running count is not just the record
+/// count), several Regions, accounts, AMIs and instance types, an instance carrying two
+/// product codes and one carrying none, and `DualSubscription` set on some records and
+/// unset on others.
+const DISCOVERED: &[Row] = &[
+    (
+        "i-0a1",
+        "000000000000",
+        "ami-0001",
+        "t3.micro",
+        "running",
+        "us-west-2",
+        "RunInstances:0010",
+        &["pc-rhel"],
+        "No",
+        "RHEL",
+        TYPE_INCLUDED,
+    ),
+    (
+        "i-0b2",
+        "000000000000",
+        "ami-0001",
+        "t3.small",
+        "running",
+        "us-west-1",
+        "RunInstances:0010",
+        &["pc-rhel"],
+        "",
+        "RHEL",
+        TYPE_INCLUDED,
+    ),
+    (
+        "i-0c3",
+        "000000000000",
+        "ami-0001",
+        "m5.large",
+        "stopped",
+        "us-west-2",
+        "RunInstances:0010",
+        &["pc-rhel"],
+        "",
+        "RHEL",
+        TYPE_INCLUDED,
+    ),
+    (
+        "i-0d4",
+        "111111111111",
+        "ami-0002",
+        "t3.micro",
+        "running",
+        "us-east-1",
+        "RunInstances",
+        &[],
+        "Yes",
+        "RHEL",
+        TYPE_BYOS,
+    ),
+    (
+        "i-0e5",
+        "000000000000",
+        "ami-0003",
+        "c6g.medium",
+        "running",
+        "eu-west-1",
+        "RunInstances:000g",
+        &["pc-suse", "pc-extra"],
+        "",
+        "SUSE Linux Enterprise Server",
+        TYPE_INCLUDED,
+    ),
+    (
+        "i-0f6",
+        "222222222222",
+        "ami-0004",
+        "t4g.nano",
+        "terminated",
+        "ap-south-1",
+        "RunInstances:0g00",
+        &["pc-ubuntu"],
+        "",
+        "Ubuntu Pro",
+        TYPE_MARKETPLACE,
+    ),
+];
+
+/// What `DISCOVERED` aggregates to: one subscription per distinct (name, type) pair, in
+/// (name, type) order, counting only the RUNNING instances that use it. `Ubuntu Pro` was
+/// discovered but its only instance is terminated, so it reports a count of zero.
+const EXPECTED_SUBSCRIPTIONS: &[(&str, &str, i64)] = &[
+    ("RHEL", TYPE_BYOS, 1),
+    ("RHEL", TYPE_INCLUDED, 2),
+    ("SUSE Linux Enterprise Server", TYPE_INCLUDED, 1),
+    ("Ubuntu Pro", TYPE_MARKETPLACE, 0),
+];
+
+/// One emulator: the router that dispatches, plus the shared engine its service was built
+/// from (so a test can pre-fill the store the handlers read).
+struct Harness {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+fn harness() -> Harness {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // The tests sign nothing; authentication is the framework's concern, not this
+    // service's.
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    Harness { router, engine }
+}
+
+/// Put `DISCOVERED` in the store directly: discovery reads the account's EC2 inventory,
+/// which no operation of THIS service writes, so the store is pre-filled to exercise the
+/// projection the two list operations perform over it.
+fn discover(h: &Harness, rows: &[Row]) {
+    let state = h
+        .engine
+        .state::<ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState>();
+    let mut state = state.lock();
+    for row in rows {
+        let (
+            instance_id,
+            account_id,
+            ami_id,
+            instance_type,
+            status,
+            region,
+            usage_operation,
+            product_codes,
+            dual_subscription,
+            subscription_name,
+            subscription_type,
+        ) = *row;
+        state.discovered_instances.insert(
+            instance_id.to_string(),
+            DiscoveredInstanceRecord {
+                instance_id: instance_id.to_string(),
+                account_id: account_id.to_string(),
+                ami_id: ami_id.to_string(),
+                instance_type: instance_type.to_string(),
+                status: status.to_string(),
+                region: region.to_string(),
+                usage_operation: usage_operation.to_string(),
+                product_codes: product_codes.iter().map(|code| code.to_string()).collect(),
+                subscription_name: subscription_name.to_string(),
+                subscription_type: subscription_type.to_string(),
+                dual_subscription: Some(dual_subscription.to_string())
+                    .filter(|value| !value.is_empty()),
+                ..DiscoveredInstanceRecord::default()
+            },
+        );
+    }
+}
+
+/// What a call answered: the HTTP status, the wire error code (if any) and the body.
+#[derive(Debug)]
+struct Reply {
+    status: u16,
+    error_type: Option<String>,
+    body: Value,
+}
+
+impl Reply {
+    fn ok(&self, case: &str) -> &Value {
+        assert_eq!(
+            self.status, 200,
+            "case {case:?}: expected HTTP 200, got {} with body {:?}",
+            self.status, self.body
+        );
+        &self.body
+    }
+
+    /// Assert this reply is the modelled client error `code` with HTTP `status`.
+    fn error(&self, case: &str, status: u16, code: &str) {
+        assert_eq!(
+            self.status, status,
+            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
+            self.status, self.body
+        );
+        let actual = self.error_type.as_deref().unwrap_or("<none>");
+        assert!(
+            actual.ends_with(code),
+            "case {case:?}: expected error code {code}, got {actual:?} with body {:?}",
+            self.body
+        );
+    }
+}
+
+async fn call(h: &Harness, path: &str, body: &Value) -> Reply {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{SIGNING_NAME}.{REGION}.amazonaws.com{path}"))
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20260101/{REGION}/{SIGNING_NAME}\
+                 /aws4_request, SignedHeaders=host, Signature=0"
+            ),
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(body).expect("the request body serializes"),
+        ))
+        .expect("a well-formed request");
+    let response = h.router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let header_error = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body: Value = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    let error_type = header_error.or_else(|| {
+        body.get("__type")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    Reply {
+        status,
+        error_type,
+        body,
+    }
+}
+
+/// A member of a list entry, as a string.
+fn member(entry: &Value, name: &str, case: &str) -> String {
+    entry
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: no {name} in {entry:?}"))
+        .to_string()
+}
+
+/// The entries a list body reports under `key`.
+fn entries<'a>(reply: &'a Reply, key: &str, case: &str) -> &'a Vec<Value> {
+    reply
+        .ok(case)
+        .get(key)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: no {key} in {:?}", reply.body))
+}
+
+/// The subscriptions a `ListLinuxSubscriptions` body reports, as (name, type, count).
+fn subscriptions(reply: &Reply, case: &str) -> Vec<(String, String, i64)> {
+    entries(reply, "Subscriptions", case)
+        .iter()
+        .map(|entry| {
+            (
+                member(entry, "Name", case),
+                member(entry, "Type", case),
+                entry
+                    .get("InstanceCount")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_else(|| panic!("case {case:?}: no InstanceCount in {entry:?}")),
+            )
+        })
+        .collect()
+}
+
+/// The `InstanceID`s a `ListLinuxSubscriptionInstances` body reports.
+fn instance_ids(reply: &Reply, case: &str) -> Vec<String> {
+    entries(reply, "Instances", case)
+        .iter()
+        .map(|entry| member(entry, "InstanceID", case))
+        .collect()
+}
+
+/// The `NextToken` of a 200 body, if it carries one.
+fn next_token(reply: &Reply, case: &str) -> Option<String> {
+    reply
+        .ok(case)
+        .get("NextToken")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+#[tokio::test]
+async fn an_account_that_discovered_nothing_reports_nothing() {
+    let h = harness();
+    for (path, key) in [(SUBSCRIPTIONS, "Subscriptions"), (INSTANCES, "Instances")] {
+        let case = &format!("{path} before any discovery");
+        let reply = call(&h, path, &json!({})).await;
+        assert!(
+            entries(&reply, key, case).is_empty(),
+            "case {case:?}: expected an empty {key}, got {:?}",
+            reply.body
+        );
+        assert_eq!(
+            next_token(&reply, case),
+            None,
+            "case {case:?}: a complete page carries no NextToken, got {:?}",
+            reply.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscriptions_aggregate_the_discovered_instances() {
+    let h = harness();
+    discover(&h, DISCOVERED);
+
+    let case = "every discovered subscription";
+    let reply = call(&h, SUBSCRIPTIONS, &json!({})).await;
+    let actual = subscriptions(&reply, case);
+    let expected: Vec<(String, String, i64)> = EXPECTED_SUBSCRIPTIONS
+        .iter()
+        .map(|(name, kind, count)| (name.to_string(), kind.to_string(), *count))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "case {case:?}: expected {expected:?}, got {actual:?}"
+    );
+
+    // The same store answers the instance list, so the two cannot disagree: every
+    // discovered record is reported, and the counts above are exactly its running rows.
+    let instance_case = "every discovered instance";
+    let reply = call(&h, INSTANCES, &json!({})).await;
+    let listed = instance_ids(&reply, instance_case);
+    let mut expected_ids: Vec<String> = DISCOVERED.iter().map(|row| row.0.to_string()).collect();
+    expected_ids.sort();
+    assert_eq!(
+        listed, expected_ids,
+        "case {instance_case:?}: expected {expected_ids:?}, got {listed:?}"
+    );
+    let running = DISCOVERED.iter().filter(|row| row.4 == "running").count() as i64;
+    let counted: i64 = actual.iter().map(|(_, _, count)| count).sum();
+    assert_eq!(
+        counted, running,
+        "case {instance_case:?}: the subscription counts ({counted}) must add up to the \
+         running discovered instances ({running})"
+    );
+}
+
+#[tokio::test]
+async fn every_member_of_a_discovered_instance_is_reported_from_state() {
+    let h = harness();
+    discover(&h, DISCOVERED);
+
+    let case = "instance members";
+    let reply = call(&h, INSTANCES, &json!({})).await;
+    let listed = entries(&reply, "Instances", case).clone();
+    for row in DISCOVERED {
+        let (
+            instance_id,
+            account_id,
+            ami_id,
+            instance_type,
+            status,
+            region,
+            usage_operation,
+            product_codes,
+            dual_subscription,
+            subscription_name,
+            subscription_type,
+        ) = *row;
+        let _ = subscription_type;
+        let entry = listed
+            .iter()
+            .find(|entry| member(entry, "InstanceID", case) == instance_id)
+            .unwrap_or_else(|| panic!("case {case:?}: {instance_id} is missing from {listed:?}"));
+        for (name, expected) in [
+            ("AccountID", account_id),
+            ("AmiId", ami_id),
+            ("InstanceType", instance_type),
+            ("Status", status),
+            ("Region", region),
+            ("UsageOperation", usage_operation),
+            ("SubscriptionName", subscription_name),
+        ] {
+            let actual = member(entry, name, case);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: {instance_id} {name} expected {expected:?}, got {actual:?}"
+            );
+        }
+        let codes: Vec<String> = entry
+            .get("ProductCode")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: no ProductCode in {entry:?}"))
+            .iter()
+            .map(|code| code.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            codes, product_codes,
+            "case {case:?}: {instance_id} ProductCode expected {product_codes:?}, got {codes:?}"
+        );
+        let dual = entry.get("DualSubscription").and_then(Value::as_str);
+        let expected_dual = Some(dual_subscription).filter(|value| !value.is_empty());
+        assert_eq!(
+            dual, expected_dual,
+            "case {case:?}: {instance_id} DualSubscription expected {expected_dual:?}, got {dual:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_subscription_filter_selects_along_its_operator() {
+    let h = harness();
+    discover(&h, DISCOVERED);
+
+    // (operator — `None` is an absent `Operator`, values, the subscription names expected
+    // in (name, type) order). `Subscription` is the only `Name` this list documents, and
+    // it addresses the subscription's name.
+    let cases: &[(Option<&str>, &[&str], &[&str])] = &[
+        (None, &["RHEL"], &["RHEL", "RHEL"]),
+        (Some("Equal"), &["RHEL"], &["RHEL", "RHEL"]),
+        (
+            Some("Equal"),
+            &["RHEL", "Ubuntu Pro"],
+            &["RHEL", "RHEL", "Ubuntu Pro"],
+        ),
+        (Some("Equal"), &["rhel"], &[]),
+        (Some("Equal"), &["RH"], &[]),
+        (
+            Some("Contains"),
+            &["Linux"],
+            &["SUSE Linux Enterprise Server"],
+        ),
+        (
+            Some("Contains"),
+            &["RH", "SUSE"],
+            &["RHEL", "RHEL", "SUSE Linux Enterprise Server"],
+        ),
+        (
+            Some("NotEqual"),
+            &["RHEL"],
+            &["SUSE Linux Enterprise Server", "Ubuntu Pro"],
+        ),
+        (
+            Some("NotEqual"),
+            &["nothing-like-this"],
+            &["RHEL", "RHEL", "SUSE Linux Enterprise Server", "Ubuntu Pro"],
+        ),
+    ];
+
+    for (operator, values, expected) in cases {
+        let case = &format!("Subscription {operator:?} {values:?}");
+        let mut filter = json!({ "Name": "Subscription", "Values": values });
+        if let Some(operator) = operator {
+            filter["Operator"] = json!(operator);
+        }
+        let reply = call(&h, SUBSCRIPTIONS, &json!({ "Filters": [filter] })).await;
+        let names: Vec<String> = subscriptions(&reply, case)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert_eq!(
+            names, *expected,
+            "case {case:?}: expected {expected:?}, got {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_instance_filter_selects_on_the_member_it_names() {
+    let h = harness();
+    discover(&h, DISCOVERED);
+
+    // Every `Filter$Name` the model documents for this list, with the instance ids it
+    // selects (in instance-id order).
+    let cases: &[(&str, &str, &[&str], &[&str])] = &[
+        ("AccountID", "Equal", &["111111111111"], &["i-0d4"]),
+        ("AmiID", "Equal", &["ami-0003"], &["i-0e5"]),
+        ("DualSubscription", "Equal", &["Yes"], &["i-0d4"]),
+        ("DualSubscription", "Equal", &["No"], &["i-0a1"]),
+        ("InstanceID", "Equal", &["i-0c3"], &["i-0c3"]),
+        (
+            "InstanceType",
+            "Contains",
+            &["t3."],
+            &["i-0a1", "i-0b2", "i-0d4"],
+        ),
+        ("ProductCode", "Equal", &["pc-extra"], &["i-0e5"]),
+        (
+            "Region",
+            "Contains",
+            &["us-west"],
+            &["i-0a1", "i-0b2", "i-0c3"],
+        ),
+        ("Status", "NotEqual", &["running"], &["i-0c3", "i-0f6"]),
+        (
+            "UsageOperation",
+            "Equal",
+            &["RunInstances:0010"],
+            &["i-0a1", "i-0b2", "i-0c3"],
+        ),
+    ];
+
+    for (name, operator, values, expected) in cases {
+        let case = &format!("{name} {operator} {values:?}");
+        let reply = call(
+            &h,
+            INSTANCES,
+            &json!({ "Filters": [{ "Name": name, "Values": values, "Operator": operator }] }),
+        )
+        .await;
+        let listed = instance_ids(&reply, case);
+        assert_eq!(
+            listed, *expected,
+            "case {case:?}: expected {expected:?}, got {listed:?}"
+        );
+    }
+
+    // Several filters select what satisfies ALL of them.
+    let case = "Region us-west AND Status running";
+    let reply = call(
+        &h,
+        INSTANCES,
+        &json!({ "Filters": [
+            { "Name": "Region", "Values": ["us-west"], "Operator": "Contains" },
+            { "Name": "Status", "Values": ["running"], "Operator": "Equal" },
+        ] }),
+    )
+    .await;
+    let listed = instance_ids(&reply, case);
+    assert_eq!(
+        listed,
+        vec!["i-0a1".to_string(), "i-0b2".to_string()],
+        "case {case:?}: expected the running us-west instances, got {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn max_results_pages_each_list_exactly_once() {
+    let h = harness();
+    discover(&h, DISCOVERED);
+
+    for (path, key, total) in [
+        (SUBSCRIPTIONS, "Subscriptions", EXPECTED_SUBSCRIPTIONS.len()),
+        (INSTANCES, "Instances", DISCOVERED.len()),
+    ] {
+        // One page of everything is the reference the paged walks must reproduce.
+        let case = &format!("{path} unpaged");
+        let reply = call(&h, path, &json!({})).await;
+        let whole = entries(&reply, key, case).clone();
+        assert_eq!(
+            whole.len(),
+            total,
+            "case {case:?}: expected {total} entries, got {:?}",
+            reply.body
+        );
+
+        for page_size in 1..=total + 1 {
+            let case = &format!("{path} MaxResults={page_size}");
+            let mut walked: Vec<Value> = Vec::new();
+            let mut token: Option<String> = None;
+            let mut pages = 0;
+            loop {
+                let mut body = json!({ "MaxResults": page_size });
+                if let Some(token) = &token {
+                    body["NextToken"] = json!(token);
+                }
+                let reply = call(&h, path, &body).await;
+                let page = entries(&reply, key, case).clone();
+                assert!(
+                    page.len() <= page_size,
+                    "case {case:?}: page {pages} holds {} entries, more than MaxResults",
+                    page.len()
+                );
+                walked.extend(page);
+                token = next_token(&reply, case);
+                pages += 1;
+                assert!(
+                    pages <= total + 1,
+                    "case {case:?}: the walk did not terminate after {pages} pages"
+                );
+                if token.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(
+                walked, whole,
+                "case {case:?}: the paged walk must visit every entry exactly once, in order"
+            );
+            let expected_pages = total.div_ceil(page_size).max(1);
+            assert_eq!(
+                pages, expected_pages,
+                "case {case:?}: expected {expected_pages} pages, took {pages}"
+            );
+        }
+
+        // A page size below 1 makes no progress, and a cursor that is not one this list
+        // minted is not a client-chosen value: both are refused.
+        for (label, body) in [
+            ("MaxResults=0", json!({ "MaxResults": 0 })),
+            ("NextToken=not-a-token", json!({ "NextToken": "zzz" })),
+        ] {
+            let case = &format!("{path} {label}");
+            call(&h, path, &body).await.error(case, 400, "ValidationException");
+        }
+    }
+
+    // A cursor is a position in ONE list: the one the filter selection produced. The
+    // token minted by a filtered first page is not honoured for a different selection.
+    let case = "a cursor from another selection";
+    let first = call(
+        &h,
+        INSTANCES,
+        &json!({ "MaxResults": 1, "Filters": [{ "Name": "Region", "Values": ["us-west"], "Operator": "Contains" }] }),
+    )
+    .await;
+    let token = next_token(&first, case).unwrap_or_else(|| {
+        panic!("case {case:?}: expected a NextToken on a truncated page, got {first:?}")
+    });
+    call(
+        &h,
+        INSTANCES,
+        &json!({ "MaxResults": 1, "NextToken": token, "Filters": [{ "Name": "Status", "Values": ["running"], "Operator": "Equal" }] }),
+    )
+    .await
+    .error(case, 400, "ValidationException");
+}
+
+#[tokio::test]
+async fn a_filter_a_list_cannot_apply_is_refused() {
+    let h = harness();
+    discover(&h, DISCOVERED);
+
+    // (the list, the filter, why it cannot be applied).
+    let cases: &[(&str, Value, &str)] = &[
+        (
+            SUBSCRIPTIONS,
+            json!({ "Name": "Region", "Values": ["us-west-2"] }),
+            "Region is documented for the instance list, not for this one",
+        ),
+        (
+            SUBSCRIPTIONS,
+            json!({ "Values": ["RHEL"] }),
+            "a filter with no Name addresses no member",
+        ),
+        (
+            SUBSCRIPTIONS,
+            json!({ "Name": "Subscription" }),
+            "a filter with no Values has nothing to compare",
+        ),
+        (
+            SUBSCRIPTIONS,
+            json!({ "Name": "subscription", "Values": ["RHEL"] }),
+            "the documented Name is case-sensitive",
+        ),
+        (
+            INSTANCES,
+            json!({ "Name": "Subscription", "Values": ["RHEL"] }),
+            "Subscription is documented for the subscription list, not for this one",
+        ),
+        (
+            INSTANCES,
+            json!({ "Name": "Status", "Values": ["running"], "Operator": "Equals" }),
+            "Equals is outside the modelled Operator set",
+        ),
+    ];
+
+    for (path, filter, why) in cases {
+        let case = &format!("{path} {filter}: {why}");
+        call(&h, path, &json!({ "Filters": [filter] }))
+            .await
+            .error(case, 400, "ValidationException");
+    }
+
+    // A refused request changes nothing: the next caller still sees the whole store.
+    let case = "the store after the refusals";
+    let reply = call(&h, SUBSCRIPTIONS, &json!({})).await;
+    assert_eq!(
+        subscriptions(&reply, case).len(),
+        EXPECTED_SUBSCRIPTIONS.len(),
+        "case {case:?}: expected the store untouched, got {:?}",
+        reply.body
+    );
+}

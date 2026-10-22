@@ -683,13 +683,24 @@ pub fn check_identifier(member: &str, value: &str, max_len: usize) -> Result<(),
 
 /// Refuse a `MaxRecords` outside the range every describe operation documents.
 pub fn check_max_records(max_records: Option<i32>) -> Result<usize, String> {
+    check_max_records_in(max_records, &MAX_RECORDS_RANGE)
+}
+
+/// Refuse a `MaxRecords` outside `range`, for the operations whose own member documents
+/// a different bound than [`MAX_RECORDS_RANGE`] — `DescribeOrderableDBInstanceOptions`
+/// documents "Minimum 20, maximum 1000". The default page size and the wording of the
+/// refusal stay here, shared by every describe operation.
+pub fn check_max_records_in(
+    max_records: Option<i32>,
+    range: &std::ops::RangeInclusive<i32>,
+) -> Result<usize, String> {
     match max_records {
         None => Ok(DEFAULT_MAX_RECORDS),
-        Some(value) if MAX_RECORDS_RANGE.contains(&value) => Ok(value as usize),
+        Some(value) if range.contains(&value) => Ok(value as usize),
         Some(value) => Err(format!(
             "invalid value {value} for MaxRecords: must be a value from {} to {}",
-            MAX_RECORDS_RANGE.start(),
-            MAX_RECORDS_RANGE.end()
+            range.start(),
+            range.end()
         )),
     }
 }
