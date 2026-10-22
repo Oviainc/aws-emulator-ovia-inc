@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the data sets state actually holds, in creation order,
+//! bounded by `maxResults` and resumable through the opaque `NextToken`, optionally
+//! filtered by `origin`. Reporting only: it never writes. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataSets"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDataSetsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // `origin` is typed `__string` on the wire but names the model's `Origin`
+        // enum, so a value outside that set can match no data set and is refused
+        // rather than answered with a silently empty page.
+        if let Some(origin) = &input.origin {
+            if !ORIGIN_VALUES.contains(&origin.as_str()) {
+                return Err(ListDataSetsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "origin must be one of {}; received {origin}",
+                            ORIGIN_VALUES.join(", ")
+                        ),
+                        exception_cause: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        let store = state.lock();
+        // Page over the ids state holds, in creation order, so the same call twice
+        // returns the same page.
+        let ordered: Vec<String> = store
+            .data_set_order
+            .iter()
+            .filter(|id| {
+                store.data_sets.get(*id).is_some_and(|record| {
+                    input
+                        .origin
+                        .as_ref()
+                        .is_none_or(|origin| record.origin == *origin)
+                })
+            })
+            .cloned()
+            .collect();
+
+        let Some((start, end)) =
+            crate::state::page_window(&ordered, input.next_token.as_deref(), input.max_results)
+        else {
+            return Err(ListDataSetsErrorModeled::ValidationException(
+                crate::state::invalid_next_token(),
+            )
+            .into());
+        };
+
+        let data_sets: Vec<DataSetEntry> = ordered
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|id| store.data_sets.get(id))
+            .map(|record| DataSetEntry {
+                arn: record.arn.clone(),
+                asset_type: record.asset_type.clone(),
+                created_at: record.created_at,
+                description: record.description.clone(),
+                id: record.id.clone(),
+                name: record.name.clone(),
+                origin: record.origin.clone(),
+                origin_details: record.origin_details.clone(),
+                source_id: record.source_id.clone(),
+                updated_at: record.updated_at,
+            })
+            .collect();
+
+        Ok(ListDataSetsOutput {
+            data_sets: Some(data_sets),
+            // A token only when something is left to fetch, so a paginating client
+            // stops on this page rather than asking for an empty one.
+            next_token: crate::state::next_token(&ordered, start, end),
+        })
     }
 }

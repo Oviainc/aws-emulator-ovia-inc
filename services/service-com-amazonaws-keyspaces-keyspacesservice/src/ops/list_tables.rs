@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTables
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTables`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages a keyspace's tables out of [`crate::state`]. This is the ONLY file
+//! to touch for `ListTables`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTables::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +84,29 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `ListTables` returns, and the page size a caller that names no
+/// `maxResults` gets: the maximum of the modelled `maxResults` range (`1..1000`).
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// Encode the resume point of a page as the opaque `nextToken` the caller hands back.
+///
+/// The token names the LAST table on the page just returned, qualified by its keyspace,
+/// and is hex-encoded so no caller can read a resource name out of it or build one by
+/// hand. `tableName` cannot contain `#` (its modelled pattern is
+/// `^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`), so the separator is unambiguous.
+fn encode_page_token(keyspace_name: &str, table_name: &str) -> String {
+    ::hex::encode(format!("{keyspace_name}#{table_name}"))
+}
+
+/// The table name a `nextToken` resumes after, or `None` when the token is not one this
+/// service issued for `keyspace_name` — a token minted for a different keyspace resumes
+/// nothing here and is refused rather than silently ignored.
+fn decode_page_token(token: &str, keyspace_name: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let (keyspace, table) = decoded.split_once('#')?;
+    (keyspace == keyspace_name && !table.is_empty()).then(|| table.to_string())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +179,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTables` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTablesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTables"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTablesErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // `maxResults` is modelled `1..1000`, so the boundary validator has already
+        // refused a page size outside that range; an absent one means "no limit the
+        // caller asked for", which is the whole keyspace up to the modelled maximum.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize);
+
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token, &input.keyspace_name).ok_or_else(
+                || {
+                    ListTablesErrorModeled::ValidationException(ValidationException {
+                        message: Some(format!(
+                            "nextToken is not a pagination token this service issued for keyspace '{}'.",
+                            input.keyspace_name
+                        )),
+                    })
+                },
+            )?),
+        };
+
+        let mut store = state.lock();
+        // Reporting, not mutating: see the note in `get_table.rs`.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(keyspace) = store.keyspaces.get(&input.keyspace_name) else {
+            return Err(ListTablesErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.keyspace_name),
+            )
+            .into());
+        };
+
+        // One page, plus one lookahead item: the token is present exactly when a table
+        // follows the last one on this page, so the final page carries none.
+        let mut scanned: Vec<&crate::state::Table> = match resume_after.as_deref() {
+            Some(after) => keyspace
+                .tables
+                .range::<str, _>((
+                    ::std::ops::Bound::Excluded(after),
+                    ::std::ops::Bound::Unbounded,
+                ))
+                .map(|(_, table)| table)
+                .take(page_size + 1)
+                .collect(),
+            None => keyspace.tables.values().take(page_size + 1).collect(),
+        };
+        let truncated = scanned.len() > page_size;
+        scanned.truncate(page_size);
+        let next_token = match truncated {
+            true => scanned
+                .last()
+                .map(|table| encode_page_token(&table.keyspace_name, &table.table_name)),
+            false => None,
+        };
+
+        Ok(ListTablesOutput {
+            next_token,
+            tables: Some(
+                scanned
+                    .into_iter()
+                    .map(|table| TableSummary {
+                        keyspace_name: table.keyspace_name.clone(),
+                        table_name: table.table_name.clone(),
+                        resource_arn: table.resource_arn.clone(),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

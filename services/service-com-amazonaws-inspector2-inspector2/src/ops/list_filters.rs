@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFilters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFilters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFilters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages through the filters stored in this service's shared state,
+//! honouring the `arns` and `action` selectors.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +137,28 @@ impl<Eng> ListFilters<Eng> {
     }
 }
 
+/// `ListFilters`'s page size when the request names no `maxResults`: the largest page
+/// the model allows (`ListFilterMaxResults` range 1..100), so an unpaginated caller sees
+/// everything it can in one answer.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// A `nextToken` is an opaque cursor, so it is the hex of the last ARN of the page it
+/// follows rather than a position in a freshly built list: the next call resumes at the
+/// first stored filter ordered after that ARN, which stays correct when filters are
+/// created or deleted between pages.
+fn encode_token(arn: &str) -> String {
+    ::hex::encode(arn.as_bytes())
+}
+
+/// The ARN a cursor names, or `None` when the value is not a cursor this service minted.
+/// A token only decodes when it is hex AND the bytes are a filter ARN of this service, so
+/// an arbitrary even-length hex string is refused rather than read as a position.
+fn decode_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let minted_prefix = format!("arn:aws:{}:", crate::state::SERVICE_NAMESPACE);
+    decoded.starts_with(&minted_prefix).then_some(decoded)
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListFilters<Eng>
 {
@@ -161,18 +176,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFilters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFiltersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFilters"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListFiltersErrorModeled::InternalServerException(InternalServerException {
+                message: "Amazon Inspector filter state is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // A token this service did not mint cannot name a position, so the request is
+        // refused rather than silently answered from the start of the list.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token).ok_or_else(|| {
+                ListFiltersErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token returned by a previous ListFilters call"
+                        .to_string(),
+                    reason: "CANNOT_PARSE".to_string(),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "must be a nextToken returned by ListFilters".to_string(),
+                    }]),
+                })
+            })?),
+            None => None,
+        };
+
+        // `maxResults` is modelled `range 1..100`, so the boundary validator has already
+        // refused anything outside it by the time this runs.
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_PAGE_SIZE, |max| max.max(1) as usize);
+
+        // `arns` is a caller-supplied list with no modelled length bound, so the ARNs it
+        // names are indexed ONCE into a set before the store is touched. Selecting with a
+        // set lookup keeps the walk's cost linear in the stored filters (times a log of
+        // the request's list) instead of the PRODUCT of the two lengths, and the indexing
+        // happens before the shared lock is taken rather than under it.
+        let selected_arns: Option<::std::collections::BTreeSet<&str>> = input
+            .arns
+            .as_ref()
+            .map(|arns| arns.iter().map(String::as_str).collect());
+
+        let guard = state.lock();
+        // One more than the page is read so the cursor is only emitted when a further
+        // filter really exists. An `arns` or `action` selector the request did not carry
+        // constrains nothing, and so does an EMPTY `arns` list: it names no ARN to
+        // select by.
+        let selected: Vec<&crate::state::StoredFilter> = guard
+            .filters
+            .values()
+            .filter(|stored| {
+                after
+                    .as_deref()
+                    .is_none_or(|cursor| stored.arn.as_str() > cursor)
+            })
+            .filter(|stored| {
+                selected_arns
+                    .as_ref()
+                    .is_none_or(|arns| arns.is_empty() || arns.contains(stored.arn.as_str()))
+            })
+            .filter(|stored| {
+                input
+                    .action
+                    .as_ref()
+                    .is_none_or(|action| *action == stored.action)
+            })
+            .take(page_size + 1)
+            .collect();
+
+        let truncated = selected.len() > page_size;
+        let page = &selected[..selected.len().min(page_size)];
+        let next_token = truncated
+            .then(|| page.last().map(|stored| encode_token(&stored.arn)))
+            .flatten();
+
+        let filters = page
+            .iter()
+            .map(|stored| Filter {
+                arn: stored.arn.clone(),
+                owner_id: stored.owner_id.clone(),
+                name: stored.name.clone(),
+                criteria: stored.criteria.clone(),
+                action: stored.action.clone(),
+                created_at: crate::state::timestamp(stored.created_at),
+                updated_at: crate::state::timestamp(stored.updated_at),
+                description: stored.description.clone(),
+                reason: stored.reason.clone(),
+                // Rendered exactly as stored: absent when the request carried no `tags`,
+                // and an empty map when it carried an empty one.
+                tags: stored.tags.as_ref().map(|tags| {
+                    tags.iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                }),
+            })
+            .collect();
+
+        Ok(ListFiltersOutput {
+            filters,
+            next_token,
+        })
     }
 }

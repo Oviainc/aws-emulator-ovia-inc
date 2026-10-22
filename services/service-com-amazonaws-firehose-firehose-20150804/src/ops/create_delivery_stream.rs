@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeliveryStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeliveryStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeliveryStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a new stream in [`crate::state`] and answers its generated ARN. The stream
+//! starts in `CREATING`, as the model documents, and the clock owes it `ACTIVE`.
 //!
 //! ## Shape of an operation
 //!
@@ -240,18 +234,412 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeliveryStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeliveryStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeliveryStream"))
+        // Mounted on an engine that holds no state this service can reach. Unreachable
+        // through the router (which mounts every service on one `InMemoryEngine`), and
+        // this operation models no server-side error to report it with, so the scaffold
+        // channel carries it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDeliveryStream",
+            ));
+        };
+
+        // "You must specify only one of the following destination configuration
+        // parameters" — the create carries exactly one destination.
+        let destination = sole_destination(&input)?;
+
+        // `DeliveryStreamType` defaults to `DirectPut`: "Provider applications access the
+        // Firehose stream directly."
+        let stream_type = input
+            .delivery_stream_type
+            .clone()
+            .unwrap_or_else(|| DIRECT_PUT.to_string());
+        if !DELIVERY_STREAM_TYPE_VALUES.contains(&stream_type.as_str()) {
+            return Err(invalid_argument(format!(
+                "DeliveryStreamType '{stream_type}' is not valid; valid values are {}",
+                DELIVERY_STREAM_TYPE_VALUES.join(", ")
+            )));
+        }
+        let source = source_description(&input, &stream_type)?;
+        let region = crate::state::request_region(ctx);
+        let encryption = encryption_configuration(
+            input
+                .delivery_stream_encryption_configuration_input
+                .as_ref(),
+            &region,
+        )?;
+
+        let now = ::std::time::SystemTime::now();
+        let arn = ::engine::emulator_arn(
+            "firehose",
+            &region,
+            &format!("deliverystream/{}", input.delivery_stream_name),
+        );
+
+        let mut store = state.lock();
+        store.materialise_due(now);
+
+        // "This name must be unique per Amazon Web Services account in the same Amazon
+        // Web Services Region."
+        if store.streams.contains_key(&input.delivery_stream_name) {
+            return Err(CreateDeliveryStreamErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Firehose stream {} already exists",
+                        input.delivery_stream_name
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.streams.len() >= crate::state::MAX_STREAMS_PER_REGION {
+            return Err(CreateDeliveryStreamErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the limit of {} Firehose streams per Region has been reached",
+                        crate::state::MAX_STREAMS_PER_REGION
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut stream = crate::state::DeliveryStream {
+            name: input.delivery_stream_name.clone(),
+            arn: arn.clone(),
+            // "This is an asynchronous operation that immediately returns. The initial
+            // status of the Firehose stream is CREATING."
+            status: crate::state::StreamStatus::Creating,
+            pending: Some((
+                crate::state::PendingTransition::Activate,
+                now + crate::state::TRANSITION_DELAY,
+            )),
+            stream_type,
+            version_id: 1,
+            create_timestamp: now,
+            last_update_timestamp: now,
+            source,
+            destinations: Vec::new(),
+            encryption,
+            // `Tags` is a modelled list of 1..50, so a longer one is refused at the
+            // boundary; two entries with the same key fold to the last given.
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value.unwrap_or_default()))
+                .collect(),
+            records: Vec::new(),
+            buffered_bytes: 0,
+            // Firehose numbers destination ids from one.
+            next_destination_id: 1,
+        };
+        let destination_id = stream.mint_destination_id();
+        stream.destinations.push(crate::state::Destination {
+            destination_id,
+            config: destination,
+        });
+        store.streams.insert(input.delivery_stream_name, stream);
+
+        Ok(CreateDeliveryStreamOutput {
+            delivery_stream_arn: Some(arn),
+        })
     }
 }
+
+/// The default `DeliveryStreamType`.
+const DIRECT_PUT: &str = "DirectPut";
+
+/// Refuse an input combination the model cannot express, with this operation's own
+/// `InvalidArgumentException`: "The specified input parameter has a value that is not
+/// valid."
+fn invalid_argument(message: String) -> CreateDeliveryStreamError {
+    CreateDeliveryStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The one destination configuration the request carries, refusing both none and more
+/// than one.
+///
+/// Credentials the caller supplies inside a configuration (a Redshift password, a
+/// Snowflake private key or passphrase, an HTTP endpoint access key) are dropped rather
+/// than stored: every one is `@sensitive` and no modelled description carries it back, so
+/// the emulator has no reason to keep it.
+fn sole_destination(
+    input: &CreateDeliveryStreamInput,
+) -> Result<crate::state::DestinationConfigKind, CreateDeliveryStreamError> {
+    use crate::state::DestinationConfigKind as Kind;
+
+    let mut supplied: Vec<(&'static str, Kind)> = Vec::new();
+    if let Some(config) = input.s3_destination_configuration.clone() {
+        supplied.push(("S3DestinationConfiguration", Kind::S3(Box::new(config))));
+    }
+    if let Some(config) = input.extended_s3_destination_configuration.clone() {
+        supplied.push((
+            "ExtendedS3DestinationConfiguration",
+            Kind::ExtendedS3(Box::new(config)),
+        ));
+    }
+    if let Some(mut config) = input.redshift_destination_configuration.clone() {
+        config.password = None;
+        supplied.push((
+            "RedshiftDestinationConfiguration",
+            Kind::Redshift(Box::new(config)),
+        ));
+    }
+    if let Some(config) = input.elasticsearch_destination_configuration.clone() {
+        supplied.push((
+            "ElasticsearchDestinationConfiguration",
+            Kind::Elasticsearch(Box::new(config)),
+        ));
+    }
+    if let Some(config) = input
+        .amazonopensearchservice_destination_configuration
+        .clone()
+    {
+        supplied.push((
+            "AmazonopensearchserviceDestinationConfiguration",
+            Kind::AmazonOpenSearchService(Box::new(config)),
+        ));
+    }
+    if let Some(config) = input.splunk_destination_configuration.clone() {
+        supplied.push((
+            "SplunkDestinationConfiguration",
+            Kind::Splunk(Box::new(config)),
+        ));
+    }
+    if let Some(mut config) = input.http_endpoint_destination_configuration.clone() {
+        config.endpoint_configuration.access_key = None;
+        supplied.push((
+            "HttpEndpointDestinationConfiguration",
+            Kind::HttpEndpoint(Box::new(config)),
+        ));
+    }
+    if let Some(mut config) = input.snowflake_destination_configuration.clone() {
+        config.private_key = None;
+        config.key_passphrase = None;
+        supplied.push((
+            "SnowflakeDestinationConfiguration",
+            Kind::Snowflake(Box::new(config)),
+        ));
+    }
+    if let Some(config) = input
+        .amazon_open_search_serverless_destination_configuration
+        .clone()
+    {
+        supplied.push((
+            "AmazonOpenSearchServerlessDestinationConfiguration",
+            Kind::AmazonOpenSearchServerless(Box::new(config)),
+        ));
+    }
+    if let Some(config) = input.iceberg_destination_configuration.clone() {
+        supplied.push((
+            "IcebergDestinationConfiguration",
+            Kind::Iceberg(Box::new(config)),
+        ));
+    }
+
+    if supplied.len() > 1 {
+        let names: Vec<&str> = supplied.iter().map(|(name, _)| *name).collect();
+        return Err(invalid_argument(format!(
+            "only one destination configuration may be specified, but {} were: {}",
+            names.len(),
+            names.join(", ")
+        )));
+    }
+    supplied
+        .pop()
+        .map(|(_, kind)| kind)
+        .ok_or_else(|| invalid_argument("a destination configuration must be specified".to_string()))
+}
+
+/// The `SourceDescription` for the declared stream type, refusing a source configuration
+/// that does not belong to that type and a type whose source configuration is absent.
+fn source_description(
+    input: &CreateDeliveryStreamInput,
+    stream_type: &str,
+) -> Result<Option<SourceDescription>, CreateDeliveryStreamError> {
+    let supplied: Vec<&'static str> = [
+        input
+            .kinesis_stream_source_configuration
+            .as_ref()
+            .map(|_| "KinesisStreamSourceConfiguration"),
+        input
+            .msk_source_configuration
+            .as_ref()
+            .map(|_| "MSKSourceConfiguration"),
+        input
+            .database_source_configuration
+            .as_ref()
+            .map(|_| "DatabaseSourceConfiguration"),
+        input
+            .direct_put_source_configuration
+            .as_ref()
+            .map(|_| "DirectPutSourceConfiguration"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    // The source configuration a create supplies must be the one its declared type names.
+    let expected = match stream_type {
+        "KinesisStreamAsSource" => "KinesisStreamSourceConfiguration",
+        "MSKAsSource" => "MSKSourceConfiguration",
+        "DatabaseAsSource" => "DatabaseSourceConfiguration",
+        _ => "DirectPutSourceConfiguration",
+    };
+    if let Some(foreign) = supplied.iter().find(|name| **name != expected) {
+        return Err(invalid_argument(format!(
+            "{foreign} cannot be specified for a Firehose stream of type {stream_type}; \
+             that type is configured with {expected}"
+        )));
+    }
+
+    match stream_type {
+        "KinesisStreamAsSource" => {
+            let Some(config) = input.kinesis_stream_source_configuration.as_ref() else {
+                return Err(invalid_argument(format!(
+                    "KinesisStreamSourceConfiguration is required for a Firehose stream of \
+                     type {stream_type}"
+                )));
+            };
+            Ok(Some(SourceDescription {
+                kinesis_stream_source_description: Some(KinesisStreamSourceDescription {
+                    kinesis_stream_arn: Some(config.kinesis_stream_arn.clone()),
+                    role_arn: Some(config.role_arn.clone()),
+                    delivery_start_timestamp: Some(::aws_smithy_types::DateTime::from(
+                        ::std::time::SystemTime::now(),
+                    )),
+                }),
+                ..SourceDescription::default()
+            }))
+        }
+        "MSKAsSource" => {
+            let Some(config) = input.msk_source_configuration.as_ref() else {
+                return Err(invalid_argument(format!(
+                    "MSKSourceConfiguration is required for a Firehose stream of type {stream_type}"
+                )));
+            };
+            Ok(Some(SourceDescription {
+                msk_source_description: Some(MSKSourceDescription {
+                    msk_cluster_arn: Some(config.msk_cluster_arn.clone()),
+                    topic_name: Some(config.topic_name.clone()),
+                    authentication_configuration: Some(config.authentication_configuration.clone()),
+                    delivery_start_timestamp: Some(::aws_smithy_types::DateTime::from(
+                        ::std::time::SystemTime::now(),
+                    )),
+                    read_from_timestamp: config.read_from_timestamp,
+                }),
+                ..SourceDescription::default()
+            }))
+        }
+        "DatabaseAsSource" => {
+            let Some(config) = input.database_source_configuration.as_ref() else {
+                return Err(invalid_argument(format!(
+                    "DatabaseSourceConfiguration is required for a Firehose stream of type \
+                     {stream_type}"
+                )));
+            };
+            Ok(Some(SourceDescription {
+                database_source_description: Some(DatabaseSourceDescription {
+                    r#type: Some(config.r#type.clone()),
+                    endpoint: Some(config.endpoint.clone()),
+                    port: Some(config.port),
+                    ssl_mode: config.ssl_mode.clone(),
+                    databases: Some(config.databases.clone()),
+                    tables: Some(config.tables.clone()),
+                    columns: config.columns.clone(),
+                    surrogate_keys: config.surrogate_keys.clone(),
+                    snapshot_watermark_table: Some(config.snapshot_watermark_table.clone()),
+                    // Nothing has been snapshotted yet.
+                    snapshot_info: Some(Vec::new()),
+                    database_source_authentication_configuration: Some(
+                        config.database_source_authentication_configuration.clone(),
+                    ),
+                    database_source_vpc_configuration: Some(
+                        config.database_source_vpc_configuration.clone(),
+                    ),
+                }),
+                ..SourceDescription::default()
+            }))
+        }
+        // DirectPut carries a source description only when the create configured one.
+        _ => Ok(input
+            .direct_put_source_configuration
+            .as_ref()
+            .map(|config| SourceDescription {
+                direct_put_source_description: Some(DirectPutSourceDescription {
+                    throughput_hint_in_m_bs: Some(config.throughput_hint_in_m_bs),
+                }),
+                ..SourceDescription::default()
+            })),
+    }
+}
+
+/// The stored encryption state for a create that asked for server-side encryption.
+///
+/// Enabling SSE is asynchronous, so it starts `ENABLING` and the clock owes it `ENABLED`.
+fn encryption_configuration(
+    input: Option<&DeliveryStreamEncryptionConfigurationInput>,
+    region: &str,
+) -> Result<Option<DeliveryStreamEncryptionConfiguration>, CreateDeliveryStreamError> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    if !KEY_TYPE_VALUES.contains(&input.key_type.as_str()) {
+        return Err(invalid_argument(format!(
+            "KeyType '{}' is not valid; valid values are {}",
+            input.key_type,
+            KEY_TYPE_VALUES.join(", ")
+        )));
+    }
+    // "If you set KeyType to CUSTOMER_MANAGED_CMK, you must specify the Amazon Resource
+    // Name (ARN) of the CMK. If you set KeyType to AWS_OWNED_CMK, Firehose uses a
+    // service-account CMK."
+    match (input.key_type.as_str(), input.key_arn.as_ref()) {
+        ("CUSTOMER_MANAGED_CMK", None) => {
+            return Err(invalid_argument(
+                "KeyARN is required when KeyType is CUSTOMER_MANAGED_CMK".to_string(),
+            ))
+        }
+        ("AWS_OWNED_CMK", Some(_)) => {
+            return Err(invalid_argument(
+                "KeyARN cannot be specified when KeyType is AWS_OWNED_CMK".to_string(),
+            ))
+        }
+        _ => {}
+    }
+    // A CMK is reachable only from its own Region, so one named in another Region cannot
+    // be used: KMS answers NotFoundException, which Firehose reports as
+    // `InvalidKMSResourceException` ("Firehose throws this exception when an attempt to
+    // put records or to start or stop Firehose stream encryption fails. This happens when
+    // the KMS service throws one of the following exception types: AccessDeniedException,
+    // InvalidStateException, DisabledException, or NotFoundException."). The ARN grammar
+    // itself is modelled, so the boundary has already checked it; the Region is the part
+    // this emulator can judge.
+    if let Some(key_arn) = input.key_arn.as_ref() {
+        let key_region = key_arn.split(':').nth(3).unwrap_or_default();
+        if !key_region.is_empty() && key_region != region {
+            return Err(CreateDeliveryStreamErrorModeled::InvalidKMSResourceException(
+                InvalidKMSResourceException {
+                    code: Some("NotFoundException".to_string()),
+                    message: Some(format!(
+                        "the KMS key {key_arn} is in Region {key_region} and cannot be used \
+                         by a Firehose stream in Region {region}"
+                    )),
+                },
+            )
+            .into());
+        }
+    }
+    Ok(Some(DeliveryStreamEncryptionConfiguration {
+        key_arn: input.key_arn.clone(),
+        key_type: Some(input.key_type.clone()),
+        status: Some("ENABLING".to_string()),
+        failure_description: None,
+    }))
+}
+
+

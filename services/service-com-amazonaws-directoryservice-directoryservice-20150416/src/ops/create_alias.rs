@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns an alias to a stored directory, so the directory reports it as its `Alias`
+//! and in the `AccessUrl` derived from it. The model's own warning — "After an alias has
+//! been created, it cannot be deleted or reused" — is what makes both an alias already
+//! taken and a directory that already has one an `EntityAlreadyExistsException`.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAlias"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        if !store.directories.contains_key(&input.directory_id) {
+            return Err(CreateAliasErrorModeled::EntityDoesNotExistException(
+                EntityDoesNotExistException {
+                    message: Some(crate::state::no_such_directory(&input.directory_id)),
+                    request_id: None,
+                },
+            )
+            .into());
+        }
+
+        // An alias is unique across the account and a directory has at most one, so
+        // either collision refuses the call and leaves the stored alias as it was. The
+        // index also holds the aliases of deleted directories, which "cannot be
+        // deleted or reused".
+        if store.aliases.contains_key(&input.alias) {
+            return Err(already_exists(format!(
+                "Alias {alias} is already in use",
+                alias = input.alias
+            )));
+        }
+        if let Some(existing) = store
+            .directories
+            .get(&input.directory_id)
+            .and_then(|directory| directory.alias.clone())
+        {
+            return Err(already_exists(format!(
+                "Directory {directory_id} already has the alias {existing}",
+                directory_id = input.directory_id
+            )));
+        }
+
+        // The reservation index is the one store here a caller can grow without
+        // deleting anything — an alias outlives its directory — so it carries its own
+        // documented maximum and the call is refused once the index is full. Checked
+        // BEFORE the insert below, so a refused call stores nothing.
+        if store.aliases.len() >= crate::state::MAX_RESERVED_ALIASES {
+            return Err(CreateAliasErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "This emulator keeps at most {max} alias reservations; no further alias can be created",
+                    max = crate::state::MAX_RESERVED_ALIASES
+                )),
+                request_id: None,
+            })
+            .into());
+        }
+
+        store
+            .aliases
+            .insert(input.alias.clone(), input.directory_id.clone());
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        directory.alias = Some(input.alias);
+
+        // Both members are read back off the stored record, so the response cannot
+        // echo an alias the store did not take.
+        Ok(CreateAliasOutput {
+            directory_id: Some(directory.directory_id.clone()),
+            alias: directory.alias.clone(),
+        })
     }
+}
+
+/// Refuse the request with the modelled `EntityAlreadyExistsException`, naming what
+/// already holds the alias.
+fn already_exists(message: String) -> CreateAliasError {
+    CreateAliasErrorModeled::EntityAlreadyExistsException(EntityAlreadyExistsException {
+        message: Some(message),
+        request_id: None,
+    })
+    .into()
 }

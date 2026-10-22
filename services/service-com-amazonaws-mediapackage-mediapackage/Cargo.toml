@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Stable, content-derived labels for ingest/playback hostnames and paths, and the
+# seeds of the system-generated ingest endpoint ids and credentials.
+sha2 = { workspace = true }
+# Hex encoding for those labels and for the opaque List* paging tokens.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

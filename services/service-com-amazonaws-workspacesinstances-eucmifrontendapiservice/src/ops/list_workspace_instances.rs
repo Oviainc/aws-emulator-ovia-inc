@@ -152,10 +152,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The opaque `NextToken` this operation mints is the hex encoding of the
-        // `WorkspaceInstanceId` the next page resumes at, so a caller cannot read a
-        // resource id straight out of it. A token this service did not mint is refused
-        // rather than guessed at: it must decode to a value shaped like an instance id.
+        // The `NextToken` this operation mints is the hex encoding of the
+        // `WorkspaceInstanceId` the next page resumes at. The encoding carries no
+        // secrecy — hex is trivially reversible — it is a round-trip and validation
+        // device: a token must decode to a value shaped like an instance id, so one
+        // this service did not issue is refused rather than guessed at.
         let resume_from = match input.next_token.as_deref() {
             None => None,
             Some(token) => {
@@ -197,15 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Iteration is in id order (the store is a `BTreeMap`), which is creation
         // order, so a token resumes at a well-defined place even across a create or
-        // delete between pages.
-        let matching = state
-            .instances
-            .values()
-            .filter(|record| {
-                resume_from
-                    .as_deref()
-                    .is_none_or(|resume| record.id.as_str() >= resume)
-            })
+        // delete between pages. `range` seeks straight to the resume point rather than
+        // scanning the ids before it.
+        let from_resume = match &resume_from {
+            Some(resume) => state.instances.range::<String, _>(resume..),
+            None => state.instances.range::<String, _>(..),
+        };
+        let matching = from_resume
+            .map(|(_, record)| record)
             .filter(|record| {
                 // An absent `ProvisionStates` is no filter, and so is an empty list:
                 // the member asks which states to keep, and naming none asks for no

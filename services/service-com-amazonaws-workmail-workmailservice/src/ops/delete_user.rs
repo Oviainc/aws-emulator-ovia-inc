@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a user of an organization from this service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +149,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUser"))
+        let _ = ctx;
+        // Absent only when this service is mounted on an engine that carries no store,
+        // in which case the operation genuinely cannot be served here.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("DeleteUser"))?;
+        let mut store = state.lock();
+
+        let organization = store
+            .organizations
+            .get_mut(&input.organization_id)
+            .ok_or_else(|| {
+                DeleteUserErrorModeled::OrganizationNotFoundException(
+                    OrganizationNotFoundException {
+                        message: Some(format!(
+                            "An organization with the identifier {} was not found.",
+                            input.organization_id
+                        )),
+                    },
+                )
+            })?;
+        if organization.state != crate::state::ORGANIZATION_STATE_ACTIVE {
+            return Err(DeleteUserErrorModeled::OrganizationStateException(
+                OrganizationStateException {
+                    message: Some(format!(
+                        "The organization {} is in state {} and cannot be written to.",
+                        organization.organization_id, organization.state
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The identifier can be the UserId or Username" (`DeleteUserRequest$UserId`).
+        let resolved = if organization.users.contains_key(&input.user_id) {
+            Some(input.user_id.clone())
+        } else {
+            organization.user_id_for_name(&input.user_id).cloned()
+        };
+
+        // `@idempotent`: the user is already gone, so the delete has already happened.
+        // `DeleteUser` models no not-found error, which is the same statement.
+        let Some(user_id) = resolved else {
+            return Ok(DeleteUserOutput {});
+        };
+
+        // "Before you can delete a user, the user state must be DISABLED." — a registered
+        // user must be deregistered first.
+        let user_state = organization
+            .users
+            .get(&user_id)
+            .map(|user| user.state.clone())
+            .unwrap_or_default();
+        if user_state != crate::state::entity_state::DISABLED {
+            return Err(DeleteUserErrorModeled::EntityStateException(
+                EntityStateException {
+                    message: Some(format!(
+                        "The user {user_id} is in state {user_state}; it must be DISABLED before \
+                         it can be deleted."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        organization.remove_user(&user_id);
+        Ok(DeleteUserOutput {})
     }
 }

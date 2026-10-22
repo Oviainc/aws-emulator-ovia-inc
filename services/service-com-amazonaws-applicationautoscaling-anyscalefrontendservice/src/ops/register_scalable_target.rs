@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterScalableTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterScalableTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterScalableTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -241,18 +232,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterScalableTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterScalableTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterScalableTarget"))
+        use crate::state::{
+            check_dimension_namespace, check_enum, scalable_target_arn, service_linked_role_arn,
+            ScalableTargetRecord, TargetKey,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RegisterScalableTargetErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The two identifying enums. The boundary validator refuses anything the model
+        // constrains, but an enum SHAPE arrives as a plain string, so the permitted set
+        // is checked here against the model-derived value lists.
+        check_enum(
+            "serviceNamespace",
+            &input.service_namespace,
+            SERVICE_NAMESPACE_VALUES,
+        )
+        .map_err(validation)?;
+        check_enum(
+            "scalableDimension",
+            &input.scalable_dimension,
+            SCALABLE_DIMENSION_VALUES,
+        )
+        .map_err(validation)?;
+        check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
+            .map_err(validation)?;
+
+        for (member, capacity) in [
+            ("minCapacity", input.min_capacity),
+            ("maxCapacity", input.max_capacity),
+        ] {
+            if let Some(value) = capacity {
+                if value < 0 {
+                    return Err(validation(format!(
+                        "Value '{value}' at '{member}' failed to satisfy constraint: \
+                         Member must have value greater than or equal to 0"
+                    )));
+                }
+            }
+        }
+
+        let key = TargetKey {
+            service_namespace: input.service_namespace.clone(),
+            resource_id: input.resource_id.clone(),
+            scalable_dimension: input.scalable_dimension.clone(),
+        };
+
+        let mut state = state.lock();
+
+        // Register is an upsert on the (namespace, resource id, dimension) identity: "To
+        // update a scalable target, specify the parameters that you want to change. […]
+        // Any parameters that you don't specify are not changed by this update request."
+        let arn = match state.targets.get(&key) {
+            Some(existing) => {
+                let mut updated = existing.clone();
+                if let Some(min) = input.min_capacity {
+                    updated.min_capacity = min;
+                }
+                if let Some(max) = input.max_capacity {
+                    updated.max_capacity = max;
+                }
+                if let Some(role_arn) = input.role_arn.clone() {
+                    updated.role_arn = role_arn;
+                }
+                if let Some(requested) = input.suspended_state.clone() {
+                    updated.suspended_state =
+                        Some(merge_suspended_state(updated.suspended_state, requested));
+                }
+                // `Tags` is create-time only: "Use this parameter to tag the scalable
+                // target when it is created. To tag an existing scalable target, use the
+                // TagResource operation."
+                check_capacity_range(updated.min_capacity, updated.max_capacity)?;
+                let arn = updated.arn.clone();
+                state.targets.insert(key.clone(), updated);
+                arn
+            }
+            None => {
+                // On a FIRST registration both capacities are required: "This property is
+                // required when registering a new scalable target."
+                let (Some(min_capacity), Some(max_capacity)) =
+                    (input.min_capacity, input.max_capacity)
+                else {
+                    return Err(validation(
+                        "MinCapacity and MaxCapacity are required when registering a new \
+                         scalable target",
+                    ));
+                };
+                check_capacity_range(min_capacity, max_capacity)?;
+                // The emulator's own store bound, checked only on the create path so an
+                // update of an existing target still succeeds at the ceiling.
+                if state.targets.len() >= crate::state::MAX_SCALABLE_TARGETS {
+                    return Err(RegisterScalableTargetErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "This emulator holds at most {} scalable targets; deregister one \
+                                 before registering another",
+                                crate::state::MAX_SCALABLE_TARGETS
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                let arn = scalable_target_arn(&crate::state::request_region(ctx.parts()), &key);
+                let record = ScalableTargetRecord {
+                    arn: arn.clone(),
+                    min_capacity,
+                    max_capacity,
+                    role_arn: input
+                        .role_arn
+                        .clone()
+                        .unwrap_or_else(|| service_linked_role_arn(&input.service_namespace)),
+                    creation_time: ::std::time::SystemTime::now(),
+                    suspended_state: input.suspended_state.clone(),
+                    tags: input
+                        .tags
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect(),
+                };
+                state.arn_index.insert(arn.clone(), key.clone());
+                state.targets.insert(key.clone(), record);
+                arn
+            }
+        };
+
+        Ok(RegisterScalableTargetOutput {
+            scalable_target_arn: Some(arn),
+        })
+    }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> RegisterScalableTargetError {
+    RegisterScalableTargetErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Refuse a capacity window whose minimum is above its maximum: scaling "will not scale
+/// capacity to values that are outside of the minimum and maximum range", which is not a
+/// range at all when the bounds are inverted.
+fn check_capacity_range(min_capacity: i32, max_capacity: i32) -> Result<(), RegisterScalableTargetError> {
+    if min_capacity > max_capacity {
+        return Err(validation(format!(
+            "MinCapacity ({min_capacity}) must be less than or equal to MaxCapacity \
+             ({max_capacity})"
+        )));
+    }
+    Ok(())
+}
+
+/// Apply the suspended-scaling attributes the request names, keeping the stored value of
+/// every attribute it leaves out — the same "parameters that you don't specify are not
+/// changed" rule the top-level members follow, one level down.
+fn merge_suspended_state(
+    stored: Option<SuspendedState>,
+    requested: SuspendedState,
+) -> SuspendedState {
+    let stored = stored.unwrap_or_default();
+    SuspendedState {
+        dynamic_scaling_in_suspended: requested
+            .dynamic_scaling_in_suspended
+            .or(stored.dynamic_scaling_in_suspended),
+        dynamic_scaling_out_suspended: requested
+            .dynamic_scaling_out_suspended
+            .or(stored.dynamic_scaling_out_suspended),
+        scheduled_scaling_suspended: requested
+            .scheduled_scaling_suspended
+            .or(stored.scheduled_scaling_suspended),
     }
 }

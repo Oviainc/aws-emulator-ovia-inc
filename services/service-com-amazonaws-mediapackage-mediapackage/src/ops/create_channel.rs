@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a Channel and stores it; every later read renders from that stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +149,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateChannelErrorModeled::InternalServerErrorException(InternalServerErrorException {
+                message: Some("the mediapackage state store is unavailable".into()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Bound what the caller may make this record cost, before anything is stored.
+        let refuse = |message: String| {
+            CreateChannelError::from(CreateChannelErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(message),
+                },
+            ))
+        };
+        crate::state::bound_chars("Id", &input.id, crate::state::MAX_STRING_CHARS)
+            .map_err(refuse)?;
+        if let Some(description) = &input.description {
+            crate::state::bound_chars(
+                "Description",
+                description,
+                crate::state::MAX_STRING_CHARS,
+            )
+            .map_err(refuse)?;
+        }
+        crate::state::bound_tags(&input.tags).map_err(refuse)?;
+
+        // The ID must be unique within the region: a second CreateChannel with an id
+        // already in use is refused, never an overwrite of the stored channel.
+        if state.channels.contains_key(&input.id) {
+            return Err(CreateChannelErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(format!("A channel with ID \"{}\" already exists.", input.id)),
+                },
+            )
+            .into());
+        }
+
+        // The store lives for the life of the process and only a create adds to it, so
+        // it is capped by entry count; past the cap the resource limit is reported.
+        if state.channels.len() >= crate::state::MAX_CHANNELS {
+            return Err(CreateChannelErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "The channel limit of {} for this account has been reached.",
+                        crate::state::MAX_CHANNELS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let ingest_endpoints = state.mint_ingest_endpoints(&region, &input.id);
+        let record = crate::state::ChannelRecord {
+            arn: crate::state::channel_arn(&region, &input.id),
+            description: input.description.clone(),
+            created_at: crate::state::now_iso8601(),
+            ingest_endpoints,
+            egress_log_group_name: None,
+            ingress_log_group_name: None,
+            tags: crate::state::tags_from_wire(&input.tags),
+            id: input.id.clone(),
+        };
+        // `insert` + the read back below: the record returned is always the STORED one,
+        // and the id is free (refused as a duplicate above), so nothing is replaced.
+        let id = input.id.clone();
+        state.channels.insert(id.clone(), record);
+        let stored = state
+            .channels
+            .get(&id)
+            .expect("the record just inserted under this id");
+
+        // Rendered from the STORED record, so the create response and every later
+        // DescribeChannel/ListChannels are the same bytes.
+        let channel = stored.to_channel();
+        Ok(CreateChannelOutput {
+            arn: channel.arn,
+            created_at: channel.created_at,
+            description: channel.description,
+            egress_access_logs: channel.egress_access_logs,
+            hls_ingest: channel.hls_ingest,
+            id: channel.id,
+            ingress_access_logs: channel.ingress_access_logs,
+            tags: channel.tags,
+        })
     }
 }

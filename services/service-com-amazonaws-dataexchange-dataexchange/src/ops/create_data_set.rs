@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a data set, persists it in
+//! [`crate::state::ComAmazonawsDataexchangeDataexchangeState::data_sets`] and answers
+//! out of the stored record, so a following `GetDataSet` / `ListDataSets` returns
+//! exactly what was created. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +166,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataSetErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // `AssetType` is a modelled enum and `Name` / `Description` are `@required`,
+        // so the boundary validator has already refused anything outside them. What
+        // the model does NOT bound is how much caller-sized text each member may
+        // park in the store, so those bounds are enforced here.
+        if let Err(message) = crate::state::bound_chars(
+            "Name",
+            &input.name,
+            crate::state::MAX_NAME_CHARS,
+        )
+        .and_then(|()| {
+            crate::state::bound_chars(
+                "Description",
+                &input.description,
+                crate::state::MAX_DESCRIPTION_CHARS,
+            )
+        })
+        .and_then(|()| crate::state::bound_tags(input.tags.as_ref()))
+        {
+            return Err(CreateDataSetErrorModeled::ValidationException(
+                crate::state::invalid_request(message),
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+
+        // Persist first, then answer out of what was stored: the response is the
+        // state a later read sees, not a second copy assembled from the request.
+        // The cap is checked under the same lock the insert takes, and before any id
+        // is minted, so a refused create consumes nothing.
+        let stored = {
+            let mut store = state.lock();
+            // The store is bounded, and the model declares the 402 for exactly this.
+            if store.data_sets.len() >= crate::state::MAX_DATA_SETS {
+                return Err(CreateDataSetErrorModeled::ServiceLimitExceededException(
+                    crate::state::data_set_limit_exceeded(),
+                )
+                .into());
+            }
+            let id = crate::state::mint_id();
+            let created_at = crate::state::now();
+            let record = crate::state::DataSet {
+                arn: crate::state::data_set_arn(&region, &id),
+                id: id.clone(),
+                name: input.name,
+                description: input.description,
+                asset_type: input.asset_type,
+                // A data set this account creates is OWNED; ENTITLED describes a
+                // subscriber's copy, which only a data grant or a subscription mints.
+                origin: crate::state::ORIGIN_OWNED.to_string(),
+                // OriginDetails / SourceId are the entitled-copy members, absent on an
+                // owned data set.
+                origin_details: None,
+                source_id: None,
+                tags: input.tags.unwrap_or_default(),
+                created_at,
+                updated_at: created_at,
+                revisions: ::std::collections::HashMap::new(),
+                revision_order: ::std::vec::Vec::new(),
+            };
+            let stored = record.clone();
+            store.data_set_order.push(id.clone());
+            store.data_sets.insert(id, record);
+            stored
+        };
+
+        Ok(CreateDataSetOutput {
+            arn: Some(stored.arn),
+            asset_type: Some(stored.asset_type),
+            created_at: Some(stored.created_at),
+            description: Some(stored.description),
+            id: Some(stored.id),
+            name: Some(stored.name),
+            origin: Some(stored.origin),
+            origin_details: stored.origin_details,
+            source_id: stored.source_id,
+            // An untagged data set carries no Tags member at all, not an empty map.
+            tags: (!stored.tags.is_empty()).then_some(stored.tags),
+            updated_at: Some(stored.updated_at),
+        })
     }
 }

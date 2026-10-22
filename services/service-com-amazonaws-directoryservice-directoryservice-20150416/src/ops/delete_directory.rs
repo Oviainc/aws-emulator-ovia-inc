@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDirectory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDirectory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDirectory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored directory, with its tags, and answers with the deleted id. A
+//! second delete of the same id, like any other call that names it, then reports
+//! `EntityDoesNotExistException`.
+//!
+//! The alias the directory held stays RESERVED: `CreateAlias`' own documentation says
+//! "After an alias has been created, it cannot be deleted or reused", so deleting the
+//! directory that holds one does not hand the alias back to the next caller.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +141,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDirectory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDirectoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDirectory"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let removed = store.directories.remove(&input.directory_id).ok_or_else(|| {
+            DeleteDirectoryErrorModeled::EntityDoesNotExistException(
+                EntityDoesNotExistException {
+                    message: Some(crate::state::no_such_directory(&input.directory_id)),
+                    request_id: None,
+                },
+            )
+        })?;
+
+        // The alias index is deliberately NOT touched: an alias "cannot be deleted or
+        // reused", so it stays reserved against the id it was created for and a later
+        // `CreateAlias` asking for it is refused.
+
+        Ok(DeleteDirectoryOutput {
+            directory_id: Some(removed.directory_id),
+        })
     }
 }

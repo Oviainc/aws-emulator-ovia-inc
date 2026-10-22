@@ -1,0 +1,987 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for the OpenSearch Service domain lifecycle: `CreateDomain`,
+//! `DescribeDomain`, `DescribeDomainConfig`, `ListDomainNames`, `UpdateDomainConfig`
+//! and `DeleteDomain`.
+//!
+//! Every case drives the real wire path — a `restJson1` HTTP request through the
+//! multi-service router into the mounted service — so what is asserted is what a
+//! client sees, not what a handler returns.
+//!
+//! The tests assert RULES over sets of inputs, not one recorded call: the domain
+//! name constraint over its published length bounds and one past each plus the
+//! shapes its pattern refuses, `EngineType` over the whole `EngineType` catalog and
+//! one value past it, and the option-merge rule over a table of eight different
+//! option containers (a structure, a string, two maps, an enum) — each row both
+//! applied and dry-run.
+
+use std::time::Duration;
+
+use bytes::Bytes;
+use serde_json::{json, Value};
+use service_com_amazonaws_opensearch_amazonopensearchservice::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The API version every path of this service is prefixed with.
+const PREFIX: &str = "/2021-01-01";
+
+/// Long enough for the emulator's provisioning span (500 ms) to have fallen due, so
+/// the next read materialises the settled configuration.
+const SETTLE_WAIT: Duration = Duration::from_millis(700);
+
+/// One emulator with this service mounted on a fresh shared engine.
+struct Emulator {
+    router: MultiServiceRouter,
+}
+
+/// One answered request: the HTTP status, the `x-amzn-errortype` error code when the
+/// answer is a failure, and the parsed JSON body (`Value::Null` for an empty body).
+struct Answer {
+    status: u16,
+    error: Option<String>,
+    body: Value,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: std::sync::Arc<engine::InMemoryEngine> =
+            std::sync::Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        // The tests exercise the service, not SigV4: requests carry a credential scope
+        // so the router can name the target service, but no real signature.
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(engine));
+        Self { router }
+    }
+
+    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+        let payload = body.map(|value| value.to_string()).unwrap_or_default();
+        let request = http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "es.us-east-1.amazonaws.com")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIAIOSFODNN7EXAMPLE/20260101/us-east-1/es/aws4_request, \
+                 SignedHeaders=host, Signature=0",
+            )
+            .header("content-type", "application/json")
+            .body(Bytes::from(payload))
+            .expect("the test request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let error = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = response.into_body();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        Answer {
+            status,
+            error,
+            body,
+        }
+    }
+
+    async fn create(&self, body: Value) -> Answer {
+        self.call("POST", &format!("{PREFIX}/opensearch/domain"), Some(body))
+            .await
+    }
+
+    async fn describe(&self, name: &str) -> Answer {
+        self.call(
+            "GET",
+            &format!("{PREFIX}/opensearch/domain/{name}"),
+            None,
+        )
+        .await
+    }
+
+    async fn describe_config(&self, name: &str) -> Answer {
+        self.call(
+            "GET",
+            &format!("{PREFIX}/opensearch/domain/{name}/config"),
+            None,
+        )
+        .await
+    }
+
+    async fn update_config(&self, name: &str, body: Value) -> Answer {
+        self.call(
+            "POST",
+            &format!("{PREFIX}/opensearch/domain/{name}/config"),
+            Some(body),
+        )
+        .await
+    }
+
+    async fn delete(&self, name: &str) -> Answer {
+        self.call(
+            "DELETE",
+            &format!("{PREFIX}/opensearch/domain/{name}"),
+            None,
+        )
+        .await
+    }
+
+    async fn list(&self, engine_type: Option<&str>) -> Answer {
+        let uri = match engine_type {
+            None => format!("{PREFIX}/domain"),
+            Some(value) => format!("{PREFIX}/domain?engineType={value}"),
+        };
+        self.call("GET", &uri, None).await
+    }
+}
+
+/// The wire error code of a failed answer: the `x-amzn-errortype` header when the
+/// path that answered sets one, else the `__type` of the error body.
+fn error_code(answer: &Answer) -> String {
+    if let Some(code) = answer.error.as_deref() {
+        return code.to_string();
+    }
+    let raw = answer.body["__type"].as_str().unwrap_or_default();
+    raw.split('#').next_back().unwrap_or(raw).to_string()
+}
+
+/// A required string member of a response body, with the case named on failure.
+fn string_member(body: &Value, member: &str, case: &str) -> String {
+    body[member]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: expected a string {member}, got {body:?}"))
+        .to_owned()
+}
+
+/// One option's `UpdateVersion`, from the `*Status` container `DomainConfig` reports
+/// it in.
+fn option_version(config: &Value, option: &str, case: &str) -> i64 {
+    config[option]["Status"]["UpdateVersion"]
+        .as_i64()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case}: expected {option}.Status.UpdateVersion, got {:?}",
+                config[option]
+            )
+        })
+}
+
+/// One option's `OptionState`, from the `*Status` container `DomainConfig` reports it
+/// in.
+fn option_state(config: &Value, option: &str, case: &str) -> String {
+    config[option]["Status"]["State"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case}: expected {option}.Status.State, got {:?}",
+                config[option]
+            )
+        })
+        .to_owned()
+}
+
+/// The option containers every domain in the merge tables is created with, each at
+/// revision 1. One row per kind of value an option carries: a structure, a policy
+/// string, two maps keyed by a free-form key and by a `LogType`, and an enum.
+fn baseline_options() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "ClusterConfig",
+            json!({ "InstanceType": "r6g.large.search", "InstanceCount": 2 }),
+        ),
+        (
+            "EBSOptions",
+            json!({ "EBSEnabled": true, "VolumeType": "gp3", "VolumeSize": 20 }),
+        ),
+        ("AccessPolicies", json!("{\"Version\":\"2012-10-17\"}")),
+        (
+            "AdvancedOptions",
+            json!({ "rest.action.multi.allow_explicit_index": "true" }),
+        ),
+        (
+            "SnapshotOptions",
+            json!({ "AutomatedSnapshotStartHour": 0 }),
+        ),
+        ("IPAddressType", json!("ipv4")),
+        (
+            "LogPublishingOptions",
+            json!({ "SEARCH_SLOW_LOGS": { "Enabled": false } }),
+        ),
+        (
+            "SoftwareUpdateOptions",
+            json!({ "AutoSoftwareUpdateEnabled": false }),
+        ),
+    ]
+}
+
+/// One change to make: the option it names, the container to send, and the
+/// `DryRunResults$DeploymentType` applying it is — `Blue/Green` where it changes the
+/// shape of the provisioned cluster, `DynamicUpdate` where it is a setting on the
+/// running one.
+fn change_rows() -> Vec<(&'static str, Value, &'static str)> {
+    vec![
+        (
+            "ClusterConfig",
+            json!({ "InstanceType": "r6g.xlarge.search", "InstanceCount": 4 }),
+            "Blue/Green",
+        ),
+        (
+            "EBSOptions",
+            json!({ "EBSEnabled": true, "VolumeType": "gp3", "VolumeSize": 40 }),
+            "Blue/Green",
+        ),
+        (
+            "AccessPolicies",
+            json!("{\"Version\":\"2012-10-17\",\"Statement\":[]}"),
+            "DynamicUpdate",
+        ),
+        (
+            "AdvancedOptions",
+            json!({
+                "rest.action.multi.allow_explicit_index": "false",
+                "indices.fielddata.cache.size": "40",
+            }),
+            "DynamicUpdate",
+        ),
+        (
+            "SnapshotOptions",
+            json!({ "AutomatedSnapshotStartHour": 3 }),
+            "DynamicUpdate",
+        ),
+        ("IPAddressType", json!("dualstack"), "Blue/Green"),
+        (
+            "LogPublishingOptions",
+            json!({
+                "INDEX_SLOW_LOGS": {
+                    "Enabled": true,
+                    "CloudWatchLogsLogGroupArn":
+                        "arn:aws:logs:us-east-1:000000000000:log-group:/aws/opensearch/slow",
+                },
+            }),
+            "DynamicUpdate",
+        ),
+        (
+            "SoftwareUpdateOptions",
+            json!({
+                "AutoSoftwareUpdateEnabled": true,
+                "UseLatestServiceSoftwareForBlueGreen": true,
+            }),
+            "DynamicUpdate",
+        ),
+    ]
+}
+
+/// A `CreateDomain` body for `name` carrying every [`baseline_options`] container.
+fn baseline_create(name: &str) -> Value {
+    let mut body = json!({ "DomainName": name, "EngineVersion": "OpenSearch_2.11" });
+    for (option, value) in baseline_options() {
+        body[option] = value;
+    }
+    body
+}
+
+/// `CreateDomain` with [`baseline_create`], asserting it was accepted.
+async fn create_baseline(emulator: &Emulator, name: &str) -> Value {
+    let answer = emulator.create(baseline_create(name)).await;
+    assert_eq!(
+        answer.status, 200,
+        "case CreateDomain({name:?}): expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["DomainStatus"].clone()
+}
+
+#[tokio::test]
+async fn a_created_domain_is_persisted_and_read_back_member_for_member() {
+    let emulator = Emulator::new();
+    let name = "my-domain";
+    let created = create_baseline(&emulator, name).await;
+
+    assert_eq!(
+        created["DomainName"].as_str(),
+        Some(name),
+        "case CreateDomain({name:?}): expected the requested DomainName, got {:?}",
+        created["DomainName"]
+    );
+    assert_eq!(
+        created["DomainId"].as_str(),
+        Some(format!("{}/{name}", engine::emulator_account_id()).as_str()),
+        "case CreateDomain({name:?}): expected DomainId <account>/<name>, got {:?}",
+        created["DomainId"]
+    );
+    assert_eq!(
+        created["ARN"].as_str(),
+        Some(
+            format!(
+                "arn:aws:es:us-east-1:{}:domain/{name}",
+                engine::emulator_account_id()
+            )
+            .as_str()
+        ),
+        "case CreateDomain({name:?}): expected the domain ARN, got {:?}",
+        created["ARN"]
+    );
+    assert_eq!(
+        (
+            created["Created"].as_bool(),
+            created["Deleted"].as_bool(),
+            created["Processing"].as_bool()
+        ),
+        (Some(true), Some(false), Some(true)),
+        "case CreateDomain({name:?}): a new domain is created, not deleted and still \
+         processing, got {created:?}"
+    );
+    assert_eq!(
+        created["DomainProcessingStatus"].as_str(),
+        Some("Creating"),
+        "case CreateDomain({name:?}): expected DomainProcessingStatus Creating, got {:?}",
+        created["DomainProcessingStatus"]
+    );
+
+    // The endpoint is the domain's own host, in the Region the request was signed
+    // for, and it carries an opaque per-domain suffix rather than just the name.
+    let endpoint = string_member(&created, "Endpoint", "CreateDomain(endpoint)");
+    assert!(
+        endpoint.starts_with(&format!("search-{name}-"))
+            && endpoint.ends_with(".us-east-1.es.amazonaws.com"),
+        "case CreateDomain(endpoint): expected search-{name}-<suffix>.us-east-1.es.amazonaws.com, \
+         got {endpoint:?}"
+    );
+
+    // Defaults the model documents: `MIXED` when no use case is given, `GENERAL`
+    // when no engine mode is.
+    assert_eq!(
+        (created["UseCase"].as_str(), created["EngineMode"].as_str()),
+        (Some("MIXED"), Some("GENERAL")),
+        "case CreateDomain(defaults): expected UseCase MIXED and EngineMode GENERAL, got {created:?}"
+    );
+
+    // The read reports the persisted record, not a body synthesised from the
+    // request: every member the create answered comes back identical.
+    let fetched = emulator.describe(name).await;
+    assert_eq!(
+        fetched.status, 200,
+        "case DescribeDomain({name:?}): expected 200, got {} with {:?}",
+        fetched.status, fetched.body
+    );
+    let described = &fetched.body["DomainStatus"];
+    for member in [
+        "DomainId",
+        "DomainName",
+        "ARN",
+        "Created",
+        "Deleted",
+        "Endpoint",
+        "EngineVersion",
+        "ClusterConfig",
+        "EBSOptions",
+        "AccessPolicies",
+        "AdvancedOptions",
+        "SnapshotOptions",
+        "IPAddressType",
+        "LogPublishingOptions",
+        "SoftwareUpdateOptions",
+        "UseCase",
+        "EngineMode",
+    ] {
+        assert_eq!(
+            described[member], created[member],
+            "case DescribeDomain({member}): expected the persisted {:?}, got {:?}",
+            created[member], described[member]
+        );
+    }
+
+    // A read does not change what the next caller sees.
+    let again = emulator.describe(name).await;
+    assert_eq!(
+        again.body["DomainStatus"], *described,
+        "case DescribeDomain(twice): a read must not change the record: {:?} then {:?}",
+        described, again.body["DomainStatus"]
+    );
+
+    // Every option the create carried is at revision 1 and reports a real
+    // `OptionStatus` built from the record's own history.
+    let config = emulator.describe_config(name).await;
+    assert_eq!(
+        config.status, 200,
+        "case DescribeDomainConfig({name:?}): expected 200, got {} with {:?}",
+        config.status, config.body
+    );
+    let config = &config.body["DomainConfig"];
+    for (option, value) in baseline_options() {
+        assert_eq!(
+            config[option]["Options"], value,
+            "case DescribeDomainConfig({option}): expected the persisted {value:?}, got {:?}",
+            config[option]["Options"]
+        );
+        assert_eq!(
+            option_version(config, option, option),
+            1,
+            "case DescribeDomainConfig({option}): a created option is at revision 1, got {:?}",
+            config[option]["Status"]
+        );
+        assert!(
+            config[option]["Status"]["CreationDate"].is_number()
+                && config[option]["Status"]["UpdateDate"].is_number(),
+            "case DescribeDomainConfig({option}): expected CreationDate/UpdateDate timestamps, \
+             got {:?}",
+            config[option]["Status"]
+        );
+    }
+    // An option the request named no value for has no container at all, rather than
+    // an invented one.
+    for option in ["VPCOptions", "CognitoOptions", "EncryptionAtRestOptions"] {
+        assert!(
+            config[option].is_null(),
+            "case DescribeDomainConfig({option}): an unset option is absent, got {:?}",
+            config[option]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_domain_name_is_accepted_exactly_where_the_modelled_constraint_allows_it() {
+    // `DomainName` is `@length(min: 3, max: 28)` with `@pattern("^[a-z][a-z0-9\\-]+$")`:
+    // each published bound and one past it, plus one row per character class the
+    // pattern refuses.
+    let twenty_eight = "a".repeat(28);
+    let twenty_nine = "a".repeat(29);
+    let cases: Vec<(&str, bool)> = vec![
+        ("abc", true),
+        ("a-b", true),
+        ("a0-z9", true),
+        (twenty_eight.as_str(), true),
+        ("ab", false),
+        ("a", false),
+        (twenty_nine.as_str(), false),
+        ("1abc", false),
+        ("-abc", false),
+        ("Abc", false),
+        ("a_bc", false),
+        ("a.bc", false),
+        ("abc!", false),
+    ];
+
+    let emulator = Emulator::new();
+    for (name, accepted) in cases {
+        let answer = emulator
+            .create(json!({ "DomainName": name, "ClusterConfig": { "InstanceCount": 1 } }))
+            .await;
+        if accepted {
+            assert_eq!(
+                answer.status, 200,
+                "case CreateDomain({name:?}): expected 200 inside the constraint, got {} with {:?}",
+                answer.status, answer.body
+            );
+            let read = emulator.describe(name).await;
+            assert_eq!(
+                read.status, 200,
+                "case DescribeDomain({name:?}): an accepted name is persisted, got {} with {:?}",
+                read.status, read.body
+            );
+        } else {
+            assert_eq!(
+                answer.status, 400,
+                "case CreateDomain({name:?}): expected 400 outside the constraint, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ValidationException",
+                "case CreateDomain({name:?}): expected ValidationException, got {:?}",
+                answer.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn engine_type_is_derived_from_the_engine_version_prefix() {
+    // `EngineType` has exactly two values, and `VersionString`'s pattern allows
+    // exactly two prefixes; the rows span both prefixes over several versions, plus
+    // the row where the request names no version at all.
+    let cases: Vec<(&str, Option<&str>, &str)> = vec![
+        ("opensearch-one", Some("OpenSearch_1.0"), "OpenSearch"),
+        ("opensearch-two", Some("OpenSearch_2.11"), "OpenSearch"),
+        ("opensearch-three", Some("OpenSearch_3.1"), "OpenSearch"),
+        (
+            "elasticsearch-seven",
+            Some("Elasticsearch_7.10"),
+            "Elasticsearch",
+        ),
+        (
+            "elasticsearch-six",
+            Some("Elasticsearch_6.8"),
+            "Elasticsearch",
+        ),
+        (
+            "elasticsearch-five",
+            Some("Elasticsearch_5.1"),
+            "Elasticsearch",
+        ),
+        ("default-version", None, "OpenSearch"),
+    ];
+
+    let emulator = Emulator::new();
+    for (name, version, _) in &cases {
+        let mut body = json!({ "DomainName": name });
+        if let Some(version) = version {
+            body["EngineVersion"] = json!(version);
+        }
+        let answer = emulator.create(body).await;
+        assert_eq!(
+            answer.status, 200,
+            "case CreateDomain({name:?}, {version:?}): expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        // A request that names no version gets the one the emulator creates domains
+        // at, and that stored value is what the engine type is derived from.
+        let stored = answer.body["DomainStatus"]["EngineVersion"].clone();
+        assert_eq!(
+            stored.as_str(),
+            Some(version.unwrap_or("OpenSearch_2.11")),
+            "case CreateDomain({name:?}, {version:?}): expected the stored EngineVersion, got {stored:?}"
+        );
+    }
+
+    // Unfiltered, every domain is listed with the engine type its version implies.
+    let all = emulator.list(None).await;
+    assert_eq!(
+        all.status, 200,
+        "case ListDomainNames(no filter): expected 200, got {} with {:?}",
+        all.status, all.body
+    );
+    let listed = all.body["DomainNames"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case ListDomainNames(no filter): expected DomainNames, got {:?}", all.body))
+        .clone();
+    assert_eq!(
+        listed.len(),
+        cases.len(),
+        "case ListDomainNames(no filter): expected every created domain, got {listed:?}"
+    );
+    for (name, version, engine_type) in &cases {
+        let entry = listed
+            .iter()
+            .find(|entry| entry["DomainName"].as_str() == Some(*name))
+            .unwrap_or_else(|| {
+                panic!("case ListDomainNames({name:?}): expected an entry, got {listed:?}")
+            });
+        assert_eq!(
+            entry["EngineType"].as_str(),
+            Some(*engine_type),
+            "case ListDomainNames({name:?}, {version:?}): expected EngineType {engine_type:?}, \
+             got {entry:?}"
+        );
+    }
+
+    // Filtered, the listing holds exactly the domains of that engine type.
+    for engine_type in ["OpenSearch", "Elasticsearch"] {
+        let filtered = emulator.list(Some(engine_type)).await;
+        assert_eq!(
+            filtered.status, 200,
+            "case ListDomainNames({engine_type}): expected 200, got {} with {:?}",
+            filtered.status, filtered.body
+        );
+        let names: Vec<String> = filtered.body["DomainNames"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case ListDomainNames({engine_type}): expected DomainNames, got {:?}",
+                    filtered.body
+                )
+            })
+            .iter()
+            .map(|entry| entry["DomainName"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        let mut expected: Vec<String> = cases
+            .iter()
+            .filter(|(_, _, kind)| *kind == engine_type)
+            .map(|(name, _, _)| (*name).to_owned())
+            .collect();
+        expected.sort();
+        let mut got = names.clone();
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "case ListDomainNames({engine_type}): expected {expected:?}, got {names:?}"
+        );
+    }
+
+    // One value past the catalog is refused, not served as an empty page.
+    let bogus = emulator.list(Some("Lucene")).await;
+    assert_eq!(
+        bogus.status, 400,
+        "case ListDomainNames(Lucene): expected 400 outside the EngineType catalog, got {} with {:?}",
+        bogus.status, bogus.body
+    );
+    assert_eq!(
+        error_code(&bogus),
+        "ValidationException",
+        "case ListDomainNames(Lucene): expected ValidationException, got {:?}",
+        bogus.body
+    );
+}
+
+#[tokio::test]
+async fn an_updated_option_replaces_only_itself_and_bumps_only_its_own_revision() {
+    let emulator = Emulator::new();
+    for (index, (option, value, _)) in change_rows().into_iter().enumerate() {
+        let name = format!("merge-{index}");
+        create_baseline(&emulator, &name).await;
+
+        let case = format!("UpdateDomainConfig({option})");
+        let answer = emulator
+            .update_config(&name, json!({ option: value.clone() }))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let answered = &answer.body["DomainConfig"];
+        assert!(
+            answer.body["DryRunResults"].is_null(),
+            "case {case}: an applied update reports no dry-run results, got {:?}",
+            answer.body["DryRunResults"]
+        );
+
+        // The update's own answer, the config read and the status read all report the
+        // one stored record.
+        let read_config = emulator.describe_config(&name).await;
+        assert_eq!(
+            read_config.status, 200,
+            "case {case}: DescribeDomainConfig expected 200, got {} with {:?}",
+            read_config.status, read_config.body
+        );
+        let stored = &read_config.body["DomainConfig"];
+        let read_status = emulator.describe(&name).await;
+        let status = &read_status.body["DomainStatus"];
+
+        for (label, config) in [("answered", answered), ("stored", stored)] {
+            assert_eq!(
+                config[option]["Options"], value,
+                "case {case} ({label}): a supplied container replaces the stored value: \
+                 expected {value:?}, got {:?}",
+                config[option]["Options"]
+            );
+            assert_eq!(
+                option_version(config, option, &case),
+                2,
+                "case {case} ({label}): the changed option moves to revision 2, got {:?}",
+                config[option]["Status"]
+            );
+            assert_eq!(
+                option_state(config, option, &case),
+                "Processing",
+                "case {case} ({label}): the option the change is applying is Processing, got {:?}",
+                config[option]["Status"]
+            );
+            // Every option the request did NOT name keeps its value and its revision.
+            for (other, baseline) in baseline_options() {
+                if other == option {
+                    continue;
+                }
+                assert_eq!(
+                    config[other]["Options"], baseline,
+                    "case {case} ({label}): {other} was not named and must keep {baseline:?}, \
+                     got {:?}",
+                    config[other]["Options"]
+                );
+                assert_eq!(
+                    option_version(config, other, &case),
+                    1,
+                    "case {case} ({label}): {other} was not named and stays at revision 1, got {:?}",
+                    config[other]["Status"]
+                );
+                assert_eq!(
+                    option_state(config, other, &case),
+                    "Active",
+                    "case {case} ({label}): {other} was not named and stays Active, got {:?}",
+                    config[other]["Status"]
+                );
+            }
+        }
+
+        assert_eq!(
+            status[option], value,
+            "case {case}: DescribeDomain reports the merged {option}: expected {value:?}, got {:?}",
+            status[option]
+        );
+        assert_eq!(
+            status["DomainProcessingStatus"].as_str(),
+            Some("Modifying"),
+            "case {case}: a domain applying a change is Modifying, got {:?}",
+            status["DomainProcessingStatus"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dry_run_reports_the_change_it_would_make_and_stores_nothing() {
+    let emulator = Emulator::new();
+    let rows = change_rows();
+
+    // One domain per row, all created up front so a single wait settles them: a dry
+    // run against a domain still provisioning cannot predict a deployment type, and
+    // that case is asserted separately below.
+    for index in 0..rows.len() {
+        create_baseline(&emulator, &format!("dry-{index}")).await;
+    }
+    tokio::time::sleep(SETTLE_WAIT).await;
+
+    for (index, (option, value, deployment)) in rows.into_iter().enumerate() {
+        let name = format!("dry-{index}");
+        let case = format!("UpdateDomainConfig({option}, DryRun)");
+        let answer = emulator
+            .update_config(
+                &name,
+                json!({ option: value.clone(), "DryRun": true }),
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.body["DomainConfig"][option]["Options"], value,
+            "case {case}: a dry run reports the change it would make: expected {value:?}, got {:?}",
+            answer.body["DomainConfig"][option]["Options"]
+        );
+        assert_eq!(
+            answer.body["DryRunResults"]["DeploymentType"].as_str(),
+            Some(deployment),
+            "case {case}: expected DeploymentType {deployment:?}, got {:?}",
+            answer.body["DryRunResults"]
+        );
+
+        // Nothing was stored: the option is still at its baseline value and revision.
+        let stored = emulator.describe_config(&name).await;
+        let config = &stored.body["DomainConfig"];
+        let baseline = baseline_options()
+            .into_iter()
+            .find(|(candidate, _)| *candidate == option)
+            .map(|(_, baseline)| baseline)
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            config[option]["Options"], baseline,
+            "case {case}: a dry run must not mutate: expected the baseline {baseline:?}, got {:?}",
+            config[option]["Options"]
+        );
+        assert_eq!(
+            option_version(config, option, &case),
+            1,
+            "case {case}: a dry run must not bump a revision, got {:?}",
+            config[option]["Status"]
+        );
+    }
+
+    // "None - The request doesn't include any configuration changes."
+    let empty = emulator
+        .update_config("dry-0", json!({ "DryRun": true }))
+        .await;
+    assert_eq!(
+        empty.body["DryRunResults"]["DeploymentType"].as_str(),
+        Some("None"),
+        "case UpdateDomainConfig(no change, DryRun): expected DeploymentType None, got {:?}",
+        empty.body["DryRunResults"]
+    );
+
+    // "Undetermined - The domain is in the middle of an update and can't predict the
+    // deployment type."
+    create_baseline(&emulator, "dry-unsettled").await;
+    let unsettled = emulator
+        .update_config(
+            "dry-unsettled",
+            json!({ "ClusterConfig": { "InstanceCount": 4 }, "DryRun": true }),
+        )
+        .await;
+    assert_eq!(
+        unsettled.body["DryRunResults"]["DeploymentType"].as_str(),
+        Some("Undetermined"),
+        "case UpdateDomainConfig(while processing, DryRun): expected DeploymentType Undetermined, \
+         got {:?}",
+        unsettled.body["DryRunResults"]
+    );
+}
+
+#[tokio::test]
+async fn a_configuration_change_settles_from_processing_to_active_on_the_clock() {
+    let emulator = Emulator::new();
+    let name = "settling-domain";
+    create_baseline(&emulator, name).await;
+
+    // Straight after the create the domain is still provisioning, and so is every
+    // option the create set.
+    let before = emulator.describe_config(name).await;
+    let before = &before.body["DomainConfig"];
+    for (option, _) in baseline_options() {
+        assert_eq!(
+            option_state(before, option, "before settling"),
+            "Processing",
+            "case before settling({option}): expected Processing, got {:?}",
+            before[option]["Status"]
+        );
+    }
+
+    tokio::time::sleep(SETTLE_WAIT).await;
+
+    let after_status = emulator.describe(name).await;
+    let after_status = &after_status.body["DomainStatus"];
+    assert_eq!(
+        (
+            after_status["Processing"].as_bool(),
+            after_status["DomainProcessingStatus"].as_str()
+        ),
+        (Some(false), Some("Active")),
+        "case after settling: expected Processing false and DomainProcessingStatus Active, \
+         got {after_status:?}"
+    );
+
+    let after = emulator.describe_config(name).await;
+    let after = &after.body["DomainConfig"];
+    for (option, value) in baseline_options() {
+        assert_eq!(
+            option_state(after, option, "after settling"),
+            "Active",
+            "case after settling({option}): expected Active, got {:?}",
+            after[option]["Status"]
+        );
+        // Settling moves the state, nothing else: the values and revisions stand.
+        assert_eq!(
+            after[option]["Options"], value,
+            "case after settling({option}): expected the persisted {value:?}, got {:?}",
+            after[option]["Options"]
+        );
+        assert_eq!(
+            option_version(after, option, "after settling"),
+            1,
+            "case after settling({option}): settling must not bump a revision, got {:?}",
+            after[option]["Status"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_duplicate_domain_name_is_refused_and_the_first_record_stands() {
+    let emulator = Emulator::new();
+    for name in ["dup-one", "dup-two", "dup-three"] {
+        let first = create_baseline(&emulator, name).await;
+        let again = emulator
+            .create(json!({
+                "DomainName": name,
+                "ClusterConfig": { "InstanceType": "m5.large.search", "InstanceCount": 9 },
+            }))
+            .await;
+        assert_eq!(
+            again.status, 409,
+            "case CreateDomain({name:?} twice): expected 409, got {} with {:?}",
+            again.status, again.body
+        );
+        assert_eq!(
+            error_code(&again),
+            "ResourceAlreadyExistsException",
+            "case CreateDomain({name:?} twice): expected ResourceAlreadyExistsException, got {:?}",
+            again.body
+        );
+        let read = emulator.describe(name).await;
+        assert_eq!(
+            read.body["DomainStatus"]["ClusterConfig"], first["ClusterConfig"],
+            "case CreateDomain({name:?} twice): the refused create must not touch the record: \
+             expected {:?}, got {:?}",
+            first["ClusterConfig"], read.body["DomainStatus"]["ClusterConfig"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_domain_is_gone_from_every_read_path() {
+    let emulator = Emulator::new();
+    for name in ["keep-one", "to-delete", "keep-two"] {
+        create_baseline(&emulator, name).await;
+    }
+
+    let deleted = emulator.delete("to-delete").await;
+    assert_eq!(
+        deleted.status, 200,
+        "case DeleteDomain(to-delete): expected 200, got {} with {:?}",
+        deleted.status, deleted.body
+    );
+    let status = &deleted.body["DomainStatus"];
+    assert_eq!(
+        (status["Deleted"].as_bool(), status["DomainName"].as_str()),
+        (Some(true), Some("to-delete")),
+        "case DeleteDomain(to-delete): expected the final status Deleted true, got {status:?}"
+    );
+
+    for (label, answer) in [
+        ("DescribeDomain", emulator.describe("to-delete").await),
+        (
+            "DescribeDomainConfig",
+            emulator.describe_config("to-delete").await,
+        ),
+        ("DeleteDomain again", emulator.delete("to-delete").await),
+    ] {
+        assert_eq!(
+            answer.status, 409,
+            "case {label}(deleted): expected 409, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            error_code(&answer),
+            "ResourceNotFoundException",
+            "case {label}(deleted): expected ResourceNotFoundException, got {:?}",
+            answer.body
+        );
+    }
+
+    let listed = emulator.list(None).await;
+    let names: Vec<String> = listed.body["DomainNames"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case ListDomainNames(after delete): expected DomainNames, got {:?}", listed.body))
+        .iter()
+        .map(|entry| entry["DomainName"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["keep-one".to_string(), "keep-two".to_string()],
+        "case ListDomainNames(after delete): expected only the surviving domains, got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_domain_name_is_not_found_on_every_path_that_resolves_one() {
+    let emulator = Emulator::new();
+    create_baseline(&emulator, "present-domain").await;
+
+    for name in ["never-created", "also-missing", "gone-domain"] {
+        for (label, answer) in [
+            ("DescribeDomain", emulator.describe(name).await),
+            ("DescribeDomainConfig", emulator.describe_config(name).await),
+            (
+                "UpdateDomainConfig",
+                emulator
+                    .update_config(name, json!({ "ClusterConfig": { "InstanceCount": 2 } }))
+                    .await,
+            ),
+            ("DeleteDomain", emulator.delete(name).await),
+        ] {
+            assert_eq!(
+                answer.status, 409,
+                "case {label}({name:?}): expected 409, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ResourceNotFoundException",
+                "case {label}({name:?}): expected ResourceNotFoundException, got {:?}",
+                answer.body
+            );
+        }
+    }
+}

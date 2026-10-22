@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDirectory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDirectory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDirectory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a Simple AD directory: mints a `DirectoryId`, persists the record (its name,
+//! short name, description, size, VPC settings, network type and tags) in
+//! [`crate::state`] and answers with the minted id. The administrator `Password` is
+//! `@sensitive` and no operation reports it back, so it is not stored.
+//!
+//! The directory is persisted in the modelled `Requested` stage with the move to
+//! `Active` owed by the clock one [`crate::state::TRANSITION_SPAN`] later, so a caller
+//! that describes it immediately still sees the transient stage.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +169,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDirectory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDirectoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDirectory"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // `NetworkType`'s own documentation: "Simple AD supports IPv4 and Dual-stack
+        // only." The member is modelled as the whole `NetworkType` enum, so the
+        // boundary validator passes `IPv6`; the per-directory-type rule is enforced
+        // here, naming the member and the values it admits.
+        if let Some(network_type) = input.network_type.as_deref() {
+            if !crate::state::SIMPLE_AD_NETWORK_TYPES.contains(&network_type) {
+                return Err(invalid_parameter(format!(
+                    "NetworkType {network_type} is not supported by a {} directory; supported values are {}",
+                    crate::state::TYPE_SIMPLE_AD,
+                    crate::state::SIMPLE_AD_NETWORK_TYPES.join(", ")
+                )));
+            }
+        }
+
+        // Nothing caller-sized reaches the store unchecked: the tag list is bounded
+        // before the store lock is taken at all. `CreateDirectory` models no
+        // `TagLimitExceededException`, so the bound is reported as the invalid
+        // parameter it is.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid_parameter(format!(
+                "Tags may carry at most {max} entries, got {got}",
+                max = crate::state::MAX_TAGS,
+                got = requested_tags.len()
+            )));
+        }
+        let tags: ::std::collections::BTreeMap<String, String> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        if store.directories.len() >= crate::state::MAX_DIRECTORIES {
+            return Err(CreateDirectoryErrorModeled::DirectoryLimitExceededException(
+                DirectoryLimitExceededException {
+                    message: Some(format!(
+                        "Maximum number of directories in the region has been reached: {}",
+                        crate::state::MAX_DIRECTORIES
+                    )),
+                    request_id: None,
+                },
+            )
+            .into());
+        }
+
+        let directory_id = store.mint_directory_id();
+        let seq = store.next_seq();
+        let record = crate::state::Directory {
+            directory_id: directory_id.clone(),
+            name: input.name,
+            short_name: input.short_name,
+            description: input.description,
+            size: Some(input.size),
+            // Only AWS Managed Microsoft AD has an edition.
+            edition: None,
+            directory_type: crate::state::TYPE_SIMPLE_AD.to_string(),
+            stage: crate::state::STAGE_REQUESTED.to_string(),
+            stage_due_at: Some(now + crate::state::TRANSITION_SPAN),
+            launch_time: now,
+            stage_last_updated: now,
+            // No alias until `CreateAlias` assigns one; the directory id stands in for
+            // it until then.
+            alias: None,
+            vpc_settings: input
+                .vpc_settings
+                .map(|requested| DirectoryVpcSettingsDescription {
+                    vpc_id: Some(requested.vpc_id),
+                    subnet_ids: Some(requested.subnet_ids),
+                    // The security group and availability zones are chosen by the VPC
+                    // data plane this emulator does not have, so they stay absent
+                    // rather than invented.
+                    security_group_id: None,
+                    availability_zones: None,
+                }),
+            network_type: input.network_type,
+            // `EnableSso` (still scaffolded) is what turns this on.
+            sso_enabled: false,
+            desired_number_of_domain_controllers: None,
+            tags,
+            seq,
+        };
+        store.directories.insert(directory_id.clone(), record);
+
+        // Read the id back out of the store, so the response cannot name a directory
+        // the insert did not persist.
+        let stored = store
+            .directories
+            .get(&directory_id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(CreateDirectoryOutput {
+            directory_id: Some(stored.directory_id.clone()),
+        })
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> CreateDirectoryError {
+    CreateDirectoryErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        request_id: None,
+    })
+    .into()
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnvironments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnvironments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnvironments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the environments in state, in creation order, one `maxResults`-sized page
+//! at a time. A read, so it changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnvironments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnvironmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnvironments"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEnvironmentsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the thinclient environment store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` resumes after the environment it was minted for. One this
+        // service did not mint cannot name a position, so it is refused rather than
+        // silently read as "from the start".
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some("") => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(seq) => Some(seq),
+                None => {
+                    return Err(ListEnvironmentsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "nextToken is not a pagination token issued by ListEnvironments"
+                                    .to_string(),
+                            ),
+                            reason: Some("fieldValidationFailed".to_string()),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: "pass back the nextToken of the previous page unchanged"
+                                    .to_string(),
+                            }]),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE) as usize;
+
+        let store = state.lock();
+        let remaining: Vec<&crate::state::StoredEnvironment> = store
+            .ordered_environments()
+            .into_iter()
+            .filter(|env| resume_after.is_none_or(|after| env.seq > after))
+            .collect();
+
+        let page: Vec<EnvironmentSummary> = remaining
+            .iter()
+            .take(page_size)
+            .map(|env| env.to_summary())
+            .collect();
+        // The final page omits `nextToken`; any other page carries the position of
+        // its last item, so the next call resumes exactly where this one stopped.
+        let next_token = (remaining.len() > page.len())
+            .then(|| remaining[page.len() - 1].seq)
+            .map(crate::state::encode_page_token);
+
+        Ok(ListEnvironmentsOutput {
+            environments: Some(page),
+            next_token,
+        })
     }
 }
