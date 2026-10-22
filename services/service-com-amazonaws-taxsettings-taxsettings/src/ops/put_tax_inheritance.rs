@@ -2,8 +2,20 @@
 
 //! @op PutTaxInheritance
 //!
-//! Records the account's tax-inheritance election, which `GetTaxInheritance`
-//! reads back.
+//! Records the account's tax-inheritance election — for the AWS Organizations
+//! management account, which is the only caller allowed to make it.
+//!
+//! Tax inheritance is an organization-level election (whether an organization's
+//! member accounts inherit the management account's tax settings), so AWS refuses
+//! the call from any other account with `ValidationException` /
+//! `FieldValidationFailed`. This emulator presents ONE standalone account that
+//! belongs to no organization, so no caller it serves is a management account and
+//! every call gets that refusal rather than a success that stores an election AWS
+//! would not have stored; see [`crate::state::MANAGEMENT_ACCOUNT_ONLY`]. The
+//! election itself is state
+//! ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::tax_inheritance`]),
+//! which `GetTaxInheritance` reports, so a caller that can be shown to be a
+//! management account has somewhere to write it.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +146,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            PutTaxInheritanceErrorModeled::InternalServerException(
-                crate::state::state_unavailable(),
-            )
-        })?;
+        // `ctx` carries request metadata and the engine is held on `self`; this
+        // operation stores nothing (see below), so neither is read.
+        let _ = (ctx, &self.engine);
 
         // The election IS this operation's only input, so a request that omits it
-        // asks for nothing: refuse rather than silently clear the stored value.
-        // An unlisted `HeritageStatus` value is already refused by the boundary
-        // validator, which carries the enum's value set.
-        let Some(heritage_status) = input.heritage_status else {
+        // asks for nothing: refuse before anything else, because the request is
+        // unusable whoever sent it. An unlisted `HeritageStatus` value is already
+        // refused by the boundary validator, which carries the enum's value set.
+        if input.heritage_status.is_none() {
             return Err(PutTaxInheritanceErrorModeled::ValidationException(
                 crate::state::validation(
                     crate::state::ERROR_CODE_MISSING_INPUT,
@@ -154,9 +163,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
             .into());
-        };
+        }
 
-        state.lock().tax_inheritance = Some(heritage_status);
-        Ok(PutTaxInheritanceOutput {})
+        // The caller is not an AWS Organizations management account — nothing
+        // this emulator serves is — so the election is refused the way AWS
+        // refuses it, and nothing is stored. The refusal is about the CALLER, not
+        // about a parameter, so it names no field.
+        Err(PutTaxInheritanceErrorModeled::ValidationException(
+            crate::state::validation_of_the_call(
+                crate::state::ERROR_CODE_FIELD_VALIDATION_FAILED,
+                crate::state::MANAGEMENT_ACCOUNT_ONLY,
+            ),
+        )
+        .into())
     }
 }

@@ -7,18 +7,34 @@
 //! bumps its revision, so the document access tokens the previous write minted
 //! no longer name anything.
 //!
-//! Three refusals this handler adds beyond the constraints the boundary
+//! The status is the outcome of validating the submitted TRN, which the model
+//! documents as `Verified`, `Pending` or `Rejected`. Validating means checking
+//! the number against the tax authority's registry, which takes time and which
+//! this emulator cannot do at all, so a write stores the registration `Pending`
+//! and the validation falls due one [`crate::state::TRN_VALIDATION_DELAY`] later;
+//! every read then reports what that validation reached
+//! ([`crate::state::SETTLED_REGISTRATION_STATUS`]).
+//!
+//! Four refusals this handler adds beyond the constraints the boundary
 //! validator enforces, spelled out here so a later fixer does not read them as
 //! model-derived:
 //!
+//! * a `legalAddress` submitted for a registration type AWS derives the address
+//!   from the tax number for (`crate::state::TYPES_WITH_DERIVED_LEGAL_ADDRESS`)
+//!   is refused: the address is not the caller's to supply. India's `PAN` is such
+//!   a type, and because this emulator has no registry to derive an address FROM,
+//!   while every shape that reports a registration requires one, a `PAN` entry
+//!   cannot be stored here either way — the same knowingly-not-emulated gap as
+//!   the Brazil and Mexico carve-outs below.
 //! * `legalName` and `legalAddress` are optional on `TaxRegistrationEntry` but
 //!   `@required` on every shape that REPORTS a registration (`TaxRegistration`,
 //!   `TaxRegistrationWithJurisdiction`), so an entry omitting either is refused
 //!   rather than stored in a form no read could return. The model documents a
-//!   Brazil carve-out for both, which rests on a billing address verified in the
-//!   Billing console; this service models no API that supplies one, so the
-//!   carve-out is knowingly NOT emulated — a Brazilian TRN must be submitted
-//!   with its legal name and address here.
+//!   Brazil carve-out for both (and a Mexico one, where both are "populated
+//!   based on your tax registration number"), which rests on data verified
+//!   outside this API; this service models no API that supplies one, so the
+//!   carve-outs are knowingly NOT emulated — such a TRN must be submitted with
+//!   its legal name and address here.
 //! * the model's non-blank pattern `^(?!\s*$)[\s\S]+$` is a negative lookahead
 //!   the boundary validator's regex engine cannot compile, so this handler
 //!   applies it to `registrationId`, `legalName` and every address line.
@@ -204,6 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::resolve_account_id(input.account_id);
         let entry = &input.tax_registration_entry;
 
+        // A registration type whose legal address AWS derives from the tax
+        // number itself does not take one from the request.
+        crate::state::check_registration_type_members(entry)
+            .map_err(PutTaxRegistrationErrorModeled::ValidationException)?;
+
         // Both shapes that report a registration (`TaxRegistration`,
         // `TaxRegistrationWithJurisdiction`) mark `legalName` and `legalAddress`
         // `@required`, so a record missing either could never be read back:
@@ -266,7 +287,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let revision = previous_revision.map_or(1, |revision| revision.saturating_add(1));
-        let stored = crate::state::StoredTaxRegistration::from_entry(entry, &account_id, revision);
+        let stored = crate::state::StoredTaxRegistration::from_entry(
+            entry,
+            &account_id,
+            revision,
+            ::std::time::Instant::now(),
+        );
         let status = stored.status.clone();
         store.registrations.insert(account_id, stored);
 

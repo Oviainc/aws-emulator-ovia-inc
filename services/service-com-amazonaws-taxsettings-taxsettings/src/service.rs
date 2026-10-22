@@ -41,9 +41,106 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with: the
+/// modelled `ValidationException` (`@httpError 400`), which every operation of
+/// this service declares. Restated here because `override_refusal` replaces the
+/// code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// Render one constraint violation the way this service states it: the member
+/// path and the violated constraint, and NOTHING of the value that was refused.
+///
+/// Returns `None` for a violation class this service has no wording for, which
+/// lets [`constraint_envelope`] decline the whole refusal and keep the
+/// framework's wording rather than invent a sentence for it ([`ViolationKind`]
+/// is `#[non_exhaustive]`, so a class can be added upstream).
+fn constraint_clause(violation: &Violation) -> Option<String> {
+    let requirement = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        // The requirement reported is the expression itself, without the `^` /
+        // `$` the model spells it with: the service states the pattern a value
+        // must satisfy, not the anchoring the model uses to make the match
+        // total, so a client that re-validates locally with the pattern it read
+        // out of the message uses the one AWS documents.
+        ViolationKind::Pattern(pattern) => format!(
+            "Member must satisfy regular expression pattern: {}",
+            unanchored(pattern)
+        ),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return None,
+    };
+    // An absent member has no submitted value at all, so it is reported as the
+    // null it was: that is a fact of the request's shape, not a rendering of a
+    // value the caller sent. Every other violation names the member only. What
+    // this service validates IS the caller's tax data — `TaxRegistrationEntry`
+    // and `TaxRegistration` are `@sensitive` as whole shapes, and an exemption
+    // certificate's file name is customer document data — so no refused value is
+    // echoed into a 400 body a client logs.
+    let subject = match &violation.kind {
+        ViolationKind::MissingRequiredMember => "Value null",
+        _ => "Value",
+    };
+    Some(format!(
+        "{subject} at '{}' failed to satisfy constraint: {requirement}",
+        violation.path
+    ))
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with. A `$`
+/// escaped by a backslash is a literal dollar sign inside the expression, not
+/// the end anchor, so it stays.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// The `ValidationException` message for a refusal: the AWS envelope
+/// (`N validation error(s) detected: `) over one clause per violation.
+///
+/// `None` declines the whole refusal — see [`constraint_clause`].
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(constraint_clause)
+        .collect::<Option<Vec<_>>>()?;
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-taxsettings-taxsettings` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +195,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // This service states a constraint violation WITHOUT the value that
+        // violated it, and states a `@pattern` without the model's anchors — the
+        // form the real service answers with, and the form a client parsing the
+        // standard `1 validation error detected: Value at '<path>' … pattern:
+        // <pattern>` envelope reads the member path and the constraint out of.
+        // The code stays the modelled `ValidationException` (HTTP 400), which is
+        // what the framework would have answered; only the wording changes.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

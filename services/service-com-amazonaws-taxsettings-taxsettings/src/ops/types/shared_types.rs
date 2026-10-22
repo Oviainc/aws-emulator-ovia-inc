@@ -11,18 +11,36 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-taxsettings-taxsettings.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.taxsettings#ConflictException")]
+// `ConflictException`, `InternalServerException` and `ResourceNotFoundException` are
+// rendered with their `message` only.
+//
+// The model marks each one's `errorCode` `@required`, but it targets `ErrorCode` — a
+// free-form string (length 0..50), NOT the `ValidationExceptionErrorCode` enum — and it
+// carries a SERVICE-DEFINED code, never the exception's own shape name, which the wire
+// already carries in `x-amzn-errortype` / `__type`. This service publishes no code for a
+// missing resource, a state conflict or an internal fault, and the real service omits the
+// member on those paths rather than inventing one (recorded: a taxsettings 404 answers
+// `{"message": ...}` with no `errorCode`), so the three are declared unsupported and left
+// off the wire instead of being filled with the shape name — which a client reading
+// `errorCode` to classify a failure would take for a service code. `ValidationException`
+// below keeps its `errorCode`: that one targets the model's enum and this service has a
+// token to report.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.taxsettings#ConflictException",
+    unsupported = ["errorCode"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ConflictException {
     pub message: String,
-    pub error_code: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.taxsettings#InternalServerException")]
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.taxsettings#InternalServerException",
+    unsupported = ["errorCode"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct InternalServerException {
     pub message: String,
-    pub error_code: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.taxsettings#ValidationException")]
@@ -74,11 +92,14 @@ pub struct TaxExemptionType {
     pub applicable_jurisdictions: Option<Vec<Authority>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.taxsettings#ResourceNotFoundException")]
+/// Rendered with its `message` only — see the note above `ConflictException`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.taxsettings#ResourceNotFoundException",
+    unsupported = ["errorCode"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ResourceNotFoundException {
     pub message: String,
-    pub error_code: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.taxsettings#TaxRegistrationEntry")]

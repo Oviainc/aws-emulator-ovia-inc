@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&account_id)
             .ok_or_else(|| {
                 DeleteTaxRegistrationErrorModeled::ResourceNotFoundException(
-                    crate::state::no_tax_registration(&account_id),
+                    crate::state::no_tax_registration(),
                 )
             })?;
         Ok(DeleteTaxRegistrationOutput {})

@@ -13,45 +13,78 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_STORED_REGISTRATIONS,
+    ComAmazonawsTaxsettingsTaxsettingsState, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+    MAX_STORED_REGISTRATIONS, STATUS_PENDING,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One emulator: this service mounted on one shared engine. Each test builds its
 /// own, so no test observes another's writes.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, with the engine it was built on — for a test that has to
+/// move a clock-owed transition rather than wait for it.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_taxsettings_taxsettings::EmulatedService::new(engine),
+        service_com_amazonaws_taxsettings_taxsettings::EmulatedService::new(engine.clone()),
     );
-    router
+    (router, engine)
+}
+
+/// Hold every stored TRN's validation open, so a read reports the status its
+/// write reported however long the test takes to get there.
+pub(crate) fn hold_validations_open(engine: &Arc<engine::InMemoryEngine>) {
+    let state = engine.state::<ComAmazonawsTaxsettingsTaxsettingsState>();
+    let mut store = state.lock();
+    for stored in store.registrations.values_mut() {
+        stored.validation_due_at = Some(Instant::now() + Duration::from_secs(3_600));
+    }
+}
+
+/// Make every stored TRN's validation due, the way the clock would have: the
+/// next read must report what the validation reached. Never a sleep — the due
+/// instant is state.
+pub(crate) fn make_validations_due(engine: &Arc<engine::InMemoryEngine>) {
+    let state = engine.state::<ComAmazonawsTaxsettingsTaxsettingsState>();
+    let mut store = state.lock();
+    for stored in store.registrations.values_mut() {
+        stored.validation_due_at = Some(Instant::now());
+    }
 }
 
 /// What one TaxSettings call answered: the HTTP status, the restJson1 `__type`
 /// error code (empty on success) and the parsed JSON body.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_code: String,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// A body member, or `Value::Null` when the response omitted it.
-    fn get(&self, member: &str) -> &Value {
+    pub(crate) fn get(&self, member: &str) -> &Value {
         self.body.get(member).unwrap_or(&Value::Null)
     }
 }
 
 /// Call one operation. The SigV4 credential scope names `tax`, this service's
 /// signing name, which is how the router picks the service that claims it.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> Answer {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://tax.us-east-1.amazonaws.com/{operation}"))
@@ -96,9 +129,11 @@ struct Case {
 ///
 /// `registrationType` covers every value of the model's `TaxRegistrationType`
 /// enum — `VAT | GST | CPF | CNPJ | SST | TIN | NRIC | PAN | NIP`
-/// (`smithy_query(query="shape", shape="TaxRegistrationType")`) — so the table
-/// includes the seven the issue did not cite. `sector` covers every value of
-/// `Sector` (`Business | Individual | Government`).
+/// (`smithy_query(query="shape", shape="TaxRegistrationType")`) — except `PAN`,
+/// whose legal address AWS derives from the tax number so that an entry may not
+/// submit one; `tests/all/fidelity_rules.rs` covers every type against that rule.
+/// `sector` covers every value of `Sector` (`Business | Individual |
+/// Government`).
 fn round_trip_cases() -> Vec<Case> {
     vec![
         Case {
@@ -214,21 +249,6 @@ fn round_trip_cases() -> Vec<Case> {
             }),
         },
         Case {
-            name: "PAN registration",
-            account_id: "000000000008",
-            entry: json!({
-                "registrationId": "ABCDE1234F",
-                "registrationType": "PAN",
-                "legalName": "Acme India Private Limited",
-                "sector": "Business",
-                "legalAddress": {
-                    "stateOrRegion": "Maharashtra",
-                    "postalCode": "400001",
-                    "countryCode": "IN",
-                },
-            }),
-        },
-        Case {
             name: "NIP registration with Polish additional information",
             account_id: "000000000009",
             entry: json!({
@@ -261,9 +281,13 @@ const ECHOED_MEMBERS: &[&str] = &[
 /// RULE: a stored tax registration is reported, member for member, as it was
 /// submitted, with the status `PutTaxRegistration` returned — for every entry
 /// the model's shapes admit, not just the cited one.
+///
+/// Every TRN's validation is held open here, so the status a read reports is the
+/// one the write reported; `tests/all/fidelity_rules.rs` drives the transition
+/// the clock owes once that validation falls due.
 #[tokio::test]
 async fn a_stored_registration_is_reported_exactly_as_submitted() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     for case in round_trip_cases() {
         let put = call(
             &router,
@@ -276,12 +300,12 @@ async fn a_stored_registration_is_reported_exactly_as_submitted() {
             "case {:?}: PutTaxRegistration expected 200, got {} {:?}",
             case.name, put.status, put.body
         );
+        hold_validations_open(&engine);
         let put_status = put.get("status").as_str().unwrap_or_default().to_string();
-        assert!(
-            !put_status.is_empty(),
-            "case {:?}: PutTaxRegistration must report a status, got {:?}",
-            case.name,
-            put.body
+        assert_eq!(
+            put_status, STATUS_PENDING,
+            "case {:?}: PutTaxRegistration must report the status it stored, got {:?}",
+            case.name, put.body
         );
 
         let got = call(
@@ -680,7 +704,7 @@ async fn deleting_a_registration_removes_it_from_every_read() {
 /// registration again replaces the account's record rather than adding one.
 #[tokio::test]
 async fn reads_are_repeatable_and_a_rewrite_replaces_the_record() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     let account_id = "000000000042";
     let first = json!({
         "registrationId": "DE111111111",
@@ -703,6 +727,10 @@ async fn reads_are_repeatable_and_a_rewrite_replaces_the_record() {
     )
     .await;
     assert_eq!(put.status, 200, "setup put failed: {:?}", put.body);
+    // A read settles the TRN validation the clock has made due, which is a
+    // change the clock owed, not one the read made: hold it open so that what is
+    // left to observe is only what the reads themselves do.
+    hold_validations_open(&engine);
 
     // Three identical reads, plus a listing between them: every read must answer
     // the same thing.
@@ -731,6 +759,7 @@ async fn reads_are_repeatable_and_a_rewrite_replaces_the_record() {
     )
     .await;
     assert_eq!(rewrite.status, 200, "rewrite failed: {:?}", rewrite.body);
+    hold_validations_open(&engine);
     let got = call(
         &router,
         "GetTaxRegistration",
@@ -819,49 +848,8 @@ async fn an_omitted_account_id_is_the_callers_own_account() {
     );
 }
 
-/// RULE: `GetTaxInheritance` reports the election `PutTaxInheritance` last
-/// recorded, and reports none while none has been recorded.
-#[tokio::test]
-async fn tax_inheritance_reports_the_last_election_recorded() {
-    let router = emulator();
-
-    let before = call(&router, "GetTaxInheritance", &json!({})).await;
-    assert_eq!(
-        before.status, 200,
-        "GetTaxInheritance expected 200, got {} {:?}",
-        before.status, before.body
-    );
-    assert!(
-        before.get("heritageStatus").is_null(),
-        "expected no election before any was recorded, got {:?}",
-        before.body
-    );
-
-    // Every `HeritageStatus` value the model lists, each written twice over, so
-    // the read tracks the LAST write rather than the first.
-    for election in ["OptIn", "OptOut", "OptIn"] {
-        let put = call(
-            &router,
-            "PutTaxInheritance",
-            &json!({ "heritageStatus": election }),
-        )
-        .await;
-        assert_eq!(
-            put.status, 200,
-            "case {election:?}: PutTaxInheritance expected 200, got {} {:?}",
-            put.status, put.body
-        );
-        for _ in 0..2 {
-            let got = call(&router, "GetTaxInheritance", &json!({})).await;
-            assert_eq!(
-                got.get("heritageStatus").as_str(),
-                Some(election),
-                "case {election:?}: expected the election just recorded, got {:?}",
-                got.body
-            );
-        }
-    }
-}
+// The tax-inheritance election — what `GetTaxInheritance` reports and who may
+// set it — is covered by `tests/all/fidelity_rules.rs`.
 
 /// One refused (or accepted) request: the operation, the body, and the answer it
 /// must get.
@@ -1047,22 +1035,25 @@ async fn values_outside_the_model_are_refused_and_values_inside_it_are_served() 
             error_code: "ValidationException",
             modelled_error_code: "",
         },
-        // Both HeritageStatus values the model lists are served.
+        // Both `HeritageStatus` values the model lists reach the handler's own
+        // rule: only an AWS Organizations management account may set the
+        // election, and no caller this emulator serves is one — see
+        // `tests/all/fidelity_rules.rs`.
         Refusal {
             name: "heritageStatus OptIn",
             operation: "PutTaxInheritance",
             body: json!({ "heritageStatus": "OptIn" }),
-            status: 200,
-            error_code: "",
-            modelled_error_code: "",
+            status: 400,
+            error_code: "ValidationException",
+            modelled_error_code: "FieldValidationFailed",
         },
         Refusal {
             name: "heritageStatus OptOut",
             operation: "PutTaxInheritance",
             body: json!({ "heritageStatus": "OptOut" }),
-            status: 200,
-            error_code: "",
-            modelled_error_code: "",
+            status: 400,
+            error_code: "ValidationException",
+            modelled_error_code: "FieldValidationFailed",
         },
     ];
 
@@ -1311,6 +1302,14 @@ async fn the_resident_registration_store_is_bounded() {
         (409, "ConflictException"),
         "case {overflow_account:?}: expected 409 ConflictException past the \
          {MAX_STORED_REGISTRATIONS}-record bound, got {refused:?}"
+    );
+    // The refusal body carries the members this service populates and no more:
+    // `errorCode` is a service-defined code, not the exception's shape name,
+    // which the wire already carries in `__type`.
+    assert!(
+        refused.body.get("errorCode").is_none(),
+        "case {overflow_account:?}: the conflict body must not carry an errorCode, got {:?}",
+        refused.body
     );
     let not_stored = call(
         &router,

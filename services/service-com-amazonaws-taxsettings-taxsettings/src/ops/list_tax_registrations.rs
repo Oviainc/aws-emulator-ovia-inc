@@ -178,7 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it is bounded by `page_size` records, not by the size of the store; the
         // guard is released before the response is assembled.
         let (account_details, more_remain) = {
-            let store = state.lock();
+            let mut store = state.lock();
+            // Enumerating the registrations settles the TRN validations the clock
+            // has already made due, so the listing reports each record in the
+            // same state `GetTaxRegistration` does.
+            store.settle_due(::std::time::Instant::now());
             let mut remaining = store
                 .registrations
                 .iter()

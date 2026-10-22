@@ -2,8 +2,13 @@
 
 //! @op GetTaxRegistration
 //!
-//! Reports the tax registration stored for an account. Purely reporting: it
-//! changes nothing a later caller sees.
+//! Reports the tax registration stored for an account, after settling the TRN
+//! validation the clock has already made due
+//! ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::settle_due`]). That
+//! settling is the only thing it writes, and it writes what was owed at an
+//! instant the WRITE fixed, whether or not anybody called: it starts nothing and
+//! decides nothing, so what a later caller sees is what the clock had already
+//! made true.
 //!
 //! ## Shape of an operation
 //!
@@ -143,14 +148,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let account_id = crate::state::resolve_account_id(input.account_id);
-        let tax_registration = state
-            .lock()
+        // Reporting the registration settles the TRN validation the clock has
+        // already made due — the status the record had at that instant whether or
+        // not anybody called — and reports what it reached. Nothing else about
+        // the record changes, so a later caller sees exactly this.
+        let mut store = state.lock();
+        store.settle_due(::std::time::Instant::now());
+        let tax_registration = store
             .registrations
             .get(&account_id)
             .map(crate::state::StoredTaxRegistration::to_tax_registration)
             .ok_or_else(|| {
                 GetTaxRegistrationErrorModeled::ResourceNotFoundException(
-                    crate::state::no_tax_registration(&account_id),
+                    crate::state::no_tax_registration(),
                 )
             })?;
         Ok(GetTaxRegistrationOutput {

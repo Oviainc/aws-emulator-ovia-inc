@@ -2,9 +2,11 @@
 
 //! @op GetTaxInheritance
 //!
-//! Reports the tax-inheritance election `PutTaxInheritance` last recorded, and
-//! reports it absent while no election has been recorded. Purely reporting: it
-//! changes nothing a later caller sees.
+//! Reports the account's tax-inheritance election: the one `PutTaxInheritance`
+//! recorded, or [`crate::state::DEFAULT_HERITAGE_STATUS`] while none is
+//! recorded — `HeritageStatus` is `OptIn | OptOut` with no "unset" value, so an
+//! account that has not opted in is opted out. Purely reporting: it changes
+//! nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -138,7 +140,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::state_unavailable(),
             )
         })?;
-        let heritage_status = state.lock().tax_inheritance.clone();
-        Ok(GetTaxInheritanceOutput { heritage_status })
+        // The account's election, or the one it has while none is recorded:
+        // `HeritageStatus` has two values and no "unset" token, so an account
+        // that has not opted in is reported `OptOut` rather than with the member
+        // missing — a client branching on the status must be able to tell the two
+        // apart.
+        let heritage_status = state
+            .lock()
+            .tax_inheritance
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_HERITAGE_STATUS.to_string());
+        Ok(GetTaxInheritanceOutput {
+            heritage_status: Some(heritage_status),
+        })
     }
 }
