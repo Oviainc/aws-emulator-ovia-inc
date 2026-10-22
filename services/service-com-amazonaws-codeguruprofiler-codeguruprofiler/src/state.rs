@@ -9,7 +9,9 @@ use std::collections::{HashMap, VecDeque};
 
 use ::aws_smithy_types::DateTime;
 
-use crate::ops::types::{AgentOrchestrationConfig, ProfilingGroupDescription, ProfilingStatus};
+use crate::ops::types::{
+    AgentOrchestrationConfig, FindingsReportSummary, ProfilingGroupDescription, ProfilingStatus,
+};
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
 /// credential scope to read a region from). `emulator_arn`'s own documented default.
@@ -57,6 +59,16 @@ pub const MAX_PROFILING_GROUPS: usize = 256;
 /// stored group count. Inside the modelled `maxResults` range (1..1000).
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 
+/// The `AggregationPeriod` of a DAILY profile, as the model's `AggregationPeriod` enum
+/// spells it (its values are "P1D", "PT1H", "PT5M" — see `AGGREGATION_PERIOD_VALUES`).
+/// A findings report over a `P1D` profile is what `dailyReportsOnly` selects.
+pub const DAILY_AGGREGATION_PERIOD: &str = "P1D";
+
+/// How many findings reports one profiling group retains, so the report store is
+/// bounded the way the profile store is. Emulator-chosen, like
+/// [`MAX_RETAINED_PROFILES_PER_GROUP`]; the oldest analysed window is dropped first.
+pub const MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP: usize = 64;
+
 /// How many `PostAgentProfile` idempotency tokens one group remembers. Emulator-chosen,
 /// and deliberately larger than [`MAX_RETAINED_PROFILES_PER_GROUP`] so every retained
 /// profile's token is still recognised as a replay; the oldest token is forgotten
@@ -71,6 +83,62 @@ pub struct AgentProfile {
     pub bytes: Vec<u8>,
     pub content_type: String,
     pub received_at: DateTime,
+}
+
+/// One recommendation ("findings") report: the result of analysing ONE profile window
+/// of one group, which `ListFindingsReports` and `GetFindingsReportAccountSummary`
+/// summarise as a `FindingsReportSummary`.
+///
+/// Reports are STORED, never derived from a request: this emulator runs no
+/// recommendation analysis of its own, so the only way one enters the store is
+/// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_findings_report`] — a
+/// group that has had no analysis recorded against it holds no reports, and
+/// `ListFindingsReports` answers it with an empty list rather than with invented
+/// findings.
+#[derive(Debug, Clone)]
+pub struct FindingsReport {
+    /// `FindingsReportSummary.id`: the report's UUID (the member's modelled pattern is
+    /// `[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`).
+    pub id: String,
+    /// Start of the profile window the analysis covered.
+    pub profile_start_time: DateTime,
+    /// End of the profile window the analysis covered.
+    pub profile_end_time: DateTime,
+    /// `FindingsReportSummary.totalNumberOfFindings`: "The total number of different
+    /// recommendations that were found by the analysis."
+    pub total_number_of_findings: i32,
+    /// The `AggregationPeriod` of the profile analysed — what `dailyReportsOnly`
+    /// selects on. `FindingsReportSummary` has no member for it, so it is stored and
+    /// never reported.
+    pub aggregation_period: String,
+}
+
+impl FindingsReport {
+    /// The `FindingsReportSummary` a list operation reports for this stored report.
+    /// `profilingGroupName` comes from the stored group, not from the request that is
+    /// asking for it.
+    pub fn summary(&self, group_name: &str) -> FindingsReportSummary {
+        FindingsReportSummary {
+            id: Some(self.id.clone()),
+            profiling_group_name: Some(group_name.to_string()),
+            profile_start_time: Some(self.profile_start_time),
+            profile_end_time: Some(self.profile_end_time),
+            total_number_of_findings: Some(self.total_number_of_findings),
+        }
+    }
+
+    /// Whether this is a report over a daily profile — the reports
+    /// `dailyReportsOnly=true` restricts a listing to.
+    pub fn is_daily(&self) -> bool {
+        self.aggregation_period == DAILY_AGGREGATION_PERIOD
+    }
+
+    /// Whether the profile window this report analysed overlaps the closed interval
+    /// `[start, end]` — the time range a listing asks about.
+    pub fn overlaps(&self, start: DateTime, end: DateTime) -> bool {
+        self.profile_end_time.as_secs_f64() >= start.as_secs_f64()
+            && self.profile_start_time.as_secs_f64() <= end.as_secs_f64()
+    }
 }
 
 /// A profiling group, as Create/ConfigureAgent/PostAgentProfile left it.
@@ -101,6 +169,11 @@ pub struct ProfilingGroup {
     /// first. Bounded at [`MAX_RETAINED_PROFILE_TOKENS_PER_GROUP`] by
     /// [`ProfilingGroup::remember_profile_token`], which is the only writer.
     pub seen_profile_tokens: VecDeque<String>,
+    /// The recommendation reports recorded against this group, oldest recorded FIRST.
+    /// Bounded at [`MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP`] by
+    /// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_findings_report`],
+    /// which is the only writer.
+    pub findings_reports: VecDeque<FindingsReport>,
 }
 
 impl ProfilingGroup {
@@ -167,6 +240,31 @@ impl ProfilingGroup {
         }
         self.seen_profile_tokens.push_back(token.to_string());
         true
+    }
+
+    /// This group's recorded findings reports that a listing of `[start, end]` reports:
+    /// those whose analysed profile window overlaps that range, and — when
+    /// `daily_only` — only those over a daily (`P1D`) profile. Ordered by analysed
+    /// window, oldest first, then by report id, so paging a listing visits every
+    /// report exactly once however the store was written.
+    pub fn findings_reports_in(
+        &self,
+        start: DateTime,
+        end: DateTime,
+        daily_only: bool,
+    ) -> Vec<&FindingsReport> {
+        let mut reports: Vec<&FindingsReport> = self
+            .findings_reports
+            .iter()
+            .filter(|report| report.overlaps(start, end) && (!daily_only || report.is_daily()))
+            .collect();
+        reports.sort_by(|left, right| {
+            left.profile_start_time
+                .as_secs_f64()
+                .total_cmp(&right.profile_start_time.as_secs_f64())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        reports
     }
 
     /// The most recently received profile whose receipt time falls in
@@ -247,6 +345,26 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
             }
         }
         PostedProfile::Stored
+    }
+
+    /// Record one recommendation report against `group_name`, within
+    /// [`MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP`] (the oldest recorded report is
+    /// dropped first, so the report store cannot grow without limit). `false` when
+    /// there is no such group.
+    ///
+    /// The ONLY way a findings report enters this store. The emulator performs no
+    /// recommendation analysis of profiles — nothing in it invents findings — so a
+    /// group holds reports only where analysis was recorded for it, which is why
+    /// `ListFindingsReports` answers a group that has had none with an empty list.
+    pub fn record_findings_report(&mut self, group_name: &str, report: FindingsReport) -> bool {
+        let Some(group) = self.groups.get_mut(group_name) else {
+            return false;
+        };
+        while group.findings_reports.len() >= MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP {
+            group.findings_reports.pop_front();
+        }
+        group.findings_reports.push_back(report);
+        true
     }
 
     /// Profile bytes retained across every group — what

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutPackageOriginConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutPackageOriginConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutPackageOriginConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the `publish`/`upstream` origin restrictions on a package of a repository and
+//! answers with the stored configuration. Creates the package record, with no versions,
+//! when the repository does not hold it yet — which the model's own documentation for this
+//! operation states explicitly — so this is the operation that puts a package into a
+//! repository's package map that [`crate::ops::list_packages`] reads.
 //!
 //! ## Shape of an operation
 //!
@@ -181,20 +177,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutPackageOriginConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutPackageOriginConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutPackageOriginConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutPackageOriginConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(
+                PutPackageOriginConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Domain {} not found.", input.domain),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some("domain".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(repository) = domain.repositories.get_mut(&input.repository) else {
+            return Err(
+                PutPackageOriginConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Repository {} not found in domain {}.",
+                            input.repository, input.domain
+                        ),
+                        resource_id: Some(input.repository.clone()),
+                        resource_type: Some("repository".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let key = crate::state::package_key(
+            &input.format,
+            input.namespace.as_deref(),
+            &input.package,
+        );
+
+        // Creating a package record is a growth site, so it is bounded; setting the
+        // restrictions on a package the repository already holds is not, and is accepted
+        // even at the ceiling.
+        if !repository.packages.contains_key(&key)
+            && repository.packages.len() >= crate::state::MAX_PACKAGES_PER_REPOSITORY
+        {
+            return Err(PutPackageOriginConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Cannot create package {}: repository {} already holds the maximum of {} packages.",
+                        input.package,
+                        input.repository,
+                        crate::state::MAX_PACKAGES_PER_REPOSITORY
+                    ),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Documented behaviour of THIS operation: "PutPackageOriginConfiguration can be
+        // called on a package that doesn't yet exist in the repository. When called on a
+        // package that does not exist, a package is created in the repository with no
+        // versions and the requested restrictions are set on the package." So the write
+        // is an upsert keyed by the (format, namespace, package) triple, and the record's
+        // identity comes from the key, never from the previous value.
+        let package = repository
+            .packages
+            .entry(key)
+            .or_insert_with(|| crate::state::Package {
+                format: input.format.clone(),
+                namespace: input.namespace.clone(),
+                name: input.package.clone(),
+                origin_restrictions: input.restrictions.clone(),
+            });
+        // The restrictions are set on both paths — the insert above stores them for a new
+        // record, so only an existing one still needs overwriting.
+        package.origin_restrictions = input.restrictions;
+
+        // The response is the projection of the record that was just stored, so a later
+        // read of the same package cannot disagree with it.
+        Ok(PutPackageOriginConfigurationOutput {
+            origin_configuration: Some(package.origin_configuration()),
+        })
     }
 }
