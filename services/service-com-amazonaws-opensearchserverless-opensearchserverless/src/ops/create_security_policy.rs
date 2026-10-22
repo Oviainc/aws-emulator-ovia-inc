@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSecurityPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSecurityPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSecurityPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: parses the `policy` text, stores a `SecurityPolicyRecord` in
+//! [`crate::state`] under its `(type, name)` pair with a freshly minted `policyVersion`,
+//! and answers from the stored record. A second create for the same pair is a
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +84,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::SecurityPolicyRecord;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +157,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSecurityPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSecurityPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSecurityPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSecurityPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `SecurityPolicyType` is an enum the boundary validator does not narrow, so the
+        // handler refuses a value outside the model's own value list.
+        if !SECURITY_POLICY_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            return Err(CreateSecurityPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "type must be one of [{}], got {:?}",
+                        SECURITY_POLICY_TYPE_VALUES.join(", "),
+                        input.r#type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `policy` arrives as text and `SecurityPolicyDetail$policy` is a document, so the
+        // text has to parse as JSON for there to be a policy at all. It is stored PARSED,
+        // which is also what makes a read answer "the JSON policy document without any
+        // whitespaces" rather than the caller's own formatting.
+        let parsed: serde_json::Value = serde_json::from_str(&input.policy).map_err(|error| {
+            CreateSecurityPolicyErrorModeled::ValidationException(ValidationException {
+                message: Some(format!("policy must be a JSON document: {error}")),
+            })
+        })?;
+        let policy = crate::state::document_from_json(&parsed);
+
+        let mut store = state.lock();
+
+        // A replayed `clientToken` is a retry of the call that created the policy, so it
+        // answers that policy instead of creating or conflicting with a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(record) = store.replayed_security_policy(Self::NAME, token) {
+                return Ok(CreateSecurityPolicyOutput {
+                    security_policy_detail: Some(record.detail()),
+                });
+            }
+        }
+
+        let key = (input.r#type.clone(), input.name.clone());
+        if store.security_policies.contains_key(&key) {
+            return Err(CreateSecurityPolicyErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Policy with name {} and type {} already exists",
+                        input.name, input.r#type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.security_policy_count(&input.r#type)
+            >= crate::state::MAX_SECURITY_POLICIES_PER_TYPE
+        {
+            return Err(
+                CreateSecurityPolicyErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "Maximum number of {} policies exceeded: {}",
+                            input.r#type,
+                            crate::state::MAX_SECURITY_POLICIES_PER_TYPE
+                        ),
+                        resource_id: Some(input.name.clone()),
+                        resource_type: Some("security-policy".to_string()),
+                        service_code: crate::state::ARN_NAMESPACE.to_string(),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let created_date = crate::state::now_epoch_millis();
+        let policy_version = store.next_policy_version(created_date);
+        let record = SecurityPolicyRecord {
+            kind: input.r#type.clone(),
+            name: input.name.clone(),
+            policy_version,
+            description: input.description,
+            policy,
+            created_date,
+            // A just-created policy has only ever been written once, so it was last
+            // modified when it was created.
+            last_modified_date: created_date,
+        };
+        store.security_policies.insert(key.clone(), record);
+        if let Some(token) = input.client_token.as_deref() {
+            let value = crate::state::security_policy_token_value(&key.0, &key.1);
+            store.remember_token(Self::NAME, token, &value);
+        }
+
+        // Answered from the STORED record, so the create cannot report anything a later
+        // `GetSecurityPolicy` would not.
+        let stored = store.security_policies.get(&key).ok_or_else(|| {
+            CreateSecurityPolicyError::from(
+                CreateSecurityPolicyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                    },
+                ),
+            )
+        })?;
+        Ok(CreateSecurityPolicyOutput {
+            security_policy_detail: Some(stored.detail()),
+        })
     }
 }

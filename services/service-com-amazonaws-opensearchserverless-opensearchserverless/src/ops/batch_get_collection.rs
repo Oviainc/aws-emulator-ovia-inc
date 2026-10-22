@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetCollection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetCollection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetCollection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves each requested id or name against the `CollectionRecord`s stored
+//! in [`crate::state`], reporting every field from the stored record (including the
+//! endpoints derived from the collection id) and placing the ids or names that name no
+//! stored collection in `collectionErrorDetails`.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +140,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetCollection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetCollectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetCollection"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetCollectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // From `ids`' and `names`' own documentation: "You can't provide names and IDs in
+        // the same request" — and a request that names neither selects no collection at
+        // all, so neither combination is servable.
+        let refusal = match (input.ids.as_deref(), input.names.as_deref()) {
+            (Some(_), Some(_)) => Some("ids and names cannot be provided in the same request"),
+            (None, None) => Some("one of ids or names must be provided"),
+            _ => None,
+        };
+        if let Some(message) = refusal {
+            return Err(BatchGetCollectionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        let mut details: Vec<CollectionDetail> = Vec::new();
+        let mut errors: Vec<CollectionErrorDetail> = Vec::new();
+
+        // Each requested key is answered in request order, either as a detail built from
+        // the stored record or as the `NOT_FOUND` error detail the model documents.
+        for id in input.ids.unwrap_or_default() {
+            match store.collections.get(&id) {
+                Some(record) => details.push(record.detail()),
+                None => errors.push(crate::state::collection_error_for_id(&id)),
+            }
+        }
+        for name in input.names.unwrap_or_default() {
+            match store.collection_by_name(&name) {
+                Some(record) => details.push(record.detail()),
+                None => errors.push(crate::state::collection_error_for_name(&name)),
+            }
+        }
+
+        Ok(BatchGetCollectionOutput {
+            collection_details: Some(details),
+            collection_error_details: Some(errors),
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCollection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCollection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCollection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `CollectionId`, derives the collection's ARN and its index and
+//! Dashboards endpoints from that id, stores a `CollectionRecord` in [`crate::state`]
+//! under the id (indexed by name) in the non-terminal `CREATING` status, and answers from
+//! the stored record. A second create for a name already taken is a `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +90,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::CollectionRecord;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +164,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCollection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCollectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCollection"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCollectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // The three enum members the boundary validator does not narrow: each is refused
+        // against the model's own value list, naming the member and the list.
+        for (member, supplied, allowed) in [
+            ("type", input.r#type.as_deref(), COLLECTION_TYPE_VALUES),
+            (
+                "standbyReplicas",
+                input.standby_replicas.as_deref(),
+                STANDBY_REPLICAS_VALUES,
+            ),
+            (
+                "deletionProtection",
+                input.deletion_protection.as_deref(),
+                DELETION_PROTECTION_VALUES,
+            ),
+        ] {
+            if let Some(value) = supplied {
+                if !allowed.contains(&value) {
+                    return Err(CreateCollectionErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "{member} must be one of [{}], got {value:?}",
+                                allowed.join(", ")
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+        if let Some(options) = &input.vector_options {
+            let supplied = options.serverless_vector_acceleration.as_str();
+            if !SERVERLESS_VECTOR_ACCELERATION_STATUS_VALUES.contains(&supplied) {
+                return Err(CreateCollectionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "vectorOptions.ServerlessVectorAcceleration must be one of [{}], got {supplied:?}",
+                            SERVERLESS_VECTOR_ACCELERATION_STATUS_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // A replayed `clientToken` is a retry of the call that created the collection, so
+        // it answers that collection instead of creating or conflicting with a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(record) = store.replayed_collection(Self::NAME, token) {
+                return Ok(CreateCollectionOutput {
+                    create_collection_detail: Some(record.create_detail()),
+                });
+            }
+        }
+
+        // A collection name identifies one collection in the account, so a name already
+        // taken is the conflict `ConflictException` describes: "thrown when a resource
+        // with the same name already exists or is being created".
+        if let Some(existing) = store.collection_by_name(&input.name) {
+            return Err(CreateCollectionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Collection with name {} already exists with id {}",
+                        existing.name, existing.id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.collections.len() >= crate::state::MAX_COLLECTIONS {
+            return Err(
+                CreateCollectionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "Maximum number of collections exceeded: {}",
+                            crate::state::MAX_COLLECTIONS
+                        ),
+                        resource_id: Some(input.name.clone()),
+                        resource_type: Some("collection".to_string()),
+                        service_code: crate::state::ARN_NAMESPACE.to_string(),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_collection_id();
+        let created_date = crate::state::now_epoch_millis();
+        // `EncryptionConfig` either names a customer managed key or selects the
+        // AWS-owned one; a collection encrypted with the AWS-owned key has no customer
+        // key ARN to report, so it reports the service's own marker for it.
+        let kms_key_arn = input
+            .encryption_config
+            .as_ref()
+            .and_then(|config| config.kms_key_arn.clone())
+            .unwrap_or_else(|| crate::state::AWS_OWNED_KEY.to_string());
+        let mut record = CollectionRecord {
+            id: id.clone(),
+            name: input.name,
+            // Overwritten by `begin_transition` below, which is what owes the move to
+            // `ACTIVE`.
+            status: crate::state::COLLECTION_CREATING.to_string(),
+            kind: input
+                .r#type
+                .unwrap_or_else(|| crate::state::DEFAULT_COLLECTION_TYPE.to_string()),
+            description: input.description,
+            arn: crate::state::collection_arn(&region, &id),
+            kms_key_arn,
+            standby_replicas: input
+                .standby_replicas
+                .unwrap_or_else(|| crate::state::STANDBY_REPLICAS_ENABLED.to_string()),
+            deletion_protection: input
+                .deletion_protection
+                .unwrap_or_else(|| crate::state::DELETION_PROTECTION_DISABLED.to_string()),
+            vector_options: input.vector_options,
+            collection_group_name: input.collection_group_name,
+            collection_endpoint: crate::state::collection_endpoint(&id, &region),
+            dashboard_endpoint: crate::state::dashboard_endpoint(&id, &region),
+            fips_collection_endpoint: crate::state::fips_collection_endpoint(&id, &region),
+            fips_dashboard_endpoint: crate::state::fips_dashboard_endpoint(&id, &region),
+            created_date,
+            last_modified_date: created_date,
+            tags: input.tags.unwrap_or_default(),
+            pending_status: None,
+        };
+        // The collection is returned in the non-terminal `CREATING` status and reaches
+        // `ACTIVE` on its own a moment later, with nobody calling.
+        record.begin_transition(
+            crate::state::COLLECTION_CREATING,
+            crate::state::COLLECTION_ACTIVE,
+        );
+        store.insert_collection(record);
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_token(Self::NAME, token, &id);
+        }
+
+        // Answered from the STORED record, so the create cannot report anything a later
+        // `BatchGetCollection` would not.
+        let stored = store.collections.get(&id).ok_or_else(|| {
+            CreateCollectionError::from(CreateCollectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            ))
+        })?;
+        Ok(CreateCollectionOutput {
+            create_collection_detail: Some(stored.create_detail()),
+        })
     }
 }
