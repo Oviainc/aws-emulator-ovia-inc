@@ -167,9 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Documented on `StartTime`: "The value for StartTime must be earlier than
         // the value for EndTime." An end at or before the start describes no
-        // window, so there is nothing to analyse. The modelled constraints
-        // (required members, the `Identifier` pattern, the `ServiceType` value
-        // set) are already refused before this handler runs.
+        // window, so there is nothing to analyse. The RULE is the model's; the
+        // sentence is the service-wide one every handler enforcing it shares (see
+        // [`crate::service::TIME_RANGE_ORDERING_MESSAGE`]). The modelled
+        // constraints (required members, the `Identifier` pattern, the
+        // `ServiceType` value set) are already refused by the validation stage,
+        // before this handler runs.
         if let Some(end_time) = input.end_time {
             if crate::state::timestamp_key(input.start_time)
                 >= crate::state::timestamp_key(end_time)
@@ -178,8 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     CreatePerformanceAnalysisReportErrorModeled::InvalidArgumentException(
                         InvalidArgumentException {
                             message: Some(
-                                "The value for StartTime must be earlier than the value for EndTime."
-                                    .to_string(),
+                                crate::service::TIME_RANGE_ORDERING_MESSAGE.to_string(),
                             ),
                         },
                     )

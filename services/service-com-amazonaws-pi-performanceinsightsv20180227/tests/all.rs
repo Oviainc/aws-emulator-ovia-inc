@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/authorization_gate.rs"]
 mod authorization_gate;
+#[path = "all/input_validation.rs"]
+mod input_validation;
 #[path = "all/performance_analysis_reports.rs"]
 mod performance_analysis_reports;
 #[path = "all/pi_harness.rs"]
