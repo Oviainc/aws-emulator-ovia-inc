@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReserveContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReserveContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReserveContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +146,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReserveContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReserveContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReserveContact"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ReserveContactErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        let profile = guard
+            .mission_profile_by_arn(&input.mission_profile_arn)
+            .ok_or_else(|| {
+                ReserveContactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!(
+                        "No mission profile exists with ARN {}",
+                        input.mission_profile_arn
+                    )),
+                })
+            })?
+            .clone();
+
+        // A contact window runs forwards and is at least as long as the profile's
+        // minimum viable contact duration.
+        let duration_seconds = input.end_time.as_secs_f64() - input.start_time.as_secs_f64();
+        if duration_seconds <= 0.0 {
+            return Err(ReserveContactErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some("endTime must be later than startTime".to_string()),
+                    parameter_name: Some("endTime".to_string()),
+                },
+            )
+            .into());
+        }
+        let minimum = profile.minimum_viable_contact_duration_seconds;
+        if duration_seconds < f64::from(minimum) {
+            return Err(ReserveContactErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "the contact window is {duration_seconds} seconds long, shorter than the \
+                         mission profile's minimumViableContactDurationSeconds of {minimum}"
+                    )),
+                    parameter_name: Some("endTime".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The store this emulator keeps is bounded, so a caller cannot grow it without
+        // limit; past the bound a reservation is refused the way the service refuses one
+        // that runs past an account limit. Checked after the request itself, so what the
+        // caller hears is what is wrong with the request.
+        if guard.contacts.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(ReserveContactErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} contacts",
+                        crate::state::MAX_RECORDS_PER_STORE
+                    )),
+                    parameter_name: None,
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now_timestamp();
+        let contact_id = crate::state::new_uuid();
+        let contact = crate::state::Contact {
+            contact_id: contact_id.clone(),
+            mission_profile_arn: input.mission_profile_arn,
+            satellite_arn: input.satellite_arn,
+            start_time: input.start_time,
+            end_time: input.end_time,
+            // The pre/post-pass window is the contact window widened by the profile's
+            // pre- and post-pass durations; an unset duration widens it by nothing.
+            pre_pass_start_time: crate::state::shift_seconds(
+                &input.start_time,
+                -i64::from(profile.contact_pre_pass_duration_seconds.unwrap_or(0)),
+            ),
+            post_pass_end_time: crate::state::shift_seconds(
+                &input.end_time,
+                i64::from(profile.contact_post_pass_duration_seconds.unwrap_or(0)),
+            ),
+            ground_station: input.ground_station,
+            // A reservation is admitted into SCHEDULING; the scheduler owes it the move
+            // to SCHEDULED, which any later read materialises once it is due.
+            contact_status: "SCHEDULING".to_string(),
+            region: crate::state::request_region(ctx.parts()),
+            version_id: 1,
+            tracking_overrides: input.tracking_overrides,
+            tags: input.tags.unwrap_or_default(),
+            created: now,
+            last_updated: now,
+            scheduling_settles_at: Some(
+                ::std::time::SystemTime::now() + crate::state::SCHEDULING_SETTLES_AFTER,
+            ),
+        };
+
+        // A contact has an ARN even though no operation in this slice returns one: it is
+        // what `TagResource`/`UntagResource`/`ListTagsForResource` address a contact by,
+        // and it is minted here so the one index resolves every ARN this service hands
+        // out, rather than a later operation having to re-derive and re-register it. No
+        // response carries it yet, so this entry is read by nothing until those
+        // operations (out of scope for this slice, still 501) land.
+        let contact_arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &contact.region,
+            &format!("contact/{contact_id}"),
+        );
+        guard.arn_index.insert(
+            contact_arn,
+            crate::state::ResourceRef::Contact {
+                contact_id: contact_id.clone(),
+            },
+        );
+        let version_id = contact.version_id;
+        guard.contacts.insert(contact_id.clone(), contact);
+
+        Ok(ReserveContactOutput {
+            contact_id: Some(contact_id),
+            version_id: Some(version_id),
+        })
     }
 }

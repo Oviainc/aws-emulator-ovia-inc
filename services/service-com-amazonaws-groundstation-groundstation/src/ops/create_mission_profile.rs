@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMissionProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMissionProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMissionProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -106,11 +97,29 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-groundstation-groundsta
 // here — hence the `CreateMissionProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.groundstation#CreateMissionProfile")]
+//
+// `ResourceLimitExceededException` is widened in with `extra_errors`, DELIBERATELY off
+// this operation's own modelled error set: the SERVICE models the shape (`CreateConfig`
+// and `ReserveContact` declare it, and `shared_types` emits it) and it is the shape this
+// service answers with when a create runs past an account limit, which is how the
+// bounded store below refuses one. The alternative — reporting an emulator store bound
+// through one of this operation's three declared errors — would misdescribe it: the
+// request is valid (not `InvalidParameterException`), it names resources that exist (not
+// `ResourceNotFoundException`) and nothing downstream failed (not
+// `DependencyException`). A client that models only the operation's declared errors sees
+// this as an unmodelled error with HTTP 429 and the service's own
+// `ResourceLimitExceededException` code, which is the honest answer; the bound is an
+// emulator guard on the shared in-process store, not an AWS quota (see
+// `state::MAX_RECORDS_PER_STORE`), and it is reachable only after 1,000 creates.
+#[smithy_macros::operation_error(
+    "com.amazonaws.groundstation#CreateMissionProfile",
+    extra_errors = ["ResourceLimitExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateMissionProfileErrorModeled {
     DependencyException(DependencyException),
     InvalidParameterException(InvalidParameterException),
+    ResourceLimitExceededException(ResourceLimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -165,18 +174,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMissionProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMissionProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMissionProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMissionProfileErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mission_profile_id = crate::state::new_uuid();
+        let mission_profile_arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &region,
+            &format!("mission-profile/{mission_profile_id}"),
+        );
+
+        let mut guard = state.lock();
+
+        // Every config a profile wires up must exist, and a reference whose member names
+        // ONE config type must name a config of that type: `trackingConfigArn` is "ARN of
+        // a tracking Config" and `telemetrySinkConfigArn` a telemetry-sink one, while a
+        // dataflow edge joins configs of whatever types the dataflow runs between, so an
+        // edge endpoint is only required to exist.
+        let mut referenced: Vec<(&String, Option<&str>)> =
+            vec![(&input.tracking_config_arn, Some("tracking"))];
+        if let Some(arn) = input.telemetry_sink_config_arn.as_ref() {
+            referenced.push((arn, Some("telemetry-sink")));
+        }
+        for edge in &input.dataflow_edges {
+            referenced.extend(edge.iter().map(|arn| (arn, None)));
+        }
+        for (arn, required_type) in referenced {
+            let resolved = guard.config_by_arn(arn);
+            let matches = resolved.is_some_and(|config| {
+                required_type.is_none_or(|wanted| config.config_type == wanted)
+            });
+            if !matches {
+                return Err(CreateMissionProfileErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(match required_type {
+                            Some(wanted) => format!("No {wanted} config exists with ARN {arn}"),
+                            None => format!("No config exists with ARN {arn}"),
+                        }),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The store this emulator keeps is bounded, so a caller cannot grow it without
+        // limit; past the bound a create is refused the way the service refuses one that
+        // runs past an account limit. Checked after the references above, so what the
+        // caller hears is what is wrong with the request.
+        if guard.mission_profiles.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(
+                CreateMissionProfileErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} mission profiles",
+                            crate::state::MAX_RECORDS_PER_STORE
+                        )),
+                        parameter_name: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let stored = crate::state::MissionProfile {
+            mission_profile_id: mission_profile_id.clone(),
+            mission_profile_arn: mission_profile_arn.clone(),
+            name: input.name,
+            region,
+            contact_pre_pass_duration_seconds: input.contact_pre_pass_duration_seconds,
+            contact_post_pass_duration_seconds: input.contact_post_pass_duration_seconds,
+            minimum_viable_contact_duration_seconds: input.minimum_viable_contact_duration_seconds,
+            dataflow_edges: input.dataflow_edges,
+            tracking_config_arn: input.tracking_config_arn,
+            telemetry_sink_config_arn: input.telemetry_sink_config_arn,
+            tags: input.tags.unwrap_or_default(),
+            streams_kms_key: input.streams_kms_key,
+            streams_kms_role: input.streams_kms_role,
+        };
+
+        guard.arn_index.insert(
+            mission_profile_arn,
+            crate::state::ResourceRef::MissionProfile {
+                mission_profile_id: mission_profile_id.clone(),
+            },
+        );
+        guard
+            .mission_profiles
+            .insert(mission_profile_id.clone(), stored);
+
+        Ok(CreateMissionProfileOutput {
+            mission_profile_id: Some(mission_profile_id),
+        })
     }
 }
