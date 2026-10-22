@@ -24,20 +24,25 @@ pub const ARN_SERVICE: &str = "iotsitewise";
 /// credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// How long after the creating call this emulator takes to move a new asset or
-/// asset model from `CREATING` to `ACTIVE`.
+/// How long after the call that starts it this emulator takes to settle a
+/// resource's owed transition — `CREATING` -> `ACTIVE` after a create, and
+/// `UPDATING` -> `ACTIVE` after an update.
 ///
-/// CHOSEN, not documented: AWS publishes no duration for this transition, only
-/// that `CreateAsset`/`CreateAssetModel` answer with the resource in `CREATING`
-/// and that it becomes `ACTIVE` later. The span is deliberately non-zero so a
-/// caller that reads the resource straight after creating it still observes the
-/// transient state the real service reports.
+/// CHOSEN, not documented: AWS publishes no duration for these transitions, only
+/// that `CreateAsset`/`CreateAssetModel` answer with the resource in `CREATING`,
+/// that `UpdateAsset` answers with it in `UPDATING`, and that it becomes `ACTIVE`
+/// later. The span is deliberately non-zero so a caller that reads the resource
+/// straight after the call still observes the transient state the real service
+/// reports.
 pub const ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
 /// `AssetState`/`AssetModelState` value a freshly created resource reports.
 pub const STATE_CREATING: &str = "CREATING";
 /// `AssetState`/`AssetModelState` value a settled resource reports.
 pub const STATE_ACTIVE: &str = "ACTIVE";
+/// `AssetState`/`AssetModelState` value a resource reports while a mutating call
+/// it already accepted settles.
+pub const STATE_UPDATING: &str = "UPDATING";
 /// `AssetState`/`AssetModelState` value a deleted resource's last answer carries.
 pub const STATE_DELETING: &str = "DELETING";
 
@@ -114,9 +119,13 @@ pub struct AssetModelRecord {
 impl AssetModelRecord {
     /// The model's status as of `now`: `CREATING` until the owed transition falls
     /// due, `ACTIVE` from then on. Derived, so a read never has to write.
+    ///
+    /// A model's only owed transition today is the one `CreateAssetModel` starts,
+    /// so the transient label is always `CREATING` here; `UpdateAssetModel`, which
+    /// would also owe an `UPDATING` -> `ACTIVE` one, is still a scaffold stub.
     pub fn status(&self, now: SystemTime) -> AssetModelStatus {
         AssetModelStatus {
-            state: state_at(self.active_at, now).to_string(),
+            state: state_at(STATE_CREATING, self.active_at, now).to_string(),
             error: None,
         }
     }
@@ -136,8 +145,13 @@ pub struct AssetRecord {
     pub hierarchies: Vec<AssetHierarchy>,
     pub creation_date: SystemTime,
     pub last_update_date: SystemTime,
-    /// The instant the `CREATING` -> `ACTIVE` transition the clock owes falls due.
+    /// The instant the transition the clock owes — from [`Self::settling_state`]
+    /// to `ACTIVE` — falls due.
     pub active_at: SystemTime,
+    /// The `AssetState` this asset reports until [`Self::active_at`] falls due:
+    /// [`STATE_CREATING`] for a freshly created asset, [`STATE_UPDATING`] while a
+    /// mutating call it already accepted settles.
+    pub settling_state: String,
     pub tags: HashMap<String, String>,
 }
 
@@ -168,9 +182,28 @@ impl AssetRecord {
     /// The asset's status as of `now`; see [`AssetModelRecord::status`].
     pub fn status(&self, now: SystemTime) -> AssetStatus {
         AssetStatus {
-            state: state_at(self.active_at, now).to_string(),
+            state: self.state(now).to_string(),
             error: None,
         }
+    }
+
+    /// The asset's `AssetState` as of `now`: its [`Self::settling_state`] until
+    /// the owed transition falls due, `ACTIVE` from then on. Derived, so a read
+    /// never has to write.
+    pub fn state(&self, now: SystemTime) -> &str {
+        state_at(&self.settling_state, self.active_at, now)
+    }
+
+    /// Record that a mutating call landed at `now`: the asset reports `UPDATING`
+    /// until the transition that call owes falls due, and `ACTIVE` after it.
+    ///
+    /// The due instant is STORED, never slept on, so the caller's own call
+    /// returns immediately and the transient state is still what a read taken
+    /// straight afterwards observes.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.last_update_date = now;
+        self.settling_state = STATE_UPDATING.to_string();
+        self.active_at = now + ACTIVATION_DELAY;
     }
 
     /// This asset as a `ListAssets` summary, as of `now`.
@@ -190,10 +223,10 @@ impl AssetRecord {
     }
 }
 
-/// `CREATING` before the owed transition falls due, `ACTIVE` once it has.
-fn state_at(active_at: SystemTime, now: SystemTime) -> &'static str {
+/// `settling` before the owed transition falls due, `ACTIVE` once it has.
+fn state_at(settling: &str, active_at: SystemTime, now: SystemTime) -> &str {
     if now < active_at {
-        STATE_CREATING
+        settling
     } else {
         STATE_ACTIVE
     }
