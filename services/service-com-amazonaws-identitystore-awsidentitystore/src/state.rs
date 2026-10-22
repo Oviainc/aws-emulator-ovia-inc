@@ -574,6 +574,42 @@ impl IdentityStoreData {
         Some(membership)
     }
 
+    /// Remove the group `group_id` names, releasing its `DisplayName` uniqueness
+    /// claim and every membership it holds. `None` when the store holds no such
+    /// group.
+    ///
+    /// The memberships go with the group because a `GroupMembership` is an edge
+    /// between a group and a member: once the group is gone there is nothing for the
+    /// edge to point at, so a membership naming it is a state no sequence of creates
+    /// could produce (`CreateGroupMembership` requires both ends to exist) and the
+    /// group index would keep the deleted id alive in `ListGroupMemberships`.
+    pub fn remove_group(&mut self, group_id: &str) -> Option<Group> {
+        let group = self.groups.remove(group_id)?;
+        // The index IS the store's uniqueness claim on the name, so dropping the
+        // holder frees the name for a later create. Guarded on the holder's id in case
+        // the entry has since been re-pointed at another group.
+        let claimed_name = group.display_name.clone().filter(|display_name| {
+            self.group_display_name_index
+                .get(display_name)
+                .is_some_and(|holder| holder == group_id)
+        });
+        if let Some(display_name) = claimed_name {
+            self.group_display_name_index.remove(&display_name);
+        }
+        // Taking the group's membership list out first means `remove_membership` finds
+        // no `memberships_by_group` entry to prune — harmless re-entry, the same way
+        // `remove_user` relies on for `memberships_by_member` — and it still clears
+        // each membership from `memberships` and from the member index.
+        let membership_ids = self
+            .memberships_by_group
+            .remove(group_id)
+            .unwrap_or_default();
+        for membership_id in &membership_ids {
+            self.remove_membership(membership_id);
+        }
+        Some(group)
+    }
+
     /// Remove the user `user_id` names, with the `UserName` claim it held and every
     /// membership that names it as a member. `None` when this store holds no such
     /// user, so the caller can report it as not found rather than answer a success

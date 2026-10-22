@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCreateBillScenarioUsageModification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCreateBillScenarioUsageModification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints one usage modification per request entry under the bill scenario
+//! `billScenarioId` names, stores it there, and reports each one with the `id` it was
+//! assigned and the `quantities` computed from the entry's `amounts`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCreateBillScenarioUsageModification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `billScenarioId` no live scenario carries is `ResourceNotFoundException` (HTTP
+//! 404) for the whole request — there is no parent to store anything under. A failure
+//! that belongs to ONE entry is reported in `errors` against that entry's `key`, which
+//! the model requires to be unique within a request for exactly that reason, while the
+//! other entries are still created.
+//!
+//! The operation is `@idempotent` and `clientToken` is an `@idempotencyToken`, so a
+//! replayed token answers with the modifications the first call created instead of
+//! minting a second set. A token carrying a request the first call did not make
+//! (another scenario, other entries) is `ConflictException` (HTTP 409) rather than a
+//! replay of someone else's answer.
+//!
+//! The key-uniqueness requirement is INFERRED from that member's documentation rather
+//! than declared by the model — see the comment on the branch that reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +128,109 @@ impl From<BatchCreateBillScenarioUsageModificationErrorModeled> for BatchCreateB
     }
 }
 
+/// How deep a `filterExpression` is digested before the digest stops descending.
+///
+/// `Expression` nests through caller-supplied `and`/`or`/`not`, so the recursion below
+/// is bounded rather than trusting the request's depth. A request deeper than this
+/// digests to the same value past the cap, which costs only that two such requests
+/// could share one idempotency token — never a crash.
+const MAX_EXPRESSION_DEPTH: usize = 32;
+
+/// Push the digest parts of one batch entry.
+///
+/// Written member by member rather than from a derived `Debug`, so the digest is a
+/// contract this file owns: ADD A LINE HERE when the model gives
+/// `BatchCreateBillScenarioUsageModificationEntry` (or `HistoricalUsageEntity`, or
+/// `Expression`) another member, or two requests differing only in that member will
+/// share one fingerprint. `request_fingerprint` length-prefixes every part, so parts
+/// cannot run together.
+fn push_entry_digest(parts: &mut Vec<String>, entry: &BatchCreateBillScenarioUsageModificationEntry) {
+    parts.push(entry.key.clone());
+    parts.push(entry.service_code.clone());
+    parts.push(entry.usage_type.clone());
+    parts.push(entry.operation.clone());
+    parts.push(entry.usage_account_id.clone());
+    parts.push(entry.availability_zone.clone().unwrap_or_default());
+    parts.push(entry.group.clone().unwrap_or_default());
+    for amount in entry.amounts.as_deref().unwrap_or_default() {
+        parts.push(amount.start_hour.secs().to_string());
+        parts.push(amount.amount.to_string());
+    }
+    if let Some(historical) = &entry.historical_usage {
+        parts.push(historical.service_code.clone());
+        parts.push(historical.usage_type.clone());
+        parts.push(historical.operation.clone());
+        parts.push(historical.location.clone().unwrap_or_default());
+        parts.push(historical.usage_account_id.clone());
+        parts.push(
+            historical
+                .bill_interval
+                .start
+                .map(|start| start.secs())
+                .unwrap_or_default()
+                .to_string(),
+        );
+        parts.push(
+            historical
+                .bill_interval
+                .end
+                .map(|end| end.secs())
+                .unwrap_or_default()
+                .to_string(),
+        );
+        push_expression_digest(parts, &historical.filter_expression, 0);
+    }
+}
+
+/// Push the digest parts of a filter expression, descending at most
+/// [`MAX_EXPRESSION_DEPTH`] levels.
+fn push_expression_digest(parts: &mut Vec<String>, expression: &Expression, depth: usize) {
+    if depth > MAX_EXPRESSION_DEPTH {
+        return;
+    }
+    for (member, filter) in [
+        ("costCategories", &expression.cost_categories),
+        ("dimensions", &expression.dimensions),
+        ("tags", &expression.tags),
+    ] {
+        if let Some(filter) = filter {
+            parts.push(member.to_string());
+            parts.push(filter.key.clone().unwrap_or_default());
+            parts.extend(filter.match_options.clone().unwrap_or_default());
+            parts.extend(filter.values.clone().unwrap_or_default());
+        }
+    }
+    for (member, branch) in [("and", &expression.and), ("or", &expression.or)] {
+        for child in branch.iter().flatten() {
+            parts.push(member.to_string());
+            push_expression_digest(parts, child, depth + 1);
+        }
+    }
+    if let Some(negated) = &expression.not {
+        parts.push("not".to_string());
+        push_expression_digest(parts, negated, depth + 1);
+    }
+}
+
+/// This operation's item for one stored modification.
+fn item_for(
+    modification: &crate::state::UsageModification,
+) -> BatchCreateBillScenarioUsageModificationItem {
+    BatchCreateBillScenarioUsageModificationItem {
+        id: Some(modification.id.clone()),
+        key: modification.key.clone(),
+        service_code: modification.service_code.clone(),
+        usage_type: modification.usage_type.clone(),
+        operation: modification.operation.clone(),
+        location: modification.location.clone(),
+        availability_zone: modification.availability_zone.clone(),
+        group: modification.group.clone(),
+        usage_account_id: Some(modification.usage_account_id.clone()),
+        quantities: modification.quantities(),
+        historical_usage: modification.historical_usage.clone(),
+    }
+}
+
 /// The `BatchCreateBillScenarioUsageModification` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,20 +265,206 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCreateBillScenarioUsageModification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCreateBillScenarioUsageModificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchCreateBillScenarioUsageModificationErrorModeled::DataUnavailableException(
+                    DataUnavailableException {
+                        message: "the bill scenario store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+        // Materialise the expiry the clock has already made due, so this call does not
+        // store anything under a scenario that is already past its `expiresAt`.
+        state.purge_expired(crate::state::now_secs());
+
+        // The per-entry failures this request earns, computed from the request alone:
+        // an entry whose `key` repeats an earlier entry's cannot be answered against
+        // that key. Computed BEFORE the replay branch so a replayed token reproduces
+        // the first call's `errors`, not an empty list.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCreateBillScenarioUsageModification"))
+        // INFERRED, not modelled: the model declares no `@uniqueItems`-style constraint
+        // on an entry's `key`; the requirement is read off
+        // `BatchCreateBillScenarioUsageModificationEntry$key`'s documentation ("A unique
+        // identifier for this entry in the batch operation [...] useful to identify
+        // errors associated with any usage entry"), which only holds if one key names
+        // one entry of a request. If the real service turns out to accept duplicate
+        // keys, this is the rule to drop. It is scoped to the request, as that
+        // documentation scopes it: a key may be reused by a later call.
+        let mut keys_seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+        let mut accepted: Vec<&BatchCreateBillScenarioUsageModificationEntry> =
+            Vec::with_capacity(input.usage_modifications.len());
+        let mut errors = Vec::new();
+        for entry in &input.usage_modifications {
+            if keys_seen.insert(entry.key.as_str()) {
+                accepted.push(entry);
+            } else {
+                errors.push(BatchCreateBillScenarioUsageModificationError2 {
+                    key: Some(entry.key.clone()),
+                    // CHOSEN from the values `BatchCreateBillScenarioUsageModificationErrorCode`
+                    // declares (`BAD_REQUEST` | `CONFLICT` | `INTERNAL_SERVER_ERROR` |
+                    // `NOT_FOUND`): the model does not say which one a duplicate key
+                    // earns, and a clash between two entries of one request is a
+                    // conflict rather than any of the other three.
+                    error_code: Some("CONFLICT".to_string()),
+                    error_message: Some(format!(
+                        "key {} appears more than once in this request; each entry's key must be unique",
+                        entry.key
+                    )),
+                });
+            }
+        }
+
+        // A replayed `@idempotencyToken` answers with the modifications the first call
+        // created, with their original ids — and, because the answer is only replayed
+        // when the request DIGEST also matches, the `errors` recomputed above are the
+        // ones that first call reported. The same token carrying a different request
+        // (another scenario, other entries) is not a retry, so it is refused as a
+        // conflict rather than answered with another request's modifications.
+        let mut digest_parts: Vec<String> = vec![input.bill_scenario_id.clone()];
+        for entry in &input.usage_modifications {
+            push_entry_digest(&mut digest_parts, entry);
+        }
+        let fingerprint = crate::state::request_fingerprint(&digest_parts);
+
+        match state.replay(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Replayed(ids) => {
+                // The record resolves unless pruning has removed the modifications it
+                // named, which `prune_idempotency` only does once they are gone (with
+                // their scenario, or one by one through a delete); falling through then
+                // creates what the caller asked for, exactly as `CreateBillScenario`
+                // does, rather than answering a batch with the few rows that survived.
+                if let Some(scenario) = state.bill_scenario(&input.bill_scenario_id) {
+                    let items: Vec<_> = ids
+                        .iter()
+                        .filter_map(|id| scenario.usage_modification(id))
+                        .map(item_for)
+                        .collect();
+                    if items.len() == ids.len() {
+                        return Ok(BatchCreateBillScenarioUsageModificationOutput {
+                            items: Some(items),
+                            errors: Some(errors),
+                        });
+                    }
+                }
+            }
+            crate::state::Replay::Mismatch(created) => {
+                return Err(
+                    BatchCreateBillScenarioUsageModificationErrorModeled::ConflictException(
+                        ConflictException {
+                            message: "this clientToken was already used for a different \
+                                      BatchCreateBillScenarioUsageModification request"
+                                .to_string(),
+                            // The resource the token already created, so the caller can
+                            // resolve the conflict against it.
+                            resource_id: created
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| input.bill_scenario_id.clone()),
+                            resource_type: "BillScenarioUsageModification".to_string(),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        let Some(scenario) = state.bill_scenario(&input.bill_scenario_id) else {
+            return Err(
+                BatchCreateBillScenarioUsageModificationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No bill scenario found with identifier {}",
+                            input.bill_scenario_id
+                        ),
+                        resource_id: input.bill_scenario_id.clone(),
+                        resource_type: "BillScenario".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let stored = scenario.usage_modifications.len();
+        if stored + accepted.len() > crate::state::MAX_USAGE_MODIFICATIONS_PER_BILL_SCENARIO {
+            return Err(
+                BatchCreateBillScenarioUsageModificationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "a bill scenario holds at most {} usage modifications; this scenario holds {stored}",
+                            crate::state::MAX_USAGE_MODIFICATIONS_PER_BILL_SCENARIO,
+                        ),
+                        resource_id: input.bill_scenario_id.clone(),
+                        resource_type: "BillScenarioUsageModification".to_string(),
+                        service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every id this request assigns is minted BEFORE the scenario is borrowed
+        // mutably, in one pass over the store, so no two rows of one batch (and no row
+        // and an existing resource) can share an id.
+        let created_ids = state.mint_resource_ids(accepted.len());
+
+        let mut items = Vec::with_capacity(accepted.len());
+        // Resolved again because minting needed the store immutably; the scenario was
+        // found above and this guard holds the only lock on the store, so it is still
+        // there — and if it somehow were not, the caller is told so rather than panicked at.
+        let Some(scenario) = state.bill_scenario_mut(&input.bill_scenario_id) else {
+            return Err(
+                BatchCreateBillScenarioUsageModificationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No bill scenario found with identifier {}",
+                            input.bill_scenario_id
+                        ),
+                        resource_id: input.bill_scenario_id.clone(),
+                        resource_type: "BillScenario".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        for (entry, id) in accepted.iter().zip(&created_ids) {
+            let modification = crate::state::UsageModification {
+                id: id.clone(),
+                key: Some(entry.key.clone()),
+                service_code: entry.service_code.clone(),
+                usage_type: entry.usage_type.clone(),
+                operation: entry.operation.clone(),
+                usage_account_id: entry.usage_account_id.clone(),
+                availability_zone: entry.availability_zone.clone(),
+                // Resolving a usage type's pricing location needs the pricing
+                // catalog, which this emulator does not carry.
+                location: None,
+                group: entry.group.clone(),
+                amounts: entry.amounts.clone().unwrap_or_default(),
+                historical_usage: entry.historical_usage.clone(),
+            };
+
+            items.push(item_for(&modification));
+            scenario.usage_modifications.push(modification);
+        }
+
+        state.record_idempotent(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            created_ids,
+        );
+
+        Ok(BatchCreateBillScenarioUsageModificationOutput {
+            items: Some(items),
+            errors: Some(errors),
+        })
     }
 }

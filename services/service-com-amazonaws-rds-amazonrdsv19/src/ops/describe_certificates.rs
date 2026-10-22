@@ -200,7 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
         };
 
-        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeCertificatesError::invalid_parameter_value)?;
         Ok(DescribeCertificatesOutput {
             default_certificate_for_new_launches: Some(
                 crate::state::DEFAULT_CA_CERTIFICATE_FOR_NEW_LAUNCHES.to_string(),

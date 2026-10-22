@@ -11,9 +11,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AsyncInferenceConfig, ContainerDefinition, DataCaptureConfig, ExplainerConfig, IamIdentity,
-    InferenceExecutionConfig, ManagedConfiguration, MetricsConfig, ProductionVariant,
-    ProductionVariantSummary, Tag, UserContext, VpcConfig,
+    ArtifactSource, AsyncInferenceConfig, ContainerDefinition, DataCaptureConfig, ExplainerConfig,
+    IamIdentity, InferenceExecutionConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
+    ProductionVariant, ProductionVariantSummary, Tag, UserContext, VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -48,6 +48,17 @@ pub const ENDPOINT_CONFIG_QUOTA: usize = 1_000;
 pub const ENDPOINT_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const MODEL_PACKAGE_GROUP_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. Bounds the lineage-artifact store the same way, and is what
+/// `CreateArtifact` answers `ResourceLimitExceeded` past.
+pub const ARTIFACT_QUOTA: usize = 1_000;
+
+/// The lineage group every lineage entity this account creates belongs to.
+///
+/// SageMaker ML Lineage Tracking gives an account one lineage group per Region,
+/// `sagemaker-default-lineage-group`, and reports its ARN as the `LineageGroupArn` of
+/// each entity in it; this emulator models no other lineage group, so every artifact
+/// reports this one.
+pub const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
 
 /// The most models `ListModels` returns in one page, including when `MaxResults` is
 /// absent or larger.
@@ -153,6 +164,28 @@ impl Endpoint {
     }
 }
 
+/// An artifact created by `CreateArtifact`, as `DescribeArtifact` replays it.
+///
+/// `properties` keeps the caller's map as given — `None` for an absent member and
+/// `Some(empty)` for an empty one — so a reader cannot tell them apart only because
+/// the store flattened them. It is a `BTreeMap` so the map serialises in one stable
+/// order whatever order the request arrived in.
+#[derive(Debug, Clone)]
+pub struct Artifact {
+    pub arn: String,
+    /// The Region the ARN names, i.e. the one the creating request signed for. Held
+    /// separately so the per-Region name uniqueness rule does not have to parse the ARN.
+    pub region: String,
+    pub name: Option<String>,
+    pub artifact_type: String,
+    pub source: ArtifactSource,
+    pub properties: Option<BTreeMap<String, String>>,
+    pub metadata_properties: Option<MetadataProperties>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
 /// A model package group created by `CreateModelPackageGroup`, as
 /// `DescribeModelPackageGroup` replays it.
 ///
@@ -181,6 +214,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoints: BTreeMap<String, Endpoint>,
     /// Keyed by `ModelPackageGroupName`.
     pub model_package_groups: BTreeMap<String, ModelPackageGroup>,
+    /// Lineage artifacts, keyed by `ArtifactArn` — the only identifier `DescribeArtifact`
+    /// resolves one by, and the one `CreateArtifact` mints.
+    pub artifacts: BTreeMap<String, Artifact>,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -204,6 +240,22 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// [`MODEL_PACKAGE_GROUP_QUOTA`].
     pub fn model_package_groups_below_quota(&self) -> bool {
         self.model_package_groups.len() < MODEL_PACKAGE_GROUP_QUOTA
+    }
+
+    /// Whether another artifact fits, i.e. the store is below [`ARTIFACT_QUOTA`].
+    pub fn artifacts_below_quota(&self) -> bool {
+        self.artifacts.len() < ARTIFACT_QUOTA
+    }
+
+    /// The artifact called `name` in `region`, if one is stored.
+    ///
+    /// `CreateArtifact`'s `ArtifactName` is documented unique to an account in a Region,
+    /// so this is what a create checks before taking a name. Artifacts are keyed by ARN
+    /// (the name is optional), hence the scan over a store bounded by [`ARTIFACT_QUOTA`].
+    pub fn artifact_named(&self, region: &str, name: &str) -> Option<&Artifact> {
+        self.artifacts
+            .values()
+            .find(|artifact| artifact.region == region && artifact.name.as_deref() == Some(name))
     }
 }
 
@@ -270,9 +322,53 @@ pub fn record_state_change(
 }
 
 /// `arn:aws:sagemaker:<region>:<account>:<kind>/<name>` — the one ARN form this
-/// service mints, for the three resource kinds it owns.
+/// service mints, for the resource kinds it owns.
 pub fn resource_arn(region: &str, kind: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("{kind}/{name}"))
+}
+
+/// The ARN of the Region's default lineage group (see [`DEFAULT_LINEAGE_GROUP`]), as
+/// `LineageGroupArn` carries it.
+pub fn lineage_group_arn(region: &str) -> String {
+    resource_arn(region, "lineage-group", DEFAULT_LINEAGE_GROUP)
+}
+
+/// Mint the opaque id a lineage entity's ARN carries: 32 lowercase hex digits, the form
+/// SageMaker's `artifact/<id>` ARNs take. The caller never supplies it — a lineage
+/// entity is named by its ARN, so the id is the server's to generate, and it is derived
+/// from nothing in the request.
+///
+/// Emulator-grade and deliberately NOT cryptographic: the bits come from SHA-256 over
+/// three sources, which make an id unique within a run but no more unpredictable than
+/// what they carry — a `RandomState` hash of the counter (std's hash-DoS seed, not a
+/// CSPRNG), a monotonic counter, so two ids minted in the same nanosecond on different
+/// threads differ by construction, and the wall clock in nanoseconds, so ids do not
+/// repeat across processes. An artifact id is an identifier inside an authenticated
+/// store, never a secret; nothing here may be relied on as one.
+pub fn mint_lineage_entity_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+    let counter = MINTED.fetch_add(1, Ordering::Relaxed);
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(counter);
+    let entropy = hasher.finish();
+
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_nanos())
+        .unwrap_or_default();
+
+    let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
+    ::sha2::Digest::update(&mut digest, entropy.to_le_bytes());
+    ::sha2::Digest::update(&mut digest, counter.to_le_bytes());
+    ::sha2::Digest::update(&mut digest, nanos.to_le_bytes());
+    let hashed = ::sha2::Digest::finalize(digest);
+
+    // 16 bytes of the digest, hex-rendered: the 32-digit form the real ARNs carry.
+    ::hex::encode(&hashed[..16])
 }
 
 /// The resource NAME an `ArnOrName`-typed member addresses.

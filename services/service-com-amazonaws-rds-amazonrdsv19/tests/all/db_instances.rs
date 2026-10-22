@@ -454,6 +454,24 @@ async fn create_persists_every_setting_and_describe_reads_it_back() {
     let router = emulator();
     let mut hosted_zone_ids = Vec::new();
 
+    // One row names a DB subnet group of its own, and a `DBSubnetGroupName` is now
+    // RESOLVED against the store rather than echoed, so the group has to exist before
+    // an instance can reference it.
+    expect_ok(
+        "the named subnet group is created first",
+        call(
+            &router,
+            "CreateDBSubnetGroup",
+            &params![
+                "DBSubnetGroupName" => "emu-subnets",
+                "DBSubnetGroupDescription" => "two subnets",
+                "SubnetIds.SubnetIdentifier.1" => "subnet-0a1b2c3d",
+                "SubnetIds.SubnetIdentifier.2" => "subnet-1b2c3d4e",
+            ],
+        )
+        .await,
+    );
+
     for row in INSTANCE_CASES {
         let extra: Vec<(&str, String)> = row
             .extra
