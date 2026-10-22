@@ -42,7 +42,7 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 
 /// As [`emulator`], over an engine the caller already holds — so a test can seed or
 /// inspect the service's state through the very store the handlers write.
-fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
