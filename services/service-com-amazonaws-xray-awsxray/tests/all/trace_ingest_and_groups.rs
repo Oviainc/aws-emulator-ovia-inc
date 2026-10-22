@@ -63,15 +63,21 @@ impl Answer {
 
 impl Xray {
     pub(crate) fn new() -> Self {
+        Self::with_engine().0
+    }
+
+    /// One emulator and the engine it was mounted on, for a test that has to
+    /// seed state no operation in the API writes.
+    pub(crate) fn with_engine() -> (Self, Arc<engine::InMemoryEngine>) {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(service_com_amazonaws_xray_awsxray::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ));
         // These tests exercise handlers, not SigV4; the signing name still has to
         // route, which the `Host` header below does.
         router.set_request_authentication(false);
-        Self { router }
+        (Self { router }, engine)
     }
 
     pub(crate) async fn call(&self, path: &str, body: &Value) -> Answer {
@@ -128,17 +134,21 @@ impl Xray {
 }
 
 /// Floating-point seconds compare: the values travel as JSON doubles.
-fn close(actual: f64, expected: f64) -> bool {
+pub(crate) fn close(actual: f64, expected: f64) -> bool {
     (actual - expected).abs() < 1e-6
 }
 
 /// A 35-character X-Ray trace id (version, 8 hex, 24 hex), distinct per `n`.
-fn trace_id(n: u32) -> String {
-    format!("1-581cf7{n:02x}-a006649127e371903a2de9{n:02}")
+///
+/// The widths are fixed, so the id stays inside `TraceId`'s modelled `@length`
+/// 1..35 for every `n`, and sorting the ids orders them by `n` — which is what
+/// the pagination cases below rely on.
+pub(crate) fn trace_id(n: u32) -> String {
+    format!("1-{n:08x}-{n:024x}")
 }
 
 /// The JSON array member of `value`, or an empty slice.
-fn array<'a>(value: &'a Value, member: &str) -> &'a [Value] {
+pub(crate) fn array<'a>(value: &'a Value, member: &str) -> &'a [Value] {
     value
         .get(member)
         .and_then(Value::as_array)
@@ -146,7 +156,7 @@ fn array<'a>(value: &'a Value, member: &str) -> &'a [Value] {
 }
 
 /// A root segment document with the given times and optional HTTP status.
-fn root_document(id: &str, trace: &str, name: &str, start: f64, end: Option<f64>) -> Value {
+pub(crate) fn root_document(id: &str, trace: &str, name: &str, start: f64, end: Option<f64>) -> Value {
     let mut document = json!({
         "trace_id": trace,
         "id": id,

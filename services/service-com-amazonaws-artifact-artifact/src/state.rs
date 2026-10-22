@@ -33,6 +33,8 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+use smithy_server_runtime::Violation;
+
 use crate::ops::types::{
     ConflictException, CustomerAgreementSummary, InquiryDetail, InquirySummary, ReportDetail,
     ReportSummary, ResourceNotFoundException, ValidationException,
@@ -909,11 +911,64 @@ pub fn inquiry_token_mismatch(inquiry_id: &str) -> ConflictException {
 
 /// The modelled `ValidationException` for a token this service never issued, carrying
 /// `ValidationExceptionReason`'s `invalidToken`.
-pub fn invalid_token(message: impl Into<String>) -> ValidationException {
+///
+/// The message is the service's own fixed refusal text ([`INVALID_TOKEN_MESSAGE`]), not a
+/// sentence describing which check failed: which token member was refused, and why the
+/// emulator could not place it, is information about the SERVER, and a client branches on
+/// the error code and the reason rather than on prose. The token itself is not echoed
+/// either — the request already carried it.
+pub fn invalid_token() -> ValidationException {
     ValidationException {
-        message: message.into(),
+        message: INVALID_TOKEN_MESSAGE.to_string(),
         reason: REASON_INVALID_TOKEN.to_string(),
         field_list: None,
+    }
+}
+
+/// The `ValidationException` message every token refusal in this service states: a token
+/// (a `nextToken` or a `termToken`) this service did not issue is refused with this one
+/// fixed text, which neither names the check that rejected it nor echoes the token.
+pub const INVALID_TOKEN_MESSAGE: &str = "The provided token is invalid.";
+
+/// The `ValidationException` message this service states for a request the boundary
+/// validator refused against the model's own constraints.
+///
+/// The AWS validation envelope — `N validation error(s) detected: <clause>; …`, each
+/// clause naming the member path and the requirement it failed — with the REJECTED VALUE
+/// left out of the clause: a present-but-invalid value is reported as `Value at '<path>'
+/// …`, while an absent required member keeps the `Value null at '<path>' …` the framework
+/// renders, because absence IS the fact the clause is stating. Returns `None` when there
+/// is nothing to state, so the caller keeps the framework's default wording.
+///
+/// The requirement half of every clause comes from the framework's own rendering of the
+/// violation, so a constraint it learns to check cannot drift from this wording; only the
+/// echo of the value is removed.
+pub fn constraint_violation_message(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations.iter().map(clause_without_rejected_value).collect();
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
+
+/// One violation's clause with the rejected value removed from it.
+///
+/// The framework renders `Value '<shown>' at '<path>' failed to satisfy constraint: …`;
+/// the value is known here, so the echo is removed by name rather than by parsing the
+/// sentence. A clause that does not start with the echo (an absent member's `Value null`,
+/// or a wording the framework changes) is kept exactly as the framework rendered it.
+fn clause_without_rejected_value(violation: &Violation) -> String {
+    let rendered = violation.message();
+    let Some(shown) = violation.value.as_deref() else {
+        return rendered;
+    };
+    match rendered.strip_prefix(&format!("Value '{shown}' at ")) {
+        Some(rest) => format!("Value at {rest}"),
+        None => rendered,
     }
 }
 

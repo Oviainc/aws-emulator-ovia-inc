@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStandards
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStandards`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports Security Hub CSPM's published standards catalog
+//! ([`crate::state::STANDARDS_CATALOG`]) for the caller's Region: one `Standard` per
+//! published standard, with its Region-qualified ARN, name, description, provider,
+//! `EnabledByDefault` flag and managing product. The catalog is service metadata, so
+//! the response does not depend on what the account has enabled — but the account
+//! must be subscribed to call Security Hub CSPM at all, which is the modelled
+//! `InvalidAccessException` (401).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStandards::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `Providers` selects the catalog entries whose `Provider` it names, `MaxResults`
+//! bounds the page and `NextToken` resumes where the previous page stopped. Purely
+//! reporting: nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +134,27 @@ impl<Eng> DescribeStandards<Eng> {
     }
 }
 
+/// `MaxResults`' upper bound (`@range(min: 1, max: 100)` on `MaxResults`), which is
+/// also the page size used when the caller names none.
+pub const MAX_RESULTS_LIMIT: usize = 100;
+
+/// Marker the opaque `NextToken` carries, so a token minted for another list — or a
+/// value a caller invented — is rejected rather than read as an offset.
+const NEXT_TOKEN_PREFIX: &str = "securityhub:standards:";
+
+/// A `NextToken` resuming at `offset` in the catalog. Opaque to the caller: the
+/// cursor is hex-encoded, so nothing in the response invites arithmetic on it.
+fn encode_next_token(offset: usize) -> String {
+    ::hex::encode(format!("{NEXT_TOKEN_PREFIX}{offset}"))
+}
+
+/// The offset a `NextToken` resumes at, or `None` when it is not one this operation
+/// minted.
+fn decode_next_token(token: &str) -> Option<usize> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(NEXT_TOKEN_PREFIX)?.parse().ok()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for DescribeStandards<Eng>
 {
@@ -149,18 +172,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStandards` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStandardsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStandards"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeStandardsError::Modeled(DescribeStandardsErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+        let invalid_input = |message: String| {
+            DescribeStandardsError::Modeled(DescribeStandardsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                },
+            ))
+        };
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        // Reporting the catalog still requires a subscription: an account that has
+        // not enabled Security Hub CSPM is not permitted to call it.
+        if !state
+            .lock()
+            .hubs
+            .contains_key(&(account_id.clone(), region.clone()))
+        {
+            return Err(DescribeStandardsErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A `Providers` list with no values constrains nothing, so it reads the same
+        // as an omitted filter; any value the enum does not define is refused rather
+        // than silently matching no standard.
+        let providers = input.providers.as_deref().unwrap_or_default();
+        for provider in providers {
+            if !STANDARDS_PROVIDER_VALUES.contains(&provider.as_str()) {
+                return Err(invalid_input(format!(
+                    "Providers: {provider} is not a StandardsProvider; expected one of {}",
+                    STANDARDS_PROVIDER_VALUES.join(", ")
+                )));
+            }
+        }
+
+        let selected: Vec<Standard> = crate::state::standards_catalog(&region)
+            .into_iter()
+            .filter(|standard| {
+                providers.is_empty()
+                    || standard
+                        .provider
+                        .as_deref()
+                        .is_some_and(|provider| providers.iter().any(|want| want == provider))
+            })
+            .collect();
+
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator already refuses a value outside it; clamping here keeps the page
+        // bounded even if this handler is reached another way.
+        let page_size = input.max_results.map_or(MAX_RESULTS_LIMIT, |requested| {
+            usize::try_from(requested)
+                .unwrap_or(MAX_RESULTS_LIMIT)
+                .clamp(1, MAX_RESULTS_LIMIT)
+        });
+        let offset = match input.next_token.as_deref() {
+            Some(token) => decode_next_token(token).ok_or_else(|| {
+                invalid_input("NextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+        if offset > selected.len() {
+            return Err(invalid_input(
+                "NextToken refers to a position past the end of the result set".to_string(),
+            ));
+        }
+
+        let page: Vec<Standard> = selected.iter().skip(offset).take(page_size).cloned().collect();
+        let next_offset = offset + page.len();
+        let next_token = (next_offset < selected.len()).then(|| encode_next_token(next_offset));
+
+        Ok(DescribeStandardsOutput {
+            standards: Some(page),
+            next_token,
+        })
     }
 }

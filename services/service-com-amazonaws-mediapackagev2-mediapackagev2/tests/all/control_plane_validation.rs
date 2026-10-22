@@ -1000,11 +1000,13 @@ async fn an_immutable_origin_endpoint_member_cannot_be_changed_by_an_update() {
     );
 }
 
-/// RULE 7 (same rule, the never-set case) — a member with no stored value is not a
-/// member an update changes: an endpoint created without `StreamNameOutputMode` takes the
-/// one an update names, and only then is it fixed.
+/// RULE 7 (same rule, the case the create left unnamed) — the mode is immutable from
+/// creation, because the service applies one whether or not the create named it: the
+/// model states "If you don't specify a value, the default is INDEX" and "You can't
+/// change the stream name output mode after you create the endpoint". So an update
+/// repeating the applied mode is accepted and one naming the other mode is refused.
 #[tokio::test]
-async fn an_immutable_member_the_create_omitted_is_set_by_the_first_update_and_then_fixed() {
+async fn the_immutable_mode_the_create_omitted_is_the_service_applied_one() {
     let emulator = Emulator::new();
     assert_eq!(emulator.create_group("grp", json!({})).await.0, 200);
     assert_eq!(
@@ -1015,39 +1017,32 @@ async fn an_immutable_member_the_create_omitted_is_set_by_the_first_update_and_t
         .create_endpoint("grp", "chan", "ep", minimal_endpoint("TS"))
         .await;
     assert_eq!(status, 200, "case \"setup\": got {status} {created}");
-    assert!(
-        created["StreamNameOutputMode"].is_null(),
-        "case \"setup\": the create omitted the member, so nothing may be reported for it, \
-         got {created}"
+    assert_eq!(
+        created["StreamNameOutputMode"],
+        json!("INDEX"),
+        "case \"setup\": the create must report the mode the service applied, got {created}"
     );
 
-    // Nothing is stored for the member, so there is nothing to change: the update is
-    // accepted and the value it names becomes the endpoint's.
+    // Naming the applied mode is no change, so the update is accepted.
     let body = json!({
         "ContainerType": "TS",
         "HlsManifests": [{"ManifestName": "index"}],
-        "StreamNameOutputMode": "PASSTHROUGH_NAME",
+        "StreamNameOutputMode": "INDEX",
     });
     let (status, updated) = emulator
         .update_endpoint("grp", "chan", "ep", body.clone(), &[])
         .await;
     assert_eq!(
         status, 200,
-        "case \"first update supplies the mode\": expected 200, got {status} {updated}"
+        "case \"an update repeating the applied mode\": expected 200, got {status} {updated}"
     );
     assert_eq!(
-        updated["StreamNameOutputMode"], json!("PASSTHROUGH_NAME"),
-        "case \"first update supplies the mode\": the value must be stored and reported"
+        updated["StreamNameOutputMode"],
+        json!("INDEX"),
+        "case \"an update repeating the applied mode\": the mode must be kept and reported"
     );
 
-    // Repeating the same value is still no change; naming the other one now is.
-    let (status, again) = emulator
-        .update_endpoint("grp", "chan", "ep", body, &[])
-        .await;
-    assert_eq!(
-        status, 200,
-        "case \"an update repeating the stored mode\": expected 200, got {status} {again}"
-    );
+    // Naming the other mode is a change to an immutable member.
     let (status, refused) = emulator
         .update_endpoint(
             "grp",
@@ -1056,21 +1051,21 @@ async fn an_immutable_member_the_create_omitted_is_set_by_the_first_update_and_t
             json!({
                 "ContainerType": "TS",
                 "HlsManifests": [{"ManifestName": "index"}],
-                "StreamNameOutputMode": "INDEX",
+                "StreamNameOutputMode": "PASSTHROUGH_NAME",
             }),
             &[],
         )
         .await;
     assert_validation(
-        "an update changing the now-stored mode",
+        "an update changing the applied mode",
         status,
         &refused,
         "STREAM_NAME_OUTPUT_MODE_IMMUTABLE",
     );
     assert_eq!(
         emulator.get_endpoint("grp", "chan", "ep").await.1["StreamNameOutputMode"],
-        json!("PASSTHROUGH_NAME"),
-        "case \"an update changing the now-stored mode\": the stored mode must be kept"
+        json!("INDEX"),
+        "case \"an update changing the applied mode\": the stored mode must be kept"
     );
 }
 

@@ -2,316 +2,363 @@
 
 //! Cross-service routing for the `aws-marketplace` SigV4 signing name.
 //!
-//! EVERY AWS Marketplace-family service signs as `aws-marketplace` — Marketplace
-//! Catalog, Agreement, Deployment, Discovery, Entitlement, Metering and Reporting — while
-//! each serves its own endpoint (`catalog.marketplace`, `agreement-marketplace`,
+//! EVERY AWS Marketplace-family service signs as `aws-marketplace` — Catalog,
+//! Agreement, Deployment, Discovery, Entitlement, Metering and Reporting — while each
+//! serves its own endpoint (`catalog.marketplace`, `agreement-marketplace`,
 //! `deployment-marketplace`, `discovery-marketplace`, `entitlement.marketplace`,
 //! `metering.marketplace`, `reporting-marketplace`). The router resolves a request's
 //! routing key from the SigV4 credential scope first, so all seven see the key
 //! `aws-marketplace`: a service that claims on the signing name alone claims the other
-//! six's traffic too, and the router answers `500 AmbiguousService` for ALL of them. Each
-//! one therefore also requires the request to address its own wire path space — the first
-//! URI path segments its model declares, or the root path for a service whose protocol
-//! posts every operation to `/` — and, for the three RPC members that all post to that
-//! one root path, the operation the request names out of band (`x-amz-target`, or the
-//! `/operation/<Op>` segment of an `rpcv2Cbor` path).
+//! six's traffic too, and the router — which refuses to serve a request two services
+//! claim — answers `500 AmbiguousService` to every one of them.
 //!
-//! This suite pins that: with all seven mounted, each one's own path space reaches it,
-//! each RPC member's own operation reaches it, and none of them answers the router's
-//! refusals.
+//! The rule each of them applies instead: claim a request only when the signing name
+//! matches AND the request addresses that service's own modelled wire surface — the
+//! URI path space its operations bind for a REST protocol, or (for an RPC one, which
+//! posts every operation to one path and names its target out of band) that protocol's
+//! path plus the service NAMED in `X-Amz-Target` / the `rpcv2Cbor` URI. Path segments
+//! alone cannot separate the three RPC peers (Agreement, Entitlement, Metering): all of
+//! them post every operation to the same root path, so only the service a request names
+//! distinguishes them.
+//!
+//! This suite pins that over the whole family, with every service of the emulator
+//! mounted: rows across all seven, each reaching the service that owns its surface. A
+//! row's expected answer is deliberately one only that service produces — its own
+//! modelled error, or a 200 — so it can pass only when exactly one service claimed the
+//! request. The router's own refusals (`404 UnknownService` when nobody claims,
+//! `500 AmbiguousService` when several do) are excluded by construction.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
+use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 `Authorization` header whose credential scope names the signing name all seven
-/// services share. The signature is never checked: the router here runs with request
-/// authentication off.
+/// A SigV4 `Authorization` header whose credential scope names the signing name all
+/// seven services share. The signature is never checked: the router here runs with
+/// request authentication off.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIAIOSFODNN7EXAMPLE/20260101/us-east-1/aws-marketplace/aws4_request, \
      SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
-/// The router's OWN refusals, which no request below may answer: nobody claimed it, or
-/// more than one service did.
-const ROUTER_REFUSALS: [&str; 2] = ["UnknownService", "AmbiguousService"];
+/// The one catalog every AWS Marketplace Catalog operation documents.
+const CATALOG: &str = "AWSMarketplace";
 
-fn build_router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_marketplacecatalog_awsmpseymour::EmulatedService::new(Arc::clone(
-            &engine,
-        )),
-    );
-    router.register_service(
-        service_com_amazonaws_marketplaceagreement_awsmpcommerceservice_v20200301::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(
-        service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(
-        service_com_amazonaws_marketplacediscovery_awsmarketplacediscovery::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(
-        service_com_amazonaws_marketplaceentitlementservice_awsmpentitlementservice::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(
-        service_com_amazonaws_marketplacemetering_awsmpmeteringservice::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router.register_service(
-        service_com_amazonaws_marketplacereporting_awsmarketplacereporting::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    router
+/// A resource ARN of the catalog's own namespace that names no resource of this
+/// account's catalog — which its tagging and resource-policy surface answers its own
+/// `AccessDeniedException` for.
+const FOREIGN_RESOURCE_ARN: &str = "arn:aws:aws-marketplace:us-east-1:000000000000:other/thing";
+
+/// Stack for assembling the router, as `router/tests/all/boot_serve.rs` documents:
+/// `build_router` costs more stack than a cargo test thread's default, so it is
+/// assembled on a thread sized for it and handed back (a `MultiServiceRouter` is
+/// `Send`).
+const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Every service of this emulator, over one shared engine — the production router.
+fn router() -> MultiServiceRouter {
+    std::thread::Builder::new()
+        .name("marketplace-routing".to_string())
+        .stack_size(BOOT_STACK_SIZE)
+        .spawn(|| {
+            let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+            let mut router = aws_emulator_router::build_router(engine);
+            router.set_request_authentication(false);
+            router
+        })
+        .expect("spawn the router-assembly thread")
+        .join()
+        .expect("the production router must assemble")
 }
 
-/// Dispatch one request and report its status and wire error code. `target` is the
-/// `x-amz-target` header an RPC request names its operation in, absent for a REST one.
+/// What the emulator answered: the HTTP status, the wire error code (`__type`, or
+/// `code`/`Code` for a model that names it so), and the message.
+struct Answer {
+    status: u16,
+    code: String,
+    message: String,
+}
+
 async fn dispatch(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
     target: Option<&str>,
-    body: &'static str,
-) -> (u16, Option<String>) {
-    let mut builder = http::Request::builder()
+    body: Option<Value>,
+) -> Answer {
+    let payload = body.map(|value| value.to_string()).unwrap_or_default();
+    let mut builder = ::http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", "catalog.marketplace.us-east-1.amazonaws.com")
-        .header("content-type", "application/json")
+        .header("host", "localhost")
         .header("authorization", AUTHORIZATION);
     if let Some(target) = target {
         builder = builder.header("x-amz-target", target);
     }
+    if !payload.is_empty() {
+        builder = builder.header("content-type", "application/json");
+    }
     let request = builder
-        .body(Bytes::from_static(body.as_bytes()))
-        .expect("build the request");
+        .body(Bytes::from(payload))
+        .expect("the test request is well formed");
+
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
-    // The error code, read from the body's `__type` discriminator: a status alone cannot
-    // tell the router's own `UnknownService` (nobody claimed the request) or
-    // `AmbiguousService` (several did) from a service's own modeled error.
-    let error_code = serde_json::from_slice::<serde_json::Value>(response.body())
-        .ok()
-        .and_then(|body| {
-            body.get("__type")
-                .or_else(|| body.get("Code"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .map(|code| code.rsplit('#').next().unwrap_or(&code).to_string());
-    (status, error_code)
+    let parsed: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    let code = ["/__type", "/code", "/Code"]
+        .iter()
+        .filter_map(|pointer| parsed.pointer(pointer).and_then(Value::as_str))
+        .map(|raw| raw.rsplit('#').next().unwrap_or(raw).to_string())
+        .next()
+        .unwrap_or_default();
+    let message = ["/message", "/Message"]
+        .iter()
+        .filter_map(|pointer| parsed.pointer(pointer).and_then(Value::as_str))
+        .map(str::to_string)
+        .next()
+        .unwrap_or_default();
+    Answer {
+        status,
+        code,
+        message,
+    }
 }
 
+/// Rows across every service sharing the `aws-marketplace` signing name: the request
+/// that addresses a service's own wire surface reaches it, and no two services claim
+/// one request.
 #[tokio::test]
-async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_path_space() {
-    let router = build_router();
+async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_surface() {
+    let router = router();
 
-    // (case, method, uri, body, expected status, expected error code)
+    // (case, method, uri, x-amz-target, body, expected status, expected error code)
     //
-    // Asserting the ERROR CODE as well as the status is what excludes the two routing
-    // failures: the router answers `UnknownService` (404) when nobody claims a request
-    // and `AmbiguousService` (500) when several do, so a row naming a service's OWN
-    // answer can only pass when exactly one service claimed it.
-    //
-    // Marketplace Catalog owns a literal path per operation; its tagging and
-    // resource-policy operations are implemented, so an ARN naming no resource of its
-    // catalog is its own `AccessDeniedException`, its entity reads answer their own
-    // modeled result for an entity the catalog does not hold, and an operation of its own
-    // that is still scaffolded answers the scaffold's `NotImplemented` on its own path.
-    // The other family members answer on their own paths too — Reporting
-    // `/getBuyerDashboard`, Deployment `/tags/{resourceArn}`, Discovery `/2026-02-05/...`
-    // — whether they are implemented (a 200) or still scaffolded (a 501). The RPC members
-    // (Agreement, Entitlement, Metering) all claim the root path their protocol posts to;
-    // the operation each request names is what separates those three, which the suite
-    // below asserts.
-    let rows: [(&str, &str, &str, &'static str, u16, &str); 9] = [
+    // The REST four are addressed by their own path space — several rows each, spanning
+    // the shapes those path spaces take (a literal per operation, a `/tags/{arn}`
+    // label, a date-stamped prefix) — and the RPC three post to one path and name
+    // themselves in `X-Amz-Target`. An expected `""` code is a success.
+    #[allow(clippy::type_complexity)]
+    let rows: [(&str, &str, &str, Option<&str>, Option<Value>, u16, &str); 17] = [
         (
-            "marketplace catalog list tags",
+            "catalog: an empty list of change sets",
             "POST",
-            "/ListTagsForResource",
-            r#"{"ResourceArn":"arn:aws:aws-marketplace:us-east-1:000000000000:other/thing"}"#,
-            403,
-            "AccessDeniedException",
-        ),
-        (
-            "marketplace catalog get resource policy",
-            "GET",
-            "/GetResourcePolicy?resourceArn=arn%3Aaws%3Aaws-marketplace%3Aus-east-1%3A000000000000%3Aother%2Fthing",
-            "",
-            403,
-            "AccessDeniedException",
-        ),
-        (
-            "marketplace catalog list entities",
-            "POST",
-            "/ListEntities",
-            r#"{"Catalog":"AWSMarketplace","EntityType":"AmiProduct"}"#,
+            "/ListChangeSets",
+            None,
+            Some(json!({"Catalog": CATALOG})),
             200,
-            // A success carries no `__type`; the row is asserted on its status alone
-            // below, which a routing refusal (404 / 500) could not produce.
             "",
         ),
         (
-            "marketplace catalog describe entity, for an entity it does not hold",
+            "catalog: a change set that does not exist",
+            "PATCH",
+            "/CancelChangeSet?catalog=AWSMarketplace&changeSetId=cs-does-not-exist",
+            None,
+            None,
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "catalog: an entity it does not hold",
             "GET",
             "/DescribeEntity?catalog=AWSMarketplace&entityId=prod-nosuchentity01",
-            "",
+            None,
+            None,
             404,
-            // The catalog's OWN modeled 404, which the router's own 404
-            // (`UnknownService`) could not produce.
             "ResourceNotFoundException",
         ),
         (
-            "marketplace catalog batch describe entities",
+            "catalog: a batch read reporting a missing entity in its own Errors map",
             "POST",
             "/BatchDescribeEntities",
-            r#"{"EntityRequestList":[{"Catalog":"AWSMarketplace","EntityId":"prod-nosuchentity01"}]}"#,
+            None,
+            Some(json!({
+                "EntityRequestList": [{"Catalog": CATALOG, "EntityId": "prod-nosuchentity01"}],
+            })),
             200,
-            // A batch read reports a missing entity inside its `Errors` map, so the call
-            // itself succeeds and carries no `__type`.
             "",
         ),
         (
-            "marketplace catalog describe assessment, still scaffolded",
+            "catalog: an assessment that does not exist",
             "POST",
             "/DescribeAssessment",
-            r#"{"Catalog":"AWSMarketplace","AssessmentIdentifier":"assessment-1a2b3c"}"#,
-            501,
-            "NotImplemented",
-        ),
-        (
-            "marketplace reporting buyer dashboard",
-            "POST",
-            "/getBuyerDashboard",
-            r#"{"dashboardIdentifier":"arn:aws:aws-marketplace::000000000000:AWSMarketplace/ReportingData/Agreement_V1/Dashboard/AgreementSummary_V1","embeddingDomains":["https://example.com"]}"#,
-            200,
-            // Implemented, so it answers its own success — which carries no `__type`.
-            "",
-        ),
-        (
-            "marketplace deployment tags",
-            "GET",
-            "/tags/arn%3Aaws%3Aaws-marketplace%3Aus-east-1%3A000000000000%3Adeployment-parameter%2Fd-1",
-            "",
+            None,
+            Some(json!({"Catalog": CATALOG, "AssessmentIdentifier": "assessment-1a2b3c"})),
             404,
-            // Implemented, so an unknown deployment parameter is its OWN modeled
-            // `ResourceNotFoundException` — which a routing failure could not produce: the
-            // router's own 404 is `UnknownService`, asserted by the suite below.
             "ResourceNotFoundException",
         ),
         (
-            "marketplace discovery search listings",
+            "catalog: an empty list of entities",
             "POST",
-            "/2026-02-05/searchListings",
-            r#"{}"#,
+            "/ListEntities",
+            None,
+            Some(json!({"Catalog": CATALOG, "EntityType": "AmiProduct"})),
             200,
-            // Implemented, so it answers its own success — which carries no `__type`.
             "",
         ),
-    ];
-
-    for (case, method, uri, body, expected_status, expected_code) in rows {
-        let (status, error_code) = dispatch(&router, method, uri, None, body).await;
-        assert_eq!(
-            status, expected_status,
-            "case {case:?}: expected HTTP {expected_status} from the one service that owns \
-             {uri}, got {status} {error_code:?}"
-        );
-        if !expected_code.is_empty() {
-            assert_eq!(
-                error_code.as_deref(),
-                Some(expected_code),
-                "case {case:?}: expected {expected_code} from the one service that owns \
-                 {uri}, got {status} {error_code:?}"
-            );
-        }
-    }
-}
-
-/// The three RPC members of the family (Agreement, Entitlement Service, Metering) all
-/// serve the one path their protocol posts to — `POST /`, plus `POST
-/// /service/{Service}/operation/{Op}` for the two that also speak `rpcv2Cbor` — so the
-/// path cannot separate them. The operation the request names can, and each service's own
-/// generated routing table is what answers whether it is that service's.
-///
-/// The payload here is not a real one for each operation, so a row's own service answers
-/// however it answers that request; what is asserted is that a SERVICE answered, never a
-/// router refusal.
-#[tokio::test]
-async fn an_rpc_request_reaches_the_service_whose_model_names_its_operation() {
-    let router = build_router();
-
-    // (case, uri, x-amz-target)
-    let rows: [(&str, &str, Option<&str>); 5] = [
         (
-            "Agreement over awsJson: DescribeAgreement",
+            "catalog: tags of a resource outside this catalog",
+            "POST",
+            "/ListTagsForResource",
+            None,
+            Some(json!({"ResourceArn": FOREIGN_RESOURCE_ARN})),
+            403,
+            "AccessDeniedException",
+        ),
+        (
+            "catalog: the policy of a resource outside this catalog",
+            "GET",
+            "/GetResourcePolicy?resourceArn=arn%3Aaws%3Aaws-marketplace%3Aus-east-1%3A000000000000%3Aother%2Fthing",
+            None,
+            None,
+            403,
+            "AccessDeniedException",
+        ),
+        (
+            // A request addressing a REST peer's path while naming an RPC peer in
+            // `X-Amz-Target` contradicts itself. The path's owner serves it (a REST
+            // claim is its path, and that header is nothing to it) and the RPC peer it
+            // names does NOT also claim it — which would be two claimants, the 500 this
+            // issue is about.
+            "catalog: its own path, carrying an RPC peer's target",
+            "POST",
+            "/ListChangeSets",
+            Some("AWSMPMeteringService.ResolveCustomer"),
+            Some(json!({"Catalog": CATALOG})),
+            200,
+            "",
+        ),
+        (
+            "reporting: a dashboard outside the modelled ARN pattern",
+            "POST",
+            "/getBuyerDashboard",
+            None,
+            Some(json!({
+                "dashboardIdentifier": "arn:aws:aws-marketplace",
+                "embeddingDomains": ["https://a.example.com"],
+            })),
+            400,
+            "ValidationException",
+        ),
+        (
+            "deployment: a parameter write",
+            "POST",
+            "/catalogs/AWSMarketplace/products/prod-1/deployment-parameters",
+            None,
+            Some(json!({
+                "agreementId": "agmt-1",
+                "deploymentParameter": {"name": "param", "secretString": "secret"},
+            })),
+            200,
+            "",
+        ),
+        (
+            "deployment: tags of a parameter that does not exist",
+            "GET",
+            "/tags/arn%3Aaws%3Aaws-marketplace%3Aus-east-1%3A000000000000%3Adeployment-parameter%2Fd-1",
+            None,
+            None,
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "discovery: a listing that does not exist",
+            "POST",
+            "/2026-02-05/getListing",
+            None,
+            Some(json!({"listingId": "no-such-listing"})),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "discovery: a listing search",
+            "POST",
+            "/2026-02-05/searchListings",
+            None,
+            Some(json!({})),
+            200,
+            "",
+        ),
+        (
+            "entitlement: entitlements for a product with none",
+            "POST",
+            "/",
+            Some("AWSMPEntitlementService.GetEntitlements"),
+            Some(json!({"ProductCode": "no-such-product"})),
+            200,
+            "",
+        ),
+        (
+            "agreement: an agreement that does not exist",
+            "POST",
             "/",
             Some("AWSMPCommerceService_v20200301.DescribeAgreement"),
+            Some(json!({"agreementId": "no-such-agreement"})),
+            404,
+            "ResourceNotFoundException",
         ),
         (
-            "Agreement over rpcv2Cbor: SearchAgreements",
-            "/service/AWSMPCommerceService_v20200301/operation/SearchAgreements",
-            None,
-        ),
-        (
-            "Entitlement Service over rpcv2Cbor: GetEntitlements",
-            "/service/AWSMPEntitlementService/operation/GetEntitlements",
-            None,
-        ),
-        (
-            "Metering over awsJson: MeterUsage",
-            "/",
-            Some("AWSMPMeteringService.MeterUsage"),
-        ),
-        (
-            "Metering over awsJson: ResolveCustomer",
+            "metering: a registration token it rejects",
+            "POST",
             "/",
             Some("AWSMPMeteringService.ResolveCustomer"),
+            Some(json!({"RegistrationToken": "token"})),
+            400,
+            // `InvalidTokenException` is modelled by Marketplace Metering alone, so
+            // only Metering can answer it.
+            "InvalidTokenException",
         ),
     ];
 
-    for (case, uri, target) in rows {
-        let (status, error_code) = dispatch(&router, "POST", uri, target, "{}").await;
-        let code = error_code.clone().unwrap_or_default();
-        assert!(
-            !ROUTER_REFUSALS.contains(&code.as_str()),
-            "case {case:?}: exactly one service must claim this request, got {status} \
-             {error_code:?}"
+    for (case, method, uri, target, body, expected_status, expected_code) in rows {
+        let answer = dispatch(&router, method, uri, target, body).await;
+        assert_eq!(
+            (answer.status, answer.code.as_str()),
+            (expected_status, expected_code),
+            "case {case:?}: expected HTTP {expected_status} {expected_code:?} from the one \
+             service that owns {uri}, got {} {:?} ({:?})",
+            answer.status,
+            answer.code,
+            answer.message
         );
     }
 }
 
+/// A request signed for `aws-marketplace` that addresses NO service's surface is the
+/// router's `404 UnknownService` — never the `500 AmbiguousService` several claimants
+/// produced, and never one service's answer to another's traffic.
 #[tokio::test]
-async fn no_marketplace_service_claims_another_family_members_path() {
-    let router = build_router();
+async fn a_request_on_no_marketplace_surface_is_unclaimed() {
+    let router = router();
 
-    // A path NO service in the family declares reaches none of them: the router answers
-    // its own `UnknownService`, which is the proof that each claim is narrowed to its own
-    // path space rather than left open (an open claim would answer `AmbiguousService`,
-    // and a single over-broad claim would answer that service's own error).
-    for (case, method, uri) in [
-        ("a path no family member declares", "POST", "/NotAnOperation"),
-        ("another service's style of path", "GET", "/v1/things/t-1"),
-    ] {
-        let (status, error_code) = dispatch(&router, method, uri, None, "").await;
+    // (case, method, uri, x-amz-target)
+    let rows: [(&str, &str, &str, Option<&str>); 6] = [
+        ("a path no model binds", "POST", "/NoSuchOperation", None),
+        ("another family member's style of path", "GET", "/v1/things/t-1", None),
+        ("a path no family member declares", "POST", "/NotAnOperation", None),
+        ("a root post naming no service", "POST", "/", None),
+        (
+            "a target naming no service of this family",
+            "POST",
+            "/",
+            Some("NotAMarketplaceService.DoThing"),
+        ),
+        (
+            "an rpcv2Cbor uri naming no service of this family",
+            "POST",
+            "/service/NotAMarketplaceService/operation/DoThing",
+            None,
+        ),
+    ];
+
+    for (case, method, uri, target) in rows {
+        let answer = dispatch(&router, method, uri, target, None).await;
         assert_eq!(
-            (status, error_code.as_deref()),
-            (404, Some("UnknownService")),
-            "case {case:?}: {uri} must reach no service at all, got {status} {error_code:?}"
+            (answer.status, answer.code.as_str()),
+            (404, "UnknownService"),
+            "case {case:?}: expected the router's 404 UnknownService, got {} {:?} ({:?})",
+            answer.status,
+            answer.code,
+            answer.message
         );
     }
 }

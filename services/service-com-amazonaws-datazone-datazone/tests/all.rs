@@ -15,3 +15,5 @@
 mod domain_project_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_project.rs"]
+mod update_project;

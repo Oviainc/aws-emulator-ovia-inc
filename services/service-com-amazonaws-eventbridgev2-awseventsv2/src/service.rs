@@ -45,6 +45,59 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// This service's own `awsService.endpointPrefix`, the second key a request may
+/// resolve to.
+///
+/// The generated `ROUTE_KEY` is the model's `aws.auth#sigv4` name (`events`, shared
+/// with the EventBridge endpoint), but a request that carries no SigV4 scope resolves
+/// its key from the endpoint HOST instead, and this endpoint's host is
+/// `eventsv2.<region>.<dnsSuffix>` — `smithy_query(query="service_info")`:
+/// `awsService.endpointPrefix` `eventsv2`. No other emulated service claims that key,
+/// so honouring it adds no ambiguity and lets an anonymous or presigned request that
+/// addresses this endpoint by host reach it.
+const OWN_ENDPOINT_PREFIX: &str = "eventsv2";
+
+/// Whether the request these `parts` came from matches this service's wire identity
+/// (its SigV4 signing name or its endpoint prefix) AND the modelled URI path space its
+/// generated `ROUTE_PATH_SEGMENTS` declares.
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
+/// owner of that rule, and it is CALLED here rather than re-implemented: the request's
+/// route key must match the key passed AND its first URI path segment must be one the
+/// generated, model-derived `ROUTE_PATH_SEGMENTS` declares, by exact segment
+/// equality. That path conjunct is what separates two services sharing one SigV4
+/// signing name — this V2 endpoint (`eventsv2`) and the EventBridge endpoint (`events`)
+/// both sign as `events`
+/// (`smithy_query(query="service_info")`: `sigv4Name` `events` on both,
+/// `awsService.endpointPrefix` `eventsv2` here and `events` there), so the key alone
+/// matches both and the router rejects every such request as `500 AmbiguousService`.
+///
+/// The path spaces are disjoint by protocol: this model is `rpcv2Cbor`, whose every
+/// request is `POST /service/AWSEventsV2/operation/<Operation>`, so its generated
+/// segment list is the `service` segment that form always carries; the EventBridge
+/// model is `awsJson1_1`, which posts every request to `/`.
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed only
+/// the request's parts, so the two things it reads — the URI and the headers — are
+/// re-presented to it as a bodiless request. It reads neither the body nor the method, so
+/// nothing it decides on is missing.
+fn claims_route_key_and_path(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    [crate::ROUTE_KEY, OWN_ENDPOINT_PREFIX].iter().any(|key| {
+        emulator_server::can_handle_based_on_route_key_and_path(
+            &request,
+            key,
+            crate::ROUTE_PATH_SEGMENTS,
+        )
+    })
+}
+
 /// The `com-amazonaws-eventbridgev2-awseventsv2` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +127,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // Delegated to the framework's own predicate — see
+        // [`claims_route_key_and_path`]: this service's signing name (`events`) is
+        // shared with the EventBridge endpoint, so the claim is the route key AND the
+        // model-derived first URI path segment (`service`, the fixed first segment of
+        // every `rpcv2Cbor` request). Matching on the signing name alone would have
+        // both services claim every `events`-signed request, which the router answers
+        // with `500 AmbiguousService` instead of serving either one.
+        claims_route_key_and_path(parts)
     }
 
     fn override_operation(

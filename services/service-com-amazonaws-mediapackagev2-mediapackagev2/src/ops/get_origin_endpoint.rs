@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: endpoint.modified_at,
             reset_at: endpoint.reset_at,
             description: endpoint.description.clone(),
-            startover_window_seconds: endpoint.startover_window_seconds,
+            startover_window_seconds: Some(endpoint.startover_window_seconds),
             hls_manifests: Some(endpoint.hls_manifests.clone()),
             low_latency_hls_manifests: Some(endpoint.low_latency_hls_manifests.clone()),
             dash_manifests: Some(endpoint.dash_manifests.clone()),
@@ -247,8 +247,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             force_endpoint_error_configuration: endpoint
                 .force_endpoint_error_configuration
                 .clone(),
-            uri_separator: endpoint.uri_separator.clone(),
-            stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
+            uri_separator: Some(endpoint.uri_separator.clone()),
+            stream_name_output_mode: Some(endpoint.stream_name_output_mode.clone()),
             e_tag: Some(endpoint.etag.clone()),
             tags: Some(endpoint.tags.clone()),
         })

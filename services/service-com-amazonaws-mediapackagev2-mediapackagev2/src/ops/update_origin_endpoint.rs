@@ -279,7 +279,7 @@ fn endpoint_output(
         created_at: endpoint.created_at,
         modified_at: endpoint.modified_at,
         description: endpoint.description.clone(),
-        startover_window_seconds: endpoint.startover_window_seconds,
+        startover_window_seconds: Some(endpoint.startover_window_seconds),
         hls_manifests: Some(endpoint.hls_manifests.clone()),
         low_latency_hls_manifests: Some(endpoint.low_latency_hls_manifests.clone()),
         dash_manifests: Some(endpoint.dash_manifests.clone()),
@@ -287,8 +287,8 @@ fn endpoint_output(
         force_endpoint_error_configuration: endpoint
             .force_endpoint_error_configuration
             .clone(),
-        uri_separator: endpoint.uri_separator.clone(),
-        stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
+        uri_separator: Some(endpoint.uri_separator.clone()),
+        stream_name_output_mode: Some(endpoint.stream_name_output_mode.clone()),
         e_tag: Some(endpoint.etag.clone()),
         tags: Some(endpoint.tags.clone()),
     }
@@ -418,27 +418,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The immutable members: `ContainerType` is required on every update, so it is
-        // compared always; `StreamNameOutputMode` only when the request provides one AND
-        // the endpoint already has one, because an absent request value means "keep what
-        // is there" and an endpoint created without the member has no value to change.
-        // Both are refused BEFORE a single field is written, so a rejected update leaves
-        // the endpoint — and its ETag — exactly as it was.
+        // compared always; `StreamNameOutputMode` only when the request provides one,
+        // because an absent request value means "keep what is there". Every endpoint HAS
+        // a stored mode — the service applies one at create whether or not the request
+        // named it — so a request that names a different one is asking to change an
+        // immutable member. Both are refused BEFORE a single field is written, so a
+        // rejected update leaves the endpoint — and its ETag — exactly as it was.
         if input.container_type != endpoint.container_type {
             return Err(UpdateOriginEndpointErrorModeled::ValidationException(
                 immutable_violation(&CONTAINER_TYPE),
             )
             .into());
         }
-        if let (Some(requested), Some(stored)) = (
-            input.stream_name_output_mode.as_ref(),
-            endpoint.stream_name_output_mode.as_ref(),
-        ) {
-            if requested != stored {
-                return Err(UpdateOriginEndpointErrorModeled::ValidationException(
-                    immutable_violation(&STREAM_NAME_OUTPUT_MODE),
-                )
-                .into());
-            }
+        if input
+            .stream_name_output_mode
+            .as_ref()
+            .is_some_and(|requested| requested != &endpoint.stream_name_output_mode)
+        {
+            return Err(UpdateOriginEndpointErrorModeled::ValidationException(
+                immutable_violation(&STREAM_NAME_OUTPUT_MODE),
+            )
+            .into());
         }
         // `ETag` is the precondition the caller read from an earlier response: "If the
         // specified ETag does not match the resource's current entity tag, the update
@@ -498,19 +498,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An update carries the whole packaging configuration, so a member the request
         // omits is cleared rather than kept — except the two the model says are preserved
         // when absent (`UriSeparator`: "If you don't specify a value in the update
-        // request, the current value is preserved") or cannot be changed at all.
-        endpoint.segment = input.segment.unwrap_or_default();
+        // request, the current value is preserved") or cannot be changed at all. The
+        // members the SERVICE applies are re-materialised here exactly as the create
+        // materialises them, so an update that names none of them leaves the endpoint
+        // reporting the service's own settings rather than nothing.
+        endpoint.segment = crate::state::materialized_segment(input.segment);
         endpoint.description = input.description;
-        endpoint.startover_window_seconds = input.startover_window_seconds;
+        endpoint.startover_window_seconds =
+            crate::state::materialized_startover_window_seconds(input.startover_window_seconds);
         endpoint.force_endpoint_error_configuration = input.force_endpoint_error_configuration;
         if let Some(separator) = input.uri_separator {
-            endpoint.uri_separator = Some(separator);
+            endpoint.uri_separator = separator;
         }
-        // The immutability check above has already established that a provided mode
-        // equals the stored one, or that there was none stored to change: an endpoint
-        // created without the member takes the one this update names.
+        // The immutability check above has already established that a provided mode equals
+        // the stored one, so this assignment keeps the endpoint's mode as it was.
         if let Some(mode) = input.stream_name_output_mode {
-            endpoint.stream_name_output_mode = Some(mode);
+            endpoint.stream_name_output_mode = mode;
         }
         endpoint.modified_at = crate::state::now();
         // The ETag covers everything the endpoint is made of, so it rotates exactly when

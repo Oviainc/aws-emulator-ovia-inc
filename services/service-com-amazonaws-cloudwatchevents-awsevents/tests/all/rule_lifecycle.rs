@@ -23,10 +23,18 @@ use service_com_amazonaws_cloudwatchevents_awsevents::state::ComAmazonawsCloudwa
 use service_com_amazonaws_cloudwatchevents_awsevents::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 credential scope naming this service. Its 4th field (`events`) is what routes
-/// a request here, and its region is what every ARN this service mints is built for.
+/// A SigV4 credential scope naming this service. Its 4th field is what routes a request
+/// here, and its region is what every ARN this service mints is built for.
+///
+/// The field is `cloudwatchevents`, this model's sdkId-derived route key, NOT the
+/// `events` signing name its model declares: `CloudWatch Events` is the legacy sdkId of
+/// the service now called EventBridge, and the two models publish one identical wire
+/// identity, so the `events` key is owned by the EventBridge crate
+/// (`services/service-com-amazonaws-eventbridge-awsevents`, the superset model) and this
+/// service answers under its own key — see the `OWN_SDK_ID_KEY` note in `src/service.rs`.
+/// Routing both to one key is what the router refuses as `500 AmbiguousService`.
 const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/eu-west-1/events/aws4_request, \
+     Credential=AKIDEXAMPLE/20260101/eu-west-1/cloudwatchevents/aws4_request, \
      SignedHeaders=host, Signature=abc";
 
 /// The region [`SIGNED_FOR_EU_WEST_1`] signs for.

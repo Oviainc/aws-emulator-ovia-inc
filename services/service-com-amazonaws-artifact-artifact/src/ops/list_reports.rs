@@ -164,13 +164,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The token is the report id the next page starts at, so anything that is not a
-        // report id was never issued by this operation.
+        // report id was never issued by this operation. A token this service did not
+        // issue is refused with the service's one fixed invalid-token text, the same as
+        // every other token member.
         if let Some(token) = input.next_token.as_deref() {
             if !crate::state::is_report_id(token) {
                 return Err(ListReportsErrorModeled::ValidationException(
-                    crate::state::invalid_token(
-                        "nextToken is not a token returned by ListReports",
-                    ),
+                    crate::state::invalid_token(),
                 )
                 .into());
             }

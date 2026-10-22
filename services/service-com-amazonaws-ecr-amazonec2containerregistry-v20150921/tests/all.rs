@@ -25,6 +25,8 @@ mod pull_time_update_exclusions;
 mod registry_policy;
 #[path = "all/registry_replication_configuration.rs"]
 mod registry_replication_configuration;
+#[path = "all/registry_scanning_configuration.rs"]
+mod registry_scanning_configuration;
 #[path = "all/repository_creation_templates.rs"]
 mod repository_creation_templates;
 #[path = "all/repository_image_lifecycle.rs"]

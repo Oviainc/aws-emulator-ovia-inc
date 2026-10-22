@@ -465,12 +465,109 @@ pub fn decode_next_token(token: &str) -> Option<(String, String)> {
     Some((name, id))
 }
 
+/// `ValidationExceptionReason$FIELD_VALIDATION_FAILED` — the modelled classification for
+/// a request whose members were read but whose values the service refused. See
+/// `VALIDATION_EXCEPTION_REASON_VALUES` for the enum's whole value set.
+pub const REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
+/// `ValidationExceptionReason$CANNOT_PARSE` — the modelled classification for a value
+/// the service could not decode at all (an opaque pagination token, say), as opposed to
+/// one that was decoded and then failed a field rule.
+pub const REASON_CANNOT_PARSE: &str = "CANNOT_PARSE";
+
+/// The modelled `ValidationException` (HTTP 400) for members whose values the service
+/// refused: `Reason` is `FIELD_VALIDATION_FAILED`, `Fields` carries one entry per
+/// offending member, and the required `Message` states each distinct field message once
+/// (a cross-member rule names every member it covers with the same sentence, and
+/// `Message` must not repeat it per member).
+///
+/// `Message` carries this service's `[Validation]` tag, the same form
+/// [`tagged_message`] gives every other exception class; a `Fields` entry does NOT —
+/// the tag names the exception's class, and a field finding is a clause inside it.
+///
+/// Every operation builds this refusal class here, so the envelope cannot drift between
+/// operations; each operation still wraps the result in its OWN modelled error enum.
+pub fn field_validation_exception(
+    fields: &[(String, String)],
+) -> crate::ops::types::ValidationException {
+    let mut distinct: Vec<&str> = Vec::new();
+    for (_, message) in fields {
+        if !distinct.contains(&message.as_str()) {
+            distinct.push(message);
+        }
+    }
+    crate::ops::types::ValidationException {
+        message: tagged_message(VALIDATION_TAG, &distinct.join(" ")),
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        fields: Some(
+            fields
+                .iter()
+                .map(|(name, message)| crate::ops::types::ValidationExceptionField {
+                    name: name.clone(),
+                    message: message.clone(),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// The modelled `ValidationException` for a value the service could not decode:
+/// `Reason` `CANNOT_PARSE`, which tells the caller the value cannot be corrected, only
+/// obtained again, plus one `Fields` entry naming the member whose value could not be
+/// decoded.
+pub fn cannot_parse_exception(
+    member: &str,
+    message: &str,
+) -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: tagged_message(VALIDATION_TAG, message),
+        reason: Some(REASON_CANNOT_PARSE.to_string()),
+        fields: Some(vec![crate::ops::types::ValidationExceptionField {
+            name: member.to_string(),
+            message: message.to_string(),
+        }]),
+    }
+}
+
+/// The modelled `ValidationException` for a request the service refused without
+/// classifying it: only the `@required` `Message`. `ValidationExceptionReason` has no
+/// value for "a member the request had to carry is absent" (`UNKNOWN_OPERATION`,
+/// `CANNOT_PARSE`, `FIELD_VALIDATION_FAILED`, `OTHER`), and the recorded service leaves
+/// `Reason` and `Fields` off that answer rather than inventing one.
+pub fn unclassified_exception(message: String) -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: tagged_message(VALIDATION_TAG, &message),
+        reason: None,
+        fields: None,
+    }
+}
+
+/// The failure class every `ValidationException` message this service words opens with
+/// (see [`tagged_message`]).
+const VALIDATION_TAG: &str = "Validation";
+
+/// The sentence a member-constraint failure states, in the form the framework's own
+/// constraint walk uses so a handler-enforced rule reads like a modelled one.
+pub fn constraint_sentence(member: &str, constraint: &str) -> String {
+    format!("Value at {member} failed to satisfy constraint: {constraint}")
+}
+
+/// The refusal for one member that failed one constraint: the sentence above, reported
+/// as a field validation naming that member.
+pub fn member_constraint_exception(
+    member: &str,
+    constraint: &str,
+) -> crate::ops::types::ValidationException {
+    field_validation_exception(&[(
+        member.to_string(),
+        constraint_sentence(member, constraint),
+    )])
+}
+
 /// The tag this service opens an exception message with: the failure class in square
-/// brackets, then the sentence — `[ResourceNotFound] …`, `[Conflict] …`. Every lookup
-/// and collision failure this service words goes through here, so one form covers them
-/// all. (Recorded `ValidationException` messages carry a `[Validation] …` tag of the
-/// same shape; wording those is the subject of its own open issue, so
-/// [`validation_detail`] below is left as it stands.)
+/// brackets, then the sentence — `[ResourceNotFound] …`, `[Conflict] …`,
+/// `[Validation] …`. Every failure this service words goes through here, so one form
+/// covers them all.
 fn tagged_message(tag: &str, sentence: &str) -> String {
     format!("[{tag}] {sentence}")
 }
@@ -595,23 +692,112 @@ pub fn idempotency_token_conflict(
     )
 }
 
-/// The `message` and `Fields` a modelled `ValidationException` carries for one member
-/// that failed one constraint. Shared so every operation words a refusal identically;
-/// each operation still wraps it in its OWN modelled error enum.
-pub fn validation_detail(
-    member: &str,
-    constraint: &str,
-) -> (String, Vec<crate::ops::types::ValidationExceptionField>) {
-    (
-        format!(
-            "1 validation error detected: Value at {member} failed to satisfy constraint: {constraint}"
-        ),
-        vec![crate::ops::types::ValidationExceptionField {
-            name: member.to_string(),
-            message: constraint.to_string(),
-        }],
-    )
+/// The refusal for a member the request had to carry and did not: the required
+/// `Message`, worded exactly as the framework words an absent modelled member, so a
+/// member this service requires by documentation reads like one the model requires.
+/// No `Reason` and no `Fields` — see [`unclassified_exception`].
+pub fn absent_member_exception(member: &str) -> crate::ops::types::ValidationException {
+    unclassified_exception(::aws_smithy_schema_server::missing_member_message(member))
 }
+
+/// The refusal for a workload that names neither `AwsRegions` nor `NonAwsRegions`:
+/// "Either AwsRegions, NonAwsRegions, or both must be specified when creating a
+/// workload" (the `CreateWorkload` doc). The rule spans both members, so `Fields`
+/// carries an entry for EACH of them with the one sentence that states it, and
+/// `Message` states that sentence once.
+pub fn either_regions_exception() -> crate::ops::types::ValidationException {
+    let sentence = format!("Either {AWS_REGIONS_MEMBER} or {NON_AWS_REGIONS_MEMBER} is required.");
+    field_validation_exception(&[
+        (AWS_REGIONS_MEMBER.to_string(), sentence.clone()),
+        (NON_AWS_REGIONS_MEMBER.to_string(), sentence),
+    ])
+}
+
+/// Every Amazon Web Services Region id a workload may name in `AwsRegions`.
+///
+/// This model types `AwsRegion` as a plain string ("An Amazon Web Services Region, for
+/// example, `us-west-2` or `ap-northeast-1`" — `smithy_query(query="shape",
+/// shape="AwsRegion")`), so the value set is not in the model: it is the published
+/// Region list from the AWS General Reference ("Regions, Availability Zones, and Local
+/// Zones"), which other AWS Smithy models enumerate verbatim as an `AwsRegion` enum.
+/// Sorted, so a reader can see at a glance what is and is not here.
+pub const AWS_REGIONS: &[&str] = &[
+    "af-south-1",
+    "ap-east-1",
+    "ap-east-2",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-south-1",
+    "ap-south-2",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ap-southeast-5",
+    "ap-southeast-6",
+    "ap-southeast-7",
+    "ca-central-1",
+    "ca-west-1",
+    "cn-north-1",
+    "cn-northwest-1",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-isoe-west-1",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-south-2",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "eusc-de-east-1",
+    "il-central-1",
+    "me-central-1",
+    "me-south-1",
+    "mx-central-1",
+    "sa-east-1",
+    "us-east-1",
+    "us-east-2",
+    "us-gov-east-1",
+    "us-gov-west-1",
+    "us-iso-east-1",
+    "us-iso-west-1",
+    "us-isob-east-1",
+    "us-isob-west-1",
+    "us-isof-east-1",
+    "us-isof-south-1",
+    "us-west-1",
+    "us-west-2",
+];
+
+/// The refusal for an `AwsRegions` entry that is not a Region, or `None` when every
+/// entry is one. A workload records the Regions it runs in, so a value no Region
+/// carries can never be true of the resource and is refused before any state is
+/// written; `NonAwsRegions` is deliberately NOT checked, because it names Regions
+/// outside AWS, which no published list bounds.
+pub fn unknown_aws_region_exception(
+    regions: &[String],
+) -> Option<crate::ops::types::ValidationException> {
+    let unknown: Vec<(String, String)> = regions
+        .iter()
+        .filter(|region| !AWS_REGIONS.contains(&region.as_str()))
+        .map(|region| {
+            (
+                AWS_REGIONS_MEMBER.to_string(),
+                format!("Unknown region {region}."),
+            )
+        })
+        .collect();
+    (!unknown.is_empty()).then(|| field_validation_exception(&unknown))
+}
+
+/// The modelled member name an unknown-Region finding reports
+/// (`CreateWorkloadInput$AwsRegions` / `UpdateWorkloadInput$AwsRegions`).
+const AWS_REGIONS_MEMBER: &str = "AwsRegions";
+
+/// The modelled member that satisfies the cross-member Regions rule in place of
+/// `AwsRegions` (`CreateWorkloadInput$NonAwsRegions`).
+const NON_AWS_REGIONS_MEMBER: &str = "NonAwsRegions";
 
 /// The region this request was signed for, from its SigV4 credential scope; an
 /// unsigned request is attributed to [`DEFAULT_REGION`].

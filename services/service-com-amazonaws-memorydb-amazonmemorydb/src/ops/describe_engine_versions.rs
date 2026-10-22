@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEngineVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEngineVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEngineVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the engine versions this service offers — the catalog
+//! [`crate::state::ENGINE_VERSIONS`] holds — narrowed by the `Engine`, `EngineVersion`
+//! and `ParameterGroupFamily` the request named, by `DefaultOnly`, and paged with
+//! `MaxResults`/`NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +154,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEngineVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEngineVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEngineVersions"))
+        // What this operation reports is SERVICE metadata — the engine versions MemoryDB
+        // offers are the same for every account and every caller, like a region's
+        // availability zones — so it reads the catalog in `crate::state` and no
+        // per-caller record, and it writes nothing at all. The store is still resolved,
+        // exactly as the other handlers in this service do it, so that a service mounted
+        // on something other than the shared engine is refused here rather than answering
+        // out of a store nobody else can see.
+        if crate::state::service_state(&*self.engine).is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        }
+        if input.max_results.is_some_and(|max| max < 1) {
+            // The same refusal the other listings in this service make for a page size
+            // below 1, carried by this operation's own modelled 400.
+            return Err(
+                DescribeEngineVersionsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some("MaxResults must be at least 1.".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Each filter selects on a value the catalog itself publishes for an entry, so
+        // the three of them COMPOSE: a version is reported only when it matches every
+        // filter the request supplied. That is what makes an engine together with a
+        // version another engine offers select nothing, instead of reporting a version
+        // under an engine that does not have it.
+        let selected: Vec<&crate::state::EngineVersion> = crate::state::ENGINE_VERSIONS
+            .iter()
+            .filter(|candidate| {
+                input
+                    .engine
+                    .as_deref()
+                    .is_none_or(|engine| engine == candidate.engine)
+                    && input
+                        .engine_version
+                        .as_deref()
+                        .is_none_or(|version| version == candidate.version())
+                    && input
+                        .parameter_group_family
+                        .as_deref()
+                        .is_none_or(|family| family == candidate.parameter_group_family())
+            })
+            .collect();
+
+        if selected.is_empty() {
+            // Each filter is a free-form string the model constrains in no way, so this
+            // is not a malformed VALUE but a combination naming no engine version this
+            // service offers — including the degenerate combination of one filter that
+            // matches nothing. The message is built from the filters the request
+            // actually carried.
+            let mut named: Vec<String> = Vec::new();
+            if let Some(engine) = input.engine.as_deref() {
+                named.push(format!("engine {engine}"));
+            }
+            if let Some(version) = input.engine_version.as_deref() {
+                named.push(format!("version {version}"));
+            }
+            if let Some(family) = input.parameter_group_family.as_deref() {
+                named.push(format!("parameter group family {family}"));
+            }
+            return Err(
+                DescribeEngineVersionsErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "Cannot find an engine version for {}.",
+                            named.join(" with ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `DefaultOnly` — "only the default version of the specified engine or engine
+        // and major version combination is to be returned": the default is the greatest
+        // minor version the catalog publishes for an engine's major version, which is
+        // the version that parameter group family's engine defaults come from.
+        let entries: Vec<(String, EngineVersionInfo)> = selected
+            .into_iter()
+            .filter(|candidate| !input.default_only || candidate.is_family_default())
+            .map(|candidate| (candidate.catalog_key(), candidate.to_api()))
+            .collect();
+
+        let (engine_versions, next_token) = crate::state::paginate(
+            entries,
+            crate::state::page_limit(input.max_results),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            DescribeEngineVersionsError::from(
+                DescribeEngineVersionsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "NextToken does not name a position in this listing.".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        Ok(DescribeEngineVersionsOutput {
+            engine_versions: Some(engine_versions),
+            next_token,
+        })
     }
 }

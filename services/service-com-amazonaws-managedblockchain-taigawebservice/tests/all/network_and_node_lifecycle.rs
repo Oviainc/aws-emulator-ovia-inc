@@ -39,6 +39,9 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
 /// One answer from the emulator.
+///
+/// `pub(crate)`, like the four helpers below, so a sibling suite in this test crate
+/// drives the emulator through the one harness rather than a second copy of it.
 #[derive(Debug)]
 pub(crate) struct Answer {
     pub(crate) status: u16,
@@ -180,7 +183,7 @@ pub(crate) async fn available_network(
 }
 
 /// Create one node on `network_id`/`member_id` and return its `NodeId`.
-async fn create_node(
+pub(crate) async fn create_node(
     router: &MultiServiceRouter,
     network_id: &str,
     member_id: &str,

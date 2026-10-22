@@ -163,28 +163,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // The PROPOSAL is the resource this operation was asked for; the network id only
+        // scopes the lookup, so the failure names the proposal whenever that proposal
+        // cannot be read — including when the network id names nothing stored.
+        let found = guard.networks.get(&input.network_id).and_then(|network| {
+            network
+                .proposals
+                .get(&input.proposal_id)
+                .map(|proposal| (network, proposal))
+        });
+        let Some((network, proposal)) = found else {
             return Err(GetProposalErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "network {} does not exist on this account",
-                        input.network_id
-                    )),
-                    resource_name: Some(input.network_id.clone()),
-                },
-            )
-            .into());
-        };
-
-        let Some(proposal) = network.proposals.get(&input.proposal_id) else {
-            return Err(GetProposalErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "proposal {} does not exist on network {}",
-                        input.proposal_id, input.network_id
-                    )),
-                    resource_name: Some(input.proposal_id.clone()),
-                },
+                crate::state::not_found(crate::state::RESOURCE_PROPOSAL, &input.proposal_id),
             )
             .into());
         };

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetServiceGraph
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetServiceGraph`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetServiceGraph::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Derives the service graph of a `[StartTime, EndTime)` window from the STORED
+//! segment documents, through the one derivation in
+//! [`crate::state::service_graph`] that `GetTraceGraph` answers from too: a node
+//! per distinct segment `name`, an edge per stored `parent_id` link between two
+//! different services, and every count, time and histogram recomputed from the
+//! documents `PutTraceSegments` kept.
+//!
+//! Two refusals, both `InvalidRequestException` (400):
+//!
+//! * a `[StartTime, EndTime]` window that names no interval of recorded traffic,
+//!   through the one window check in [`crate::state::validate_window`]; and
+//! * a `GroupName` / `GroupARN` that names no stored group — and a group whose
+//!   `FilterExpression` this emulator cannot evaluate yet, because answering a
+//!   filtered request with the UNFILTERED graph under HTTP 200 would be a wrong
+//!   answer rather than a missing one.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +164,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetServiceGraph` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetServiceGraphErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetServiceGraph"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetServiceGraphErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray trace store is unavailable on this emulator engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let start = crate::state::epoch_seconds(&input.start_time);
+        let end = crate::state::epoch_seconds(&input.end_time);
+        let now = crate::state::now_epoch_seconds();
+        if let Err(window) = crate::state::validate_window(start, end, now) {
+            return Err(refuse(window.message(start, end)));
+        }
+
+        let store = state.lock();
+
+        // A graph "based on which group" is the group's filter expression applied
+        // to the window. The group has to exist, and this slice cannot evaluate
+        // the expression — so a group that carries one is REFUSED rather than
+        // answered with every service in the window.
+        if input.group_name.is_some() || input.group_arn.is_some() {
+            let Ok(group_name) =
+                store.resolve_group_name(input.group_name.as_deref(), input.group_arn.as_deref())
+            else {
+                return Err(refuse(GROUP_NOT_FOUND.to_string()));
+            };
+            let filtered = store.groups.get(&group_name).is_some_and(|group| {
+                group
+                    .filter_expression
+                    .as_deref()
+                    .is_some_and(|filter| !filter.trim().is_empty())
+            });
+            if filtered {
+                return Err(refuse(format!(
+                    "the FilterExpression of group `{group_name}` is not evaluated by this emulator yet; ask for a graph of a group without one, or omit the group"
+                )));
+            }
+        }
+
+        let services = crate::state::service_graph(store.traces.values(), Some((start, end)));
+        let page = crate::state::page_service_graph(
+            &services,
+            input.next_token.as_deref(),
+            SERVICE_GRAPH_PAGE_SIZE,
+        )
+        .map_err(refuse)?;
+
+        Ok(GetServiceGraphOutput {
+            start_time: Some(input.start_time),
+            end_time: Some(input.end_time),
+            services: Some(page.services),
+            // The graph is derived from the stored segments at read time, never
+            // from a cached older version of a group's filter expression.
+            contains_old_group_versions: false,
+            next_token: page.next_token,
+        })
     }
+}
+
+/// How many `Service` values one page carries.
+///
+/// The model declares no page size for `GetServiceGraph`, so this is the
+/// emulator's: a `NextToken` is emitted only when the graph exceeded it, and
+/// resuming from that token returns the remainder.
+pub const SERVICE_GRAPH_PAGE_SIZE: usize = 5;
+
+/// What a `GroupName` / `GroupARN` naming no stored group is refused with.
+pub const GROUP_NOT_FOUND: &str = "Group not found";
+
+/// Refuse the request with the error this operation models for an invalid one.
+fn refuse(message: String) -> GetServiceGraphError {
+    GetServiceGraphErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
 }
