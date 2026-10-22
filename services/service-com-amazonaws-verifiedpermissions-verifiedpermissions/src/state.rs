@@ -2,8 +2,9 @@
 
 //! Engine state for the com-amazonaws-verifiedpermissions-verifiedpermissions service.
 //!
-//! Everything a handler persists lives here: policy stores, the policies inside
-//! them, the alias table and the idempotency-token ledger. The Cedar-specific
+//! Everything a handler persists lives here: policy stores, the policies and
+//! identity sources inside them, the alias table and the idempotency-token
+//! ledger. The Cedar-specific
 //! helpers (parsing a policy's scope out of its statement, evaluating an
 //! authorization request) live beside it in [`cedar`], so every operation reaches
 //! one implementation rather than re-deriving the policy language.
@@ -59,6 +60,28 @@ pub const ALIAS_STATE_PENDING_DELETION: &str = "PendingDeletion";
 /// in the low milliseconds; a store that reaches it refuses further policies with
 /// the `ServiceQuotaExceededException` `CreatePolicy` already models.
 pub const MAX_POLICY_BYTES_PER_STORE: usize = 1024 * 1024;
+
+/// This emulator's MEMORY bound on identity sources per policy store:
+/// `identity_sources` is a structure a caller grows by an entry per
+/// `CreateIdentitySource` call, so without a cap a loop of calls grows host
+/// memory without limit. It is this emulator's bound, not a published AWS
+/// quota; a store that reaches it refuses further identity sources with the
+/// `ServiceQuotaExceededException` `CreateIdentitySource` models.
+pub const MAX_IDENTITY_SOURCES_PER_STORE: usize = 100;
+
+/// The Cedar entity type a Cognito identity source's principals carry when the
+/// create request named no `principalEntityType`.
+///
+/// `CreateIdentitySource$principalEntityType` is optional while
+/// `GetIdentitySource$principalEntityType` is **required**, so an omitted value
+/// has to resolve to the service's own default; for an Amazon Cognito user pool
+/// source that default is the `AWS::Cognito` entity type Verified Permissions
+/// generates principals as when the policy store maps none of its own.
+pub const DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE: &str = "AWS::Cognito";
+
+/// The region used for a request that carries no SigV4 credential scope — the
+/// region every AWS SDK defaults to when none is configured.
+pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// Published Verified Permissions quota: *Tags per resource* — 50. The model
 /// states this limit twice: `TagResource`'s own documentation ("You can
@@ -151,7 +174,12 @@ pub struct PolicyStore {
     pub tags: BTreeMap<String, String>,
     /// The store's policies, keyed by `policyId`.
     pub policies: BTreeMap<String, Policy>,
-    /// Strictly increasing, so every minted `policyId` in this store is distinct.
+    /// The store's identity sources, keyed by `identitySourceId`. A `BTreeMap`
+    /// so `ListIdentitySources` enumerates in a stable order once it is
+    /// implemented.
+    pub identity_sources: BTreeMap<String, IdentitySource>,
+    /// Strictly increasing, so every id minted inside this store — a `policyId`
+    /// or an `identitySourceId` — is distinct.
     pub next_id_seq: u64,
     /// The Cedar schema `PutSchema` stored, when one has been stored. A store
     /// holds at most ONE schema — `PutSchema` "creates or updates" it — so this
@@ -174,6 +202,222 @@ pub struct StoredSchema {
     pub created_date: DateTime,
     /// When the schema was last put.
     pub last_updated_date: DateTime,
+}
+
+/// One identity source in a store: the provider it points at, the Cedar entity
+/// type its principals carry, and when it was created and last changed.
+#[derive(Debug, Clone)]
+pub struct IdentitySource {
+    pub identity_source_id: String,
+    pub policy_store_id: String,
+    /// The resolved `principalEntityType`: the request's value, or
+    /// [`DEFAULT_COGNITO_PRINCIPAL_ENTITY_TYPE`] when it named none.
+    pub principal_entity_type: String,
+    pub created_date: DateTime,
+    pub last_updated_date: DateTime,
+    pub configuration: IdentitySourceConfiguration,
+}
+
+/// The provider an identity source points at — the `Configuration` union's two
+/// arms, reduced to what this service persists.
+#[derive(Debug, Clone)]
+pub enum IdentitySourceConfiguration {
+    CognitoUserPool(CognitoUserPoolSource),
+    OpenIdConnect(OpenIdConnectSource),
+}
+
+impl IdentitySourceConfiguration {
+    /// A canonical rendering of this configuration, for the idempotency ledger:
+    /// two `CreateIdentitySource` calls carrying one `clientToken` are the same
+    /// call only when every member of their configurations agrees. Spelled out
+    /// member by member rather than taken from `#[derive(Debug)]`, so what
+    /// counts as "different parameters" is a stated contract that a later field
+    /// rename cannot silently change.
+    pub fn fingerprint(&self) -> String {
+        match self {
+            Self::CognitoUserPool(cognito) => format!(
+                "cognito:userPoolArn={};clientIds={:?};groupEntityType={:?}",
+                cognito.user_pool_arn, cognito.client_ids, cognito.group_entity_type
+            ),
+            Self::OpenIdConnect(oidc) => {
+                let groups = oidc.group_configuration.as_ref().map(|groups| {
+                    (groups.group_claim.as_str(), groups.group_entity_type.as_str())
+                });
+                let tokens = match &oidc.token_selection {
+                    OpenIdConnectTokens::AccessToken {
+                        principal_id_claim,
+                        audiences,
+                    } => format!("accessTokenOnly:claim={principal_id_claim};audiences={audiences:?}"),
+                    OpenIdConnectTokens::IdentityToken {
+                        principal_id_claim,
+                        client_ids,
+                    } => format!("identityTokenOnly:claim={principal_id_claim};clientIds={client_ids:?}"),
+                };
+                format!(
+                    "oidc:issuer={};entityIdPrefix={:?};groups={:?};tokenSelection={}",
+                    oidc.issuer, oidc.entity_id_prefix, groups, tokens
+                )
+            }
+        }
+    }
+}
+
+/// An Amazon Cognito user pool identity source. `region` and `user_pool_id` are
+/// the segments [`resolve_user_pool_arn`] read out of `user_pool_arn`, so the
+/// derived issuer and discovery URL below are computed from the ARN rather than
+/// taken from the request.
+#[derive(Debug, Clone)]
+pub struct CognitoUserPoolSource {
+    pub user_pool_arn: String,
+    pub user_pool_id: String,
+    pub region: String,
+    pub client_ids: Vec<String>,
+    /// `groupConfiguration.groupEntityType`, when the request set one.
+    pub group_entity_type: Option<String>,
+}
+
+impl CognitoUserPoolSource {
+    /// The pool's OIDC issuer, in the form the model documents for
+    /// `CognitoUserPoolConfigurationDetail$issuer`:
+    /// `https://cognito-idp.<region>.amazonaws.com/<user-pool-id>`.
+    pub fn issuer(&self) -> String {
+        format!(
+            "https://cognito-idp.{}.amazonaws.com/{}",
+            self.region, self.user_pool_id
+        )
+    }
+
+    /// The pool's OIDC discovery URL, in the form the model documents for
+    /// `IdentitySourceDetails$discoveryUrl`:
+    /// `https://cognito-idp.<region>.amazonaws.com/<user-pool-id>/.well-known/openid-configuration`.
+    pub fn discovery_url(&self) -> String {
+        format!("{}/.well-known/openid-configuration", self.issuer())
+    }
+}
+
+/// An OpenID Connect identity source.
+#[derive(Debug, Clone)]
+pub struct OpenIdConnectSource {
+    pub issuer: String,
+    pub entity_id_prefix: Option<String>,
+    /// Both members of `groupConfiguration` are required when it is present, so
+    /// the pair is stored — and reported — together or not at all.
+    pub group_configuration: Option<OpenIdConnectGroups>,
+    pub token_selection: OpenIdConnectTokens,
+}
+
+/// `OpenIdConnectGroupConfiguration`: which token claim carries group
+/// membership, and the entity type it maps to.
+#[derive(Debug, Clone)]
+pub struct OpenIdConnectGroups {
+    pub group_claim: String,
+    pub group_entity_type: String,
+}
+
+/// `OpenIdConnectTokenSelection`: a policy store processes either the access
+/// token or the identity token from one OIDC provider, never both.
+#[derive(Debug, Clone)]
+pub enum OpenIdConnectTokens {
+    AccessToken {
+        principal_id_claim: String,
+        audiences: Vec<String>,
+    },
+    IdentityToken {
+        principal_id_claim: String,
+        client_ids: Vec<String>,
+    },
+}
+
+/// The region and user pool id a Cognito `userPoolArn` names, or why this
+/// emulator cannot resolve the pool it names.
+///
+/// Verified Permissions resolves the user pool before it creates the identity
+/// source, and the pool has to be one the service can reach: AWS documents that
+/// the user pool must be in the same account and Region as the policy store.
+/// This emulator presents exactly one account ([`engine::emulator_account_id`])
+/// and serves the region the request was signed for, so an ARN naming any other
+/// account or region names a pool that does not exist here. The pool id itself
+/// carries the region it was created in (`<region>_<suffix>`), so an id that
+/// disagrees with its own ARN names no pool either.
+///
+/// The `Err` is the text of the refusal, so the caller is told which segment of
+/// the ARN it has to fix.
+///
+/// What this CANNOT check: whether a pool with that id was ever created. The
+/// cognito-idp emulator holds its user pools in its own state struct, and
+/// [`service_state`] reaches per-service state BY TYPE — that type lives in the
+/// cognito-idp crate, which this crate does not depend on (one crate per
+/// service), and no shared crate publishes a pool registry. The partition, the
+/// account, the region and the region the pool id names are therefore the whole
+/// of the resolution this service can perform.
+pub fn resolve_user_pool_arn(arn: &str, request_region: &str) -> Result<(String, String), String> {
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    let ["arn", partition, "cognito-idp", region, account, resource] = fields[..] else {
+        return Err(format!(
+            "configuration.cognitoUserPoolConfiguration.userPoolArn: {arn} is not an \
+             Amazon Cognito user pool ARN"
+        ));
+    };
+    let Some(user_pool_id) = resource.strip_prefix("userpool/") else {
+        return Err(format!(
+            "configuration.cognitoUserPoolConfiguration.userPoolArn: {arn} does not name a \
+             user pool"
+        ));
+    };
+    // A resource in another partition is not reachable from this one at all, so
+    // the partition is resolved like the account and the region below.
+    let own_partition = emulator_partition();
+    if partition != own_partition {
+        return Err(format!(
+            "configuration.cognitoUserPoolConfiguration.userPoolArn: no Amazon Cognito user \
+             pool {user_pool_id} exists in partition {partition}; an identity source can only \
+             reference a user pool in partition {own_partition}"
+        ));
+    }
+    let own_account = ::engine::emulator_account_id();
+    if account != own_account {
+        return Err(format!(
+            "configuration.cognitoUserPoolConfiguration.userPoolArn: no Amazon Cognito user \
+             pool {user_pool_id} exists in account {account}; an identity source can only \
+             reference a user pool in account {own_account}"
+        ));
+    }
+    if region != request_region {
+        return Err(format!(
+            "configuration.cognitoUserPoolConfiguration.userPoolArn: no Amazon Cognito user \
+             pool {user_pool_id} exists in region {region}; an identity source can only \
+             reference a user pool in its policy store's region {request_region}"
+        ));
+    }
+    if !user_pool_id.starts_with(&format!("{region}_")) {
+        return Err(format!(
+            "configuration.cognitoUserPoolConfiguration.userPoolArn: no Amazon Cognito user \
+             pool {user_pool_id} exists in region {region}; a user pool id names the region \
+             the pool was created in"
+        ));
+    }
+    Ok((region.to_string(), user_pool_id.to_string()))
+}
+
+/// The region the request was signed for, or [`DEFAULT_REGION`] when it carries
+/// no SigV4 credential scope. A Cognito user pool is reachable only from the
+/// region it lives in, so the region is read off the request rather than fixed.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The ARN partition this emulator presents, read out of an ARN it builds
+/// itself ([`engine::emulator_arn`]) rather than written as a literal, so the
+/// two can never disagree.
+pub fn emulator_partition() -> String {
+    ::engine::emulator_arn("verifiedpermissions", "", "")
+        .split(':')
+        .nth(1)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// One policy in a store. `statement` is the Cedar text exactly as it arrived;
@@ -318,6 +562,16 @@ impl PolicyStore {
     pub fn mint_policy_id(&mut self) -> String {
         self.next_id_seq += 1;
         format!("SP{}", base62(scramble(self.next_id_seq)))
+    }
+
+    /// Mint the next `identitySourceId` for this store. `IS` + 22 base62
+    /// characters, the shape AWS publishes (`ISEXAMPLEabcdefg111111`) and well
+    /// inside `IdentitySourceId`'s `^[a-zA-Z0-9-]*$`, length 1..200. It draws on
+    /// the same strictly increasing counter as [`Self::mint_policy_id`], so no
+    /// two ids minted in one store ever share a suffix.
+    pub fn mint_identity_source_id(&mut self) -> String {
+        self.next_id_seq += 1;
+        format!("IS{}", base62(scramble(self.next_id_seq)))
     }
 
     /// Resolve a `policyId` request member: either a policy id, or
