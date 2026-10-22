@@ -28,16 +28,16 @@ use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubs
 };
 
 /// This service's sigv4 signing name (`OPERATIONS.md`, "Wire protocol").
-const SIGNING_NAME: &str = "license-manager-user-subscriptions";
+pub(crate) const SIGNING_NAME: &str = "license-manager-user-subscriptions";
 /// The region the test requests are signed for; every minted ARN must carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 /// The canonical account id every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The products `RegisterIdentityProvider`'s `Product` documentation lists:
 /// VISUAL_STUDIO_ENTERPRISE | VISUAL_STUDIO_PROFESSIONAL | OFFICE_PROFESSIONAL_PLUS |
 /// OFFICE_STANDARD | REMOTE_DESKTOP_SERVICES.
-const PRODUCTS: &[&str] = &[
+pub(crate) const PRODUCTS: &[&str] = &[
     "VISUAL_STUDIO_ENTERPRISE",
     "VISUAL_STUDIO_PROFESSIONAL",
     "OFFICE_PROFESSIONAL_PLUS",
@@ -47,12 +47,15 @@ const PRODUCTS: &[&str] = &[
 
 /// One emulator: the router that dispatches, plus the shared engine its service was
 /// built from (so a test can read the store the handlers wrote).
-struct Harness {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+///
+/// Shared with the other suites in this crate (see `tests/all.rs`) so there is ONE wire
+/// harness for the service rather than a copy per suite.
+pub(crate) struct Harness {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
-fn harness() -> Harness {
+pub(crate) fn harness() -> Harness {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The tests sign nothing; authentication is the framework's concern, not this
@@ -64,14 +67,14 @@ fn harness() -> Harness {
 
 /// What a call answered: the HTTP status, the wire error code (if any) and the body.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: Option<String>,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn ok(&self, case: &str) -> &Value {
+    pub(crate) fn ok(&self, case: &str) -> &Value {
         assert_eq!(
             self.status, 200,
             "case {case:?}: expected HTTP 200, got {} with body {:?}",
@@ -81,7 +84,7 @@ impl Reply {
     }
 }
 
-async fn call(h: &Harness, path: &str, body: &Value) -> Reply {
+pub(crate) async fn call(h: &Harness, path: &str, body: &Value) -> Reply {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!(
@@ -123,7 +126,7 @@ async fn call(h: &Harness, path: &str, body: &Value) -> Reply {
     }
 }
 
-async fn register(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn register(h: &Harness, body: &Value) -> Reply {
     call(h, "/identity-provider/RegisterIdentityProvider", body).await
 }
 
@@ -131,7 +134,7 @@ async fn deregister(h: &Harness, body: &Value) -> Reply {
     call(h, "/identity-provider/DeregisterIdentityProvider", body).await
 }
 
-async fn list_providers(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn list_providers(h: &Harness, body: &Value) -> Reply {
     call(h, "/identity-provider/ListIdentityProviders", body).await
 }
 
@@ -209,7 +212,7 @@ const REGISTRATIONS: &[Registration] = &[
     },
 ];
 
-fn provider_union(directory_id: &str) -> Value {
+pub(crate) fn provider_union(directory_id: &str) -> Value {
     json!({ "ActiveDirectoryIdentityProvider": { "DirectoryId": directory_id } })
 }
 
@@ -235,7 +238,7 @@ fn arn_prefix(kind: &str) -> String {
     format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:{kind}/")
 }
 
-fn as_str<'a>(value: &'a Value, member: &str, case: &str) -> &'a str {
+pub(crate) fn as_str<'a>(value: &'a Value, member: &str, case: &str) -> &'a str {
     value
         .get(member)
         .and_then(Value::as_str)

@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/identity_provider_subscriptions.rs"]
 mod identity_provider_subscriptions;
+#[path = "all/list_instances.rs"]
+mod list_instances;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

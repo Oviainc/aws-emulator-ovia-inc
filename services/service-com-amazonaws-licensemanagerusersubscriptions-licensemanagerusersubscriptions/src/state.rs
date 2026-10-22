@@ -3,8 +3,9 @@
 //! Engine state for the com-amazonaws-licensemanagerusersubscriptions-licensemanagerusersubscriptions service.
 //!
 //! One store holds every resource the service's operations share: identity-provider
-//! registrations, the product users subscribed through them, and the tags written
-//! against either resource's ARN. The list/lookup/pagination/filter helpers live here
+//! registrations, the product users subscribed through them, the EC2 instances that
+//! provide those subscriptions, and the tags written against a resource's ARN. The
+//! list/lookup/pagination/filter helpers live here
 //! too, so the operation handlers in `ops/` all resolve a resource the same way
 //! instead of each growing its own copy.
 
@@ -12,7 +13,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Filter, IdentityProvider, IdentityProviderSummary, ProductUserSummary, Settings,
+    Filter, IdentityProvider, IdentityProviderSummary, InstanceSummary, ProductUserSummary,
+    Settings,
 };
 
 /// The status a registration carries while its VPC endpoints are being provisioned.
@@ -73,6 +75,33 @@ pub struct IdentityProviderRecord {
     pub registered_due_at: SystemTime,
 }
 
+/// An EC2 instance that provides user-based subscriptions.
+///
+/// An instance is not created by an API of this service: it enters the service's view
+/// through the user-association plane (`AssociateUser` names the `InstanceId` a user is
+/// associated with), and `ListInstances` only REPORTS what is held here. So this record
+/// carries no value `ListInstances` invents — every member is what the writer persisted.
+#[derive(Debug, Clone)]
+pub struct InstanceRecord {
+    /// The EC2 instance id; the key of `instances`.
+    pub instance_id: String,
+    /// The status of the instance resource, as the writer recorded it. The model
+    /// (`InstanceSummary.Status`) is a free-form string, so no vocabulary is imposed here.
+    pub status: String,
+    /// The user-based subscription products this instance provides, in the order they
+    /// were added.
+    pub products: Vec<String>,
+    /// Set only when the service has something to report; never fabricated.
+    pub status_message: Option<String>,
+    /// The account that owns the instance.
+    pub owner_account_id: String,
+    /// The registration the instance's users were resolved through, when one is known.
+    pub identity_provider: Option<IdentityProvider>,
+    /// When the instance's status was last checked, if it ever was. A status check is
+    /// work this service performs, so a read never invents one.
+    pub last_status_check_at: Option<SystemTime>,
+}
+
 /// A product user, as `StartProductSubscription` stored it.
 #[derive(Debug, Clone)]
 pub struct ProductUserRecord {
@@ -115,6 +144,11 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     pub product_user_order: Vec<String>,
     /// `(IdentityProviderArn, product, username) -> ProductUserArn`.
     pub product_user_index: HashMap<(String, String, String), String>,
+    /// Instances providing user-based subscriptions, by EC2 instance id.
+    pub instances: HashMap<String, InstanceRecord>,
+    /// Instance ids in the order the instances entered the store, so a list is stable
+    /// and pageable.
+    pub instance_order: Vec<String>,
     /// Tags by resource ARN, written by whichever operation accepted them, so a later
     /// tagging operation reads the same store.
     pub tags: HashMap<String, HashMap<String, String>>,
@@ -151,6 +185,33 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .iter()
             .filter_map(|arn| self.identity_providers.get(arn).cloned())
             .collect()
+    }
+
+    /// The instances in the order they entered the store.
+    pub fn instances_in_order(&self) -> Vec<InstanceRecord> {
+        self.instance_order
+            .iter()
+            .filter_map(|id| self.instances.get(id).cloned())
+            .collect()
+    }
+
+    /// Record an instance, keeping the list order the order of first appearance: a
+    /// re-recorded instance updates its record in place rather than moving in the list.
+    ///
+    /// Every writer that brings an instance into the service's view goes through here, so
+    /// `instances` and `instance_order` cannot disagree.
+    pub fn upsert_instance(&mut self, record: InstanceRecord) {
+        let id = record.instance_id.clone();
+        if self.instances.insert(id.clone(), record).is_none() {
+            self.instance_order.push(id);
+        }
+    }
+
+    /// Remove an instance from the store and from the list order.
+    pub fn remove_instance(&mut self, instance_id: &str) -> Option<InstanceRecord> {
+        let record = self.instances.remove(instance_id)?;
+        self.instance_order.retain(|id| id != instance_id);
+        Some(record)
     }
 
     /// The product users of one registration (optionally one product), in subscription order.
@@ -358,6 +419,20 @@ pub fn identity_provider_summary(record: &IdentityProviderRecord) -> IdentityPro
         identity_provider_arn: Some(record.arn.clone()),
         failure_message: record.failure_message.clone(),
         owner_account_id: Some(record.owner_account_id.clone()),
+    }
+}
+
+/// The `InstanceSummary` the model requires, built entirely from the stored record —
+/// every member is what the writer persisted, and an absent one stays absent.
+pub fn instance_summary(record: &InstanceRecord) -> InstanceSummary {
+    InstanceSummary {
+        instance_id: record.instance_id.clone(),
+        status: record.status.clone(),
+        products: record.products.clone(),
+        last_status_check_date: record.last_status_check_at.map(iso8601),
+        status_message: record.status_message.clone(),
+        owner_account_id: Some(record.owner_account_id.clone()),
+        identity_provider: record.identity_provider.clone(),
     }
 }
 
