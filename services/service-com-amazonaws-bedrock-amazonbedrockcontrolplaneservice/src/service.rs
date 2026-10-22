@@ -75,22 +75,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
         // This service signs as `bedrock` — a signing name it SHARES with every other
-        // emulated Bedrock-family service (Bedrock Runtime, Bedrock Agent, Bedrock
-        // Agent Runtime, Bedrock Data Automation and Bedrock Data Automation Runtime).
-        // The router resolves the routing key from the SigV4 credential scope first, so
-        // all six see the key `bedrock`: claiming on the signing name ALONE makes each
-        // of them claim every sibling's traffic, and the router — which refuses rather
-        // than guesses — answers `500 AmbiguousService` for ALL of it.
+        // Bedrock-family service (`bedrock-runtime`, `bedrock-agent`,
+        // `bedrock-agent-runtime`, `bedrock-data-automation` and
+        // `bedrock-data-automation-runtime` all carry `aws.auth#sigv4` name `bedrock`
+        // while serving their own endpoint prefix). The router resolves a request's
+        // routing key from the SigV4 credential scope first, so all six see the key
+        // `bedrock`: claiming on the signing name ALONE makes each of them a claimant for
+        // every Bedrock request, and the router — which refuses to pick one — answers
+        // `500 AmbiguousService`, a code no AWS model carries, for ALL of it, leaving the
+        // whole family unreachable.
         //
-        // So the claim is narrowed to this service's own modelled wire surface, by the
-        // one rule `service-common` states for every service under a shared signing
-        // name. This model is `restJson1` and binds every operation to a URI whose
-        // first segment is a literal, so that surface is its path space (`guardrails`,
-        // `model-customization-jobs`, `foundation-models`, …), which the generated
-        // `ROUTE_PATH_SEGMENTS` carries and the rule matches by EXACT segment equality.
-        service_common::claims_request(
+        // So the claim is narrowed to this service's own modelled wire surface, by the one
+        // rule `service_common::bedrock` states for the whole family (which narrows
+        // `service_common::claims_request` with the family's shared-segment split): the
+        // signing name AND a first URI path segment this `restJson1` model declares
+        // (`guardrails`, `foundation-models`, `logging`, `custom-models`,
+        // `model-customization-jobs`, …), matched by EXACT segment equality. `None` for
+        // the RPC argument: every operation of this model is bound to a URI, so it names
+        // no service out of band.
+        service_common::bedrock::claims_request(
             parts,
-            self.entry.identity().signing_name(),
+            self.definition(),
             crate::ROUTE_PATH_SEGMENTS,
             None,
         )

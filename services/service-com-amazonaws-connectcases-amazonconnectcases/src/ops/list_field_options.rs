@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFieldOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFieldOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the field options a field holds, ordered by `FieldOption$value` — the
+//! reader `BatchPutFieldOptions` writes for. A read: it computes its page from
+//! the stored option set and writes nothing. `values` filters the page to the
+//! option values it names, `maxResults` sizes the page and `nextToken` carries
+//! an opaque cursor naming the last value of the page it follows.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFieldOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +141,51 @@ impl<Eng> ListFieldOptions<Eng> {
     }
 }
 
+/// `ListFieldOptions`'s page size when the request names no `maxResults`: the
+/// largest page the model allows (`ListFieldOptionsRequest$maxResults` is
+/// `range 1..100`), so an unpaginated caller sees everything it can in one
+/// answer.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// Smallest and largest page the model allows, from the same `range 1..100`.
+/// Restated here so a `maxResults` outside the modelled range is refused by this
+/// code and not only by the boundary validator.
+const MIN_PAGE_SIZE: i32 = 1;
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// What a minted `nextToken` carries, so a token this service did not mint
+/// cannot be read as a position.
+const CURSOR_TAG: &str = "cases:field-option:v1";
+
+/// A `nextToken` is an opaque cursor: the hex of a tagged payload naming the
+/// domain, the field and the LAST option value of the page it follows, rather
+/// than an index into a freshly built list, so the next page resumes at the
+/// first option ordered after that value even when options are added or removed
+/// between calls. The domain and field are part of the payload so a cursor
+/// minted while paging one field is not read as a position in another.
+fn encode_token(domain_id: &str, field_id: &str, last_value: &str) -> String {
+    let payload = ::serde_json::json!([CURSOR_TAG, domain_id, field_id, last_value]);
+    ::hex::encode(payload.to_string().as_bytes())
+}
+
+/// The option value a cursor names, or `None` when `token` is not a cursor this
+/// service minted for this domain and field — so neither an arbitrary hex string
+/// nor another field's cursor is read as a position.
+fn decode_token(token: &str, domain_id: &str, field_id: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let payload: ::serde_json::Value = ::serde_json::from_str(&decoded).ok()?;
+    let parts = payload.as_array()?;
+    let [tag, domain, field, value] = parts.as_slice() else {
+        return None;
+    };
+    let matches_scope = tag.as_str() == Some(CURSOR_TAG)
+        && domain.as_str() == Some(domain_id)
+        && field.as_str() == Some(field_id);
+    matches_scope
+        .then(|| value.as_str().map(::std::string::ToString::to_string))
+        .flatten()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListFieldOptions<Eng>
 {
@@ -159,18 +203,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFieldOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFieldOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFieldOptions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFieldOptionsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // Bound the caller-chosen work BEFORE the store lock is taken: the
+        // filter list and the page size are held to the model's own caps here as
+        // well as at the boundary.
+        let filter = input.values.unwrap_or_default();
+        if let Some(message) = crate::state::list_too_long(
+            "values",
+            filter.len(),
+            crate::state::MAX_LIST_FIELD_OPTION_VALUES,
+        ) {
+            return Err(
+                ListFieldOptionsErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+        // The model constrains `maxResults` to `range 1..100`, so a value
+        // outside it is refused rather than coerced into a page the caller did
+        // not ask for.
+        let page_size = match input.max_results {
+            None => DEFAULT_PAGE_SIZE,
+            Some(requested) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested) => {
+                requested as usize
+            }
+            Some(requested) => {
+                return Err(ListFieldOptionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "maxResults is {requested}; it must be between {MIN_PAGE_SIZE} and \
+                             {MAX_PAGE_SIZE}"
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // An opaque cursor is resolved before the store is read, so a token this
+        // service did not mint for this field is refused rather than silently
+        // paged from the start.
+        let resume_after = match input.next_token {
+            None => None,
+            Some(token) => match decode_token(&token, &input.domain_id, &input.field_id) {
+                Some(value) => Some(value),
+                None => {
+                    return Err(ListFieldOptionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a pagination token this service issued \
+                                      for this domain and field"
+                                .to_string(),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let store = state.lock();
+        let domain = store
+            .domain(&input.domain_id)
+            .map_err(ListFieldOptionsErrorModeled::ResourceNotFoundException)?;
+        let field = domain
+            .field(&input.field_id)
+            .map_err(ListFieldOptionsErrorModeled::ResourceNotFoundException)?;
+
+        // The stored set is already ordered by value, so the filtered view is
+        // too and the cursor is a position in it. A field of a type that has no
+        // options simply holds none, which is an empty page rather than a
+        // refusal.
+        let matching: Vec<&FieldOption> = field
+            .options
+            .values()
+            .filter(|option| filter.is_empty() || filter.iter().any(|want| want == &option.value))
+            .filter(|option| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| option.value.as_str() > after)
+            })
+            .collect();
+
+        let options: Vec<FieldOption> = matching
+            .iter()
+            .take(page_size)
+            .map(|option| (*option).clone())
+            .collect();
+        // A `nextToken` is reported only when options remain after this page,
+        // which is how a paginating client knows to stop.
+        let next_token = (matching.len() > options.len())
+            .then(|| {
+                options
+                    .last()
+                    .map(|last| encode_token(&input.domain_id, &input.field_id, &last.value))
+            })
+            .flatten();
+
+        Ok(ListFieldOptionsOutput {
+            options,
+            next_token,
+        })
     }
 }
