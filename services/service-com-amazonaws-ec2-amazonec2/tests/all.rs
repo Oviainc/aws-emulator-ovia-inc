@@ -26,6 +26,8 @@ mod describe_vpcs;
 // The shared ec2Query plumbing every suite drives the service through.
 #[path = "all/ec2_query.rs"]
 mod ec2_query;
+#[path = "all/images.rs"]
+mod images;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
 #[path = "all/instance_type_offerings.rs"]
@@ -34,6 +36,8 @@ mod instance_type_offerings;
 mod launch_templates;
 #[path = "all/security_group_filter_limits.rs"]
 mod security_group_filter_limits;
+#[path = "all/security_groups.rs"]
+mod security_groups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/vpc_lifecycle.rs"]
