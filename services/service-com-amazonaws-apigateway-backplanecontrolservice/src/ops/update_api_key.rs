@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApiKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApiKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `ApiKey` record,
+//! in request order, and reports the updated record — so a later `GetApiKey` reads back
+//! exactly what the patch set.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApiKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The whole list is applied to a COPY of the record and written back only once every
+//! op has succeeded, so a list carrying one unsupported op leaves the stored key as it
+//! was rather than half-patched. A successful patch advances `lastUpdatedDate`.
+//!
+//! The key's `value` is not reported here: it is reported only where the model says so,
+//! `CreateApiKey` and `GetApiKey` with `includeValue` (see `crate::state::ApiKeyEntry`).
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +93,92 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeSet;
+
+use crate::state::{
+    patch_bool, patch_optional_string, patch_string_set, ApiKeyEntry, Patch, PatchFailure,
+    PatchOpKind, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+};
+
+/// The paths `UpdateApiKey` accepts for a `replace`: the `ApiKey`'s single-valued
+/// updateable members. A recorded AWS refusal of a `replace` of `/id` names exactly
+/// this set — "Must be one of: [/description, /enabled, /name, /customerId]" — so `id`,
+/// `value`, `createdDate` and `lastUpdatedDate` are not patchable (the service assigns
+/// them) and `tags` are changed through `TagResource`/`UntagResource`.
+const REPLACE_PATHS: &[&str] = &["/description", "/enabled", "/name", "/customerId"];
+
+/// The paths it accepts for an `add` or a `remove`: the key's COLLECTION members, which
+/// are what an element is added to or removed from. A recorded AWS refusal of a
+/// `remove` of `/description` names exactly this set — "Must be one of: [/stages,
+/// /labels]" — so the single-valued members above take a `replace` and only these two
+/// take an `add` or a `remove`.
+const COLLECTION_PATHS: &[&str] = &["/stages", "/labels"];
+
+/// Apply one patch to a COPY of a stored key.
+///
+/// `apis` is the set of stored `RestApi` ids, so a stage association can only be added
+/// for an API that exists — the same rule `CreateApiKey` applies to `stageKeys`.
+fn apply_patch(
+    entry: &mut ApiKeyEntry,
+    patch: &Patch,
+    apis: &BTreeSet<String>,
+) -> Result<(), PatchFailure> {
+    match patch.op {
+        // Which paths an op may name depends on the op: a single-valued member is
+        // replaced, a collection has elements added and removed.
+        PatchOpKind::Replace => match patch.member() {
+            "name" => patch_optional_string(&mut entry.name, patch, MAX_STRING_CHARS),
+            "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+            "customerId" => patch_optional_string(&mut entry.customer_id, patch, MAX_STRING_CHARS),
+            "enabled" => patch_bool(&mut entry.enabled, patch),
+            _ => Err(patch.unsupported_path(REPLACE_PATHS)),
+        },
+        PatchOpKind::Add | PatchOpKind::Remove => match patch.member() {
+            // One entry names one stage of one API, which is how the member is stored
+            // and how `stageKeys` reports it: `<restApiId>/<stageName>`.
+            "stages" => {
+                let stage_key = patch.collection_entry(1)?;
+                let (rest_api_id, stage_name) = stage_key.split_once('/').unwrap_or((
+                    stage_key.as_str(),
+                    "",
+                ));
+                if rest_api_id.is_empty() || stage_name.is_empty() || stage_name.contains('/') {
+                    return Err(PatchFailure::BadRequest(format!(
+                        "{} takes a stage as <restApiId>/<stageName>, got {stage_key:?}",
+                        patch.path
+                    )));
+                }
+                // An association can only be created for an API that exists; dropping
+                // one needs no such check, because the association is what goes away.
+                if patch.op == PatchOpKind::Add && !apis.contains(rest_api_id) {
+                    return Err(PatchFailure::NotFound(
+                        crate::state::NO_SUCH_REST_API.to_string(),
+                    ));
+                }
+                patch_string_set(
+                    &mut entry.stage_keys,
+                    patch,
+                    &stage_key,
+                    MAX_COLLECTION_ENTRIES,
+                )
+            }
+            // A label is stored on the key and reported by nothing: the `ApiKey` shape
+            // this service models declares no member for the labels, so the patch is
+            // persisted and no response renders it.
+            "labels" => {
+                let label = patch.collection_entry(1)?;
+                crate::state::bound_chars(&patch.path, &label, MAX_STRING_CHARS)
+                    .map_err(PatchFailure::BadRequest)?;
+                patch_string_set(&mut entry.labels, patch, &label, MAX_COLLECTION_ENTRIES)
+            }
+            _ => Err(patch.unsupported_path(COLLECTION_PATHS)),
+        },
+        // `move`, `copy` and `test` name no member of this resource: "Not all valid
+        // operations are supported for a given resource" (`PatchOperation$op`).
+        _ => Err(patch.unsupported_op()),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,18 +252,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApiKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApiKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApiKey"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
+            .map_err(patch_failure)?;
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+
+        let mut updated = store
+            .api_keys
+            .get(&input.api_key)
+            .ok_or_else(|| {
+                UpdateApiKeyErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_API_KEY.to_string()),
+                })
+            })?
+            .clone();
+        let apis: BTreeSet<String> = store.rest_apis.keys().cloned().collect();
+
+        // Applied to the COPY: a list whose later op is refused leaves the stored record
+        // untouched, rather than keeping the ops before it.
+        for patch in &patches {
+            apply_patch(&mut updated, patch, &apis).map_err(patch_failure)?;
+        }
+        // A successful patch is when the record last changed. An empty list changes
+        // nothing, so it moves nothing.
+        if !patches.is_empty() {
+            updated.last_updated_date = Some(now);
+        }
+
+        store.api_keys.insert(input.api_key.clone(), updated);
+        let stored = store
+            .api_keys
+            .get(&input.api_key)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // Rendered through the one `ApiKey` body this crate builds, so the update
+        // reports the record exactly as `GetApiKey` will read it back.
+        let body = CreateApiKeyOutput::from(stored);
+        let output = UpdateApiKeyOutput {
+            id: body.id,
+            // Withheld here: the key value is reported only by `CreateApiKey` and by
+            // `GetApiKey` when the request asks for it.
+            value: None,
+            name: body.name,
+            customer_id: body.customer_id,
+            description: body.description,
+            enabled: body.enabled,
+            created_date: body.created_date,
+            last_updated_date: body.last_updated_date,
+            stage_keys: body.stage_keys,
+            tags: body.tags,
+        };
+        // Everything below is owned, so the lock is released before the audit record is
+        // emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — the key's `value` is a secret and is never a field here.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            api_key = ?input.api_key,
+            patch_operations = patches.len(),
+            outcome = "updated",
+            "api key updated",
+        );
+        Ok(output)
     }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateApiKeyError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateApiKeyErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateApiKeyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateApiKeyErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

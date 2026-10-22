@@ -32,7 +32,8 @@ const MAX_VALUE_CHARS: usize = 128;
 const MINTED_VALUE_CHARS: usize = 40;
 
 /// `CreateApiKey` with `request`, asserting the modelled 201 and returning the body.
-async fn create_key(gateway: &Gateway, case: &str, request: Value) -> Value {
+/// Shared with the sibling `patch_updates` suite, which patches the keys it creates.
+pub(crate) async fn create_key(gateway: &Gateway, case: &str, request: Value) -> Value {
     let answer = gateway.call("POST", "/apikeys", Some(request)).await;
     assert_eq!(
         answer.status, 201,
@@ -43,7 +44,7 @@ async fn create_key(gateway: &Gateway, case: &str, request: Value) -> Value {
 }
 
 /// `GetApiKey` for `id`, with `includeValue` set when `include_value`.
-async fn get_key(gateway: &Gateway, id: &str, include_value: bool) -> Answer {
+pub(crate) async fn get_key(gateway: &Gateway, id: &str, include_value: bool) -> Answer {
     let uri = if include_value {
         format!("/apikeys/{id}?includeValue=true")
     } else {
@@ -53,7 +54,7 @@ async fn get_key(gateway: &Gateway, id: &str, include_value: bool) -> Answer {
 }
 
 /// Assert `answer` is the modelled failure `(status, code)`.
-fn assert_failure(answer: &Answer, status: u16, code: &str, case: &str) {
+pub(crate) fn assert_failure(answer: &Answer, status: u16, code: &str, case: &str) {
     assert_eq!(
         answer.status, status,
         "case {case}: expected {status}, got {} with {:?}",
@@ -151,6 +152,9 @@ async fn a_created_api_key_is_persisted_and_read_back_member_for_member() {
             "case {case}: enabled must report the request's value or its default, got {:?}",
             created["enabled"]
         );
+        // The two collection members are always reported, empty when the key holds
+        // nothing: an `ApiKey` carries a list of stage associations and a map of tags,
+        // which are empty rather than absent on a key that has neither.
         assert_eq!(
             created["tags"],
             request.get("tags").cloned().unwrap_or(json!({})),
@@ -161,6 +165,16 @@ async fn a_created_api_key_is_persisted_and_read_back_member_for_member() {
             created["createdDate"].is_number() && created["lastUpdatedDate"].is_number(),
             "case {case}: expected both timestamps, got {created:?}"
         );
+        // A timestamp on this surface is a WHOLE number of epoch seconds.
+        for member in ["createdDate", "lastUpdatedDate"] {
+            let stamp = created[member]
+                .as_f64()
+                .unwrap_or_else(|| panic!("case {case}: expected a numeric {member}"));
+            assert!(
+                stamp.fract() == 0.0,
+                "case {case}: {member} must be whole epoch seconds, got {stamp}"
+            );
+        }
         assert_eq!(
             created["stageKeys"],
             json!([]),

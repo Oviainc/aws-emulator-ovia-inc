@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMethod
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMethod`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `Method` record,
+//! in request order, and reports the updated method — so a later `GetMethod` reads back
+//! exactly what the patch set.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMethod::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The whole list is applied to a COPY of the record and written back only once every op
+//! has succeeded, so a list carrying one unsupported op leaves the stored method as it
+//! was rather than half-patched.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +112,85 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    patch_bool, patch_bool_map, patch_optional_string, patch_required_string, patch_string_map,
+    patch_string_set, MethodEntry, Patch, PatchFailure, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+};
+
+/// The `path` values `UpdateMethod` accepts: one per updateable member of the `Method`
+/// shape. `httpMethod` is the method's identity, and `methodResponses` and
+/// `methodIntegration` are sub-resources with their own operations
+/// (`UpdateMethodResponse`, `UpdateIntegration`), so none of them is patchable here.
+const SUPPORTED_PATHS: &[&str] = &[
+    "/apiKeyRequired",
+    "/authorizationScopes",
+    "/authorizationType",
+    "/authorizerId",
+    "/operationName",
+    "/requestModels/<content-type>",
+    "/requestParameters/<parameter-name>",
+    "/requestValidatorId",
+];
+
+/// Apply one patch to a COPY of a stored method.
+fn apply_patch(entry: &mut MethodEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // `authorizationType` is how a method is authorized and `Method` always reports
+        // one, so it can be replaced but not removed.
+        "authorizationType" => {
+            patch_required_string(&mut entry.authorization_type, patch, MAX_STRING_CHARS)
+        }
+        "apiKeyRequired" => patch_bool(&mut entry.api_key_required, patch),
+        "authorizerId" => patch_optional_string(&mut entry.authorizer_id, patch, MAX_STRING_CHARS),
+        "operationName" => {
+            patch_optional_string(&mut entry.operation_name, patch, MAX_STRING_CHARS)
+        }
+        "requestValidatorId" => {
+            patch_optional_string(&mut entry.request_validator_id, patch, MAX_STRING_CHARS)
+        }
+        "authorizationScopes" => {
+            let scope = patch.collection_entry(1)?;
+            crate::state::bound_chars(&patch.path, &scope, MAX_STRING_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            patch_string_set(
+                &mut entry.authorization_scopes,
+                patch,
+                &scope,
+                MAX_COLLECTION_ENTRIES,
+            )
+        }
+        // The path names ONE entry of the map: `/requestParameters/<name>` with a
+        // boolean value — "a Boolean flag indicating whether the parameter is required
+        // (true) or optional (false)" (`Method$requestParameters`).
+        "requestParameters" => {
+            let name = patch.map_key(1)?;
+            crate::state::bound_chars(&patch.path, &name, MAX_STRING_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            patch_bool_map(
+                &mut entry.request_parameters,
+                patch,
+                name,
+                MAX_COLLECTION_ENTRIES,
+            )
+        }
+        // As `requestParameters`, with the model name as the entry's value:
+        // `/requestModels/<content-type>`, where a `/` in the content type is escaped
+        // `~1` the way a JSON Pointer requires.
+        "requestModels" => {
+            let content_type = patch.map_key(1)?;
+            crate::state::bound_chars(&patch.path, &content_type, MAX_STRING_CHARS)
+                .map_err(PatchFailure::BadRequest)?;
+            patch_string_map(
+                &mut entry.request_models,
+                patch,
+                content_type,
+                MAX_COLLECTION_ENTRIES,
+            )
+        }
+        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -186,18 +263,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMethod` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMethodErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMethod"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
+            .map_err(patch_failure)?;
+
+        let verb = super::put_method::method_key(&input.http_method);
+        let mut store = state.lock();
+
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            UpdateMethodErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+            })
+        })?;
+        let resource = api.resources.get_mut(&input.resource_id).ok_or_else(|| {
+            UpdateMethodErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_RESOURCE.to_string()),
+            })
+        })?;
+        // Patched on a COPY: a list whose later op is refused leaves the stored method
+        // untouched, rather than keeping the ops before it.
+        let mut updated = resource
+            .methods
+            .get(&verb)
+            .ok_or_else(|| {
+                UpdateMethodErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_METHOD.to_string()),
+                })
+            })?
+            .clone();
+
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+
+        resource.methods.insert(verb.clone(), updated);
+        let stored = resource.methods.get(&verb).ok_or_else(|| {
+            UpdateMethodErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_METHOD.to_string()),
+            })
+        })?;
+        // Rendered through the one `Method` body this crate builds, so the update
+        // reports the record exactly as `GetMethod` will read it back.
+        let body = GetMethodOutput::from(stored);
+        Ok(UpdateMethodOutput {
+            http_method: body.http_method,
+            authorization_type: body.authorization_type,
+            authorizer_id: body.authorizer_id,
+            api_key_required: body.api_key_required,
+            request_validator_id: body.request_validator_id,
+            operation_name: body.operation_name,
+            request_parameters: body.request_parameters,
+            request_models: body.request_models,
+            method_responses: body.method_responses,
+            method_integration: body.method_integration,
+            authorization_scopes: body.authorization_scopes,
+        })
     }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateMethodError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateMethodErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateMethodErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateMethodErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

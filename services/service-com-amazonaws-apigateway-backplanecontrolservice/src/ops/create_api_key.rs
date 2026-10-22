@@ -322,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(crate::state::state_unavailable)?,
         };
 
-        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let now = crate::state::now();
         let mut store = state.lock();
 
         // Bound the growth a caller drives, at API Gateway's published quota.
@@ -375,10 +375,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             customer_id: input.customer_id,
             enabled: input.enabled,
             created_date: Some(now),
-            // A key is created and last updated at the same instant; `UpdateApiKey`
-            // moves this one, and is still scaffolded.
+            // A key is created and last updated at the same instant; a successful
+            // `UpdateApiKey` patch moves this one.
             last_updated_date: Some(now),
             stage_keys,
+            // A key is created with no labels; an `UpdateApiKey` patch of `/labels`
+            // adds them.
+            labels: Vec::new(),
             tags: input
                 .tags
                 .unwrap_or_default()

@@ -135,6 +135,13 @@ pub struct ApiKeyEntry {
     /// The stages this key is associated with, each rendered `<restApiId>/<stageName>`
     /// as the modelled `ApiKey$stageKeys` list of strings reports them.
     pub stage_keys: Vec<String>,
+    /// The labels an `UpdateApiKey` patch of `/labels` adds to and removes from the key.
+    ///
+    /// Stored and reported by nothing: AWS accepts `/labels` as a collection path on an
+    /// API key (a recorded refusal lists it beside `/stages`), while the `ApiKey` shape
+    /// this service's model declares carries no member for it — so the patch is applied
+    /// to the record and no response renders it.
+    pub labels: Vec<String>,
     pub tags: BTreeMap<String, String>,
     /// This key's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
@@ -283,6 +290,466 @@ pub fn page_of(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Patch operations
+//
+// Every `Update*` operation of this service is an HTTP PATCH carrying
+// `patchOperations`: a list of JSON-Pointer addressed edits that the service applies to
+// the stored resource, in request order, before reporting the updated resource. What an
+// `op` means, how a `path` is read and how a single-valued member, a string set or a map
+// member is edited are shared here, so no two handlers can disagree about it: a handler
+// only maps a supported path to the member of its own record that the path names.
+// ---------------------------------------------------------------------------
+
+/// The `op` of one [`Patch`]: the values the model's `Op` enum declares
+/// (`smithy_query(query="shape", shape="Op")`: add, remove, replace, move, copy, test),
+/// which [`crate::ops::types::OP_VALUES`] lists on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchOpKind {
+    Add,
+    Remove,
+    Replace,
+    Move,
+    Copy,
+    Test,
+}
+
+impl PatchOpKind {
+    /// The kind an `op` string names, or `None` when it names none of them.
+    pub fn parse(op: &str) -> Option<Self> {
+        match op {
+            "add" => Some(Self::Add),
+            "remove" => Some(Self::Remove),
+            "replace" => Some(Self::Replace),
+            "move" => Some(Self::Move),
+            "copy" => Some(Self::Copy),
+            "test" => Some(Self::Test),
+            _ => None,
+        }
+    }
+
+    /// The wire spelling, for a refusal message that quotes the op back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Remove => "remove",
+            Self::Replace => "replace",
+            Self::Move => "move",
+            Self::Copy => "copy",
+            Self::Test => "test",
+        }
+    }
+}
+
+/// Why a patch could not be applied. A handler maps this to the modelled error its own
+/// operation declares for that kind of refusal, so the same malformed patch is answered
+/// with the same status whichever resource it targeted.
+#[derive(Debug, Clone)]
+pub enum PatchFailure {
+    /// The request is not valid: an unknown op, a path this resource has no updateable
+    /// member for, a value that is not of the member's type. `BadRequestException`.
+    BadRequest(String),
+    /// The patch names a resource that does not exist. `NotFoundException`.
+    NotFound(String),
+    /// Applying the patch would collide with another stored record.
+    /// `ConflictException`.
+    Conflict(String),
+}
+
+/// One parsed entry of `patchOperations`.
+#[derive(Debug, Clone)]
+pub struct Patch {
+    /// The edit to perform.
+    pub op: PatchOpKind,
+    /// The `path` exactly as the request spelled it, for a refusal that quotes it back.
+    pub path: String,
+    /// `path` split into its JSON Pointer reference tokens, each unescaped — so
+    /// `/binaryMediaTypes/image~1png` is `["binaryMediaTypes", "image/png"]`.
+    pub tokens: Vec<String>,
+    /// The op's `value`: "applicable for the add or replace operation"
+    /// (`PatchOperation$value`).
+    pub value: Option<String>,
+    /// The `copy`/`move` source pointer (`PatchOperation$from`).
+    pub from: Option<String>,
+}
+
+/// Decode one JSON Pointer reference token.
+///
+/// From `PatchOperation$path`: "Any slash ("/") character appearing in path names must
+/// be escaped with "~1"". `~1` is decoded before `~0`, as RFC 6901 requires, so an
+/// escaped tilde cannot go on to produce a second escape.
+fn unescape_pointer_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
+impl Patch {
+    /// Parse one wire `PatchOperation`.
+    fn parse(operation: &crate::ops::types::PatchOperation) -> Result<Self, PatchFailure> {
+        let op = operation.op.as_deref().ok_or_else(|| {
+            PatchFailure::BadRequest(
+                "each patchOperations entry must carry an op".to_string(),
+            )
+        })?;
+        let op = PatchOpKind::parse(op).ok_or_else(|| {
+            PatchFailure::BadRequest(format!(
+                "Invalid patch operation specified: {op}; expected one of {}",
+                crate::ops::types::OP_VALUES.join(", ")
+            ))
+        })?;
+        let path = operation.path.as_deref().ok_or_else(|| {
+            PatchFailure::BadRequest(
+                "each patchOperations entry must carry a path".to_string(),
+            )
+        })?;
+        bound_chars("a patchOperations path", path, MAX_STRING_CHARS)
+            .map_err(PatchFailure::BadRequest)?;
+        // A JSON Pointer to a member of the targeted resource starts at the resource
+        // root, so it begins with `/` and names at least one member.
+        let tokens: Vec<String> = match path.strip_prefix('/') {
+            Some(rest) if !rest.is_empty() => rest.split('/').map(unescape_pointer_token).collect(),
+            _ => {
+                return Err(PatchFailure::BadRequest(format!(
+                    "Invalid patch path: {path}; a path is a JSON Pointer naming a member of the resource, such as /name"
+                )))
+            }
+        };
+        Ok(Self {
+            op,
+            path: path.to_string(),
+            tokens,
+            value: operation.value.clone(),
+            from: operation.from.clone(),
+        })
+    }
+
+    /// The member the path's first reference token names.
+    pub fn member(&self) -> &str {
+        self.tokens.first().map_or("", String::as_str)
+    }
+
+    /// The op's `value`, refusing an add or replace that carries none: there is nothing
+    /// to set the member to.
+    pub fn require_value(&self) -> Result<&str, PatchFailure> {
+        self.value.as_deref().ok_or_else(|| {
+            PatchFailure::BadRequest(format!(
+                "a {} of {} requires a value",
+                self.op.as_str(),
+                self.path
+            ))
+        })
+    }
+
+    /// The op's `value` read as the boolean a boolean member takes.
+    pub fn require_bool(&self) -> Result<bool, PatchFailure> {
+        let value = self.require_value()?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(PatchFailure::BadRequest(format!(
+                "{} takes a boolean value of true or false, got {value:?}",
+                self.path
+            ))),
+        }
+    }
+
+    /// The op's `value` read as an integer inside `range`, for a member documented with
+    /// bounds.
+    pub fn require_i32_in(
+        &self,
+        range: ::std::ops::RangeInclusive<i32>,
+    ) -> Result<i32, PatchFailure> {
+        let value = self.require_value()?;
+        let parsed: i32 = value.trim().parse().map_err(|_| {
+            PatchFailure::BadRequest(format!(
+                "{} takes an integer value, got {value:?}",
+                self.path
+            ))
+        })?;
+        if !range.contains(&parsed) {
+            return Err(PatchFailure::BadRequest(format!(
+                "{} must be between {} and {}, inclusive: {parsed}",
+                self.path,
+                range.start(),
+                range.end()
+            )));
+        }
+        Ok(parsed)
+    }
+
+    /// This patch as it addresses a member of a NESTED structure: the first `depth`
+    /// reference tokens — the ones naming the structure itself — are dropped, so the
+    /// structure's own members are addressed exactly the way a top-level member is.
+    /// `path` is kept whole, so a refusal still quotes the pointer the request sent.
+    pub fn rebased(&self, depth: usize) -> Self {
+        Self {
+            tokens: self.tokens.iter().skip(depth).cloned().collect(),
+            ..self.clone()
+        }
+    }
+
+    /// Refuse a path that reaches INTO a single-valued member (`/name/first`): such a
+    /// member has no sub-member a pointer could name.
+    pub fn require_single_valued(&self) -> Result<(), PatchFailure> {
+        if self.tokens.len() == 1 {
+            return Ok(());
+        }
+        Err(PatchFailure::BadRequest(format!(
+            "Invalid patch path: {}; {} is a single-valued member and has no sub-member",
+            self.path,
+            self.member()
+        )))
+    }
+
+    /// The refusal for a path the targeted resource has no updateable member for.
+    ///
+    /// "Attempts to apply an unsupported operation on a resource will return an error
+    /// message" (`PatchOperation$op`), and the message API Gateway returns names the
+    /// path, the op and the paths the resource does have — as a recorded refusal shows:
+    /// `Invalid patch path  '/id' specified for op 'replace'. Must be one of:
+    /// [/description, /enabled, /name, /customerId]`. That is the rule reproduced here,
+    /// with each operation's own `supported` list; a caller has to fix the request from
+    /// this text alone.
+    pub fn unsupported_path(&self, supported: &[&str]) -> PatchFailure {
+        PatchFailure::BadRequest(format!(
+            "Invalid patch path  '{}' specified for op '{}'. Must be one of: [{}]",
+            self.path,
+            self.op.as_str(),
+            supported.join(", ")
+        ))
+    }
+
+    /// The refusal for an op the member this path names does not support.
+    ///
+    /// "Not all valid operations are supported for a given resource. Support of the
+    /// operations depends on specific operational contexts. Attempts to apply an
+    /// unsupported operation on a resource will return an error message"
+    /// (`PatchOperation$op`): the ops these resources support are `add`, `remove` and
+    /// `replace` — `move`, `copy` and `test` name nothing on them — and a recorded AWS
+    /// refusal of a `move` says exactly `Invalid patch operation specified. Must be
+    /// 'add'|'remove'|'replace'`, which is the rule reproduced here.
+    pub fn unsupported_op(&self) -> PatchFailure {
+        PatchFailure::BadRequest(
+            "Invalid patch operation specified. Must be 'add'|'remove'|'replace'".to_string(),
+        )
+    }
+
+    /// The entry of a collection member this patch names.
+    ///
+    /// `depth` is how many reference tokens the member itself takes, so the entry is
+    /// what the path carries beyond it (`/binaryMediaTypes/image~1png`) and otherwise
+    /// the op's own `value` (`op=add, path=/binaryMediaTypes, value=image/png`) — the
+    /// two spellings a client can address one entry of a string collection with.
+    pub fn collection_entry(&self, depth: usize) -> Result<String, PatchFailure> {
+        match self.tokens.get(depth..) {
+            Some(rest) if !rest.is_empty() => Ok(rest.join("/")),
+            _ => Ok(self.require_value()?.to_string()),
+        }
+    }
+
+    /// The key of a map member this patch names: the reference token beyond the member,
+    /// which is the key, unescaped.
+    pub fn map_key(&self, depth: usize) -> Result<String, PatchFailure> {
+        match self.tokens.get(depth..) {
+            Some(rest) if !rest.is_empty() => Ok(rest.join("/")),
+            _ => Err(PatchFailure::BadRequest(format!(
+                "Invalid patch path: {}; {} is a map and the path must name one key, as in {}/<key>",
+                self.path,
+                self.member(),
+                self.path.trim_end_matches('/')
+            ))),
+        }
+    }
+}
+
+/// Parse a request's `patchOperations` into the edits to apply, in request order.
+///
+/// Called BEFORE anything is written, so a list this service cannot read leaves the
+/// store untouched. The list is caller-sized, so it is bounded like every other
+/// caller-sized collection — see [`bound_entries`].
+pub fn parse_patches(
+    operations: Option<&Vec<crate::ops::types::PatchOperation>>,
+) -> Result<Vec<Patch>, PatchFailure> {
+    let operations: &[crate::ops::types::PatchOperation] =
+        operations.map(Vec::as_slice).unwrap_or_default();
+    bound_entries("patchOperations", operations.len(), MAX_COLLECTION_ENTRIES)
+        .map_err(PatchFailure::BadRequest)?;
+    operations.iter().map(Patch::parse).collect()
+}
+
+/// Apply `patch` to a single-valued OPTIONAL string member.
+///
+/// `add` and `replace` set it to the op's value — `value` is "applicable for the add or
+/// replace operation" (`PatchOperation$value`) — and `remove` clears it, which an
+/// optional member can be. Any other op is unsupported on such a member.
+pub fn patch_optional_string(
+    current: &mut Option<String>,
+    patch: &Patch,
+    max_chars: usize,
+) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => {
+            let value = patch.require_value()?;
+            bound_chars(&patch.path, value, max_chars).map_err(PatchFailure::BadRequest)?;
+            *current = Some(value.to_string());
+        }
+        PatchOpKind::Remove => *current = None,
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to a single-valued REQUIRED string member: as
+/// [`patch_optional_string`], except that `remove` is refused — the member always has a
+/// value — and an empty value is refused for the same reason.
+pub fn patch_required_string(
+    current: &mut String,
+    patch: &Patch,
+    max_chars: usize,
+) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => {
+            let value = patch.require_value()?;
+            if value.is_empty() {
+                return Err(PatchFailure::BadRequest(format!(
+                    "{} must not be empty",
+                    patch.path
+                )));
+            }
+            bound_chars(&patch.path, value, max_chars).map_err(PatchFailure::BadRequest)?;
+            *current = value.to_string();
+        }
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to a single-valued string member whose value set the model declares as
+/// an enum: as [`patch_optional_string`], plus the enum's own values, because a patch
+/// `value` is a bare string on the wire and so reaches the handler unvalidated.
+pub fn patch_enum_string(
+    current: &mut Option<String>,
+    patch: &Patch,
+    values: &[&str],
+) -> Result<(), PatchFailure> {
+    if matches!(patch.op, PatchOpKind::Add | PatchOpKind::Replace) {
+        patch.require_single_valued()?;
+        let value = patch.require_value()?;
+        if !values.contains(&value) {
+            return Err(PatchFailure::BadRequest(format!(
+                "{} takes one of {}, got {value:?}",
+                patch.path,
+                values.join(", ")
+            )));
+        }
+    }
+    patch_optional_string(current, patch, MAX_STRING_CHARS)
+}
+
+/// Apply `patch` to a boolean member. `remove` is refused: a boolean member declared
+/// with a default always has one of its two values.
+pub fn patch_bool(current: &mut bool, patch: &Patch) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => *current = patch.require_bool()?,
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to a nullable integer member bounded by `range`; `remove` clears it.
+pub fn patch_optional_i32(
+    current: &mut Option<i32>,
+    patch: &Patch,
+    range: ::std::ops::RangeInclusive<i32>,
+) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => *current = Some(patch.require_i32_in(range)?),
+        PatchOpKind::Remove => *current = None,
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to a member that is a set of strings (`binaryMediaTypes`,
+/// `authorizationScopes`, an API key's stage associations).
+///
+/// `add` appends `entry` when the collection does not hold it already, so adding twice
+/// is the same as adding once; `remove` drops it. `replace` is unsupported: the path
+/// names one entry, not the whole collection. The collection is caller-sized, so it is
+/// bounded like every other.
+pub fn patch_string_set(
+    current: &mut Vec<String>,
+    patch: &Patch,
+    entry: &str,
+    max_entries: usize,
+) -> Result<(), PatchFailure> {
+    match patch.op {
+        PatchOpKind::Add => {
+            if !current.iter().any(|held| held == entry) {
+                bound_entries(&patch.path, current.len() + 1, max_entries)
+                    .map_err(PatchFailure::BadRequest)?;
+                current.push(entry.to_string());
+            }
+        }
+        PatchOpKind::Remove => current.retain(|held| held != entry),
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to a map member whose values are strings: `add` and `replace` set
+/// `key` to the op's value, `remove` drops the key.
+pub fn patch_string_map(
+    current: &mut BTreeMap<String, String>,
+    patch: &Patch,
+    key: String,
+    max_entries: usize,
+) -> Result<(), PatchFailure> {
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => {
+            let value = patch.require_value()?;
+            bound_chars(&patch.path, value, MAX_STRING_CHARS).map_err(PatchFailure::BadRequest)?;
+            if !current.contains_key(&key) {
+                bound_entries(&patch.path, current.len() + 1, max_entries)
+                    .map_err(PatchFailure::BadRequest)?;
+            }
+            current.insert(key, value.to_string());
+        }
+        PatchOpKind::Remove => {
+            current.remove(&key);
+        }
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to a map member whose values are booleans; see [`patch_string_map`].
+pub fn patch_bool_map(
+    current: &mut BTreeMap<String, bool>,
+    patch: &Patch,
+    key: String,
+    max_entries: usize,
+) -> Result<(), PatchFailure> {
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => {
+            let value = patch.require_bool()?;
+            if !current.contains_key(&key) {
+                bound_entries(&patch.path, current.len() + 1, max_entries)
+                    .map_err(PatchFailure::BadRequest)?;
+            }
+            current.insert(key, value);
+        }
+        PatchOpKind::Remove => {
+            current.remove(&key);
+        }
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
 impl ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// Mint a fresh id of the shape API Gateway assigns a `RestApi` or a `Resource`:
     /// ten lowercase alphanumeric characters.
@@ -385,6 +852,21 @@ pub fn mint_api_key_value(store: &::emulator_server::CredentialStore) -> Option<
     // The key value is not a credential of this emulator; see above.
     let _ = store.delete(&minted.id);
     (value.chars().count() == API_KEY_VALUE_LEN).then_some(value)
+}
+
+/// The instant a record is stamped with, at the resolution this surface reports a
+/// timestamp in: WHOLE epoch seconds.
+///
+/// API Gateway's REST-JSON responses carry `Timestamp` members as whole-second epoch
+/// numbers, so a stored instant is truncated to the second when it is taken rather than
+/// when it is serialized: a client that parses the member as an integer epoch, and
+/// anything that compares or hashes the serialized value, then reads the same value the
+/// service reports.
+pub fn now() -> ::aws_smithy_types::DateTime {
+    let seconds = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    ::aws_smithy_types::DateTime::from_secs(i64::try_from(seconds).unwrap_or(0))
 }
 
 /// What a handler answers when [`service_state`] cannot reach this service's store.
