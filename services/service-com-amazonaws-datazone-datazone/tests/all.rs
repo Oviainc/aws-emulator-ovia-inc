@@ -19,6 +19,8 @@ mod domain_name_conflict_and_not_found;
 mod domain_project_lifecycle;
 #[path = "all/glossary_lifecycle.rs"]
 mod glossary_lifecycle;
+#[path = "all/policy_grants.rs"]
+mod policy_grants;
 #[path = "all/project_memberships.rs"]
 mod project_memberships;
 #[path = "all/resource_tagging.rs"]

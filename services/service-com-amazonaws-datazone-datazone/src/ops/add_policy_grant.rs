@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddPolicyGrant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddPolicyGrant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddPolicyGrant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one policy grant under a PERSISTED domain, so `ListPolicyGrants` answers from
+//! the stored record, `RemovePolicyGrant` drops it, and the grant disappears with its
+//! domain.
+//!
+//! `detail` must be the `PolicyGrantDetail` member the request's `policyType` names: the
+//! model declares the two in one-to-one correspondence (see
+//! [`crate::state::policy_type_of_detail`]), so any other pairing is refused with a 400
+//! `ValidationException`.
+//!
+//! `createdBy` is the CALLER's principal (derived from the request's SigV4 scope), and
+//! `grantId` is minted (10 characters, the modelled `GrantIdentifier` pattern) — neither
+//! comes from the request body. A repeated `clientToken` on the same grant request
+//! answers with the grant the first one created instead of adding a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +171,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddPolicyGrant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddPolicyGrantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddPolicyGrant"))
+        use crate::state::{
+            caller_principal, now_ms, policy_type_of_detail, principal_key, PolicyGrant,
+            DOMAIN_STATUS_AVAILABLE, MAX_POLICY_GRANTS_PER_DOMAIN,
+        };
+
+        // `policyType` says which policy to grant and `detail` carries that policy's
+        // own parameters; the model gives `PolicyGrantDetail` exactly one member per
+        // `ManagedPolicyType` value, so a request pairing them differently asks to
+        // grant one policy and describes another.
+        let detail_policy_type = policy_type_of_detail(&input.detail);
+        if detail_policy_type != input.policy_type {
+            return Err(AddPolicyGrantErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "detail describes the {detail_policy_type} policy, but policyType is {}",
+                    input.policy_type
+                ),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddPolicyGrantErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // This operation models no `ResourceNotFoundException`, so an unknown domain is
+        // refused as a bad request.
+        let domain_status = store
+            .domains
+            .get(&input.domain_identifier)
+            .map(|domain| domain.status.clone())
+            .ok_or_else(|| {
+                AddPolicyGrantErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "domainIdentifier {} does not identify a domain",
+                        input.domain_identifier
+                    ),
+                })
+            })?;
+        // A domain still being created, or already being deleted, cannot take a grant:
+        // the request conflicts with the domain's current state.
+        if domain_status != DOMAIN_STATUS_AVAILABLE {
+            return Err(AddPolicyGrantErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Domain {} is {domain_status}, so it cannot accept a policy grant",
+                    input.domain_identifier
+                ),
+            })
+            .into());
+        }
+
+        let grants = store
+            .domains
+            .get(&input.domain_identifier)
+            .map(|domain| &domain.policy_grants);
+        // `clientToken` is an `@idempotencyToken`: a replay of the request that created a
+        // grant answers with that grant rather than adding a second one. It is a replay
+        // only when the rest of the request describes that same grant — the same entity,
+        // policy type and principal — so a token reused for a different grant still adds
+        // that grant instead of being answered with an unrelated one.
+        let wanted_principal = principal_key(&input.principal);
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = grants.and_then(|grants| {
+                grants
+                    .values()
+                    .find(|grant| {
+                        grant.client_token.as_deref() == Some(token)
+                            && grant.entity_type == input.entity_type
+                            && grant.entity_identifier == input.entity_identifier
+                            && grant.policy_type == input.policy_type
+                            && principal_key(&grant.principal) == wanted_principal
+                    })
+                    .map(|grant| grant.grant_id.clone())
+            });
+            if let Some(grant_id) = replayed {
+                return Ok(AddPolicyGrantOutput {
+                    grant_id: Some(grant_id),
+                });
+            }
+        }
+        // The store is bounded, so an add loop cannot grow the emulator's heap without
+        // limit; the refusal is the error the operation already models.
+        if grants.is_some_and(|grants| grants.len() >= MAX_POLICY_GRANTS_PER_DOMAIN) {
+            return Err(AddPolicyGrantErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {MAX_POLICY_GRANTS_PER_DOMAIN} policy grants in one domain"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Mint an id no stored grant holds: the mint is unique by construction unless
+        // its counter digits wrap, and this makes that unconditional rather than taking
+        // an earlier grant's place. Exhausting every attempt is a store this emulator
+        // cannot mint into, which is a server-side failure, not a bad request.
+        let mut minted = None;
+        for _ in 0..=MAX_POLICY_GRANTS_PER_DOMAIN {
+            let candidate = store.mint_grant_id(now);
+            let taken = store
+                .domains
+                .get(&input.domain_identifier)
+                .is_some_and(|domain| domain.policy_grants.contains_key(&candidate));
+            if !taken {
+                minted = Some(candidate);
+                break;
+            }
+        }
+        let grant_id = minted.ok_or_else(|| {
+            AddPolicyGrantErrorModeled::InternalServerException(InternalServerException {
+                message: "could not mint an unused grant id".to_string(),
+            })
+        })?;
+        let grant = PolicyGrant {
+            grant_id: grant_id.clone(),
+            entity_type: input.entity_type,
+            entity_identifier: input.entity_identifier,
+            policy_type: input.policy_type,
+            principal: input.principal,
+            detail: input.detail,
+            created_at_ms: now,
+            created_by: caller_principal(ctx),
+            client_token: input.client_token,
+        };
+        // `domain_status` proved the domain is there; store the grant under it.
+        if let Some(domain) = store.domains.get_mut(&input.domain_identifier) {
+            domain.policy_grants.insert(grant_id.clone(), grant);
+        }
+
+        Ok(AddPolicyGrantOutput {
+            grant_id: Some(grant_id),
+        })
     }
 }

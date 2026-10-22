@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPolicyGrants
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPolicyGrants`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPolicyGrants::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the policy grants `AddPolicyGrant` stored on one entity of one domain, for
+//! one `policyType`, paginated over the stored map in a stable order.
+//!
+//! A reporting operation: it writes nothing beyond the domain lifecycle steps the clock
+//! already owes (see `crate::state::settle_clock`).
 //!
 //! ## Shape of an operation
 //!
@@ -151,6 +148,14 @@ impl<Eng> ListPolicyGrants<Eng> {
     }
 }
 
+/// The `maxResults` range the model declares for this operation (`@range` min 1, max 25
+/// on `MaxResultsForListDomains`, smithy_query operation="ListPolicyGrants"). A request
+/// naming no `maxResults` gets the top of the range, and a value is clamped into it
+/// rather than trusted: a 0 would otherwise answer an empty page while the entity has
+/// grants.
+const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = 25;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListPolicyGrants<Eng>
 {
@@ -168,18 +173,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPolicyGrants` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPolicyGrantsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPolicyGrants"))
+        let _ = ctx;
+        use crate::state::{date_time, decode_page_token, encode_page_token, now_ms};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPolicyGrantsErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListPolicyGrantsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                })
+            })?),
+            None => None,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(MAX_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+
+        // This operation models no `ResourceNotFoundException`, so an unknown domain is
+        // refused as a bad request rather than reported as a domain with no grants.
+        let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+            ListPolicyGrantsErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "domainIdentifier {} does not identify a domain",
+                    input.domain_identifier
+                ),
+            })
+        })?;
+
+        // A grant is listed only for the entity it was added to and the policy type it
+        // grants; an entity this emulator holds no grant for is an empty list, which is
+        // what the required `grantList` member reports.
+        let matching = domain
+            .policy_grants
+            .values()
+            .filter(|grant| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| grant.grant_id.as_str() > after)
+            })
+            .filter(|grant| {
+                grant.entity_type == input.entity_type
+                    && grant.entity_identifier == input.entity_identifier
+                    && grant.policy_type == input.policy_type
+            });
+
+        let mut grant_list: Vec<PolicyGrantMember> = Vec::new();
+        let mut next_token = None;
+        for grant in matching {
+            if grant_list.len() == page_size {
+                next_token = grant_list
+                    .last()
+                    .and_then(|last| last.grant_id.as_deref())
+                    .map(encode_page_token);
+                break;
+            }
+            grant_list.push(PolicyGrantMember {
+                principal: Some(grant.principal.clone()),
+                detail: Some(grant.detail.clone()),
+                created_at: Some(date_time(grant.created_at_ms)),
+                created_by: Some(grant.created_by.clone()),
+                grant_id: Some(grant.grant_id.clone()),
+            });
+        }
+
+        Ok(ListPolicyGrantsOutput {
+            grant_list,
+            next_token,
+        })
     }
 }

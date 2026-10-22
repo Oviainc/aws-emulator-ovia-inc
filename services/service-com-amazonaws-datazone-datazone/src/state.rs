@@ -96,6 +96,11 @@ pub struct Domain {
     /// The projects stored in this domain, so they go with it when it is deleted.
     /// Bounded by [`MAX_PROJECTS_PER_DOMAIN`].
     pub projects: BTreeMap<String, Project>,
+    /// The policy grants stored in this domain, keyed by `grantId`, so they go with it
+    /// when it is deleted. A `BTreeMap` so every `ListPolicyGrants` iterates in one
+    /// stable order and a pagination token can resume from a key. Bounded by
+    /// [`MAX_POLICY_GRANTS_PER_DOMAIN`].
+    pub policy_grants: BTreeMap<String, PolicyGrant>,
     /// The business glossaries stored in this domain, keyed by glossary id, so they go
     /// with the domain when it is deleted. Bounded by [`MAX_GLOSSARIES_PER_DOMAIN`].
     pub glossaries: BTreeMap<String, Glossary>,
@@ -328,6 +333,115 @@ pub fn membership_from_request(
     ))
 }
 
+/// One stored policy grant: an authorization policy of one `policyType`, held by one
+/// principal, on one entity (`entityType` + `entityIdentifier`) inside a domain.
+///
+/// `principal` and `detail` are kept as the modelled unions the request carried, so
+/// `ListPolicyGrants` reports back exactly what `AddPolicyGrant` persisted rather than
+/// a lossy projection of it.
+#[derive(Debug, Clone)]
+pub struct PolicyGrant {
+    /// The grant's own id, minted by [`ComAmazonawsDatazoneDatazoneState::mint_grant_id`].
+    pub grant_id: String,
+    /// `TargetEntityType`: ASSET_TYPE | DOMAIN_UNIT | ENVIRONMENT_BLUEPRINT_CONFIGURATION
+    /// | ENVIRONMENT_PROFILE (model enum `com.amazonaws.datazone#TargetEntityType`).
+    pub entity_type: String,
+    /// The id of the entity the grant is attached to.
+    pub entity_identifier: String,
+    /// `ManagedPolicyType` (model enum `com.amazonaws.datazone#ManagedPolicyType`).
+    pub policy_type: String,
+    pub principal: crate::ops::types::PolicyGrantPrincipal,
+    pub detail: crate::ops::types::PolicyGrantDetail,
+    pub created_at_ms: i64,
+    pub created_by: String,
+    /// The `@idempotencyToken` the request that created this grant carried, so a replay
+    /// of that request answers with this grant instead of adding a second one. Stored on
+    /// the grant (rather than in a side map) so the token is released with the grant.
+    pub client_token: Option<String>,
+}
+
+/// The canonical key of a `PolicyGrantPrincipal`: two principals are the same principal
+/// exactly when their keys are equal.
+///
+/// `RemovePolicyGrant` identifies the grant to drop by its principal, and the modelled
+/// unions and structures carry no `PartialEq`, so the comparison is made explicit here:
+/// every member of every variant is rendered, separated by a byte no identifier can
+/// contain (`\x1f`), so no two different principals can collide.
+pub fn principal_key(principal: &crate::ops::types::PolicyGrantPrincipal) -> String {
+    use crate::ops::types::{
+        DomainUnitGrantFilter, GroupPolicyGrantPrincipal, PolicyGrantPrincipal, ProjectGrantFilter,
+        UserPolicyGrantPrincipal,
+    };
+    const SEP: char = '\x1f';
+    match principal {
+        PolicyGrantPrincipal::User(UserPolicyGrantPrincipal::userIdentifier(id)) => {
+            format!("user{SEP}userIdentifier{SEP}{id}")
+        }
+        PolicyGrantPrincipal::User(UserPolicyGrantPrincipal::allUsersGrantFilter(_)) => {
+            format!("user{SEP}allUsersGrantFilter")
+        }
+        PolicyGrantPrincipal::Group(GroupPolicyGrantPrincipal::groupIdentifier(id)) => {
+            format!("group{SEP}groupIdentifier{SEP}{id}")
+        }
+        PolicyGrantPrincipal::Project(project) => {
+            let filter = match project.project_grant_filter.as_ref() {
+                Some(ProjectGrantFilter::domainUnitFilter(f)) => format!(
+                    "domainUnitFilter{SEP}{}{SEP}{}",
+                    f.domain_unit,
+                    f.include_child_domain_units.unwrap_or(false)
+                ),
+                None => String::new(),
+            };
+            format!(
+                "project{SEP}{}{SEP}{}{SEP}{}{SEP}{filter}",
+                project.project_designation,
+                project.user_created_designation_id.as_deref().unwrap_or(""),
+                project.project_identifier.as_deref().unwrap_or(""),
+            )
+        }
+        PolicyGrantPrincipal::domainUnit(unit) => {
+            let filter = match unit.domain_unit_grant_filter.as_ref() {
+                Some(DomainUnitGrantFilter::allDomainUnitsGrantFilter(_)) => {
+                    "allDomainUnitsGrantFilter"
+                }
+                None => "",
+            };
+            format!(
+                "domainUnit{SEP}{}{SEP}{}{SEP}{filter}",
+                unit.domain_unit_designation,
+                unit.domain_unit_identifier.as_deref().unwrap_or(""),
+            )
+        }
+    }
+}
+
+/// The `ManagedPolicyType` a `PolicyGrantDetail` member describes.
+///
+/// The model declares the two in one-to-one correspondence: every `ManagedPolicyType`
+/// value has the `PolicyGrantDetail` member of the same name (smithy_query
+/// shape="ManagedPolicyType" / shape="PolicyGrantDetail"), so a request whose `detail`
+/// is not the member its `policyType` names describes a different policy from the one it
+/// asks to grant.
+pub fn policy_type_of_detail(detail: &crate::ops::types::PolicyGrantDetail) -> &'static str {
+    use crate::ops::types::PolicyGrantDetail as D;
+    match detail {
+        D::createDomainUnit(_) => "CREATE_DOMAIN_UNIT",
+        D::overrideDomainUnitOwners(_) => "OVERRIDE_DOMAIN_UNIT_OWNERS",
+        D::addToProjectMemberPool(_) => "ADD_TO_PROJECT_MEMBER_POOL",
+        D::overrideProjectOwners(_) => "OVERRIDE_PROJECT_OWNERS",
+        D::createGlossary(_) => "CREATE_GLOSSARY",
+        D::createFormType(_) => "CREATE_FORM_TYPE",
+        D::createAssetType(_) => "CREATE_ASSET_TYPE",
+        D::createProject(_) => "CREATE_PROJECT",
+        D::createEnvironmentProfile(_) => "CREATE_ENVIRONMENT_PROFILE",
+        D::delegateCreateEnvironmentProfile(_) => "DELEGATE_CREATE_ENVIRONMENT_PROFILE",
+        D::createEnvironment(_) => "CREATE_ENVIRONMENT",
+        D::createEnvironmentFromBlueprint(_) => "CREATE_ENVIRONMENT_FROM_BLUEPRINT",
+        D::createProjectFromProjectProfile(_) => "CREATE_PROJECT_FROM_PROJECT_PROFILE",
+        D::useAssetType(_) => "USE_ASSET_TYPE",
+    }
+}
+
 /// One stored DataZone asset type, at one revision.
 ///
 /// An asset type is a named, revisioned schema: the metadata forms an asset of that
@@ -372,6 +486,10 @@ pub const MAX_DOMAINS: usize = 100;
 /// The most projects this emulator stores in one domain, for the same reason and with
 /// the same refusal (`CreateProject` models `ServiceQuotaExceededException` too).
 pub const MAX_PROJECTS_PER_DOMAIN: usize = 500;
+
+/// The most policy grants this emulator stores in one domain, for the same reason and
+/// with the same refusal (`AddPolicyGrant` models `ServiceQuotaExceededException` too).
+pub const MAX_POLICY_GRANTS_PER_DOMAIN: usize = 500;
 
 /// The most members this emulator stores in one project, for the same reason: a
 /// ceiling so an add loop cannot grow the store without bound. The refusal is each
@@ -594,6 +712,34 @@ impl ComAmazonawsDatazoneDatazoneState {
             base36(u64::try_from(now).unwrap_or(0)),
             base36(self.id_seq)
         )
+    }
+
+    /// Mint a `GrantIdentifier`: exactly 10 characters, which is what the model's
+    /// `^[A-Za-z0-9+/]{10}$` pattern (smithy_query shape="GrantIdentifier") admits.
+    ///
+    /// The value encoded is the mint instant in the high digits and the per-process
+    /// counter in the low ones, so two grants minted in the same millisecond still get
+    /// different ids. Only the 62 alphanumeric characters of the pattern's class are
+    /// used, so an id is safe to carry in a URI as well as in a body.
+    pub fn mint_grant_id(&mut self, now: i64) -> String {
+        /// A subset of the pattern's character class, in ASCII order.
+        const ALPHABET: &[u8; 62] =
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        const LEN: usize = 10;
+
+        self.id_seq += 1;
+        // 62^10 is about 8.4e17, so the encoded value must stay below that: 1e11
+        // milliseconds of clock (about 3 years of distinct instants) times 1e6
+        // counter values is 1e17.
+        let mut value = u64::try_from(now).unwrap_or(0) % 100_000_000_000 * 1_000_000
+            + self.id_seq % 1_000_000;
+        let mut out = [ALPHABET[0]; LEN];
+        for slot in out.iter_mut().rev() {
+            *slot = ALPHABET[usize::try_from(value % 62).unwrap_or(0)];
+            value /= 62;
+        }
+        // The buffer holds one ASCII byte per digit by construction.
+        String::from_utf8(out.to_vec()).expect("the alphabet is ASCII")
     }
 
     /// Materialise every domain lifecycle step the clock already owes at `now`: a
