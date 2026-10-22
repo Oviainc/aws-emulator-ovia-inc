@@ -195,10 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
             return Err(AddTagsToCertificateErrorModeled::InvalidArnException(
                 InvalidArnException {
-                    message: Some(format!(
-                        "{} is not an ACM certificate ARN",
-                        input.certificate_arn
-                    )),
+                    message: Some(crate::state::invalid_arn_message(&input.certificate_arn)),
                 },
             )
             .into());
@@ -217,9 +214,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(certificate) = store.certificates.get_mut(&input.certificate_arn) else {
             return Err(AddTagsToCertificateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Could not find certificate {}",
-                        input.certificate_arn
+                    message: Some(crate::state::certificate_not_found_message(
+                        &input.certificate_arn,
                     )),
                 },
             )

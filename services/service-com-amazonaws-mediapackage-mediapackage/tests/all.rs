@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/mutation_persistence.rs"]
+mod mutation_persistence;
 #[path = "all/origin_endpoint_defaults.rs"]
 mod origin_endpoint_defaults;
 #[path = "all/state_roundtrip.rs"]

@@ -17,6 +17,8 @@ mod agreement_cancellation_requests;
 mod agreement_lifecycle;
 #[path = "all/billing_adjustments.rs"]
 mod billing_adjustments;
+#[path = "all/error_bodies.rs"]
+mod error_bodies;
 #[path = "all/payment_requests.rs"]
 mod payment_requests;
 #[path = "all/refusal_wording.rs"]
