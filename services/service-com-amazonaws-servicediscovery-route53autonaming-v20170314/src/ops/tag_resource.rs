@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -106,6 +97,18 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
+/// What this operation answers for a `ResourceARN` that names no stored resource:
+/// the modelled `ResourceNotFoundException` (HTTP 404). One function, so the lookup
+/// and the write-through branch cannot drift apart in what they report.
+fn not_found(resource_arn: &str) -> TagResourceError {
+    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "The operation can't be completed because the resource {resource_arn} was not found."
+        )),
+    })
+    .into()
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -142,18 +145,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        let mut state = state.lock();
+
+        // The call is addressed by ARN; an ARN this store minted for no resource names
+        // nothing to tag.
+        let Some(resource) = state.resolve_tagged_resource(&input.resource_arn) else {
+            return Err(not_found(&input.resource_arn));
+        };
+
+        // Tagging is a MERGE onto what is stored, never a replace: the tags this call
+        // names are set, every other tag the resource carries is left as it is.
+        let Some(stored) = state.tags(&resource).map(<[(String, String)]>::to_vec) else {
+            return Err(not_found(&input.resource_arn));
+        };
+        let merged = crate::state::tags_after_applying(
+            &stored,
+            input.tags.into_iter().map(|tag| (tag.key, tag.value)),
+        );
+
+        // The quota is on the tags the RESOURCE ends up carrying, so it is checked
+        // against the merged set and nothing is stored when the call is refused.
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "The list of tags on the resource is over the quota of {}.",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                    resource_name: Some(input.resource_arn.clone()),
+                },
+            )
+            .into());
+        }
+
+        // The write target is the record the resolution above named, under the same
+        // held lock — so it is still there. Reporting the resource as not found is the
+        // honest answer if it ever were not: a 200 for a write that did not happen
+        // would claim something this call did not do.
+        let Some(tags) = state.tags_mut(&resource) else {
+            return Err(not_found(&input.resource_arn));
+        };
+        *tags = merged;
+
+        Ok(TagResourceOutput {})
     }
 }

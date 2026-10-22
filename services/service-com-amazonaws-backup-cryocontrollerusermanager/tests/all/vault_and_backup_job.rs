@@ -33,10 +33,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=00";
 
 /// The region in [`AUTHORIZATION`]'s credential scope.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The one account id a generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Longer than the job's settle span, so a read after this sleep observes the
 /// completion the clock has already made due.
@@ -191,20 +191,18 @@ async fn a_created_vault_round_trips_and_a_deleted_one_is_gone() {
             Some("BACKUP_VAULT"),
             "case {case:?}: expected VaultType BACKUP_VAULT, got {described:?}"
         );
-        assert_eq!(
-            described.get("VaultState").and_then(Value::as_str),
-            Some("AVAILABLE"),
-            "case {case:?}: expected VaultState AVAILABLE, got {described:?}"
+        assert!(
+            described.get("VaultState").is_none(),
+            "case {case:?}: a standard BACKUP_VAULT reports no VaultState, got {described:?}"
         );
         assert_eq!(
             described.get("NumberOfRecoveryPoints").and_then(Value::as_i64),
             Some(0),
             "case {case:?}: a fresh vault holds no recovery points, got {described:?}"
         );
-        assert_eq!(
-            described.get("EncryptionKeyType").and_then(Value::as_str),
-            Some("AWS_OWNED_KMS_KEY"),
-            "case {case:?}: no EncryptionKeyArn was given, got {described:?}"
+        assert!(
+            described.get("EncryptionKeyType").is_none(),
+            "case {case:?}: a standard BACKUP_VAULT reports no EncryptionKeyType, got {described:?}"
         );
         assert_eq!(
             described.get("CreationDate"),
@@ -398,8 +396,9 @@ async fn a_repeat_create_collides_unless_it_replays_the_original_request() {
     }
 }
 
-/// A vault created with an `EncryptionKeyArn` reports it, and reports the
-/// customer-managed `EncryptionKeyType` derived from it.
+/// A vault created with an `EncryptionKeyArn` reports it. `EncryptionKeyType`
+/// stays unset: AWS does not populate it for a standard `BACKUP_VAULT`,
+/// whatever key encrypts it.
 #[tokio::test]
 async fn a_customer_managed_key_is_reported_from_state() {
     let router = router();
@@ -415,10 +414,9 @@ async fn a_customer_managed_key_is_reported_from_state() {
         key,
         "case \"customer managed key\": expected the stored key ARN, got {described:?}"
     );
-    assert_eq!(
-        described.get("EncryptionKeyType").and_then(Value::as_str),
-        Some("CUSTOMER_MANAGED_KMS_KEY"),
-        "case \"customer managed key\": expected CUSTOMER_MANAGED_KMS_KEY, got {described:?}"
+    assert!(
+        described.get("EncryptionKeyType").is_none(),
+        "case \"customer managed key\": a BACKUP_VAULT reports no EncryptionKeyType, got {described:?}"
     );
     assert_eq!(
         string_at(&described, "CreatorRequestId"),
