@@ -21,6 +21,8 @@ mod batch_get_stream_key;
 mod channel_lifecycle;
 #[path = "all/live_stream_reads.rs"]
 mod live_stream_reads;
+#[path = "all/playback_key_pair_import.rs"]
+mod playback_key_pair_import;
 #[path = "all/recording_configuration_lifecycle.rs"]
 mod recording_configuration_lifecycle;
 #[path = "all/recording_configuration_list.rs"]
