@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a REPORTING operation. It answers from the Execution record
+//! `StartExecution` stored, materialising only the terminal status the clock has
+//! already made due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -230,18 +227,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeExecution"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        if crate::state::parse_execution_arn(&input.execution_arn).is_none() {
+            return Err(DescribeExecutionErrorModeled::InvalidArn(InvalidArn {
+                message: Some(format!(
+                    "'{}' is not an execution ARN of this service",
+                    input.execution_arn
+                )),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        // The one write a report may make: the terminal status was owed at the instant
+        // the clock made it due, whether or not anybody described the execution.
+        store.settle(crate::state::now());
+
+        let Some(execution) = store.executions.get(&input.execution_arn) else {
+            return Err(DescribeExecutionErrorModeled::ExecutionDoesNotExist(
+                ExecutionDoesNotExist {
+                    message: Some(format!("execution {} does not exist", input.execution_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "Executions of an EXPRESS state machine aren't supported by
+        // DescribeExecution unless a Map Run dispatched them": an Express execution
+        // this emulator started was not dispatched by a Map Run, so there is nothing
+        // for this operation to report about it.
+        let express = store
+            .state_machines
+            .get(&execution.state_machine_arn)
+            .is_some_and(|machine| machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS);
+        if express {
+            return Err(DescribeExecutionErrorModeled::ExecutionDoesNotExist(
+                ExecutionDoesNotExist {
+                    message: Some(format!(
+                        "execution {} belongs to an EXPRESS state machine, whose executions \
+                         DescribeExecution does not report",
+                        input.execution_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `inputDetails`/`outputDetails` say whether the data itself is included: it
+        // is, because the stored execution carries it.
+        let included = Some(CloudWatchEventsExecutionDataDetails { included: true });
+        Ok(DescribeExecutionOutput {
+            execution_arn: execution.arn.clone(),
+            state_machine_arn: execution.state_machine_arn.clone(),
+            name: Some(execution.name.clone()),
+            status: execution.status.clone(),
+            start_date: crate::state::to_date_time(execution.start_date),
+            stop_date: execution.stop_date.map(crate::state::to_date_time),
+            input: Some(execution.input.clone()),
+            input_details: included.clone(),
+            output: execution.output.clone(),
+            output_details: execution.output.as_ref().and(included),
+            trace_header: execution.trace_header.clone(),
+            map_run_arn: None,
+            error: execution.error.clone(),
+            cause: execution.cause.clone(),
+            state_machine_version_arn: None,
+            state_machine_alias_arn: None,
+            redrive_count: Some(execution.redrive_count),
+            redrive_date: None,
+            redrive_status: None,
+            redrive_status_reason: None,
+        })
     }
 }

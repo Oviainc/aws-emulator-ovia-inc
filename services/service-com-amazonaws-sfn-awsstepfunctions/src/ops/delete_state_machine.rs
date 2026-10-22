@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStateMachine
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStateMachine`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: begins the documented asynchronous deletion — the state machine
+//! reports `DELETING` from this call and is removed from [`crate::state`] once the
+//! clock makes the removal due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStateMachine::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +146,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStateMachine` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStateMachineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStateMachine"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let Some(parsed) = crate::state::parse_state_machine_arn(&input.state_machine_arn) else {
+            return Err(DeleteStateMachineErrorModeled::InvalidArn(InvalidArn {
+                message: Some(format!(
+                    "'{}' is not a state machine ARN of this service",
+                    input.state_machine_arn
+                )),
+            })
+            .into());
+        };
+        // "A qualified state machine ARN can either refer to a Distributed Map state
+        // defined within a state machine, a version ARN, or an alias ARN", and "if
+        // you provide a qualified state machine ARN that refers to a Distributed Map
+        // state, the request fails with ValidationException". A Distributed Map state
+        // is named by a label after the state machine name; a version or alias is a
+        // qualifier after it. This emulator holds none of the three — versions and
+        // aliases are not implemented and still answer 501 — so a qualified ARN names
+        // nothing it could delete, and a success would be indistinguishable from one.
+        if parsed.name.contains('/') || parsed.qualifier.is_some() {
+            return Err(DeleteStateMachineErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "'{}' is a qualified ARN, naming a Distributed Map state, a version or an \
+                         alias, which DeleteStateMachine does not accept",
+                        input.state_machine_arn
+                    )),
+                    reason: Some("API_DOES_NOT_SUPPORT_LABELED_ARNS".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        store.settle(now);
+        // "This is an asynchronous operation. It sets the state machine's status to
+        // DELETING and begins the deletion process." Deleting an ARN the store does
+        // not hold is a success all the same: the operation models no
+        // `StateMachineDoesNotExist`, and the post-condition the caller asked for
+        // already holds.
+        store.begin_delete_state_machine(&input.state_machine_arn, now);
+
+        Ok(DeleteStateMachineOutput {})
     }
 }
