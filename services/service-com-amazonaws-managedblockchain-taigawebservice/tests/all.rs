@@ -17,6 +17,8 @@ mod accessor_lifecycle;
 mod invitations;
 #[path = "all/network_and_node_lifecycle.rs"]
 mod network_and_node_lifecycle;
+#[path = "all/proposal_lifecycle.rs"]
+mod proposal_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_node_log_publishing.rs"]

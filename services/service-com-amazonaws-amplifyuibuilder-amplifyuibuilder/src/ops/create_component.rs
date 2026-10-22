@@ -250,11 +250,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             events: data.events,
             source_id: data.source_id,
             schema_version: data.schema_version,
-            tags: data.tags,
+            tags: data.tags.unwrap_or_default(),
             created_at: now,
-            // `modifiedAt` reports the last call that changed the component, and
-            // nothing has changed it yet.
-            modified_at: None,
+            // `modifiedAt` reports when the component last changed, and creating
+            // it is the change that first set it: the service reports the two at
+            // the same instant for a component nothing has updated yet.
+            modified_at: now,
             cursor,
         };
 

@@ -4,6 +4,9 @@
 //! Returns the tags persisted for the resource an ARN names in [`crate::state`]. This
 //! is the ONLY file to touch for this operation.
 //!
+//! An ARN with no record behind it is refused as the resource TYPE it names, exactly as
+//! `TagResource` refuses it ([`crate::state::MissingResource`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -148,17 +151,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
+        // The ARN is resolved against the resource it NAMES, and an ARN with no record
+        // behind it takes the refusal that resource type carries: the same modelled
+        // `ResourceNotFoundException` shape throughout, but a missing hypervisor is
+        // answered 400 with `ErrorCode` `HypervisorNotFound` where every other type
+        // takes the shape's own 404 (`crate::state::MissingResource`).
         let Some(gateway) = state.gateway(&input.resource_arn) else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+            let missing = crate::state::MissingResource::for_arn(&input.resource_arn);
+            let error = ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    error_code: None,
-                    message: Some(format!(
-                        "The resource '{}' was not found.",
-                        input.resource_arn
-                    )),
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.resource_arn)),
                 },
-            )
-            .into());
+            );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
         };
 
         // The persisted tags, including any the create call carried. An untagged

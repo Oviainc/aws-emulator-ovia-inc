@@ -15,6 +15,9 @@
 //! request carried, and a delete makes the record absent. The tables below span that
 //! class — several gateways differing in display name, activation key and tag count, and
 //! every page size over a fixed set of records — rather than one recorded request.
+//!
+//! The request harness here ([`call`], [`build_router`], [`Reply`]) is shared with the
+//! sibling suites in this directory, which reach it as `crate::gateway_lifecycle::*`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -36,7 +39,14 @@ const TARGET_PREFIX: &str = "BackupOnPremises_v20210101";
 
 /// The region the requests below are signed for. Deliberately NOT the emulator's
 /// `us-east-1` fallback: a minted ARN has to carry the region the caller addressed.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
+
+/// The activation key the helpers below create gateways with.
+///
+/// `CreateGateway` registers a gateway only for a key this service ISSUED
+/// (`state::activation_key_issued`), so every test that expects a create to succeed
+/// records its key first — see [`issue_activation_keys`].
+pub(crate) const ACTIVATION_KEY: &str = "ACTIVATION-KEY123";
 
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
 /// name (`backup-gateway`) and [`REGION`]. The signature itself is never checked here:
@@ -47,26 +57,26 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// What one dispatched request answered.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// The awsJson error discriminator, namespace stripped.
-    code: Option<String>,
-    body: Value,
+    pub(crate) code: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn str_at(&self, pointer: &str) -> Option<&str> {
+    pub(crate) fn str_at(&self, pointer: &str) -> Option<&str> {
         self.body.pointer(pointer).and_then(Value::as_str)
     }
 
-    fn gateway_arn(&self) -> &str {
+    pub(crate) fn gateway_arn(&self) -> &str {
         self.str_at("/GatewayArn")
             .unwrap_or_else(|| panic!("no GatewayArn in {:?}", self.body))
     }
 
     /// The returned `Tags` list as a map, so a test compares tag SETS and not the
     /// order a list happens to carry.
-    fn tags(&self) -> BTreeMap<String, String> {
+    pub(crate) fn tags(&self) -> BTreeMap<String, String> {
         self.body
             .get("Tags")
             .and_then(Value::as_array)
@@ -83,7 +93,7 @@ impl Reply {
             .unwrap_or_default()
     }
 
-    fn gateway_arns(&self) -> Vec<String> {
+    pub(crate) fn gateway_arns(&self) -> Vec<String> {
         self.body
             .get("Gateways")
             .and_then(Value::as_array)
@@ -101,23 +111,40 @@ impl Reply {
             .unwrap_or_default()
     }
 
-    fn next_token(&self) -> Option<String> {
+    pub(crate) fn next_token(&self) -> Option<String> {
         self.str_at("/NextToken").map(str::to_string)
     }
 }
 
-fn build_engine() -> Arc<engine::InMemoryEngine> {
+pub(crate) fn build_engine() -> Arc<engine::InMemoryEngine> {
     Arc::new(engine::InMemoryEngine::new())
 }
 
-fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+/// Record `keys` as activation keys this service issued.
+///
+/// On AWS an activation key reaches the service out of band, from the gateway appliance
+/// that was deployed — no operation of this model issues one — so the store's registry
+/// is the only place a key can come from, and a test that wants a create to succeed puts
+/// it there, exactly as `CreateGateway` reads it.
+pub(crate) fn issue_activation_keys(engine: &Arc<engine::InMemoryEngine>, keys: &[&str]) {
+    let state = service_state(&**engine).expect("the in-memory engine must expose this state");
+    let mut store = state.lock();
+    for key in keys {
+        store.issue_activation_key(key, SystemTime::now());
+    }
+}
+
+/// The router every test dispatches through, with [`ACTIVATION_KEY`] already issued: the
+/// creates below address a gateway appliance the service has activated.
+pub(crate) fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(backup_gateway::EmulatedService::new(Arc::clone(engine)));
+    issue_activation_keys(engine, &[ACTIVATION_KEY]);
     router
 }
 
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Reply {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Reply {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -157,7 +184,11 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Rep
     }
 }
 
-fn create_body(display_name: &str, activation_key: &str, tags: &BTreeMap<String, String>) -> Value {
+pub(crate) fn create_body(
+    display_name: &str,
+    activation_key: &str,
+    tags: &BTreeMap<String, String>,
+) -> Value {
     let mut body = json!({
         "ActivationKey": activation_key,
         "GatewayDisplayName": display_name,
@@ -212,18 +243,18 @@ fn matches_modelled_gateway_arn(arn: &str) -> bool {
 /// A well-formed `GatewayArn` for a gateway that was never created — the shape the
 /// modelled pattern accepts, so it reaches the handler rather than the boundary
 /// validator.
-fn never_created_arn() -> String {
+pub(crate) fn never_created_arn() -> String {
     format!(
         "arn:aws:backup-gateway:{REGION}:{}:gateway/bgw-0000000000000999",
         engine::EMULATOR_ACCOUNT_ID
     )
 }
 
-async fn create(router: &MultiServiceRouter, display_name: &str) -> String {
+pub(crate) async fn create(router: &MultiServiceRouter, display_name: &str) -> String {
     let reply = call(
         router,
         "CreateGateway",
-        &create_body(display_name, "ACTIVATION-KEY123", &BTreeMap::new()),
+        &create_body(display_name, ACTIVATION_KEY, &BTreeMap::new()),
     )
     .await;
     assert_eq!(
@@ -294,11 +325,7 @@ async fn gateway_lifecycle_round_trips_through_the_store() {
     let created = call(
         &router,
         "CreateGateway",
-        &create_body(
-            "my-gateway",
-            "ACTIVATION-KEY123",
-            &tag_map([("env", "test")]),
-        ),
+        &create_body("my-gateway", ACTIVATION_KEY, &tag_map([("env", "test")])),
     )
     .await;
     assert_eq!(
@@ -488,7 +515,7 @@ async fn every_created_gateway_is_its_own_record() {
 
     // (case, GatewayDisplayName, ActivationKey, Tags)
     let rows: [(&str, &str, &str, BTreeMap<String, String>); 5] = [
-        ("no tags", "gw-plain", "ACTIVATION-KEY123", BTreeMap::new()),
+        ("no tags", "gw-plain", ACTIVATION_KEY, BTreeMap::new()),
         (
             "one tag",
             "gw-one-tag",
@@ -515,6 +542,16 @@ async fn every_created_gateway_is_its_own_record() {
             tag_map([("env", "test")]),
         ),
     ];
+
+    // Each row activates its own appliance, so each row's key is issued before it is
+    // used: the keys differ in length and spelling, which the refusal does not key on.
+    issue_activation_keys(
+        &engine,
+        &rows
+            .iter()
+            .map(|(_, _, activation_key, _)| *activation_key)
+            .collect::<Vec<_>>(),
+    );
 
     let mut arns = BTreeSet::new();
     for (case, display_name, activation_key, tags) in &rows {
@@ -921,7 +958,7 @@ async fn the_store_and_the_page_are_bounded() {
         for index in 0..MAX_STORED_GATEWAYS {
             store.create_gateway(
                 REGION,
-                "ACTIVATION-KEY123",
+                ACTIVATION_KEY,
                 &format!("gw-seeded-{index}"),
                 BACKUP_VM,
                 BTreeMap::new(),
@@ -938,7 +975,7 @@ async fn the_store_and_the_page_are_bounded() {
     let refused = call(
         &router,
         "CreateGateway",
-        &create_body("gw-over-ceiling", "ACTIVATION-KEY123", &BTreeMap::new()),
+        &create_body("gw-over-ceiling", ACTIVATION_KEY, &BTreeMap::new()),
     )
     .await;
     assert_eq!(

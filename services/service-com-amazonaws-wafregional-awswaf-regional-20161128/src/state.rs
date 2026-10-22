@@ -2,13 +2,14 @@
 
 //! Engine state for the com-amazonaws-wafregional-awswaf-regional-20161128 service.
 //!
-//! AWS WAF Classic's `IPSet` and `SqlInjectionMatchSet` records and the change tokens
-//! every mutating call consumes live here, so `GetChangeToken`,
+//! AWS WAF Classic's `IPSet`, `Rule` and `SqlInjectionMatchSet` records and the change
+//! tokens every mutating call consumes live here, so `GetChangeToken`,
 //! `GetChangeTokenStatus`, `CreateIPSet`, `UpdateIPSet`, `GetIPSet`, `ListIPSets`,
-//! `DeleteIPSet`, `CreateSqlInjectionMatchSet` and `GetSqlInjectionMatchSet` all read
-//! and write ONE copy of each resource. The helpers below (id minting, the
-//! change-token protocol, CIDR parsing, the `IPSet`/`IPSetSummary` and
-//! `SqlInjectionMatchSet` projections) are shared by those handlers rather than
+//! `DeleteIPSet`, `CreateRule`, `GetRule`, `CreateSqlInjectionMatchSet` and
+//! `GetSqlInjectionMatchSet` all read and write ONE copy of each resource. The helpers
+//! below (id minting, the change-token protocol, CIDR parsing, metric-name validation,
+//! the `IPSet`/`IPSetSummary`, `Rule` and `SqlInjectionMatchSet` projections) are
+//! shared by those handlers rather than
 //! duplicated per operation.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +17,8 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    IPSet, IPSetDescriptor, IPSetSummary, SqlInjectionMatchSet, SqlInjectionMatchTuple,
+    IPSet, IPSetDescriptor, IPSetSummary, Predicate, Rule, SqlInjectionMatchSet,
+    SqlInjectionMatchTuple,
 };
 
 /// `ChangeTokenStatus` wire values, from the model's `CHANGE_TOKEN_STATUS_VALUES`
@@ -102,6 +104,76 @@ pub const MAX_CHANGE_TOKENS: usize = 1_000;
 ///
 /// Source: `PaginationLimit`'s modelled `@range` of 0..100.
 pub const MAX_PAGE_SIZE: usize = 100;
+
+/// The most `Rule`s this emulator stores for the account before `CreateRule` answers
+/// its modelled `WAFLimitsExceededException`.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes for
+/// an account (100 rules); every `Rule` is a stored record, so the number a caller can
+/// create has to be bounded somewhere.
+pub const MAX_RULES: usize = 100;
+
+/// The most tags one resource may carry, and so the most `Tags` entries one create
+/// request may bring.
+///
+/// The model bounds `TagList` at `len 1..` — a minimum only — so without this the
+/// number of tag entries one request persists would be the caller's choice. This bound
+/// is the per-resource tag quota AWS publishes (50 tags per resource).
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The metric names AWS WAF reserves, which no resource may take.
+///
+/// Source: the `MetricName` member's own documentation on every create operation that
+/// carries one — "It can't contain whitespace or metric names reserved for AWS WAF,
+/// including \"All\" and \"Default_Action.\""
+///
+/// Only `All` is reachable through [`metric_name_is_allowed`]: `Default_Action` carries
+/// an underscore, so the character-set rule refuses it first. It is listed anyway
+/// because the documentation names it, and because the list is what a reader looks at
+/// to see which names are reserved.
+pub const RESERVED_METRIC_NAMES: &[&str] = &["All", "Default_Action"];
+
+/// Whether `metric_name` is a metric name AWS WAF accepts.
+///
+/// The rule is the `MetricName` member's own documentation: "The name can contain only
+/// alphanumeric characters (A-Z, a-z, 0-9), with maximum length 128 and minimum length
+/// one. It can't contain whitespace or metric names reserved for AWS WAF, including
+/// "All" and "Default_Action."" The length bounds are modelled (`len 1..128`) and so
+/// already refused at the boundary; what is left to enforce here is the character set
+/// (which excludes whitespace, punctuation and non-ASCII letters alike) and the
+/// reserved names in [`RESERVED_METRIC_NAMES`].
+///
+/// Shared by every handler whose input carries a `MetricName` (`CreateRule`, and the
+/// `CreateRateBasedRule` / `CreateRuleGroup` / `CreateWebACL` handlers once they are
+/// implemented), so one rule is enforced in one place.
+pub fn metric_name_is_allowed(metric_name: &str) -> bool {
+    !metric_name.is_empty()
+        && metric_name.chars().all(|c| c.is_ascii_alphanumeric())
+        && !RESERVED_METRIC_NAMES.contains(&metric_name)
+}
+
+/// AWS WAF Classic answers each refusal class with ONE fixed sentence that carries no
+/// request-derived content: the recordings show the identical `message` for a
+/// never-created id and for a deleted one. These constants are that per-exception
+/// sentence, so a handler never builds an error message out of the request.
+///
+/// The model declares a bare `message` member on each error shape and no wire text, so
+/// each constant below is the sentence the recordings carry for its exception type.
+pub const MESSAGE_DISALLOWED_NAME: &str = "The specified name is not permitted.";
+/// The fixed sentence for `WAFStaleDataException` — see [`MESSAGE_DISALLOWED_NAME`].
+pub const MESSAGE_STALE_DATA: &str = "The input token is no longer current.";
+/// The fixed sentence for `WAFNonexistentItemException` — see
+/// [`MESSAGE_DISALLOWED_NAME`].
+pub const MESSAGE_NONEXISTENT_ITEM: &str = "The referenced item does not exist.";
+/// The fixed sentence for `WAFLimitsExceededException`, from the shape's own
+/// documentation ("The operation exceeds a resource limit") — see
+/// [`MESSAGE_DISALLOWED_NAME`].
+pub const MESSAGE_LIMITS_EXCEEDED: &str = "The operation exceeds a resource limit.";
+/// The fixed sentence for `WAFInternalErrorException`, from the shape's own
+/// documentation — see [`MESSAGE_DISALLOWED_NAME`].
+pub const MESSAGE_INTERNAL_ERROR: &str =
+    "The operation failed because of a system problem, even though the request was \
+     valid. Retry your request.";
 
 /// A descriptor's identity: the parsed IP address and the prefix length.
 ///
@@ -225,6 +297,72 @@ impl IPSetEntry {
     }
 }
 
+/// One `Predicate` stored on a `Rule`.
+///
+/// The predicates themselves arrive through `UpdateRule`; a rule `CreateRule` just
+/// made holds none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateEntry {
+    /// Whether the predicate is negated.
+    pub negated: bool,
+    /// `PredicateType` as it goes on the wire (`IPMatch`, `ByteMatch`, …).
+    pub kind: String,
+    /// The id of the condition set this predicate points at.
+    pub data_id: String,
+}
+
+impl PredicateEntry {
+    /// This record projected onto the modelled `Predicate` shape.
+    pub fn to_modelled(&self) -> Predicate {
+        Predicate {
+            negated: self.negated,
+            r#type: self.kind.clone(),
+            data_id: self.data_id.clone(),
+        }
+    }
+}
+
+/// One stored `Rule`.
+#[derive(Debug, Clone)]
+pub struct RuleEntry {
+    pub rule_id: String,
+    pub name: String,
+    pub metric_name: String,
+    /// The predicates in insertion order; empty until `UpdateRule` adds any.
+    pub predicates: Vec<PredicateEntry>,
+    /// The resource's tag set. A tag set is keyed by `Key`, so the last value given
+    /// for a key is the value the resource carries.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl RuleEntry {
+    /// A new rule holding no predicates and no tags.
+    pub fn new(rule_id: String, name: String, metric_name: String) -> Self {
+        Self {
+            rule_id,
+            name,
+            metric_name,
+            predicates: Vec::new(),
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// This record projected onto the modelled `Rule` shape the Create and Get
+    /// responses carry: the stored record's own fields, never request input.
+    pub fn to_modelled(&self) -> Rule {
+        Rule {
+            rule_id: self.rule_id.clone(),
+            name: Some(self.name.clone()),
+            metric_name: Some(self.metric_name.clone()),
+            predicates: self
+                .predicates
+                .iter()
+                .map(PredicateEntry::to_modelled)
+                .collect(),
+        }
+    }
+}
+
 /// One stored `SqlInjectionMatchSet`.
 #[derive(Debug, Clone)]
 pub struct SqlInjectionMatchSetEntry {
@@ -278,6 +416,9 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// walks them in one stable order and a `NextMarker` taken on one page resumes at
     /// the right place on the next.
     pub ip_sets: BTreeMap<String, IPSetEntry>,
+    /// Every stored `Rule`, keyed by its `RuleId`. A `BTreeMap` for the same reason as
+    /// [`Self::ip_sets`]: one stable order for the paginated `ListRules`.
+    pub rules: BTreeMap<String, RuleEntry>,
     /// Every stored `SqlInjectionMatchSet`, keyed by its `SqlInjectionMatchSetId`. A
     /// `BTreeMap` for the same reason as `ip_sets`: one stable walk order for the
     /// paginated list.

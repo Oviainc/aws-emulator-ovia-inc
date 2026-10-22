@@ -617,6 +617,37 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     }
 }
 
+/// Whether `setting` is one of the two `ImageTagMutability` values that honour
+/// exclusion filters: a filter names tags "excluded from the repository's image tag
+/// mutability setting", and only the `*_WITH_EXCLUSION` settings have an exclusion to
+/// apply. The four modelled values are matched exactly, so a value the model widens the
+/// enum with later is not read as an exclusion setting by its name alone.
+pub fn honours_exclusion_filters(setting: &str) -> bool {
+    matches!(setting, "IMMUTABLE_WITH_EXCLUSION" | "MUTABLE_WITH_EXCLUSION")
+}
+
+/// Refuse a tag-mutability configuration that pairs exclusion filters with a setting
+/// that has no exclusion to apply: `MUTABLE` lets every tag be overwritten and
+/// `IMMUTABLE` lets none, so a filter beside either could never be consulted. The model
+/// cannot express the pairing, so both the operations that write this configuration
+/// check it here, through one rule.
+///
+/// The converse is NOT refused: a `*_WITH_EXCLUSION` setting carrying no filter excludes
+/// nothing, which is exactly its plain counterpart's behaviour rather than a
+/// contradiction.
+pub fn check_exclusion_filters(
+    setting: &str,
+    filters: &[ImageTagMutabilityExclusionFilter],
+) -> Result<(), Fault> {
+    if !filters.is_empty() && !honours_exclusion_filters(setting) {
+        return Err(Fault::InvalidParameter(format!(
+            "imageTagMutabilityExclusionFilters cannot be specified with the {setting} \
+             image tag mutability setting"
+        )));
+    }
+    Ok(())
+}
+
 /// The identity of a repository creation template's namespace prefix.
 ///
 /// `Prefix`'s own documentation: "There is always an assumed / applied to the end of the

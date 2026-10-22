@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints and persists an App Runner service record (see
+//! [`crate::state`]) in `OPERATION_IN_PROGRESS`, records the `CREATE_SERVICE`
+//! operation whose id this call returns, and leaves the move to `RUNNING` owed
+//! to the clock. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +173,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateService"))
+        use crate::state;
+
+        // The modelled client-input error for every rule below. `ServiceName`'s
+        // own length/pattern are refused at the boundary before this runs.
+        let invalid = |message: String| -> Self::Error {
+            CreateServiceErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = state::request_region(ctx);
+
+        let source_configuration =
+            state::normalise_source(input.source_configuration).map_err(invalid)?;
+        let network_configuration = state::network_with_defaults(input.network_configuration);
+        state::validate_network(&network_configuration).map_err(invalid)?;
+        if let Some(observability) = input.observability_configuration.as_ref() {
+            state::validate_observability(observability).map_err(invalid)?;
+        }
+        let auto_scaling_configuration_summary =
+            state::auto_scaling_summary(&region, input.auto_scaling_configuration_arn.as_deref())
+                .map_err(invalid)?;
+
+        let handle = state::service_state(&*self.engine).ok_or_else(|| {
+            Self::Error::from(CreateServiceErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("this service's state is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = handle.lock();
+        store.settle_due(now);
+
+        // `ServiceName` "must be unique across all the running App Runner
+        // services in your Amazon Web Services account in the Amazon Web
+        // Services Region" (the member's model doc) — so the index is keyed by
+        // Region as well, and the same name in another Region is free.
+        if store
+            .name_index
+            .contains_key(&(region.clone(), input.service_name.clone()))
+        {
+            return Err(invalid(format!(
+                "A service with the name {} already exists in this account and Region",
+                input.service_name
+            )));
+        }
+
+        // The published service quota, which App Runner publishes per Region.
+        // Answering the modelled `ServiceQuotaExceededException` is both what App
+        // Runner does and what keeps the store bounded for a caller that only
+        // ever creates. The whole-store ceiling is what bounds it when the Region
+        // itself varies: the Region comes from the request's own credential
+        // scope, so the per-Region allowance alone does not dominate this insert.
+        let in_region = store.service_count(&region);
+        if in_region >= state::MAX_SERVICES_PER_ACCOUNT
+            || store.services.len() >= state::MAX_SERVICES_TOTAL
+        {
+            let reached = if in_region >= state::MAX_SERVICES_PER_ACCOUNT {
+                format!(
+                    "the quota of {} App Runner services for this account and Region",
+                    state::MAX_SERVICES_PER_ACCOUNT
+                )
+            } else {
+                format!(
+                    "this emulator's ceiling of {} App Runner services",
+                    state::MAX_SERVICES_TOTAL
+                )
+            };
+            return Err(CreateServiceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!("You've reached {reached}")),
+                },
+            )
+            .into());
+        }
+
+        let service_id = store.mint_service_id(&format!("service/{region}/{}", input.service_name));
+        let service_arn = state::service_arn(&region, &input.service_name, &service_id);
+        let operation_id = store.mint_operation_id(&format!("{}/{service_arn}", state::OP_TYPE_CREATE_SERVICE));
+
+        let record = state::ServiceRecord {
+            service_name: input.service_name.clone(),
+            service_url: state::service_url(&region, &service_id),
+            service_id,
+            service_arn: service_arn.clone(),
+            created_at: now,
+            updated_at: now,
+            region: region.clone(),
+            status: state::SERVICE_OPERATION_IN_PROGRESS.to_string(),
+            source_configuration,
+            instance_configuration: state::instance_configuration_with_defaults(
+                input.instance_configuration,
+            ),
+            encryption_configuration: input.encryption_configuration,
+            health_check_configuration: state::health_check_with_defaults(
+                input.health_check_configuration,
+            ),
+            auto_scaling_configuration_summary,
+            network_configuration,
+            observability_configuration: input.observability_configuration,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|tag| tag.key.map(|key| (key, tag.value.unwrap_or_default())))
+                .collect(),
+            // "This is an asynchronous operation": the service is answered in
+            // `OPERATION_IN_PROGRESS` and the clock owes it `RUNNING`.
+            pending: Some(state::PendingTransition {
+                due_at: now + state::OPERATION_SETTLE_DELAY,
+                to_status: state::SERVICE_RUNNING.to_string(),
+                operation_id: operation_id.clone(),
+            }),
+        };
+
+        let service = record.to_service();
+        store.expect_due(now + state::OPERATION_SETTLE_DELAY);
+        store.record_operation(
+            &service_arn,
+            state::OP_TYPE_CREATE_SERVICE,
+            operation_id.clone(),
+            now,
+        );
+        store
+            .name_index
+            .insert((region, input.service_name), service_arn.clone());
+        store.services.insert(service_arn, record);
+
+        Ok(CreateServiceOutput {
+            service,
+            operation_id,
+        })
     }
 }
