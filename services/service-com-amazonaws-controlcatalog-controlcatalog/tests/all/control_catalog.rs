@@ -36,8 +36,8 @@ const LIST_OPERATIONS: [(&str, &str, u32); 5] = [
 
 /// A router with only this service mounted — one emulator "session".
 ///
-/// `pub(crate)` so a sibling suite in this test target drives the emulator through the
-/// same front door rather than standing up a second harness of its own.
+/// `pub(crate)` so the sibling suites in this test target drive the emulator through
+/// the same front door rather than standing up a second harness of their own.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }

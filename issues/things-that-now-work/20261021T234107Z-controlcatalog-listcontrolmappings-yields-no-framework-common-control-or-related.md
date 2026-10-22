@@ -43,3 +43,26 @@ Example (Cause 3, step task#3): expected a RELATED_CONTROL mapping {RelatedContr
 1. Boot the emulator built from this checkout and replay the simparity-wire-aws-v1 corpus.
 2. Replay fixture controlcatalog-catalog-list-control-mappings and compare its POST /list-control-mappings responses at steps task#1, task#2, task#3, task#4, task#5, task#6, task#7, task#8 and task#9.
 3. Each step filters on one control ARN and returns 200 with an empty ControlMappings list where the recording returns that control's FRAMEWORK, COMMON_CONTROL and RELATED_CONTROL mappings.
+
+## Resolution
+
+The rule — ListControlMappings reports, for the controls a filter admits, every
+control-mapping record the catalog holds for them, and an empty list when the filter
+admits no published control — holds and is now pinned end-to-end by
+`services/service-com-amazonaws-controlcatalog-controlcatalog/tests/all/control_mappings.rs`,
+which compares the wire response against the records in `src/state.rs` for every
+published control, every modelled `MappingType`, every published common control and
+several ARN forms the catalog does not publish.
+
+Under that rule the catalog's own mapping records were too thin, and that part was
+fixed: every published control now records the common control it implements, items in
+several published compliance frameworks, and its related controls in both directions
+(`COMPLEMENTARY` and `ALTERNATIVE`), instead of a single mapping per control.
+
+All nine recorded causes are DECLINED. Each asks for the mapping set AWS publishes for
+one of nine opaque AWS catalog identifiers (`control/1038h7d21e6g8i10g6v3xsssi`, …).
+Those identifiers, and the 4–44 framework/common-control/related-control rows attached
+to each, are AWS's published catalog *content*: no rule derives them, and they exist
+only in the recording, so transcribing them would be fitting the recorded instance
+rather than implementing the rule. The replay of this fixture therefore still diverges
+on `$.ControlMappings[*]`.

@@ -448,6 +448,17 @@ const CATALOG_EPOCH: i64 = 1_701_043_200;
 /// One day in seconds, the step between seeded catalog timestamps.
 const DAY: i64 = 86_400;
 
+// The compliance frameworks this catalog's FRAMEWORK mappings name, each written as
+// the framework's own published title. The modeled `FrameworkName` admits 3..250
+// characters, so the published title is what goes on the wire; the item beside it in
+// a mapping row is that framework's own identifier for the requirement.
+const NIST_SP_800_53_R5: &str = "NIST Special Publication 800-53 Revision 5";
+const NIST_CSF_V1_1: &str = "NIST Cybersecurity Framework Version 1.1";
+const PCI_DSS_V4_0: &str = "Payment Card Industry Data Security Standard v4.0";
+const CIS_AWS_FOUNDATIONS_V3_0_0: &str = "CIS Amazon Web Services Foundations Benchmark v3.0.0";
+const CIS_CONTROLS_V8_0: &str = "CIS Critical Security Controls Version 8.0";
+const CIS_GCP_FOUNDATION_V2_0_0: &str = "CIS Google Cloud Platform Foundation Benchmark v2.0.0";
+
 /// Build the catalog this emulator serves.
 ///
 /// Small but complete: every objective names a domain that is in `domains`, every
@@ -808,78 +819,152 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
     let control_arn = |slug: &str| catalog_arn("control", &catalog_id(slug));
 
     // --- control mappings --------------------------------------------------
-    let mapping_seed: Vec<(String, MappingDetails)> = vec![
+    // The catalog records, for every control it publishes, that control's WHOLE
+    // mapping set, which is the only wire source for "what does this control
+    // satisfy, implement and relate to":
+    //
+    //  * COMMON_CONTROL — the common control the control implements;
+    //  * FRAMEWORK — one entry per published compliance-framework item the control
+    //    satisfies. A control normally satisfies items in SEVERAL frameworks at
+    //    once, so one entry per control is not the catalog's shape;
+    //  * RELATED_CONTROL — one entry per control it is published alongside, with
+    //    how the two relate: COMPLEMENTARY where both can be enabled and reinforce
+    //    one another, ALTERNATIVE where either one satisfies the common control the
+    //    pair implements, MUTUALLY_EXCLUSIVE where enabling both would conflict
+    //    (this catalog publishes no pair that does, so it records none).
+    //
+    // Each framework row names a published framework and that framework's own
+    // identifier for the requirement the control satisfies; the identifier is
+    // quoted in the comment beside the row. Relations are recorded in both
+    // directions, because a query filters on one control at a time and each side of
+    // a pair has to report the relation when it is the one queried.
+    let framework = |name: &str, item: &str| MappingDetails::Framework {
+        name: name.to_string(),
+        item: item.to_string(),
+    };
+    let implements = |common_control_slug: &str| MappingDetails::CommonControl {
+        common_control_arn: common_control_arn(common_control_slug),
+    };
+    let related = |control_slug: &str, relation_type: &str| MappingDetails::RelatedControl {
+        control_arn: Some(control_arn(control_slug)),
+        relation_type: relation_type.to_string(),
+    };
+    let mapping_seed: Vec<(&str, Vec<MappingDetails>)> = vec![
         (
-            control_arn("s3-bucket-server-side-encryption-enabled"),
-            MappingDetails::CommonControl {
-                common_control_arn: common_control_arn("encrypt-data-at-rest-in-storage-services"),
-            },
+            "s3-bucket-server-side-encryption-enabled",
+            vec![
+                implements("encrypt-data-at-rest-in-storage-services"),
+                // "Protection of information at rest".
+                framework(NIST_SP_800_53_R5, "SC-28"),
+                // "Data-at-rest is protected".
+                framework(NIST_CSF_V1_1, "PR.DS-1"),
+                // "Primary account number is rendered unreadable wherever it is stored".
+                framework(PCI_DSS_V4_0, "3.5.1"),
+                // "Encrypt sensitive data at rest".
+                framework(CIS_CONTROLS_V8_0, "3.11"),
+                related("require-encrypted-ebs-volumes", "COMPLEMENTARY"),
+            ],
         ),
         (
-            control_arn("s3-bucket-server-side-encryption-enabled"),
-            MappingDetails::Framework {
-                name: "NIST Special Publication 800-53 Revision 5".to_string(),
-                item: "SC-28".to_string(),
-            },
+            "restrict-root-user-access-keys",
+            vec![
+                implements("require-multi-factor-authentication"),
+                // "Ensure no 'root' user account access key exists".
+                framework(CIS_AWS_FOUNDATIONS_V3_0_0, "1.4"),
+                // "Least privilege".
+                framework(NIST_SP_800_53_R5, "AC-6"),
+                // "Identities and credentials are issued, managed and revoked".
+                framework(NIST_CSF_V1_1, "PR.AC-1"),
+                // "Group, shared and generic accounts are managed".
+                framework(PCI_DSS_V4_0, "8.2.2"),
+                // Both controls implement the multi-factor-authentication common
+                // control for the same provider through different implementation
+                // types (an Organizations policy and a Security Hub control), so
+                // either one satisfies it: the catalog records them as ALTERNATIVE.
+                related("require-mfa-for-console-access", "ALTERNATIVE"),
+            ],
         ),
         (
-            control_arn("restrict-root-user-access-keys"),
-            MappingDetails::CommonControl {
-                common_control_arn: common_control_arn("require-multi-factor-authentication"),
-            },
+            "cloud-trail-multi-region-enabled",
+            vec![
+                implements("enable-centralized-logging"),
+                // "Event logging".
+                framework(NIST_SP_800_53_R5, "AU-2"),
+                // "Event data are collected and correlated".
+                framework(NIST_CSF_V1_1, "DE.AE-3"),
+                // "Ensure CloudTrail is enabled in all Regions".
+                framework(CIS_AWS_FOUNDATIONS_V3_0_0, "3.1"),
+                // "Audit logs are enabled and active for all system components".
+                framework(PCI_DSS_V4_0, "10.2.1"),
+            ],
         ),
         (
-            control_arn("restrict-root-user-access-keys"),
-            MappingDetails::Framework {
-                name: "CIS Amazon Web Services Foundations Benchmark v3.0.0".to_string(),
-                item: "1.4".to_string(),
-            },
+            "require-encrypted-ebs-volumes",
+            vec![
+                implements("encrypt-data-at-rest-in-storage-services"),
+                // "Protection of information at rest".
+                framework(NIST_SP_800_53_R5, "SC-28"),
+                // "Data-at-rest is protected".
+                framework(NIST_CSF_V1_1, "PR.DS-1"),
+                // "Ensure EBS volume encryption is enabled".
+                framework(CIS_AWS_FOUNDATIONS_V3_0_0, "2.2.1"),
+                related("s3-bucket-server-side-encryption-enabled", "COMPLEMENTARY"),
+            ],
         ),
         (
-            control_arn("cloud-trail-multi-region-enabled"),
-            MappingDetails::CommonControl {
-                common_control_arn: common_control_arn("enable-centralized-logging"),
-            },
+            "deny-public-rds-snapshots",
+            vec![
+                implements("restrict-public-access"),
+                // "Access enforcement".
+                framework(NIST_SP_800_53_R5, "AC-3"),
+                // "Protections against data leaks are implemented".
+                framework(NIST_CSF_V1_1, "PR.DS-5"),
+                // "Configure data access control lists".
+                framework(CIS_CONTROLS_V8_0, "3.3"),
+                // Both controls implement the restrict-public-access common control,
+                // each over the resources of its own provider, so an estate that spans
+                // both enables both: COMPLEMENTARY rather than ALTERNATIVE.
+                related("gcp-storage-bucket-uniform-access", "COMPLEMENTARY"),
+            ],
         ),
         (
-            control_arn("cloud-trail-multi-region-enabled"),
-            MappingDetails::Framework {
-                name: "NIST Special Publication 800-53 Revision 5".to_string(),
-                item: "AU-2".to_string(),
-            },
+            "require-mfa-for-console-access",
+            vec![
+                implements("require-multi-factor-authentication"),
+                // "Identification and authentication (organizational users)".
+                framework(NIST_SP_800_53_R5, "IA-2"),
+                // "Users, devices and other assets are authenticated".
+                framework(NIST_CSF_V1_1, "PR.AC-7"),
+                // "Ensure MFA is enabled for all IAM users that have a console password".
+                framework(CIS_AWS_FOUNDATIONS_V3_0_0, "1.10"),
+                // "Multi-factor authentication is implemented for all access".
+                framework(PCI_DSS_V4_0, "8.4.2"),
+                related("restrict-root-user-access-keys", "ALTERNATIVE"),
+            ],
         ),
         (
-            control_arn("require-encrypted-ebs-volumes"),
-            MappingDetails::CommonControl {
-                common_control_arn: common_control_arn("encrypt-data-at-rest-in-storage-services"),
-            },
-        ),
-        (
-            control_arn("deny-public-rds-snapshots"),
-            MappingDetails::CommonControl {
-                common_control_arn: common_control_arn("restrict-public-access"),
-            },
-        ),
-        (
-            control_arn("deny-public-rds-snapshots"),
-            MappingDetails::RelatedControl {
-                control_arn: Some(control_arn("require-encrypted-ebs-volumes")),
-                relation_type: "COMPLEMENTARY".to_string(),
-            },
-        ),
-        (
-            control_arn("require-mfa-for-console-access"),
-            MappingDetails::CommonControl {
-                common_control_arn: common_control_arn("require-multi-factor-authentication"),
-            },
-        ),
-        (
-            control_arn("gcp-storage-bucket-uniform-access"),
-            MappingDetails::CommonControl {
-                common_control_arn: common_control_arn("restrict-public-access"),
-            },
+            "gcp-storage-bucket-uniform-access",
+            vec![
+                implements("restrict-public-access"),
+                // "Ensure that uniform bucket-level access is enabled on Cloud Storage buckets".
+                framework(CIS_GCP_FOUNDATION_V2_0_0, "5.2"),
+                // "Access enforcement".
+                framework(NIST_SP_800_53_R5, "AC-3"),
+                // "Protections against data leaks are implemented".
+                framework(NIST_CSF_V1_1, "PR.DS-5"),
+                related("deny-public-rds-snapshots", "COMPLEMENTARY"),
+            ],
         ),
     ];
+    let mapping_seed: Vec<(String, MappingDetails)> = mapping_seed
+        .into_iter()
+        .flat_map(|(control_slug, mappings)| {
+            let arn = control_arn(control_slug);
+            mappings
+                .into_iter()
+                .map(move |mapping| (arn.clone(), mapping))
+        })
+        .collect();
     for (control_arn, mapping) in mapping_seed {
         let (mapping_type, target) = match &mapping {
             MappingDetails::Framework { name, item } => {

@@ -15,5 +15,7 @@
 mod control_arn_resolution;
 #[path = "all/control_catalog.rs"]
 mod control_catalog;
+#[path = "all/control_mappings.rs"]
+mod control_mappings;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
