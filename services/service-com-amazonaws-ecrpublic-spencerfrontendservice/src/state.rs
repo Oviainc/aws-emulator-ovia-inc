@@ -226,6 +226,24 @@ impl StoredRepository {
     }
 }
 
+/// How a requested `imageIds` entry reads inside an error message.
+///
+/// ECR names the whole requested [`ImageIdentifier`] back to the caller, both members
+/// spelled out and an absent one rendered as `null`, so the caller sees the entry
+/// exactly as it sent it rather than only the half that was matched.
+///
+/// The private-registry service renders it identically
+/// (`service-com-amazonaws-ecr-amazonec2containerregistry-v20150921`'s
+/// `state::identifier_description`); the two are separate functions only because
+/// `ImageIdentifier` is generated per service crate. Keep them in step.
+pub fn identifier_description(id: &ImageIdentifier) -> String {
+    format!(
+        "imageId {{imageDigest:'{}', imageTag:'{}'}}",
+        id.image_digest.as_deref().unwrap_or("null"),
+        id.image_tag.as_deref().unwrap_or("null")
+    )
+}
+
 /// Why an [`ImageIdentifier`] names no stored image. Each variant is one of the
 /// `ImageFailureCode` values the model declares, which is how `BatchDeleteImage` reports
 /// it; `DescribeImages` answers the same three cases with its own modelled errors.

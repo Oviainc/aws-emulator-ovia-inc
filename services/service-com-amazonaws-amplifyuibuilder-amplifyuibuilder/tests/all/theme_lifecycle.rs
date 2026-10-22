@@ -85,9 +85,18 @@ impl Answer {
         self.body["id"].as_str().unwrap_or_default().to_string()
     }
 
-    /// The wire error code (`__type`), or the empty string on a success.
+    /// The error-type discriminator the body carries — `__type`, or the `code` / `Code`
+    /// spellings the same JSON error parsers also accept — or the empty string when it
+    /// carries none.
+    ///
+    /// Every refusal of one of this service's own modelled exceptions must carry NONE of
+    /// them: AmplifyUIBuilder names no exception on the wire, so a client classifies a
+    /// failure by HTTP status (see `component_refusals.rs`).
     fn error_code(&self) -> &str {
-        self.body["__type"].as_str().unwrap_or_default()
+        ["__type", "code", "Code"]
+            .iter()
+            .find_map(|member| self.body[*member].as_str())
+            .unwrap_or_default()
     }
 }
 
@@ -514,8 +523,8 @@ async fn get_theme_refuses_an_id_that_names_no_theme_in_that_app_environment() {
         );
         assert_eq!(
             read.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected the modelled ResourceNotFoundException, got {:?}",
+            "",
+            "case {case:?}: a refusal must name no error type, got {:?}",
             read.body
         );
     }
