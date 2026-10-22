@@ -248,6 +248,28 @@ impl TargetAccountConfigurationRecord {
         }
     }
 
+    /// Apply an `UpdateTargetAccountConfiguration` request to this record.
+    ///
+    /// `roleArn` and `description` are both OPTIONAL on that request while `roleArn` is
+    /// required on the create, so the update is a partial one: a member the request
+    /// carries replaces the stored value, and a member it omits leaves the stored value
+    /// exactly as it was. An empty `description` IS carried
+    /// (`TargetAccountConfigurationDescription` is modelled `@length(min: 0)`), so it
+    /// replaces the stored description with the empty string rather than counting as
+    /// "omitted".
+    ///
+    /// The `accountId` names the record and so is never changed by an update, and the
+    /// creating `@idempotencyToken` is kept: a retry of the create still resolves to this
+    /// record, and reports it in whatever state it is now in.
+    pub fn apply_update(&mut self, role_arn: Option<&str>, description: Option<&str>) {
+        if let Some(role_arn) = role_arn {
+            self.role_arn = role_arn.to_string();
+        }
+        if let Some(description) = description {
+            self.description = Some(description.to_string());
+        }
+    }
+
     /// The `TargetAccountConfiguration` every target-account-configuration operation
     /// returns: every member is the stored one.
     pub fn to_target_account_configuration(&self) -> TargetAccountConfiguration {
