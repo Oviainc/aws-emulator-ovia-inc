@@ -19,6 +19,15 @@
 //! sub-segment at its own posted speed would be a per-segment cost model, which this slice
 //! does not carry.
 //!
+//! The network also carries the manoeuvre data a leg's TRAVEL STEPS are derived from. A
+//! road is a run of the grid with an orientation and a grid index ([`RoadSegment`]), two
+//! roads of different orientations meet in a [`Junction`] with the angle between their own
+//! directions ([`TravelledRoad::junction_with`]), and a leg's geometry is a sequence of
+//! [`PathVertex`] each carrying the road it is on — so [`leg_runs`] cuts the leg into
+//! [`LegRun`]s at the junctions where its road changes, each run with its share of the
+//! leg's distance and duration and the angle it turned through. No step boundary, turn
+//! angle or road name is chosen: each is read off the network.
+//!
 //! Nothing in here reads a clock or a random source except [`now`], so a request repeated
 //! with the same inputs computes the same distances, durations and geometry.
 
@@ -241,6 +250,48 @@ pub enum RoadClass {
     Footpath,
 }
 
+/// Which way a run of the grid points. It is what the angle between two runs — and so the
+/// manoeuvre at the junction they meet in — is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoadOrientation {
+    /// A road of constant longitude, running north-south.
+    Meridian,
+    /// A road of constant latitude, running east-west.
+    Parallel,
+}
+
+impl RoadOrientation {
+    /// Bearing of the run's forward direction, in degrees clockwise from north: a meridian
+    /// road points north and a parallel road east.
+    pub fn forward_bearing_deg(self) -> f64 {
+        match self {
+            Self::Meridian => 0.0,
+            Self::Parallel => 90.0,
+        }
+    }
+
+    /// Which coordinate of a position runs ALONG this road: latitude for a meridian road,
+    /// longitude for a parallel one.
+    fn axis(self) -> usize {
+        match self {
+            Self::Meridian => 1,
+            Self::Parallel => 0,
+        }
+    }
+}
+
+/// Where two roads of the network meet: the point they cross in and the angle between them.
+///
+/// A junction is what makes a step boundary a manoeuvre rather than a chosen point: the
+/// two roads genuinely cross here, and the angle is measured from their own directions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Junction {
+    /// The crossing point, `[longitude, latitude]`.
+    pub position: Position,
+    /// Angle between the two roads' forward directions, in degrees in `[0, 180]`.
+    pub crossing_angle_deg: f64,
+}
+
 /// One segment of the synthetic road network: a straight run of one grid road across one
 /// materialised cell.
 #[derive(Debug, Clone)]
@@ -257,12 +308,106 @@ pub struct RoadSegment {
     pub allows: Vec<TravelMode>,
     /// The road's class.
     pub class: RoadClass,
+    /// Which way the run points.
+    pub orientation: RoadOrientation,
+    /// The road's grid index: which multiple of [`ROAD_SPACING_DEG`] the road sits at.
+    /// With [`RoadSegment::orientation`] it identifies the ROAD, which the per-cell
+    /// [`RoadSegment::id`] does not — one road crosses as many cells as it spans.
+    pub grid_index: i64,
 }
 
 impl RoadSegment {
     /// Whether `mode` may travel on this road.
     pub fn allows(&self, mode: TravelMode) -> bool {
         self.allows.contains(&mode)
+    }
+
+    /// This run's road, as a travel step of a leg reports it.
+    pub fn travelled(&self) -> TravelledRoad {
+        TravelledRoad {
+            label: self.road_label.clone(),
+            class: self.class,
+            speed_kph: self.speed_kph,
+            orientation: self.orientation,
+            grid_index: self.grid_index,
+        }
+    }
+}
+
+/// The road a stretch of a leg travels on: what a travel step reports as its road, and
+/// what the manoeuvre at its start is classified from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TravelledRoad {
+    /// Name of the road.
+    pub label: String,
+    /// The road's class.
+    pub class: RoadClass,
+    /// Posted speed of the road, in km/h.
+    pub speed_kph: f64,
+    /// Which way the road runs.
+    pub orientation: RoadOrientation,
+    /// The road's grid index.
+    pub grid_index: i64,
+}
+
+impl TravelledRoad {
+    /// Whether this is the same ROAD as `other`. A road runs across every cell it spans,
+    /// so its identity is its orientation and grid index rather than the per-cell segment
+    /// a position snapped onto — otherwise a leg crossing a cell boundary would read as
+    /// changing road where it travels straight on.
+    pub fn is_same_road(&self, other: &Self) -> bool {
+        self.orientation == other.orientation && self.grid_index == other.grid_index
+    }
+
+    /// The junction this road and `other` meet in: the point they cross and the angle
+    /// between their forward directions. `None` for two roads of the same orientation,
+    /// which run parallel and so never meet.
+    ///
+    /// Every road of the grid sits at a multiple of [`ROAD_SPACING_DEG`] along its own axis
+    /// and runs the whole way along the other, so a meridian road and a parallel road cross
+    /// in exactly one point: the meridian's longitude and the parallel's latitude. The
+    /// per-cell segments the network materialises are pieces of those roads, not their
+    /// extent, so the junction is read off the roads rather than off the pieces a leg
+    /// happened to snap onto.
+    pub fn junction_with(&self, other: &Self) -> Option<Junction> {
+        if self.orientation == other.orientation {
+            return None;
+        }
+        let (meridian, parallel) = match self.orientation {
+            RoadOrientation::Meridian => (self, other),
+            RoadOrientation::Parallel => (other, self),
+        };
+        Some(Junction {
+            position: [
+                meridian.grid_index as f64 * ROAD_SPACING_DEG,
+                parallel.grid_index as f64 * ROAD_SPACING_DEG,
+            ],
+            crossing_angle_deg: turn_between_deg(
+                self.orientation.forward_bearing_deg(),
+                other.orientation.forward_bearing_deg(),
+            )
+            .abs(),
+        })
+    }
+
+    /// Bearing travel takes along this road to get from `from` to `to`, in degrees
+    /// clockwise from north: the road's own forward bearing, reversed where travel runs
+    /// against it.
+    ///
+    /// `None` where the two positions do not differ along the road's axis, which leaves the
+    /// direction travel takes along it undetermined.
+    pub fn travel_bearing_deg(&self, from: Position, to: Position) -> Option<f64> {
+        let axis = self.orientation.axis();
+        let delta = to[axis] - from[axis];
+        if delta.abs() < POSITION_EPSILON {
+            return None;
+        }
+        let forward = self.orientation.forward_bearing_deg();
+        Some(if delta > 0.0 {
+            forward
+        } else {
+            (forward + 180.0).rem_euclid(360.0)
+        })
     }
 }
 
@@ -292,6 +437,58 @@ impl LegType {
     }
 }
 
+/// One vertex of a leg's geometry: the position, and the road the leg travels there.
+#[derive(Debug, Clone)]
+pub struct PathVertex {
+    /// `[longitude, latitude]` of the vertex.
+    pub position: Position,
+    /// The road the leg is on here. A leg's two submitted endpoints are not snapped
+    /// points, so they carry the road of the nearest snapped vertex: the traveller departs
+    /// on the road the leg's first snapped point is on and arrives on the road of its last.
+    pub road: Option<TravelledRoad>,
+    /// Whether this vertex is itself a point snapped onto the network, as against an
+    /// endpoint that inherited its road.
+    pub snapped: bool,
+    /// The junction the previous vertex's road and this vertex's road meet in, when the
+    /// road changes here and the two roads cross.
+    pub junction: Option<Junction>,
+}
+
+impl PathVertex {
+    /// A vertex off the road network: a leg's submitted endpoint, or a sample the network
+    /// held no road for.
+    fn off_network(position: Position) -> Self {
+        Self {
+            position,
+            road: None,
+            snapped: false,
+            junction: None,
+        }
+    }
+}
+
+/// One run of a leg: the stretch travelled on a single road, which is what one travel step
+/// of the leg reports.
+#[derive(Debug, Clone)]
+pub struct LegRun {
+    /// Offset into the leg's geometry of the vertex the run starts at.
+    pub geometry_offset: usize,
+    /// The run's share of the leg's distance, in metres.
+    pub distance_m: i64,
+    /// The run's share of the leg's duration, in seconds.
+    pub duration_s: i64,
+    /// The road travelled, when the run runs on the network.
+    pub road: Option<TravelledRoad>,
+    /// Signed angle the leg turns through to enter this run, in degrees in `[-180, 180]`:
+    /// positive turns right. It is the angle between the two ROADS where they meet in a
+    /// junction, signed by the bearings travel takes along them, and the angle between
+    /// those bearings where the two roads never cross. `None` for the first run of a leg,
+    /// which turns off nothing, and for a boundary neither run gives a direction for.
+    pub turn_angle_deg: Option<f64>,
+    /// The junction the previous run and this one meet in, when the two roads cross.
+    pub junction: Option<Junction>,
+}
+
 /// One leg of a computed route: the section from one waypoint to the next.
 #[derive(Debug, Clone)]
 pub struct CachedLeg {
@@ -299,10 +496,137 @@ pub struct CachedLeg {
     pub end: Position,
     pub distance_m: i64,
     pub duration_s: i64,
-    /// The leg's geometry, following the road network; at least two positions.
-    pub geometry: Vec<Position>,
+    /// The leg's geometry, following the road network, each vertex with the road it is on;
+    /// at least two vertices.
+    pub path: Vec<PathVertex>,
+    /// The runs of the leg, in travel order: the manoeuvres its travel steps report.
+    pub runs: Vec<LegRun>,
     pub travel_mode: TravelMode,
     pub leg_type: LegType,
+}
+
+/// The positions of a path, in order.
+pub fn path_positions(path: &[PathVertex]) -> Vec<Position> {
+    path.iter().map(|vertex| vertex.position).collect()
+}
+
+/// The runs of a leg whose geometry is `path`, with each run's share of the leg's
+/// `distance_m` and `duration_s`.
+///
+/// A new run starts wherever the road changes, so a run is a stretch of ONE road and a run
+/// boundary is a junction of two. A run's distance is its share of the leg's geometry, and
+/// its duration that same share of the leg's duration — the cost function is the leg's
+/// distance over one speed, so a share of the distance is that share of the time. Both are
+/// rounded CUMULATIVELY, so the runs of a leg sum to exactly the leg's own distance and
+/// duration rather than to it plus a rounding error per run.
+pub fn leg_runs(path: &[PathVertex], distance_m: i64, duration_s: i64) -> Vec<LegRun> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let last = path.len() - 1;
+
+    // Length of the geometry up to each vertex, which is what the share of the leg a run
+    // covers is read off.
+    let mut cumulative = Vec::with_capacity(path.len());
+    let mut travelled = 0.0;
+    cumulative.push(travelled);
+    for pair in path.windows(2) {
+        travelled += haversine_m(pair[0].position, pair[1].position);
+        cumulative.push(travelled);
+    }
+    let total = cumulative[last];
+    // A leg with no length at all (two coincident positions) is divided by vertex count,
+    // so the shares still run from 0 to 1 and the runs still sum to the leg.
+    let share = |index: usize| -> f64 {
+        if total > 0.0 {
+            cumulative[index] / total
+        } else {
+            index as f64 / last.max(1) as f64
+        }
+    };
+
+    // A run starts at the leg's first vertex and wherever the road changes.
+    let mut starts = vec![0_usize];
+    for index in 1..path.len() {
+        let changed = match (&path[index - 1].road, &path[index].road) {
+            (Some(previous), Some(current)) => !previous.is_same_road(current),
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            starts.push(index);
+        }
+    }
+
+    // The bearing travel takes along each run: the road's own direction where the run has
+    // an extent along it, and otherwise the direction of the hop leaving it.
+    let bearing = |start: usize, road_end: usize| -> Option<f64> {
+        let from = path[start].position;
+        if let Some(bearing) = path[start]
+            .road
+            .as_ref()
+            .and_then(|road| road.travel_bearing_deg(from, path[road_end].position))
+        {
+            return Some(bearing);
+        }
+        planar_bearing_deg(from, path.get(road_end + 1)?.position)
+    };
+    let bearings: Vec<Option<f64>> = starts
+        .iter()
+        .enumerate()
+        .map(|(ordinal, &start)| {
+            let road_end = match starts.get(ordinal + 1) {
+                // The next run starts at the vertex the road changes in, so the vertices on
+                // THIS run's road end one before it.
+                Some(&next) => next.saturating_sub(1).max(start),
+                None => last,
+            };
+            bearing(start, road_end)
+        })
+        .collect();
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(ordinal, &start)| {
+            // The run runs to where the next one starts, so the runs of a leg tile its
+            // whole geometry; the last one runs to the leg's end.
+            let end = starts.get(ordinal + 1).copied().unwrap_or(last);
+            let turn_angle_deg = match (
+                ordinal.checked_sub(1).and_then(|previous| bearings[previous]),
+                bearings[ordinal],
+            ) {
+                (Some(entered), Some(left)) => {
+                    let travelled = turn_between_deg(entered, left);
+                    // Where the road the leg leaves and the road it joins meet in a
+                    // junction, the leg turns through the angle BETWEEN THOSE ROADS, and
+                    // the bearings decide only which way round it turns. Only a boundary
+                    // with no junction — two roads that never cross — is left with the
+                    // angle between the bearings alone.
+                    Some(match path[start].junction {
+                        Some(junction) if travelled < 0.0 => -junction.crossing_angle_deg,
+                        Some(junction) => junction.crossing_angle_deg,
+                        None => travelled,
+                    })
+                }
+                _ => None,
+            };
+            LegRun {
+                geometry_offset: start,
+                distance_m: scaled_share(share(end), distance_m) - scaled_share(share(start), distance_m),
+                duration_s: scaled_share(share(end), duration_s) - scaled_share(share(start), duration_s),
+                road: path[start].road.clone(),
+                turn_angle_deg,
+                junction: path[start].junction,
+            }
+        })
+        .collect()
+}
+
+/// `share` of `total`, rounded: the cumulative value a run's distance or duration is the
+/// difference of.
+fn scaled_share(share: f64, total: i64) -> i64 {
+    clamp_cost(share.clamp(0.0, 1.0) * total as f64)
 }
 
 /// A computed route: its legs plus the totals and road labels derived from them.
@@ -327,12 +651,8 @@ pub struct SnappedPosition {
     pub position: Position,
     /// Distance from the submitted position to [`SnappedPosition::position`], in metres.
     pub offset_m: f64,
-    /// Name of the road snapped to.
-    pub road_label: String,
-    /// Posted speed of the road snapped to, in km/h.
-    pub speed_kph: f64,
-    /// Class of the road snapped to.
-    pub class: RoadClass,
+    /// The road snapped to.
+    pub road: TravelledRoad,
 }
 
 /// Per-service state for com-amazonaws-georoutes-routesservice. A handler reaches it through [`service_state`].
@@ -453,6 +773,8 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
                 road_label: label_of(class, true, i),
                 allows: allows_of(class),
                 class,
+                orientation: RoadOrientation::Meridian,
+                grid_index: i,
             });
         }
 
@@ -474,6 +796,8 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
                 road_label: label_of(class, false, j),
                 allows: allows_of(class),
                 class,
+                orientation: RoadOrientation::Parallel,
+                grid_index: j,
             });
         }
 
@@ -497,16 +821,11 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
                 continue;
             }
             let (position, offset_m) = nearest_point_on_polyline(pos, &segment.polyline);
-            if best
-                .as_ref()
-                .is_none_or(|current| offset_m < current.offset_m)
-            {
+            if best.as_ref().is_none_or(|current| offset_m < current.offset_m) {
                 best = Some(SnappedPosition {
                     position,
                     offset_m,
-                    road_label: segment.road_label.clone(),
-                    speed_kph: segment.speed_kph,
-                    class: segment.class,
+                    road: segment.travelled(),
                 });
             }
         }
@@ -540,24 +859,32 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         let mut uses_controlled_access_highway = false;
 
         for pair in positions.windows(2) {
-            let (geometry, segments) = self.path_between(pair[0], pair[1], mode, objective, variant);
-            for (label, speed_kph, class) in segments {
-                uses_controlled_access_highway |= class == RoadClass::Motorway;
-                match roads.iter_mut().find(|(seen, _, _)| *seen == label) {
+            let path = self.path_between(pair[0], pair[1], mode, objective, variant);
+            // The roads the route travelled, counted per SNAPPED sample: an endpoint that
+            // inherited the road of its neighbour is the same travel on that road, not a
+            // second traversal of it.
+            for road in path
+                .iter()
+                .filter(|vertex| vertex.snapped)
+                .filter_map(|vertex| vertex.road.as_ref())
+            {
+                uses_controlled_access_highway |= road.class == RoadClass::Motorway;
+                match roads.iter_mut().find(|(seen, _, _)| *seen == road.label) {
                     Some(entry) => entry.2 += 1,
-                    None => roads.push((label, speed_kph, 1)),
+                    None => roads.push((road.label.clone(), road.speed_kph, 1)),
                 }
             }
             // The distance IS the length of the geometry this leg reports, so a client
             // that measures the returned line gets the number beside it.
-            let distance_m = clamp_cost(polyline_length_m(&geometry));
+            let distance_m = clamp_cost(polyline_length_m(&path_positions(&path)));
             let duration_s = clamp_cost(distance_m as f64 / speed);
             legs.push(CachedLeg {
                 start: pair[0],
                 end: pair[1],
                 distance_m,
                 duration_s,
-                geometry,
+                runs: leg_runs(&path, distance_m, duration_s),
+                path,
                 travel_mode: mode,
                 leg_type: LegType::for_mode(mode),
             });
@@ -588,13 +915,15 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         route
     }
 
-    /// The geometry of one leg, and the roads it was snapped onto.
+    /// The geometry of one leg: each vertex with the road the leg travels there.
     ///
     /// The straight line from `from` to `to` is sampled every [`SAMPLE_SPACING_M`], each
     /// interior sample is pushed sideways by the objective's detour plus
     /// `variant * ALTERNATIVE_OFFSET_M` (zero for the shortest direct route) and then
     /// snapped onto the nearest road `mode` may use, so the returned geometry runs along
-    /// the road network and its length is the leg's distance.
+    /// the road network and its length is the leg's distance. Where a sample lands on a
+    /// different road from the one before it, the two runs' own junction is recorded on the
+    /// vertex: that is the manoeuvre boundary the leg's travel steps are cut at.
     fn path_between(
         &mut self,
         from: Position,
@@ -602,18 +931,18 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         mode: TravelMode,
         objective: RoutingObjective,
         variant: u32,
-    ) -> (Vec<Position>, Vec<(String, f64, RoadClass)>) {
+    ) -> Vec<PathVertex> {
         let straight_m = haversine_m(from, to);
         // A leg between two positions that are the same place has nothing to travel: it
         // reports that pair as its geometry and costs zero, rather than wandering onto the
         // road network and back.
         if positions_equal(from, to) {
-            return (vec![from, to], Vec::new());
+            return vec![PathVertex::off_network(from), PathVertex::off_network(to)];
         }
         let steps = ((straight_m / SAMPLE_SPACING_M).ceil() as usize).clamp(2, MAX_PATH_SEGMENTS);
         let bow_m = self.factors(objective).detour_m + f64::from(variant) * ALTERNATIVE_OFFSET_M;
-        let mut geometry = vec![from];
-        let mut segments = Vec::new();
+        let mut path = vec![PathVertex::off_network(from)];
+        let mut previous_road: Option<TravelledRoad> = None;
         for step in 1..steps {
             let t = step as f64 / steps as f64;
             let mut sample = interpolate(from, to, t);
@@ -621,19 +950,52 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
                 // A half sine, so the bow leaves and rejoins the direct path at the ends.
                 sample = offset_sideways(from, to, sample, bow_m * (std::f64::consts::PI * t).sin());
             }
-            if let Some(snapped) = self.snap(sample, mode) {
-                geometry.push(snapped.position);
-                segments.push((snapped.road_label, snapped.speed_kph, snapped.class));
-            } else {
-                geometry.push(sample);
+            match self.snap(sample, mode) {
+                Some(snapped) => {
+                    // A run boundary is a junction of two roads: where the road changes,
+                    // the two roads' own crossing is the point they meet in and the angle
+                    // between them is what the manoeuvre there is read from.
+                    let junction = previous_road
+                        .as_ref()
+                        .filter(|previous| !previous.is_same_road(&snapped.road))
+                        .and_then(|previous| previous.junction_with(&snapped.road));
+                    previous_road = Some(snapped.road.clone());
+                    path.push(PathVertex {
+                        position: snapped.position,
+                        road: Some(snapped.road),
+                        snapped: true,
+                        junction,
+                    });
+                }
+                None => path.push(PathVertex::off_network(sample)),
             }
         }
-        geometry.push(to);
-        geometry.dedup_by(|a, b| positions_equal(*a, *b));
-        if geometry.len() < 2 {
-            geometry.push(to);
+        path.push(PathVertex::off_network(to));
+        path.dedup_by(|a, b| positions_equal(a.position, b.position));
+        if path.len() < 2 {
+            path.push(PathVertex::off_network(to));
         }
-        (geometry, segments)
+        inherit_endpoint_roads(&mut path);
+        path
+    }
+}
+
+/// A leg's submitted endpoints are not snapped points, so they carry no road of their own:
+/// the traveller departs on the road the leg's first snapped vertex is on and arrives on
+/// the road of its last. Without it a leg's first and last step would be a run of no road
+/// rather than the stretch on those roads.
+fn inherit_endpoint_roads(path: &mut [PathVertex]) {
+    if let Some(first) = path.iter().position(|vertex| vertex.road.is_some()) {
+        let road = path[first].road.clone();
+        for vertex in &mut path[..first] {
+            vertex.road = road.clone();
+        }
+    }
+    if let Some(last) = path.iter().rposition(|vertex| vertex.road.is_some()) {
+        let road = path[last].road.clone();
+        for vertex in &mut path[last + 1..] {
+            vertex.road = road.clone();
+        }
     }
 }
 
@@ -774,7 +1136,33 @@ fn nearest_point_on_segment(pos: Position, a: Position, b: Position) -> Position
 
 /// Whether two positions are the same at the 6-digit precision the geometry carries.
 fn positions_equal(a: Position, b: Position) -> bool {
-    (a[0] - b[0]).abs() < 1e-7 && (a[1] - b[1]).abs() < 1e-7
+    (a[0] - b[0]).abs() < POSITION_EPSILON && (a[1] - b[1]).abs() < POSITION_EPSILON
+}
+
+/// Two positions closer than this in a coordinate are the same place at the 6-digit
+/// precision the geometry carries, so nothing is read off the difference between them.
+const POSITION_EPSILON: f64 = 1e-7;
+
+/// Bearing from `from` to `to`, in degrees clockwise from north, in the local planar frame
+/// between them. `None` when the two positions are the same place, which has no bearing.
+pub fn planar_bearing_deg(from: Position, to: Position) -> Option<f64> {
+    let (mx, my) = metres_per_degree((from[1] + to[1]) / 2.0);
+    let (dx, dy) = ((to[0] - from[0]) * mx, (to[1] - from[1]) * my);
+    if dx.hypot(dy) < f64::EPSILON {
+        return None;
+    }
+    Some(dx.atan2(dy).to_degrees().rem_euclid(360.0))
+}
+
+/// The turn from bearing `entered` to bearing `left`, in degrees in `(-180, 180]`:
+/// positive to the right (clockwise), negative to the left.
+pub fn turn_between_deg(entered: f64, left: f64) -> f64 {
+    let delta = (left - entered).rem_euclid(360.0);
+    if delta > 180.0 {
+        delta - 360.0
+    } else {
+        delta
+    }
 }
 
 /// Round a cost into the model's `0..4294967295` range.

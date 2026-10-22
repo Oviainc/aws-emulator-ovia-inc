@@ -15,8 +15,9 @@
 //! modes return (`TransitLegDetails`, boarding steps, next departures) cannot be computed
 //! from the road model. So do `Exclude` (a country exclusion is "strictly excluded", and
 //! no road carries the country it is in), any `SpanAdditionalFeatures`, and any
-//! `LegAdditionalFeatures` other than `Summary`: those ask for data the road model does
-//! not carry, and an empty list in their place would be absence dressed as success.
+//! `LegAdditionalFeatures` other than `Summary` and `TravelStepInstructions`: those ask for
+//! data the road model does not carry, and an empty list in their place would be absence
+//! dressed as success.
 //!
 //! `Avoid` is best-effort by its own documentation — a violated avoidance "produces a
 //! notice for the violation" — so a route that uses a controlled-access highway the
@@ -27,22 +28,35 @@
 //!
 //! ## Travel steps
 //!
-//! A leg's `TravelSteps` and `AfterTravelSteps` are the empty required lists, and that is
-//! the whole of what this model can say about steps: a step is a manoeuvre with an
-//! instruction, a turn angle, a signpost, an intersection or a roundabout exit, and the
-//! road model in [`crate::state`] is a grid of straight runs that carries none of those —
-//! there is no junction geometry to derive a turn from and no text to put in an
-//! instruction. The empty list is therefore the answer for a request that asks for no
-//! steps, and a request that DOES ask for them — `TravelStepType` or
-//! `InstructionsMeasurementSystem` — is declined with 501 rather than answered with it.
-//! The gap is filed as its own issue,
-//! `issues/things-that-do-not-work/20261022T070000Z-georoutes-calculateroutes-travel-steps-gap.md`,
-//! which states what the road model needs before a step can be computed; nothing here
-//! fabricates one.
+//! A leg's `TravelSteps` are its manoeuvres, one per RUN of road the leg travels: the road
+//! model in [`crate::state`] carries each road's orientation and grid index, so a leg's
+//! snapped geometry cuts into runs at the junctions where its road changes, and each
+//! junction carries the angle between the two roads' own directions. A step therefore
+//! reports the run's share of the leg's distance and duration (the shares sum to exactly
+//! the leg's own), its `GeometryOffset`, the `CurrentRoad` and `NextRoad` the network
+//! names, and a `Type` classified from the road classes it joins and leaves and from that
+//! angle — never chosen. `AfterTravelSteps` is the stop the route makes at the leg's end:
+//! a vehicle parks and a pedestrian waits for the waypoint's `StopDuration`, which is the
+//! one value each of those step-type enums declares; a leg with no stop at its end has
+//! nothing to perform after travelling and so an empty list.
 //!
-//! `Allow`, `Tolls`, `Traffic`, `TravelModeOptions` and `Languages` have nothing to act on
-//! for the same reason: the model carries no HOV/HOT lane, toll, traffic variation,
-//! vehicle restriction or localized text.
+//! What the network does NOT hold is left out rather than invented: it has no roundabout,
+//! ramp, exit number or route number, so no `RoundaboutEnter`/`RoundaboutExit`/
+//! `RoundaboutPass`/`Ramp` step arises and `ExitNumber`, `RouteNumber` and `Towards` stay
+//! empty. `Instruction` is built from the manoeuvre, the road name and the step's distance,
+//! and is carried only when the effective `TravelStepType` is `Default` — "Only available
+//! when the TravelStepType is Default" — while `Signpost` is carried only for `TurnByTurn`,
+//! as its own documentation says, and names the road the junction leads onto.
+//!
+//! `Languages` and `InstructionsMeasurementSystem` act on that text: an instruction is
+//! rendered in the requested language where this emulator holds text in it (English only),
+//! and otherwise in the regional default with the model's own `MainLanguageNotFound`
+//! notice, since "the request uses the regional default as the fallback if the requested
+//! language can't be provided"; its distance is stated in metres and kilometres for
+//! `Metric` and in feet and miles for `Imperial`.
+//!
+//! `Allow`, `Tolls`, `Traffic` and `TravelModeOptions` have nothing to act on: the model
+//! carries no HOV/HOT lane, toll, traffic variation or vehicle restriction.
 //!
 //! ## Authorization
 //!
@@ -151,7 +165,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{self, CachedLeg, Instant, LegType, Position, RoutingObjective, TravelMode};
+use crate::state::{
+    self, CachedLeg, Instant, Junction, LegType, PathVertex, Position, RoadClass, RoutingObjective, TravelMode,
+    TravelledRoad,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -211,6 +228,102 @@ const MAX_WAYPOINTS: usize = 23;
 /// The upper bound of `RouteWaypoint$StopDuration`'s modeled range (`0..49999`).
 const MAX_STOP_DURATION_S: i64 = 49_999;
 
+/// The `LegAdditionalFeatures` this slice computes: the leg summary, and the step
+/// instructions the travel steps carry. Every other feature asks for data the road model
+/// does not hold (tolls, incidents, elevation, zones, truck road types, transit stops and
+/// departures), so a request naming one is declined rather than answered without it.
+const COMPUTED_LEG_FEATURES: [&str; 2] = ["Summary", "TravelStepInstructions"];
+
+/// The language this emulator holds instruction text in. A request whose `Languages` names
+/// no tag of this language is answered in it anyway — "the request uses the regional
+/// default as the fallback if the requested language can't be provided" — and carries the
+/// model's `MainLanguageNotFound` notice.
+const INSTRUCTION_LANGUAGE: &str = "en";
+
+/// The angle bands, in degrees, a manoeuvre at a junction is classified into: inside
+/// `STRAIGHT` the leg continues straight on, up to `KEEP` it keeps to one side of a fork,
+/// at `UTURN` or beyond it doubles back, and anything between is a turn. AWS publishes no
+/// bands, so these are this emulator's own, applied to every leg and travel mode alike.
+const STRAIGHT_ANGLE_DEG: f64 = 10.0;
+const KEEP_ANGLE_DEG: f64 = 45.0;
+const UTURN_ANGLE_DEG: f64 = 160.0;
+
+/// The bands of `RouteTurnIntensity`, in degrees: a turn gentler than `SLIGHT` is
+/// `Slight`, one at `SHARP` or beyond is `Sharp`, and the rest are `Typical`. This
+/// emulator's own, as above.
+const SLIGHT_TURN_ANGLE_DEG: f64 = 60.0;
+const SHARP_TURN_ANGLE_DEG: f64 = 120.0;
+
+/// The exact definitions of the units an instruction states a distance in.
+const METRES_PER_KILOMETRE: f64 = 1_000.0;
+const METRES_PER_FOOT: f64 = 0.3048;
+const METRES_PER_MILE: f64 = 1_609.344;
+
+/// Seconds in a minute, for the duration an after-travel step states.
+const SECONDS_PER_MINUTE: i64 = 60;
+
+/// `RouteTravelStepType`: how much detail the steps of the answer carry.
+///
+/// The member carries no modeled default. `Default` — "basic steps intended for web based
+/// applications" — is what a request naming none gets, and it is the only value whose
+/// steps carry an `Instruction` ("Only available when the TravelStepType is Default");
+/// `TurnByTurn` carries instead the members the model marks as its own, the manoeuvre
+/// details and the `Signpost` "applicable only for TurnByTurn steps".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepDetail {
+    Default,
+    TurnByTurn,
+}
+
+impl StepDetail {
+    /// The detail named by a model enum value, read against the generated value list so the
+    /// accepted set cannot drift from the model.
+    fn from_model(value: &str) -> Option<Self> {
+        if !ROUTE_TRAVEL_STEP_TYPE_VALUES.contains(&value) {
+            return None;
+        }
+        match value {
+            "Default" => Some(Self::Default),
+            "TurnByTurn" => Some(Self::TurnByTurn),
+            _ => None,
+        }
+    }
+}
+
+/// `MeasurementSystem`: the units a step's instruction states its distance in. A request
+/// naming none gets `Metric`, the system every distance this model carries is in
+/// (`DistanceMeters`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Measurement {
+    Metric,
+    Imperial,
+}
+
+impl Measurement {
+    /// The system named by a model enum value, read against the generated value list.
+    fn from_model(value: &str) -> Option<Self> {
+        if !MEASUREMENT_SYSTEM_VALUES.contains(&value) {
+            return None;
+        }
+        match value {
+            "Metric" => Some(Self::Metric),
+            "Imperial" => Some(Self::Imperial),
+            _ => None,
+        }
+    }
+}
+
+/// What the steps of the answer are rendered with.
+#[derive(Debug, Clone, Copy)]
+struct StepRendering<'a> {
+    /// The effective `TravelStepType`.
+    detail: StepDetail,
+    /// The language tag the instructions and the localized road names are rendered in.
+    language: &'a str,
+    /// The effective `InstructionsMeasurementSystem`.
+    measurement: Measurement,
+}
+
 /// Where the route's clock is pinned: at its departure or at its arrival.
 #[derive(Debug, Clone, Copy)]
 enum Anchor {
@@ -228,6 +341,8 @@ struct Rendering<'a> {
     wants_leg_summary: bool,
     /// Whether the route violates an avoidance the request asked for.
     violated_avoidance: bool,
+    /// What the leg's travel steps are rendered with.
+    steps: StepRendering<'a>,
 }
 
 /// One point of the requested sequence: origin, a waypoint, or the destination.
@@ -249,7 +364,10 @@ struct SequencePoint {
 struct MergedLeg {
     distance_m: i64,
     duration_s: i64,
-    geometry: Vec<Position>,
+    /// The leg's geometry, each vertex with the road it is on.
+    path: Vec<PathVertex>,
+    /// The runs of the merged leg: the manoeuvres its travel steps report.
+    runs: Vec<state::LegRun>,
     /// The pass-through waypoints inside this leg, with their offset into its geometry.
     pass_through: Vec<(SequencePoint, usize)>,
     start: SequencePoint,
@@ -347,25 +465,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "CalculateRoutes with SpanAdditionalFeatures",
             ));
         }
-        // The steps of a leg are the turn-by-turn instructions of a route, which this
-        // model has no instruction text or manoeuvre data to build. A request that asks
-        // for a step type or an instruction measurement system is therefore declined
-        // rather than answered with an empty step list.
-        if input.travel_step_type.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CalculateRoutes with TravelStepType",
-            ));
-        }
-        if input.instructions_measurement_system.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CalculateRoutes with InstructionsMeasurementSystem",
-            ));
-        }
-        // `Summary` is the one leg feature this slice computes; every other one asks for
-        // data the road model does not carry (tolls, incidents, elevation, step
-        // instructions, zones, truck road types, transit stops and departures).
+        // The steps of a leg are its manoeuvres, which the road model now determines: the
+        // requested step detail and measurement system decide what each step says, not
+        // whether one can be computed.
+        let step_detail = match input.travel_step_type.as_deref() {
+            None => StepDetail::Default,
+            Some(value) => StepDetail::from_model(value).ok_or_else(|| {
+                invalid(
+                    "TravelStepType",
+                    format!("TravelStepType {value} is not a RouteTravelStepType"),
+                )
+            })?,
+        };
+        let measurement = match input.instructions_measurement_system.as_deref() {
+            None => Measurement::Metric,
+            Some(value) => Measurement::from_model(value).ok_or_else(|| {
+                invalid(
+                    "InstructionsMeasurementSystem",
+                    format!("InstructionsMeasurementSystem {value} is not a MeasurementSystem"),
+                )
+            })?,
+        };
+        let (language, language_fell_back) =
+            instruction_language(input.languages.as_deref().unwrap_or_default());
+        // `Summary` and `TravelStepInstructions` are the leg features this slice computes;
+        // every other one asks for data the road model does not carry (tolls, incidents,
+        // elevation, zones, truck road types, transit stops and departures).
         let leg_features = input.leg_additional_features.as_deref().unwrap_or_default();
-        if let Some(feature) = leg_features.iter().find(|feature| *feature != "Summary") {
+        if let Some(feature) = leg_features
+            .iter()
+            .find(|feature| !COMPUTED_LEG_FEATURES.contains(&feature.as_str()))
+        {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "CalculateRoutes with the LegAdditionalFeature {feature}"
             )));
@@ -482,15 +612,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     anchor,
                     wants_leg_summary,
                     violated_avoidance,
+                    steps: StepRendering {
+                        detail: step_detail,
+                        language: &language,
+                        measurement,
+                    },
                 },
             )?);
         }
 
         Ok(CalculateRoutesOutput {
             leg_geometry_format: geometry_format,
-            // Nothing about a route over this road model is worth a notice: no language
-            // was dropped, and no transit data was consulted.
-            notices: Vec::new(),
+            // The one thing worth a notice about a route over this road model: the
+            // instructions could not be rendered in the language the request asked for, so
+            // they fell back to the regional default.
+            notices: if language_fell_back {
+                vec![RouteResponseNotice {
+                    code: "MainLanguageNotFound".to_string(),
+                    impact: Some("Low".to_string()),
+                }]
+            } else {
+                Vec::new()
+            },
             pricing_bucket,
             routes,
         })
@@ -595,7 +738,7 @@ impl<Eng> CalculateRoutes<Eng> {
         let travel_mode = rendering.travel_mode;
         let wants_leg_summary = rendering.wants_leg_summary;
         let violated_avoidance = rendering.violated_avoidance;
-        let geometry = leg_geometry(&leg.geometry, rendering.geometry_format)?;
+        let geometry = leg_geometry(&state::path_positions(&leg.path), rendering.geometry_format)?;
         let leg_type = LegType::for_mode(travel_mode);
         let departure_time =
             state::format_timestamp(departure).ok_or_else(|| internal("the leg departure time is not representable"))?;
@@ -611,8 +754,18 @@ impl<Eng> CalculateRoutes<Eng> {
 
         match leg_type {
             LegType::Pedestrian => {
+                let steps = manoeuvres(leg, leg_type);
                 route_leg.pedestrian_leg_details = Some(RoutePedestrianLegDetails {
-                    after_travel_steps: Vec::new(),
+                    after_travel_steps: after_travel_stop(leg)
+                        .map(|duration_s| RoutePedestrianAfterTravelStep {
+                            duration: duration_s,
+                            instruction: (rendering.steps.detail == StepDetail::Default)
+                                .then(|| format!("Wait for {}.", duration_text(duration_s))),
+                            // The one value `RoutePedestrianAfterTravelStepType` declares.
+                            r#type: "Wait".to_string(),
+                        })
+                        .into_iter()
+                        .collect(),
                     arrival: RoutePedestrianArrival {
                         place: pedestrian_place(&leg.end),
                         time: Some(arrival_time),
@@ -624,9 +777,7 @@ impl<Eng> CalculateRoutes<Eng> {
                     notices: Vec::new(),
                     pass_through_waypoints: pass_through_waypoints(leg),
                     // Spans are only computed for the features `SpanAdditionalFeatures`
-                    // asks for, and this slice computes none of them. Steps are empty for
-                    // the reason the module header gives: this road model carries no
-                    // junction, signpost or instruction data a step could be derived from.
+                    // asks for, and this slice computes none of them.
                     spans: Vec::new(),
                     summary: wants_leg_summary.then_some(RoutePedestrianSummary {
                         overview: Some(RoutePedestrianOverviewSummary {
@@ -637,12 +788,28 @@ impl<Eng> CalculateRoutes<Eng> {
                             duration: leg.duration_s,
                         }),
                     }),
-                    travel_steps: Vec::new(),
+                    travel_steps: steps
+                        .iter()
+                        .map(|manoeuvre| pedestrian_step(manoeuvre, rendering.steps))
+                        .collect(),
                 });
             }
             LegType::Vehicle => {
+                let steps = manoeuvres(leg, leg_type);
                 route_leg.vehicle_leg_details = Some(RouteVehicleLegDetails {
-                    after_travel_steps: Vec::new(),
+                    after_travel_steps: after_travel_stop(leg)
+                        .map(|duration_s| RouteVehicleAfterTravelStep {
+                            // The model's charge details are for an electric vehicle's
+                            // charging stop, which this model has no charger to compute.
+                            charge_step_details: None,
+                            duration: duration_s,
+                            instruction: (rendering.steps.detail == StepDetail::Default)
+                                .then(|| format!("Park for {}.", duration_text(duration_s))),
+                            // The one value `RouteVehicleAfterTravelStepType` declares.
+                            r#type: "Park".to_string(),
+                        })
+                        .into_iter()
+                        .collect(),
                     arrival: RouteVehicleArrival {
                         place: vehicle_place(&leg.end),
                         time: Some(arrival_time),
@@ -682,7 +849,10 @@ impl<Eng> CalculateRoutes<Eng> {
                     }),
                     tolls: Vec::new(),
                     toll_systems: Vec::new(),
-                    travel_steps: Vec::new(),
+                    travel_steps: steps
+                        .iter()
+                        .map(|manoeuvre| vehicle_step(manoeuvre, rendering.steps))
+                        .collect(),
                     truck_road_types: Vec::new(),
                     zones: Vec::new(),
                 });
@@ -711,7 +881,8 @@ fn merge_legs(sequence: &[SequencePoint], computed: &[CachedLeg]) -> Vec<MergedL
                 current = Some(MergedLeg {
                     distance_m: leg.distance_m,
                     duration_s: leg.duration_s,
-                    geometry: leg.geometry.clone(),
+                    path: leg.path.clone(),
+                    runs: Vec::new(),
                     pass_through: Vec::new(),
                     start,
                     end,
@@ -720,11 +891,11 @@ fn merge_legs(sequence: &[SequencePoint], computed: &[CachedLeg]) -> Vec<MergedL
             Some(open) => {
                 // `start` is the pass-through waypoint this sub-leg continues from: it
                 // sits at the end of the geometry accumulated so far.
-                let offset = open.geometry.len().saturating_sub(1);
+                let offset = open.path.len().saturating_sub(1);
                 open.pass_through.push((start, offset));
                 open.distance_m = state::clamp_cost(open.distance_m.saturating_add(leg.distance_m) as f64);
                 open.duration_s = state::clamp_cost(open.duration_s.saturating_add(leg.duration_s) as f64);
-                open.geometry.extend(leg.geometry.iter().skip(1).copied());
+                open.path.extend(leg.path.iter().skip(1).cloned());
                 open.end = end;
             }
         }
@@ -733,6 +904,13 @@ fn merge_legs(sequence: &[SequencePoint], computed: &[CachedLeg]) -> Vec<MergedL
         }
     }
     legs.extend(current);
+    // The runs of a leg are cut from the WHOLE of its geometry, so they are computed once
+    // the sub-legs of a pass-through waypoint have been merged into it: a waypoint passed
+    // through without stopping does not end a manoeuvre, and the runs of the merged leg
+    // carry its merged distance and duration.
+    for leg in &mut legs {
+        leg.runs = state::leg_runs(&leg.path, leg.distance_m, leg.duration_s);
+    }
     legs
 }
 
@@ -772,6 +950,453 @@ fn pedestrian_place(point: &SequencePoint) -> RoutePedestrianPlace {
         waypoint_index: point.waypoint_index.and_then(|index| i32::try_from(index).ok()),
         ..Default::default()
     }
+}
+
+/// The language a step's instruction and localized road names are rendered in, and whether
+/// the request asked for one this emulator has no text in.
+///
+/// A requested tag counts as answered when its primary subtag is the language the text is
+/// held in, so `en-GB` is answered in English and reported as asked; anything else falls
+/// back to the regional default, which the caller is told about through the model's
+/// `MainLanguageNotFound` notice rather than by silently reading as a translation.
+fn instruction_language(requested: &[String]) -> (String, bool) {
+    if requested.is_empty() {
+        return (INSTRUCTION_LANGUAGE.to_string(), false);
+    }
+    match requested
+        .iter()
+        .find(|tag| primary_subtag(tag).eq_ignore_ascii_case(INSTRUCTION_LANGUAGE))
+    {
+        Some(tag) => (tag.clone(), false),
+        None => (INSTRUCTION_LANGUAGE.to_string(), true),
+    }
+}
+
+/// The primary language subtag of a BCP 47 tag: everything before the first subtag
+/// separator, so `en-US` and `en` name the same language.
+fn primary_subtag(tag: &str) -> &str {
+    tag.split(['-', '_']).next().unwrap_or(tag)
+}
+
+/// The manoeuvre a travel step performs, as the model's travel-step-type enums name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepKind {
+    Depart,
+    Continue,
+    ContinueHighway,
+    EnterHighway,
+    Exit,
+    Keep,
+    Turn,
+    UTurn,
+    Arrive,
+}
+
+impl StepKind {
+    /// This manoeuvre as the model's enum value. `RouteVehicleTravelStepType` declares
+    /// every one of them; `RoutePedestrianTravelStepType` declares only `Arrive`,
+    /// `Continue`, `Depart`, `Keep` and `Turn`, which is exactly what [`StepKind::classify`]
+    /// yields for a pedestrian leg.
+    fn as_model(self) -> &'static str {
+        match self {
+            Self::Depart => "Depart",
+            Self::Continue => "Continue",
+            Self::ContinueHighway => "ContinueHighway",
+            Self::EnterHighway => "EnterHighway",
+            Self::Exit => "Exit",
+            Self::Keep => "Keep",
+            Self::Turn => "Turn",
+            Self::UTurn => "UTurn",
+            Self::Arrive => "Arrive",
+        }
+    }
+
+    /// The manoeuvre at a junction: the angle the leg turns through there, the road it
+    /// leaves and the road it joins.
+    ///
+    /// The road CLASS decides it first — joining, leaving or staying on a controlled-access
+    /// highway is that manoeuvre whatever the angle — and otherwise the angle does: inside
+    /// the straight band the leg continues, a shallow angle keeps to one side of a fork, a
+    /// reversal is a U-turn and anything between is a turn. A pedestrian never travels a
+    /// motorway of this network, and its step-type enum declares neither the highway
+    /// manoeuvres nor a U-turn, so a pedestrian reversal is a turn.
+    fn classify(
+        leg_type: LegType,
+        angle_deg: f64,
+        from: Option<&TravelledRoad>,
+        onto: Option<&TravelledRoad>,
+    ) -> Self {
+        let highway = |road: Option<&TravelledRoad>| road.is_some_and(|road| road.class == RoadClass::Motorway);
+        if leg_type == LegType::Vehicle {
+            match (highway(from), highway(onto)) {
+                (false, true) => return Self::EnterHighway,
+                (true, false) => return Self::Exit,
+                (true, true) => return Self::ContinueHighway,
+                (false, false) => {}
+            }
+        }
+        let angle = angle_deg.abs();
+        if angle <= STRAIGHT_ANGLE_DEG {
+            Self::Continue
+        } else if angle <= KEEP_ANGLE_DEG {
+            Self::Keep
+        } else if angle >= UTURN_ANGLE_DEG && leg_type == LegType::Vehicle {
+            Self::UTurn
+        } else {
+            Self::Turn
+        }
+    }
+}
+
+/// One manoeuvre of a leg, before it is rendered into the step shape of its leg type.
+#[derive(Debug, Clone)]
+struct Manoeuvre {
+    kind: StepKind,
+    /// Distance travelled from this manoeuvre to the next, in metres.
+    distance_m: i64,
+    /// Duration of that travel, in seconds.
+    duration_s: i64,
+    /// Offset into the leg's geometry of the vertex the manoeuvre is performed at.
+    geometry_offset: usize,
+    /// Signed angle the manoeuvre turns through, in degrees; `None` where the model
+    /// determines none — a departure and an arrival turn through nothing.
+    turn_angle_deg: Option<f64>,
+    /// Names of the roads that meet in the junction the manoeuvre is performed in; empty
+    /// where the model has no junction there.
+    intersection: Vec<String>,
+    /// The road travelled after the manoeuvre, which is the road it joins.
+    current_road: Option<TravelledRoad>,
+    /// The road the NEXT manoeuvre joins.
+    next_road: Option<TravelledRoad>,
+    /// The junction the manoeuvre is performed in, when the two roads cross.
+    junction: Option<Junction>,
+}
+
+/// The manoeuvres of a leg: one per run of road it travels, then its arrival.
+///
+/// A run is a stretch of ONE road, so a run boundary is a junction of two and the manoeuvre
+/// performed there is classified from the angle between them. The first run departs and the
+/// last entry arrives at the leg's end, travelling nothing further.
+fn manoeuvres(leg: &MergedLeg, leg_type: LegType) -> Vec<Manoeuvre> {
+    let mut out = Vec::with_capacity(leg.runs.len() + 1);
+    for (ordinal, run) in leg.runs.iter().enumerate() {
+        let previous = ordinal.checked_sub(1).and_then(|index| leg.runs.get(index));
+        let from = previous.and_then(|previous| previous.road.as_ref());
+        let kind = match (ordinal, run.turn_angle_deg) {
+            (0, _) => StepKind::Depart,
+            (_, Some(angle)) => StepKind::classify(leg_type, angle, from, run.road.as_ref()),
+            // Neither run gives a direction for this boundary, so the model determines no
+            // angle there and the leg travels on rather than manoeuvring.
+            (_, None) => StepKind::Continue,
+        };
+        out.push(Manoeuvre {
+            kind,
+            distance_m: run.distance_m,
+            duration_s: run.duration_s,
+            geometry_offset: run.geometry_offset,
+            turn_angle_deg: run.turn_angle_deg,
+            // The junction is where the road the leg leaves and the road it joins cross,
+            // so the intersection is named by those two roads.
+            intersection: run
+                .junction
+                .map(|_| {
+                    [from, run.road.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .map(|road| road.label.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            current_road: run.road.clone(),
+            next_road: leg.runs.get(ordinal + 1).and_then(|next| next.road.clone()),
+            junction: run.junction,
+        });
+    }
+    out.push(Manoeuvre {
+        kind: StepKind::Arrive,
+        distance_m: 0,
+        duration_s: 0,
+        geometry_offset: leg.path.len().saturating_sub(1),
+        turn_angle_deg: None,
+        intersection: Vec::new(),
+        current_road: leg.runs.last().and_then(|run| run.road.clone()),
+        next_road: None,
+        junction: None,
+    });
+    out
+}
+
+/// One `RouteVehicleTravelStep`: the manoeuvre, its own details and the roads it joins.
+fn vehicle_step(manoeuvre: &Manoeuvre, rendering: StepRendering<'_>) -> RouteVehicleTravelStep {
+    let details = turn_details(manoeuvre, rendering.language);
+    let kind = manoeuvre.kind;
+    RouteVehicleTravelStep {
+        continue_highway_step_details: (kind == StepKind::ContinueHighway).then(|| {
+            RouteContinueHighwayStepDetails {
+                intersection: details.intersection.clone(),
+                steering_direction: details.steering_direction.clone(),
+                turn_angle: details.turn_angle,
+                turn_intensity: details.turn_intensity.clone(),
+            }
+        }),
+        continue_step_details: (kind == StepKind::Continue).then(|| RouteContinueStepDetails {
+            intersection: details.intersection.clone(),
+        }),
+        current_road: manoeuvre
+            .current_road
+            .as_ref()
+            .map(|road| route_road(road, rendering.language)),
+        distance: manoeuvre.distance_m,
+        duration: manoeuvre.duration_s,
+        enter_highway_step_details: (kind == StepKind::EnterHighway).then(|| RouteEnterHighwayStepDetails {
+            intersection: details.intersection.clone(),
+            steering_direction: details.steering_direction.clone(),
+            turn_angle: details.turn_angle,
+            turn_intensity: details.turn_intensity.clone(),
+        }),
+        // This network numbers no road exit, so there is no exit number to report.
+        exit_number: None,
+        exit_step_details: (kind == StepKind::Exit).then(|| RouteExitStepDetails {
+            intersection: details.intersection.clone(),
+            // `RelativeExit` is which of several exits to take, which a junction of two
+            // runs does not have.
+            relative_exit: None,
+            steering_direction: details.steering_direction.clone(),
+            turn_angle: details.turn_angle,
+            turn_intensity: details.turn_intensity.clone(),
+        }),
+        geometry_offset: i32::try_from(manoeuvre.geometry_offset).ok(),
+        instruction: (rendering.detail == StepDetail::Default).then(|| instruction(manoeuvre, rendering)),
+        keep_step_details: (kind == StepKind::Keep).then(|| RouteKeepStepDetails {
+            intersection: details.intersection.clone(),
+            steering_direction: details.steering_direction.clone(),
+            turn_angle: details.turn_angle,
+            turn_intensity: details.turn_intensity.clone(),
+        }),
+        next_road: manoeuvre
+            .next_road
+            .as_ref()
+            .map(|road| route_road(road, rendering.language)),
+        // The network holds no ramp and no roundabout, so no step of a route over it is
+        // one: an empty detail structure in their place would be a manoeuvre invented.
+        ramp_step_details: None,
+        roundabout_enter_step_details: None,
+        roundabout_exit_step_details: None,
+        roundabout_pass_step_details: None,
+        signpost: (rendering.detail == StepDetail::TurnByTurn)
+            .then(|| signpost(manoeuvre, rendering.language))
+            .flatten(),
+        turn_step_details: (kind == StepKind::Turn).then(|| RouteTurnStepDetails {
+            intersection: details.intersection.clone(),
+            steering_direction: details.steering_direction.clone(),
+            turn_angle: details.turn_angle,
+            turn_intensity: details.turn_intensity.clone(),
+        }),
+        r#type: kind.as_model().to_string(),
+        u_turn_step_details: (kind == StepKind::UTurn).then(|| RouteUTurnStepDetails {
+            intersection: details.intersection.clone(),
+            steering_direction: details.steering_direction.clone(),
+            turn_angle: details.turn_angle,
+            turn_intensity: details.turn_intensity.clone(),
+        }),
+    }
+}
+
+/// One `RoutePedestrianTravelStep`. A pedestrian leg travels no motorway of this network,
+/// so none of the highway manoeuvres its step-type enum leaves out can arise on one.
+fn pedestrian_step(manoeuvre: &Manoeuvre, rendering: StepRendering<'_>) -> RoutePedestrianTravelStep {
+    let details = turn_details(manoeuvre, rendering.language);
+    let kind = manoeuvre.kind;
+    RoutePedestrianTravelStep {
+        continue_step_details: (kind == StepKind::Continue).then(|| RouteContinueStepDetails {
+            intersection: details.intersection.clone(),
+        }),
+        current_road: manoeuvre
+            .current_road
+            .as_ref()
+            .map(|road| route_road(road, rendering.language)),
+        distance: manoeuvre.distance_m,
+        duration: manoeuvre.duration_s,
+        exit_number: None,
+        geometry_offset: i32::try_from(manoeuvre.geometry_offset).ok(),
+        instruction: (rendering.detail == StepDetail::Default).then(|| instruction(manoeuvre, rendering)),
+        keep_step_details: (kind == StepKind::Keep).then(|| RouteKeepStepDetails {
+            intersection: details.intersection.clone(),
+            steering_direction: details.steering_direction.clone(),
+            turn_angle: details.turn_angle,
+            turn_intensity: details.turn_intensity.clone(),
+        }),
+        next_road: manoeuvre
+            .next_road
+            .as_ref()
+            .map(|road| route_road(road, rendering.language)),
+        roundabout_enter_step_details: None,
+        roundabout_exit_step_details: None,
+        roundabout_pass_step_details: None,
+        signpost: (rendering.detail == StepDetail::TurnByTurn)
+            .then(|| signpost(manoeuvre, rendering.language))
+            .flatten(),
+        turn_step_details: (kind == StepKind::Turn).then(|| RouteTurnStepDetails {
+            intersection: details.intersection.clone(),
+            steering_direction: details.steering_direction.clone(),
+            turn_angle: details.turn_angle,
+            turn_intensity: details.turn_intensity.clone(),
+        }),
+        r#type: kind.as_model().to_string(),
+    }
+}
+
+/// The members every manoeuvre detail structure of the model carries: where the manoeuvre
+/// is performed, which way it steers and how far through it turns.
+#[derive(Debug, Clone)]
+struct TurnDetails {
+    intersection: Vec<LocalizedString>,
+    steering_direction: Option<String>,
+    turn_angle: f64,
+    turn_intensity: Option<String>,
+}
+
+/// The manoeuvre details of a step, read off the angle the junction determined.
+fn turn_details(manoeuvre: &Manoeuvre, language: &str) -> TurnDetails {
+    let angle = manoeuvre.turn_angle_deg.unwrap_or_default();
+    TurnDetails {
+        intersection: manoeuvre
+            .intersection
+            .iter()
+            .map(|name| localized(name, language))
+            .collect(),
+        steering_direction: Some(steering_direction(angle).to_string()),
+        turn_angle: angle,
+        turn_intensity: Some(turn_intensity(angle).to_string()),
+    }
+}
+
+/// `RouteSteeringDirection` of a manoeuvre turning `angle_deg`: a turn to the right is a
+/// positive angle (clockwise from the bearing travelled in), one to the left negative, and
+/// an angle inside the straight band steers straight on.
+fn steering_direction(angle_deg: f64) -> &'static str {
+    if angle_deg.abs() <= STRAIGHT_ANGLE_DEG {
+        "Straight"
+    } else if angle_deg > 0.0 {
+        "Right"
+    } else {
+        "Left"
+    }
+}
+
+/// `RouteTurnIntensity` of a manoeuvre turning `angle_deg`.
+fn turn_intensity(angle_deg: f64) -> &'static str {
+    let angle = angle_deg.abs();
+    if angle < SLIGHT_TURN_ANGLE_DEG {
+        "Slight"
+    } else if angle >= SHARP_TURN_ANGLE_DEG {
+        "Sharp"
+    } else {
+        "Typical"
+    }
+}
+
+/// A `RouteRoad` for a road the leg travels: its name and the road type its class is.
+///
+/// `RouteNumber` and `Towards` are the empty required lists: this network numbers no road
+/// and names no destination reachable along one, so there is nothing to put in them.
+fn route_road(road: &TravelledRoad, language: &str) -> RouteRoad {
+    RouteRoad {
+        road_name: vec![localized(&road.label, language)],
+        route_number: Vec::new(),
+        towards: Vec::new(),
+        r#type: Some(road_type(road.class).to_string()),
+    }
+}
+
+/// `RouteRoadType` of a road class: a motorway is a `Highway`, and a street or footpath of
+/// the grid is `Urban` — at its ~55 m spacing the network is a city grid, and nothing in it
+/// is `Rural`.
+fn road_type(class: RoadClass) -> &'static str {
+    match class {
+        RoadClass::Motorway => "Highway",
+        RoadClass::Street | RoadClass::Footpath => "Urban",
+    }
+}
+
+/// The sign at the junction a step is performed in. The network holds no sign text, but a
+/// junction of two named roads is signed by the road it leads onto, so the label carries
+/// that road's name. `None` where the model has no junction for the step — a departure, an
+/// arrival, or a boundary whose two runs do not cross — since then there is no sign.
+fn signpost(manoeuvre: &Manoeuvre, language: &str) -> Option<RouteSignpost> {
+    let road = manoeuvre.junction.and(manoeuvre.current_road.as_ref())?;
+    Some(RouteSignpost {
+        labels: vec![RouteSignpostLabel {
+            // The network numbers no road, so the label carries its name only.
+            route_number: None,
+            text: Some(localized(&road.label, language)),
+        }],
+    })
+}
+
+/// A `LocalizedString` in the language the step text is rendered in.
+fn localized(value: &str, language: &str) -> LocalizedString {
+    LocalizedString {
+        language: Some(language.to_string()),
+        value: value.to_string(),
+    }
+}
+
+/// The instruction text of a step: the manoeuvre performed, the road it joins and how far
+/// it then runs.
+///
+/// The network carries the text of no instruction, so the sentence is BUILT from the
+/// manoeuvre the junction determined, the road name the network holds and the step's own
+/// distance in the requested measurement system. Nothing in it is read from the request.
+fn instruction(manoeuvre: &Manoeuvre, rendering: StepRendering<'_>) -> String {
+    let road = manoeuvre
+        .current_road
+        .as_ref()
+        .map_or_else(|| "the road ahead".to_string(), |road| road.label.clone());
+    let distance = distance_text(manoeuvre.distance_m, rendering.measurement);
+    let steering = steering_direction(manoeuvre.turn_angle_deg.unwrap_or_default()).to_lowercase();
+    match manoeuvre.kind {
+        StepKind::Depart => format!("Depart on {road} and continue for {distance}."),
+        StepKind::Continue => format!("Continue on {road} for {distance}."),
+        StepKind::ContinueHighway => format!("Continue on the highway {road} for {distance}."),
+        StepKind::EnterHighway => format!("Enter the highway {road} and continue for {distance}."),
+        StepKind::Exit => format!("Exit the highway onto {road} and continue for {distance}."),
+        StepKind::Keep => format!("Keep {steering} onto {road} and continue for {distance}."),
+        StepKind::Turn => format!("Turn {steering} onto {road} and continue for {distance}."),
+        StepKind::UTurn => format!("Make a U-turn onto {road} and continue for {distance}."),
+        StepKind::Arrive => "Arrive at your destination.".to_string(),
+    }
+}
+
+/// `distance_m` as an instruction states it: metres below a kilometre and kilometres above
+/// it for `Metric`, feet below a mile and miles above it for `Imperial`. The conversions
+/// are the exact definitions of the units — a foot is 0.3048 m and a mile 1,609.344 m.
+fn distance_text(distance_m: i64, measurement: Measurement) -> String {
+    let metres = distance_m.max(0) as f64;
+    match measurement {
+        Measurement::Metric if metres < METRES_PER_KILOMETRE => format!("{} m", distance_m.max(0)),
+        Measurement::Metric => format!("{:.1} km", metres / METRES_PER_KILOMETRE),
+        Measurement::Imperial if metres < METRES_PER_MILE => format!("{:.0} ft", metres / METRES_PER_FOOT),
+        Measurement::Imperial => format!("{:.1} mi", metres / METRES_PER_MILE),
+    }
+}
+
+/// A duration as an instruction states it: seconds below a minute and whole minutes above.
+fn duration_text(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < SECONDS_PER_MINUTE {
+        format!("{seconds} s")
+    } else {
+        format!("{} min", seconds / SECONDS_PER_MINUTE)
+    }
+}
+
+/// How long the route stops at the end of a leg, when it stops there at all: the
+/// `StopDuration` of the waypoint the leg ends at. A leg that ends at a waypoint with no
+/// stop duration — the route's destination included — has nothing to perform after
+/// travelling, so it carries no after-travel step.
+fn after_travel_stop(leg: &MergedLeg) -> Option<i64> {
+    (leg.end.stop_duration_s > 0).then_some(leg.end.stop_duration_s)
 }
 
 /// The pass-through waypoints of a leg, each with its offset into the leg's geometry.
