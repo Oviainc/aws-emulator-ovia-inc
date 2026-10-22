@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTranscriptionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTranscriptionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTranscriptionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one stored transcription job, answering the modelled empty 204 body.
+//! A job name no record exists under is a `BadRequestException`, the error this
+//! operation models for "the entity you're trying to delete doesn't exist"; after a
+//! successful delete `GetTranscriptionJob` answers `NotFoundException` and the job is
+//! gone from `ListTranscriptionJobs`.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +163,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTranscriptionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTranscriptionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTranscriptionJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteTranscriptionJobErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        if store
+            .transcription_jobs
+            .remove(&input.transcription_job_name)
+            .is_none()
+        {
+            return Err(DeleteTranscriptionJobErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "The requested job {} couldn't be found. Check the job name and \
+                         try your request again.",
+                        input.transcription_job_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        ::tracing::info!(
+            operation = "DeleteTranscriptionJob",
+            job = %input.transcription_job_name,
+            "transcription job deleted"
+        );
+        Ok(DeleteTranscriptionJobOutput)
     }
 }
