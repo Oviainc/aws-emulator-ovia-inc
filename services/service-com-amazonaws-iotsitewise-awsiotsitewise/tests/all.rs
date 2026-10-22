@@ -58,3 +58,5 @@ mod support;
 mod time_series;
 #[path = "all/update_asset.rs"]
 mod update_asset;
+#[path = "all/update_asset_model.rs"]
+mod update_asset_model;

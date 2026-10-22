@@ -205,12 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removed, the way HTTP preconditions are: a precondition that fails
         // leaves the resource exactly as it was.
         //
-        // `Match-For-Version-Type` names which version the headers talk about.
-        // This store keeps one version of a model, which is its LATEST and — once
-        // the owed CREATING -> ACTIVE transition has fallen due — also its ACTIVE
-        // one; a model still CREATING has a LATEST version and no ACTIVE version.
-        // So the ETag the headers target is the stored model's, except that
-        // `ACTIVE` targets nothing while no active version exists.
+        // `Match-For-Version-Type` names which version the headers talk about;
+        // [`crate::state::asset_model_target_etag`] is where this service decides
+        // which ETag that is, shared with the other asset-model writes that carry
+        // these headers.
         let record = store.asset_models.get(&id).ok_or_else(|| {
             DeleteAssetModelError::Modeled(DeleteAssetModelErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -222,14 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
         let arn = record.arn.clone();
-        let version_type = input.match_for_version_type.as_deref().unwrap_or(LATEST_VERSION);
-        let target_e_tag = match version_type {
-            ACTIVE_VERSION => (record.state(now) == crate::state::STATE_ACTIVE)
-                .then(|| crate::state::asset_model_etag(record)),
-            // LATEST, and anything the enum admits but this store does not
-            // distinguish: the stored version is the latest one.
-            _ => Some(crate::state::asset_model_etag(record)),
-        };
+        let target_e_tag = crate::state::asset_model_target_etag(
+            record,
+            input.match_for_version_type.as_deref(),
+            now,
+        );
 
         // `If-Match`: delete only if the targeted version's ETag is the one the
         // caller last read. A caller that read a different version — or that
@@ -249,7 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `*` is the ONLY value the member's modelled pattern `^\*$` admits and
         // the boundary validator refuses anything else before this handler runs,
         // so the match is exact rather than a stand-in for "any value".
-        if input.if_none_match.as_deref() == Some(SELECT_ALL) && target_e_tag.is_some() {
+        if input.if_none_match.as_deref() == Some(crate::state::SELECT_ALL)
+            && target_e_tag.is_some()
+        {
             return Err(precondition_failed(
                 "Precondition failed for provided If-None-Match value.",
                 &id,
@@ -308,15 +305,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The `AssetModelVersionType` value naming a model's latest version.
-const LATEST_VERSION: &str = "LATEST";
-
-/// The `AssetModelVersionType` value naming a model's active version.
-const ACTIVE_VERSION: &str = "ACTIVE";
-
-/// The one value the `SelectAll` member `ifNoneMatch` admits (pattern `^\*$`).
-const SELECT_ALL: &str = "*";
 
 /// HTTP 412 `PreconditionFailedException` for a conditional header that evaluated
 /// to FALSE, naming the resource the precondition was evaluated on.

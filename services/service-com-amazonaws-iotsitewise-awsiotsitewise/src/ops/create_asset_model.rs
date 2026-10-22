@@ -245,6 +245,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The published per-model quotas the input members state: "You can specify
+        // up to 200 properties per asset model" / "up to 10 hierarchies per asset
+        // model". The same bounds `UpdateAssetModel` holds the new definition to,
+        // so a model cannot be created outside what an update of it would accept.
+        if input.asset_model_properties.as_deref().unwrap_or(&[]).len()
+            > crate::state::MAX_PROPERTIES_PER_ASSET_MODEL
+        {
+            return Err(CreateAssetModelError::Modeled(
+                CreateAssetModelErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "An asset model carries at most {} properties.",
+                        crate::state::MAX_PROPERTIES_PER_ASSET_MODEL
+                    ),
+                }),
+            ));
+        }
+        if input.asset_model_hierarchies.as_deref().unwrap_or(&[]).len()
+            > crate::state::MAX_HIERARCHIES_PER_ASSET_MODEL
+        {
+            return Err(CreateAssetModelError::Modeled(
+                CreateAssetModelErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "An asset model carries at most {} hierarchies.",
+                        crate::state::MAX_HIERARCHIES_PER_ASSET_MODEL
+                    ),
+                }),
+            ));
+        }
+
         // A caller-supplied id must be globally unique; an absent one is minted.
         let asset_model_id = match input.asset_model_id.clone() {
             Some(id) => {

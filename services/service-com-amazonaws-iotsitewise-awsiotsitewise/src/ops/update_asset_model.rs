@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAssetModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAssetModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAssetModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation REPLACES an asset model's definition in the shared
+//! engine store (`crate::state`) and propagates it to every asset created from that
+//! model; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -218,18 +212,493 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAssetModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAssetModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAssetModelError::Modeled(UpdateAssetModelErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> answer mapping, so a retry with the same token updates the model a
+        // second time rather than replaying the first answer. Left to the idempotency
+        // issue, exactly as `CreateAssetModel` and `UpdateAsset` leave it; nothing is
+        // fabricated for it.
+        let mut store = state.lock();
+
+        // The label is either the raw UUID or the `externalId:<externalId>` alias form.
+        let id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+
+        // The conditional request headers are evaluated FIRST, the way HTTP
+        // preconditions are: a precondition that fails changes nothing at all, so
+        // it is decided before any other refusal and before any write.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAssetModel"))
+        // The wording of both refusals is the one IoT SiteWise answers a failed
+        // asset-model precondition with — "Provided If-Match value does not match
+        // the current latest version ETag." — parameterised by the version the
+        // headers targeted; nothing of the request's own values goes into it.
+        let version_type = input
+            .match_for_version_type
+            .as_deref()
+            .unwrap_or(crate::state::VERSION_TYPE_LATEST)
+            .to_lowercase();
+        let target_e_tag = {
+            let record = store
+                .asset_models
+                .get(&id)
+                .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+            crate::state::asset_model_target_etag(
+                record,
+                input.match_for_version_type.as_deref(),
+                now,
+            )
+        };
+        // `If-Match`: update only if the targeted version's ETag is the one the
+        // caller last read. A caller that read a different version — or that
+        // targets a version which does not exist — is refused 412.
+        if let Some(expected) = input.if_match.as_deref() {
+            if target_e_tag.as_deref() != Some(expected) {
+                return Err(precondition_failed(
+                    &region,
+                    &id,
+                    format!(
+                        "Provided If-Match value does not match the current {version_type} \
+                         version ETag."
+                    ),
+                ));
+            }
+        }
+        // `ifNoneMatch` is modelled as `SelectAll` with the pattern `^\*$`, so `*`
+        // is the only value that reaches here; it asks that the targeted version
+        // NOT exist.
+        if input.if_none_match.as_deref() == Some(crate::state::SELECT_ALL)
+            && target_e_tag.is_some()
+        {
+            return Err(precondition_failed(
+                &region,
+                &id,
+                format!(
+                    "Provided If-None-Match value does not match the current {version_type} \
+                     version ETag."
+                ),
+            ));
+        }
+
+        // `assetModelExternalId` ASSIGNS an external id to a model that has none:
+        // the member documents that "The asset model must not already have an
+        // external ID" and that the id "must be unique within your Amazon Web
+        // Services account". Both checks run before anything is written.
+        let external_id = input.asset_model_external_id.as_deref();
+        if let Some(requested) = external_id {
+            if let Some(owner) = store.asset_model_external_ids.get(requested) {
+                // Re-assigning the id this model already carries asks for the state
+                // it is already in, so it is a no-op rather than a collision.
+                if owner != &id {
+                    let owner = owner.clone();
+                    return Err(already_exists(&region, &owner, "externalId"));
+                }
+            } else if let Some(current) = store
+                .asset_models
+                .get(&id)
+                .and_then(|record| record.external_id.clone())
+            {
+                return Err(invalid_request(format!(
+                    "The asset model {id} already has the external ID {current}, so the external \
+                     ID {requested} cannot be assigned to it."
+                )));
+            }
+        }
+
+        // The request carries the model's NEW definition in full: "The updated
+        // property definitions" / "The updated hierarchy definitions". An omitted
+        // list therefore leaves the model carrying none of that kind — removing a
+        // property is exactly what the operation's own documentation asks a caller
+        // to do by submitting the request "with the entire existing property
+        // removed" — rather than patching the stored list.
+        let requested_properties = input.asset_model_properties.as_deref().unwrap_or(&[]);
+        let requested_hierarchies = input.asset_model_hierarchies.as_deref().unwrap_or(&[]);
+        let requested_composite_models =
+            input.asset_model_composite_models.as_deref().unwrap_or(&[]);
+
+        // The published per-model quotas the input members state.
+        if requested_properties.len() > crate::state::MAX_PROPERTIES_PER_ASSET_MODEL {
+            return Err(limit_exceeded(format!(
+                "An asset model carries at most {} properties.",
+                crate::state::MAX_PROPERTIES_PER_ASSET_MODEL
+            )));
+        }
+        if requested_hierarchies.len() > crate::state::MAX_HIERARCHIES_PER_ASSET_MODEL {
+            return Err(limit_exceeded(format!(
+                "An asset model carries at most {} hierarchies.",
+                crate::state::MAX_HIERARCHIES_PER_ASSET_MODEL
+            )));
+        }
+        if requested_composite_models.len() > crate::state::MAX_COMPOSITE_MODELS_PER_ASSET_MODEL {
+            return Err(limit_exceeded(format!(
+                "This emulator holds at most {} composite models per asset model.",
+                crate::state::MAX_COMPOSITE_MODELS_PER_ASSET_MODEL
+            )));
+        }
+
+        // Everything the new definition needs is resolved and refused against the
+        // STORED definition before a single field is written, so a refused update
+        // leaves the model exactly as it was.
+        let record = store
+            .asset_models
+            .get(&id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+        let properties = resolve_properties(&record.properties, requested_properties)?;
+
+        let mut hierarchies = Vec::with_capacity(requested_hierarchies.len());
+        for requested in requested_hierarchies {
+            // Each hierarchy names the asset model whose assets may be children of
+            // this one's; that model has to exist, as it does on the create.
+            let child = store
+                .resolve_asset_model_id(&requested.child_asset_model_id)
+                .ok_or_else(|| model_not_found(&requested.child_asset_model_id))?;
+            // A hierarchy the model already holds keeps its id, so the child
+            // associations recorded under it survive an update that keeps it.
+            let held = record.hierarchies.iter().find(|held| {
+                same_member(
+                    held.id.as_deref(),
+                    held.external_id.as_deref(),
+                    requested.id.as_deref(),
+                    requested.external_id.as_deref(),
+                )
+            });
+            hierarchies.push(AssetModelHierarchy {
+                id: Some(
+                    held.and_then(|held| held.id.clone())
+                        .or_else(|| non_empty(requested.id.as_deref()))
+                        .unwrap_or_else(crate::state::new_id),
+                ),
+                external_id: requested.external_id.clone(),
+                name: requested.name.clone(),
+                child_asset_model_id: child,
+            });
+        }
+
+        let mut composite_models: Vec<AssetModelCompositeModel> =
+            Vec::with_capacity(requested_composite_models.len());
+        for requested in requested_composite_models {
+            let held = record.composite_models.iter().find(|held| {
+                same_member(
+                    held.id.as_deref(),
+                    held.external_id.as_deref(),
+                    requested.id.as_deref(),
+                    requested.external_id.as_deref(),
+                )
+            });
+            // A composite model's nested properties follow the same rules as the
+            // model's own, including the published 200-per-composite-model quota.
+            let properties = match requested.properties.as_deref() {
+                Some(nested) => {
+                    if nested.len() > crate::state::MAX_PROPERTIES_PER_COMPOSITE_MODEL {
+                        return Err(limit_exceeded(format!(
+                            "A composite model carries at most {} properties.",
+                            crate::state::MAX_PROPERTIES_PER_COMPOSITE_MODEL
+                        )));
+                    }
+                    let stored = held
+                        .and_then(|held| held.properties.as_deref())
+                        .unwrap_or(&[]);
+                    Some(resolve_properties(stored, nested)?)
+                }
+                None => None,
+            };
+            let composite_model_id = match held.and_then(|held| held.id.clone()) {
+                Some(id) => id,
+                None => match non_empty(requested.id.as_deref()) {
+                    // A composite model id is globally unique, so a caller-supplied
+                    // one this model does not hold must be free everywhere.
+                    Some(requested_id) => {
+                        if store.composite_model_id_taken(&requested_id) {
+                            return Err(already_exists(&region, &id, "assetModelCompositeModelId"));
+                        }
+                        requested_id
+                    }
+                    None => loop {
+                        let candidate = crate::state::new_id();
+                        if !store.composite_model_id_taken(&candidate) {
+                            break candidate;
+                        }
+                    },
+                },
+            };
+            // One request cannot describe the same composite model twice: the two
+            // entries would be one stored composite model, so the later one would
+            // silently win.
+            if composite_models
+                .iter()
+                .any(|planned| planned.id.as_deref() == Some(composite_model_id.as_str()))
+            {
+                return Err(invalid_request(format!(
+                    "The request names the composite model {composite_model_id} more than once."
+                )));
+            }
+            composite_models.push(AssetModelCompositeModel {
+                id: Some(composite_model_id),
+                external_id: requested.external_id.clone(),
+                name: requested.name.clone(),
+                description: requested.description.clone(),
+                r#type: requested.r#type.clone(),
+                properties,
+            });
+        }
+
+        // The links a composite model carries beside its own definition — the
+        // composite model it is nested inside and the component model it reuses —
+        // have no member in the `AssetModelCompositeModel` shape this request
+        // carries, so they are kept for every composite model the new definition
+        // still holds and dropped with the ones it does not. A kept composite model
+        // whose PARENT is gone becomes top-level: a link pointing at a composite
+        // model this asset model no longer holds would name nothing.
+        let composite_model_links: ::std::collections::HashMap<
+            String,
+            crate::state::CompositeModelLink,
+        > = record
+            .composite_model_links
+            .iter()
+            .filter(|(composite_id, _)| {
+                composite_models
+                    .iter()
+                    .any(|kept| kept.id.as_deref() == Some(composite_id.as_str()))
+            })
+            .map(|(composite_id, link)| {
+                let parent_id = link.parent_id.clone().filter(|parent| {
+                    composite_models
+                        .iter()
+                        .any(|kept| kept.id.as_deref() == Some(parent.as_str()))
+                });
+                (
+                    composite_id.clone(),
+                    crate::state::CompositeModelLink {
+                        parent_id,
+                        composed_asset_model_id: link.composed_asset_model_id.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        // Nothing can be refused from here on, so the writes land together.
+        let record = store
+            .asset_models
+            .get_mut(&id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+        record.name = input.asset_model_name.clone();
+        record.description = input.asset_model_description.clone();
+        if let Some(requested) = external_id {
+            record.external_id = Some(requested.to_string());
+        }
+        record.properties = properties;
+        record.hierarchies = hierarchies;
+        record.composite_models = composite_models;
+        record.composite_model_links = composite_model_links;
+        // `assetModelType` has no member on this request, so the kind of model this
+        // is cannot change here.
+        //
+        // The model reports UPDATING until the transition this call owes falls due,
+        // and the new definition carries a new version — hence a new ETag.
+        record.begin_update(now);
+        let output = UpdateAssetModelOutput {
+            asset_model_id: Some(record.id.clone()),
+            asset_model_status: record.status(now),
+        };
+
+        // Keep the `externalId:` lookup index in step with the record it resolves to.
+        if let Some(requested) = external_id {
+            store
+                .asset_model_external_ids
+                .insert(requested.to_string(), id.clone());
+        }
+
+        // "Updates an asset model and all of the assets that were created from the
+        // model. Each asset created from the model inherits the updated asset
+        // model's property and hierarchy definitions."
+        store.propagate_asset_model_definitions(&id, now);
+
+        Ok(output)
     }
+}
+
+/// `id`, unless it is absent or empty.
+fn non_empty(id: Option<&str>) -> Option<String> {
+    id.filter(|id| !id.is_empty()).map(ToString::to_string)
+}
+
+/// Whether a request's `(id, externalId)` pair names the stored member whose own
+/// pair is `(held_id, held_external_id)`.
+///
+/// A member of a model's definition — a property, a hierarchy, a composite model —
+/// is addressed by its `id`, or by its `externalId` when the request carries no id
+/// for it; a request that carries neither describes a NEW member, which is why a
+/// pair of absent ids never matches anything.
+fn same_member(
+    held_id: Option<&str>,
+    held_external_id: Option<&str>,
+    id: Option<&str>,
+    external_id: Option<&str>,
+) -> bool {
+    match (non_empty(id), non_empty(external_id)) {
+        (Some(id), _) => held_id == Some(id.as_str()),
+        (None, Some(external_id)) => held_external_id == Some(external_id.as_str()),
+        (None, None) => false,
+    }
+}
+
+/// The property list a request's `AssetModelProperty`s become, resolved against
+/// the `stored` properties they replace.
+///
+/// Each requested property is checked by the same rule every arriving model
+/// property is ([`crate::state::check_property_shape`]). A property the model
+/// already holds keeps its stored id — so its asset-level data and its alias
+/// survive — and may change its name, unit and the inside of its type, but not its
+/// TYPE or its DATA TYPE: "You can’t change the type or data type of an existing
+/// property". A property the request carries no stored id for is new and gets one
+/// minted, unless the request supplied one.
+fn resolve_properties(
+    stored: &[AssetModelProperty],
+    requested: &[AssetModelProperty],
+) -> Result<Vec<AssetModelProperty>, UpdateAssetModelError> {
+    let mut resolved: Vec<AssetModelProperty> = Vec::with_capacity(requested.len());
+    for property in requested {
+        crate::state::check_property_shape(
+            &property.name,
+            &property.data_type,
+            property.data_type_spec.as_deref(),
+            &property.r#type,
+        )
+        .map_err(invalid_request)?;
+        let held = stored.iter().find(|held| {
+            same_member(
+                held.id.as_deref(),
+                held.external_id.as_deref(),
+                property.id.as_deref(),
+                property.external_id.as_deref(),
+            )
+        });
+        let id = match held {
+            Some(held) => {
+                // `dataTypeSpec` is part of a STRUCT property's data type ("the data
+                // type of the structure for this property"), so it cannot move either.
+                if held.data_type != property.data_type
+                    || held.data_type_spec != property.data_type_spec
+                {
+                    return Err(invalid_request(format!(
+                        "The existing property {} cannot change its data type from {} to {}.",
+                        property.name,
+                        describe_data_type(&held.data_type, held.data_type_spec.as_deref()),
+                        describe_data_type(&property.data_type, property.data_type_spec.as_deref()),
+                    )));
+                }
+                let held_kind = crate::state::property_type_kind(&held.r#type);
+                let kind = crate::state::property_type_kind(&property.r#type);
+                if held_kind != kind {
+                    return Err(invalid_request(format!(
+                        "The existing property {} cannot change its property type from {} to {}.",
+                        property.name,
+                        held_kind.unwrap_or("none"),
+                        kind.unwrap_or("none"),
+                    )));
+                }
+                held.id.clone().unwrap_or_else(crate::state::new_id)
+            }
+            None => non_empty(property.id.as_deref()).unwrap_or_else(crate::state::new_id),
+        };
+        resolved.push(AssetModelProperty {
+            id: Some(id),
+            external_id: property.external_id.clone(),
+            name: property.name.clone(),
+            data_type: property.data_type.clone(),
+            data_type_spec: property.data_type_spec.clone(),
+            unit: property.unit.clone(),
+            r#type: property.r#type.clone(),
+            // `path` is server-computed, never caller-supplied; `DescribeAssetModel`
+            // reports what it derives.
+            path: None,
+        });
+    }
+    // One request cannot describe the same stored property twice: both entries
+    // would be that one property, so the later one would silently win.
+    for (at, property) in resolved.iter().enumerate() {
+        if resolved[..at]
+            .iter()
+            .any(|earlier| earlier.id == property.id)
+        {
+            return Err(invalid_request(format!(
+                "The request names the property {} more than once.",
+                property.id.as_deref().unwrap_or_default()
+            )));
+        }
+    }
+    Ok(resolved)
+}
+
+/// A property's data type as a refusal names it: the `PropertyDataType`, plus the
+/// `dataTypeSpec` a STRUCT carries.
+fn describe_data_type(data_type: &str, data_type_spec: Option<&str>) -> String {
+    match data_type_spec {
+        Some(spec) => format!("{data_type} ({spec})"),
+        None => data_type.to_string(),
+    }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the asset-model label that
+/// resolved to nothing, in this service's one not-found wording.
+fn model_not_found(label: &str) -> UpdateAssetModelError {
+    UpdateAssetModelError::Modeled(UpdateAssetModelErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_ASSET_MODEL, label),
+        },
+    ))
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> UpdateAssetModelError {
+    UpdateAssetModelError::Modeled(UpdateAssetModelErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 410 `LimitExceededException` carrying `message`.
+fn limit_exceeded(message: String) -> UpdateAssetModelError {
+    UpdateAssetModelError::Modeled(UpdateAssetModelErrorModeled::LimitExceededException(
+        LimitExceededException { message },
+    ))
+}
+
+/// HTTP 409 `ResourceAlreadyExistsException` for a `dimension` of the request an
+/// existing resource already uses; `asset_model_id` is the model the caller has to
+/// look at.
+fn already_exists(
+    region: &str,
+    asset_model_id: &str,
+    dimension: &str,
+) -> UpdateAssetModelError {
+    UpdateAssetModelError::Modeled(
+        UpdateAssetModelErrorModeled::ResourceAlreadyExistsException(
+            ResourceAlreadyExistsException {
+                message: crate::state::already_using_message("asset model", dimension),
+                resource_id: asset_model_id.to_string(),
+                resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+            },
+        ),
+    )
+}
+
+/// HTTP 412 `PreconditionFailedException` for a conditional header that evaluated
+/// to FALSE, naming the resource the precondition was evaluated on.
+fn precondition_failed(region: &str, id: &str, message: String) -> UpdateAssetModelError {
+    UpdateAssetModelError::Modeled(UpdateAssetModelErrorModeled::PreconditionFailedException(
+        PreconditionFailedException {
+            message,
+            resource_id: id.to_string(),
+            resource_arn: crate::state::asset_model_arn(region, id),
+        },
+    ))
 }
