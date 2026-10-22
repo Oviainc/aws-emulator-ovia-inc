@@ -189,6 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // What the service and this account may use in a `configData` — the ranges the
+        // model documents for its numeric members, the uplink frequencies this account is
+        // authorised to transmit on, and a recording bucket whose location the service can
+        // read — holds of the parameters an update stores exactly as of the ones a create
+        // stores, so an update outside them is refused and the stored config is left as it
+        // was.
+        guard
+            .validate_config_data(&input.config_data)
+            .map_err(UpdateConfigErrorModeled::InvalidParameterException)?;
+
         // An `uplinkEchoConfig` echoes a specific ANTENNA UPLINK config, named by ARN:
         // the update is held to the same reference rule, and answers the same text, as
         // the create, so an echo config cannot be pointed at a config that does not

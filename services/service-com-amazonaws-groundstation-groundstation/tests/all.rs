@@ -15,6 +15,8 @@
 mod lifecycle_writes;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
+#[path = "all/request_validation.rs"]
+mod request_validation;
 #[path = "all/scheduling_loop.rs"]
 mod scheduling_loop;
 #[path = "all/state_roundtrip.rs"]
