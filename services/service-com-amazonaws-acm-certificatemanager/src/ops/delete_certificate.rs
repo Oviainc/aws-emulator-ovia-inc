@@ -204,6 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // Materialise what the clock already owes before deciding whether this
+        // certificate may be deleted, so the refusal is judged on the record's
+        // current state rather than a stale one.
+        store.materialize_due(::std::time::SystemTime::now());
         let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
             return Err(DeleteCertificateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

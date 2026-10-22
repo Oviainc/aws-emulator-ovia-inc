@@ -202,7 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|record| (record.identifier.clone(), record.to_wire()))
             .collect();
 
-        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBInstancesError::invalid_parameter_value)?;
         Ok(DescribeDBInstancesOutput {
             marker: page.next_marker,
             db_instances: Some(page.items),

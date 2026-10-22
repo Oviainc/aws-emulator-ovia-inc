@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::certificate_lifecycle::{
-    call, call_in_region, describe, list_all_arns, request_certificate, router, KEY_ALGORITHMS,
-    REGION,
+    call, call_in_region, describe, hold_pending_validations, list_all_arns, request_certificate,
+    router, router_with_engine, KEY_ALGORITHMS, REGION,
 };
 
 /// The `KeyAlgorithm` values `ListCertificates` reports to a request that names no
@@ -318,7 +318,7 @@ async fn the_stored_validation_method_comes_from_the_request_then_its_options() 
         (None, None, "EMAIL"),
     ];
 
-    let router = router();
+    let (router, engine) = router_with_engine();
     for (index, (method, option, expected)) in cases.iter().enumerate() {
         let case = format!("ValidationMethod={method:?} Options.ValidationMethod={option:?}");
         let domain = format!("m{index}.example.com");
@@ -331,6 +331,9 @@ async fn the_stored_validation_method_comes_from_the_request_then_its_options() 
         }
 
         let arn = request_certificate(&router, &body).await;
+        // The evidence a pending validation publishes is what this case reads, so the
+        // certificate is held in the status the request put it in.
+        hold_pending_validations(&engine);
         let detail = describe(&router, &arn).await;
         let validations = detail["DomainValidationOptions"]
             .as_array()

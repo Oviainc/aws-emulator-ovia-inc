@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBillScenarioUsageModifications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBillScenarioUsageModifications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the usage modifications stored under a bill scenario, in the order they
+//! were created. It reports only stored state, as the model's `@readonly` says; its one
+//! write is materialising an expiry the clock had already made due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBillScenarioUsageModifications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `filters` select on the attribute each `ListUsageFilterName` names (the `HISTORICAL_*`
+//! half reading the modification's `historicalUsage`) with the filter's `matchOption`;
+//! several filters are AND-ed and the values of one filter are OR-ed. `maxResults` is
+//! the page size and `nextToken` is emitted only while items remain. A `billScenarioId`
+//! no live scenario carries is `ResourceNotFoundException` (HTTP 404).
+//!
+//! One limitation worth stating: `LOCATION` (and `HISTORICAL_LOCATION` for an entry
+//! that sent no `historicalUsage.location`) selects on a value this emulator never
+//! has, because a usage type's pricing location comes from the pricing catalog it does
+//! not carry. Such a filter matches nothing rather than being refused, since the real
+//! service does support it.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +116,25 @@ impl From<ListBillScenarioUsageModificationsErrorModeled> for ListBillScenarioUs
     }
 }
 
+/// Whether `modification` satisfies every `ListUsageFilter` the request carries.
+fn selected(
+    modification: &crate::state::UsageModification,
+    filters: Option<&[ListUsageFilter]>,
+) -> bool {
+    filters
+        .unwrap_or_default()
+        .iter()
+        .all(|filter| match modification.filter_value(&filter.name) {
+            Some(candidate) => crate::state::matches_filter(
+                candidate,
+                &filter.values,
+                filter.match_option.as_deref(),
+            ),
+            // The modification carries nothing for this attribute, so nothing matches.
+            None => false,
+        })
+}
+
 /// The `ListBillScenarioUsageModifications` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -144,20 +169,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBillScenarioUsageModifications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBillScenarioUsageModificationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBillScenarioUsageModifications"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListBillScenarioUsageModificationsErrorModeled::DataUnavailableException(
+                    DataUnavailableException {
+                        message: "the bill scenario store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+        // Materialise the expiry the clock has already made due, so a scenario past its
+        // `expiresAt` reads as gone rather than lingering for the life of the process.
+        state.purge_expired(crate::state::now_secs());
+
+        let Some(scenario) = state.bill_scenario(&input.bill_scenario_id) else {
+            return Err(
+                ListBillScenarioUsageModificationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No bill scenario found with identifier {}",
+                            input.bill_scenario_id
+                        ),
+                        resource_id: input.bill_scenario_id.clone(),
+                        resource_type: "BillScenario".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let matching: Vec<BillScenarioUsageModificationItem> = scenario
+            .usage_modifications
+            .iter()
+            .filter(|modification| selected(modification, input.filters.as_deref()))
+            .map(|modification| BillScenarioUsageModificationItem {
+                id: Some(modification.id.clone()),
+                service_code: modification.service_code.clone(),
+                usage_type: modification.usage_type.clone(),
+                operation: modification.operation.clone(),
+                location: modification.location.clone(),
+                availability_zone: modification.availability_zone.clone(),
+                group: modification.group.clone(),
+                usage_account_id: Some(modification.usage_account_id.clone()),
+                quantities: modification.quantities(),
+                historical_usage: modification.historical_usage.clone(),
+            })
+            .collect();
+
+        // A page token is bound to the selection it was measured against, so an offset
+        // from one scenario or filter set is never applied to another's list.
+        let mut scope_parts: Vec<String> =
+            vec![Self::NAME.to_string(), input.bill_scenario_id.clone()];
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            scope_parts.push(filter.name.clone());
+            scope_parts.push(filter.match_option.clone().unwrap_or_default());
+            scope_parts.extend(filter.values.iter().cloned());
+        }
+        let scope = crate::state::request_fingerprint(&scope_parts);
+
+        let (items, next_token) = crate::state::paginate(
+            &matching,
+            input.next_token.as_deref(),
+            input.max_results,
+            &scope,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        Ok(ListBillScenarioUsageModificationsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }
