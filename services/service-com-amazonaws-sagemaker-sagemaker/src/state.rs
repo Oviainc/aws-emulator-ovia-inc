@@ -44,6 +44,15 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// the span is compressed, never zero.
 pub const ENDPOINT_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
 
+/// How long after `CreateMlflowApp` the clock owes the `Creating` -> `Created`
+/// transition of `MlflowAppStatus`.
+///
+/// A caller that describes the app straight after creating it still observes
+/// `Creating`; one that waits observes `Created`. Real SageMaker takes minutes to stand
+/// an MLflow app up; the span is compressed, never zero, and the due instant is stored
+/// rather than slept on.
+pub const MLFLOW_APP_CREATED_AFTER: Duration = Duration::from_millis(300);
+
 /// How long after `CreateApp` the clock owes the `Pending` -> `InService` transition.
 ///
 /// Same contract as [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that describes the app
@@ -66,6 +75,9 @@ pub const MODEL_QUOTA: usize = 1_000;
 pub const ENDPOINT_CONFIG_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const ENDPOINT_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. `CreateMlflowApp` models `ResourceLimitExceeded` for exactly
+/// this refusal.
+pub const MLFLOW_APP_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`]. Counts model packages of both kinds (unversioned packages and
 /// the versions registered into model package groups), which is what `CreateModelPackage`
 /// mints and `DeleteModelPackage` releases.
@@ -98,6 +110,18 @@ pub const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
 /// a caller that wants the rest follows `NextToken`. Matches the ceiling the other
 /// paginated services in this workspace apply.
 pub const MAX_PAGE_SIZE: i32 = 50;
+
+/// `MlflowAppStatus`'s members this emulator moves an MLflow app through (the modelled
+/// enum also carries the update, delete and failure states, which creating one does not
+/// reach). Named once here so no handler compares a bare string literal.
+pub const MLFLOW_APP_CREATING: &str = "Creating";
+/// See [`MLFLOW_APP_CREATING`].
+pub const MLFLOW_APP_CREATED: &str = "Created";
+
+/// `ModelRegistrationMode`'s member `CreateMlflowApp` stores when the request names
+/// none: the operation's model doc states "If not specified, AutomaticModelRegistration
+/// defaults to AutoModelRegistrationDisabled".
+pub const AUTO_MODEL_REGISTRATION_DISABLED: &str = "AutoModelRegistrationDisabled";
 
 /// `EndpointStatus`'s members this emulator moves an endpoint through (the modelled
 /// enum also carries the update, rollback and delete states, which this slice does not
@@ -225,6 +249,56 @@ impl Endpoint {
         if self.status == STATUS_CREATING && now >= self.in_service_at {
             self.status = STATUS_IN_SERVICE.to_string();
             self.last_modified_time = self.in_service_at;
+            return true;
+        }
+        false
+    }
+}
+
+/// An MLflow app created by `CreateMlflowApp`, as `DescribeMlflowApp` replays it.
+///
+/// `created_at` is the instant the clock owes the `Creating` -> `Created` transition;
+/// like an endpoint's, it is stored and materialised by whichever reporting call first
+/// runs at or after it.
+///
+/// Every member mirrors what the create request carried, so a describe replays the
+/// request rather than a value invented on the read path. `model_registration_mode` is
+/// the one member with a DOCUMENTED default, so it is stored resolved; the others stay
+/// `None` when the request named none, because the model documents no default for them.
+///
+/// `created_by` is stored at creation (through [`caller_user_context`], as
+/// `CreateModelPackageGroup` does) rather than rebuilt per read, so every later read
+/// reports the identity that actually created the app.
+#[derive(Debug, Clone)]
+pub struct MlflowApp {
+    pub arn: String,
+    pub name: String,
+    pub artifact_store_uri: String,
+    pub role_arn: String,
+    pub kms_key_id: Option<String>,
+    pub model_registration_mode: String,
+    pub weekly_maintenance_window_start: Option<String>,
+    pub account_default_status: Option<String>,
+    pub default_domain_id_list: Option<Vec<String>>,
+    pub tags: Vec<Tag>,
+    pub status: String,
+    pub created_by: UserContext,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub created_at: SystemTime,
+}
+
+impl MlflowApp {
+    /// Materialise the `Creating` -> `Created` transition the clock already owes, the
+    /// way [`Endpoint::settle_status`] does: it was due at `created_at` whether or not
+    /// anybody described the app, and `LastModifiedTime` moves to the instant it was
+    /// due rather than to "now", so the value is stable across later reads.
+    ///
+    /// Answers whether the transition happened on this call.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == MLFLOW_APP_CREATING && now >= self.created_at {
+            self.status = MLFLOW_APP_CREATED.to_string();
+            self.last_modified_time = self.created_at;
             return true;
         }
         false
@@ -572,6 +646,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Keyed by `MlflowAppArn` — the app's ARN is its identity, since the model
+    /// documents that an MLflow app's NAME is not part of its ARN.
+    pub mlflow_apps: BTreeMap<String, MlflowApp>,
     /// Keyed by `AppImageConfigName`, which AWS documents as unique to the account.
     pub app_image_configs: BTreeMap<String, AppImageConfig>,
     /// Keyed by `CodeRepositoryName`.
@@ -611,6 +688,11 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// Whether another MLflow app fits, i.e. the store is below [`MLFLOW_APP_QUOTA`].
+    pub fn mlflow_apps_below_quota(&self) -> bool {
+        self.mlflow_apps.len() < MLFLOW_APP_QUOTA
     }
 
     /// Whether another AppImageConfig fits, i.e. the store is below
@@ -809,19 +891,23 @@ pub fn lineage_group_arn(region: &str) -> String {
     resource_arn(region, "lineage-group", DEFAULT_LINEAGE_GROUP)
 }
 
-/// Mint the opaque id a lineage entity's ARN carries: 32 lowercase hex digits, the form
-/// SageMaker's `artifact/<id>` ARNs take. The caller never supplies it — a lineage
-/// entity is named by its ARN, so the id is the server's to generate, and it is derived
-/// from nothing in the request.
+/// Mint the opaque id an ARN carries for a resource whose ARN does NOT contain the
+/// resource's name: 32 lowercase hex digits, the form SageMaker's `artifact/<id>` and
+/// `mlflow-app/<id>` ARNs take. The caller never supplies it — such a resource is named
+/// by its ARN, so the id is the server's to generate, and it is derived from nothing in
+/// the request. (`MlflowAppName` is `len 1..256` while `MlflowAppArn` is `len 1..128`,
+/// and the `CreateMlflowApp` model doc says the name "is not part of the ... ARN": an
+/// id-bearing ARN is what keeps a minted ARN inside the modelled length whatever the
+/// name's length.)
 ///
 /// Emulator-grade and deliberately NOT cryptographic: the bits come from SHA-256 over
 /// three sources, which make an id unique within a run but no more unpredictable than
 /// what they carry — a `RandomState` hash of the counter (std's hash-DoS seed, not a
 /// CSPRNG), a monotonic counter, so two ids minted in the same nanosecond on different
 /// threads differ by construction, and the wall clock in nanoseconds, so ids do not
-/// repeat across processes. An artifact id is an identifier inside an authenticated
-/// store, never a secret; nothing here may be relied on as one.
-pub fn mint_lineage_entity_id() -> String {
+/// repeat across processes. Such an id is an identifier inside an authenticated store,
+/// never a secret; nothing here may be relied on as one.
+pub fn mint_opaque_resource_id() -> String {
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
 

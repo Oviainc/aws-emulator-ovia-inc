@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMlflowApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMlflowApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: registers an MLflow app in `crate::state` keyed by the `MlflowAppArn`
+//! it mints from the request's region, in status `Creating`, and refuses a create past
+//! the store's bound with the modelled `ResourceLimitExceeded`. This is the ONLY file
+//! to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMlflowApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The ARN's resource segment is a server-minted id, NOT the app's name: the model doc
+//! for `Name` says the string "is not part of the ... ARN", and `MlflowAppArn` is
+//! `len 1..128` while `MlflowAppName` is `len 1..256`, so a name-bearing ARN could not
+//! satisfy the modelled constraint for every accepted name. The clock owes the app its
+//! `Created` status after [`crate::state::MLFLOW_APP_CREATED_AFTER`], which whichever
+//! reporting call first runs at or after it materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +168,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMlflowApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMlflowAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMlflowApp"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            "mlflow-app",
+            &crate::state::mint_opaque_resource_id(),
+        );
+
+        let now = ::std::time::SystemTime::now();
+        let created_at = now + crate::state::MLFLOW_APP_CREATED_AFTER;
+        // The identity this request signed with, built the way every other creator
+        // attribution in this crate is (`CreateModelPackageGroup`): the IAM identity
+        // only, and never the credential itself.
+        let created_by = crate::state::caller_user_context(ctx);
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller repeating this create cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation
+        // models.
+        if !store.mlflow_apps_below_quota() {
+            return Err(CreateMlflowAppErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for MLflow apps is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::MLFLOW_APP_QUOTA,
+                        store.mlflow_apps.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The minted id is unique within the run by construction, so the key is free;
+        // asserted rather than assumed, the way `CreateArtifact` does for the other
+        // minted-ARN store, so an id-space defect fails a test run loudly instead of
+        // replacing a stored app in silence.
+        debug_assert!(
+            !store.mlflow_apps.contains_key(&arn),
+            "a freshly minted MLflow app ARN must not already be in the store"
+        );
+
+        store.mlflow_apps.insert(
+            arn.clone(),
+            crate::state::MlflowApp {
+                arn: arn.clone(),
+                name: input.name,
+                artifact_store_uri: input.artifact_store_uri,
+                role_arn: input.role_arn,
+                kms_key_id: input.kms_key_id,
+                // The one member the model documents a default for: absent means
+                // `AutoModelRegistrationDisabled`.
+                model_registration_mode: input.model_registration_mode.unwrap_or_else(|| {
+                    crate::state::AUTO_MODEL_REGISTRATION_DISABLED.to_string()
+                }),
+                // The model documents no default for these, so an absent member stays
+                // absent rather than acquiring a value this emulator invented.
+                weekly_maintenance_window_start: input.weekly_maintenance_window_start,
+                account_default_status: input.account_default_status,
+                default_domain_id_list: input.default_domain_id_list,
+                tags: input.tags.unwrap_or_default(),
+                status: crate::state::MLFLOW_APP_CREATING.to_string(),
+                created_by,
+                creation_time: now,
+                last_modified_time: now,
+                created_at,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateMlflowAppOutput { arn: Some(arn) })
     }
 }
