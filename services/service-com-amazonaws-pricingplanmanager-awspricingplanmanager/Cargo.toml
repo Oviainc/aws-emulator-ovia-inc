@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hashes the stored subscription record into its `ETag` concurrency token and the
+# opaque id in a minted subscription ARN.
+sha2 = { workspace = true }
+# Hex-codes those digests and the opaque ListSubscriptions `nextToken`.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

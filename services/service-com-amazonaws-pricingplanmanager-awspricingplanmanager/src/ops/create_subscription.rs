@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a subscription, persists it in [`crate::state`] and answers with the stored
+//! record plus its `ETag`. A repeated `clientToken` returns the subscription the first
+//! call minted, never a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +102,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::ApprovalMode;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -182,18 +178,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSubscription"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSubscriptionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let CreateSubscriptionInput {
+            plan_family,
+            plan_tier,
+            usage_level,
+            resource_arns,
+            approval_mode,
+            client_token,
+        } = input;
+
+        // `approvalMode` targets an enum shape, so the boundary validator has already
+        // refused any value the model does not declare; this arm only guards against a
+        // value that got past it.
+        let approval_mode = match approval_mode.as_deref() {
+            // "When approvalMode is set to IMMEDIATE or is not specified, the
+            // subscription is activated immediately." — CreateSubscription's doc.
+            None => ApprovalMode::Immediate,
+            Some(value) => match ApprovalMode::parse(value) {
+                Some(mode) => mode,
+                None => {
+                    return Err(CreateSubscriptionErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "approvalMode must be one of [{}], got {value}",
+                                APPROVAL_MODE_VALUES.join(", ")
+                            ),
+                            resource_id: None,
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        store.apply_due_changes(now);
+
+        // An `@idempotencyToken` replay answers with the subscription the first call
+        // created, so the same token never yields a second subscription.
+        if let Some(token) = client_token.as_deref() {
+            if let Some(existing) = store
+                .idempotency
+                .get(token)
+                .and_then(|arn| store.subscriptions.get(arn))
+            {
+                return Ok(CreateSubscriptionOutput {
+                    subscription: existing.to_subscription(),
+                    e_tag: existing.etag(),
+                });
+            }
+        }
+
+        // The account holds a bounded number of subscriptions, which is what the
+        // modelled 402 reports: "You have reached the maximum number of subscriptions
+        // allowed for your account."
+        if store.at_capacity() {
+            return Err(CreateSubscriptionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the maximum number of subscriptions allowed for this account \
+                         ({}) has been reached",
+                        crate::state::MAX_SUBSCRIPTIONS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "Free-tier subscriptions are always activated immediately regardless of
+        // approval mode"; a paid tier under MANUAL waits for ApprovePaidSubscription.
+        let status = if crate::state::is_free_plan_tier(&plan_tier)
+            || approval_mode == ApprovalMode::Immediate
+        {
+            crate::state::Status::Active
+        } else {
+            crate::state::Status::PendingApproval
+        };
+
+        let sequence = store.next_subscription_sequence();
+        let arn = crate::state::mint_subscription_arn(
+            &crate::state::request_region(ctx),
+            sequence,
+            now,
+        );
+        let record = crate::state::SubscriptionRecord {
+            arn,
+            plan_family,
+            plan_tier,
+            usage_level,
+            status,
+            status_reason: None,
+            resource_arns,
+            scheduled_change: None,
+            created_at: now,
+            updated_at: now,
+            client_token,
+            revision: 0,
+        };
+
+        let output = CreateSubscriptionOutput {
+            subscription: record.to_subscription(),
+            e_tag: record.etag(),
+        };
+        store.insert_subscription(record);
+        Ok(output)
     }
 }
