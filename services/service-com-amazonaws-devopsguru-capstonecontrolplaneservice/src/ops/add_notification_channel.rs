@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddNotificationChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddNotificationChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddNotificationChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers an SNS topic as a notification channel: mints the channel id and stores
+//! the submitted config against it, refusing a topic that already backs a channel.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +157,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddNotificationChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddNotificationChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddNotificationChannel"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddNotificationChannelError::Modeled(
+                AddNotificationChannelErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru notification channel store is unavailable"
+                            .to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // A channel IS its SNS topic: the topic ARN is what DevOps Guru publishes to
+        // and what identifies the channel, so a config without one names no channel.
+        let topic_arn = match input.config.sns.topic_arn.as_deref() {
+            Some(topic_arn) if !topic_arn.is_empty() => topic_arn.to_string(),
+            _ => {
+                return Err(AddNotificationChannelErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "Config.Sns.TopicArn is required to add a notification channel"
+                            .to_string(),
+                        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: "Config.Sns.TopicArn".to_string(),
+                            message: "must be the ARN of an Amazon SNS topic".to_string(),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let mut guard = state.lock();
+
+        // STORE BOUND. A channel is reclaimed only by `RemoveNotificationChannel`, so
+        // the store carries a maximum entry count; past it the add is refused with the
+        // `ServiceQuotaExceededException` (HTTP 402) the model declares for exactly
+        // this situation. Checked before the insert, so a refusal stores nothing.
+        if guard.notification_channels.len() >= crate::state::MAX_NOTIFICATION_CHANNELS {
+            return Err(
+                AddNotificationChannelErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already has the maximum of {} notification channels",
+                            crate::state::MAX_NOTIFICATION_CHANNELS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One topic backs at most one channel, so a repeat add of the same topic is a
+        // conflict rather than a second channel for the same destination.
+        if let Some(existing) = guard
+            .notification_channels
+            .values()
+            .find(|channel| channel.sns_topic_arn == topic_arn)
+        {
+            return Err(AddNotificationChannelErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a notification channel for Amazon SNS topic {topic_arn} already exists"
+                    ),
+                    resource_id: existing.id.clone(),
+                    resource_type: crate::state::NOTIFICATION_CHANNEL_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `NotificationChannelId` is a lowercase v4 UUID; it is minted here, never
+        // derived from the request, and the record is stored under it before the id is
+        // returned, so the caller's next read finds the channel it was told about.
+        let id = uuid::Uuid::new_v4().to_string();
+        guard.notification_channels.insert(
+            id.clone(),
+            crate::state::NotificationChannelRecord {
+                id: id.clone(),
+                sns_topic_arn: topic_arn,
+                filters: input.config.filters.as_ref().map(|filters| {
+                    crate::state::NotificationFiltersRecord {
+                        severities: filters.severities.clone(),
+                        message_types: filters.message_types.clone(),
+                    }
+                }),
+            },
+        );
+
+        Ok(AddNotificationChannelOutput { id })
     }
 }
