@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEntity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEntity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates an entity in a workspace and persists it in [`crate::state`] under
+//! that workspace, so `GetEntity` / `ListEntities` read back what was created.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEntity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three refusals this handler owns, each a `ValidationException` (the model
+//! declares no `ResourceNotFoundException` for `CreateEntity`):
+//!
+//! * the workspace does not exist;
+//! * `parentEntityId` names an entity that does not exist in the workspace;
+//! * the request carries `compositeComponents` — a composite component is
+//!   addressed by a component *path* inside a component whose component type
+//!   declares it, and component types are a later slice, so no component path
+//!   can resolve and none could be reported back by `GetEntity`.
+//!
+//! An `entityId` that is already taken in the workspace is a `ConflictException`.
+//!
+//! Two deliberate gaps, both consequences of component types being a later
+//! slice: a component's `componentTypeId` is stored WITHOUT checking that the
+//! named component type exists (the real service refuses an unknown one, but
+//! this emulator has no component-type registry — including the built-in types
+//! every real workspace carries — to resolve it against), and authorization is
+//! not emulated, so the modelled `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +181,230 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEntity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEntityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEntity"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "CreateEntity",
+            workspace_id = %input.workspace_id,
+            entity_id = input.entity_id.as_deref().unwrap_or("<generated>"),
+            "serving a request"
+        );
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEntityErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(CreateEntityErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!("workspace {} not found", input.workspace_id)),
+                },
+            )
+            .into());
+        };
+
+        // An entityId the caller did not supply is minted here, as the uuid the
+        // `EntityId` pattern's first alternative describes.
+        let entity_id = input
+            .entity_id
+            .clone()
+            .unwrap_or_else(|| ::uuid::Uuid::new_v4().to_string());
+        if workspace.entities.contains_key(&entity_id) {
+            return Err(CreateEntityErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "entity {entity_id} already exists in workspace {}",
+                        input.workspace_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The emulator's declared ceiling on the store: see
+        // `crate::state::MAX_ENTITIES_PER_WORKSPACE`. Checked AFTER the
+        // identity conflict above, so re-creating a taken id in a full
+        // workspace is still the ConflictException the id deserves.
+        if workspace.entities.len() >= crate::state::MAX_ENTITIES_PER_WORKSPACE {
+            return Err(CreateEntityErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "workspace {} has reached the limit of {} entities",
+                        input.workspace_id,
+                        crate::state::MAX_ENTITIES_PER_WORKSPACE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let parent_entity_id = input
+            .parent_entity_id
+            .clone()
+            .unwrap_or_else(|| crate::state::ROOT_PARENT_ENTITY_ID.to_string());
+        // An entity cannot be its own parent: that would make the stored parent
+        // graph cyclic, which the tree walks over it must never be asked to
+        // handle.
+        if parent_entity_id == entity_id {
+            return Err(CreateEntityErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "parentEntityId {parent_entity_id} must not name the entity being created"
+                    )),
+                },
+            )
+            .into());
+        }
+        if parent_entity_id != crate::state::ROOT_PARENT_ENTITY_ID
+            && !workspace.entities.contains_key(&parent_entity_id)
+        {
+            return Err(CreateEntityErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "parentEntityId {parent_entity_id} does not name an entity in workspace {}",
+                        input.workspace_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if input
+            .composite_components
+            .as_ref()
+            .is_some_and(|composite| !composite.is_empty())
+        {
+            return Err(CreateEntityErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "compositeComponents names a component path that does not exist"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let components = input.components.unwrap_or_default();
+        // Every property a `CreateEntity` declares is a NEW property, so its
+        // definition must carry the `dataType` the modelled
+        // `PropertyDefinitionResponse` requires back.
+        for (component_name, component) in &components {
+            for (property_name, property) in component.properties.iter().flatten() {
+                if property
+                    .definition
+                    .as_ref()
+                    .is_some_and(|definition| definition.data_type.is_none())
+                {
+                    return Err(CreateEntityErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "components.{component_name}.properties.{property_name}.definition.dataType is required"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::entity_arn(&region, &input.workspace_id, &entity_id);
+        let now = ::std::time::SystemTime::now();
+        let entity = crate::state::Entity {
+            entity_id: entity_id.clone(),
+            entity_name: input.entity_name,
+            arn: arn.clone(),
+            workspace_id: input.workspace_id.clone(),
+            description: input.description,
+            parent_entity_id,
+            components: components_from_request(components),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            creation_date_time: now,
+            update_date_time: now,
+            // The entity is returned CREATING and owes the clock its move to
+            // ACTIVE; nothing sleeps for it.
+            active_date_time: now + crate::state::ENTITY_ACTIVATION_SPAN,
+        };
+        let state_at_creation = entity.state_at(now);
+
+        // Store the entity BEFORE indexing its ARN, so the index can never name
+        // an entity that was not stored: the workspace is re-borrowed mutably
+        // here (the lookup that validated the request held it immutably) and
+        // that re-borrow is the last fallible step.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(CreateEntityErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("workspace {} vanished", input.workspace_id)),
+                },
+            )
+            .into());
+        };
+        workspace.entities.insert(entity_id.clone(), entity);
+        state.arn_index.insert(
+            arn.clone(),
+            crate::state::ResourceRef::Entity {
+                workspace_id: input.workspace_id.clone(),
+                entity_id: entity_id.clone(),
+            },
+        );
+
+        Ok(CreateEntityOutput {
+            entity_id,
+            arn,
+            creation_date_time: crate::state::timestamp(now),
+            state: state_at_creation.to_string(),
+        })
     }
+}
+
+/// Turn a `ComponentsMapRequest` into the stored component records.
+///
+/// The map key is the component name (`ComponentsMapRequest`'s key is `Name`),
+/// so it is carried onto the record rather than left only in the map, and
+/// `GetEntity` reports it as `ComponentResponse::componentName`.
+fn components_from_request(
+    components: ::std::collections::HashMap<String, ComponentRequest>,
+) -> ::std::collections::BTreeMap<String, crate::state::ComponentRecord> {
+    components
+        .into_iter()
+        .map(|(component_name, request)| {
+            let record = crate::state::ComponentRecord {
+                component_name: component_name.clone(),
+                component_type_id: request.component_type_id,
+                description: request.description,
+                properties: request
+                    .properties
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(property_name, property)| {
+                        (
+                            property_name,
+                            crate::state::PropertyRecord {
+                                definition: property.definition,
+                                value: property.value,
+                            },
+                        )
+                    })
+                    .collect(),
+                property_groups: request
+                    .property_groups
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(group_name, group)| {
+                        (
+                            group_name,
+                            crate::state::PropertyGroupRecord {
+                                group_type: group.group_type,
+                                property_names: group.property_names.unwrap_or_default(),
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            (component_name, record)
+        })
+        .collect()
 }

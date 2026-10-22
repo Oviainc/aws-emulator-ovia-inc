@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a workspace and persists it in [`crate::state`], keyed by the
+//! `workspaceId` label. Re-creating an id that already exists is a
+//! `ConflictException`; the ARN it mints is indexed so `GetWorkspace` resolves
+//! the record by ARN as well as by id.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authorization is NOT emulated here (nor anywhere in this service), so the
+//! modelled `AccessDeniedException` is never returned: the emulator verifies
+//! request signatures centrally and carries no IAM policy or `iam:PassRole`
+//! evaluation for the `role` this operation accepts. A 200 from here is not an
+//! authorization decision.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkspace"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "CreateWorkspace",
+            workspace_id = %input.workspace_id,
+            "serving a request"
+        );
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWorkspaceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        if state.workspaces.contains_key(&input.workspace_id) {
+            return Err(CreateWorkspaceErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!("workspace {} already exists", input.workspace_id)),
+                },
+            )
+            .into());
+        }
+
+        if state.workspaces.len() >= crate::state::MAX_WORKSPACES {
+            return Err(CreateWorkspaceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the limit of {} workspaces has been reached",
+                        crate::state::MAX_WORKSPACES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::workspace_arn(&region, &input.workspace_id);
+        let now = ::std::time::SystemTime::now();
+
+        state.workspaces.insert(
+            input.workspace_id.clone(),
+            crate::state::Workspace {
+                workspace_id: input.workspace_id.clone(),
+                arn: arn.clone(),
+                description: input.description,
+                s3_location: input.s3_location,
+                role: input.role,
+                linked_services: Vec::new(),
+                tags: input.tags.unwrap_or_default().into_iter().collect(),
+                creation_date_time: now,
+                update_date_time: now,
+                entities: ::std::collections::BTreeMap::new(),
+            },
+        );
+        // Indexed after the record is stored, so the index can never name a
+        // workspace that is not there.
+        state.arn_index.insert(
+            arn.clone(),
+            crate::state::ResourceRef::Workspace {
+                workspace_id: input.workspace_id.clone(),
+            },
+        );
+
+        Ok(CreateWorkspaceOutput {
+            arn,
+            creation_date_time: crate::state::timestamp(now),
+        })
     }
 }

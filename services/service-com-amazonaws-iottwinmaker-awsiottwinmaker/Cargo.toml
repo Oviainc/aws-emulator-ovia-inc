@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination tokens: `nextToken` carries a hex-encoded resume key.
+hex = { workspace = true }
+# `CreateEntity` mints a uuid `entityId` when the request names none.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEntity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEntity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes an entity from its workspace, so the next `GetEntity` on it is a
+//! `ResourceNotFoundException` and `ListEntities` no longer reports it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEntity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `isRecursive` decides what happens to the entity's children: without it, an
+//! entity that still has children is a `ValidationException`; with it, the whole
+//! subtree below the entity goes too. An unknown workspace or entity is a
+//! `ResourceNotFoundException`.
+//!
+//! The removal is SYNCHRONOUS and the `DELETING` the output reports is the state
+//! the entity was in when it was removed, not a stage to poll: the next
+//! `GetEntity` is a 404 rather than a `DELETING` entity. Authorization is not
+//! emulated, so the modelled errors for it are never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +152,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEntity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEntityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEntity"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one destroys tenant state.
+        ::tracing::info!(
+            operation = "DeleteEntity",
+            workspace_id = %input.workspace_id,
+            entity_id = %input.entity_id,
+            is_recursive = input.is_recursive.unwrap_or(false),
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteEntityErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(DeleteEntityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("workspace {} not found", input.workspace_id)),
+                },
+            )
+            .into());
+        };
+        if !workspace.entities.contains_key(&input.entity_id) {
+            return Err(DeleteEntityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "entity {} not found in workspace {}",
+                        input.entity_id, input.workspace_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let recursive = input.is_recursive.unwrap_or(false);
+        let children = workspace.children_of(&input.entity_id);
+        if !recursive && !children.is_empty() {
+            return Err(DeleteEntityErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "entity {} has {} child entities; set isRecursive to delete them too",
+                        input.entity_id,
+                        children.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Without `isRecursive` the entity has no children, so the subtree is
+        // the entity alone and the same removal serves both cases.
+        let removed = workspace.subtree_of(&input.entity_id);
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(DeleteEntityErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("workspace {} vanished", input.workspace_id)),
+                },
+            )
+            .into());
+        };
+        let mut removed_arns = Vec::with_capacity(removed.len());
+        for entity_id in removed {
+            if let Some(entity) = workspace.entities.remove(&entity_id) {
+                removed_arns.push(entity.arn);
+            }
+        }
+        let removed_count = removed_arns.len();
+        for arn in removed_arns {
+            state.arn_index.remove(&arn);
+        }
+        ::tracing::info!(
+            operation = "DeleteEntity",
+            workspace_id = %input.workspace_id,
+            entity_id = %input.entity_id,
+            removed = removed_count,
+            "removed an entity subtree"
+        );
+
+        Ok(DeleteEntityOutput {
+            state: crate::state::STATE_DELETING.to_string(),
+        })
     }
 }

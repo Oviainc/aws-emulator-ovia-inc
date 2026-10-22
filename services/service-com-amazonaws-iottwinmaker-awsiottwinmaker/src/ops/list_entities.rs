@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEntities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEntities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the entities of a workspace — "Lists all entities in a workspace", so
+//! an unfiltered call reports every stored entity, not just the root ones — in
+//! `entityId` order, a page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEntities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `maxResults` caps the page — its documented default is 25 and its documented
+//! minimum 1, so an omitted value serves 25 rows and an explicit zero is
+//! refused. (The modelled `range` on the member admits 0, so that refusal is
+//! this handler's, applied on the strength of the member's own documentation:
+//! "The default is 25. Valid Range: Minimum value of 1.") The service never serves more than
+//! [`crate::state::MAX_PAGE_SIZE`] rows whatever is asked for. The opaque
+//! `nextToken` resumes the listing at the next `entityId` and is bound to the
+//! workspace it was minted for. The model allows only ONE filter object, so a
+//! request carrying more is a `ValidationException`. The model declares no
+//! `ResourceNotFoundException` for this operation, so an unknown workspace is a
+//! `ValidationException` too.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +156,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEntities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEntitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEntities"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and a page served is a read of tenant state.
+        ::tracing::info!(
+            operation = "ListEntities",
+            workspace_id = %input.workspace_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEntitiesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        let invalid = |message: String| {
+            ListEntitiesErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        };
+
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(invalid(format!("workspace {} not found", input.workspace_id)).into());
+        };
+
+        // "Only one object is accepted as a valid input" — the `filters` member's
+        // own documentation.
+        let filters = input.filters.unwrap_or_default();
+        if filters.len() > 1 {
+            return Err(invalid(format!(
+                "filters accepts at most one object, got {}",
+                filters.len()
+            ))
+            .into());
+        }
+        let filter = filters.first();
+
+        // A `nextToken` carries the id the page resumes AT (inclusive), not an
+        // offset, so a page boundary survives an entity being created or
+        // deleted between two pages. It is bound to the workspace it was minted
+        // for, so a token from another listing is refused rather than silently
+        // resumed.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                decode_next_token(token, &input.workspace_id)
+                    .ok_or_else(|| invalid(format!("nextToken {token} is not a valid token")))?,
+            ),
+        };
+
+        // The page size served. `maxResults` documents a minimum of 1 and a
+        // default of 25, so an explicit zero is refused and a request that names
+        // none is served the documented default — never the whole workspace.
+        // Whatever is asked for, the service serves at most
+        // `crate::state::MAX_PAGE_SIZE`, so one request cannot make this loop
+        // walk an unbounded number of entities under the state lock.
+        let page_size = match input.max_results {
+            None => crate::state::DEFAULT_PAGE_SIZE,
+            Some(requested) if requested < 1 => {
+                return Err(invalid(
+                    "maxResults must be at least 1; omit it for the default of 25".to_string(),
+                )
+                .into())
+            }
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(crate::state::MAX_PAGE_SIZE)
+                .min(crate::state::MAX_PAGE_SIZE),
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // Built once per call: `hasChildEntities` is a membership test against
+        // it, so the page costs O(page) lookups rather than one full scan of the
+        // workspace per reported entity.
+        let parent_ids = workspace.parent_ids();
+        let mut matching = workspace
+            .entities
+            .values()
+            .filter(|entity| matches_filter(entity, filter))
+            .skip_while(|entity| {
+                resume_at
+                    .as_deref()
+                    .is_some_and(|from| entity.entity_id.as_str() < from)
+            });
+
+        let mut entity_summaries = Vec::new();
+        for entity in matching.by_ref().take(page_size) {
+            entity_summaries.push(EntitySummary {
+                entity_id: entity.entity_id.clone(),
+                entity_name: entity.entity_name.clone(),
+                arn: entity.arn.clone(),
+                parent_entity_id: Some(entity.parent_entity_id.clone()),
+                status: Status {
+                    state: Some(entity.state_at(now).to_string()),
+                    error: None,
+                },
+                description: entity.description.clone(),
+                has_child_entities: Some(parent_ids.contains(entity.entity_id.as_str())),
+                creation_date_time: crate::state::timestamp(entity.creation_date_time),
+                update_date_time: crate::state::timestamp(entity.update_date_time),
+            });
+        }
+        // The token the next call resumes at: the first entity this page left
+        // over.
+        let next_token = matching
+            .next()
+            .map(|entity| encode_next_token(&input.workspace_id, &entity.entity_id));
+
+        Ok(ListEntitiesOutput {
+            entity_summaries: Some(entity_summaries),
+            next_token,
+        })
     }
+}
+
+/// Whether `entity` is in the list the single accepted filter selects. With no
+/// filter every entity of the workspace is.
+fn matches_filter(entity: &crate::state::Entity, filter: Option<&ListEntitiesFilter>) -> bool {
+    match filter {
+        None => true,
+        Some(ListEntitiesFilter::parentEntityId(parent_entity_id)) => {
+            entity.parent_entity_id == *parent_entity_id
+        }
+        Some(ListEntitiesFilter::componentTypeId(component_type_id)) => {
+            entity.components.values().any(|component| {
+                component.component_type_id.as_deref() == Some(component_type_id.as_str())
+            })
+        }
+        Some(ListEntitiesFilter::externalId(external_id)) => entity
+            .components
+            .values()
+            .any(|component| component.external_ids().any(|id| id == external_id)),
+    }
+}
+
+/// The envelope a `nextToken` of this service carries, so a token minted
+/// elsewhere — for another workspace, or by hand — is recognisably not one of
+/// ours.
+const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:entities:1:";
+
+/// The opaque `nextToken` for a page of `workspace_id` starting at `entity_id`.
+///
+/// Hex so the token is opaque to a caller and safe in a JSON body, over an
+/// envelope that names the listing it belongs to and the resume KEY rather than
+/// an offset.
+fn encode_next_token(workspace_id: &str, entity_id: &str) -> String {
+    ::hex::encode(format!("{NEXT_TOKEN_PREFIX}{workspace_id}/{entity_id}"))
+}
+
+/// The entity id inside a `nextToken` minted for `workspace_id`, or `None` when
+/// the token is not one this service minted for that workspace.
+fn decode_next_token(token: &str, workspace_id: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let body = decoded.strip_prefix(NEXT_TOKEN_PREFIX)?;
+    let (token_workspace_id, entity_id) = body.split_once('/')?;
+    (token_workspace_id == workspace_id && !entity_id.is_empty())
+        .then(|| entity_id.to_string())
 }

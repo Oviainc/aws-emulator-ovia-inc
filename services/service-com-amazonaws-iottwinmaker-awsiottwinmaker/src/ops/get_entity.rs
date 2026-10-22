@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEntity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEntity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEntity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads a stored entity back. Every required output member comes from the
+//! stored record or is derived from it: `hasChildEntities` by scanning the
+//! workspace for entities that name this one as parent, and `status.state` from
+//! the instant the entity's `CREATING` -> `ACTIVE` transition fell due. The
+//! `components` map is truncated at the documented limits
+//! (`crate::state::MAX_COMPONENTS_RETURNED` components, and
+//! `crate::state::MAX_PROPERTIES_RETURNED` properties per component), with
+//! `areAllComponentsReturned` / `areAllPropertiesReturned` reporting whether it
+//! had to be. An unknown workspace or entity is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +172,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEntity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEntityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEntity"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one reads tenant state.
+        ::tracing::info!(
+            operation = "GetEntity",
+            workspace_id = %input.workspace_id,
+            entity_id = %input.entity_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetEntityErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(GetEntityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("workspace {} not found", input.workspace_id)),
+                },
+            )
+            .into());
+        };
+        let Some(entity) = workspace.entities.get(&input.entity_id) else {
+            return Err(GetEntityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "entity {} not found in workspace {}",
+                        input.entity_id, input.workspace_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let entity_state = entity.state_at(now);
+        let status = Status {
+            state: Some(entity_state.to_string()),
+            error: None,
+        };
+
+        Ok(GetEntityOutput {
+            entity_id: entity.entity_id.clone(),
+            entity_name: entity.entity_name.clone(),
+            arn: entity.arn.clone(),
+            status: status.clone(),
+            workspace_id: entity.workspace_id.clone(),
+            description: entity.description.clone(),
+            components: Some(components_response(entity, &status)),
+            parent_entity_id: entity.parent_entity_id.clone(),
+            has_child_entities: workspace.has_child_entities(&entity.entity_id),
+            creation_date_time: crate::state::timestamp(entity.creation_date_time),
+            update_date_time: crate::state::timestamp(entity.update_date_time),
+            // No sync source: an entity this service created is not projected
+            // from a linked service. The sync-job slice sets it.
+            sync_source: None,
+            // "The maximum number of components returned is 30" — the flag's own
+            // documentation. The map above is truncated to that, and the flag
+            // reports whether it had to be.
+            are_all_components_returned: Some(
+                entity.components.len() <= crate::state::MAX_COMPONENTS_RETURNED,
+            ),
+        })
+    }
+}
+
+/// The entity's stored components as the modelled `ComponentsMap` response.
+///
+/// Truncated at [`crate::state::MAX_COMPONENTS_RETURNED`], the limit the
+/// `areAllComponentsReturned` flag documents, in component-name order so which
+/// components a truncated response carries is deterministic.
+///
+/// A component has no lifecycle of its own in this slice, so it reports the
+/// entity's own status.
+fn components_response(
+    entity: &crate::state::Entity,
+    status: &Status,
+) -> ::std::collections::HashMap<String, ComponentResponse> {
+    entity
+        .components
+        .iter()
+        .take(crate::state::MAX_COMPONENTS_RETURNED)
+        .map(|(component_name, component)| {
+            let response = ComponentResponse {
+                component_name: Some(component.component_name.clone()),
+                description: component.description.clone(),
+                component_type_id: component.component_type_id.clone(),
+                status: Some(status.clone()),
+                // `definedIn` names the component type a component is defined
+                // in; component types are a later slice, so every definition
+                // here is the entity-local one and nothing is inherited.
+                defined_in: None,
+                properties: Some(
+                    component
+                        .properties
+                        .iter()
+                        .take(crate::state::MAX_PROPERTIES_RETURNED)
+                        .map(|(property_name, property)| {
+                            (property_name.clone(), property_response(property))
+                        })
+                        .collect(),
+                ),
+                property_groups: Some(
+                    component
+                        .property_groups
+                        .iter()
+                        .map(|(group_name, group)| {
+                            (group_name.clone(), property_group_response(group))
+                        })
+                        .collect(),
+                ),
+                sync_source: None,
+                // "The maximum number of properties returned is 800" — the
+                // flag's own documentation, applied to the map above.
+                are_all_properties_returned: Some(
+                    component.properties.len() <= crate::state::MAX_PROPERTIES_RETURNED,
+                ),
+                // Composite components cannot exist on a stored entity:
+                // `CreateEntity` refuses `compositeComponents` while component
+                // types (which declare the component paths they are addressed
+                // by) are a later slice.
+                composite_components: Some(::std::collections::HashMap::new()),
+                are_all_composite_components_returned: Some(true),
+            };
+            (component_name.clone(), response)
+        })
+        .collect()
+}
+
+/// The single value the model's `GroupType` enum defines (`GROUP_TYPE_VALUES`).
+///
+/// Named here so the response fallback below cannot emit a value the model does
+/// not define.
+const TABULAR_GROUP_TYPE: &str = "TABULAR";
+
+/// One stored property as the modelled `PropertyResponse`.
+fn property_response(property: &crate::state::PropertyRecord) -> PropertyResponse {
+    PropertyResponse {
+        definition: property.definition.as_ref().and_then(|definition| {
+            // `dataType` is required on the response but optional on the
+            // request (an update may omit it). `CreateEntity` refuses a new
+            // property definition without one, so a stored definition always
+            // carries it; this stays fallible rather than inventing an enum
+            // value the model does not define.
+            let Some(data_type) = definition.data_type.clone() else {
+                // Unreachable while `CreateEntity` is the only write path: it
+                // refuses a new property definition without a `dataType`.
+                // Logged rather than dropped silently so a regression there is
+                // visible instead of quietly costing the member.
+                ::tracing::warn!(
+                    "a stored property definition carries no dataType; omitting the definition"
+                );
+                return None;
+            };
+            Some(PropertyDefinitionResponse {
+                data_type,
+                is_time_series: definition.is_time_series.unwrap_or(false),
+                is_required_in_entity: definition.is_required_in_entity.unwrap_or(false),
+                is_external_id: definition.is_external_id.unwrap_or(false),
+                is_stored_externally: definition.is_stored_externally.unwrap_or(false),
+                // Nothing imports, finalises or inherits a definition in this
+                // slice: all three come from a component type.
+                is_imported: false,
+                is_final: false,
+                is_inherited: false,
+                default_value: definition.default_value.clone(),
+                configuration: definition.configuration.clone(),
+                display_name: definition.display_name.clone(),
+            })
+        }),
+        value: property.value.clone(),
+        are_all_property_values_returned: Some(true),
+    }
+}
+
+/// One stored property group as the modelled `ComponentPropertyGroupResponse`.
+///
+/// `groupType` is required on the response but optional on the request; the
+/// model's `GroupType` enum admits exactly one value (`GROUP_TYPE_VALUES`), so a
+/// group stored without one reports that value.
+fn property_group_response(
+    group: &crate::state::PropertyGroupRecord,
+) -> ComponentPropertyGroupResponse {
+    ComponentPropertyGroupResponse {
+        group_type: group
+            .group_type
+            .clone()
+            .unwrap_or_else(|| TABULAR_GROUP_TYPE.to_string()),
+        property_names: group.property_names.clone(),
+        is_inherited: false,
     }
 }

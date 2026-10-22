@@ -13,3 +13,6 @@
 // points it into `tests/all/`.
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+
+#[path = "all/workspace_entity_lifecycle.rs"]
+mod workspace_entity_lifecycle;
