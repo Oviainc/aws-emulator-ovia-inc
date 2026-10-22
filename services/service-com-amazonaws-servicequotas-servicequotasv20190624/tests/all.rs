@@ -21,6 +21,8 @@ mod default_quota_catalog;
 mod error_envelope;
 #[path = "all/quota_workflow.rs"]
 mod quota_workflow;
+#[path = "all/quotas_catalog.rs"]
+mod quotas_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support_case_and_templates.rs"]
