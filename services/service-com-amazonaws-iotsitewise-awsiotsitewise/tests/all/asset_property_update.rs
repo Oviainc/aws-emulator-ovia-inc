@@ -29,7 +29,10 @@ const ABSENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 /// notifications. Written out here as an INDEPENDENT oracle of the form the IoT
 /// SiteWise User Guide documents:
 /// `$aws/sitewise/asset-models/{assetModelId}/assets/{assetId}/properties/{propertyId}`.
-fn expected_topic(model_id: &str, asset_id: &str, property_id: &str) -> String {
+///
+/// `pub(crate)` so the sibling `DescribeAssetProperty` suite reads the SAME
+/// oracle rather than growing a second copy of it.
+pub(crate) fn expected_topic(model_id: &str, asset_id: &str, property_id: &str) -> String {
     format!("$aws/sitewise/asset-models/{model_id}/assets/{asset_id}/properties/{property_id}")
 }
 
