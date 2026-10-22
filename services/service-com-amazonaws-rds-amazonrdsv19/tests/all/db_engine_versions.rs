@@ -51,11 +51,15 @@ const MODELLED_ENGINES: [&str; 21] = [
     "sqlserver-dev-ee",
 ];
 
-/// The engines whose versions are CUSTOM engine versions: a record
-/// `CreateCustomDBEngineVersion` stores, not catalogue data. That operation is still a
-/// scaffolded 501, so this service holds none and must report none for these engines —
-/// rather than inventing one.
-const CUSTOM_ENGINES: [&str; 4] = [
+/// The engines whose versions are CUSTOM engine versions the ACCOUNT mints: RDS Custom
+/// for Oracle, whose CEVs `CreateCustomDBEngineVersion` creates from customer-supplied
+/// installation media. That operation is still a scaffolded 501, so this service holds
+/// none and must report none for these engines — rather than inventing one. RDS Custom
+/// for SQL Server is NOT among them: its custom engine versions are AWS-provided, so they
+/// are catalogue data (see `db_engine_version_catalog.rs`).
+///
+/// `pub(crate)` so the catalogue suite states this engine list once.
+pub(crate) const CUSTOM_ENGINES: [&str; 4] = [
     "custom-oracle-ee",
     "custom-oracle-ee-cdb",
     "custom-oracle-se2",
@@ -130,8 +134,8 @@ async fn describe(
 
 /// Every entry of one engine, deprecated ones included, in reported order.
 ///
-/// `pub(crate)` so the catalogue-population suite reads an engine's builds through the
-/// same helper rather than a second copy of it.
+/// `pub(crate)` so the catalogue suites read an engine's versions through the same
+/// helper rather than a second copy of it.
 pub(crate) async fn all_versions_of(router: &MultiServiceRouter, engine: &str) -> Vec<Version> {
     let (reported, marker) = describe(
         router,
@@ -730,22 +734,30 @@ pub(crate) async fn walk_every_version(
 async fn character_sets_and_timezones_are_reported_only_when_the_request_asks() {
     let router = emulator();
 
-    // (engine, the engine takes a CharacterSetName, the engine takes a Timezone).
-    // `CreateDBInstance`'s `CharacterSetName` is the Oracle character set and the SQL
-    // Server server collation, and its `Timezone` is a SQL Server member; MySQL,
-    // MariaDB and PostgreSQL are the rows that must get NEITHER even when they ask for
-    // both.
-    let rows: [(&str, bool, bool); 7] = [
-        ("oracle-se2", true, false),
-        ("oracle-ee", true, false),
-        ("sqlserver-ee", true, true),
-        ("sqlserver-web", true, true),
-        ("mysql", false, false),
-        ("mariadb", false, false),
-        ("postgres", false, false),
+    // (engine, the engine takes a CharacterSetName, the engine takes a Timezone, the
+    // engine LISTS them when the request asks). `CreateDBInstance`'s `CharacterSetName`
+    // is the Oracle character set and the SQL Server server collation, and its `Timezone`
+    // is a SQL Server member; MySQL, MariaDB and PostgreSQL are the rows that must get
+    // NEITHER even when they ask for both. The RDS Custom rows take both — they report a
+    // `DefaultCharacterSet`, which no flag gates — but list neither, whatever the request
+    // asks for: "For RDS Custom, the default is not to list supported character sets. If
+    // you enable this parameter, RDS Custom returns no results"
+    // (`ListSupportedCharacterSets`, and the same sentence on `ListSupportedTimezones`).
+    let rows: [(&str, bool, bool, bool); 11] = [
+        ("oracle-se2", true, false, true),
+        ("oracle-ee", true, false, true),
+        ("sqlserver-ee", true, true, true),
+        ("sqlserver-web", true, true, true),
+        ("mysql", false, false, true),
+        ("mariadb", false, false, true),
+        ("postgres", false, false, true),
+        ("custom-sqlserver-ee", true, true, false),
+        ("custom-sqlserver-se", true, true, false),
+        ("custom-sqlserver-web", true, true, false),
+        ("custom-sqlserver-dev", true, true, false),
     ];
 
-    for (engine, has_character_sets, has_timezones) in rows {
+    for (engine, has_character_sets, has_timezones, lists_them) in rows {
         let silent = all_versions_of(&router, engine).await;
         for version in &silent {
             assert!(
@@ -792,16 +804,16 @@ async fn character_sets_and_timezones_are_reported_only_when_the_request_asks() 
         for version in &asked {
             assert_eq!(
                 !subtrees(&version.scalars, "SupportedCharacterSets").is_empty(),
-                has_character_sets,
+                has_character_sets && lists_them,
                 "case {case:?}: SupportedCharacterSets must be reported exactly for an \
-                 engine that has them, got {}",
+                 engine that has them and lists them, got {}",
                 version.scalars
             );
             assert_eq!(
                 !subtrees(&version.scalars, "SupportedTimezones").is_empty(),
-                has_timezones,
+                has_timezones && lists_them,
                 "case {case:?}: SupportedTimezones must be reported exactly for an \
-                 engine that has them, got {}",
+                 engine that has them and lists them, got {}",
                 version.scalars
             );
         }

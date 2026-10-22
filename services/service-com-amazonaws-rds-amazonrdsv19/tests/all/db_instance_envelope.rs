@@ -230,7 +230,7 @@ const ENGINE_CASES: &[EngineCase] = &[
         identifier: "emu-env-db2-se",
         engine: "db2-se",
         requested_version: None,
-        engine_version: "12.1.0.0",
+        engine_version: "12.1.4.0.sb00080714.r1",
         db_parameter_group: "default.db2-se-12.1",
         option_group: "default:db2-se-12-1",
         license_model: "bring-your-own-license",
@@ -623,8 +623,8 @@ struct VersionCase {
 /// IS published (`8.0.99` is not `8.0`, which the real service refuses: the recorded
 /// `CreateDBInstance` answers 400 `InvalidParameterCombination` "Cannot find version
 /// 8.0.99 for mysql"), a major version the catalogue publishes no AVAILABLE version for
-/// (`mysql` 5.7 is deprecated), a version no major version matches, and an engine the
-/// catalogue publishes no version for at all.
+/// (`aurora-postgresql` 11 is deprecated), a version no major version matches, and an
+/// engine the catalogue publishes no version for at all.
 const VERSION_CASES: &[VersionCase] = &[
     VersionCase {
         case: "no version named",
@@ -662,17 +662,35 @@ const VERSION_CASES: &[VersionCase] = &[
         provisioned: Some("8.4.3"),
     },
     VersionCase {
-        case: "a major version whose only version is deprecated",
+        case: "a major version whose only versions are deprecated",
+        identifier: "emu-ver-aurora-pg-11",
+        engine: "aurora-postgresql",
+        requested: Some("11"),
+        provisioned: None,
+    },
+    VersionCase {
+        case: "a deprecated version named exactly",
+        identifier: "emu-ver-aurora-pg-1121",
+        engine: "aurora-postgresql",
+        requested: Some("11.21"),
+        provisioned: None,
+    },
+    // The same two branches on the other engine family whose major version is past its
+    // community end of life: every `mysql` 5.7 build, the RDS Extended Support ones
+    // included, is deprecated, so neither the family nor one of its builds can be
+    // provisioned.
+    VersionCase {
+        case: "a major version in extended support, whose builds are all deprecated",
         identifier: "emu-ver-mysql-57",
         engine: "mysql",
         requested: Some("5.7"),
         provisioned: None,
     },
     VersionCase {
-        case: "a deprecated version named exactly",
+        case: "a deprecated extended-support build named exactly",
         identifier: "emu-ver-mysql-5744",
         engine: "mysql",
-        requested: Some("5.7.44"),
+        requested: Some("5.7.44-rds.20250213"),
         provisioned: None,
     },
     VersionCase {

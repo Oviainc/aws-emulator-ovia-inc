@@ -131,7 +131,10 @@ async fn walk(router: &MultiServiceRouter, case: &str, page_size: usize) -> Vec<
 
 /// The `(base version, YYYYMMDD)` halves of a dated Amazon RDS Extended Support build,
 /// or `None` for a version that is not one.
-fn dated_build(version: &str) -> Option<(&str, &str)> {
+///
+/// `pub(crate)` so the catalogue suite's version-form table reads a dated build the same
+/// way this one does.
+pub(crate) fn dated_build(version: &str) -> Option<(&str, &str)> {
     version.split_once("-rds.")
 }
 
@@ -139,7 +142,9 @@ fn dated_build(version: &str) -> Option<(&str, &str)> {
 /// digits whose year, month and day fields are in range. A form check, not a calendar
 /// one — it is the shape of the published name that the rule fixes, and the catalogue
 /// holds no date arithmetic to get wrong.
-fn is_build_date(date: &str) -> bool {
+///
+/// `pub(crate)` for the same reason as [`dated_build`].
+pub(crate) fn is_build_date(date: &str) -> bool {
     if date.len() != 8 || !date.bytes().all(|byte| byte.is_ascii_digit()) {
         return false;
     }

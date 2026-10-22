@@ -139,6 +139,10 @@ async fn instance_exists(router: &MultiServiceRouter, identifier: &str) -> bool 
 /// `DescribeDBEngineVersions` report rather than written here by hand. Only the
 /// AVAILABLE ones, which are the versions a create can name ("The default is to list
 /// only available engine versions").
+///
+/// Read through the entry reader of the engine-version suite, so only the version of
+/// each ENTRY is collected: a reported entry also carries the version of every upgrade
+/// target it names, and those are the same versions again.
 async fn reported_engine_versions(router: &MultiServiceRouter, engine: &str) -> Vec<String> {
     let body = expect_ok(
         engine,
@@ -149,7 +153,10 @@ async fn reported_engine_versions(router: &MultiServiceRouter, engine: &str) -> 
         )
         .await,
     );
-    texts(&body, "EngineVersion")
+    crate::db_engine_versions::versions(&body)
+        .into_iter()
+        .map(|version| version.engine_version)
+        .collect()
 }
 
 /// The major engine versions THIS service reports for `engine`, deduplicated, read out

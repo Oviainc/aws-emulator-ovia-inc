@@ -8,10 +8,19 @@
 //!
 //! An engine version is this service's own reference data, not caller state: it exists
 //! for every caller, no request creates it, and it reads the same before and after one.
-//! The one engine-version kind that IS caller state — a CUSTOM engine version, the
-//! `custom-oracle-*` engines — is minted by `CreateCustomDBEngineVersion`, which is
-//! still a scaffolded 501, so this service holds none and reports none for those
-//! engines. When that operation is implemented its records join this report.
+//! That holds for every engine whose versions AWS itself publishes, RDS Custom for SQL
+//! Server included — its custom engine versions are AWS-provided, which is why the
+//! catalogue operations list those engines among their valid values
+//! (`smithy_query(query="doc",shape="DescribeDBMajorEngineVersionsRequest",member="Engine")`:
+//! `custom-sqlserver-ee`, `custom-sqlserver-se`, `custom-sqlserver-web`, and
+//! `custom-sqlserver-dev` beside them on `CreateDBInstance$Engine`).
+//!
+//! The one engine-version kind that IS caller state is RDS Custom for ORACLE, whose
+//! versions exist only as records `CreateCustomDBEngineVersion` mints from
+//! customer-supplied installation media (that member's own documentation) and which the
+//! catalogue operations list no valid value for. That operation is still a scaffolded
+//! 501, so this service holds none and reports none for the `custom-oracle-*` engines.
+//! When it is implemented its records join this report.
 //!
 //! ## Shape of an operation
 //!
@@ -353,6 +362,11 @@ pub(crate) struct EngineFacts {
     /// `(name, description)` pairs for `SupportedCharacterSets`, whose first entry is
     /// also `DefaultCharacterSet`. Empty for an engine that takes no `CharacterSetName`.
     pub(crate) character_sets: &'static [(&'static str, &'static str)],
+    /// `(name, description)` pairs for `SupportedNcharCharacterSets`, the sets
+    /// `CreateDBInstance` takes for `NcharCharacterSetName` ("The name of the NCHAR
+    /// character set for the Oracle DB instance. This setting doesn't apply to RDS Custom
+    /// DB instances"). Empty for an engine that takes no `NcharCharacterSetName`.
+    pub(crate) nchar_character_sets: &'static [(&'static str, &'static str)],
     /// `SupportedTimezones`. Empty for an engine that takes no `Timezone`.
     pub(crate) timezones: &'static [&'static str],
 }
@@ -569,11 +583,27 @@ const SQLSERVER_WITH_REPLICA: VersionProfile = VersionProfile::provisioned()
 const SQLSERVER: VersionProfile =
     VersionProfile::provisioned().features(SQLSERVER_FEATURE_NAMES);
 
+/// An RDS Custom for SQL Server engine version — an AWS-provided custom engine version.
+///
+/// RDS Custom gives the customer host access instead of the managed features an RDS DB
+/// instance gets: there is no option group, so none of the option-group features
+/// [`SQLSERVER_FEATURE_NAMES`] names is offered, no read replica, and no CloudWatch log
+/// export (the engine's [`EngineFacts::exportable_log_types`] is empty for the same
+/// reason). It runs provisioned, like every other SQL Server version.
+const SQLSERVER_CUSTOM: VersionProfile = VersionProfile::provisioned();
+
+/// The `SupportedFeatureNames` of an RDS for Db2 version, which loads from and unloads
+/// to Amazon S3 through the same engine integration the Oracle and SQL Server engines
+/// name.
+const DB2_FEATURE_NAMES: &[&str] = &["S3_INTEGRATION"];
+
 /// A Db2 edition that serves a read replica (Advanced and Standard).
-const DB2_WITH_REPLICA: VersionProfile = VersionProfile::provisioned().read_replica();
+const DB2_WITH_REPLICA: VersionProfile = VersionProfile::provisioned()
+    .read_replica()
+    .features(DB2_FEATURE_NAMES);
 
 /// Db2 Community Edition, which serves none.
-const DB2: VersionProfile = VersionProfile::provisioned();
+const DB2: VersionProfile = VersionProfile::provisioned().features(DB2_FEATURE_NAMES);
 
 /// Amazon DocumentDB: a cluster engine, provisioned like Aurora, whose instances are
 /// cluster members (so `SupportsReadReplica` is reported, as that control plane's own
@@ -702,6 +732,15 @@ const SQLSERVER_COLLATIONS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The NCHAR character sets an Oracle engine reports: `CreateDBInstance`'s
+/// `NcharCharacterSetName` is "the NCHAR character set for the Oracle DB instance", and
+/// the national character set of an Oracle database is one of these two, `AL16UTF16`
+/// being the default.
+const ORACLE_NCHAR_CHARACTER_SETS: &[(&str, &str)] = &[
+    ("AL16UTF16", "Unicode UTF-16 Universal character set"),
+    ("UTF8", "Unicode 3.0 UTF-8 Universal character set"),
+];
+
 /// The time zones a Microsoft SQL Server engine reports: `CreateDBInstance`'s `Timezone`
 /// is a SQL Server member, and the names are the Windows time-zone names that engine
 /// takes. A representative span of the published list, not all of it — the member is
@@ -738,17 +777,31 @@ const DOCDB_LOG_TYPES: &[&str] = &["audit", "profiler"];
 
 /// Every DB engine this service reports versions for.
 ///
-/// The engine names are exactly the `Engine` member's published "Valid Values"
+/// The engine names are the `Engine` member's published "Valid Values"
 /// (`smithy_query(query="doc",shape="DescribeDBEngineVersionsMessage",member="Engine")`),
-/// minus the four `custom-oracle-*` engines: a custom engine version is a record the
-/// account creates with `CreateCustomDBEngineVersion`, so this service reports one only
-/// once that operation stores one, never as catalogue data. The same holds for any other
-/// RDS Custom engine, whose versions are created from customer-supplied installation
-/// media by that one operation.
+/// minus the four `custom-oracle-*` engines and plus the four `custom-sqlserver-*`
+/// engines — which THIS operation's `Engine` member lists none of, so their grounding is
+/// `DescribeDBMajorEngineVersionsRequest$Engine` and `CreateDBInstance$Engine`. What
+/// decides whether an engine belongs here is WHO creates its versions:
 ///
-/// The per-engine facts (exportable log types, character sets and time zones) are this
-/// emulator's published reference data for those engines, as the RDS engine feature
-/// matrix states them. They are the same for every caller and no request changes them.
+/// * RDS Custom for Oracle — the `custom-oracle-*` engines — has versions the account
+///   mints with `CreateCustomDBEngineVersion` from customer-supplied installation media
+///   (that operation's `Engine` and `DatabaseInstallationFilesS3BucketName`
+///   documentation), so this service reports one only once that operation stores one,
+///   never as catalogue data;
+/// * RDS Custom for SQL Server — `custom-sqlserver-ee`, `custom-sqlserver-se`,
+///   `custom-sqlserver-web` and `custom-sqlserver-dev` — has AWS-PROVIDED custom engine
+///   versions, which is why the catalogue operations publish those engine names as valid
+///   values
+///   (`smithy_query(query="doc",shape="DescribeDBMajorEngineVersionsRequest",member="Engine")`,
+///   which lists them and lists no `custom-oracle-*` engine), and why
+///   `CreateDBInstance$Engine` offers them to a request that names no engine version of
+///   its own. They are catalogue data, like every other engine here.
+///
+/// The per-engine facts (exportable log types, character sets, NCHAR character sets and
+/// time zones) are this emulator's published reference data for those engines, as the RDS
+/// engine feature matrix states them. They are the same for every caller and no request
+/// changes them.
 ///
 /// `docdb` and `neptune` are here as well, and they are NOT values this model's `Engine`
 /// member lists: this Query front door also serves the Amazon DocumentDB and Amazon
@@ -764,6 +817,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Aurora MySQL",
         exportable_log_types: MYSQL_LOG_TYPES,
         character_sets: &[],
+        nchar_character_sets: &[],
         timezones: &[],
     },
     EngineFacts {
@@ -772,7 +826,51 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Aurora (PostgreSQL)",
         exportable_log_types: AURORA_POSTGRESQL_LOG_TYPES,
         character_sets: &[],
+        nchar_character_sets: &[],
         timezones: &[],
+    },
+    // RDS Custom for SQL Server. The collations and time zones are the SQL Server
+    // engine's own, so `DefaultCharacterSet` is reported for these engines too; what is
+    // NOT reported is the LIST of them, because "for RDS Custom, the default is not to
+    // list supported character sets. If you enable this parameter, RDS Custom returns no
+    // results" (`ListSupportedCharacterSets`, and the same sentence on
+    // `ListSupportedTimezones`) — see [`to_wire`]. RDS Custom publishes no CloudWatch log
+    // export for its engine versions, so the exportable log types are empty.
+    EngineFacts {
+        engine: "custom-sqlserver-ee",
+        product: "Microsoft SQL Server Enterprise Edition",
+        description: "RDS Custom for SQL Server Enterprise Edition",
+        exportable_log_types: &[],
+        character_sets: SQLSERVER_COLLATIONS,
+        nchar_character_sets: &[],
+        timezones: SQLSERVER_TIMEZONES,
+    },
+    EngineFacts {
+        engine: "custom-sqlserver-se",
+        product: "Microsoft SQL Server Standard Edition",
+        description: "RDS Custom for SQL Server Standard Edition",
+        exportable_log_types: &[],
+        character_sets: SQLSERVER_COLLATIONS,
+        nchar_character_sets: &[],
+        timezones: SQLSERVER_TIMEZONES,
+    },
+    EngineFacts {
+        engine: "custom-sqlserver-web",
+        product: "Microsoft SQL Server Web Edition",
+        description: "RDS Custom for SQL Server Web Edition",
+        exportable_log_types: &[],
+        character_sets: SQLSERVER_COLLATIONS,
+        nchar_character_sets: &[],
+        timezones: SQLSERVER_TIMEZONES,
+    },
+    EngineFacts {
+        engine: "custom-sqlserver-dev",
+        product: "Microsoft SQL Server Developer Edition",
+        description: "RDS Custom for SQL Server Developer Edition",
+        exportable_log_types: &[],
+        character_sets: SQLSERVER_COLLATIONS,
+        nchar_character_sets: &[],
+        timezones: SQLSERVER_TIMEZONES,
     },
     EngineFacts {
         engine: "db2-ae",
@@ -780,6 +878,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Db2 Advanced Edition",
         exportable_log_types: DB2_LOG_TYPES,
         character_sets: &[],
+        nchar_character_sets: &[],
         timezones: &[],
     },
     EngineFacts {
@@ -788,6 +887,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Db2 Community Edition",
         exportable_log_types: DB2_LOG_TYPES,
         character_sets: &[],
+        nchar_character_sets: &[],
         timezones: &[],
     },
     EngineFacts {
@@ -796,6 +896,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Db2 Standard Edition",
         exportable_log_types: DB2_LOG_TYPES,
         character_sets: &[],
+        nchar_character_sets: &[],
         timezones: &[],
     },
     EngineFacts {
@@ -804,6 +905,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Amazon DocumentDB (with MongoDB compatibility)",
         exportable_log_types: DOCDB_LOG_TYPES,
         character_sets: &[],
+        nchar_character_sets: &[],
         timezones: &[],
     },
     EngineFacts {
@@ -812,6 +914,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "MariaDB Community Edition",
         exportable_log_types: MYSQL_LOG_TYPES,
         character_sets: &[],
+        nchar_character_sets: &[],
         timezones: &[],
     },
     EngineFacts {
@@ -820,6 +923,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "MySQL Community Edition",
         exportable_log_types: MYSQL_LOG_TYPES,
         character_sets: &[],
+        nchar_character_sets: &[],
         timezones: &[],
     },
     EngineFacts {
@@ -828,6 +932,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Amazon Neptune",
         exportable_log_types: &["audit"],
         character_sets: &[],
+        nchar_character_sets: &[],
         timezones: &[],
     },
     EngineFacts {
@@ -836,6 +941,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Oracle Database Enterprise Edition",
         exportable_log_types: ORACLE_LOG_TYPES,
         character_sets: ORACLE_CHARACTER_SETS,
+        nchar_character_sets: ORACLE_NCHAR_CHARACTER_SETS,
         timezones: &[],
     },
     EngineFacts {
@@ -844,6 +950,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Oracle Database Enterprise Edition (multi-tenant architecture)",
         exportable_log_types: ORACLE_LOG_TYPES,
         character_sets: ORACLE_CHARACTER_SETS,
+        nchar_character_sets: ORACLE_NCHAR_CHARACTER_SETS,
         timezones: &[],
     },
     EngineFacts {
@@ -852,6 +959,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Oracle Database Standard Edition Two",
         exportable_log_types: ORACLE_LOG_TYPES,
         character_sets: ORACLE_CHARACTER_SETS,
+        nchar_character_sets: ORACLE_NCHAR_CHARACTER_SETS,
         timezones: &[],
     },
     EngineFacts {
@@ -860,6 +968,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Oracle Database Standard Edition Two (multi-tenant architecture)",
         exportable_log_types: ORACLE_LOG_TYPES,
         character_sets: ORACLE_CHARACTER_SETS,
+        nchar_character_sets: ORACLE_NCHAR_CHARACTER_SETS,
         timezones: &[],
     },
     EngineFacts {
@@ -868,6 +977,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "PostgreSQL",
         exportable_log_types: &["postgresql", "upgrade"],
         character_sets: &[],
+        nchar_character_sets: &[],
         timezones: &[],
     },
     EngineFacts {
@@ -876,6 +986,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Microsoft SQL Server Developer Edition",
         exportable_log_types: SQLSERVER_LOG_TYPES,
         character_sets: SQLSERVER_COLLATIONS,
+        nchar_character_sets: &[],
         timezones: SQLSERVER_TIMEZONES,
     },
     EngineFacts {
@@ -884,6 +995,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Microsoft SQL Server Enterprise Edition",
         exportable_log_types: SQLSERVER_LOG_TYPES,
         character_sets: SQLSERVER_COLLATIONS,
+        nchar_character_sets: &[],
         timezones: SQLSERVER_TIMEZONES,
     },
     EngineFacts {
@@ -892,6 +1004,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Microsoft SQL Server Express Edition",
         exportable_log_types: SQLSERVER_LOG_TYPES,
         character_sets: SQLSERVER_COLLATIONS,
+        nchar_character_sets: &[],
         timezones: SQLSERVER_TIMEZONES,
     },
     EngineFacts {
@@ -900,6 +1013,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Microsoft SQL Server Standard Edition",
         exportable_log_types: SQLSERVER_LOG_TYPES,
         character_sets: SQLSERVER_COLLATIONS,
+        nchar_character_sets: &[],
         timezones: SQLSERVER_TIMEZONES,
     },
     EngineFacts {
@@ -908,6 +1022,7 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
         description: "Microsoft SQL Server Web Edition",
         exportable_log_types: SQLSERVER_LOG_TYPES,
         character_sets: SQLSERVER_COLLATIONS,
+        nchar_character_sets: &[],
         timezones: SQLSERVER_TIMEZONES,
     },
 ];
@@ -1121,10 +1236,128 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         DefaultLevel::Engine,
         &AURORA_POSTGRESQL_15,
     ),
+    // --- RDS Custom for SQL Server ----------------------------------------
+    // AWS-provided custom engine versions: RDS Custom for SQL Server packages a SQL
+    // Server build as a CEV, and the engine version is named for the build it packages
+    // with a `.vN` CEV revision — the same form the RDS for SQL Server rows below use.
+    // `15.00.4073.23.v1` with the family `custom-sqlserver-ee-15.0` is the build the AWS
+    // catalogue publishes for this engine; the later rows are the builds this catalogue
+    // publishes for RDS for SQL Server, offered as CEVs of the same two major versions.
+    row(
+        "custom-sqlserver-ee",
+        "15.00.4073.23.v1",
+        "15.00",
+        "custom-sqlserver-ee-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-ee",
+        "15.00.4385.2.v1",
+        "15.00",
+        "custom-sqlserver-ee-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-ee",
+        "16.00.4165.4.v1",
+        "16.00",
+        "custom-sqlserver-ee-16.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-se",
+        "15.00.4073.23.v1",
+        "15.00",
+        "custom-sqlserver-se-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-se",
+        "15.00.4385.2.v1",
+        "15.00",
+        "custom-sqlserver-se-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-se",
+        "16.00.4165.4.v1",
+        "16.00",
+        "custom-sqlserver-se-16.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-web",
+        "15.00.4073.23.v1",
+        "15.00",
+        "custom-sqlserver-web-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-web",
+        "15.00.4385.2.v1",
+        "15.00",
+        "custom-sqlserver-web-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-web",
+        "16.00.4165.4.v1",
+        "16.00",
+        "custom-sqlserver-web-16.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-dev",
+        "15.00.4073.23.v1",
+        "15.00",
+        "custom-sqlserver-dev-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-dev",
+        "15.00.4385.2.v1",
+        "15.00",
+        "custom-sqlserver-dev-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER_CUSTOM,
+    ),
+    row(
+        "custom-sqlserver-dev",
+        "16.00.4165.4.v1",
+        "16.00",
+        "custom-sqlserver-dev-16.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+        &SQLSERVER_CUSTOM,
+    ),
     // --- Db2 --------------------------------------------------------------
+    // A Db2 engine version is published as the Db2 version with the special build it
+    // carries and its RDS revision, `V.R.M.F.sbNNNNNNNN.rN` (`sb00000000` is a build
+    // with no special build applied).
     row(
         "db2-ae",
-        "11.5.9.0",
+        "11.5.9.0.sb00000000.r1",
         "11.5",
         "db2-ae-11.5",
         STATUS_AVAILABLE,
@@ -1133,7 +1366,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "db2-ae",
-        "11.5.11.0",
+        "11.5.11.0.sb00000000.r1",
         "11.5",
         "db2-ae-11.5",
         STATUS_AVAILABLE,
@@ -1142,7 +1375,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "db2-ae",
-        "12.1.0.0",
+        "12.1.4.0.sb00080714.r1",
         "12.1",
         "db2-ae-12.1",
         STATUS_AVAILABLE,
@@ -1151,7 +1384,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "db2-ce",
-        "11.5.9.0",
+        "11.5.9.0.sb00000000.r1",
         "11.5",
         "db2-ce-11.5",
         STATUS_AVAILABLE,
@@ -1160,7 +1393,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "db2-ce",
-        "11.5.11.0",
+        "11.5.11.0.sb00000000.r1",
         "11.5",
         "db2-ce-11.5",
         STATUS_AVAILABLE,
@@ -1169,7 +1402,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "db2-ce",
-        "12.1.0.0",
+        "12.1.4.0.sb00080714.r1",
         "12.1",
         "db2-ce-12.1",
         STATUS_AVAILABLE,
@@ -1178,7 +1411,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "db2-se",
-        "11.5.9.0",
+        "11.5.9.0.sb00000000.r1",
         "11.5",
         "db2-se-11.5",
         STATUS_AVAILABLE,
@@ -1187,7 +1420,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "db2-se",
-        "11.5.11.0",
+        "11.5.11.0.sb00000000.r1",
         "11.5",
         "db2-se-11.5",
         STATUS_AVAILABLE,
@@ -1196,7 +1429,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "db2-se",
-        "12.1.0.0",
+        "12.1.4.0.sb00080714.r1",
         "12.1",
         "db2-se-12.1",
         STATUS_AVAILABLE,
@@ -1204,10 +1437,15 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         &DB2_WITH_REPLICA,
     ),
     // --- Amazon DocumentDB ------------------------------------------------
-    // The Amazon DocumentDB engine versions this front door publishes: 3.6, 4.0 and
-    // 5.0 are DocumentDB's major versions, and 5.0 is the one a cluster created without
-    // an `EngineVersion` gets (`CreateDBClusterMessage$EngineVersion` in that model: "The
-    // --engine-version will default to the latest major engine version").
+    // The Amazon DocumentDB engine versions this front door publishes: 3.6, 4.0, 5.0 and
+    // 8.0 are DocumentDB's major versions — the recorded report of the 3.6 entry names
+    // both 5.0 and 8.0 among its major-version upgrade targets (trace
+    // `rds-catalog-describe-db-engine-versions-custom-sqlserver-web-oracle-ee`, the
+    // `docdb` step), which is the only source for the `docdb8.0` family name.
+    // `CreateDBClusterMessage$EngineVersion` in that model states that "the
+    // --engine-version will default to the latest major engine version"; the engine
+    // default below is 5.0, the latest major version this catalogue publishes on more
+    // than an upgrade-target list.
     row(
         "docdb",
         "3.6.0",
@@ -1233,6 +1471,20 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "docdb5.0",
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
+        &DOCDB,
+    ),
+    // The 8.0 family is published because the recorded 3.6 entry names 8.0.x among its
+    // major-version upgrade targets, which is evidence the family is SERVED; it is not
+    // evidence of which version a cluster created without an `EngineVersion` gets, so
+    // the engine's default stays on 5.0 until an engine-version listing of 8.0 says
+    // otherwise.
+    row(
+        "docdb",
+        "8.0.0",
+        "8.0",
+        "docdb8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
         &DOCDB,
     ),
     // --- MariaDB ----------------------------------------------------------
@@ -1361,7 +1613,27 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         &MYSQL_8,
     ),
     // --- Amazon Neptune ---------------------------------------------------
-    // The Amazon Neptune engine versions this front door publishes.
+    // The Amazon Neptune engine versions this front door publishes. Neptune writes the
+    // parameter group family of its 1.1 versions as `neptune1`, and from 1.2 on as the
+    // major version itself (`neptune1.2`).
+    row(
+        "neptune",
+        "1.1.1.0",
+        "1.1",
+        "neptune1",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.1.2.0",
+        "1.1",
+        "neptune1",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &NEPTUNE,
+    ),
     row(
         "neptune",
         "1.2.1.0",
@@ -1753,6 +2025,21 @@ pub(crate) fn serves_another_control_plane(engine: &str) -> bool {
     matches!(engine, "docdb" | "neptune")
 }
 
+/// Whether `engine` is an RDS CUSTOM engine — one whose versions are custom engine
+/// versions (CEVs) and whose DB instances give the customer host access instead of the
+/// managed features an RDS DB instance gets.
+///
+/// The RDS Custom engines are the ones whose names the `Engine` members of this model
+/// publish with a `custom-` prefix (`custom-oracle-ee`, `custom-sqlserver-ee`, …), so the
+/// prefix is what decides it rather than a list that would have to be kept beside
+/// [`ENGINES`]. It is what the RDS Custom sentences on `ListSupportedCharacterSets` and
+/// `ListSupportedTimezones` apply to. The gate only ever sees an engine name the
+/// catalogue itself carries, so the prefix match is exact, like every other engine
+/// comparison in this module.
+fn is_rds_custom_engine(engine: &str) -> bool {
+    engine.starts_with("custom-")
+}
+
 /// Whether a DEFAULT engine version resolves for `engine` on this front door — what
 /// `DefaultOnly` selects, and so what decides between a report and an
 /// `InvalidParameterCombination` refusal.
@@ -1770,7 +2057,8 @@ fn resolves_a_default_version(engine: &str) -> bool {
 }
 
 /// The engine facts of `engine`, or `None` for an engine this service reports no
-/// versions for (the `custom-oracle-*` engines, and any value that is not an engine).
+/// versions for (the `custom-oracle-*` engines, whose versions only
+/// `CreateCustomDBEngineVersion` mints, and any value that is not an engine).
 pub(crate) fn engine_facts(engine: &str) -> Option<&'static EngineFacts> {
     ENGINES.iter().find(|facts| facts.engine == engine)
 }
@@ -1794,8 +2082,8 @@ pub(crate) fn engine_facts(engine: &str) -> Option<&'static EngineFacts> {
 /// * any other value — `Err`: it names no version this service can provision.
 ///
 /// `Ok(None)` means the catalogue publishes no AVAILABLE version for `engine` at all
-/// (a `custom-*` engine, whose versions a customer creates, or a value that is not an
-/// engine): there is nothing to resolve against, so the caller keeps what the request
+/// (a `custom-oracle-*` engine, whose versions a customer creates, or a value that is not
+/// an engine): there is nothing to resolve against, so the caller keeps what the request
 /// named rather than moving it to another engine's version.
 pub(crate) fn resolve_version(
     engine: &str,
@@ -2041,10 +2329,25 @@ fn to_wire(
     certificates: &[String],
 ) -> CreateCustomDBEngineVersionOutput {
     let profile = entry.profile;
-    let supported_character_sets = (input.list_supported_character_sets == Some(true)
-        && !facts.character_sets.is_empty())
-    .then(|| facts.character_sets.iter().map(character_set).collect());
+    // "For RDS Custom, the default is not to list supported character sets. If you
+    // enable this parameter, RDS Custom returns no results" — and `ListSupportedTimezones`
+    // carries the same sentence. So an RDS Custom engine version lists NEITHER, whatever
+    // the request asked for, while `DefaultCharacterSet` below is still reported: no flag
+    // gates it, and it is the engine's own default collation.
+    let rds_custom = is_rds_custom_engine(entry.engine);
+    let lists_character_sets = input.list_supported_character_sets == Some(true) && !rds_custom;
+    let supported_character_sets = (lists_character_sets && !facts.character_sets.is_empty())
+        .then(|| facts.character_sets.iter().map(character_set).collect());
+    // `SupportedNcharCharacterSets` — "the character sets supported by the Oracle DB
+    // engine for the `NcharCharacterSetName` parameter of the `CreateDBInstance`
+    // operation": the same question as `SupportedCharacterSets` asked of the national
+    // character set, so the same flag reports it, and only for an engine that takes an
+    // `NcharCharacterSetName` ("This setting doesn't apply to RDS Custom DB instances").
+    let supported_nchar_character_sets = (lists_character_sets
+        && !facts.nchar_character_sets.is_empty())
+    .then(|| facts.nchar_character_sets.iter().map(character_set).collect());
     let supported_timezones = (input.list_supported_timezones == Some(true)
+        && !rds_custom
         && !facts.timezones.is_empty())
     .then(|| {
         facts
@@ -2098,6 +2401,7 @@ fn to_wire(
         }),
         default_character_set: facts.character_sets.first().map(character_set),
         supported_character_sets,
+        supported_nchar_character_sets,
         supported_timezones,
         valid_upgrade_target: Some(valid_upgrade_targets(entry, facts, index)),
         // The members a CUSTOM engine version carries — `DBEngineVersionArn`,

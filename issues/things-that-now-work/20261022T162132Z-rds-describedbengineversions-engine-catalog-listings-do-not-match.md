@@ -12,6 +12,18 @@ Issue-Commit: 41eca1b5094053f7eb75d5bb9c5bde3b8db45df6
 
 # RDS DescribeDBEngineVersions engine catalog listings do not match the AWS catalog
 
+> _Resolution: the structural and per-entry causes are fixed — the RDS Custom for SQL
+> Server engines are served as catalogue data (cause 3), every engine version is published
+> in its engine family's form (Db2 `…sbNNNNNNNN.rN`, the dated RDS Extended Support builds),
+> the `docdb 8.0` and `neptune1` families exist, Db2 publishes its `SupportedFeatureNames`
+> and every Oracle entry its `SupportedNcharCharacterSets`. DECLINED, and so still
+> divergent on replay: the IDENTITY, COUNT and ORDER of the recorded listings (causes 1, 2,
+> 7 and the residue of 4-6 and 8-10, i.e. the `DBEngineVersion[*]` key). Those are a
+> snapshot of AWS's live catalogue on the day of the recording — it moves with every RDS
+> release and no rule produces it — so matching it entry-for-entry would be fitting the
+> recorded instance. This emulator publishes its own reference data in AWS's forms, shapes
+> and invariants instead._
+
 > _Note: this issue was identified against the code base at commit `41eca1b5094053f7eb75d5bb9c5bde3b8db45df6`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
