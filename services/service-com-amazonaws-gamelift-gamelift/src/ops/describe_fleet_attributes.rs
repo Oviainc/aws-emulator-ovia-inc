@@ -2,7 +2,7 @@
 
 //! @op DescribeFleetAttributes
 //! Reports the stored fleets: every one of them when the request names no fleet, and
-//! only the named ones otherwise, a page at a time.
+//! only the named ones that exist otherwise, a page at a time.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -229,20 +229,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both `Limit` and `NextToken` document the same carve-out: "This parameter is
         // ignored when the request specifies one or a list of fleet IDs." So a request
         // that names fleets gets all of them, whole, and no token.
+        //
+        // "a FleetAttributes object is returned for each fleet requested, UNLESS THE
+        // FLEET IDENTIFIER IS NOT FOUND", and `FleetAttributes`' own doc: "Attribute
+        // objects are returned only for fleets that currently exist." An identifier that
+        // names no stored fleet therefore selects nothing — it is simply absent from the
+        // reported collection — and the request still succeeds, so a client polling this
+        // operation to learn whether a fleet exists reads an empty page rather than a
+        // thrown `NotFoundException`.
         let mut selected = Vec::new();
         let mut reported = ::std::collections::HashSet::new();
         for id_or_arn in requested {
-            let fleet_id = state.resolve_fleet_id(id_or_arn);
-            let fleet = fleet_id
-                .as_ref()
-                .and_then(|fleet_id| state.fleets.get(fleet_id));
-            let (Some(fleet_id), Some(fleet)) = (fleet_id, fleet) else {
-                return Err(DescribeFleetAttributesErrorModeled::NotFoundException(
-                    NotFoundException {
-                        message: Some(format!("The fleet {id_or_arn} was not found.")),
-                    },
-                )
-                .into());
+            let Some(fleet_id) = state.resolve_fleet_id(id_or_arn) else {
+                continue;
+            };
+            let Some(fleet) = state.fleets.get(&fleet_id) else {
+                continue;
             };
             // "a FleetAttributes object is returned for each fleet requested": one per
             // distinct FLEET, so naming the same fleet twice — by id and by ARN, or just

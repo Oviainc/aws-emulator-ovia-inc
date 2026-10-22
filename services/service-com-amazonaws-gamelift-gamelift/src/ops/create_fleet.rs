@@ -377,10 +377,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be unreachable. Once that slice lands, an unknown build or script becomes the
         // modelled `NotFoundException` here.
         if compute_type == COMPUTE_TYPE_ANYWHERE {
+            // An Anywhere fleet is defined by the locations it deploys to, and what this
+            // branch checks is that the request carried some: so the refusal names THAT
+            // constraint — the location configurations cannot be empty — rather than a
+            // stronger one the handler does not enforce. (AWS answers a CreateFleet
+            // whose `Locations` is absent or empty with exactly this wording.)
             if input.locations.as_ref().is_none_or(Vec::is_empty) {
-                return Err(invalid(
-                    "Locations with a custom location is required to create a fleet with ComputeType ANYWHERE.",
-                ));
+                return Err(invalid("Location configuration(s) cannot be empty."));
             }
         } else {
             match (&input.build_id, &input.script_id) {

@@ -262,6 +262,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into()
         };
+        // This operation's `NotFoundException` message is BUILT FROM THE REQUEST: the
+        // fleet identifier the caller supplied, verbatim, in the template AWS answers a
+        // CreateGameSession on an absent fleet with — `Cannot find fleet with ID
+        // <FleetId>`.
+        let fleet_not_found = |fleet_reference: &str| -> Self::Error {
+            not_found(format!("Cannot find fleet with ID {fleet_reference}"))
+        };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateGameSessionErrorModeled::InternalServiceException(
@@ -308,14 +315,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(fleet_id) = state.resolve_fleet_id(&fleet_reference) else {
-            return Err(not_found(format!(
-                "The fleet {fleet_reference} was not found."
-            )));
+            return Err(fleet_not_found(&fleet_reference));
         };
         let Some(fleet) = state.fleets.get(&fleet_id) else {
-            return Err(not_found(format!(
-                "The fleet {fleet_reference} was not found."
-            )));
+            return Err(fleet_not_found(&fleet_reference));
         };
 
         // "The target fleet must be in ACTIVE status."

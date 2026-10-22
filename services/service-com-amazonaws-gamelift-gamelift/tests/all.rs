@@ -15,3 +15,5 @@
 mod hosting_loop;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unknown_resource_lookups.rs"]
+mod unknown_resource_lookups;

@@ -192,17 +192,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         state.tick(now);
 
-        let Some(fleet_id) = state.resolve_fleet_id(&input.fleet_id) else {
-            return Err(DeleteFleetErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("The fleet {} was not found.", input.fleet_id)),
+        // This operation's `NotFoundException` message is BUILT FROM THE REQUEST: the
+        // fleet identifier the caller supplied, verbatim and single-quoted, in the
+        // template AWS answers a DeleteFleet of an absent fleet with —
+        // `Unable to find fleet '<FleetId>'.`
+        let not_found = || -> Self::Error {
+            DeleteFleetErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("Unable to find fleet '{}'.", input.fleet_id)),
             })
-            .into());
+            .into()
+        };
+
+        let Some(fleet_id) = state.resolve_fleet_id(&input.fleet_id) else {
+            return Err(not_found());
         };
         let Some(fleet) = state.fleets.get_mut(&fleet_id) else {
-            return Err(DeleteFleetErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("The fleet {} was not found.", input.fleet_id)),
-            })
-            .into());
+            return Err(not_found());
         };
 
         // A fleet already being deleted keeps the deletion it is in the middle of: the
