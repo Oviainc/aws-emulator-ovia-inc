@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    Group, GroupSummary, IndexingRule, IndexingRuleValue, InsightsConfiguration,
+    EncryptionConfig, Group, GroupSummary, IndexingRule, IndexingRuleValue, InsightsConfiguration,
     ProbabilisticRuleValue,
 };
 
@@ -49,6 +49,181 @@ pub const SEGMENT_ERROR_MISSING_FIELD: &str = "MissingRequiredField";
 /// `UnprocessedTraceSegment$ErrorCode` for a document whose field is present but
 /// of the wrong JSON type.
 pub const SEGMENT_ERROR_INVALID_FIELD: &str = "InvalidField";
+
+// ---------------------------------------------------------------------------
+// Encryption configuration
+//
+// `PutEncryptionConfig` replaces the whole document and `GetEncryptionConfig`
+// reports what is stored, so both read one record ([`EncryptionConfigRecord`])
+// rather than keeping a copy each.
+// ---------------------------------------------------------------------------
+
+/// `EncryptionConfig$Type` for encryption with a caller-selected KMS key, from
+/// [`crate::ops::types::ENCRYPTION_TYPE_VALUES`].
+pub const ENCRYPTION_TYPE_KMS: &str = "KMS";
+
+/// `EncryptionConfig$Type` for X-Ray's default encryption, from
+/// [`crate::ops::types::ENCRYPTION_TYPE_VALUES`].
+pub const ENCRYPTION_TYPE_NONE: &str = "NONE";
+
+/// `EncryptionConfig$Status` while a submitted configuration is being applied,
+/// from [`crate::ops::types::ENCRYPTION_STATUS_VALUES`].
+pub const ENCRYPTION_STATUS_UPDATING: &str = "UPDATING";
+
+/// `EncryptionConfig$Status` once the stored configuration is in force, from
+/// [`crate::ops::types::ENCRYPTION_STATUS_VALUES`].
+pub const ENCRYPTION_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How long a configuration reports `UPDATING` before the clock owes it
+/// `ACTIVE`.
+///
+/// CHOSEN, not documented: X-Ray publishes no duration for applying a new
+/// encryption configuration, so this is a value inside the project's 250–750 ms
+/// band for a transition the clock owes. It is deliberately non-zero, because
+/// `EncryptionConfig$Status` documents a state a caller can observe — "While the
+/// status is UPDATING, X-Ray may encrypt data with a combination of the new and
+/// old settings" — so a read taken straight after the put must still see it.
+pub const ENCRYPTION_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// The number of digits in an Amazon Web Services account id, which the account
+/// field of an ARN carries.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The number of dash-separated groups in the id KMS mints for a single-region
+/// key.
+const KEY_ID_GROUPS: usize = 5;
+
+/// The number of hexadecimal digits after the `mrk-` prefix of the id KMS mints
+/// for a multi-region key.
+const MULTI_REGION_KEY_ID_DIGITS: usize = 32;
+
+/// Whether `candidate` is a KMS key id (`PutEncryptionConfig$KeyId`: "Key ID -
+/// The KMS key ID of the key").
+///
+/// The emulator resolves no KMS key, so only the FORM is judged, and it is judged
+/// no more narrowly than the id's two shapes: [`KEY_ID_GROUPS`] non-empty groups
+/// of hexadecimal digits for a single-region key — which covers both the
+/// canonical 8-4-4-4-12 grouping and the differently grouped example that
+/// member's own documentation gives — or `mrk-` and
+/// [`MULTI_REGION_KEY_ID_DIGITS`] hexadecimal digits for a multi-region key.
+fn is_kms_key_id(candidate: &str) -> bool {
+    let hexadecimal = |group: &str| {
+        !group.is_empty() && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    if let Some(digits) = candidate.strip_prefix("mrk-") {
+        return digits.len() == MULTI_REGION_KEY_ID_DIGITS && hexadecimal(digits);
+    }
+    let mut groups = 0usize;
+    for group in candidate.split('-') {
+        if !hexadecimal(group) {
+            return false;
+        }
+        groups += 1;
+    }
+    groups == KEY_ID_GROUPS
+}
+
+/// Whether `candidate` is a KMS alias path: `alias/` followed by a non-empty
+/// name of the characters KMS's alias name allows (`^[a-zA-Z0-9:/_-]+$`), as in
+/// `PutEncryptionConfig$KeyId`'s "Alias - The name of the key. For example,
+/// alias/MyKey".
+fn is_kms_alias(candidate: &str) -> bool {
+    candidate.strip_prefix("alias/").is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b":/_-".contains(&byte))
+    })
+}
+
+/// Whether `candidate` is the full ARN of a KMS key or alias
+/// (`arn:<partition>:kms:<region>:<account>:key/<key id>` or `…:alias/<name>`),
+/// the third form `PutEncryptionConfig$KeyId` documents.
+fn is_kms_arn(candidate: &str) -> bool {
+    let mut fields = candidate.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some("kms"),
+        Some(region),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return false;
+    };
+    !partition.is_empty()
+        && !region.is_empty()
+        && account.len() == ACCOUNT_ID_DIGITS
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+        && (is_kms_alias(resource) || resource.strip_prefix("key/").is_some_and(is_kms_key_id))
+}
+
+/// Whether `key_id` selects a KMS key in one of the three forms
+/// `PutEncryptionConfig$KeyId` documents — an alias, a key id, or the full ARN of
+/// either. Anything else is refused: the emulator holds no KMS keys, so the form
+/// of the selector is all there is to judge.
+pub fn is_kms_key_selector(key_id: &str) -> bool {
+    is_kms_alias(key_id) || is_kms_key_id(key_id) || is_kms_arn(key_id)
+}
+
+/// The encryption configuration this service reports: what `PutEncryptionConfig`
+/// last stored, and when the clock owes it `ACTIVE`.
+#[derive(Debug, Clone)]
+pub struct EncryptionConfigRecord {
+    /// `EncryptionConfig$Type`: [`ENCRYPTION_TYPE_KMS`] or
+    /// [`ENCRYPTION_TYPE_NONE`].
+    pub encryption_type: String,
+    /// `EncryptionConfig$KeyId`: the key the caller selected, kept in the form it
+    /// was given (the emulator resolves no KMS key, so it invents no other form);
+    /// `None` under [`ENCRYPTION_TYPE_NONE`].
+    pub key_id: Option<String>,
+    /// When `UPDATING` -> `ACTIVE` falls due; `None` once the configuration is
+    /// active. See [`ENCRYPTION_SETTLE_AFTER`].
+    pub active_due: Option<Instant>,
+}
+
+impl Default for EncryptionConfigRecord {
+    /// Until a configuration is put, X-Ray encrypts with its own key: `Type`
+    /// `NONE`, `Status` `ACTIVE`, and no `KeyId`.
+    fn default() -> Self {
+        Self {
+            encryption_type: ENCRYPTION_TYPE_NONE.to_string(),
+            key_id: None,
+            active_due: None,
+        }
+    }
+}
+
+impl EncryptionConfigRecord {
+    /// Materialise the `UPDATING` -> `ACTIVE` transition the clock owes by `now`.
+    pub fn settle(&mut self, now: Instant) {
+        if self.active_due.is_some_and(|due| due <= now) {
+            self.active_due = None;
+        }
+    }
+
+    /// This record as the modelled `EncryptionConfig`, as of `now`.
+    pub fn to_config(&self, now: Instant) -> EncryptionConfig {
+        let status = if self.active_due.is_some_and(|due| due > now) {
+            ENCRYPTION_STATUS_UPDATING
+        } else {
+            ENCRYPTION_STATUS_ACTIVE
+        };
+        EncryptionConfig {
+            key_id: self.key_id.clone(),
+            status: Some(status.to_string()),
+            r#type: Some(self.encryption_type.clone()),
+        }
+    }
+}
 
 /// `UnprocessedTraceSegment$ErrorCode` for a document refused because its trace
 /// already holds [`MAX_SEGMENTS_PER_TRACE`] segments.
@@ -168,6 +343,9 @@ pub struct ComAmazonawsXrayAwsxrayState {
     pub group_seq: u64,
     /// Ingest counter, stamped on a trace so the oldest can be evicted.
     pub ingest_seq: u64,
+    /// The encryption configuration `PutEncryptionConfig` stores and
+    /// `GetEncryptionConfig` reports; X-Ray's default until one is put.
+    pub encryption: EncryptionConfigRecord,
     /// Where `PutTraceSegments` and OTLP data go, as last set by
     /// `UpdateTraceSegmentDestination`; its [`Default`] is the account default
     /// every reader answers until something changes it.
@@ -811,6 +989,29 @@ impl InsightsConfigurationRecord {
 }
 
 impl ComAmazonawsXrayAwsxrayState {
+    /// Replace the encryption configuration and start its `UPDATING` span,
+    /// returning the document to report — which is the stored one, as of `now`.
+    pub fn put_encryption_config(
+        &mut self,
+        encryption_type: &str,
+        key_id: Option<String>,
+        now: Instant,
+    ) -> EncryptionConfig {
+        self.encryption = EncryptionConfigRecord {
+            encryption_type: encryption_type.to_string(),
+            key_id,
+            active_due: Some(now + ENCRYPTION_SETTLE_AFTER),
+        };
+        self.encryption.to_config(now)
+    }
+
+    /// The stored encryption configuration as of `now`, materialising the
+    /// `UPDATING` -> `ACTIVE` transition the clock already owed.
+    pub fn encryption_config(&mut self, now: Instant) -> EncryptionConfig {
+        self.encryption.settle(now);
+        self.encryption.to_config(now)
+    }
+
     /// Store one parsed segment under its trace, replacing a segment already
     /// held under the same id — which is how an in-progress segment is
     /// overwritten by the completed one.

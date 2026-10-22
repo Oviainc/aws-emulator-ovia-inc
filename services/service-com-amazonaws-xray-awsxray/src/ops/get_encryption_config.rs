@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEncryptionConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEncryptionConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the encryption configuration this service holds.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEncryptionConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `GetEncryptionConfig` answers from
+//! [`crate::state::ComAmazonawsXrayAwsxrayState::encryption`] — X-Ray's default
+//! document (`Type` `NONE`, `Status` `ACTIVE`, no `KeyId`) until
+//! `PutEncryptionConfig` stores one. It is a REPORTING operation: the only write
+//! it makes is to materialise the `UPDATING` -> `ACTIVE` transition the clock
+//! already owed, which fell due at the same instant whether or not anybody read.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +133,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEncryptionConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEncryptionConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEncryptionConfig"))
+        // The request models no members, and the configuration is service-wide, so
+        // neither the input nor the request metadata selects anything.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetEncryptionConfigErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray encryption configuration is unavailable on this emulator engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `encryption_config` settles the `UPDATING` -> `ACTIVE` transition the
+        // clock owes before rendering, so two reads either side of that instant
+        // report the same document the clock made due.
+        let encryption_config = state.lock().encryption_config(::std::time::Instant::now());
+        Ok(GetEncryptionConfigOutput {
+            encryption_config: Some(encryption_config),
+        })
     }
 }

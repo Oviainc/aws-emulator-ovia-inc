@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEncryptionConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEncryptionConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: stores the encryption configuration this service reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEncryptionConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `PutEncryptionConfig` replaces the whole document in
+//! [`crate::state::ComAmazonawsXrayAwsxrayState::encryption`] and starts its
+//! `UPDATING` span, so `GetEncryptionConfig` reports the new `Type` and `KeyId`
+//! at once and `Status` `ACTIVE` once the clock owes it
+//! ([`crate::state::ENCRYPTION_SETTLE_AFTER`]). A `KeyId` that is not a KMS key
+//! selector, a `KMS` request without one, and a `NONE` request that carries one
+//! are each refused with `InvalidRequestException` rather than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +146,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEncryptionConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEncryptionConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEncryptionConfig"))
+        // The engine is reachable from `&self` (constructor-injected); the request
+        // metadata selects nothing here, as the configuration is service-wide.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutEncryptionConfigErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray encryption configuration is unavailable on this emulator engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `Type` is a modelled enum and `KeyId`'s length bound is modelled, so what
+        // is left to refuse is the relationship between the two members — "Omit this
+        // key if you set Type to NONE" (`PutEncryptionConfig$KeyId`) — and a `KeyId`
+        // that is not one of the three KMS selector forms that member documents.
+        let refuse = |message: String| -> PutEncryptionConfigError {
+            PutEncryptionConfigErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+        let key_id = match input.r#type.as_str() {
+            crate::state::ENCRYPTION_TYPE_KMS => {
+                let Some(key_id) = input.key_id else {
+                    return Err(refuse(
+                        "KeyId is required when Type is KMS: it selects the KMS key to \
+                         encrypt with"
+                            .to_string(),
+                    ));
+                };
+                if !crate::state::is_kms_key_selector(&key_id) {
+                    return Err(refuse(format!(
+                        "KeyId `{key_id}` is not a KMS key: give an alias \
+                         (alias/MyKey), a key id, or the full ARN of either"
+                    )));
+                }
+                Some(key_id)
+            }
+            crate::state::ENCRYPTION_TYPE_NONE => {
+                if let Some(key_id) = input.key_id {
+                    return Err(refuse(format!(
+                        "KeyId `{key_id}` must be omitted when Type is NONE: NONE \
+                         selects X-Ray's default encryption"
+                    )));
+                }
+                None
+            }
+            other => {
+                return Err(refuse(format!(
+                    "Type `{other}` is not an encryption type: expected one of {}",
+                    ENCRYPTION_TYPE_VALUES.join(", ")
+                )));
+            }
+        };
+
+        let encryption_config = state.lock().put_encryption_config(
+            &input.r#type,
+            key_id,
+            ::std::time::Instant::now(),
+        );
+        Ok(PutEncryptionConfigOutput {
+            encryption_config: Some(encryption_config),
+        })
     }
 }
