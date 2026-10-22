@@ -88,9 +88,12 @@ fn element(body: &str, name: &str, case: &str) -> String {
     body[start..end].to_string()
 }
 
-/// Percent-encode one URI path segment. An ARN carries `:` and `/`, both of which a
-/// non-greedy `@httpLabel` must arrive escaped — exactly as an AWS SDK sends it.
-fn segment(raw: &str) -> String {
+/// Percent-encode one URI path segment or form component, leaving only RFC 3986's
+/// unreserved characters literal. An ARN carries `:` and `/`, both of which a non-greedy
+/// `@httpLabel` must arrive escaped — exactly as an AWS SDK sends it; an
+/// `application/x-www-form-urlencoded` component is escaped the same way, which is why
+/// `all/fis_execution_role_trust.rs` shares this one rather than writing a second copy.
+pub(crate) fn segment(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for byte in raw.bytes() {
         match byte {

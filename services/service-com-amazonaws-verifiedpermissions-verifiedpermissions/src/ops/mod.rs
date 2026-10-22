@@ -101,7 +101,8 @@ pub mod paths {
     pub const SCHEMA_CEDAR_JSON: &str = "/definition/cedarJson";
     /// The `policyStoreId` every operation in this service takes.
     pub const POLICY_STORE_ID: &str = "/policyStoreId";
-    /// `ListPolicies`' pagination cursor.
+    /// The pagination cursor a `@paginated` list operation of this service takes
+    /// (`ListPolicies`, `ListIdentitySources`).
     pub const NEXT_TOKEN: &str = "/nextToken";
     /// `CreatePolicyStoreAlias`' alias name.
     pub const ALIAS_NAME: &str = "/aliasName";

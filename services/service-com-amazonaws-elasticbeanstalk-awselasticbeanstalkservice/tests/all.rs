@@ -29,6 +29,8 @@ mod lifecycle;
 mod operations_role;
 #[path = "all/platform_branches.rs"]
 mod platform_branches;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/solution_stacks.rs"]
 mod solution_stacks;
 #[path = "all/state_roundtrip.rs"]

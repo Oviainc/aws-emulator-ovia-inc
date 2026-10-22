@@ -273,6 +273,47 @@ impl ComAmazonawsMedialiveMedialiveState {
             .find(|template| template.region == region && template.name == name)
     }
 
+    /// The ids of the templates stored in the eventbridge rule template group
+    /// `group_id` — the templates `DeleteEventBridgeRuleTemplateGroup` documents
+    /// must be "moved to another group or deleted" before the group goes.
+    ///
+    /// Derived from the templates that exist, which is also what
+    /// `EventBridgeRuleTemplateGroupSummary$TemplateCount` ("The number of
+    /// templates in a group") is read from: a group carries no list of its own.
+    pub fn event_bridge_rule_template_ids_in_group(&self, group_id: &str) -> Vec<String> {
+        self.event_bridge_rule_templates
+            .values()
+            .filter(|template| template.group_id == group_id)
+            .map(|template| template.id.clone())
+            .collect()
+    }
+
+    /// Remove the eventbridge rule template `identifier` names in `region`,
+    /// answering the record that was removed, or `None` when no template in that
+    /// region answers to it.
+    ///
+    /// `DeleteEventBridgeRuleTemplate` is documented "Deletes an eventbridge rule
+    /// template", with no precondition of its own — hence no refusal type: a
+    /// template that exists in the request's region goes, and the miss is the
+    /// only thing a handler has to refuse. Once it is gone every later read of
+    /// either of its identifiers misses, its name is free again and the group
+    /// that held it no longer counts it.
+    pub fn delete_event_bridge_rule_template(
+        &mut self,
+        region: &str,
+        identifier: &str,
+    ) -> Option<EventBridgeRuleTemplateRecord> {
+        let id = self
+            .event_bridge_rule_template(region, identifier)?
+            .id
+            .clone();
+        let removed = self.event_bridge_rule_templates.remove(&id)?;
+        // A token never outlives the resource it minted, so a retried create
+        // cannot resurrect a deleted template.
+        self.event_bridge_rule_template_tokens.forget(&id);
+        Some(removed)
+    }
+
     /// Record `token`, as presented in `region`, as having created the template
     /// `template_id`, evicting the oldest token first if that would push the map
     /// past [`MAX_EVENT_BRIDGE_RULE_TEMPLATE_TOKENS`].

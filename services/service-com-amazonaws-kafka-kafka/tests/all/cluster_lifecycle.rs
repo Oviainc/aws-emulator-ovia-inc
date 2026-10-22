@@ -11,6 +11,9 @@
 //! every cluster exactly once, a delete being visible to every later reader — the
 //! input space is small enough to walk EXHAUSTIVELY, which is strictly stronger
 //! than sampling it.
+//!
+//! The harness every suite here drives the service through lives in
+//! `tests/all/kafka_harness.rs`; this file holds only the lifecycle rules.
 
 use serde_json::Value;
 use service_com_amazonaws_kafka_kafka::state::MAX_CLUSTERS_PER_REGION;
@@ -19,7 +22,7 @@ use crate::kafka_harness::{pct, sleep_past_activation, ClusterRequest, Emulator,
 
 /// Every bootstrap-broker member the model declares, so a suite can assert that a
 /// member it did not expect is ABSENT rather than merely unchecked.
-const BOOTSTRAP_MEMBERS: &[&str] = &[
+pub(crate) const BOOTSTRAP_MEMBERS: &[&str] = &[
     "bootstrapBrokerString",
     "bootstrapBrokerStringTls",
     "bootstrapBrokerStringSaslScram",

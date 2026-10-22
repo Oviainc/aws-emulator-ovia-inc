@@ -482,6 +482,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// type. You can't specify a resource label unless the metric type is
 /// ALBRequestCountPerTarget", which is also the one metric type that cannot be resolved
 /// without one: the request count per target is counted per target group.
+///
+/// Each refusal states that rule, in the model's own words rather than in the boundary
+/// validator's constraint template.
 fn check_target_tracking_config(
     config: &TargetTrackingScalingPolicyConfiguration,
 ) -> Result<(), PutScalingPolicyError> {
@@ -494,14 +497,12 @@ fn check_target_tracking_config(
     ) {
         (Some(_), Some(_)) => {
             return Err(validation(
-                "A TargetTrackingScaling policy takes either a PredefinedMetricSpecification or a \
-                 CustomizedMetricSpecification, not both",
+                "You can specify either a predefined metric or a customized metric, but not both",
             ))
         }
         (None, None) => {
             return Err(validation(
-                "A TargetTrackingScaling policy requires either a PredefinedMetricSpecification \
-                 or a CustomizedMetricSpecification",
+                "You must specify either a predefined metric or a customized metric",
             ))
         }
         (Some(predefined), None) => {
@@ -515,15 +516,14 @@ fn check_target_tracking_config(
             match (is_alb, predefined.resource_label.as_deref()) {
                 (true, None) => {
                     return Err(validation(format!(
-                        "A {ALB_REQUEST_COUNT_PER_TARGET} policy requires a ResourceLabel \
-                         identifying the target group the request count is measured per"
+                        "A resource label is required when the metric type is \
+                         {ALB_REQUEST_COUNT_PER_TARGET}"
                     )))
                 }
                 (false, Some(_)) => {
                     return Err(validation(format!(
-                        "ResourceLabel cannot be specified unless the predefined metric type is \
-                         {ALB_REQUEST_COUNT_PER_TARGET}, got {}",
-                        predefined.predefined_metric_type
+                        "You can't specify a resource label unless the metric type is \
+                         {ALB_REQUEST_COUNT_PER_TARGET}"
                     )))
                 }
                 _ => {}
@@ -547,8 +547,8 @@ fn check_target_tracking_config(
                 .is_some_and(|metrics| !metrics.is_empty());
             if !names_metric && !has_query {
                 return Err(validation(
-                    "A CustomizedMetricSpecification requires either MetricName and Namespace or \
-                     a Metrics query",
+                    "A customized metric must specify either a metric name and namespace or a \
+                     metric math query",
                 ));
             }
             // A query names no single series, so the alarms a policy of this shape would be
@@ -626,10 +626,11 @@ fn check_tracked_metric(
 
 /// Refuse a step-scaling configuration whose steps cannot be evaluated.
 ///
-/// Both rules are the model's own: "At least one step adjustment is required if you are
-/// adding a new step scaling policy configuration", and of a step adjustment's bounds, "the
-/// upper and lower bound can't be null in the same step adjustment" with "at most one step
-/// adjustment can have a null lower bound" and the same for the upper bound.
+/// Both rules are the model's own, and the refusal is the model's own sentence for each:
+/// "At least one step adjustment is required if you are adding a new step scaling policy
+/// configuration", and of a step adjustment's bounds, "the upper and lower bound can't be
+/// null in the same step adjustment" with "at most one step adjustment can have a null lower
+/// bound" and the same for the upper bound.
 fn check_step_config(
     config: &StepScalingPolicyConfiguration,
 ) -> Result<(), PutScalingPolicyError> {
@@ -648,7 +649,8 @@ fn check_step_config(
     let adjustments = config.step_adjustments.as_deref().unwrap_or(&[]);
     if adjustments.is_empty() {
         return Err(validation(
-            "A StepScaling policy requires at least one StepAdjustment",
+            "At least one step adjustment is required if you are adding a new step scaling \
+             policy configuration",
         ));
     }
     let mut unbounded_below = 0usize;
@@ -660,9 +662,7 @@ fn check_step_config(
         ) {
             (None, None) => {
                 return Err(validation(
-                    "A StepAdjustment must specify MetricIntervalLowerBound or \
-                     MetricIntervalUpperBound: the upper and lower bound cannot both be null in \
-                     the same step adjustment",
+                    "The upper and lower bound can't be null in the same step adjustment",
                 ))
             }
             (None, Some(_)) => unbounded_below += 1,
@@ -670,10 +670,14 @@ fn check_step_config(
             (Some(_), Some(_)) => {}
         }
     }
-    if unbounded_below > 1 || unbounded_above > 1 {
+    if unbounded_below > 1 {
         return Err(validation(
-            "At most one StepAdjustment can have a null MetricIntervalLowerBound, and at most one \
-             a null MetricIntervalUpperBound",
+            "At most one step adjustment can have a null lower bound",
+        ));
+    }
+    if unbounded_above > 1 {
+        return Err(validation(
+            "At most one step adjustment can have a null upper bound",
         ));
     }
     Ok(())

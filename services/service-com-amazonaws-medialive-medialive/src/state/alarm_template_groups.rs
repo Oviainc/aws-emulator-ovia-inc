@@ -12,7 +12,9 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use super::{template_group_token_key, ComAmazonawsMedialiveMedialiveState};
+use super::{
+    template_group_token_key, ComAmazonawsMedialiveMedialiveState, TemplateGroupDeleteRefusal,
+};
 
 /// The id the first cloudwatch alarm template group of a process gets.
 ///
@@ -149,6 +151,54 @@ impl ComAmazonawsMedialiveMedialiveState {
             .get(identifier)
             .filter(|group| group.region == region)
             .or_else(|| self.alarm_template_group_named(region, identifier))
+    }
+
+    /// Remove the cloudwatch alarm template group `identifier` names in
+    /// `region`, answering the record that was removed — or refuse.
+    ///
+    /// `DeleteCloudWatchAlarmTemplateGroup` is documented "Deletes a cloudwatch
+    /// alarm template group. You must detach this group from all signal maps and
+    /// ensure its existing templates are moved to another group or deleted", so a
+    /// group a signal map still names is refused and nothing is removed. The
+    /// group's own cloudwatch alarm TEMPLATES have no store to check yet —
+    /// `CreateCloudWatchAlarmTemplate` is still a scaffold, so no group this store
+    /// holds can hold one — and that half of the precondition belongs to the
+    /// create's own issue. Once removed the group is GONE from the store, so every
+    /// later read of either of its identifiers misses and its name is free again.
+    ///
+    /// The resolution, the precondition and the removal live together here, so a
+    /// handler cannot check one of them and write past another; the handler's job
+    /// is only to turn a [`TemplateGroupDeleteRefusal`] into the operation's own
+    /// modelled error.
+    pub fn delete_alarm_template_group(
+        &mut self,
+        region: &str,
+        identifier: &str,
+    ) -> Result<CloudWatchAlarmTemplateGroupRecord, TemplateGroupDeleteRefusal> {
+        let id = self
+            .alarm_template_group(region, identifier)
+            .ok_or(TemplateGroupDeleteRefusal::NotFound)?
+            .id
+            .clone();
+
+        let signal_map_ids = self.signal_maps_using_alarm_template_group(&id);
+        if !signal_map_ids.is_empty() {
+            return Err(TemplateGroupDeleteRefusal::StillHeld {
+                signal_map_ids,
+                // The group's own cloudwatch alarm TEMPLATES have no store to
+                // read: see this method's documentation.
+                template_ids: Vec::new(),
+            });
+        }
+
+        let removed = self
+            .alarm_template_groups
+            .remove(&id)
+            .ok_or(TemplateGroupDeleteRefusal::NotFound)?;
+        // A token never outlives the resource it minted, so a retried create
+        // cannot resurrect a deleted group.
+        self.alarm_template_group_tokens.forget(&id);
+        Ok(removed)
     }
 
     /// The group called `name` in `region`, if one exists. `Name` is documented

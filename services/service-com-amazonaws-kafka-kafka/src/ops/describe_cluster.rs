@@ -180,10 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeClusterErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "No cluster exists in {region} with the ARN {}",
-                        input.cluster_arn
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
                 .into(),
             );

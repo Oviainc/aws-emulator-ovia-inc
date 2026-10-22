@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutInvocationStep
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutInvocationStep`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutInvocationStep::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores one invocation step, payload union and all, under the named
+//! session and invocation. AWS documents that an ended session's content can still
+//! be read but not added to (`smithy_query(query="doc",shape="EndSession")`), so a
+//! session that is not `ACTIVE` is a 409 `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutInvocationStep` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutInvocationStepErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutInvocationStep"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutInvocationStepErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the session store is unavailable".to_string()),
+                    reason: None,
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        // Split the one `&mut` so the store-order counter and the session map are
+        // borrowed as the disjoint fields they are.
+        let store = &mut *guard;
+        let key = crate::state::session_id_from_identifier(&input.session_identifier);
+        let Some(session) = store.sessions.get_mut(key) else {
+            return Err(PutInvocationStepErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Session with identifier {} was not found.",
+                        input.session_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+        if session.status != crate::state::SessionStatus::Active {
+            return Err(PutInvocationStepErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Session {} has status {} and can no longer be added to.",
+                    session.session_id,
+                    session.status.as_wire()
+                )),
+            })
+            .into());
+        }
+        let session_id = session.session_id.clone();
+        let now = crate::state::now();
+        let Some(invocation) = session.invocations.get_mut(&input.invocation_identifier) else {
+            return Err(PutInvocationStepErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Invocation {} was not found in session {session_id}.",
+                        input.invocation_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let step_id = input
+            .invocation_step_id
+            .unwrap_or_else(crate::state::new_uuid);
+        // An explicit `invocationStepId` that already exists overwrites that step and
+        // keeps its position in the store order, so a rewrite does not reshuffle a
+        // listing; a new id takes the next position.
+        let order = match invocation.steps.get(&step_id) {
+            Some(existing) => existing.order,
+            None => {
+                if invocation.steps.len() >= crate::state::MAX_STEPS_PER_INVOCATION {
+                    // Resource guard, not an AWS quota: see `state::MAX_SESSIONS`.
+                    return Err(PutInvocationStepErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "Invocation {} holds the maximum of {} invocation steps this emulator keeps.",
+                                invocation.invocation_id,
+                                crate::state::MAX_STEPS_PER_INVOCATION
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::next_order(&mut store.order_counter)
+            }
+        };
+        invocation.steps.insert(
+            step_id.clone(),
+            crate::state::InvocationStepRecord {
+                invocation_step_id: step_id.clone(),
+                invocation_id: invocation.invocation_id.clone(),
+                session_id,
+                invocation_step_time: input.invocation_step_time,
+                // The payload union is stored WHOLE, so GetInvocationStep hands back
+                // what was written rather than a reconstruction of it.
+                payload: input.payload,
+                order,
+            },
+        );
+
+        // The invocation borrow ends here, so the session's own field is writable
+        // again: adding content to a session modifies the session.
+        session.last_updated_at = now;
+        Ok(PutInvocationStepOutput {
+            invocation_step_id: step_id,
+        })
     }
 }

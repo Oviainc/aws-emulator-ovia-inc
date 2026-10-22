@@ -21,7 +21,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below is signed for — deliberately not the emulator's
 /// `us-east-1` default, so an ARN assertion proves the region came from the request.
-const REGION: &str = "us-west-2";
+///
+/// `pub(crate)` here and below: the suites in this test crate drive the service the
+/// same way, so they share this harness rather than each growing a copy of it.
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The access key id every request below is signed with. `Build$initiator` reports the
 /// calling identity, which is this.
@@ -29,11 +32,11 @@ const ACCESS_KEY_ID: &str = "AKIDCODEBUILDTEST";
 
 /// Long enough for a build's clock-owed transition out of `IN_PROGRESS` to have fallen
 /// due (the service settles it 750 ms after StartBuild).
-const PAST_THE_SETTLE_SPAN: Duration = Duration::from_millis(1_100);
+pub(crate) const PAST_THE_SETTLE_SPAN: Duration = Duration::from_millis(1_100);
 
 /// One router carrying only this service, over one shared engine — the same assembly
 /// `core/router` builds, minus the other services.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_on(Arc::new(engine::InMemoryEngine::new()))
 }
 
@@ -47,7 +50,7 @@ fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// Call one operation and return its HTTP status and decoded body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -94,7 +97,7 @@ fn create_project_body(name: &str, extra: Value) -> Value {
 }
 
 /// Create `name`, asserting it succeeded, and hand back the stored project.
-async fn create_project(router: &MultiServiceRouter, name: &str, extra: Value) -> Value {
+pub(crate) async fn create_project(router: &MultiServiceRouter, name: &str, extra: Value) -> Value {
     let (status, body) = call(router, "CreateProject", create_project_body(name, extra)).await;
     assert_eq!(
         status, 200,
@@ -104,7 +107,7 @@ async fn create_project(router: &MultiServiceRouter, name: &str, extra: Value) -
 }
 
 /// Start a build of `project_name`, asserting it succeeded, and hand back the build.
-async fn start_build(router: &MultiServiceRouter, body: Value) -> Value {
+pub(crate) async fn start_build(router: &MultiServiceRouter, body: Value) -> Value {
     let (status, response) = call(router, "StartBuild", body.clone()).await;
     assert_eq!(
         status, 200,
@@ -114,7 +117,7 @@ async fn start_build(router: &MultiServiceRouter, body: Value) -> Value {
 }
 
 /// The `__type` an error body carries, for asserting the error code a client branches on.
-fn error_type(body: &Value) -> String {
+pub(crate) fn error_type(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
 }
 

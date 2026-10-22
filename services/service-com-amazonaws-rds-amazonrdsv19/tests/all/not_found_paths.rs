@@ -743,10 +743,11 @@ async fn applying_a_maintenance_action_reports_the_resources_own_pending_actions
 async fn global_clusters_are_reported_out_of_state_and_filtered_by_member_region() {
     let (router, engine) = emulator();
 
-    // `CreateGlobalCluster` is still scaffolded, so the records a report must read are
-    // written straight into the store the handlers read, through the same guard a handler
-    // uses. Two global clusters, whose members sit in different regions, so the one
-    // documented filter (`region`) has something to select on.
+    // The records a report must read are written straight into the store the handlers
+    // read, through the same guard a handler uses, so this suite tests the REPORT rather
+    // than the writer (`global_clusters.rs` covers the create). Two global clusters, whose
+    // members sit in different regions, so the one documented filter (`region`) has
+    // something to select on.
     {
         let state = store(&engine);
         let mut guard = state.lock();
@@ -760,12 +761,15 @@ async fn global_clusters_are_reported_out_of_state_and_filtered_by_member_region
                     status: "available".to_string(),
                     engine: Some("aurora-postgresql".to_string()),
                     engine_version: Some("15.4".to_string()),
+                    engine_lifecycle_support: "open-source-rds-extended-support".to_string(),
                     database_name: None,
                     storage_encrypted: true,
                     deletion_protection: false,
                     member_cluster_arns: vec![format!(
                         "arn:aws:rds:{member_region}:{ACCOUNT}:cluster:{identifier}-primary"
                     )],
+                    endpoint_host: format!("host{identifier}"),
+                    tags: Vec::new(),
                 },
             );
         }
@@ -865,8 +869,9 @@ async fn global_clusters_are_reported_out_of_state_and_filtered_by_member_region
 async fn event_subscriptions_are_reported_out_of_state_per_region() {
     let (router, engine) = emulator();
 
-    // `CreateEventSubscription` is still scaffolded, so the records are written into the
-    // store directly — one in each region, so the report's regional scope is observable.
+    // The records are written into the store directly, so this suite tests the REPORT
+    // rather than the writer (`event_subscriptions.rs` covers the create) — one in each
+    // region, so the report's regional scope is observable.
     {
         let state = store(&engine);
         let mut guard = state.lock();
@@ -883,6 +888,7 @@ async fn event_subscriptions_are_reported_out_of_state_per_region() {
                     source_ids: vec![format!("{name}-source")],
                     event_categories: vec!["availability".to_string()],
                     enabled: true,
+                    tags: Vec::new(),
                 },
             );
         }

@@ -71,10 +71,12 @@
 use super::types::*;
 
 /// Refuse the request with the service's own client-input error, `BadRequestException`
-/// (HTTP 400): "thrown if the request contains a semantic error".
-fn bad_request(message: impl Into<String>) -> TagResourceError {
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> TagResourceError {
     TagResourceErrorModeled::BadRequestException(BadRequestException {
-        message: message.into(),
+        message: crate::state::validation_failed_message(&detail.into()),
     })
     .into()
 }
@@ -85,7 +87,7 @@ fn bad_request(message: impl Into<String>) -> TagResourceError {
 /// refuse an unresolvable one the same way.
 fn not_found(resource_arn: &str) -> TagResourceError {
     TagResourceErrorModeled::NotFoundException(NotFoundException {
-        message: format!("Resource with ARN {resource_arn} was not found."),
+        message: crate::state::not_found_message(resource_arn),
     })
     .into()
 }
