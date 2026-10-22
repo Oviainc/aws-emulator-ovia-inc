@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +181,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataSource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataSourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+
+        // `Type` is a modelled enum, so only a member of it names a data source kind.
+        // The catalog is the generated one, straight from the model.
+        if !DATA_SOURCE_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            return Err(CreateDataSourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "Type must be one of {}; got {}.",
+                        DATA_SOURCE_TYPE_VALUES.join(", "),
+                        input.r#type
+                    )),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The id names the resource and is the last segment of its ARN, so an empty
+        // one cannot identify anything.
+        if input.data_source_id.is_empty() {
+            return Err(CreateDataSourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some("DataSourceId must not be empty.".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::data_source_arn(&region, &input.aws_account_id, &input.data_source_id);
+        let created_time = crate::state::now_timestamp(std::time::SystemTime::now());
+
+        let mut store = state.lock();
+        let key = (input.aws_account_id.clone(), input.data_source_id.clone());
+        if store.data_sources.contains_key(&key) {
+            return Err(CreateDataSourceErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        "The data source with ID {} already exists.",
+                        input.data_source_id
+                    )),
+                    resource_type: Some("DATA_SOURCE".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The store key is `(AwsAccountId, DataSourceId)` and BOTH halves come from the
+        // request, so a per-account ceiling alone would be reset by varying the account
+        // id. The total-records ceiling is what bounds this process; the per-account one
+        // is the fidelity limit on top of it.
+        if store.data_sources.len() >= crate::state::MAX_DATA_SOURCES {
+            return Err(CreateDataSourceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This QuickSight emulator holds the maximum of {} data sources.",
+                        crate::state::MAX_DATA_SOURCES
+                    )),
+                    resource_type: Some("DATA_SOURCE".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+        if store.data_source_count(&input.aws_account_id)
+            >= crate::state::MAX_DATA_SOURCES_PER_ACCOUNT
+        {
+            return Err(CreateDataSourceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} data sources.",
+                        crate::state::MAX_DATA_SOURCES_PER_ACCOUNT
+                    )),
+                    resource_type: Some("DATA_SOURCE".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        store.data_sources.insert(
+            key,
+            crate::state::DataSourceRecord {
+                arn: arn.clone(),
+                data_source_id: input.data_source_id.clone(),
+                name: input.name,
+                r#type: input.r#type,
+                // The response below reports creation as succeeded, so the stored
+                // resource is in that terminal status from this instant: there is no
+                // later transition for the clock to owe.
+                status: crate::state::RESOURCE_STATUS_CREATION_SUCCESSFUL.to_string(),
+                created_time,
+                last_updated_time: created_time,
+                data_source_parameters: input.data_source_parameters,
+                vpc_connection_properties: input.vpc_connection_properties,
+                ssl_properties: input.ssl_properties,
+                permissions: input.permissions.unwrap_or_default(),
+                tags: input.tags.unwrap_or_default(),
+                // Creation succeeded, so the data source carries no error.
+                error_info: None,
+            },
+        );
+        // `input.credentials` is deliberately not stored: QuickSight never returns it,
+        // and keeping a secret no read can reach only risks disclosing it.
+
+        Ok(CreateDataSourceOutput {
+            arn: Some(arn),
+            data_source_id: Some(input.data_source_id),
+            creation_status: Some(crate::state::RESOURCE_STATUS_CREATION_SUCCESSFUL.to_string()),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }
