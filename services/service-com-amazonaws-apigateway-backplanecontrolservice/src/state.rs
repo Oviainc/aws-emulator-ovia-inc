@@ -209,8 +209,9 @@ pub struct MethodEntry {
     pub request_models: BTreeMap<String, String>,
     pub request_validator_id: Option<String>,
     pub authorization_scopes: Vec<String>,
-    /// Written by `PutMethodResponse`, which is still a stub, so this stays empty for
-    /// now and a `Method` body reports no `methodResponses`.
+    /// Written by `PutMethodResponse` and reported by `GetMethodResponse` and a `Method`
+    /// body's `methodResponses`, keyed by the response's `statusCode`; empty until a
+    /// response is put on the method.
     pub method_responses: BTreeMap<String, GetMethodResponseOutput>,
     /// Written by `PutIntegration` and reported by `GetIntegration` and a `Method`
     /// body's `methodIntegration`; absent until an integration is put on the method.
@@ -444,6 +445,19 @@ pub fn bound_chars(member: &str, value: &str, max: usize) -> Result<(), String> 
         ));
     }
     Ok(())
+}
+
+/// A caller-supplied map as it is STORED and reported: absent when the caller set no
+/// entry, so an empty map in the request does not become an empty map in every later
+/// read.
+///
+/// One copy for every operation that stores a caller-sized map (an integration's request
+/// parameters and templates, a method response's response parameters and models), so two
+/// of them cannot drift on what an empty map means.
+pub fn non_empty_map<V>(
+    map: Option<::std::collections::HashMap<String, V>>,
+) -> Option<::std::collections::HashMap<String, V>> {
+    map.filter(|entries| !entries.is_empty())
 }
 
 /// One page of an ordered id sequence, as a `position`/`limit` paginated collection
@@ -999,6 +1013,10 @@ pub const NO_SUCH_METHOD: &str = "Invalid Method identifier specified";
 
 /// The `NotFoundException` message for a method that carries no integration.
 pub const NO_SUCH_INTEGRATION: &str = "Invalid Integration identifier specified";
+
+/// The `NotFoundException` message for a `statusCode` that names no method response of
+/// the method.
+pub const NO_SUCH_METHOD_RESPONSE: &str = "Invalid Response status code specified";
 
 /// The `NotFoundException` message for a `stageName` that names no stage of the API.
 pub const NO_SUCH_STAGE: &str = "Invalid stage identifier specified";

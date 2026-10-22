@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutMethodResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutMethodResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutMethodResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a `MethodResponse` on an existing `Method`, keyed by its status
+//! code, so a later `GetMethodResponse` — and the `methodResponses` of the method that
+//! owns it — surfaces it. Answers from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +99,93 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use super::put_method::method_key;
+
+/// The prefix a method response header mapping expression carries.
+///
+/// From `PutMethodResponseRequest$responseParameters`' own documentation: "The method
+/// response header names must match the pattern of `method.response.header.{name}`, where
+/// name is a valid and unique header name." Hand-written because the model types the map
+/// key as a bare `String` and declares no pattern for it. `pub` because the same mapping
+/// expression is what an `IntegrationResponse`'s `responseParameters` keys are mapped TO,
+/// so the operations that write those records resolve the form in one place.
+pub const METHOD_RESPONSE_HEADER_PREFIX: &str = "method.response.header.";
+
+/// Whether `key` is a `method.response.header.{name}` mapping expression naming a valid
+/// header: the documented prefix followed by a non-empty HTTP field name.
+///
+/// The name's character set is the HTTP field-name token of RFC 9110 §5.1 (`tchar`), which
+/// is what "a valid … header name" means on the wire.
+pub fn is_method_response_header(key: &str) -> bool {
+    key.strip_prefix(METHOD_RESPONSE_HEADER_PREFIX)
+        .is_some_and(|name| !name.is_empty() && name.chars().all(is_field_name_char))
+}
+
+/// One character of an HTTP field name (RFC 9110 `tchar`); see
+/// [`is_method_response_header`].
+fn is_field_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character)
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all. The method response COUNT per method needs no cap of its own: a
+/// response is keyed by a `statusCode` the model constrains to `^[1-5]\d\d$`, so a method
+/// holds at most that many.
+fn bound_input(input: &PutMethodResponseInput) -> Result<(), String> {
+    use crate::state::{bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS};
+
+    if let Some(parameters) = &input.response_parameters {
+        bound_entries(
+            "responseParameters",
+            parameters.len(),
+            MAX_COLLECTION_ENTRIES,
+        )?;
+        for key in parameters.keys() {
+            bound_chars("a responseParameters key", key, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(models) = &input.response_models {
+        bound_entries("responseModels", models.len(), MAX_COLLECTION_ENTRIES)?;
+        for (key, value) in models {
+            bound_chars("a responseModels key", key, MAX_STRING_CHARS)?;
+            bound_chars("a responseModels value", value, MAX_STRING_CHARS)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `MethodResponse` record `input` asks for, as it must be STORED: the status code
+/// this call creates the response for, plus the two caller-supplied maps.
+///
+/// `Err` carries the `BadRequestException` message for a `responseParameters` key that is
+/// not a `method.response.header.{name}` mapping expression — the one rule these members
+/// publish. The `responseModels` values name `Model` resources, which no operation of this
+/// emulator creates yet, so a value is stored as given rather than resolved.
+///
+/// Validation happens here, before anything is written, so a refused request leaves the
+/// method's responses as they were.
+fn method_response_of(
+    input: &PutMethodResponseInput,
+) -> Result<GetMethodResponseOutput, String> {
+    for key in input.response_parameters.iter().flatten().map(|(key, _)| key) {
+        if !is_method_response_header(key) {
+            return Err(format!(
+                "Invalid mapping expression specified: {key}; a method response parameter must \
+                 match {METHOD_RESPONSE_HEADER_PREFIX}{{name}}, where name is a valid header name"
+            ));
+        }
+    }
+    Ok(GetMethodResponseOutput {
+        // The status code is a path label the model constrains to `^[1-5]\d\d$`, so the
+        // boundary validator has already refused anything that is not three digits.
+        status_code: Some(input.status_code.clone()),
+        response_parameters: crate::state::non_empty_map(input.response_parameters.clone()),
+        response_models: crate::state::non_empty_map(input.response_models.clone()),
+    })
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -140,6 +221,24 @@ impl From<PutMethodResponseErrorModeled> for PutMethodResponseError {
     fn from(modeled: PutMethodResponseErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Refuse a request that breaks one of the `MethodResponse` rules; see
+/// [`method_response_of`].
+fn bad_request(message: String) -> PutMethodResponseError {
+    PutMethodResponseErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: &str) -> PutMethodResponseError {
+    PutMethodResponseErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
 
 /// The `PutMethodResponse` operation.
@@ -180,16 +279,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutMethodResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutMethodResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutMethodResponse"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        bound_input(&input).map_err(bad_request)?;
+        let response = method_response_of(&input).map_err(bad_request)?;
+
+        let mut store = state.lock();
+
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_REST_API))?;
+        let resource = api
+            .resources
+            .get_mut(&input.resource_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        // A method response belongs to a METHOD: the verb in the URI must already name one
+        // on the resource, or there is nothing to add the response to.
+        let method = resource
+            .methods
+            .get_mut(&method_key(&input.http_method))
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+
+        // A status code names at most one response of a method: adding one that is already
+        // there is a conflict, not an overwrite — `UpdateMethodResponse` is the call that
+        // changes a stored response.
+        if method.method_responses.contains_key(&input.status_code) {
+            return Err(PutMethodResponseErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some("Method response already exists for this method".to_string()),
+                },
+            )
+            .into());
+        }
+        method
+            .method_responses
+            .insert(input.status_code.clone(), response.clone());
+
+        Ok(PutMethodResponseOutput {
+            status_code: response.status_code,
+            response_parameters: response.response_parameters,
+            response_models: response.response_models,
+        })
     }
 }
