@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the AMIs the calling account can see out of [`crate::state`]: every image of
+//! the store by default, or the subset the request's `ImageIds`, `Owners`,
+//! `ExecutableUsers` and `Filters` select, one `MaxResults`-sized page at a time. A
+//! reporting operation — it writes nothing at all, images having no clock-owed transition
+//! in this slice.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +116,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    EXECUTABLE_BY_ALL, IMAGE_OWNER_ALIASES, IMAGE_PLATFORM_WINDOWS, IMAGE_STATE_DISABLED,
+    MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES, MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
+    OWNER_SELF, aws_account_id_is_well_formed, decode_page_token, dry_run_operation,
+    encode_page_token, filter_value_matches, image_id_is_well_formed, image_is_deprecated,
+    invalid_ami_id_malformed, invalid_ami_id_not_found, invalid_pagination_token,
+    invalid_parameter_value, invalid_user_id_malformed, require_service_state,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -187,18 +192,541 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImages"))
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids: &[String] = input.image_ids.as_deref().unwrap_or_default();
+        let owners: &[String] = input.owners.as_deref().unwrap_or_default();
+        let executable_users: &[String] = input.executable_users.as_deref().unwrap_or_default();
+
+        // None of these lists is bounded by the model, and each one costs a comparison per
+        // stored image, so the request-controlled factors are capped before any work
+        // proportional to them is done.
+        for (member, values) in [
+            ("ImageIds", requested_ids),
+            ("Owners", owners),
+            ("ExecutableUsers", executable_users),
+        ] {
+            if values.len() > MAX_RESOURCE_IDS {
+                return Err(invalid_parameter_value(format!(
+                    "{member} carries {} values, above the maximum of {MAX_RESOURCE_IDS}",
+                    values.len()
+                )));
+            }
+        }
+
+        // "The maximum number of items to return for this request"
+        // (`DescribeImagesRequest$MaxResults`). The model declares no `@range` for it, so
+        // the handler is the only place the page size can be bounded — a page of none is
+        // not a page, and one above the service's ceiling is refused rather than silently
+        // cut down.
+        if let Some(max_results) = input.max_results {
+            if max_results < 1 {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be at least 1"
+                )));
+            }
+            if usize::try_from(max_results).unwrap_or(usize::MAX) > MAX_PAGE_SIZE {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. \
+                     It must be at most {MAX_PAGE_SIZE}"
+                )));
+            }
+        }
+
+        // An `Owners` or `ExecutableUsers` term that names neither an account nor one of
+        // the aliases is refused before anything is looked up: EC2 answers
+        // `InvalidUserID.Malformed` for it, not an empty result set.
+        for owner in owners {
+            if !is_owner_term(owner) {
+                return Err(invalid_user_id_malformed(owner));
+            }
+        }
+        for user in executable_users {
+            if !is_executable_by_term(user) {
+                return Err(invalid_user_id_malformed(user));
+            }
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // image would have matched it, so an unsupported filter can never read as "no
+        // results"; its value count and size are capped for the same reason the id lists
+        // above are.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum \
+                     of {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+        }
+
+        // "The token returned from a previous paginated request"
+        // (`DescribeImagesRequest$NextToken`) — anything else is refused rather than read
+        // as an id.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        // A read, and only a read: an image has no clock-owed transition in this slice, so
+        // nothing here writes to the store and two calls report the same catalog.
+        let store = state.lock();
+        let account = ::engine::emulator_account_id();
+        let now = ::std::time::SystemTime::now();
+
+        // "The image IDs" (`DescribeImagesRequest$ImageIds`): an id that is not an image
+        // id at all is malformed, and a well-formed one the account can see no image for
+        // does not exist — neither is an absent row.
+        for image_id in requested_ids {
+            if !image_id_is_well_formed(image_id) {
+                return Err(invalid_ami_id_malformed(image_id));
+            }
+            if !store
+                .images
+                .get(image_id.as_str())
+                .is_some_and(|image| is_visible(image, account))
+            {
+                return Err(invalid_ami_id_not_found(image_id));
+            }
+        }
+
+        // `DryRun` sits after every member has been validated and every named image
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        // "Specifies whether to include deprecated AMIs. Default: No deprecated AMIs are
+        // included in the response" (`IncludeDeprecated`), and the same for
+        // `IncludeDisabled`. A request that NAMES ids asks about those images in
+        // particular — it has already been told they exist rather than answered
+        // `InvalidAMIID.NotFound` — so naming an id reports the image whatever its
+        // deprecation or disabled state.
+        let named_ids = !requested_ids.is_empty();
+        let include_deprecated = named_ids || input.include_deprecated.unwrap_or(false);
+        let include_disabled = named_ids || input.include_disabled.unwrap_or(false);
+
+        // "Describes the specified images … or all of the images available to you": the
+        // store narrowed by each member the request carries, every one of which must hold
+        // ("If you specify multiple filters, the filters are joined with an AND" —
+        // `Filter`).
+        let mut selected: Vec<&Image> = store
+            .images
+            .values()
+            .filter(|image| is_visible(image, account))
+            .filter(|image| {
+                !named_ids
+                    || requested_ids
+                        .iter()
+                        .any(|id| image.image_id.as_deref() == Some(id.as_str()))
+            })
+            .filter(|image| include_deprecated || !image_is_deprecated(image, now))
+            .filter(|image| {
+                include_disabled || image.state.as_deref() != Some(IMAGE_STATE_DISABLED)
+            })
+            .filter(|image| {
+                owners.is_empty()
+                    || owners
+                        .iter()
+                        .any(|owner| owner_matches(image, owner, account))
+            })
+            .filter(|image| {
+                executable_users.is_empty()
+                    || executable_users
+                        .iter()
+                        .any(|user| executable_by_matches(image, user, account))
+            })
+            .filter(|image| matches_every_filter(image, filters))
+            .collect();
+
+        // Page in `ImageId` order, which the cursor below names a position in. The store
+        // is an ordered map, so its iteration order already satisfies this sort; doing it
+        // here establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| left.image_id.cmp(&right.image_id));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected
+                .partition_point(|image| image.image_id.as_deref().unwrap_or_default() < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves, so
+        // the `NextToken` path behaves the same whether or not one was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more items to return"
+        // (`DescribeImagesResult$NextToken`): a token only when an image follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|image| image.image_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeImagesOutput {
+            images: Some(page.iter().take(limit).map(|image| (*image).clone()).collect()),
+            next_token,
+        })
     }
+}
+
+/// Can the calling account see `image` at all?
+///
+/// "The images available to you include public images, private images that you own, and
+/// private images owned by other Amazon Web Services accounts for which you have explicit
+/// launch permissions" (`DescribeImages`). Nothing in this slice grants an explicit launch
+/// permission — `ModifyImageAttribute` is still a scaffold — so the images available are
+/// the public ones and the account's own, and a private image of another account is
+/// invisible however the request asks for it.
+fn is_visible(image: &Image, account: &str) -> bool {
+    image.public.unwrap_or(false) || image.owner_id.as_deref() == Some(account)
+}
+
+/// Is `term` something `Owners` may carry — "a combination of Amazon Web Services account
+/// IDs, self, amazon, aws-backup-vault, and aws-marketplace"
+/// (`DescribeImagesRequest$Owners`)?
+fn is_owner_term(term: &str) -> bool {
+    term == OWNER_SELF || IMAGE_OWNER_ALIASES.contains(&term) || aws_account_id_is_well_formed(term)
+}
+
+/// Is `term` something `ExecutableUsers` may carry — "an Amazon Web Services account ID,
+/// self (the sender of the request), or all (public AMIs)"
+/// (`DescribeImagesRequest$ExecutableUsers`)?
+fn is_executable_by_term(term: &str) -> bool {
+    term == OWNER_SELF || term == EXECUTABLE_BY_ALL || aws_account_id_is_well_formed(term)
+}
+
+/// Does `image` belong to the owner `term` names — the calling account for `self`, the
+/// aliased publisher for an alias, and that account for an account id?
+fn owner_matches(image: &Image, term: &str, account: &str) -> bool {
+    if term == OWNER_SELF {
+        return image.owner_id.as_deref() == Some(account);
+    }
+    if IMAGE_OWNER_ALIASES.contains(&term) {
+        return image.image_owner_alias.as_deref() == Some(term);
+    }
+    image.owner_id.as_deref() == Some(term)
+}
+
+/// May the user `term` names launch `image`?
+///
+/// "all (public AMIs)" selects the images with public launch permissions. For an account —
+/// `self` being the calling one — the only launch permission this slice models is the
+/// owner's own: explicit permissions are granted through `ModifyImageAttribute`, which is
+/// still a scaffold, so no image carries one and none can be reported for one.
+fn executable_by_matches(image: &Image, term: &str, account: &str) -> bool {
+    if term == EXECUTABLE_BY_ALL {
+        return image.public.unwrap_or(false);
+    }
+    let user = if term == OWNER_SELF { account } else { term };
+    image.owner_id.as_deref() == Some(user)
+}
+
+/// The filter names this operation documents, from `DescribeImagesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeImagesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather
+/// than listed here. Every entry must be answered by [`filter_values`].
+const IMAGE_FILTERS: [&str; 45] = [
+    "architecture",
+    "block-device-mapping.delete-on-termination",
+    "block-device-mapping.device-name",
+    "block-device-mapping.encrypted",
+    "block-device-mapping.snapshot-id",
+    "block-device-mapping.volume-size",
+    "block-device-mapping.volume-type",
+    "boot-mode",
+    "creation-date",
+    "description",
+    "ena-support",
+    "free-tier-eligible",
+    "hypervisor",
+    "image-allowed",
+    "image-id",
+    "image-type",
+    "image-watermark.source-image-creation-time",
+    "image-watermark.source-image-id",
+    "image-watermark.source-image-region",
+    "image-watermark.watermark-creation-time",
+    "image-watermark.watermark-key",
+    "instance-type-specification.supported-instance-type",
+    "instance-type-specification.unsupported-instance-type",
+    "is-public",
+    "kernel-id",
+    "manifest-location",
+    "name",
+    "owner-alias",
+    "owner-id",
+    "platform",
+    "product-code",
+    "product-code.type",
+    "public-ssm-parameter-name",
+    "ramdisk-id",
+    "root-device-name",
+    "root-device-type",
+    "source-image-id",
+    "source-image-region",
+    "source-instance-id",
+    "sriov-net-support",
+    "state",
+    "state-reason-code",
+    "state-reason-message",
+    "tag-key",
+    "virtualization-type",
+];
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
+/// the filter value" (`DescribeImagesRequest$Filters`).
+const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// Is `name` a filter this operation documents? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no
+/// tag, so it is as undocumented as any other misspelling.
+fn is_documented_filter(name: &str) -> bool {
+    name.strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || IMAGE_FILTERS.contains(&name)
+}
+
+/// One optional string as the values a filter compares against.
+fn text(value: Option<&str>) -> Vec<String> {
+    value.map(ToString::to_string).into_iter().collect()
+}
+
+/// A boolean attribute as a filter value: a client sends it the way the wire renders it,
+/// `true` or `false`. An image whose flag is not set carries no value for the filter to
+/// match, like any other absent attribute.
+fn flag(value: Option<bool>) -> Vec<String> {
+    value
+        .map(|flag| if flag { "true" } else { "false" }.to_string())
+        .into_iter()
+        .collect()
+}
+
+/// A modelled timestamp as a filter value: the ISO 8601 UTC rendering the
+/// `image-watermark.*` filters document.
+fn timestamp(value: Option<&::aws_smithy_types::DateTime>) -> Vec<String> {
+    value
+        .and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
+        .into_iter()
+        .collect()
+}
+
+/// The values the EC2 filter `name` compares against this image.
+///
+/// A filter naming an attribute this image does not carry compares against NO values, so
+/// it selects nothing — the same answer AWS gives for, say, `product-code` on an image
+/// with no product codes.
+fn filter_values(image: &Image, name: &str) -> Vec<String> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return image
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref())
+            .map(ToString::to_string)
+            .collect();
+    }
+
+    let mappings = || image.block_device_mappings.iter().flatten();
+    let ebs = || mappings().filter_map(|mapping| mapping.ebs.as_ref());
+    let watermarks = || image.image_watermarks.iter().flatten();
+    let instance_types = |supported: bool| {
+        image
+            .instance_type_specification
+            .iter()
+            .flat_map(move |specification| {
+                if supported {
+                    specification.supported_instance_types.iter()
+                } else {
+                    specification.unsupported_instance_types.iter()
+                }
+            })
+            .flatten()
+            .filter_map(|item| item.instance_type.as_deref())
+            .map(ToString::to_string)
+            .collect::<Vec<String>>()
+    };
+    match name {
+        "architecture" => text(image.architecture.as_deref()),
+        "block-device-mapping.delete-on-termination" => ebs()
+            .flat_map(|ebs| flag(ebs.delete_on_termination))
+            .collect(),
+        "block-device-mapping.device-name" => mappings()
+            .filter_map(|mapping| mapping.device_name.as_deref())
+            .map(ToString::to_string)
+            .collect(),
+        "block-device-mapping.encrypted" => ebs().flat_map(|ebs| flag(ebs.encrypted)).collect(),
+        "block-device-mapping.snapshot-id" => ebs()
+            .filter_map(|ebs| ebs.snapshot_id.as_deref())
+            .map(ToString::to_string)
+            .collect(),
+        "block-device-mapping.volume-size" => ebs()
+            .filter_map(|ebs| ebs.volume_size)
+            .map(|size| size.to_string())
+            .collect(),
+        "block-device-mapping.volume-type" => ebs()
+            .filter_map(|ebs| ebs.volume_type.as_deref())
+            .map(ToString::to_string)
+            .collect(),
+        "boot-mode" => text(image.boot_mode.as_deref()),
+        "creation-date" => text(image.creation_date.as_deref()),
+        "description" => text(image.description.as_deref()),
+        "ena-support" => flag(image.ena_support),
+        "free-tier-eligible" => flag(image.free_tier_eligible),
+        "hypervisor" => text(image.hypervisor.as_deref()),
+        "image-allowed" => flag(image.image_allowed),
+        "image-id" => text(image.image_id.as_deref()),
+        "image-type" => text(image.image_type.as_deref()),
+        "image-watermark.source-image-creation-time" => watermarks()
+            .flat_map(|watermark| timestamp(watermark.source_image_creation_time.as_ref()))
+            .collect(),
+        "image-watermark.source-image-id" => watermarks()
+            .filter_map(|watermark| watermark.source_image_id.as_deref())
+            .map(ToString::to_string)
+            .collect(),
+        "image-watermark.source-image-region" => watermarks()
+            .filter_map(|watermark| watermark.source_image_region.as_deref())
+            .map(ToString::to_string)
+            .collect(),
+        "image-watermark.watermark-creation-time" => watermarks()
+            .flat_map(|watermark| timestamp(watermark.watermark_creation_time.as_ref()))
+            .collect(),
+        "image-watermark.watermark-key" => watermarks()
+            .filter_map(|watermark| watermark.watermark_key.as_deref())
+            .map(ToString::to_string)
+            .collect(),
+        "instance-type-specification.supported-instance-type" => instance_types(true),
+        "instance-type-specification.unsupported-instance-type" => instance_types(false),
+        "is-public" => flag(image.public),
+        "kernel-id" => text(image.kernel_id.as_deref()),
+        // "The location of the image manifest" — the `ImageLocation` the store builds as
+        // `<owner>/<name>`.
+        "manifest-location" => text(image.image_location.as_deref()),
+        "name" => text(image.name.as_deref()),
+        "owner-alias" => text(image.image_owner_alias.as_deref()),
+        "owner-id" => text(image.owner_id.as_deref()),
+        // The member carries the modelled `PlatformValues` value (`Windows`), while the
+        // filter's own documentation publishes it as `windows`, so an image answers the
+        // filter with both spellings and either value selects it.
+        "platform" => image
+            .platform
+            .as_deref()
+            .map(|platform| {
+                if platform == IMAGE_PLATFORM_WINDOWS {
+                    vec![platform.to_string(), platform.to_lowercase()]
+                } else {
+                    vec![platform.to_string()]
+                }
+            })
+            .unwrap_or_default(),
+        "product-code" => image
+            .product_codes
+            .iter()
+            .flatten()
+            .filter_map(|code| code.product_code_id.as_deref())
+            .map(ToString::to_string)
+            .collect(),
+        "product-code.type" => image
+            .product_codes
+            .iter()
+            .flatten()
+            .filter_map(|code| code.product_code_type.as_deref())
+            .map(ToString::to_string)
+            .collect(),
+        "public-ssm-parameter-name" => text(image.public_ssm_parameter_name.as_deref()),
+        "ramdisk-id" => text(image.ramdisk_id.as_deref()),
+        "root-device-name" => text(image.root_device_name.as_deref()),
+        "root-device-type" => text(image.root_device_type.as_deref()),
+        "source-image-id" => text(image.source_image_id.as_deref()),
+        "source-image-region" => text(image.source_image_region.as_deref()),
+        "source-instance-id" => text(image.source_instance_id.as_deref()),
+        "sriov-net-support" => text(image.sriov_net_support.as_deref()),
+        "state" => text(image.state.as_deref()),
+        "state-reason-code" => image
+            .state_reason
+            .as_ref()
+            .and_then(|reason| reason.code.as_deref())
+            .map(ToString::to_string)
+            .into_iter()
+            .collect(),
+        "state-reason-message" => image
+            .state_reason
+            .as_ref()
+            .and_then(|reason| reason.message.as_deref())
+            .map(ToString::to_string)
+            .into_iter()
+            .collect(),
+        "tag-key" => image
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref())
+            .map(ToString::to_string)
+            .collect(),
+        "virtualization-type" => text(image.virtualization_type.as_deref()),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `image` satisfy every filter?
+///
+/// "If you specify multiple filters, the filters are joined with an AND" (`Filter`), and
+/// within one filter "if you specify multiple values for a filter, the values are joined
+/// with an OR" (`Filter$Values`) — each value matched case-sensitively, with EC2's own
+/// `*`/`?` wildcards, by [`crate::state::filter_value_matches`]. So a filter carrying no
+/// value at all matches nothing, there being no value for the attribute to match.
+fn matches_every_filter(image: &Image, filters: &[Filter]) -> bool {
+    filters.iter().all(|filter| {
+        let name = filter.name.as_deref().unwrap_or_default();
+        let held = filter_values(image, name);
+        filter
+            .values
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|wanted| {
+                held.iter()
+                    .any(|value| filter_value_matches(wanted, value))
+            })
+    })
 }
