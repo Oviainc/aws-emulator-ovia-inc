@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one package of a repository, addressed by the (`format`, `namespace`,
+//! `package`) triple, and answers with its modelled `PackageDescription` — the read-back
+//! side of [`crate::ops::put_package_origin_configuration`]. A pure read.
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +159,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePackage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribePackageErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(DescribePackageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Domain {} not found.", input.domain),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some("domain".to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(repository) = domain.repositories.get(&input.repository) else {
+            return Err(DescribePackageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Repository {} not found in domain {}.",
+                        input.repository, input.domain
+                    ),
+                    resource_id: Some(input.repository.clone()),
+                    resource_type: Some("repository".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A package is addressed by its whole (format, namespace, name) triple, so a
+        // request that names the right package name under a different format or namespace
+        // addresses a DIFFERENT package, and that one is not found.
+        let key =
+            crate::state::package_key(&input.format, input.namespace.as_deref(), &input.package);
+        let Some(package) = repository.packages.get(&key) else {
+            return Err(DescribePackageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Package {} not found in repository {}.",
+                        input.package, input.repository
+                    ),
+                    resource_id: Some(input.package.clone()),
+                    resource_type: Some("package".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribePackageOutput {
+            package: PackageDescription {
+                format: Some(package.format.clone()),
+                namespace: package.namespace.clone(),
+                name: Some(package.name.clone()),
+                origin_configuration: Some(package.origin_configuration()),
+            },
+        })
     }
 }
