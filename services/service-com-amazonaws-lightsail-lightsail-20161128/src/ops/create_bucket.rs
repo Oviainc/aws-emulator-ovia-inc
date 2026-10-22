@@ -249,6 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     prefix: None,
                 },
                 cors_rules: Vec::new(),
+                // No access key has been minted for the bucket yet: that is
+                // `CreateBucketAccessKey`'s business.
+                access_keys: Vec::new(),
                 // The bucket is serving as this call returns: the modelled
                 // `BucketState` has no transient code, so there is nothing for
                 // the clock to settle later.
