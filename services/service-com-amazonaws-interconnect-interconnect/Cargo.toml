@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# v4 UUIDs for the server-owned `Connection$sharedId` / `activationKey` and the
+# random suffix of a `ConnectionId`; v5 for the derived, stable Direct Connect
+# gateway ids of the seeded attach points.
+uuid = { version = "1", features = ["v4", "v5"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -28,6 +32,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `tokio::time::sleep`, which only the integration suite needs: it waits out a
+# connection's provisioning span to observe the clock-owed transition. No handler
+# sleeps, so the runtime dependency above stays without the `time` feature.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

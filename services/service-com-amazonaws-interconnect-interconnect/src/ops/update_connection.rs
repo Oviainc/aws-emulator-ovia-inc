@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -82,9 +73,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // here — hence the `UpdateConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.interconnect#UpdateConnection")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.interconnect#UpdateConnection",
+    extra_errors = [
+        "ResourceNotFoundException",
+        "InterconnectValidationException",
+        "InterconnectClientException",
+        "InterconnectServerException",
+    ]
+)]
 #[derive(Debug)]
 pub enum UpdateConnectionErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectValidationException(InterconnectValidationException),
+    InterconnectClientException(InterconnectClientException),
+    InterconnectServerException(InterconnectServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -138,18 +141,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateConnectionErrorModeled::InterconnectServerException(
+                InterconnectServerException {
+                    message: "the Interconnect connection store is not mounted on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::Instant::now();
+
+        let mut guard = state.lock();
+        guard.materialise_due_transitions(now);
+        // Dereferenced once so the two stores below are borrowed as the DISJOINT
+        // fields they are: the connection is looked up ONCE, mutably, and the
+        // environment catalog is read beside it. That keeps a single 404 path.
+        let store = &mut *guard;
+
+        // An identifier that names no stored connection is a 404: an update never
+        // brings a connection into existence.
+        let Some(stored) = store.connections.get_mut(&input.identifier) else {
+            return Err(UpdateConnectionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no connection with identifier '{}'",
+                        input.identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A connection on its way out, or already gone, has nothing left to modify.
+        if stored.connection.state == "deleting" || stored.connection.state == "deleted" {
+            return Err(UpdateConnectionErrorModeled::InterconnectClientException(
+                InterconnectClientException {
+                    message: format!(
+                        "connection '{}' is {} and cannot be modified",
+                        stored.connection.id, stored.connection.state
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The state the connection settles into: the one a pending transition is
+        // already owed, or its current state. A bandwidth change below moves it to
+        // `updating` and hands it back to the clock, so re-reading the settled state
+        // (rather than the reported one) keeps a second change from pinning it in
+        // `updating` for good.
+        let settled = crate::state::ComAmazonawsInterconnectInterconnectState::settled_state(stored);
+        let environment_id = stored.connection.environment_id.clone();
+
+        // A new bandwidth is allocated on the SAME environment, so it is held to
+        // that environment's currently available set, exactly as on create.
+        if let Some(bandwidth) = input.bandwidth.as_deref() {
+            let available = store
+                .environments
+                .get(&environment_id)
+                .and_then(|environment| environment.bandwidths.available.as_deref())
+                .unwrap_or_default();
+            if !available.iter().any(|offered| offered == bandwidth) {
+                return Err(UpdateConnectionErrorModeled::InterconnectValidationException(
+                    InterconnectValidationException {
+                        message: format!(
+                            "bandwidth '{bandwidth}' is not available on environment '{environment_id}'; available bandwidths are [{}]",
+                            available.join(", ")
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Mutate the stored record in place; a member the request omits is left
+        // exactly as it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConnection"))
+        // `clientToken` needs no replay index of its own: this update is already
+        // idempotent by construction. Each supplied member is assigned its
+        // requested value, so re-applying the same request is a no-op — the
+        // bandwidth comparison below sees the value it already wrote and neither
+        // re-arms the `updating` transition nor touches the record again.
+        if let Some(description) = input.description.clone() {
+            stored.connection.description = description;
+        }
+        if let Some(bandwidth) = input.bandwidth.clone() {
+            if bandwidth != stored.connection.bandwidth {
+                stored.connection.bandwidth = bandwidth.clone();
+                // "updating: the connection is being updated" — re-provisioning the
+                // circuit is not instantaneous, so the connection reports `updating`
+                // and the clock settles it back into the state it came from.
+                stored.connection.state = "updating".to_string();
+                stored.pending_transition = Some(crate::state::PendingTransition {
+                    due: now + crate::state::PROVISIONING_SPAN,
+                    state: settled,
+                });
+            }
+        }
+
+        Ok(UpdateConnectionOutput {
+            connection: Some(stored.connection.clone()),
+        })
     }
 }

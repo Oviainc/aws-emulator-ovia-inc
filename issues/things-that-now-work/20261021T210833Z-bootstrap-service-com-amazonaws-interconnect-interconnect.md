@@ -64,3 +64,16 @@ Done = an integration test that lists environments, gets one by id, creates a co
 8. Call ListConnections with `state="deleted"` — expect the created connection to be absent (filter actually applied).
 9. Call UpdateConnection with that identifier and a new `description`, leaving `bandwidth` unset — expect the returned connection to show the new description and the UNCHANGED bandwidth; then GetConnection again and expect the new description to persist.
 10. Call DeleteConnection with that identifier — expect the required `connection` in the response with `state` in {deleting, deleted}; then GetConnection/ListConnections and confirm the connection is no longer reported as requested/available.
+
+## Resolution note
+
+The slice above is implemented: ListEnvironments, GetEnvironment, CreateConnection, GetConnection, ListConnections, UpdateConnection and DeleteConnection all read and write the shared per-service store, and `tests/all/connection_lifecycle.rs` exercises them over the wire.
+
+Six operations deliberately stay at HTTP 501 and are NOT yet filed as separate reports — the plan above promised individual gap issues for them, and this change files none, so they are tracked here and by the scaffold census (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' services/service-com-amazonaws-interconnect-interconnect/src/ops/`, which still matches exactly these six files):
+
+- `describe_connection_proposal.rs` — DescribeConnectionProposal (the `activation_keys` reverse index it needs is already populated on create).
+- `accept_connection_proposal.rs` — AcceptConnectionProposal.
+- `list_attach_points.rs` — ListAttachPoints (the `attach_points` seed it needs is already in state).
+- `tag_resource.rs`, `untag_resource.rs`, `list_tags_for_resource.rs` — the tagging trio, which must read and write `StoredConnection.connection.tags` rather than a second store.
+
+`Connection$billingTier` is left unset: the member is optional and AWS publishes no rule for assigning a tier, so the emulator reports nothing there rather than an invented ordinal.

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnvironments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnvironments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnvironments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -84,9 +75,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // here — hence the `ListEnvironmentsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.interconnect#ListEnvironments")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.interconnect#ListEnvironments",
+    extra_errors = ["InterconnectValidationException", "InterconnectServerException"]
+)]
 #[derive(Debug)]
 pub enum ListEnvironmentsErrorModeled {
+    InterconnectValidationException(InterconnectValidationException),
+    InterconnectServerException(InterconnectServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -140,18 +136,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnvironments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnvironmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEnvironmentsErrorModeled::InterconnectServerException(
+                InterconnectServerException {
+                    message: "the Interconnect environment catalog is not mounted on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Read the SEEDED catalog. Environments are AWS-managed — the model binds no
+        // CreateEnvironment — so this store is the only source, and GetEnvironment
+        // answers from the same records.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnvironments"))
+        // Both filters are conjunctive and exact: an environment is listed only when
+        // it matches every filter the caller supplied.
+        let matching: Vec<(String, Environment)> = {
+            let store = state.lock();
+            store
+                .environments
+                .iter()
+                .filter(|(_, environment)| {
+                    input
+                        .provider
+                        .as_ref()
+                        .is_none_or(|wanted| {
+                            crate::state::provider_eq(&environment.provider, wanted)
+                        })
+                        && input
+                            .location
+                            .as_ref()
+                            .is_none_or(|wanted| environment.location == *wanted)
+                })
+                .map(|(id, environment)| (id.clone(), environment.clone()))
+                .collect()
+        };
+
+        // A cursor this operation did not issue is refused, rather than answered
+        // with an empty page the caller cannot tell from "no more results".
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(key) =
+                    crate::state::decode_cursor(token, crate::state::ENVIRONMENT_CURSOR_TAG)
+                else {
+                    return Err(ListEnvironmentsErrorModeled::InterconnectValidationException(
+                        InterconnectValidationException {
+                            message: "nextToken is not a pagination token issued by ListEnvironments"
+                                .to_string(),
+                        },
+                    )
+                    .into());
+                };
+                Some(key.to_string())
+            }
+            None => None,
+        };
+
+        let (environments, next_token) = crate::state::paginate(
+            matching,
+            cursor.as_deref(),
+            input.max_results,
+            crate::state::ENVIRONMENT_CURSOR_TAG,
+        );
+        Ok(ListEnvironmentsOutput {
+            environments,
+            next_token,
+        })
     }
 }
