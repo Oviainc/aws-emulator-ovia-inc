@@ -72,6 +72,17 @@
 //! which Region its VPC belongs to), and a subnet's zone and ARN do name a Region, so
 //! the seeded subnets are the ones of [`DEFAULT_REGION`]. Everything a later writer
 //! stores names the Region its own request was signed for.
+//!
+//! ## The default security group of a VPC
+//!
+//! "Your VPC automatically comes with a default security group. … you can't delete a
+//! default security group" (Amazon VPC User Guide, "Default security groups for your
+//! VPCs"), so [`ComAmazonawsEc2Amazonec2State::security_groups`] starts with the default
+//! VPC's default group rather than empty: the ambient network a fresh account has is a
+//! VPC, its per-zone default subnets AND that group, and a client provisioning into the
+//! default VPC reads all three before it can name a network. The store holds the modelled
+//! [`SecurityGroup`] shape itself, keyed by `GroupId` in a [`BTreeMap`], for the same
+//! reasons the VPC and subnet stores do.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv6Addr;
@@ -79,10 +90,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AvailabilityZone, AvailabilityZoneMessage, BlockPublicAccessStates, GroupIdentifier,
-    INSTANCE_TYPE_VALUES, Instance, InstanceState, InstanceTypeOffering, LOCATION_TYPE_VALUES,
-    LaunchTemplate, Monitoring, OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch,
-    RequestLaunchTemplateData, RunInstancesOutput, StateReason, Subnet, Tag, Vpc,
-    VpcCidrBlockAssociation, VpcCidrBlockState,
+    INSTANCE_TYPE_VALUES, Instance, InstanceState, InstanceTypeOffering, IpPermission, IpRange,
+    LOCATION_TYPE_VALUES, LaunchTemplate, Monitoring, OperatorResponse, Placement,
+    PrivateDnsNameOptionsOnLaunch, RequestLaunchTemplateData, RunInstancesOutput, SecurityGroup,
+    StateReason, Subnet, Tag, UserIdGroupPair, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -474,6 +485,9 @@ pub const INVALID_VPC_ID_NOT_FOUND: &str = "InvalidVpcID.NotFound";
 /// EC2's error code for a request that named a subnet id no subnet of the account has.
 pub const INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
 
+/// EC2's error code for a request that named a security group no group of the account has.
+pub const INVALID_GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
+
 /// EC2's error code for a pagination token this service did not issue.
 pub const INVALID_PAGINATION_TOKEN: &str = "InvalidPaginationToken";
 
@@ -606,6 +620,22 @@ pub const DEFAULT_SUBNET_PREFIX_LENGTH: u32 = 20;
 /// (`PrivateDnsNameOptionsOnLaunch$HostnameType`).
 pub const HOSTNAME_TYPE_IP_NAME: &str = "ip-name";
 
+/// The name of the default security group every VPC comes with: "the default security
+/// group is named `default`" (Amazon VPC User Guide, "Default security groups for your
+/// VPCs"). It is also the one group name a caller may name a group by.
+pub const DEFAULT_SECURITY_GROUP_NAME: &str = "default";
+
+/// The description EC2 gives the default security group of a VPC.
+pub const DEFAULT_SECURITY_GROUP_DESCRIPTION: &str = "default VPC security group";
+
+/// Every IP protocol: "Use `-1` to specify all protocols" (`IpPermission$IpProtocol`),
+/// which is what the default security group's own rules allow.
+pub const ALL_IP_PROTOCOLS: &str = "-1";
+
+/// Every IPv4 address, as a CIDR block — the destination of the default security group's
+/// outbound rule.
+pub const ALL_IPV4_ADDRESSES: &str = "0.0.0.0/0";
+
 /// VPC Block Public Access turned off — "`off`: VPC BPA is not enabled and traffic is
 /// allowed to and from internet gateways and egress-only internet gateways in this
 /// Region" (`BlockPublicAccessStates$InternetGatewayBlockMode`), which is the state of an
@@ -655,6 +685,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// field-by-field copy. Ordered by id, which is the order the describe reports and
     /// pages over.
     pub subnets: BTreeMap<String, Subnet>,
+    /// Every security group the account holds, by `GroupId`, as the modelled
+    /// [`SecurityGroup`] shape itself — so a member a writer sets round-trips through
+    /// `DescribeSecurityGroups` without a field-by-field copy. Ordered by id, which is the
+    /// order the describe reports and pages over.
+    pub security_groups: BTreeMap<String, SecurityGroup>,
     /// Every launch template the account holds, by `LaunchTemplateId`, each with its
     /// versions — see the module docs.
     pub launch_templates: BTreeMap<String, LaunchTemplateRecord>,
@@ -668,7 +703,8 @@ pub struct ComAmazonawsEc2Amazonec2State {
     pub id_counter: u64,
 }
 
-/// A fresh account's EC2 state: the default VPC AWS creates for it, and nothing else.
+/// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
+/// VPC's per-zone default subnets and its default security group — and nothing else.
 impl Default for ComAmazonawsEc2Amazonec2State {
     fn default() -> Self {
         let mut state = Self {
@@ -684,6 +720,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpcs: BTreeMap::new(),
             vpc_available_at: BTreeMap::new(),
             subnets: BTreeMap::new(),
+            security_groups: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
             launch_template_client_tokens: HashMap::new(),
             id_counter: 0,
@@ -696,6 +733,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             Vec::new(),
         );
         state.insert_default_subnets(&default_vpc, DEFAULT_VPC_CIDR_BLOCK, DEFAULT_REGION);
+        state.insert_default_security_group(&default_vpc, DEFAULT_REGION);
         state
     }
 }
@@ -902,6 +940,91 @@ impl ComAmazonawsEc2Amazonec2State {
             }));
         }
         inserted
+    }
+
+    /// Store a security group, and answer the `GroupId` it was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller: the id, the ARN built from it, and the owning account — so two writers
+    /// cannot report the same group differently.
+    pub fn insert_security_group(&mut self, spec: SecurityGroupSpec) -> String {
+        let group_id = self.next_id("sg");
+        let group = SecurityGroup {
+            group_id: Some(group_id.clone()),
+            group_name: Some(spec.group_name),
+            description: Some(spec.description),
+            vpc_id: Some(spec.vpc_id),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            security_group_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("security-group/{group_id}"),
+            )),
+            tags: Some(spec.tags),
+            ip_permissions: Some(spec.ip_permissions),
+            ip_permissions_egress: Some(spec.ip_permissions_egress),
+        };
+        self.security_groups.insert(group_id.clone(), group);
+        group_id
+    }
+
+    /// Give `vpc_id` the default security group AWS creates with it, and answer its
+    /// `GroupId`.
+    ///
+    /// "Your VPC automatically comes with a default security group" whose rules "allow all
+    /// inbound traffic from network interfaces … that are assigned to the same security
+    /// group" and "allow all outbound … traffic from the instance" (Amazon VPC User Guide,
+    /// "Default security groups for your VPCs"), so the inbound rule names this group
+    /// itself and the outbound one names [`ALL_IPV4_ADDRESSES`], both for every protocol.
+    /// The inbound rule can only be written once the id is minted, which is why it is set
+    /// after the insert rather than passed to it.
+    pub fn insert_default_security_group(&mut self, vpc_id: &str, region: &str) -> String {
+        let owner_id = ::engine::emulator_account_id().to_string();
+        let group_id = self.insert_security_group(SecurityGroupSpec {
+            vpc_id: vpc_id.to_string(),
+            group_name: DEFAULT_SECURITY_GROUP_NAME.to_string(),
+            description: DEFAULT_SECURITY_GROUP_DESCRIPTION.to_string(),
+            region: region.to_string(),
+            tags: Vec::new(),
+            ip_permissions: Vec::new(),
+            ip_permissions_egress: vec![IpPermission {
+                ip_protocol: Some(ALL_IP_PROTOCOLS.to_string()),
+                // "For `tcp`, `udp`, and `icmp`, you must specify a port range"
+                // (`IpPermission$IpProtocol`) — an all-protocols rule carries none.
+                from_port: None,
+                to_port: None,
+                user_id_group_pairs: Some(Vec::new()),
+                ip_ranges: Some(vec![IpRange {
+                    cidr_ip: Some(ALL_IPV4_ADDRESSES.to_string()),
+                    description: None,
+                }]),
+                ipv6_ranges: Some(Vec::new()),
+                prefix_list_ids: Some(Vec::new()),
+            }],
+        });
+        if let Some(group) = self.security_groups.get_mut(&group_id) {
+            group.ip_permissions = Some(vec![IpPermission {
+                ip_protocol: Some(ALL_IP_PROTOCOLS.to_string()),
+                from_port: None,
+                to_port: None,
+                user_id_group_pairs: Some(vec![UserIdGroupPair {
+                    group_id: Some(group_id.clone()),
+                    user_id: Some(owner_id),
+                    // "For a security group in a nondefault VPC, use the security group
+                    // ID" (`UserIdGroupPair$GroupName`): the referenced group is named by
+                    // id, so no group name is reported for the pair.
+                    group_name: None,
+                    description: None,
+                    vpc_id: None,
+                    vpc_peering_connection_id: None,
+                    peering_status: None,
+                }]),
+                ip_ranges: Some(Vec::new()),
+                ipv6_ranges: Some(Vec::new()),
+                prefix_list_ids: Some(Vec::new()),
+            }]);
+        }
+        group_id
     }
 
     /// Store a launch template with its first version, and answer the `LaunchTemplateId` it
@@ -1200,6 +1323,27 @@ pub fn launch_template_name_already_exists<E>(name: &str) -> crate::scaffolded::
         400,
         format!("The launch template name '{name}' is already in use"),
     )
+}
+
+/// One security group as a writer asks for it: the members a creator chooses. Everything
+/// the service derives — the group id, its ARN and the owning account — is minted by
+/// [`ComAmazonawsEc2Amazonec2State::insert_security_group`].
+#[derive(Debug, Clone)]
+pub struct SecurityGroupSpec {
+    /// The VPC the group is in.
+    pub vpc_id: String,
+    /// The group's name, unique within its VPC.
+    pub group_name: String,
+    /// The group's description.
+    pub description: String,
+    /// The Region the group's ARN names.
+    pub region: String,
+    /// The tags the group carries.
+    pub tags: Vec<Tag>,
+    /// The group's inbound rules.
+    pub ip_permissions: Vec<IpPermission>,
+    /// The group's outbound rules.
+    pub ip_permissions_egress: Vec<IpPermission>,
 }
 
 /// One subnet as a writer asks for it: the members a creator chooses. Everything the
@@ -2233,6 +2377,17 @@ pub fn invalid_subnet_id_not_found<E>(subnet_id: &str) -> crate::scaffolded::Sca
         INVALID_SUBNET_ID_NOT_FOUND,
         400,
         format!("The subnet ID '{subnet_id}' does not exist"),
+    )
+}
+
+/// Refuse a request that named a security group no group of the account has, the way EC2
+/// does: HTTP 400 `InvalidGroup.NotFound`. `group` is the id or the name the request
+/// named, whichever it could not resolve.
+pub fn invalid_group_not_found<E>(group: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_GROUP_NOT_FOUND,
+        400,
+        format!("The security group '{group}' does not exist"),
     )
 }
 

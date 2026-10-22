@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSecurityGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSecurityGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSecurityGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's security groups out of [`crate::state`]: the whole store by
+//! default, or the subset the request's `GroupIds`, `GroupNames` and `Filters` select, one
+//! `MaxResults`-sized page at a time. A reporting operation only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +83,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +152,324 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSecurityGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSecurityGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSecurityGroups"))
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeSecurityGroupsRequest$DryRun`). Every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token returned from a previous paginated request"
+        // (`DescribeSecurityGroupsRequest$NextToken`) — anything else is refused rather
+        // than read as an id, and it is refused before any other member is looked at, so
+        // whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_pagination_token)?,
+            ),
+        };
+
+        // A filter name this operation does not document is refused whether or not any
+        // group would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<(&str, &[String])> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                crate::state::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            selectors.push((canonical, filter.values.as_deref().unwrap_or_default()));
+        }
+
+        let store = state.lock();
+
+        // "The IDs of the security groups" / "the names of the security groups"
+        // (`DescribeSecurityGroupsRequest$GroupIds`, `$GroupNames`): an id or a name that
+        // names no group of the account is an error, not an absent row.
+        let requested_ids: &[String] = input.group_ids.as_deref().unwrap_or_default();
+        let requested_names: &[String] = input.group_names.as_deref().unwrap_or_default();
+        if let Some(unknown) = requested_ids
+            .iter()
+            .find(|id| !store.security_groups.contains_key(id.as_str()))
+        {
+            return Err(crate::state::invalid_group_not_found(unknown));
+        }
+        if let Some(unknown) = requested_names.iter().find(|name| {
+            !store
+                .security_groups
+                .values()
+                .any(|group| group.group_name.as_deref() == Some(name.as_str()))
+        }) {
+            return Err(crate::state::invalid_group_not_found(unknown));
+        }
+
+        // "Default: Describes all of your security groups": `GroupIds` and `GroupNames`
+        // narrow the store to the groups they name — "You can specify either the security
+        // group name or the security group ID", so a group named by either is selected —
+        // and every filter must then hold ("If you specify multiple filters, the filters
+        // are joined with an AND" — `Filter`).
+        let named_any = !requested_ids.is_empty() || !requested_names.is_empty();
+        let mut selected: Vec<&SecurityGroup> = store
+            .security_groups
+            .values()
+            .filter(|group| {
+                !named_any
+                    || requested_ids
+                        .iter()
+                        .any(|id| group.group_id.as_deref() == Some(id.as_str()))
+                    || requested_names
+                        .iter()
+                        .any(|name| group.group_name.as_deref() == Some(name.as_str()))
+            })
+            .filter(|group| matches_every_filter(group, &selectors))
+            .collect();
+
+        // Page in `GroupId` order, which the cursor below names a position in. The store is
+        // an ordered map, so its iteration order already satisfies this sort; doing it here
+        // establishes the invariant the cursor depends on at the point of use rather than
+        // inheriting it from the container `crate::state` happens to hold.
+        selected.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected
+                .partition_point(|group| group.group_id.as_deref().unwrap_or_default() < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of items to return for this request. … If this parameter is
+        // not specified, then all items are returned"
+        // (`DescribeSecurityGroupsRequest$MaxResults`) — so a request that names none is
+        // not paged at all. The model's `range 5..1000` has already refused anything
+        // outside it, so the only value that cannot convert is one the boundary validator
+        // would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(page.len());
+
+        // "This value is null when there are no more items to return"
+        // (`DescribeSecurityGroupsResult$NextToken`): a token only when a group follows
+        // this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|group| group.group_id.as_deref())
+            .map(crate::state::encode_page_token);
+
+        Ok(DescribeSecurityGroupsOutput {
+            security_groups: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|group| (*group).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The filter names this operation documents, from `DescribeSecurityGroupsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeSecurityGroupsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather
+/// than listed here. Every entry must be answered by [`filter_values`].
+const SECURITY_GROUP_FILTERS: [&str; 24] = [
+    "description",
+    "egress.ip-permission.cidr",
+    "egress.ip-permission.from-port",
+    "egress.ip-permission.group-id",
+    "egress.ip-permission.group-name",
+    "egress.ip-permission.ipv6-cidr",
+    "egress.ip-permission.prefix-list-id",
+    "egress.ip-permission.protocol",
+    "egress.ip-permission.to-port",
+    "egress.ip-permission.user-id",
+    "group-id",
+    "group-name",
+    "ip-permission.cidr",
+    "ip-permission.from-port",
+    "ip-permission.group-id",
+    "ip-permission.group-name",
+    "ip-permission.ipv6-cidr",
+    "ip-permission.prefix-list-id",
+    "ip-permission.protocol",
+    "ip-permission.to-port",
+    "ip-permission.user-id",
+    "owner-id",
+    "tag-key",
+    "vpc-id",
+];
+
+/// The prefix of an outbound-rule filter: the same rule attributes as the inbound family,
+/// read off `IpPermissionsEgress` instead of `IpPermissions`.
+const EGRESS_FILTER_PREFIX: &str = "egress.";
+
+/// The prefix of a rule filter, once the `egress.` prefix has been stripped.
+const RULE_FILTER_PREFIX: &str = "ip-permission.";
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
+/// the filter value" (`DescribeSecurityGroupsRequest$Filters`).
+const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
+/// selects on. This operation's `Filters` doc publishes no alternative spellings.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    SECURITY_GROUP_FILTERS.contains(&name).then_some(name)
+}
+
+/// A numeric attribute as a filter value compares against it: its decimal rendering, which
+/// is how the wire carries it.
+fn integer_values(value: Option<i32>) -> Option<Cow<'static, str>> {
+    value.map(|number| Cow::Owned(number.to_string()))
+}
+
+/// The values the rule attribute `attribute` of `rules` compares against.
+///
+/// "If using multiple filters for rules, the results include security groups for which any
+/// combination of rules — not necessarily a single rule — match all filters"
+/// (`DescribeSecurityGroupsRequest$Filters`), so each rule filter compares against the
+/// values of EVERY rule of the group, not against one rule at a time. `attribute` is a
+/// documented name with its `egress.`/`ip-permission.` prefix already stripped.
+fn rule_filter_values<'a>(rules: &'a [IpPermission], attribute: &str) -> Vec<Cow<'a, str>> {
+    let text = |value: Option<&'a str>| value.map(Cow::Borrowed);
+    match attribute {
+        "cidr" => rules
+            .iter()
+            .flat_map(|rule| rule.ip_ranges.iter().flatten())
+            .filter_map(|range| text(range.cidr_ip.as_deref()))
+            .collect(),
+        "ipv6-cidr" => rules
+            .iter()
+            .flat_map(|rule| rule.ipv6_ranges.iter().flatten())
+            .filter_map(|range| text(range.cidr_ipv6.as_deref()))
+            .collect(),
+        "prefix-list-id" => rules
+            .iter()
+            .flat_map(|rule| rule.prefix_list_ids.iter().flatten())
+            .filter_map(|entry| text(entry.prefix_list_id.as_deref()))
+            .collect(),
+        "from-port" => rules
+            .iter()
+            .filter_map(|rule| integer_values(rule.from_port))
+            .collect(),
+        "to-port" => rules
+            .iter()
+            .filter_map(|rule| integer_values(rule.to_port))
+            .collect(),
+        "protocol" => rules
+            .iter()
+            .filter_map(|rule| text(rule.ip_protocol.as_deref()))
+            .collect(),
+        "group-id" => rules
+            .iter()
+            .flat_map(|rule| rule.user_id_group_pairs.iter().flatten())
+            .filter_map(|pair| text(pair.group_id.as_deref()))
+            .collect(),
+        "group-name" => rules
+            .iter()
+            .flat_map(|rule| rule.user_id_group_pairs.iter().flatten())
+            .filter_map(|pair| text(pair.group_name.as_deref()))
+            .collect(),
+        "user-id" => rules
+            .iter()
+            .flat_map(|rule| rule.user_id_group_pairs.iter().flatten())
+            .filter_map(|pair| text(pair.user_id.as_deref()))
+            .collect(),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// The values the EC2 filter `name` compares against this security group.
+///
+/// A filter naming an attribute this group does not carry compares against NO values, so
+/// it selects nothing — the same answer AWS gives for, say, `ip-permission.cidr` on a group
+/// whose inbound rules name only other groups. `name` is a name [`canonical_filter_name`]
+/// resolved.
+fn filter_values<'a>(group: &'a SecurityGroup, name: &str) -> Vec<Cow<'a, str>> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return group
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+    if let Some(attribute) = name
+        .strip_prefix(EGRESS_FILTER_PREFIX)
+        .and_then(|rest| rest.strip_prefix(RULE_FILTER_PREFIX))
+    {
+        let rules = group.ip_permissions_egress.as_deref().unwrap_or_default();
+        return rule_filter_values(rules, attribute);
+    }
+    if let Some(attribute) = name.strip_prefix(RULE_FILTER_PREFIX) {
+        let rules = group.ip_permissions.as_deref().unwrap_or_default();
+        return rule_filter_values(rules, attribute);
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "description" => text(group.description.as_deref()),
+        "group-id" => text(group.group_id.as_deref()),
+        "group-name" => text(group.group_name.as_deref()),
+        "owner-id" => text(group.owner_id.as_deref()),
+        "tag-key" => group
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "vpc-id" => text(group.vpc_id.as_deref()),
+        // Unreachable, for the reason `rule_filter_values` gives.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `group` satisfy every filter?
+///
+/// "If you specify multiple filters, the filters are joined with an AND" (`Filter`), and
+/// within one filter "if you specify multiple values for a filter, the values are joined
+/// with an OR" (`Filter$Values`) — each value matched case-sensitively, with EC2's own
+/// `*`/`?` wildcards, by [`crate::state::filter_value_matches`]. So a filter carrying no
+/// value at all matches nothing, there being no value for the attribute to match.
+fn matches_every_filter(group: &SecurityGroup, selectors: &[(&str, &[String])]) -> bool {
+    selectors.iter().all(|(name, wanted_values)| {
+        let held = filter_values(group, name);
+        wanted_values.iter().any(|wanted| {
+            held.iter()
+                .any(|value| crate::state::filter_value_matches(wanted, value))
+        })
+    })
 }
