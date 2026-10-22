@@ -8,6 +8,19 @@ cargo build -p service-com-amazonaws-cloudformation-cloudformation
 cargo test  -p service-com-amazonaws-cloudformation-cloudformation
 ```
 
+## What is implemented today
+
+The stack lifecycle, computed from the stack store in `src/state.rs`:
+`CreateStack`, `DescribeStacks`, `ListStacks`, `GetTemplate`, `UpdateStack`,
+`DeleteStack` and `DescribeStackEvents`. A create/update/delete answers while the
+operation is in progress and the stack settles to its terminal status a moment later,
+so a caller that reads straight after the call still sees `*_IN_PROGRESS`
+(`state::STATUS_TRANSITION_DELAY`). `tests/all/stack_lifecycle.rs` drives all of it over
+the awsQuery wire.
+
+Every other operation (change sets, stack sets, the type registry, drift detection,
+resource scans, refactors, imports/exports) is still scaffolded and answers HTTP 501.
+
 ## Layout
 
 ```

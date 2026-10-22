@@ -98,11 +98,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // OpenSearch Ingestion reports a member that is a COLLECTION of
-        // constrained scalars once per MEMBER, not once per offending element:
-        // the entry names the collection member's own path, renders the refused
-        // values as a bracketed list and enumerates the element shape's whole
-        // constraint set. Every other refusal keeps the framework's wording,
+        // OpenSearch Ingestion states a `@pattern` requirement with the pattern
+        // it PUBLISHES for that string shape — unanchored, and with a trailing
+        // one-or-more repetition bounded by the shape's `@length` — rather than
+        // the model's regex literal. It also reports a member that is a
+        // COLLECTION of constrained scalars once per MEMBER, not once per
+        // offending element: the entry names the collection member's own path,
+        // renders the refused values as a bracketed list and enumerates the
+        // element shape's whole constraint set. Every other refusal keeps the
+        // framework's wording,
         // which already matches. See `validation` for the rule and where its
         // constraints come from; it answers `None` for everything it does not
         // reword, and returns the framework's own error code with the message it

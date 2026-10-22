@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOrganizationalUnit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOrganizationalUnit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOrganizationalUnit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a new organizational unit under a root or another OU. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +194,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOrganizationalUnit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOrganizationalUnitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOrganizationalUnit"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store unchecked: `Tags` is bounded before
+        // the store lock is taken at all. `Name`, `ParentId` and each tag's key and
+        // value are bounded by the model, so the boundary validator has already
+        // refused anything outside those.
+        let tags = input.tags.unwrap_or_default();
+        if let Err((reason, message)) = crate::state::bound_tags(&tags) {
+            return Err(if reason == crate::state::DUPLICATE_TAG_KEY_REASON {
+                CreateOrganizationalUnitErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        reason: Some(reason.to_string()),
+                    },
+                )
+                .into()
+            } else {
+                CreateOrganizationalUnitErrorModeled::ConstraintViolationException(
+                    ConstraintViolationException {
+                        message: Some(message),
+                        reason: Some(reason.to_string()),
+                    },
+                )
+                .into()
+            });
+        }
+
+        let mut store = state.lock();
+        if store.organization.is_none() {
+            return Err(
+                CreateOrganizationalUnitErrorModeled::AWSOrganizationsNotInUseException(
+                    AWSOrganizationsNotInUseException {
+                        message: Some(crate::state::NOT_IN_USE_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The parent must be a node of this organization's hierarchy: its root, or one
+        // of its OUs.
+        if !store.parent_exists(&input.parent_id) {
+            return Err(
+                CreateOrganizationalUnitErrorModeled::ParentNotFoundException(
+                    ParentNotFoundException {
+                        message: Some(crate::state::PARENT_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An OU's name is unique among its SIBLINGS, not organization-wide: the same
+        // name under a different parent is a different OU.
+        let siblings = store.child_organizational_unit_ids(&input.parent_id);
+        if siblings.iter().any(|id| {
+            store
+                .organizational_units
+                .get(id)
+                .is_some_and(|sibling| sibling.name == input.name)
+        }) {
+            return Err(
+                CreateOrganizationalUnitErrorModeled::DuplicateOrganizationalUnitException(
+                    DuplicateOrganizationalUnitException {
+                        message: Some(
+                            crate::state::DUPLICATE_ORGANIZATIONAL_UNIT_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if store.organizational_units.len() >= crate::state::MAX_ORGANIZATIONAL_UNITS {
+            return Err(
+                CreateOrganizationalUnitErrorModeled::ConstraintViolationException(
+                    ConstraintViolationException {
+                        message: Some(format!(
+                            "You have exceeded the number of OUs an organization may hold: {}",
+                            crate::state::MAX_ORGANIZATIONAL_UNITS
+                        )),
+                        reason: Some(crate::state::OU_NUMBER_LIMIT_EXCEEDED_REASON.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The new OU sits one level below its parent, and OUs nest at most
+        // `MAX_ORGANIZATIONAL_UNIT_DEPTH` levels below the root.
+        let depth = store
+            .depth_of(&input.parent_id)
+            .map(|parent_depth| parent_depth.saturating_add(1))
+            .ok_or_else(|| {
+                CreateOrganizationalUnitError::from(
+                    CreateOrganizationalUnitErrorModeled::ParentNotFoundException(
+                        ParentNotFoundException {
+                            message: Some(crate::state::PARENT_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    ),
+                )
+            })?;
+        if depth > crate::state::MAX_ORGANIZATIONAL_UNIT_DEPTH {
+            return Err(
+                CreateOrganizationalUnitErrorModeled::ConstraintViolationException(
+                    ConstraintViolationException {
+                        message: Some(format!(
+                            "You have exceeded the OU nesting depth: OUs can be nested at most {} levels beneath the root",
+                            crate::state::MAX_ORGANIZATIONAL_UNIT_DEPTH
+                        )),
+                        reason: Some(crate::state::OU_DEPTH_LIMIT_EXCEEDED_REASON.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let root_suffix = store
+            .root()
+            .map(|root| root.suffix().to_string())
+            .ok_or_else(|| internal_error("the organization has no root"))?;
+        let organization_id = store
+            .organization
+            .as_ref()
+            .map(|organization| organization.id.clone())
+            .ok_or_else(|| internal_error("the organization record disappeared"))?;
+        let id = store
+            .mint_organizational_unit_id(&root_suffix)
+            .ok_or_else(|| {
+                // No fresh id was available, so nothing is stored: refuse with the
+                // retryable modelled failure rather than mint an unchecked id over an
+                // existing record.
+                CreateOrganizationalUnitError::from(
+                    CreateOrganizationalUnitErrorModeled::ConcurrentModificationException(
+                        ConcurrentModificationException {
+                            message: Some(
+                                crate::state::CONCURRENT_MODIFICATION_MESSAGE.to_string(),
+                            ),
+                        },
+                    ),
+                )
+            })?;
+        let path = store
+            .path_under(&input.parent_id, &id)
+            .ok_or_else(|| internal_error("the parent has no path in the organization"))?;
+
+        store.insert_organizational_unit(crate::state::OrganizationalUnitRecord {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                crate::state::ARN_REGION,
+                &format!("ou/{organization_id}/{id}"),
+            ),
+            id: id.clone(),
+            name: input.name,
+            parent_id: input.parent_id,
+            path,
+            tags,
+        });
+
+        // Read back what was stored, so the response is the persisted record rather
+        // than a value built beside it.
+        let stored = store
+            .organizational_units
+            .get(&id)
+            .ok_or_else(|| internal_error("the OU just inserted could not be read back"))?;
+        Ok(CreateOrganizationalUnitOutput {
+            organizational_unit: Some(stored.to_modelled()),
+        })
     }
+}
+
+/// A broken store invariant: the organization exists, yet one of the records it implies
+/// is missing. Unreachable through the API, and reported as the modelled HTTP 500
+/// `ServiceException` rather than the scaffold's 501 — the operation IS written, so
+/// "not implemented" would be the wrong claim.
+fn internal_error(detail: &str) -> CreateOrganizationalUnitError {
+    CreateOrganizationalUnitErrorModeled::ServiceException(ServiceException {
+        message: Some(format!(
+            "Organizations can't complete your request because of an internal service error ({detail}). Try again later."
+        )),
+    })
+    .into()
 }

@@ -6,6 +6,7 @@
 //! its images by digest plus a tag index. Everything an operation answers with is
 //! derived from here; nothing is re-synthesised from a request.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
@@ -103,6 +104,20 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// credential scope names no region, and ECR's ARNs and repository URIs are regional.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The `LayerAvailability` of a blob the repository holds. The other two values the
+/// enum carries are not reachable from this store: `ARCHIVED` belongs to an image whose
+/// storage class is archive (`UpdateImageStorageClass`, still a 501 stub, is the only
+/// thing that archives one, so every stored image is [`ACTIVE_IMAGE_STATUS`]), and
+/// `UNAVAILABLE` describes a blob the registry has a record of but cannot serve, which
+/// this store never holds — a blob is either in a repository or absent from it.
+pub const AVAILABLE_LAYER_AVAILABILITY: &str = "AVAILABLE";
+
+/// The `LayerFailureCode` for a well-formed digest no repository blob answers to.
+pub const MISSING_LAYER_DIGEST_FAILURE: &str = "MissingLayerDigest";
+
+/// The `LayerFailureCode` for a requested digest that is not a content digest at all.
+pub const INVALID_LAYER_DIGEST_FAILURE: &str = "InvalidLayerDigest";
+
 /// A failure a shared state helper can report, mapped by each operation onto the
 /// modelled error its own model declares.
 #[derive(Debug, Clone)]
@@ -132,6 +147,15 @@ impl Fault {
             | Self::TooManyTags(m) => m,
         }
     }
+}
+
+/// One blob a repository holds: the digest it is addressed by, plus the size and media
+/// type the manifest that references it declares for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerBlob {
+    pub digest: String,
+    pub size: Option<i64>,
+    pub media_type: Option<String>,
 }
 
 /// One stored image: the manifest as pushed, its digest, and every tag pointing at it.
@@ -282,6 +306,42 @@ impl Repo {
     /// The digest `tag` currently points at.
     pub fn digest_of_tag(&self, tag: &str) -> Option<&String> {
         self.tag_index.get(tag)
+    }
+
+    /// Every blob this repository holds, by digest.
+    ///
+    /// A manifest cannot be pushed before every blob it references is in the
+    /// repository — `PutImage` models `LayersNotFoundException` for exactly that, "the
+    /// specified layers could not be found, or the specified layer is not valid for
+    /// this repository" — so the blobs the stored manifests reference are the blobs the
+    /// repository holds, and their descriptors are where their sizes and media types
+    /// come from. Blobs are per-repository: a layer pushed to one repository is not a
+    /// layer of another, which is why this is a method on the repository.
+    pub fn layers(&self) -> BTreeMap<String, LayerBlob> {
+        let mut layers: BTreeMap<String, LayerBlob> = BTreeMap::new();
+        for image in self.images.values() {
+            for blob in manifest_blobs(&image.manifest) {
+                match layers.entry(blob.digest.clone()) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(blob);
+                    }
+                    // One blob can be referenced by several manifests, and the formats
+                    // differ in what they say about it (a V2 schema 1 `fsLayers` entry
+                    // carries the digest alone), so each field is filled by whichever
+                    // descriptor knows it.
+                    Entry::Occupied(mut held) => {
+                        let record = held.get_mut();
+                        if record.size.is_none() {
+                            record.size = blob.size;
+                        }
+                        if record.media_type.is_none() {
+                            record.media_type = blob.media_type;
+                        }
+                    }
+                }
+            }
+        }
+        layers
     }
 
     /// Apply `incoming` to this repository's metadata tags: a key the repository already
@@ -701,6 +761,71 @@ pub fn manifest_media_type(manifest: &str) -> Option<String> {
         .get("mediaType")?
         .as_str()
         .map(ToString::to_string)
+}
+
+/// Every blob an image manifest references, in the order the manifest lists them.
+///
+/// A manifest names its blobs as descriptors, and both container-image manifest
+/// formats in use spell them the same way: the Docker image manifest V2 schema 2 and
+/// the OCI image manifest carry `config` (the image configuration blob, which a
+/// registry stores as a blob like any other) and `layers` (the filesystem layers), each
+/// descriptor carrying `digest`, `size` and `mediaType`; the older V2 schema 1 lists
+/// them as `fsLayers[].blobSum`, a digest and nothing else. A manifest list or OCI
+/// image index references *manifests* rather than blobs, so its `manifests` entries are
+/// deliberately not read here: they are other images, not this one's layers.
+pub fn manifest_blobs(manifest: &str) -> Vec<LayerBlob> {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(manifest) else {
+        return Vec::new();
+    };
+    let mut blobs = Vec::new();
+    if let Some(blob) = document.get("config").and_then(blob_descriptor) {
+        blobs.push(blob);
+    }
+    if let Some(layers) = document.get("layers").and_then(serde_json::Value::as_array) {
+        blobs.extend(layers.iter().filter_map(blob_descriptor));
+    }
+    if let Some(fs_layers) = document
+        .get("fsLayers")
+        .and_then(serde_json::Value::as_array)
+    {
+        blobs.extend(fs_layers.iter().filter_map(|entry| {
+            Some(LayerBlob {
+                digest: entry.get("blobSum")?.as_str()?.to_string(),
+                size: None,
+                media_type: None,
+            })
+        }));
+    }
+    blobs
+}
+
+/// One OCI/Docker content descriptor, or `None` when it names no blob.
+fn blob_descriptor(descriptor: &serde_json::Value) -> Option<LayerBlob> {
+    Some(LayerBlob {
+        digest: descriptor.get("digest")?.as_str()?.to_string(),
+        size: descriptor.get("size").and_then(serde_json::Value::as_i64),
+        media_type: descriptor
+            .get("mediaType")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+    })
+}
+
+/// Whether `digest` is a content digest at all: `<algorithm>:<hex>`, the form the model
+/// constrains `LayerDigest` to (`^[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+$`). A batched request
+/// carries `BatchedOperationLayerDigest`, which the model gives no pattern, so a
+/// malformed digest reaches a handler and is reported against its own entry instead of
+/// refusing the whole batch.
+pub fn is_layer_digest(digest: &str) -> bool {
+    let Some((algorithm, encoded)) = digest.split_once(':') else {
+        return false;
+    };
+    !algorithm.is_empty()
+        && algorithm
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '.'))
+        && !encoded.is_empty()
+        && encoded.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Match `tag` against an exclusion filter. `*` is the only metacharacter a filter can

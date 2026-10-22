@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores each target on the persisted target group named by `TargetGroupArn` —
+//! which must be in state, else `TargetGroupNotFoundException` — keyed by target id
+//! and effective port, so "you can register each EC2 instance or IP address with the
+//! same target group multiple times using different ports" holds and re-registering
+//! one target replaces that registration. `DescribeTargetHealth` reports what this
+//! stored.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterTargets"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("RegisterTargets")
+        })?;
+        let now = std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        let Some(group) = guard.target_groups.get_mut(&input.target_group_arn) else {
+            return Err(RegisterTargetsErrorModeled::TargetGroupNotFoundException(
+                TargetGroupNotFoundException {
+                    message: Some(format!(
+                        "Target group '{}' not found",
+                        input.target_group_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The registration keys this request asks for: the target's own port, else
+        // the group's ("by default, the load balancer routes requests to registered
+        // targets using the protocol and port for the target group. Alternatively,
+        // you can override the port for a target when you register it").
+        let requested: Vec<(String, Option<i32>)> = input
+            .targets
+            .iter()
+            .map(|target| (target.id.clone(), target.port.or(group.port)))
+            .collect();
+
+        // The target group's own bound, checked for the WHOLE request before the
+        // first insert, so a refusal stores nothing: past it the emulator answers
+        // the modelled quota error instead of growing without end. Re-registering a
+        // target the group already holds replaces it, so it does not count.
+        let mut added: std::collections::BTreeSet<&(String, Option<i32>)> =
+            std::collections::BTreeSet::new();
+        for key in &requested {
+            if !group.targets.contains_key(key) {
+                added.insert(key);
+            }
+        }
+        if group.targets.len() + added.len() > crate::state::TARGETS_PER_TARGET_GROUP {
+            return Err(RegisterTargetsErrorModeled::TooManyTargetsException(
+                TooManyTargetsException {
+                    message: Some(format!(
+                        "This emulator holds at most {} targets per target group",
+                        crate::state::TARGETS_PER_TARGET_GROUP
+                    )),
+                },
+            )
+            .into());
+        }
+
+        for (target, (id, port)) in input.targets.iter().zip(requested) {
+            group.targets.insert(
+                (id.clone(), port),
+                crate::state::RegisteredTarget {
+                    id,
+                    port,
+                    availability_zone: target.availability_zone.clone(),
+                    registered_at: now,
+                    healthy_at: now + crate::state::SETTLE_AFTER,
+                },
+            );
+        }
+
+        Ok(RegisterTargetsOutput {})
     }
 }

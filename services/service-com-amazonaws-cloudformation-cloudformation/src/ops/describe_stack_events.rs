@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStackEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStackEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStackEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers the stack-level events `CreateStack`/`UpdateStack`/`DeleteStack`
+//! recorded for the named stack, most recent first.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +65,35 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::StoredEvent;
+
+/// One recorded event as the modelled `StackEvent` shape.
+///
+/// The hook members and `ResourceProperties` are absent because nothing in this emulator
+/// produces them: no hooks run, and no resource is created to have properties.
+fn stack_event_view(stored: &StoredEvent) -> StackEvent {
+    StackEvent {
+        stack_id: stored.stack_id.clone(),
+        event_id: stored.event_id.clone(),
+        stack_name: stored.stack_name.clone(),
+        operation_id: stored.operation_id.clone(),
+        logical_resource_id: Some(stored.logical_resource_id.clone()),
+        physical_resource_id: stored.physical_resource_id.clone(),
+        resource_type: Some(stored.resource_type.clone()),
+        timestamp: crate::state::timestamp(stored.timestamp),
+        resource_status: Some(stored.resource_status.clone()),
+        resource_status_reason: stored.resource_status_reason.clone(),
+        resource_properties: None,
+        client_request_token: stored.client_request_token.clone(),
+        hook_type: None,
+        hook_status: None,
+        hook_status_reason: None,
+        hook_invocation_point: None,
+        hook_invocation_id: None,
+        hook_failure_mode: None,
+        detailed_status: None,
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +162,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStackEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStackEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStackEvents"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there are no recorded events to read.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeStackEvents",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due — which is also what appends the terminal event this
+        // call then reports.
+        store.settle(::std::time::SystemTime::now());
+
+        let stack = store.resolve(&input.stack_name).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
+                &input.stack_name,
+            ))
+        })?;
+
+        // "Returns all stack related events for a specified stack in reverse chronological
+        // order": the store appends events in order, so reading it backwards is that
+        // order.
+        let newest_first: Vec<StackEvent> =
+            stack.events.iter().rev().map(stack_event_view).collect();
+        // `@paginated(inputToken: NextToken, outputToken: NextToken,
+        // items: StackEvents)`: one response carries one bounded page.
+        let (stack_events, next_token) = crate::state::paginate(
+            crate::state::PageOf::StackEvents,
+            newest_first,
+            input.next_token.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(DescribeStackEventsOutput {
+            stack_events: Some(stack_events),
+            next_token,
+        })
     }
 }

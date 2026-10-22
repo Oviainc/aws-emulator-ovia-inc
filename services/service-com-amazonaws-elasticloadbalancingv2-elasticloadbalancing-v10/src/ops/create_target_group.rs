@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTargetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTargetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTargetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and persists a target group in [`crate::state`], with every health-check
+//! default the model documents materialized, and answers with the stored record.
+//! The model documents the operation as idempotent — "if you attempt to create
+//! multiple target groups with the same settings, each call succeeds" — so a repeat
+//! of the same name with the same settings returns the stored target group, and only
+//! a repeat with DIFFERENT settings is `DuplicateTargetGroupNameException`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,6 +156,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{HealthCheckConfig, MatcherRecord, TargetGroupRecord};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -229,18 +229,258 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTargetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTargetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTargetGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("CreateTargetGroup")
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // The modelled default for `TargetType`: "the default is instance".
+        let target_type = input
+            .target_type
+            .clone()
+            .unwrap_or_else(|| "instance".to_string());
+        // The model: "If the target type is instance, ip, or alb, health checks are
+        // always enabled and can't be disabled." The model cannot express that, so
+        // the handler refuses the combination rather than discarding the input.
+        if target_type != "lambda" && input.health_check_enabled == Some(false) {
+            return Err(CreateTargetGroupErrorModeled::InvalidConfigurationRequestException(
+                InvalidConfigurationRequestException {
+                    message: Some(format!(
+                        "Health checks cannot be disabled for a target group whose target type is {target_type}"
+                    )),
+                },
+            )
+            .into());
+        }
+        let mut candidate = TargetGroupRecord {
+            arn: String::new(),
+            name: input.name.clone(),
+            protocol: input.protocol.clone(),
+            protocol_version: input.protocol_version.clone(),
+            port: input.port,
+            vpc_id: input.vpc_id.clone(),
+            health_check: health_check_config(&input, &target_type),
+            target_type,
+            ip_address_type: input.ip_address_type.clone(),
+            target_control_port: input.target_control_port,
+            load_balancer_arns: Vec::new(),
+            attributes: std::collections::HashMap::new(),
+            tags: tag_map(input.tags.as_deref()),
+            targets: std::collections::BTreeMap::new(),
+        };
+
+        let mut guard = state.lock();
+
+        if let Some(existing) = guard
+            .name_to_tg_arn
+            .get(&candidate.name)
+            .and_then(|arn| guard.target_groups.get(arn))
+        {
+            if existing.has_settings_of(&candidate) {
+                // The idempotent repeat the model documents: answer with the stored
+                // target group and mint nothing.
+                return Ok(CreateTargetGroupOutput {
+                    target_groups: Some(vec![existing.to_shape()]),
+                });
+            }
+            return Err(CreateTargetGroupErrorModeled::DuplicateTargetGroupNameException(
+                DuplicateTargetGroupNameException {
+                    message: Some(format!(
+                        "A target group with the name '{}' already exists",
+                        candidate.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store's own bound, enforced before the insert: past it the emulator
+        // answers the modelled quota error instead of growing without end.
+        if guard.target_groups.len() >= crate::state::TARGET_GROUP_QUOTA {
+            return Err(CreateTargetGroupErrorModeled::TooManyTargetGroupsException(
+                TooManyTargetGroupsException {
+                    message: Some(format!(
+                        "This emulator holds at most {} target groups",
+                        crate::state::TARGET_GROUP_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = guard.mint_id();
+        candidate.arn = emulator_server::emulator_arn(
+            crate::state::SERVICE_NAMESPACE,
+            &region,
+            &format!("targetgroup/{}/{id}", candidate.name),
+        );
+
+        guard
+            .name_to_tg_arn
+            .insert(candidate.name.clone(), candidate.arn.clone());
+        let arn = candidate.arn.clone();
+        guard.target_groups.insert(arn.clone(), candidate);
+        let stored = guard
+            .target_groups
+            .get(&arn)
+            .expect("the target group just inserted");
+        Ok(CreateTargetGroupOutput {
+            target_groups: Some(vec![stored.to_shape()]),
+        })
+    }
+}
+
+/// The tags to store. `CreateTargetGroup` models no duplicate-key error, so a
+/// repeated key keeps its last value.
+fn tag_map(tags: Option<&[Tag]>) -> std::collections::HashMap<String, String> {
+    tags.unwrap_or_default()
+        .iter()
+        .map(|tag| (tag.key.clone(), tag.value.clone().unwrap_or_default()))
+        .collect()
+}
+
+/// Whether a protocol carries HTTP semantics, which is what decides whether a health
+/// check has a path and a response-code matcher.
+fn is_http(protocol: Option<&str>) -> bool {
+    matches!(protocol, Some("HTTP") | Some("HTTPS"))
+}
+
+/// The health check to persist: what the request gave, with every absent member
+/// filled from the default its model documents.
+///
+/// Every default below is the sentence the Smithy model carries for that member (see
+/// this file's header, or
+/// `smithy_query(query="doc",shape="CreateTargetGroupInput",member="<Member>")`).
+fn health_check_config(input: &CreateTargetGroupInput, target_type: &str) -> HealthCheckConfig {
+    let lambda = target_type == "lambda";
+    let protocol = input.protocol.as_deref();
+    let geneve = protocol == Some("GENEVE");
+
+    // "For Application Load Balancers, the default is HTTP. For Network Load
+    // Balancers and Gateway Load Balancers, the default is TCP." An HTTP or HTTPS
+    // target group is an Application Load Balancer's; every other protocol is a
+    // Network or Gateway Load Balancer's.
+    let health_check_protocol = input.health_check_protocol.clone().or_else(|| {
+        if lambda {
+            None
+        } else if is_http(protocol) {
+            Some("HTTP".to_string())
+        } else {
+            Some("TCP".to_string())
+        }
+    });
+    let health_check_is_http = is_http(health_check_protocol.as_deref());
+
+    // "If the protocol is HTTP, HTTPS, TCP, TLS, UDP, TCP_UDP, QUIC, or TCP_QUIC the
+    // default is traffic-port ... If the protocol is GENEVE, the default is port 80."
+    let port = input.health_check_port.clone().or_else(|| {
+        if lambda {
+            None
+        } else if geneve {
+            Some("80".to_string())
+        } else {
+            Some("traffic-port".to_string())
+        }
+    });
+
+    // "[HTTP1 or HTTP2 protocol version] The ping path. The default is /. [GRPC
+    // protocol version] ... The default is /AWS.ALB/healthcheck."
+    let path = input.health_check_path.clone().or_else(|| {
+        if !health_check_is_http {
+            None
+        } else if input.protocol_version.as_deref() == Some("GRPC") {
+            Some("/AWS.ALB/healthcheck".to_string())
+        } else {
+            Some("/".to_string())
+        }
+    });
+
+    // "If the target group protocol is TCP, TLS, UDP, TCP_UDP, QUIC, TCP_QUIC, HTTP
+    // or HTTPS, the default is 30 seconds. If the target group protocol is GENEVE,
+    // the default is 10 seconds. If the target type is lambda, the default is 35
+    // seconds."
+    let interval_seconds = input.health_check_interval_seconds.unwrap_or({
+        if lambda {
+            35
+        } else if geneve {
+            10
+        } else {
+            30
+        }
+    });
+
+    // "For target groups with a protocol of HTTP, the default is 6 seconds. For
+    // target groups with a protocol of TCP, TLS or HTTPS, the default is 10 seconds.
+    // For target groups with a protocol of GENEVE, the default is 5 seconds. If the
+    // target type is lambda, the default is 30 seconds."
+    let timeout_seconds = input.health_check_timeout_seconds.unwrap_or({
+        if lambda {
+            30
+        } else if geneve {
+            5
+        } else if protocol == Some("HTTP") {
+            6
+        } else {
+            10
+        }
+    });
+
+    // "The number of consecutive health check successes required before considering a
+    // target healthy ... the default is 5" for every protocol and target type.
+    let healthy_threshold = input.healthy_threshold_count.unwrap_or(5);
+
+    // "The number of consecutive health check failures required before considering a
+    // target unhealthy ... the default is 2. ... If the target type is lambda, the
+    // default is 5."
+    let unhealthy_threshold = input
+        .unhealthy_threshold_count
+        .unwrap_or(if lambda { 5 } else { 2 });
+
+    // "[HTTP/HTTPS health checks] The HTTP or gRPC codes to use when checking for a
+    // successful response from a target." A matcher therefore exists only for an
+    // HTTP/HTTPS health check: 200 for HTTP, the gRPC success code 12 for a gRPC
+    // target group.
+    let matcher = input
+        .matcher
+        .as_ref()
+        .map(|matcher| MatcherRecord {
+            http_code: matcher.http_code.clone(),
+            grpc_code: matcher.grpc_code.clone(),
+        })
+        .or_else(|| {
+            if !health_check_is_http {
+                None
+            } else if input.protocol_version.as_deref() == Some("GRPC") {
+                Some(MatcherRecord {
+                    http_code: None,
+                    grpc_code: Some("12".to_string()),
+                })
+            } else {
+                Some(MatcherRecord {
+                    http_code: Some("200".to_string()),
+                    grpc_code: None,
+                })
+            }
+        });
+
+    HealthCheckConfig {
+        // "If the target type is lambda, health checks are disabled by default but
+        // can be enabled. If the target type is instance, ip, or alb, health checks
+        // are always enabled and can't be disabled."
+        enabled: if lambda {
+            input.health_check_enabled.unwrap_or(false)
+        } else {
+            true
+        },
+        protocol: health_check_protocol,
+        port,
+        path,
+        interval_seconds,
+        timeout_seconds,
+        healthy_threshold,
+        unhealthy_threshold,
+        matcher,
     }
 }

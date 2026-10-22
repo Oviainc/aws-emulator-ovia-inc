@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateListener
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateListener`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateListener::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a listener under the load balancer named by `LoadBalancerArn` — which
+//! must be in state, else `LoadBalancerNotFoundException` — and records the listener
+//! on every target group its default actions forward to, so that target group's
+//! `LoadBalancerArns` and its targets' health reflect the association.
+//!
+//! The model documents the operation as idempotent — "if you attempt to create
+//! multiple listeners with the same settings, each call succeeds" — so a repeat on a
+//! port the load balancer already listens on returns the stored listener when the
+//! settings match, and is `DuplicateListenerException` when they do not.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +129,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::ListenerRecord;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -215,18 +218,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateListener` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateListenerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateListener"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("CreateListener")
+        })?;
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+
+        let candidate = ListenerRecord {
+            arn: String::new(),
+            load_balancer_arn: input.load_balancer_arn.clone(),
+            port: input.port,
+            protocol: input.protocol.clone(),
+            ssl_policy: input.ssl_policy.clone(),
+            certificate_arns: input
+                .certificates
+                .iter()
+                .flatten()
+                .filter_map(|certificate| certificate.certificate_arn.clone())
+                .collect(),
+            default_actions: input.default_actions.clone(),
+            alpn_policy: input.alpn_policy.clone().unwrap_or_default(),
+            attributes: std::collections::HashMap::new(),
+            tags: input
+                .tags
+                .iter()
+                .flatten()
+                .map(|tag| (tag.key.clone(), tag.value.clone().unwrap_or_default()))
+                .collect(),
+            rule_arns: Vec::new(),
+        };
+
+        let mut guard = state.lock();
+        guard.settle(now);
+
+        let Some(load_balancer) = guard.load_balancers.get(&candidate.load_balancer_arn) else {
+            return Err(CreateListenerErrorModeled::LoadBalancerNotFoundException(
+                LoadBalancerNotFoundException {
+                    message: Some(format!(
+                        "Load balancer '{}' not found",
+                        candidate.load_balancer_arn
+                    )),
+                },
+            )
+            .into());
+        };
+        let (lb_name, lb_id, lb_type) = (
+            load_balancer.name.clone(),
+            load_balancer.id.clone(),
+            load_balancer.lb_type.clone(),
+        );
+        let listener_arns = load_balancer.listener_arns.clone();
+
+        // A default action may forward only to a target group that exists.
+        let forwarded = crate::state::action_target_group_arns(&candidate.default_actions);
+        for target_group_arn in &forwarded {
+            if !guard.target_groups.contains_key(target_group_arn) {
+                return Err(CreateListenerErrorModeled::TargetGroupNotFoundException(
+                    TargetGroupNotFoundException {
+                        message: Some(format!("Target group '{target_group_arn}' not found")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // One listener per port on a load balancer: the same settings are the
+        // idempotent repeat the model documents, different ones are a duplicate.
+        if let Some(existing) = listener_arns
+            .iter()
+            .filter_map(|arn| guard.listeners.get(arn))
+            .find(|listener| listener.port == candidate.port)
+        {
+            if existing.has_settings_of(&candidate) {
+                return Ok(CreateListenerOutput {
+                    listeners: Some(vec![existing.to_shape()]),
+                });
+            }
+            return Err(CreateListenerErrorModeled::DuplicateListenerException(
+                DuplicateListenerException {
+                    message: Some(format!(
+                        "A listener already exists on port {} of load balancer '{}'",
+                        candidate.port.unwrap_or_default(),
+                        candidate.load_balancer_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The load balancer's own bound on listeners, enforced before the insert:
+        // past it the emulator answers the modelled quota error instead of growing
+        // without end.
+        if listener_arns.len() >= crate::state::LISTENERS_PER_LOAD_BALANCER {
+            return Err(CreateListenerErrorModeled::TooManyListenersException(
+                TooManyListenersException {
+                    message: Some(format!(
+                        "This emulator holds at most {} listeners per load balancer",
+                        crate::state::LISTENERS_PER_LOAD_BALANCER
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = guard.mint_id();
+        let type_code = crate::state::load_balancer_type_code(&lb_type);
+        let arn = emulator_server::emulator_arn(
+            crate::state::SERVICE_NAMESPACE,
+            &region,
+            &format!("listener/{type_code}/{lb_name}/{lb_id}/{id}"),
+        );
+        let stored = ListenerRecord {
+            arn: arn.clone(),
+            ..candidate
+        };
+        guard.listeners.insert(arn.clone(), stored);
+        if let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) {
+            load_balancer.listener_arns.push(arn.clone());
+        }
+        for target_group_arn in &forwarded {
+            guard.associate_target_group(target_group_arn, &input.load_balancer_arn);
+        }
+
+        let stored = guard.listeners.get(&arn).expect("the listener just inserted");
+        Ok(CreateListenerOutput {
+            listeners: Some(vec![stored.to_shape()]),
+        })
     }
 }

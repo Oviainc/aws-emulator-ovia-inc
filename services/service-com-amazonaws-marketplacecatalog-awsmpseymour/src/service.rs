@@ -121,7 +121,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // signing-name collisions: the signing name must match AND the request must
         // address this service's own modeled URI path space (see `claims_modeled_path`),
         // which for a restJson1 service is the first segment of each operation's
-        // `@http` URI (`/GetResourcePolicy`, `/TagResource`, …).
+        // `@http` URI (`/GetResourcePolicy`, `/TagResource`, `/ListEntities`,
+        // `/DescribeEntity`, …), disjoint from every sibling's.
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) if key == self.entry.identity().signing_name() => {
                 claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)

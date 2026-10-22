@@ -173,6 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `DescribeEntityRequest$EntityId` targets the wider `ResourceId`
+        // (`^[\w\-]+$`), which admits strings that are not entity ids at all.
+        // The id is checked against the form the model's own `EntityId` shape
+        // states BEFORE any lookup, so a malformed id is refused as a 422
+        // `ValidationException` and only a well-formed one reaches the lookup
+        // that answers 404.
+        if !crate::state::is_entity_id(&input.entity_id) {
+            return Err(DescribeEntityErrorModeled::ValidationException(
+                crate::state::invalid_entity_id(&input.entity_id),
+            )
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // An entity exists once the change set that creates it has succeeded,

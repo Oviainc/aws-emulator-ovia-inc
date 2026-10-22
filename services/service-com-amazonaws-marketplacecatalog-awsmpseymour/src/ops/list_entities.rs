@@ -254,13 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| crate::state::ENTITY_SORT_BY[0].to_string());
         if !crate::state::ENTITY_SORT_BY.contains(&sort_by.as_str()) {
             return Err(ListEntitiesErrorModeled::ValidationException(
-                crate::state::validation(
-                    "Sort.SortBy",
-                    format!(
-                        "ListEntities sorts by {:?}, not by {sort_by:?}",
-                        crate::state::ENTITY_SORT_BY
-                    ),
-                ),
+                crate::state::invalid_sort_by(&sort_by, crate::state::ENTITY_SORT_BY),
             )
             .into());
         }

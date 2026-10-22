@@ -40,6 +40,16 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! ## This service's own refusal code
+//!
+//! CloudFormation refuses a bad request with the wire error code `ValidationError`, which
+//! its model declares no shape for (its own operation docs name it: "If the stack doesn't
+//! exist, a `ValidationError` is returned"). So beside the synthetic
+//! [`Scaffolded::ValidationException`] this wrapper carries a
+//! [`Scaffolded::ValidationError`] variant, built with
+//! [`Scaffolded::validation_error`] — the same single `message`, rendered under the code
+//! a CloudFormation client actually branches on. Prefer it in this crate's handlers.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -185,6 +195,17 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// The request was refused as invalid, in CloudFormation's own wording: HTTP 400
+    /// with the wire error code `ValidationError`.
+    ///
+    /// This is the code the real service answers for a request it refuses on input
+    /// grounds — `DescribeStacks`'s own documentation says so ("If the stack doesn't
+    /// exist, a `ValidationError` is returned"), as does `GetTemplate`'s — and the
+    /// service's model declares no shape for it, so it cannot be a `Modeled` variant.
+    /// A client branches on the code, which is why this exists beside
+    /// [`Scaffolded::ValidationException`]: the synthetic code would not be the one
+    /// CloudFormation clients match on. The payload is the same single `message`.
+    ValidationError(ValidationException),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -221,6 +242,14 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request the way CloudFormation does: HTTP 400 `ValidationError`.
+    ///
+    /// Prefer this over [`Self::validation`] in this service's handlers — see the
+    /// [`Self::ValidationError`] variant for why the code differs.
+    pub fn validation_error(message: impl Into<String>) -> Self {
+        Self::ValidationError(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -228,6 +257,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::ValidationError(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +270,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::ValidationError(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,7 +285,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
-            Self::ValidationException(e) => e,
+            Self::ValidationError(e) | Self::ValidationException(e) => e,
         }
     }
 
@@ -262,7 +293,12 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
-            Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            // The `<Code>` on the wire comes from `shape_name` below, not from this
+            // schema, so both refusals render their one `message` member through the
+            // same synthetic shape and differ only in the code.
+            Self::ValidationError(_) | Self::ValidationException(_) => {
+                &VALIDATION_EXCEPTION_SCHEMA
+            }
         }
     }
 
@@ -274,6 +310,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::ValidationError(_) => "ValidationError",
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,7 +323,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
-            Self::ValidationException(_) => 400,
+            Self::ValidationError(_) | Self::ValidationException(_) => 400,
         }
     }
 
@@ -297,8 +334,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
-            Self::ValidationException(_) => None,
+            // Same reason: the synthetic shapes carry no `awsQueryError` trait, so the
+            // `<Code>` falls through to `shape_name` above — which is already the code
+            // the service answers.
+            Self::ValidationError(_) | Self::ValidationException(_) => None,
         }
     }
 }

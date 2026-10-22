@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTargetGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTargetGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTargetGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports exactly the target groups in state, filtered by `TargetGroupArns`,
+//! `Names` or the `LoadBalancerArn` they are attached to (an identifier nothing in
+//! state carries is the matching not-found refusal) and paged by
+//! `PageSize`/`Marker`. This is the read-back for `CreateTargetGroup`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTargetGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTargetGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTargetGroups"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("DescribeTargetGroups")
+        })?;
+
+        let guard = state.lock();
+
+        if let Some(load_balancer_arn) = input.load_balancer_arn.as_ref() {
+            if !guard.load_balancers.contains_key(load_balancer_arn) {
+                return Err(DescribeTargetGroupsErrorModeled::LoadBalancerNotFoundException(
+                    LoadBalancerNotFoundException {
+                        message: Some(format!("Load balancer '{load_balancer_arn}' not found")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let named = input.target_group_arns.is_some() || input.names.is_some();
+        let mut selected: Vec<&crate::state::TargetGroupRecord> = if named {
+            let mut arns: Vec<String> = Vec::new();
+            for arn in input.target_group_arns.iter().flatten() {
+                if !guard.target_groups.contains_key(arn) {
+                    return Err(not_found(arn));
+                }
+                if !arns.contains(arn) {
+                    arns.push(arn.clone());
+                }
+            }
+            for name in input.names.iter().flatten() {
+                let Some(arn) = guard.name_to_tg_arn.get(name) else {
+                    return Err(not_found(name));
+                };
+                if !arns.contains(arn) {
+                    arns.push(arn.clone());
+                }
+            }
+            arns.iter()
+                .filter_map(|arn| guard.target_groups.get(arn))
+                .collect()
+        } else {
+            guard.target_groups_in_order()
+        };
+
+        if let Some(load_balancer_arn) = input.load_balancer_arn.as_ref() {
+            selected.retain(|group| {
+                group
+                    .load_balancer_arns
+                    .iter()
+                    .any(|arn| arn == load_balancer_arn)
+            });
+        }
+
+        let (page, next_marker) =
+            crate::state::paginate(selected, input.marker.as_deref(), input.page_size).map_err(
+                |_| {
+                    crate::scaffolded::Scaffolded::validation(
+                        "The marker is not valid: it must be a NextMarker from a previous page of this collection",
+                    )
+                },
+            )?;
+
+        Ok(DescribeTargetGroupsOutput {
+            target_groups: Some(page.iter().map(|record| record.to_shape()).collect()),
+            next_marker,
+        })
     }
+}
+
+/// The modelled refusal for an ARN or name no target group in state carries.
+fn not_found(identifier: &str) -> DescribeTargetGroupsError {
+    DescribeTargetGroupsErrorModeled::TargetGroupNotFoundException(TargetGroupNotFoundException {
+        message: Some(format!("Target group '{identifier}' not found")),
+    })
+    .into()
 }
