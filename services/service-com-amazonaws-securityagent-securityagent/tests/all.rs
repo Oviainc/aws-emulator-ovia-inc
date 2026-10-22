@@ -17,5 +17,7 @@ mod agent_space_lifecycle;
 mod application_lifecycle;
 #[path = "all/security_requirement_pack.rs"]
 mod security_requirement_pack;
+#[path = "all/security_requirement_packs.rs"]
+mod security_requirement_packs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
