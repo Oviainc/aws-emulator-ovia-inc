@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkspaceApiKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkspaceApiKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkspaceApiKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a Grafana API key on a workspace: the key record is persisted on that
+//! workspace in [`crate::state`], the token is minted by the emulator's credential
+//! store, and `DeleteWorkspaceApiKey` is what removes it again.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +125,18 @@ impl From<CreateWorkspaceApiKeyErrorModeled> for CreateWorkspaceApiKeyError {
     }
 }
 
+/// The modelled server fault for a request this emulator could not serve from its own
+/// state: the service's store was not mounted, or the credential store minted no secret
+/// to answer with. Neither is something the caller can fix, and neither leaves this
+/// operation free to invent a key.
+fn server_unavailable() -> CreateWorkspaceApiKeyError {
+    CreateWorkspaceApiKeyErrorModeled::InternalServerException(InternalServerException {
+        message: "the grafana workspace store is unavailable".to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
 /// The `CreateWorkspaceApiKey` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,18 +173,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkspaceApiKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkspaceApiKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkspaceApiKey"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_unavailable());
+        };
+
+        // `keyRole` is modelled as a bare `String`, so the boundary validator admits
+        // any value: the documented set ("Valid values: ADMIN|EDITOR|VIEWER", the same
+        // three this service's `Role` shape declares) is enforced here instead.
+        if !crate::state::API_KEY_ROLES.contains(&input.key_role.as_str()) {
+            let admitted = crate::state::API_KEY_ROLES.join(", ");
+            return Err(CreateWorkspaceApiKeyErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "keyRole must be one of {admitted}, got {}",
+                        input.key_role
+                    ),
+                    reason: "FIELD_VALIDATION_FAILED".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "keyRole".to_string(),
+                        message: format!("must be one of {admitted}"),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A key is minted ON a workspace, so an id naming none has nothing to mint a
+        // key against. Settling first is what drops the keys whose `secondsToLive`
+        // has already run out.
+        let Some(workspace) = store.settled_mut(&input.workspace_id, now) else {
+            return Err(CreateWorkspaceApiKeyErrorModeled::ResourceNotFoundException(
+                crate::state::workspace_not_found(&input.workspace_id),
+            )
+            .into());
+        };
+
+        // "Keynames must be unique to the workspace": a name this workspace still
+        // holds is refused rather than replacing the key that holds it.
+        if workspace.api_keys.contains_key(&input.key_name) {
+            return Err(CreateWorkspaceApiKeyErrorModeled::ConflictException(
+                crate::state::api_key_name_taken(&input.workspace_id, &input.key_name),
+            )
+            .into());
+        }
+
+        // The per-workspace key map is bounded; past the bound a create is refused
+        // rather than adding another record.
+        if workspace.api_keys.len() >= crate::state::API_KEY_QUOTA {
+            return Err(
+                CreateWorkspaceApiKeyErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "workspace {} already holds the maximum of {} API keys",
+                            input.workspace_id,
+                            crate::state::API_KEY_QUOTA
+                        ),
+                        // The quota is per workspace, so the workspace is the resource
+                        // that reached it.
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                        service_code: "grafana".to_string(),
+                        // Named for what it bounds: an AWS quota code is an identifier
+                        // Service Quotas issues, which this emulator does not model and
+                        // so must not invent one of.
+                        quota_code: "ApiKeysPerWorkspace".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The token is a secret handed to the caller: it is minted by the emulator's
+        // credential store, never constructed here. Nothing persists it — no operation
+        // reports a key's token again.
+        let Some(key) = crate::state::mint_api_key_token(ctx.credential_store()) else {
+            return Err(server_unavailable());
+        };
+
+        // `secondsToLive` is "the time in seconds until the key expires"; the model
+        // bounds it to `@range(min: 1, max: 2592000)` (30 days), so the boundary
+        // validator has already refused anything outside that.
+        let seconds_to_live =
+            ::std::time::Duration::from_secs(u64::from(input.seconds_to_live.unsigned_abs()));
+        workspace.api_keys.insert(
+            input.key_name.clone(),
+            crate::state::ApiKey {
+                name: input.key_name.clone(),
+                role: input.key_role,
+                created: now,
+                expires: now + seconds_to_live,
+            },
+        );
+
+        Ok(CreateWorkspaceApiKeyOutput {
+            key_name: input.key_name,
+            key,
+            workspace_id: input.workspace_id,
+        })
     }
 }

@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AuthenticationDescription, AuthenticationSummary, AwsSsoAuthentication,
+    AuthenticationDescription, AuthenticationSummary, AwsSsoAuthentication, ConflictException,
     NetworkAccessConfiguration, ResourceNotFoundException, SamlAuthentication, SamlConfiguration,
     ServiceAccountSummary, ValidationException, ValidationExceptionField, VpcConfiguration,
     WorkspaceDescription, WorkspaceSummary,
@@ -72,6 +72,28 @@ pub const SAML_NOT_CONFIGURED: &str = "NOT_CONFIGURED";
 /// The `resourceType` a `ResourceNotFoundException` reports for a workspace id
 /// that names no workspace.
 pub const WORKSPACE_RESOURCE_TYPE: &str = "Workspace";
+
+/// The `resourceType` a `ResourceNotFoundException` or a `ConflictException`
+/// reports for a workspace API key.
+pub const API_KEY_RESOURCE_TYPE: &str = "ApiKey";
+
+/// The permission levels a workspace API key can carry.
+///
+/// `CreateWorkspaceApiKeyRequest$keyRole` is modelled as a plain `String`, but it
+/// documents "Valid values: ADMIN|EDITOR|VIEWER" — the same three values this
+/// service's own `Role` enum shape declares. A role outside this set is what
+/// `CreateWorkspaceApiKey` refuses with the modelled `ValidationException`.
+pub const API_KEY_ROLES: [&str; 3] = ["ADMIN", "EDITOR", "VIEWER"];
+
+/// How many API keys one workspace holds before `CreateWorkspaceApiKey` refuses
+/// with the modelled `ServiceQuotaExceededException`.
+///
+/// Like [`WORKSPACE_QUOTA`] this is the emulator's OWN bound on the store rather
+/// than a claim about any account's quota: it is what stops the per-workspace key
+/// map growing without end. Every record it holds is released by
+/// `DeleteWorkspaceApiKey`, by the key's own expiry, or by `DeleteWorkspace`,
+/// which drops the workspace record the keys live on.
+pub const API_KEY_QUOTA: usize = 100;
 
 /// The `resourceType` an error reports for a service account of a workspace.
 pub const SERVICE_ACCOUNT_RESOURCE_TYPE: &str = "ServiceAccount";
@@ -146,6 +168,25 @@ pub const WORKSPACE_QUOTA: usize = 1_000;
 /// materialised by whichever later call reads it — nothing sleeps.
 pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 
+/// One Grafana API key of a workspace, as this emulator persists it.
+///
+/// The key TOKEN is not here: it is a secret handed to the caller once, by
+/// `CreateWorkspaceApiKey`, and no operation reports it again — so nothing in the
+/// store needs to hold it.
+#[derive(Debug, Clone)]
+pub struct ApiKey {
+    /// `ApiKeyName`, unique within the workspace ("Keynames must be unique to
+    /// the workspace").
+    pub name: String,
+    /// One of [`API_KEY_ROLES`].
+    pub role: String,
+    pub created: SystemTime,
+    /// `created` plus the request's `secondsToLive` ("the time in seconds until
+    /// the key expires"). Past this instant the key is no longer a key of the
+    /// workspace.
+    pub expires: SystemTime,
+}
+
 /// A status change the clock owes a workspace: the instant it falls due, and the
 /// status the workspace carries from then on.
 #[derive(Debug, Clone)]
@@ -191,6 +232,10 @@ pub struct Workspace {
     pub saml_configuration: Option<SamlConfiguration>,
     /// Set by `AssociateLicense`; unset until then.
     pub license_type: Option<String>,
+    /// This workspace's Grafana API keys, keyed by their name: what
+    /// `CreateWorkspaceApiKey` mints and `DeleteWorkspaceApiKey` removes. They
+    /// live on the workspace record, so deleting the workspace forgets them too.
+    pub api_keys: BTreeMap<String, ApiKey>,
     pub tags: BTreeMap<String, String>,
     /// Every service account of this workspace, in the order
     /// `CreateWorkspaceServiceAccount` minted them — the stable total order
@@ -205,21 +250,27 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Materialise the status change the clock owes this workspace, if `now` is
-    /// past its due instant.
+    /// Materialise everything the clock owes this workspace by `now`: the status
+    /// change that has fallen due, and the expiry of any API key whose
+    /// `secondsToLive` has run out.
     ///
-    /// Only `status` moves: `modified` reports the last call that changed the
+    /// Only those move: `modified` reports the last call that changed the
     /// workspace, and the asynchronous work this settles was started by a call
     /// that already bumped it.
     pub fn settle(&mut self, now: SystemTime) {
-        let Some(pending) = self.pending.as_ref() else {
-            return;
-        };
-        if now < pending.due {
-            return;
+        let due = self
+            .pending
+            .as_ref()
+            .filter(|pending| now >= pending.due)
+            .map(|pending| pending.status.clone());
+        if let Some(status) = due {
+            self.status = status;
+            self.pending = None;
         }
-        self.status = pending.status.clone();
-        self.pending = None;
+        // An expired key is gone whether or not anybody called: the instant its
+        // `secondsToLive` ran out is when it stopped being a key of this
+        // workspace.
+        self.api_keys.retain(|_, key| now < key.expires);
     }
 
     /// Whether this workspace may hold service accounts at all.
@@ -593,6 +644,48 @@ pub fn workspace_not_found(id: &str) -> ResourceNotFoundException {
         resource_id: id.to_string(),
         resource_type: WORKSPACE_RESOURCE_TYPE.to_string(),
     }
+}
+
+/// The `ResourceNotFoundException` payload for a key name that names no API key
+/// of `workspace_id` — one never created, already deleted, or expired.
+pub fn api_key_not_found(workspace_id: &str, key_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("API key {key_name} not found in workspace {workspace_id}"),
+        resource_id: key_name.to_string(),
+        resource_type: API_KEY_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The `ConflictException` payload for a key name the workspace already holds:
+/// "Keynames must be unique to the workspace."
+pub fn api_key_name_taken(workspace_id: &str, key_name: &str) -> ConflictException {
+    ConflictException {
+        message: format!("workspace {workspace_id} already holds an API key named {key_name}"),
+        resource_id: key_name.to_string(),
+        resource_type: API_KEY_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// A fresh Grafana API key token, for `CreateWorkspaceApiKey`.
+///
+/// The token authenticates to the workspace's own Grafana HTTP API, NOT to this
+/// emulator, so it must never be accepted as a SigV4 credential — but it is still
+/// a secret handed to a caller, and nothing in a service may construct a secret
+/// itself. It is therefore minted by the one component that generates secrets,
+/// the emulator's credential store, and then removed from that store again: the
+/// caller gets the secret, the emulator keeps no credential it would accept, and
+/// nothing accumulates per call.
+///
+/// `None` when the store minted no session-token secret, which leaves the
+/// operation to refuse rather than report a token it made up.
+pub fn mint_api_key_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(str::to_string);
+    // The token is not a credential of this emulator; see above.
+    let _ = store.delete(&minted.id);
+    token
 }
 
 /// The workspace id the resource ARN `arn` names, or `None` when `arn` does not

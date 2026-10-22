@@ -343,6 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             saml_configuration: None,
             // A licence is associated by `AssociateLicense`, never at create.
             license_type: None,
+            // API keys are minted by `CreateWorkspaceApiKey`; a new workspace
+            // holds none.
+            api_keys: ::std::collections::BTreeMap::new(),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             // Service accounts are minted by `CreateWorkspaceServiceAccount`,
             // never at create: a new workspace holds none.
