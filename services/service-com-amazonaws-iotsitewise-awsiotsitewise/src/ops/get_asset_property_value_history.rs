@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAssetPropertyValueHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAssetPropertyValueHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAssetPropertyValueHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the stored samples of one asset property from
+//! the shared engine store (`crate::state`), windowed, quality-filtered, ordered and
+//! paginated as the model documents; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +173,224 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAssetPropertyValueHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAssetPropertyValueHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAssetPropertyValueHistory"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAssetPropertyValueHistoryError::Modeled(
+                GetAssetPropertyValueHistoryErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        // The model carries only `range min 1` for `maxResults`, so the documented
+        // ceiling ("The maximum value of maxResults is 20000") is enforced here. It is
+        // a bound on an input member, so a request past it is `InvalidRequestException`
+        // (400) — the same status the runtime's own constraint check answers with — and
+        // the message names the member and the constraint it broke.
+        let page_size = match input.max_results {
+            Some(requested) if requested > MAX_RESULTS => {
+                return Err(invalid_request(format!(
+                    "maxResults must be at most {MAX_RESULTS}, but this request asks for \
+                     {requested}."
+                )))
+            }
+            // The runtime refuses `maxResults < 1` before this handler runs, so `max(1)`
+            // only keeps the slice arithmetic below total.
+            Some(requested) => requested.max(1) as usize,
+            None => MAX_RESULTS as usize,
+        };
+
+        // The window: "the exclusive start" and "the inclusive end" of the queried
+        // range. An absent bound leaves that side open.
+        let after = input.start_date.as_ref().map(date_key);
+        let through = input.end_date.as_ref().map(date_key);
+        if let (Some(start), Some(end)) = (after, through) {
+            if end < start {
+                return Err(invalid_request(
+                    "endDate must not precede startDate.".to_string(),
+                ));
+            }
+        }
+
+        // `timeOrdering` is a modelled enum defaulting to ASCENDING, so only its two
+        // values can reach here.
+        let descending = input.time_ordering.as_deref() == Some(ORDER_DESCENDING);
+
+        let store = state.lock();
+
+        // A property is named either by its asset and property ids or by its alias;
+        // exactly one of the two forms identifies it. Resolved exactly as
+        // `GetAssetPropertyValue` resolves it, through the shared resolver, so one
+        // property is named one way across the service.
+        let (asset_id, property_id) = match (
+            input.asset_id.as_deref(),
+            input.property_id.as_deref(),
+            input.property_alias.as_deref(),
+        ) {
+            (Some(asset_label), Some(property_id), None) => {
+                let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
+                    not_found(format!("The asset {asset_label} could not be found."))
+                })?;
+                let has_property = store.assets.get(&asset_id).is_some_and(|asset| {
+                    asset
+                        .properties
+                        .iter()
+                        .any(|property| property.id == property_id)
+                });
+                if !has_property {
+                    return Err(not_found(format!(
+                        "The asset {asset_label} has no property {property_id}."
+                    )));
+                }
+                (asset_id, property_id.to_string())
+            }
+            (None, None, Some(alias)) => {
+                store.property_alias_index.get(alias).cloned().ok_or_else(|| {
+                    not_found(format!("The property alias {alias} could not be found."))
+                })?
+            }
+            _ => {
+                return Err(invalid_request(
+                    "Specify either assetId and propertyId, or propertyAlias.".to_string(),
+                ))
+            }
+        };
+
+        // The stored series is sorted ascending by timestamp, so the window and the
+        // quality filter select from it in order and ASCENDING needs no sort at all.
+        let mut selected: Vec<AssetPropertyValue> = store
+            .property_values
+            .get(&asset_id)
+            .and_then(|properties| properties.get(&property_id))
+            .map(|series| {
+                series
+                    .iter()
+                    .filter(|sample| {
+                        let at = crate::state::timestamp_key(&sample.timestamp);
+                        after.is_none_or(|start| at > start)
+                            && through.is_none_or(|end| at <= end)
+                    })
+                    .filter(|sample| keeps_quality(input.qualities.as_deref(), sample))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if descending {
+            selected.reverse();
+        }
+
+        // `nextToken` is this enumeration's resume point: the timestamp of the first
+        // sample of the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
+        // refused rather than answered with an empty page, which would report absence
+        // as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                selected
+                    .iter()
+                    .position(|sample| crate::state::timestamp_key(&sample.timestamp) == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(selected.len());
+
+        let next_token = selected
+            .get(end)
+            .map(|sample| encode_token(crate::state::timestamp_key(&sample.timestamp)));
+        selected.truncate(end);
+
+        Ok(GetAssetPropertyValueHistoryOutput {
+            asset_property_value_history: selected.split_off(start),
+            next_token,
+        })
     }
+}
+
+/// The ceiling on `maxResults`, and the page size a request that names none gets.
+///
+/// From the model doc on `GetAssetPropertyValueHistoryRequest$maxResults`: "The
+/// maximum value of `maxResults` is 20000." The other documented stop — "the size
+/// of the result set is equal to 4 MB" — is a response-size bound this emulator
+/// does not model, so the documented maximum is also the default page size.
+const MAX_RESULTS: i32 = 20_000;
+
+/// The `TimeOrdering` value that reports the newest sample first. Source:
+/// `smithy_query(query="shape", shape="TimeOrdering")` — ASCENDING | DESCENDING,
+/// with ASCENDING the documented default.
+const ORDER_DESCENDING: &str = "DESCENDING";
+
+/// The `Quality` a sample stored without one counts as: IoT SiteWise records a
+/// reading whose write carried no `quality` as `GOOD`.
+const QUALITY_GOOD: &str = "GOOD";
+
+/// Whether `sample` survives the requested quality filter.
+///
+/// `qualities` is "the quality by which to filter asset data": a request that names
+/// none asks for every sample, and one that names a quality keeps only the samples
+/// reporting it.
+fn keeps_quality(qualities: Option<&[String]>, sample: &AssetPropertyValue) -> bool {
+    match qualities {
+        // A filter naming no quality — absent, or the empty list — asks for all of them.
+        None | Some([]) => true,
+        Some(wanted) => {
+            let quality = sample.quality.as_deref().unwrap_or(QUALITY_GOOD);
+            wanted.iter().any(|candidate| candidate == quality)
+        }
+    }
+}
+
+/// A modelled `Timestamp` as the same `(seconds, nanoseconds)` total order
+/// [`crate::state::timestamp_key`] puts the stored samples in.
+fn date_key(at: &::aws_smithy_types::DateTime) -> (i64, i32) {
+    (
+        at.secs(),
+        // A subsecond offset is at most 999_999_999 nanoseconds, so it always fits.
+        i32::try_from(at.subsec_nanos()).unwrap_or(i32::MAX),
+    )
+}
+
+/// The `nextToken` that resumes at the sample with timestamp `resume`.
+fn encode_token(resume: (i64, i32)) -> String {
+    let (seconds, nanos) = resume;
+    ::hex::encode(format!("{seconds}.{nanos}").as_bytes())
+}
+
+/// Decode a `nextToken` back into the timestamp it resumes from.
+fn decode_token(token: &str) -> Result<(i64, i32), GetAssetPropertyValueHistoryError> {
+    let decoded = ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)?;
+    let (seconds, nanos) = decoded.split_once('.').ok_or_else(invalid_token)?;
+    Ok((
+        seconds.parse().map_err(|_| invalid_token())?,
+        nanos.parse().map_err(|_| invalid_token())?,
+    ))
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> GetAssetPropertyValueHistoryError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> GetAssetPropertyValueHistoryError {
+    GetAssetPropertyValueHistoryError::Modeled(
+        GetAssetPropertyValueHistoryErrorModeled::InvalidRequestException(
+            InvalidRequestException { message },
+        ),
+    )
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> GetAssetPropertyValueHistoryError {
+    GetAssetPropertyValueHistoryError::Modeled(
+        GetAssetPropertyValueHistoryErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException { message },
+        ),
+    )
 }

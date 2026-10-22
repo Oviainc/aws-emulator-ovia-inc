@@ -178,7 +178,7 @@ async fn cancel_job_run(
 /// checked by hand (this crate has no regex dependency) rather than through the crate's
 /// own predicate, so a wrong predicate in `src/` cannot make this test pass. Source:
 /// `smithy_query(query="shape",shape="Application")`.
-fn matches_resource_id(value: &str) -> bool {
+pub(crate) fn matches_resource_id(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value
             .chars()
@@ -212,7 +212,7 @@ fn matches_job_run_arn(arn: &str, region: &str) -> bool {
 
 /// `RequestIdentityUserArn`'s modelled `@pattern`
 /// `^arn:(aws[a-zA-Z0-9-]*):(iam|sts)::(\d{12})?:[\w/+=,.@-]+$` with length 20..2048.
-fn matches_request_identity_arn(arn: &str) -> bool {
+pub(crate) fn matches_request_identity_arn(arn: &str) -> bool {
     let Some(rest) = arn
         .strip_prefix("arn:aws:iam::")
         .or_else(|| arn.strip_prefix("arn:aws:sts::"))
@@ -1833,12 +1833,6 @@ async fn the_operations_this_slice_does_not_implement_still_answer_501() {
     let application_id = started_application(&router, "tok-stubs").await;
 
     for (case, method, uri, body) in [
-        (
-            "StartSession",
-            "POST",
-            format!("/applications/{application_id}/sessions"),
-            Some(json!({ "clientToken": "ses-1", "executionRoleArn": EXECUTION_ROLE })),
-        ),
         (
             "ListSessions",
             "GET",

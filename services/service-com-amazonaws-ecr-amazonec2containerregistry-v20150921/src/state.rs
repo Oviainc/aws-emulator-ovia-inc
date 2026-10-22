@@ -372,6 +372,58 @@ impl ImageRecord {
     }
 }
 
+/// Why an `imageIds` entry resolves to no stored image.
+///
+/// The variants are named after the `ImageFailureCode` values ECR reports for an
+/// identifier it could not resolve (`IMAGE_FAILURE_CODE_VALUES` in
+/// `ops::types::shared_types`), so a batch operation reports one directly and an
+/// operation that refuses the whole call maps it onto its own modelled error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageLookupFailure {
+    /// The entry carries neither an `imageDigest` nor an `imageTag`, so it names
+    /// nothing at all.
+    MissingDigestAndTag,
+    /// The entry's `imageDigest` is not a content digest at all. The model gives
+    /// `ImageDigest` no pattern, so a malformed digest reaches the handler and is
+    /// reported against its own entry rather than refusing the whole batch.
+    InvalidImageDigest,
+    /// Nothing in the repository answers to the entry.
+    ImageNotFound,
+    /// The entry's digest and its tag each name a stored image, but not the same one.
+    ImageTagDoesNotMatchDigest,
+}
+
+impl ImageLookupFailure {
+    /// The `ImageFailureCode` this failure is reported as.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::MissingDigestAndTag => "MissingDigestAndTag",
+            Self::InvalidImageDigest => "InvalidImageDigest",
+            Self::ImageNotFound => "ImageNotFound",
+            Self::ImageTagDoesNotMatchDigest => "ImageTagDoesNotMatchDigest",
+        }
+    }
+
+    /// The `failureReason` reported beside [`Self::code`]: what about the request made
+    /// the identifier unresolvable.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::MissingDigestAndTag => {
+                "Invalid request parameters: at least one of [imageDigest, imageTag] \
+                 must be specified"
+            }
+            Self::InvalidImageDigest => {
+                "Invalid request parameters: imageDigest must be of the form \
+                 <algorithm>:<hex digest>"
+            }
+            Self::ImageNotFound => "Requested image not found",
+            Self::ImageTagDoesNotMatchDigest => {
+                "Requested image tag does not match the requested image digest"
+            }
+        }
+    }
+}
+
 /// One parsed `rules` entry of a lifecycle policy document.
 ///
 /// ECR's lifecycle policy document is the service's own format, so it is read here
@@ -466,6 +518,17 @@ impl PreviewedImage {
             storage_class: Some(STANDARD_STORAGE_CLASS.to_string()),
         }
     }
+}
+
+/// How an `imageIds` entry reads in a message: ECR renders the requested
+/// `ImageIdentifier` with both members spelled out and an absent one as `null`, so a
+/// caller sees the entry exactly as it sent it.
+pub fn identifier_description(id: &ImageIdentifier) -> String {
+    format!(
+        "imageId {{imageDigest:'{}', imageTag:'{}'}}",
+        id.image_digest.as_deref().unwrap_or("null"),
+        id.image_tag.as_deref().unwrap_or("null")
+    )
 }
 
 /// The lifecycle policy preview one `StartLifecyclePolicyPreview` call started.
@@ -949,46 +1012,85 @@ impl Repo {
         self.tag_index.get(tag)
     }
 
-    /// The stored image an [`ImageIdentifier`] names, or the failure it resolves to.
+    /// The stored image an `imageIds` entry names, or why it names none.
     ///
-    /// An identifier carries a digest, a tag, or both; it names an image only when this
-    /// repository holds one that answers to every part of it. Shared by every operation
-    /// that takes an `imageId`, so they all refuse the same identifier the same way.
-    pub fn resolve_image(&self, id: &ImageIdentifier) -> Result<&ImageRecord, Fault> {
+    /// An entry carries a digest, a tag, or both, and it names an image only when this
+    /// repository holds one that answers to every part of it: a digest addresses the
+    /// manifest of that content, a tag addresses whatever the tag index points at, and
+    /// an entry carrying both resolves only when they agree. A digest that is not a
+    /// content digest at all addresses nothing, and is reported as that rather than as
+    /// an absent image.
+    ///
+    /// This is the one place an `imageId` is resolved: a batch operation reports the
+    /// failure per entry, and [`Self::resolve_image`] lifts it onto a [`Fault`] for an
+    /// operation that refuses the whole call.
+    pub fn lookup_image(&self, id: &ImageIdentifier) -> Result<&ImageRecord, ImageLookupFailure> {
+        if id
+            .image_digest
+            .as_deref()
+            // The same `<algorithm>:<hex>` form a layer digest has: a content digest is
+            // one shape, whatever it addresses.
+            .is_some_and(|digest| !is_layer_digest(digest))
+        {
+            return Err(ImageLookupFailure::InvalidImageDigest);
+        }
         match (id.image_digest.as_deref(), id.image_tag.as_deref()) {
-            (Some(digest), tag) => {
-                let stored = self.images.get(digest).ok_or_else(|| {
-                    Fault::ImageNotFound(format!(
-                        "The image with digest '{digest}' does not exist within the repository \
-                         with name '{}'",
-                        self.name
-                    ))
-                })?;
-                if let Some(tag) = tag {
-                    if !stored.tags.contains(tag) {
-                        return Err(Fault::ImageNotFound(format!(
-                            "The image with digest '{digest}' and tag '{tag}' does not exist \
-                             within the repository with name '{}'",
-                            self.name
-                        )));
-                    }
+            (None, None) => Err(ImageLookupFailure::MissingDigestAndTag),
+            (Some(digest), None) => self
+                .images
+                .get(digest)
+                .ok_or(ImageLookupFailure::ImageNotFound),
+            (None, Some(tag)) => self
+                .digest_of_tag(tag)
+                .and_then(|digest| self.images.get(digest))
+                .ok_or(ImageLookupFailure::ImageNotFound),
+            (Some(digest), Some(tag)) => {
+                let image = self
+                    .images
+                    .get(digest)
+                    .ok_or(ImageLookupFailure::ImageNotFound)?;
+                match self.digest_of_tag(tag) {
+                    // The tag is on this very image, so both parts agree.
+                    Some(tagged) if tagged == digest => Ok(image),
+                    // The tag names another stored image: the two parts disagree.
+                    Some(_) => Err(ImageLookupFailure::ImageTagDoesNotMatchDigest),
+                    // Nothing in the repository carries the tag at all.
+                    None => Err(ImageLookupFailure::ImageNotFound),
                 }
-                Ok(stored)
             }
-            (None, Some(tag)) => {
-                let missing = || {
-                    Fault::ImageNotFound(format!(
-                        "The image with tag '{tag}' does not exist within the repository with \
-                         name '{}'",
-                        self.name
-                    ))
-                };
-                let digest = self.digest_of_tag(tag).ok_or_else(missing)?;
-                self.images.get(digest).ok_or_else(missing)
-            }
-            (None, None) => Err(Fault::InvalidParameter(
+        }
+    }
+
+    /// The stored image an [`ImageIdentifier`] names, or the [`Fault`] it resolves to.
+    ///
+    /// The resolution is [`Self::lookup_image`]'s; what this adds is the mapping onto
+    /// the faults an operation that refuses the WHOLE call reports, so every such
+    /// operation refuses the same identifier the same way. An identifier that names no
+    /// stored image is an image fault; one that is malformed, or that names neither a
+    /// digest nor a tag, is a parameter fault.
+    pub fn resolve_image(&self, id: &ImageIdentifier) -> Result<&ImageRecord, Fault> {
+        // Matched exhaustively, so a lookup failure added later is a compile error here
+        // rather than silently reported as an absent image.
+        match self.lookup_image(id) {
+            Ok(stored) => Ok(stored),
+            Err(ImageLookupFailure::MissingDigestAndTag) => Err(Fault::InvalidParameter(
                 "an image identifier must carry an imageDigest, an imageTag, or both".to_string(),
             )),
+            Err(ImageLookupFailure::InvalidImageDigest) => Err(Fault::InvalidParameter(format!(
+                "Invalid parameter at 'imageIds' failed to satisfy constraint: imageDigest \
+                 '{}' must be of the form <algorithm>:<hex digest>",
+                id.image_digest.as_deref().unwrap_or_default()
+            ))),
+            Err(
+                ImageLookupFailure::ImageNotFound
+                | ImageLookupFailure::ImageTagDoesNotMatchDigest,
+            ) => Err(Fault::ImageNotFound(format!(
+                "The image with {} does not exist within the repository with name '{}' in \
+                 the registry with id '{}'",
+                identifier_description(id),
+                self.name,
+                self.registry_id
+            ))),
         }
     }
 

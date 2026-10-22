@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the manifest of each image an `imageIds` entry names, computed from what
+//! `PutImage` stored: one `images` entry per entry that resolves to a stored image and
+//! one `failures` entry, carrying the identifier as requested, for each entry that does
+//! not. A batch call never fails as a whole for an unresolvable entry; it fails only
+//! when the repository itself is not here, or when the request names another registry.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +126,35 @@ impl From<BatchGetImageErrorModeled> for BatchGetImageError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> BatchGetImageErrorModeled {
+    let message = Some(fault.message().to_string());
+    // Matched exhaustively, so a `Fault` variant added later is a compile error here
+    // rather than a silently mis-categorised 400.
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            BatchGetImageErrorModeled::RepositoryNotFoundException(RepositoryNotFoundException {
+                message,
+            })
+        }
+        crate::state::Fault::InvalidParameter(_) => {
+            BatchGetImageErrorModeled::InvalidParameterException(InvalidParameterException {
+                message,
+            })
+        }
+        // Nothing in this handler produces these: an unresolvable identifier is reported
+        // in `failures` rather than as an error, and this operation touches neither
+        // metadata tags nor lifecycle policies. Reaching one would be a bug here, not a
+        // bad request.
+        crate::state::Fault::ImageNotFound(_)
+        | crate::state::Fault::InvalidTagParameter(_)
+        | crate::state::Fault::TooManyTags(_)
+        | crate::state::Fault::LifecyclePolicyNotFound(_) => {
+            BatchGetImageErrorModeled::ServerException(ServerException { message })
+        }
+    }
+}
+
 /// The `BatchGetImage` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,18 +191,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetImage"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetImageErrorModeled::ServerException(ServerException {
+                message: Some("the ecr repository store is unavailable".to_string()),
+            })
+            .into());
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        // `acceptedMediaTypes` tells the registry which manifest schemas the client
+        // understands, so that it can convert a manifest between them. This emulator
+        // stores every manifest exactly as it was pushed and converts nothing, so the
+        // list changes neither which identifier resolves nor what is reported for it:
+        // each image is answered with the manifest and the media type the push stored.
+        let _ = &input.accepted_media_types;
+
+        // `imageIds` is modelled `@length(1..100)`, so a batch asking for nothing, or
+        // for more than the batch maximum, was already refused at the boundary.
+        let store = state.lock();
+        let repo = store
+            .repository(&input.repository_name)
+            .map_err(fault_error)?;
+
+        let mut images = Vec::new();
+        let mut failures = Vec::new();
+        // One answer per requested identifier, in request order: a batch reports on
+        // every entry it was handed, including two entries that name one image.
+        for id in &input.image_ids {
+            match repo.lookup_image(id) {
+                Ok(stored) => images.push(Image {
+                    registry_id: Some(repo.registry_id.clone()),
+                    repository_name: Some(repo.name.clone()),
+                    // The stored image's own digest, plus the tag the request addressed
+                    // it by — the one rule for that identifier lives on the record.
+                    image_id: Some(stored.identifier(id.image_tag.as_deref())),
+                    image_manifest: Some(stored.manifest.clone()),
+                    image_manifest_media_type: stored.manifest_media_type.clone(),
+                }),
+                Err(failure) => failures.push(ImageFailure {
+                    // The identifier is echoed exactly as requested: it is what lets a
+                    // caller match the failure back to its own entry.
+                    image_id: Some(id.clone()),
+                    failure_code: Some(failure.code().to_string()),
+                    failure_reason: Some(failure.reason().to_string()),
+                }),
+            }
+        }
+
+        Ok(BatchGetImageOutput {
+            images: Some(images),
+            failures: Some(failures),
+        })
     }
 }

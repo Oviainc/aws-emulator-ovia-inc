@@ -31,8 +31,8 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One response, reduced to what a client branches on.
 ///
-/// `pub(crate)` so the suites beside this one (`device_capabilities`) drive the
-/// service through the same harness rather than standing up a second one.
+/// `pub(crate)` so the suites beside this one (`arn_syntax`, `device_capabilities`)
+/// drive the service through the same harness rather than standing up a second one.
 pub(crate) struct Reply {
     pub(crate) status: u16,
     /// The wire error code (`x-amzn-errortype`, else the body's `__type`), if any.
@@ -42,7 +42,7 @@ pub(crate) struct Reply {
 
 impl Reply {
     /// The response body member `name`, as a string.
-    fn str_member(&self, name: &str) -> String {
+    pub(crate) fn str_member(&self, name: &str) -> String {
         self.body
             .get(name)
             .and_then(Value::as_str)
@@ -69,7 +69,7 @@ impl Braket {
         Self { router, engine }
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
         let payload = body.map_or_else(Bytes::new, |value| Bytes::from(value.to_string()));
         let request = http::Request::builder()
             .method(method)
@@ -123,11 +123,11 @@ impl Braket {
             .await
     }
 
-    async fn create_task(&self, body: Value) -> Reply {
+    pub(crate) async fn create_task(&self, body: Value) -> Reply {
         self.call("POST", "/quantum-task", Some(body)).await
     }
 
-    async fn get_task(&self, arn: &str) -> Reply {
+    pub(crate) async fn get_task(&self, arn: &str) -> Reply {
         self.call("GET", &format!("/quantum-task/{}", encode(arn)), None)
             .await
     }
@@ -148,7 +148,7 @@ impl Braket {
         self.call("POST", "/quantum-tasks", Some(body)).await
     }
 
-    async fn cancel_task(&self, arn: &str, client_token: &str) -> Reply {
+    pub(crate) async fn cancel_task(&self, arn: &str, client_token: &str) -> Reply {
         self.call(
             "PUT",
             &format!("/quantum-task/{}/cancel", encode(arn)),
@@ -177,7 +177,7 @@ impl Braket {
     }
 
     /// The ARN of one ONLINE device from the inventory.
-    async fn an_online_device(&self) -> String {
+    pub(crate) async fn an_online_device(&self) -> String {
         let inventory = self.inventory().await;
         let device = inventory
             .iter()
@@ -195,7 +195,7 @@ impl Braket {
 /// serialized merge into the shared mainline kept refusing to squash. Everything
 /// outside the unreserved set of RFC 3986 section 2.3 is escaped, which is what the
 /// server's own path decoder reverses.
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     value
         .bytes()
         .map(|b| match b {
@@ -257,7 +257,7 @@ fn action_document() -> String {
 
 /// The body of a `CreateQuantumTask` call on `device_arn`, with the required members
 /// filled in.
-fn create_body(client_token: &str, device_arn: &str, shots: i64) -> Value {
+pub(crate) fn create_body(client_token: &str, device_arn: &str, shots: i64) -> Value {
     json!({
         "clientToken": client_token,
         "deviceArn": device_arn,
@@ -586,10 +586,13 @@ async fn get_device_reports_each_seeded_device_and_rejects_unknown_arns() {
         );
     }
 
+    // A well-formed device ARN the seeded inventory does not hold is a 404. An ARN
+    // that is not a device ARN at all is invalid INPUT, not a missing resource: that
+    // rule and its table live in `tests/all/arn_syntax.rs`.
     for unknown in [
         "arn:aws:braket:::device/quantum-simulator/amazon/nope",
         "arn:aws:braket:us-east-1::device/qpu/ionq/Aria-9",
-        "not-an-arn",
+        "arn:aws-us-gov:braket:us-gov-west-1:000000000000:device/qpu/nobody/Nothing",
     ] {
         let reply = braket.get_device(unknown).await;
         assert_eq!(
@@ -785,9 +788,11 @@ async fn a_created_quantum_task_reads_back_exactly_as_it_was_created() {
         read_extras.body
     );
 
+    // A well-formed quantum-task ARN no record is held for is a 404; a value that is
+    // not a quantum-task ARN at all is a 400 (see `tests/all/arn_syntax.rs`).
     for unknown in [
         "arn:aws:braket:eu-west-1:000000000000:quantum-task/00000000-0000-4000-8000-000000000000",
-        "nope",
+        "arn:aws-cn:braket:cn-north-1:123456789012:quantum-task/not-created-here",
     ] {
         let reply = braket.get_task(unknown).await;
         assert_eq!(
@@ -935,7 +940,7 @@ async fn create_quantum_task_refuses_by_device_status_and_shot_range() {
     for unknown in [
         "arn:aws:braket:::device/quantum-simulator/amazon/sv9",
         "arn:aws:braket:eu-west-1::device/qpu/nobody/Nothing",
-        "x",
+        "arn:aws:braket:us-east-1:000000000000:device/qpu/nobody/Nothing",
     ] {
         let reply = braket
             .create_task(create_body("tok-unknown", unknown, 1))
@@ -1523,10 +1528,11 @@ async fn cancel_quantum_task_moves_the_record_and_conflicts_on_a_finished_task()
         conflict.error
     );
 
-    // An ARN no task is held for is a 404, whatever it looks like.
+    // A well-formed ARN no task is held for is a 404; a value that is not a
+    // quantum-task ARN at all is a 400 (see `tests/all/arn_syntax.rs`).
     for unknown in [
         "arn:aws:braket:eu-west-1:000000000000:quantum-task/11111111-1111-4111-8111-111111111111",
-        "nope",
+        "arn:aws:braket:::quantum-task/never-created",
     ] {
         let reply = braket.cancel_task(unknown, "cancel-token-5").await;
         assert_eq!(

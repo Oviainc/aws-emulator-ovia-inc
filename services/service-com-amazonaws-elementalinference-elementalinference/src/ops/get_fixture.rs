@@ -2,14 +2,14 @@
 
 //! @op GetFixture
 //! IMPLEMENTED: reports the one fixture a `fixtureId` names, as the data-source
-//! catalog holds it. Reporting only (`@readonly`): it writes nothing at all.
+//! catalog HOLDS it. Reporting only (`@readonly`): it writes nothing at all.
 //!
-//! The catalog lives in [`crate::state`] and is the same one `SearchFixtures`
-//! projects, so a fixture this operation returns agrees member for member with the
-//! `FixtureSummary` that search reported for it.
+//! The fixture store lives in [`crate::state`] and is the same one `SearchFixtures`
+//! selects from, so a fixture this operation returns agrees member for member with
+//! the `FixtureSummary` that search reported for it.
 //!
-//! An id no catalog entry has is the modelled `ValidationException` (HTTP 400), which
-//! is the refusal the recorded behaviour of this operation shows for an id that names
+//! An id the store does not hold is the modelled `ValidationException` (HTTP 400),
+//! which is the refusal the recorded behaviour of this operation shows for an id that names
 //! no fixture (corpus unit `elementalinference.get-fixture-not-found`), and not the
 //! `ResourceNotFoundException` the model also declares: a `fixtureId` is an opaque
 //! reference the service itself hands out (`SearchFixtures`, or a feed's clipping
@@ -180,15 +180,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries request metadata only, and this operation needs none of it.
         let _ = ctx;
-        // The fixture comes from the data-source catalog in `crate::state`, not from
-        // the engine's store: no operation of this service creates a fixture, and
-        // this one is `@readonly`, so there is nothing here to write and nothing
-        // per-account to read. The engine stays on `self` all the same, as every
-        // handler's constructor seam.
-        let _ = &self.engine;
+        // The fixture comes from the fixture store in `crate::state`, reached through
+        // the shared engine held on `self` (the constructor seam). This operation is
+        // `@readonly`, so it only reads that store.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFixtureErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
 
-        let Some(fixture) = crate::state::fixture_by_id(&input.fixture_id) else {
-            // A `fixtureId` the data source does not recognise is refused as INPUT,
+        let Some(fixture) = state.fixture(&input.fixture_id) else {
+            // A `fixtureId` the data source does not hold is refused as INPUT,
             // not reported as a missing resource: the recorded behaviour of this
             // operation for an id that names no fixture is error code
             // `ValidationException` (HTTP 400).
@@ -217,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: fixture.name.clone(),
             fixture_group: fixture.group.clone(),
             scheduled_start: Some(fixture.scheduled_start()),
-            status: fixture.status_at(crate::state::now_secs()).to_string(),
+            status: fixture.status.clone(),
             competitors: fixture.competitors.clone(),
         })
     }

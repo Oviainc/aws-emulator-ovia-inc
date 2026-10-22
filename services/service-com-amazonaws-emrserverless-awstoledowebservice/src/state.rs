@@ -11,7 +11,9 @@
 //! retained in the terminal `TERMINATED` state rather than dropped, so a client reading
 //! the application back after a delete observes that state), and
 //! `StartJobRun` / `GetJobRun` / `ListJobRuns` / `CancelJobRun` work on the job runs it
-//! owns.
+//! owns. An interactive session lives inside one application the same way a job run
+//! does: `StartSession` mints a [`SessionRecord`] on the application it names and
+//! `GetSession` reports it.
 //!
 //! Each record holds the MODELLED shape (`Application`, `JobRun`) verbatim, so a
 //! reporting operation returns exactly what the mutating one stored rather than
@@ -26,7 +28,7 @@ use crate::ops::types::{
     Application, ApplicationSummary, AutoStartConfig, AutoStopConfig, IdentityCenterConfiguration,
     IdentityCenterConfigurationInput, ImageConfiguration, ImageConfigurationInput, JobRun,
     JobRunSummary, JobLevelCostAllocationConfiguration, MonitoringConfiguration,
-    ResourceNotFoundException, WorkerTypeSpecification, WorkerTypeSpecificationInput,
+    ResourceNotFoundException, Session, WorkerTypeSpecification, WorkerTypeSpecificationInput,
 };
 
 /// This service's ARN namespace, and the `sigv4Name` the model declares
@@ -55,6 +57,11 @@ pub const MAX_APPLICATIONS: usize = 1_000;
 
 /// The same bound, for the job runs one application holds.
 pub const MAX_JOB_RUNS_PER_APPLICATION: usize = 1_000;
+
+/// The same bound, for the interactive sessions one application holds. `StartSession`
+/// models `ServiceQuotaExceededException` ("The maximum number of resources per account
+/// has been reached"), which is what it answers past this bound.
+pub const MAX_SESSIONS_PER_APPLICATION: usize = 1_000;
 
 /// The job run timeout stored when `StartJobRun` names none.
 ///
@@ -161,6 +168,44 @@ pub const CANCELLED_STATE_DETAILS: &str = "Job run cancelled at the request of t
 /// `SUCCESS`, `FAILED`, `CANCELLING`, `CANCELLED`, `QUEUED`) — the three that name a
 /// finished run.
 pub const TERMINAL_JOB_RUN_STATES: &[&str] = &["SUCCESS", "FAILED", "CANCELLED"];
+
+/// `Session$stateDetails` for a session a caller has just asked for, before the service
+/// has brought it up.
+pub const SESSION_SUBMITTED_STATE_DETAILS: &str = "Session submitted.";
+
+/// `Session$stateDetails` for a session that has come up and is ready for statements.
+pub const SESSION_STARTED_STATE_DETAILS: &str = "Session started.";
+
+/// `Session$stateDetails` for a session the service terminated for having stayed idle
+/// for its `idleTimeoutMinutes`.
+pub const SESSION_IDLE_TIMEOUT_STATE_DETAILS: &str =
+    "Session terminated after remaining idle for its idle timeout.";
+
+/// The `SessionState` values from which a session never moves again.
+///
+/// Source: the `SessionState` enum (`SUBMITTED`, `STARTING`, `STARTED`, `IDLE`, `BUSY`,
+/// `FAILED`, `TERMINATING`, `TERMINATED`) — the two that name a session that is over.
+pub const TERMINAL_SESSION_STATES: &[&str] = &["FAILED", "TERMINATED"];
+
+/// True when `state` names a `SessionState` a session never leaves.
+pub fn is_terminal_session_state(state: &str) -> bool {
+    TERMINAL_SESSION_STATES.contains(&state)
+}
+
+/// The earliest Amazon EMR release whose applications serve interactive sessions.
+///
+/// Source: `StartSession`'s own documentation — "This operation is supported for EMR
+/// release 7.13.0 and later."
+pub const MIN_SESSION_RELEASE: (u32, u32, u32) = (7, 13, 0);
+
+/// Whether an application on `release_label` serves interactive sessions.
+///
+/// A label this emulator can read no version out of is judged to serve them rather than
+/// refused for a version nothing can order — the same leniency
+/// [`supported_engine_type`] applies.
+pub fn release_supports_sessions(release_label: &str) -> bool {
+    release_version(release_label).is_none_or(|version| version >= MIN_SESSION_RELEASE)
+}
 
 /// The `ApplicationState` values `DeleteApplication` admits, judged against the state
 /// the application has SETTLED on ([`ApplicationRecord::settled_state`]).
@@ -303,6 +348,69 @@ impl JobRunRecord {
     }
 }
 
+/// One interactive session, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    /// The modelled `Session` shape `GetSession` returns verbatim.
+    pub session: Session,
+    /// The state change the clock owes this session, if any.
+    pub pending: Option<PendingState>,
+}
+
+impl SessionRecord {
+    /// Materialise every state change the clock owes this session, if `now` is past
+    /// their due instants.
+    ///
+    /// `updatedAt` moves to the DUE instant rather than to `now`: the change happened
+    /// when it fell due, whether or not anybody was reading. A session that comes up
+    /// owes a further change when its idle timeout falls due, so this settles in a loop
+    /// rather than once: a reader arriving after both instants observes the later state.
+    pub fn settle(&mut self, now: SystemTime) {
+        while let Some(pending) = self.pending.clone() {
+            if now < pending.due {
+                return;
+            }
+            let at = DateTime::from(pending.due);
+            self.session.state = pending.state;
+            if let Some(details) = pending.state_details {
+                self.session.state_details = details;
+            }
+            self.session.updated_at = at;
+            self.pending = None;
+            if self.session.state == "STARTED" {
+                // The session came up at the due instant, and this emulator runs no
+                // statement in it, so it has been idle since that same instant.
+                self.session.started_at = Some(at);
+                self.session.idle_since = Some(at);
+                self.pending = self.idle_timeout_pending(pending.due);
+            }
+            if is_terminal_session_state(&self.session.state) {
+                self.session.ended_at = Some(at);
+                return;
+            }
+        }
+    }
+
+    /// The termination the session's idle timeout owes it, measured from `idle_since`.
+    ///
+    /// `StartSessionRequest$idleTimeoutMinutes` documents it: "The idle timeout in
+    /// minutes for the session. After the session remains idle for this duration, Amazon
+    /// EMR Serverless automatically terminates it." A session that named no timeout, or
+    /// named zero minutes, is owed no termination: nothing documents a default, so none
+    /// is invented.
+    fn idle_timeout_pending(&self, idle_since: SystemTime) -> Option<PendingState> {
+        let minutes = u64::try_from(self.session.idle_timeout_minutes.unwrap_or(0)).ok()?;
+        if minutes == 0 {
+            return None;
+        }
+        Some(PendingState {
+            due: idle_since + Duration::from_secs(minutes * 60),
+            state: "TERMINATED".to_string(),
+            state_details: Some(SESSION_IDLE_TIMEOUT_STATE_DETAILS.to_string()),
+        })
+    }
+}
+
 /// One EMR Serverless application, as this emulator persists it, together with the job
 /// runs submitted to it.
 #[derive(Debug, Clone)]
@@ -320,6 +428,14 @@ pub struct ApplicationRecord {
     pub job_run_tokens: HashMap<String, String>,
     /// The counter job run ids are minted from.
     pub next_job_run_seq: u64,
+    /// This application's interactive sessions, keyed by id, in the stable total order
+    /// ids were minted in — the order a session listing walks them in.
+    pub sessions: BTreeMap<String, SessionRecord>,
+    /// A `StartSession` `clientToken` to the session that token started, so a retried
+    /// start answers with the first session instead of a second one.
+    pub session_tokens: HashMap<String, String>,
+    /// The counter session ids are minted from.
+    pub next_session_seq: u64,
 }
 
 impl ApplicationRecord {
@@ -337,6 +453,9 @@ impl ApplicationRecord {
             }
         }
         for record in self.job_runs.values_mut() {
+            record.settle(now);
+        }
+        for record in self.sessions.values_mut() {
             record.settle(now);
         }
     }
@@ -381,6 +500,33 @@ impl ApplicationRecord {
                 return id;
             }
         }
+    }
+
+    /// Mint an unused session id matching `SessionId`'s `^[0-9a-z]+$`, the same way
+    /// [`Self::mint_job_run_id`] mints a job run id.
+    pub fn mint_session_id(&mut self) -> String {
+        loop {
+            self.next_session_seq = self.next_session_seq.wrapping_add(1);
+            let id = format!("{:016x}", self.next_session_seq);
+            if !self.sessions.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Whether interactive sessions are enabled on this application.
+    ///
+    /// `InteractiveConfiguration$sessionEnabled` documents it: "Enables interactive
+    /// sessions on the application. When set to `true`, you can start interactive
+    /// sessions using the `StartSession` operation." Nothing documents a default, and
+    /// the member is optional, so an application that enabled nothing serves no
+    /// sessions.
+    pub fn session_enabled(&self) -> bool {
+        self.application
+            .interactive_configuration
+            .as_ref()
+            .and_then(|config| config.session_enabled)
+            .unwrap_or(false)
     }
 
     /// Whether this application starts by itself when a job run is submitted to it.
@@ -484,6 +630,13 @@ pub fn application_arn(region: &str, application_id: &str) -> String {
 /// followed by `/jobruns/<jobRunId>`.
 pub fn job_run_arn(application_arn: &str, job_run_id: &str) -> String {
     format!("{application_arn}/jobruns/{job_run_id}")
+}
+
+/// The ARN of a session, which `SessionArn`'s pattern
+/// `^arn:(aws[a-zA-Z0-9-]*):emr-serverless:.+:(\d{12}):\/applications\/[0-9a-zA-Z]+\/sessions\/[0-9a-zA-Z]+$`
+/// defines as its application's ARN followed by `/sessions/<sessionId>`.
+pub fn session_arn(application_arn: &str, session_id: &str) -> String {
+    format!("{application_arn}/sessions/{session_id}")
 }
 
 /// The region this request was signed for — the region every ARN it mints names.
@@ -677,6 +830,10 @@ pub const APPLICATION_NOT_FOUND_MESSAGE: &str = "Application does not exist";
 /// The same, for the job run (or job run attempt) a request names.
 pub const JOB_RUN_NOT_FOUND_MESSAGE: &str = "Job Run with given ID doesn't exist";
 
+/// The same, for the session a request names: one phrase for the resource class, naming
+/// no identifier, as this service's other not-found refusals do.
+pub const SESSION_NOT_FOUND_MESSAGE: &str = "Session does not exist";
+
 /// The `ResourceNotFoundException` payload for an application id that names none.
 ///
 /// Takes no argument on purpose: the message states the resource class, so there is no
@@ -691,6 +848,13 @@ pub fn application_not_found() -> ResourceNotFoundException {
 pub fn job_run_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: JOB_RUN_NOT_FOUND_MESSAGE.to_string(),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a session id that names none.
+pub fn session_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: SESSION_NOT_FOUND_MESSAGE.to_string(),
     }
 }
 

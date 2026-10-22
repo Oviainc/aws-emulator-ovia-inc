@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendAgreementPaymentRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendAgreementPaymentRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendAgreementPaymentRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a payment request against an agreement's `VariablePaymentTerm`, in the
+//! `PENDING_APPROVAL` status the service documents. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +178,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendAgreementPaymentRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendAgreementPaymentRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SendAgreementPaymentRequestErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: the same token names the same payment request, so
+        // a retried send reports the first one rather than charging the buyer
+        // twice, and a token reused for DIFFERENT details is a conflict rather
+        // than an answer about another request. The token is read off the stored
+        // records, so there is no second map to grow or to diverge from them.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.payment_request_for_token(token))
+            .cloned();
+        if let Some(request) = replayed {
+            if !request.matches_send(&input) {
+                return Err(SendAgreementPaymentRequestErrorModeled::ConflictException(
+                    crate::state::conflict(
+                        crate::state::RESOURCE_TYPE_PAYMENT_REQUEST,
+                        &request.id,
+                        format!(
+                            "clientToken {:?} already sent payment request {} with different \
+                             details",
+                            request.client_token.as_deref().unwrap_or_default(),
+                            request.id
+                        ),
+                    ),
+                )
+                .into());
+            }
+            return Ok(sent(&request));
+        }
+
+        // "The agreement must be active and have a `VariablePaymentTerm` to
+        // support payment requests."
+        let Some(agreement) = store.agreements.get(&input.agreement_id).cloned() else {
+            return Err(
+                SendAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                )
+                .into(),
+            );
+        };
+        if agreement.status != crate::state::STATUS_ACTIVE {
+            // "The agreement must be active": `ValidationExceptionReason` models
+            // this case as `INACTIVE_AGREEMENT`.
+            return Err(SendAgreementPaymentRequestErrorModeled::ValidationException(
+                crate::state::validation_exception("INACTIVE_AGREEMENT", "agreementId"),
+            )
+            .into());
+        }
+
+        // "A `ValidationException` is returned … if the agreement doesn't have an
+        // active `VariablePaymentTerm`, or if the `termId` is invalid."
+        let Some(term) = agreement.variable_payment_term(&input.term_id) else {
+            return Err(SendAgreementPaymentRequestErrorModeled::ValidationException(
+                crate::state::validation_exception("INVALID_TERM_ID", "termId"),
+            )
+            .into());
+        };
+
+        // "The amount requested to be charged to the buyer, positive decimal
+        // value in the currency of the accepted term."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendAgreementPaymentRequest"))
+        // The other bound the service states — "must not exceed the remaining
+        // available balance under the VariablePaymentTerm maxTotalChargeAmount"
+        // — is measured against `VariablePaymentTerm$maxTotalChargeAmount`,
+        // which belongs to the agreement proposal this emulator does not hold
+        // (see `crate::state`'s module docs). No accepted term carries that
+        // maximum, so there is no balance to measure an amount against, and
+        // nothing is refused on a limit the emulator would have had to invent.
+        if !crate::state::is_positive_amount(&input.charge_amount) {
+            return Err(SendAgreementPaymentRequestErrorModeled::ValidationException(
+                crate::state::validation_exception("INVALID_CHARGE_AMOUNT", "chargeAmount"),
+            )
+            .into());
+        }
+
+        let currency_code = term.currency_code.clone();
+        // The store is bounded: past its bound a send is refused rather than
+        // adding another record, so no caller can grow this service's state
+        // without end. The operation models no `ServiceQuotaExceededException`,
+        // so the refusal is its modelled `ThrottlingException`.
+        if store.payment_requests.len() >= crate::state::PAYMENT_REQUEST_QUOTA {
+            return Err(SendAgreementPaymentRequestErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    request_id: None,
+                    message: Some(format!(
+                        "this account already holds the maximum of {} payment requests",
+                        crate::state::PAYMENT_REQUEST_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+        let id = store.mint_payment_request_id();
+        let request = crate::state::PaymentRequest {
+            id: id.clone(),
+            agreement_id: agreement.id.clone(),
+            term_id: input.term_id,
+            name: input.name,
+            description: input.description,
+            charge_amount: input.charge_amount,
+            // "positive decimal value in the currency of the accepted term".
+            currency_code,
+            // "The payment request is created in `PENDING_APPROVAL` status, at
+            // which point the buyer can accept or reject it."
+            status: crate::state::PAYMENT_REQUEST_STATUS_PENDING_APPROVAL.to_string(),
+            // The charge is created when the buyer approves the request.
+            charge_id: None,
+            // This call is the seller's, so the account that made it is the
+            // payment request's proposer.
+            proposer_account_id: ::engine::emulator_account_id().to_string(),
+            client_token: input.client_token,
+            created_at: now,
+            updated_at: now,
+        };
+        let sent_request = request.clone();
+        store.payment_requests.insert(id.clone(), request);
+        crate::state::audit("SendAgreementPaymentRequest", "sent", &id, ctx.parts());
+
+        Ok(sent(&sent_request))
+    }
+}
+
+/// This operation's projection of the payment request it stored — the same one a
+/// replayed `clientToken` answers with, so a retry reports the stored record
+/// rather than the retry's own input.
+fn sent(request: &crate::state::PaymentRequest) -> SendAgreementPaymentRequestOutput {
+    SendAgreementPaymentRequestOutput {
+        payment_request_id: Some(request.id.clone()),
+        agreement_id: Some(request.agreement_id.clone()),
+        status: Some(request.status.clone()),
+        name: Some(request.name.clone()),
+        description: request.description.clone(),
+        charge_amount: Some(request.charge_amount.clone()),
+        currency_code: request.currency_code.clone(),
+        created_at: Some(::aws_smithy_types::DateTime::from(request.created_at)),
     }
 }

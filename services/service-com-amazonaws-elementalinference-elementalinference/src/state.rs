@@ -17,10 +17,18 @@
 //! source" (`GetFixtureResponse$name`/`$status`), an external feed of sports data that
 //! both `SearchFixtures` and `GetFixture` only report — the model marks each of them
 //! `@readonly`, so neither may write. The fixture catalog at the bottom of this module
-//! is therefore the emulator's stand-in for that external data source: ONE deterministic
-//! catalog, derived from the sport and the UTC day, that both operations project. A
-//! fixture `SearchFixtures` lists and the same fixture `GetFixture` retrieves are the
-//! same record by construction, and no request mutates what a later caller sees.
+//! is therefore a STORE of the events that data source holds
+//! ([`ComAmazonawsElementalinferenceElementalinferenceState::fixtures`]), and both
+//! operations answer out of it: a search reports the held fixtures its criteria select
+//! and nothing else, and `GetFixture` answers for an id the store holds.
+//!
+//! That store starts EMPTY and is filled only through the in-process seeding seam
+//! ([`ComAmazonawsElementalinferenceElementalinferenceState::seed_fixtures`]): this
+//! emulator reaches no sports data source, and no modelled operation admits an event
+//! into one, so there is nothing for it to hold until something hands it a record. A
+//! window the store holds no event in therefore reports an empty list ("The array is
+//! empty if no fixtures match", `SearchFixturesResponse$fixtures`) rather than a card
+//! of invented games, and no request mutates what a later caller sees.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -366,6 +374,15 @@ pub struct ComAmazonawsElementalinferenceElementalinferenceState {
     pub dictionaries: BTreeMap<String, Dictionary>,
     /// Monotonic source for minted dictionary ids: unique and stable within a run.
     pub next_dictionary_seq: u64,
+    /// Every fixture the external sports data source holds, keyed by its `FixtureId`.
+    /// `BTreeMap` so a search has ONE stable order to page over, which is what a
+    /// `nextToken` names a position in.
+    ///
+    /// EMPTY until something seeds it ([`Self::seed_fixtures`]): `SearchFixtures` and
+    /// `GetFixture` are the only operations that touch a fixture and both are
+    /// `@readonly`, so no request adds, changes or removes an entry — which is also
+    /// what BOUNDS this map, since nothing on the wire can grow it.
+    pub fixtures: BTreeMap<String, Fixture>,
     /// The earliest instant at which some record owes the clock a move, when any does.
     /// [`Self::settle_due_transitions`] reads it first and returns without touching
     /// the store while nothing is owed, so the common request path is O(1).
@@ -407,6 +424,49 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                 return id;
             }
         }
+    }
+
+    /// Install fixtures into the data-source catalog, keyed by their `FixtureId`.
+    ///
+    /// THE SEEDING SEAM, and the only way an entry reaches [`Self::fixtures`]: this
+    /// service models no operation that creates a fixture, because AWS relays
+    /// fixtures from an external sports data source, so an emulator that is to report
+    /// any has to be handed them in process. A fixture whose id is already held is
+    /// REPLACED, so re-seeding an updated record neither duplicates it nor moves it in
+    /// the page order.
+    pub fn seed_fixtures<I: IntoIterator<Item = Fixture>>(&mut self, fixtures: I) {
+        for fixture in fixtures {
+            self.fixtures.insert(fixture.id.clone(), fixture);
+        }
+    }
+
+    /// Drop every held fixture — the seam's other half, for a data source that holds
+    /// nothing.
+    pub fn clear_fixtures(&mut self) {
+        self.fixtures.clear();
+    }
+
+    /// The one fixture a `FixtureId` names, or `None` when the catalog holds no such
+    /// entry.
+    pub fn fixture(&self, fixture_id: &str) -> Option<&Fixture> {
+        self.fixtures.get(fixture_id)
+    }
+
+    /// Every held fixture of `sport` scheduled on a UTC day from `start_day` through
+    /// `end_day` (both ends included, as a search window is), in `FixtureId` order.
+    ///
+    /// This is the SELECTION a search reports from: a fixture of another sport, or one
+    /// scheduled outside the window, is not in it, so a window the catalog holds no
+    /// event for selects nothing at all.
+    pub fn fixtures_in_window(
+        &self,
+        sport: DataSourceSport,
+        start_day: i64,
+        end_day: i64,
+    ) -> impl Iterator<Item = &Fixture> {
+        self.fixtures.values().filter(move |fixture| {
+            fixture.sport == sport && (start_day..=end_day).contains(&fixture.scheduled_day())
+        })
     }
 
     /// Record that the clock owes a move at `due`, so the next settle pass runs.
@@ -577,10 +637,9 @@ fn id_from_seq(seq: u64, len: usize, alphabet: &[u8]) -> String {
     id
 }
 
-/// SplitMix64: a well-known 64-bit mixer, used here only to spread a counter or a
-/// seed over the whole 64-bit range. Deterministic, so everything derived from it
-/// (an id this service mints, a day's fixtures) is identical on every call with the
-/// same input.
+/// SplitMix64: a well-known 64-bit mixer, used here only to spread a counter over the
+/// whole 64-bit range. Deterministic, so an id this service mints from a given
+/// sequence number is identical on every call.
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
@@ -612,8 +671,9 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// The fixture catalog: this emulator's stand-in for the external sports data
-// source that `SearchFixtures` and `GetFixture` report (see the module docs).
+// The fixture catalog: the events the external sports data source holds, as this
+// emulator holds them, and the window arithmetic a search selects them with
+// (see the module docs). The records themselves live in the state struct above.
 // ---------------------------------------------------------------------------
 
 /// Seconds in a UTC day. A `FixtureDate` names a UTC day ("in UTC",
@@ -626,39 +686,17 @@ const SECONDS_PER_DAY: i64 = 86_400;
 /// (`SearchFixturesRequest$endDate`).
 pub const MAX_SEARCH_WINDOW_DAYS: i64 = 7;
 
-/// The most fixtures the catalog holds for one sport on one UTC day.
+/// A fixture whose scheduled start is still ahead.
 ///
-/// The data source's real schedule density is not something AWS documents, so this
-/// is the emulator's own figure. It is what BOUNDS the work a search can ask for:
-/// a window is at most [`MAX_SEARCH_WINDOW_DAYS`] days, so one search ranges over at
-/// most `MAX_SEARCH_WINDOW_DAYS * MAX_FIXTURES_PER_DAY` fixtures whatever the request
-/// says.
-pub const MAX_FIXTURES_PER_DAY: usize = 4;
-
-/// A day's fixtures are two hours apart from 17:00 UTC ([`build_fixture`]), so the
-/// last of them must still start inside the day it is scheduled on.
-const _: () = assert!(
-    17 + 2 * (MAX_FIXTURES_PER_DAY - 1) <= 23,
-    "every fixture of a day must start inside that UTC day"
-);
-
-/// How long a fixture counts as under way, i.e. the span after its scheduled start
-/// within which its status is [`FIXTURE_STATUS_IN_PROGRESS`] rather than
-/// [`FIXTURE_STATUS_COMPLETED`].
-///
-/// AWS documents no duration for this, so the span is the emulator's own choice: it
-/// is long enough to cover a game of either modelled sport.
-pub const FIXTURE_IN_PROGRESS_SECS: i64 = 3 * 60 * 60;
-
-/// A fixture whose scheduled start is still ahead. `GetFixtureResponse$status` is the
-/// lifecycle status "as provided by the data source. For example, Scheduled or
-/// Completed", so the value is a free-form string and these three are the catalog's.
+/// `GetFixtureResponse$status` is the lifecycle status "as provided by the data
+/// source. For example, Scheduled or Completed", so the member is a free-form string
+/// whose values belong to the data source: this constant and
+/// [`FIXTURE_STATUS_COMPLETED`] are the two the model's own documentation names, and a
+/// held fixture carries whatever status it was given.
 pub const FIXTURE_STATUS_SCHEDULED: &str = "Scheduled";
 
-/// A fixture that has started and is within [`FIXTURE_IN_PROGRESS_SECS`] of its start.
-pub const FIXTURE_STATUS_IN_PROGRESS: &str = "InProgress";
-
-/// A fixture whose scheduled start is more than [`FIXTURE_IN_PROGRESS_SECS`] ago.
+/// A fixture that has been played — the other status the model's documentation names
+/// (see [`FIXTURE_STATUS_SCHEDULED`]).
 pub const FIXTURE_STATUS_COMPLETED: &str = "Completed";
 
 /// The sports the data source covers: exactly the `DataSourceSport` enum
@@ -691,87 +729,47 @@ impl DataSourceSport {
         }
     }
 
-    /// The competitors the catalog draws this sport's fixtures from.
-    ///
-    /// The real data source's teams are third-party data this emulator has no access
-    /// to, so these names are deliberately invented rather than borrowed from any
-    /// real competition: nobody can mistake them for data-source truth.
-    fn roster(self) -> &'static [&'static str] {
-        match self {
-            Self::Basketball => &[
-                "Alder Arrows",
-                "Birchwood Bolts",
-                "Cedar Cyclones",
-                "Dunmore Dynamos",
-                "Elmridge Eagles",
-                "Foxglove Flyers",
-                "Granite Giants",
-                "Harborview Hawks",
-                "Ironwood Icons",
-                "Juniper Jets",
-                "Kestrel Kings",
-                "Larchmont Lions",
-            ],
-            Self::AmericanFootball => &[
-                "Maplefield Mariners",
-                "Northgate Nomads",
-                "Oakhurst Otters",
-                "Pinecrest Pilots",
-                "Quarryside Quakers",
-                "Ridgeway Rangers",
-                "Stonebrook Stags",
-                "Thornhill Titans",
-                "Umberland Union",
-                "Valewood Vipers",
-                "Westmoor Wolves",
-                "Yarrowdale Yaks",
-            ],
-        }
-    }
-
-    /// The competition this sport's fixtures belong to, as `fixtureGroup` reports it
-    /// for a fixture the data source names a group for.
-    fn group(self) -> &'static str {
-        match self {
-            Self::Basketball => "Emulator Basketball League",
-            Self::AmericanFootball => "Emulator Football Conference",
-        }
-    }
+    /// Every sport the enum declares, in model order.
+    pub const ALL: &'static [Self] = &[Self::Basketball, Self::AmericanFootball];
 }
 
-/// One fixture in the catalog: a sports event the data source knows about.
+/// One fixture the data source holds: a sports event, as the store keeps it.
 ///
-/// Every field other than the status is fixed by the fixture's identity, so the
+/// Every member is the data source's own — the emulator derives none of them — so the
 /// `FixtureSummary` `SearchFixtures` lists and the `GetFixture` response for the same
-/// `fixtureId` agree member for member. The status is the one time-dependent member:
-/// it follows the fixture's own scheduled start, which is what the data source
-/// reports a lifecycle status from.
+/// `fixtureId` are two projections of this ONE record and agree member for member.
 #[derive(Debug, Clone)]
 pub struct Fixture {
-    /// The `FixtureId`, as [`fixture_id`] builds it.
+    /// The `FixtureId` (modelled length 1..128): the key this fixture is held under
+    /// and the id `GetFixture` answers for.
     pub id: String,
-    /// The fixture's name: the two competing teams.
+    /// The sport this fixture belongs to, which is what a search's required `sport`
+    /// selects on.
+    pub sport: DataSourceSport,
+    /// The fixture's name, "as provided by the data source. For example, the names of
+    /// the two competing teams" (`FixtureSummary$name`).
     pub name: String,
     /// The competition the fixture belongs to; `None` for a fixture the data source
     /// gives no group for ("The data source doesn't provide this information for
     /// every fixture", `GetFixtureResponse$fixtureGroup`).
     pub group: Option<String>,
-    /// The scheduled start, in seconds since the Unix epoch.
+    /// The scheduled start, in seconds since the Unix epoch. Its UTC day is what a
+    /// search's date window selects on ("The search includes fixtures that are
+    /// scheduled on this day", `SearchFixturesRequest$startDate`), so a held fixture
+    /// always has one.
     pub scheduled_start_secs: i64,
-    /// The competitors, home side first.
+    /// The lifecycle status "as provided by the data source"
+    /// (`FixtureSummary$status`) — see [`FIXTURE_STATUS_SCHEDULED`].
+    pub status: String,
+    /// The competitors (`CompetitorList`, modelled length ..30).
     pub competitors: Vec<Competitor>,
 }
 
 impl Fixture {
-    /// This fixture's lifecycle status at `now_secs` (seconds since the epoch).
-    pub fn status_at(&self, now_secs: i64) -> &'static str {
-        if now_secs < self.scheduled_start_secs {
-            FIXTURE_STATUS_SCHEDULED
-        } else if now_secs < self.scheduled_start_secs + FIXTURE_IN_PROGRESS_SECS {
-            FIXTURE_STATUS_IN_PROGRESS
-        } else {
-            FIXTURE_STATUS_COMPLETED
-        }
+    /// The UTC day this fixture is scheduled on, as a day number since the Unix
+    /// epoch — the figure a search's window is compared against.
+    pub fn scheduled_day(&self) -> i64 {
+        self.scheduled_start_secs.div_euclid(SECONDS_PER_DAY)
     }
 
     /// The scheduled start as the modelled `Timestamp`.
@@ -780,13 +778,13 @@ impl Fixture {
     }
 
     /// The `FixtureSummary` projection `SearchFixtures` reports.
-    pub fn summary(&self, now_secs: i64) -> FixtureSummary {
+    pub fn summary(&self) -> FixtureSummary {
         FixtureSummary {
             fixture_id: self.id.clone(),
             name: self.name.clone(),
             fixture_group: self.group.clone(),
             scheduled_start: Some(self.scheduled_start()),
-            status: self.status_at(now_secs).to_string(),
+            status: self.status.clone(),
             competitors: self.competitors.clone(),
         }
     }
@@ -838,121 +836,25 @@ pub fn fixture_date_string(epoch_day: i64) -> Option<String> {
     rendered.get(..10).map(str::to_string)
 }
 
-/// The `FixtureId` of the `index`-th fixture of `sport` on `epoch_day`.
+/// The epoch-second instant of `hour`:`minute` UTC on `epoch_day`, or `None` when
+/// that day number is not a day the calendar has, or the time of day is not a time a
+/// UTC day has (`hour` outside 0..=23, `minute` outside 0..=59).
 ///
-/// The id is `<sport>-<YYYYMMDD>-<NN>`: it names the catalog entry, so `GetFixture`
-/// can answer for any id `SearchFixtures` has reported without the two operations
-/// having to share anything but this catalog. Ids of one sport sort in the same order
-/// as the fixtures themselves, which is what lets a search page over them.
-fn fixture_id(sport: DataSourceSport, epoch_day: i64, index: usize) -> Option<String> {
-    let date = fixture_date_string(epoch_day)?;
-    Some(format!(
-        "{}-{}-{index:02}",
-        sport.as_wire(),
-        date.replace('-', "")
-    ))
-}
-
-/// The seed the catalog derives one sport's day from: FNV-1a over the sport's name
-/// with the day number mixed in, so no two sports and no two days share a seed.
-fn day_seed(sport: DataSourceSport, epoch_day: i64) -> u64 {
-    // FNV-1a's 64-bit offset basis and prime.
-    let mut hash: u64 = 0xCBF2_9CE4_8422_2325;
-    for byte in sport.as_wire().as_bytes() {
-        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01B3);
-    }
-    let mut seed = hash ^ (epoch_day as u64);
-    splitmix64(&mut seed)
-}
-
-/// Every fixture the catalog holds for `sport` on `epoch_day`, in scheduled order.
-///
-/// Deterministic: the same sport and day always yield the same fixtures, with the
-/// same ids, names, competitors and scheduled starts. At most
-/// [`MAX_FIXTURES_PER_DAY`] of them, and never zero — the data source schedules this
-/// sport every day — so an empty search result means the filters matched nothing.
-/// Scheduled order is also ascending id order, which is what a `nextToken` names a
-/// position in.
-pub fn fixtures_on_day(sport: DataSourceSport, epoch_day: i64) -> Vec<Fixture> {
-    let mut seed = day_seed(sport, epoch_day);
-    let count = 1 + (splitmix64(&mut seed) % MAX_FIXTURES_PER_DAY as u64) as usize;
-    (1..=count)
-        .filter_map(|index| build_fixture(sport, epoch_day, index))
-        .collect()
-}
-
-/// The one fixture an id names, or `None` when no catalog entry has that id.
-///
-/// The id is parsed back into the sport, day and index it was built from, and the
-/// day is then derived exactly as a search derives it, so a fixture retrieved by id
-/// is the very record a search of its day reports.
-pub fn fixture_by_id(id: &str) -> Option<Fixture> {
-    // The sport itself contains `-` (`american-football`), so the id is split from
-    // the RIGHT: index, day, then whatever is left is the sport.
-    let mut parts = id.rsplitn(3, '-');
-    let index_text = parts.next()?;
-    let day_text = parts.next()?;
-    let sport = DataSourceSport::from_wire(parts.next()?)?;
-    if index_text.len() != 2 || !index_text.bytes().all(|b| b.is_ascii_digit()) {
+/// The seam's companion to [`parse_fixture_date`]: a fixture is held with the instant
+/// it starts at, and this is how a caller that knows the day and the kick-off time
+/// builds that instant without reimplementing the UTC day arithmetic. Refusing a time
+/// of day outside the day is what keeps the instant ON the day the caller named, since
+/// that day is what a search window selects on; every step is checked, so no input
+/// wraps or panics.
+pub fn fixture_start_secs(epoch_day: i64, hour: i64, minute: i64) -> Option<i64> {
+    fixture_date_string(epoch_day)?;
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) {
         return None;
     }
-    if day_text.len() != 8 || !day_text.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let date = format!(
-        "{}-{}-{}",
-        day_text.get(..4)?,
-        day_text.get(4..6)?,
-        day_text.get(6..)?
-    );
-    let epoch_day = parse_fixture_date(&date)?;
-    // Comparing the whole id is what refuses an index the day does not have: the
-    // day's fixtures carry the only ids it has.
-    fixtures_on_day(sport, epoch_day)
-        .into_iter()
-        .find(|fixture| fixture.id == id)
-}
-
-/// Derive one fixture of `sport` on `epoch_day` from its own seed.
-fn build_fixture(sport: DataSourceSport, epoch_day: i64, index: usize) -> Option<Fixture> {
-    let id = fixture_id(sport, epoch_day, index)?;
-    let roster = sport.roster();
-    // Each fixture is derived from a seed of its own, so a single fixture can be
-    // rebuilt from its id alone without rebuilding the ones before it.
-    let mut seed = day_seed(sport, epoch_day) ^ (index as u64).wrapping_mul(0x9E37_79B9);
-    let home = (splitmix64(&mut seed) % roster.len() as u64) as usize;
-    // The away side is drawn from the rest of the roster, so no team plays itself.
-    let away =
-        (home + 1 + (splitmix64(&mut seed) % (roster.len() as u64 - 1)) as usize) % roster.len();
-    // A day's fixtures are two hours apart from 17:00 UTC, on the half hour: the
-    // day's `index`-th fixture is its `index`-th in time too, and the last of at most
-    // [`MAX_FIXTURES_PER_DAY`] still starts inside the day the id names.
-    let hour = 17 + 2 * (index as i64 - 1);
-    let minute = (splitmix64(&mut seed) % 2) as i64 * 30;
-    // The data source does not name a group for every fixture, so one in four has none.
-    let group = (!splitmix64(&mut seed).is_multiple_of(4)).then(|| sport.group().to_string());
-
-    Some(Fixture {
-        id,
-        name: format!("{} at {}", roster[away], roster[home]),
-        group,
-        scheduled_start_secs: epoch_day.checked_mul(SECONDS_PER_DAY)? + hour * 60 * 60 + minute * 60,
-        competitors: vec![
-            Competitor {
-                name: Some(roster[home].to_string()),
-                is_home: Some(true),
-            },
-            Competitor {
-                name: Some(roster[away].to_string()),
-                is_home: Some(false),
-            },
-        ],
-    })
-}
-
-/// Seconds since the Unix epoch now, as the fixture statuses are measured against.
-pub fn now_secs() -> i64 {
-    ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()).secs()
+    epoch_day
+        .checked_mul(SECONDS_PER_DAY)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

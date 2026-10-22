@@ -71,10 +71,10 @@ pub(crate) fn is_next_token(value: &str) -> bool {
 
 /// One emulator: a router carrying only this service, over one shared engine.
 ///
-/// `pub(crate)` because the suites beside this one (the billing-adjustment one,
-/// `validation_messages` and the agreement-cancellation-request one) drive the
-/// same emulator over the same wire helpers rather than building a second
-/// harness.
+/// `pub(crate)` because the suites beside this one (the billing-adjustment,
+/// payment-request, `validation_messages` and agreement-cancellation-request
+/// ones) drive the same emulator over the same wire helpers rather than building
+/// a second harness.
 pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -213,7 +213,7 @@ fn renewal_term(id: &str, enable_auto_renew: bool) -> Value {
 }
 
 /// A requested term carrying the acceptor's variable-payment choice.
-fn variable_payment_term(id: &str) -> Value {
+pub(crate) fn variable_payment_term(id: &str) -> Value {
     json!({
         "id": id,
         "configuration": {
