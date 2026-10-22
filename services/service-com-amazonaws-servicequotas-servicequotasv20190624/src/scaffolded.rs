@@ -177,6 +177,41 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The HTTP status this service answers a modeled error with, from the status its
+/// model declares for that error shape.
+///
+/// Service Quotas speaks `awsJson1_1` (see this crate's `OPERATIONS.md`), and an
+/// awsJson front end does not put the exact code an error shape's `@httpError` trait
+/// names on the wire: it reports the error's FAULT — every modeled client error
+/// (`@error: "client"`) is HTTP 400 and the body's `__type` is what tells one from
+/// another, while a server error keeps its 5xx status so a client's retry classifier
+/// still sees a server fault.
+///
+/// Two independent facts say so for this service:
+///
+/// * the recorded wire answers a lookup that names no quota, service or request with
+///   HTTP 400 carrying `NoSuchResourceException` — a shape the model annotates
+///   `@httpError(404)`;
+/// * the statuses this model declares across its client errors are not HTTP semantics
+///   at all but legacy error numbers: `TagPolicyViolationException` is
+///   `@httpError(401)` ("the specified tag is a reserved word"),
+///   `InvalidResourceStateException` is `@httpError(405)` ("the resource is in an
+///   invalid state"), `QuotaExceededException` `@httpError(409)`. A front end putting
+///   those on the wire would tell a client to re-authenticate, or that the method is
+///   not allowed, for a request whose fault is simply the caller's input.
+///
+/// Classified from the modeled status rather than from a list of shape names, so an
+/// error shape this service starts returning later is covered without touching this
+/// function: `@httpError(401)`/`(403)`/`(404)`/`(405)`/`(409)`/`(429)` all render as
+/// 400, and `@httpError(500)` stays 500.
+pub fn wire_http_status(modeled_status: u16) -> u16 {
+    if modeled_status >= 500 {
+        modeled_status
+    } else {
+        400
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -278,14 +313,18 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// 501 for the scaffold signal; for a modeled error, the status this service puts
+    /// on the wire for that error's fault — see [`wire_http_status`], which for an
+    /// awsJson service is not always the `@httpError` the model declares.
     ///
-    /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
-    /// retryable, so a client would retry an operation that can never succeed.
+    /// Keep the 501 a 501 and not a 5xx server fault: SDK retry classifiers treat
+    /// those as retryable, so a client would retry an operation that can never
+    /// succeed. The scaffold signal and the synthetic `ValidationException` are not
+    /// modeled shapes, so neither goes through the fault mapping.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => wire_http_status(e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

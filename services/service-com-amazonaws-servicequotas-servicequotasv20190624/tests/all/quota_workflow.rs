@@ -731,7 +731,7 @@ async fn an_increase_applies_only_in_the_region_it_was_requested_in() {
         .await;
     assert_eq!(
         (status, code.contains("NoSuchResourceException")),
-        (404, true),
+        (400, true),
         "case a request read from another region: got {status} {code}"
     );
 }
@@ -811,63 +811,65 @@ async fn an_invalid_request_is_refused_with_the_modelled_error() {
     let long_code = "v".repeat(64);
 
     // Each row: why it is invalid, the operation, the request, the expected status
-    // and the expected error shape. The 404/400 split is the model's own
-    // (`httpError` on each error shape).
+    // and the expected error shape. Every one of these is a CLIENT fault, so this
+    // awsJson front end serves it on HTTP 400 whatever `@httpError` the shape
+    // carries (`crate::scaffolded::wire_http_status`); the body's `__type` is what
+    // tells one refusal from another.
     let rows: Vec<(&str, &str, Value, u16, &str)> = vec![
         (
             "an unknown service code",
             "ListServiceQuotas",
             json!({"ServiceCode": "nosuchservice"}),
-            404,
+            400,
             "NoSuchResourceException",
         ),
         (
             "an unknown service code",
             "ListAWSDefaultServiceQuotas",
             json!({"ServiceCode": "nosuchservice"}),
-            404,
+            400,
             "NoSuchResourceException",
         ),
         (
             "an unknown quota code",
             "GetServiceQuota",
             json!({"ServiceCode": "vpc", "QuotaCode": "L-NoSuchQuota"}),
-            404,
+            400,
             "NoSuchResourceException",
         ),
         (
             "an unknown quota code",
             "GetAWSDefaultServiceQuota",
             json!({"ServiceCode": "vpc", "QuotaCode": "L-NoSuchQuota"}),
-            404,
+            400,
             "NoSuchResourceException",
         ),
         (
             "a quota code that belongs to another service",
             "GetServiceQuota",
             json!({"ServiceCode": "lambda", "QuotaCode": "L-F678F1CE"}),
-            404,
+            400,
             "NoSuchResourceException",
         ),
         (
             "a quota code that belongs to another service",
             "ListServiceQuotas",
             json!({"ServiceCode": "lambda", "QuotaCode": "L-F678F1CE"}),
-            404,
+            400,
             "NoSuchResourceException",
         ),
         (
             "an unknown request id",
             "GetRequestedServiceQuotaChange",
             json!({"RequestId": "0123456789abcdef0123456789abcdef"}),
-            404,
+            400,
             "NoSuchResourceException",
         ),
         (
             "an unknown quota in the history",
             HISTORY,
             json!({"ServiceCode": "vpc", "QuotaCode": "L-NoSuchQuota"}),
-            404,
+            400,
             "NoSuchResourceException",
         ),
         (
@@ -1149,8 +1151,8 @@ async fn the_request_store_is_bounded_and_refuses_past_its_ceiling() {
         )
         .await;
     assert_eq!(
-        status, 409,
-        "case a request past the ceiling: expected HTTP 409, got {status} with {code}"
+        status, 400,
+        "case a request past the ceiling: expected HTTP 400, got {status} with {code}"
     );
     assert!(
         code.contains("QuotaExceededException"),
