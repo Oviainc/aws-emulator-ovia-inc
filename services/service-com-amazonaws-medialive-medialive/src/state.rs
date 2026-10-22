@@ -839,6 +839,65 @@ impl SdiSourceRecord {
     }
 }
 
+/// Why a monitor template GROUP's delete removed nothing. Each variant is one
+/// modelled refusal, and both of them leave the store exactly as it was.
+///
+/// ONE enum for the two group resources
+/// ([`ComAmazonawsMedialiveMedialiveState::delete_alarm_template_group`] and
+/// [`ComAmazonawsMedialiveMedialiveState::delete_event_bridge_rule_template_group`]),
+/// whose deletes document the SAME precondition sentence, so the two cannot
+/// disagree about which refusal an unmet precondition is. A delete that documents
+/// no precondition (the eventbridge rule TEMPLATE's) does not use this type: it
+/// answers the record it removed or nothing at all.
+#[derive(Debug)]
+pub enum TemplateGroupDeleteRefusal {
+    /// No group of that type in the request's region answers to the identifier,
+    /// by either form `Identifier` documents (its id or its current name).
+    NotFound,
+    /// Something still holds the group, and its delete documents that the caller
+    /// "must detach this group from all signal maps and ensure its existing
+    /// templates are moved to another group or deleted" first. Each list carries
+    /// the ids that still hold it, and is empty when that half of the
+    /// precondition is met (or, for a group whose templates have no store yet,
+    /// when there is nothing of that kind to check).
+    StillHeld {
+        signal_map_ids: Vec<String>,
+        template_ids: Vec<String>,
+    },
+}
+
+/// The message a group delete's conflict carries: the resource type, the
+/// identifier the request named, what still holds it and the precondition both
+/// group deletes document ("You must detach this group from all signal maps and
+/// ensure its existing templates are moved to another group or deleted").
+///
+/// ONE builder, so the two group deletes cannot word the same refusal two ways,
+/// and each clause appears only when that list is non-empty.
+pub fn still_held_message(
+    resource_type: &str,
+    identifier: &str,
+    signal_map_ids: &[String],
+    template_ids: &[String],
+) -> String {
+    let mut held: Vec<String> = Vec::new();
+    if !signal_map_ids.is_empty() {
+        held.push(format!(
+            "is still attached to the signal maps {}",
+            signal_map_ids.join(", ")
+        ));
+    }
+    if !template_ids.is_empty() {
+        held.push(format!(
+            "still holds the templates {}",
+            template_ids.join(", ")
+        ));
+    }
+    format!(
+        "{resource_type} {identifier} {}; detach the group from all signal maps and move its existing templates to another group or delete them before deleting it",
+        held.join(" and ")
+    )
+}
+
 /// Per-service state for com-amazonaws-medialive-medialive. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMedialiveMedialiveState {
@@ -1270,6 +1329,91 @@ impl ComAmazonawsMedialiveMedialiveState {
             .get(identifier)
             .filter(|group| group.region == region)
             .or_else(|| self.event_bridge_rule_template_group_named(region, identifier))
+    }
+
+    /// Remove the eventbridge rule template group `identifier` names in
+    /// `region`, answering the record that was removed — or refuse.
+    ///
+    /// `DeleteEventBridgeRuleTemplateGroup` is documented "Deletes an eventbridge
+    /// rule template group. You must detach this group from all signal maps and
+    /// ensure its existing templates are moved to another group or deleted", so a
+    /// group a signal map still names, or one that still holds templates, is
+    /// refused and nothing is removed — reporting BOTH halves at once, so a
+    /// caller learns everything it must undo from one refusal. Once removed the
+    /// group is GONE from the store, so every later read of either of its
+    /// identifiers misses and its name is free again.
+    ///
+    /// The resolution, the preconditions and the removal live together here, so a
+    /// handler cannot check one of them and write past another; the handler's job
+    /// is only to turn a [`TemplateGroupDeleteRefusal`] into the operation's own
+    /// modelled error.
+    pub fn delete_event_bridge_rule_template_group(
+        &mut self,
+        region: &str,
+        identifier: &str,
+    ) -> Result<EventBridgeRuleTemplateGroupRecord, TemplateGroupDeleteRefusal> {
+        let id = self
+            .event_bridge_rule_template_group(region, identifier)
+            .ok_or(TemplateGroupDeleteRefusal::NotFound)?
+            .id
+            .clone();
+
+        let signal_map_ids = self.signal_maps_using_event_bridge_rule_template_group(&id);
+        let template_ids = self.event_bridge_rule_template_ids_in_group(&id);
+        if !signal_map_ids.is_empty() || !template_ids.is_empty() {
+            return Err(TemplateGroupDeleteRefusal::StillHeld {
+                signal_map_ids,
+                template_ids,
+            });
+        }
+
+        let removed = self
+            .event_bridge_rule_template_groups
+            .remove(&id)
+            .ok_or(TemplateGroupDeleteRefusal::NotFound)?;
+        // A token never outlives the resource it minted, so a retried create
+        // cannot resurrect a deleted group.
+        self.event_bridge_rule_template_group_tokens.forget(&id);
+        Ok(removed)
+    }
+
+    /// The ids of the signal maps that currently name the monitor template group
+    /// `group_id`, through whichever of a signal map's two group lists `groups`
+    /// reads.
+    ///
+    /// ONE walk for both group resources, so the attachment both deletes refuse
+    /// on is read the same way.
+    fn signal_maps_naming_group(
+        &self,
+        group_id: &str,
+        groups: fn(&SignalMapRecord) -> &[String],
+    ) -> Vec<String> {
+        self.signal_maps
+            .values()
+            .filter(|map| groups(map).iter().any(|named| named == group_id))
+            .map(|map| map.id.clone())
+            .collect()
+    }
+
+    /// The ids of the signal maps that name the cloudwatch alarm template group
+    /// `group_id` — the attachment `DeleteCloudWatchAlarmTemplateGroup` documents
+    /// the caller must undo first ("You must detach this group from all signal
+    /// maps").
+    pub fn signal_maps_using_alarm_template_group(&self, group_id: &str) -> Vec<String> {
+        self.signal_maps_naming_group(group_id, |map| {
+            map.cloud_watch_alarm_template_group_ids.as_slice()
+        })
+    }
+
+    /// The ids of the signal maps that name the eventbridge rule template group
+    /// `group_id`, on the same terms as the cloudwatch alarm ones beside them.
+    pub fn signal_maps_using_event_bridge_rule_template_group(
+        &self,
+        group_id: &str,
+    ) -> Vec<String> {
+        self.signal_maps_naming_group(group_id, |map| {
+            map.event_bridge_rule_template_group_ids.as_slice()
+        })
     }
 
     /// The full `Channel` description of one stored channel, or `None` when no

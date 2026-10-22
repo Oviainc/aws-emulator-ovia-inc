@@ -5,11 +5,11 @@
 //! An invitation enters this service's store when an approved `InviteAction` is carried
 //! out — "The `InviteAction` is carried out when a `Proposal` is `APPROVED`"
 //! (smithy_query: shape `InviteAction`) — which is
-//! `state::record_invitation`. `CreateProposal` and `VoteOnProposal`, the calls that drive
-//! it, are still scaffolds owned by their own issues
-//! (`20261022T023011Z-managedblockchain-createproposal-stub.md`), so these cases record
-//! the invitations through that one state entry point and then drive every assertion
-//! through the router the production emulator mounts.
+//! `state::record_invitation`. `VoteOnProposal`, the call that drives it once the votes
+//! approve a proposal, is exercised end to end in `vote_on_proposal.rs`; these cases
+//! record the invitations through that one state entry point, so each row arranges the
+//! listing it asserts on directly, and then drive every assertion through the router the
+//! production emulator mounts.
 //!
 //! The tables span the classes the rules generalise over: how many invitations are held,
 //! page sizes from one to past the item count plus both published `MaxResults` bounds and

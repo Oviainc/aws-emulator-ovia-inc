@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartKeyPhrasesDetectionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartKeyPhrasesDetectionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartKeyPhrasesDetectionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Mints the job's id and ARN, persists the whole submitted record in
+//! [`crate::state`], and answers `SUBMITTED`. A repeated `ClientRequestToken`
+//! carrying the same parameters resolves to the job it already created instead of
+//! creating a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +117,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{AnalysisJob, JobFamily, Submission, PROCESSING_SPAN, QUEUE_SPAN};
+
+/// The family every job this operation creates belongs to.
+const FAMILY: JobFamily = JobFamily::KeyPhrasesDetection;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -194,18 +197,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartKeyPhrasesDetectionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartKeyPhrasesDetectionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartKeyPhrasesDetectionJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The service store is unavailable. Retry your request.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // The tag bound every Comprehend resource shares, stated once in
+        // `crate::state`; only the exception wrapper is this operation's own.
+        let tags = input.tags.unwrap_or_default();
+        if let Some(message) = crate::state::too_many_tags_message(&tags) {
+            return Err(
+                StartKeyPhrasesDetectionJobErrorModeled::TooManyTagsException(
+                    TooManyTagsException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = SystemTime::now();
+        // The submission's identity, beside its token: what makes a second call a
+        // RETRY of this one rather than a new job (see `state::Submission`).
+        let fingerprint = Submission {
+            job_name: input.job_name.as_deref(),
+            language_code: &input.language_code,
+            input_data_config: &input.input_data_config,
+            output_data_config: &input.output_data_config,
+            data_access_role_arn: &input.data_access_role_arn,
+            volume_kms_key_id: input.volume_kms_key_id.as_deref(),
+            vpc_config: input.vpc_config.as_ref(),
+            tags: &tags,
+        }
+        .fingerprint();
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is `@idempotencyToken`: the same token re-submitted
+        // with the same parameters names the job it already created. A request that
+        // carries none is a fresh submission, as the member's documentation says.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartKeyPhrasesDetectionJob"))
+        // A retry is the SAME request again, so the token alone does not decide:
+        // the model declares no error for a token reused with different members,
+        // and the same token carrying different parameters is a different
+        // submission, which gets a job of its own.
+        if let Some(token) = input.client_request_token.as_ref() {
+            if let Some(existing) = store
+                .idempotency_tokens
+                .get(&(FAMILY, token.clone(), fingerprint.clone()))
+                .cloned()
+            {
+                if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, existing)) {
+                    // Report the status the clock already owed this job, so a
+                    // retried token and a Describe an instant apart cannot disagree.
+                    job.settle(now);
+                    return Ok(StartKeyPhrasesDetectionJobOutput {
+                        job_id: Some(job.job_id.clone()),
+                        job_arn: Some(job.job_arn.clone()),
+                        job_status: Some(job.job_status.clone()),
+                    });
+                }
+            }
+        }
+
+        let (seq, job_id) = store.mint_job_id(now);
+        let job_arn = ::emulator_server::emulator_arn(
+            "comprehend",
+            &region,
+            &format!("{}/{job_id}", FAMILY.arn_resource_type()),
+        );
+        let job = AnalysisJob {
+            seq,
+            job_id: job_id.clone(),
+            job_arn: job_arn.clone(),
+            job_name: input.job_name,
+            job_status: "SUBMITTED".to_string(),
+            message: None,
+            submit_time: now,
+            end_time: None,
+            in_progress_due_at: now + QUEUE_SPAN,
+            terminal_due_at: now + QUEUE_SPAN + PROCESSING_SPAN,
+            stopped_due_at: None,
+            input_data_config: input.input_data_config,
+            output_data_config: input.output_data_config,
+            language_code: input.language_code,
+            data_access_role_arn: input.data_access_role_arn,
+            volume_kms_key_id: input.volume_kms_key_id,
+            vpc_config: input.vpc_config,
+            tags,
+            client_request_token: input.client_request_token,
+            submission_fingerprint: fingerprint,
+        };
+        let job_status = job.job_status.clone();
+        store.insert_analysis_job(FAMILY, job);
+
+        Ok(StartKeyPhrasesDetectionJobOutput {
+            job_id: Some(job_id),
+            job_arn: Some(job_arn),
+            job_status: Some(job_status),
+        })
     }
 }

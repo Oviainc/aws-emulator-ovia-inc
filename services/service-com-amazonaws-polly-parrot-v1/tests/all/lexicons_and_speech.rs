@@ -23,22 +23,37 @@ const REGION: &str = "us-east-1";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One emulator with Polly mounted on it, driven exactly as the router drives it.
-struct Polly {
+///
+/// `pub(crate)` because the whole `tests/all/` tree is ONE test crate: the other
+/// suites drive the service through this harness rather than standing up a second one.
+pub(crate) struct Polly {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Polly {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The tests exercise handler behaviour, not SigV4; the `Authorization`
         // header below is still what routes the request and names the region.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
     }
 
-    async fn call(&self, method: &str, path: &str, body: &str) -> http::Response<Bytes> {
+    /// The engine this emulator serves from, for a suite that has to seed state a
+    /// still-scaffolded operation would otherwise have to create.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
+    }
+
+    pub(crate) async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> http::Response<Bytes> {
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://polly.{REGION}.amazonaws.com{path}"))
@@ -55,34 +70,34 @@ impl Polly {
         self.router.dispatch(request).await
     }
 
-    async fn put_lexicon(&self, name: &str, content: &str) -> http::Response<Bytes> {
+    pub(crate) async fn put_lexicon(&self, name: &str, content: &str) -> http::Response<Bytes> {
         let body = serde_json::json!({ "Content": content }).to_string();
         self.call("PUT", &format!("/v1/lexicons/{name}"), &body).await
     }
 
-    async fn get_lexicon(&self, name: &str) -> http::Response<Bytes> {
+    pub(crate) async fn get_lexicon(&self, name: &str) -> http::Response<Bytes> {
         self.call("GET", &format!("/v1/lexicons/{name}"), "").await
     }
 
-    async fn delete_lexicon(&self, name: &str) -> http::Response<Bytes> {
+    pub(crate) async fn delete_lexicon(&self, name: &str) -> http::Response<Bytes> {
         self.call("DELETE", &format!("/v1/lexicons/{name}"), "").await
     }
 
-    async fn list_lexicons(&self, query: &str) -> http::Response<Bytes> {
+    pub(crate) async fn list_lexicons(&self, query: &str) -> http::Response<Bytes> {
         self.call("GET", &format!("/v1/lexicons{query}"), "").await
     }
 
-    async fn describe_voices(&self, query: &str) -> http::Response<Bytes> {
+    pub(crate) async fn describe_voices(&self, query: &str) -> http::Response<Bytes> {
         self.call("GET", &format!("/v1/voices{query}"), "").await
     }
 
-    async fn synthesize(&self, request: &serde_json::Value) -> http::Response<Bytes> {
+    pub(crate) async fn synthesize(&self, request: &serde_json::Value) -> http::Response<Bytes> {
         self.call("POST", "/v1/speech", &request.to_string()).await
     }
 }
 
 /// The JSON body of a response, for the operations that return one.
-fn json(response: &http::Response<Bytes>) -> serde_json::Value {
+pub(crate) fn json(response: &http::Response<Bytes>) -> serde_json::Value {
     serde_json::from_slice(response.body()).unwrap_or_else(|e| {
         panic!(
             "expected a JSON body, got {:?}: {e}",
@@ -92,7 +107,7 @@ fn json(response: &http::Response<Bytes>) -> serde_json::Value {
 }
 
 /// The modeled error code a failure response carries (`__type` on restJson1).
-fn error_code(response: &http::Response<Bytes>) -> String {
+pub(crate) fn error_code(response: &http::Response<Bytes>) -> String {
     json(response)
         .get("__type")
         .and_then(|t| t.as_str())
@@ -297,9 +312,10 @@ async fn lexicon_attributes_are_derived_from_the_document() {
     );
 }
 
-/// RULE: a `Content` that is not a PLS lexicon, or one declaring an alphabet or
-/// language Amazon Polly does not support, is refused with the modeled error for that
-/// cause — and nothing is stored.
+/// RULE: a `Content` that is not a PLS lexicon Amazon Polly can read — including one
+/// declaring an alphabet it does not support — is `InvalidLexiconException`, one
+/// declaring an unsupported language is `UnsupportedPlsLanguageException`, and
+/// nothing is stored either way.
 #[tokio::test]
 async fn an_unusable_pls_document_is_refused_with_its_modeled_error() {
     let polly = Polly::new();
@@ -310,7 +326,7 @@ async fn an_unusable_pls_document_is_refused_with_its_modeled_error() {
         (
             "unknown alphabet",
             "<lexicon version=\"1.0\" alphabet=\"x-klingon\" xml:lang=\"en-US\"/>",
-            "UnsupportedPlsAlphabetException",
+            "InvalidLexiconException",
         ),
         (
             "unknown language",
@@ -885,9 +901,9 @@ async fn speech_marks_are_json_only_and_computed_from_the_text() {
 
 /// RULE: `Engine` and `LanguageCode` are checked against the voice the request names,
 /// as the catalog `DescribeVoices` serves records it — so an engine the voice does not
-/// support is `EngineNotSupportedException` and a language it does not speak is
-/// `LanguageNotSupportedException`, while a bilingual voice's additional language is
-/// accepted.
+/// support is the request-shape refusal `ValidationException` and a language it does
+/// not speak is `LanguageNotSupportedException`, while a bilingual voice's additional
+/// language is accepted.
 #[tokio::test]
 async fn synthesis_checks_the_voice_against_the_catalog() {
     let polly = Polly::new();
@@ -897,8 +913,8 @@ async fn synthesis_checks_the_voice_against_the_catalog() {
         ("Joanna", "neural", None, None),
         ("Joanna", "standard", None, None),
         ("Geraint", "standard", None, None),
-        ("Geraint", "neural", None, Some("EngineNotSupportedException")),
-        ("Kevin", "standard", None, Some("EngineNotSupportedException")),
+        ("Geraint", "neural", None, Some("ValidationException")),
+        ("Kevin", "standard", None, Some("ValidationException")),
         // Aditi is the bilingual voice the model's own documentation names: en-IN by
         // default, hi-IN as an additional language.
         ("Aditi", "standard", Some("hi-IN"), None),

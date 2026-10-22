@@ -263,6 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        let now = ::std::time::SystemTime::now();
         let identifier = store.mint_identifier();
         let rule_arn = ::engine::emulator_arn("rbin", &region, &format!("rule/{identifier}"));
         // A rule created WITH a lock configuration starts out `locked`; one created
@@ -272,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .lock_configuration
             .as_ref()
             .map(|_| "locked".to_string());
-        store.insert_rule(crate::state::Rule {
+        let mut rule = crate::state::Rule {
             identifier: identifier.clone(),
             rule_arn,
             description: input.description,
@@ -281,14 +282,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_tags,
             exclude_resource_tags,
             tags,
-            // Recycle Bin hands back a rule that already retains resources, so there is
-            // no `pending` interval here for the clock to work off.
-            status: "available".to_string(),
+            // `status` and `available_at` are `begin_pending`'s to set, just below, so
+            // the pending invariant lives in exactly one place for CreateRule and
+            // UpdateRule alike.
+            status: String::new(),
+            available_at: now,
             lock_configuration: input.lock_configuration,
             lock_state,
             lock_end_time: None,
-            created_at: ::std::time::SystemTime::now(),
-        });
+            created_at: now,
+        };
+        // A freshly minted rule is not retaining resources yet — "Only retention rules
+        // that are in the `available` state retain resources" — so it starts `pending`
+        // and reaches `available` once the clock makes the transition due, whether or
+        // not anybody calls again.
+        rule.begin_pending(now);
+        store.insert_rule(rule);
 
         // Read the response back OUT of the store, so the caller sees what a later
         // GetRule or ListRules will see rather than the request object.
@@ -306,7 +315,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             identifier: Some(stored.identifier.clone()),
             retention_period: Some(stored.retention_period.clone()),
             description: stored.description.clone(),
-            tags: Some(stored.tags.clone()),
+            // `Tags` reports "the tags assigned to the retention rule": a rule carrying
+            // no tags has no tag assignment to report, so the OPTIONAL member is left
+            // unset rather than serialized as an empty list. (The resource-selection
+            // members below are reported either way — they are always part of a rule's
+            // record, empty or not.)
+            tags: (!stored.tags.is_empty()).then(|| stored.tags.clone()),
             resource_type: Some(stored.resource_type.clone()),
             resource_tags: Some(stored.resource_tags.clone()),
             status: Some(stored.status.clone()),

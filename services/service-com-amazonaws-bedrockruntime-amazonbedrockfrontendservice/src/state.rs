@@ -5,8 +5,11 @@
 //! Besides the state struct itself this module holds the pieces every Bedrock
 //! Runtime handler shares, so no two operations grow their own copy:
 //!
-//! * the seeded **model registry** (`models`) that `modelId` resolution and the
-//!   404 for an unknown model are driven from;
+//! * the seeded **model inventory** (`models`) that `modelId` resolution and
+//!   its refusals are driven from — a 400 `ValidationException` for an
+//!   identifier the service cannot interpret, a 404
+//!   `ResourceNotFoundException` for one naming a model or resource that is not
+//!   available here;
 //! * the **tokenizer** (`count_text_tokens`, `truncate_to_tokens`) that
 //!   `CountTokens`, `Converse` and `InvokeModel` all count with, so the counts
 //!   two operations report for the same text agree by construction;
@@ -60,7 +63,7 @@ pub const MAX_DOCUMENT_DEPTH: usize = 64;
 #[derive(Debug)]
 pub struct ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
     /// The recognised foundation models, keyed by model id. Seeded by
-    /// [`Default`], so `modelId` resolution and its 404 are state-driven.
+    /// [`Default`], so `modelId` resolution and its refusals are state-driven.
     pub models: BTreeMap<String, ModelEntry>,
     /// Every async invocation this emulator still retains, keyed by
     /// `invocationArn`. Bounded by [`MAX_ASYNC_INVOKE_RECORDS`].
@@ -97,13 +100,69 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
     /// Resolve a `modelId` as given on the wire to a registry entry, or `None`
     /// when this emulator does not recognise the model.
     ///
-    /// Accepts the three spellings the model's `modelId` pattern allows for a
-    /// base model: the bare model id, a `foundation-model/<id>` ARN, and a
-    /// cross-region inference profile id, which prefixes the model id with a
-    /// geography (`us.`, `eu.`, `apac.`, `us-gov.`) — see "Supported Regions and
-    /// models for cross-region inference" in the Amazon Bedrock User Guide.
+    /// Accepts the spellings the model's `modelId` pattern allows for a base
+    /// model: the bare model id, a `foundation-model/<id>` ARN, an
+    /// `inference-profile/<id>` ARN, and a cross-region inference profile id,
+    /// which prefixes the model id with a geography (`us.`, `eu.`, `apac.`,
+    /// `us-gov.`) — see "Supported Regions and models for cross-region
+    /// inference" in the Amazon Bedrock User Guide.
+    ///
+    /// This is the raw registry lookup: it says nothing about whether the model
+    /// can serve inference. An operation that is about to invoke a model calls
+    /// [`Self::resolve_model_for_inference`] instead, which carries the refusal
+    /// the service owes for an identifier it cannot serve.
     pub fn resolve_model(&self, model_id: &str) -> Option<&ModelEntry> {
-        self.models.get(normalize_model_id(model_id).as_str())
+        match interpret_model_id(model_id) {
+            ModelIdentifier::BaseModel { key, .. } => self.models.get(key.as_str()),
+            ModelIdentifier::AccountResource => None,
+        }
+    }
+
+    /// Resolve a `modelId` for a call that is about to run inference against it.
+    ///
+    /// The identifier is interpreted BEFORE the inventory is consulted, because
+    /// the two failures are different faults with different statuses:
+    ///
+    /// * an identifier this service cannot interpret as naming a model it offers
+    ///   — a bare id (or cross-region profile id) that is in no inventory — is a
+    ///   client input fault: [`ModelRejection::Invalid`], answered with
+    ///   `ValidationException` (400) and the service's fixed
+    ///   [`INVALID_MODEL_IDENTIFIER_MESSAGE`];
+    /// * an identifier that DOES name a resource — an ARN, or a base model the
+    ///   inventory carries as retired — whose resource is not available here is
+    ///   [`ModelRejection::NotFound`], answered with `ResourceNotFoundException`
+    ///   (404).
+    ///
+    /// Keeping the two apart is what lets an SDK classify the failure: 400 is a
+    /// non-retryable client fault, while 404 is routinely retried as
+    /// eventual consistency.
+    pub fn resolve_model_for_inference(&self, model_id: &str) -> Result<&ModelEntry, ModelRejection> {
+        let (key, named_by_arn) = match interpret_model_id(model_id) {
+            ModelIdentifier::BaseModel { key, named_by_arn } => (key, named_by_arn),
+            // A well-formed ARN of an account-scoped resource: a custom model, a
+            // provisioned throughput, an imported model, a custom-model
+            // deployment, a prompt, a prompt router or a SageMaker endpoint.
+            // This emulator holds no such resource, so the ARN names one that
+            // does not exist.
+            ModelIdentifier::AccountResource => {
+                return Err(ModelRejection::NotFound(format!(
+                    "Could not resolve the resource named by the provided model identifier: \
+                     {model_id}"
+                )))
+            }
+        };
+        match self.models.get(key.as_str()) {
+            Some(entry) if entry.lifecycle == ModelLifecycle::EndOfLife => {
+                Err(ModelRejection::NotFound(END_OF_LIFE_MESSAGE.to_string()))
+            }
+            Some(entry) => Ok(entry),
+            None if named_by_arn => Err(ModelRejection::NotFound(format!(
+                "Could not resolve the model named by the provided model identifier: {model_id}"
+            ))),
+            None => Err(ModelRejection::Invalid(
+                INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
+            )),
+        }
     }
 
     /// The next async-invoke id: 12 lowercase alphanumeric characters, as the
@@ -217,65 +276,210 @@ pub enum ModelFamily {
     CohereCommand,
 }
 
-/// One recognised foundation model.
+/// What a base model takes and produces.
+///
+/// Modalities as published per model in "Supported foundation models in Amazon
+/// Bedrock" in the Amazon Bedrock User Guide. Only [`ModelModality::Text`] has
+/// an `InvokeModel` envelope in this emulator; an invocation of any other
+/// modality is refused with the modelled error rather than answered with a
+/// fabricated embedding, image or video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelModality {
+    /// Text in, text out.
+    Text,
+    /// Text in, an embedding vector out.
+    Embedding,
+    /// An image out.
+    Image,
+    /// A video out.
+    Video,
+}
+
+impl ModelModality {
+    /// The modality as it reads in a refusal message.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Embedding => "embedding",
+            Self::Image => "image",
+            Self::Video => "video",
+        }
+    }
+}
+
+/// Where a base model is in the Bedrock model lifecycle.
+///
+/// "Model lifecycle" in the Amazon Bedrock User Guide: a model id stays a
+/// recognised identifier after its model reaches end of life, but the model no
+/// longer serves inference — which is a 404 on a resource that existed, not a
+/// 400 on an identifier the service cannot read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelLifecycle {
+    /// Available for inference.
+    Active,
+    /// Past its end-of-life date: the identifier resolves, the model is gone.
+    EndOfLife,
+}
+
+/// One foundation model id this service recognises.
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
     /// The bare model id, e.g. `anthropic.claude-3-sonnet-20240229-v1:0`.
     pub model_id: String,
-    /// Which `InvokeModel` body envelope the model speaks.
-    pub family: ModelFamily,
+    /// Which `InvokeModel` body envelope the model speaks, or `None` when this
+    /// emulator implements none for it — every non-text modality, and the text
+    /// providers whose envelope it does not render (see [`seed_models`]). An
+    /// invocation of one is refused, never answered with an invented payload.
+    pub family: Option<ModelFamily>,
+    /// What the model takes and produces.
+    pub modality: ModelModality,
+    /// Whether the model still serves inference at all.
+    pub lifecycle: ModelLifecycle,
     /// Whether the model is served by the Converse API. Not every base model is
     /// — "Supported models and model features" in the Amazon Bedrock User Guide
     /// lists the Cohere Command (text) models as `InvokeModel`-only, for
     /// instance — and `Converse` must refuse one that is not.
     pub supports_converse: bool,
     /// The model's own ceiling on generated tokens, which caps
-    /// `inferenceConfig.maxTokens`.
+    /// `inferenceConfig.maxTokens`. Zero for a model that generates no text.
     pub max_output_tokens: u32,
 }
 
-/// The models this emulator recognises.
+/// The foundation model ids this service recognises.
 ///
-/// Base model ids as published in "Amazon Bedrock base model IDs (on-demand
-/// throughput)" in the Amazon Bedrock User Guide.
+/// Ids as published in "Amazon Bedrock base model IDs (on-demand throughput)"
+/// and "Supported foundation models in Amazon Bedrock" in the Amazon Bedrock
+/// User Guide, and the retired ones in "Model lifecycle". The inventory carries
+/// an id whether or not this emulator can serve it, because resolving the
+/// IDENTIFIER and serving the MODEL are separate steps: a recognised id is
+/// never reported as an invalid identifier.
+///
+/// It covers, for every provider whose `InvokeModel` envelope
+/// [`invoke_model_response_body`] renders (Amazon Titan and Nova, Anthropic
+/// Claude, Meta Llama, Mistral AI and Cohere Command), that provider's
+/// published on-demand base models — text models served in their own envelope,
+/// non-text models recognised but refused — plus the retired ids of every
+/// provider, which need no envelope. A text provider whose envelope is not
+/// implemented (AI21 Jamba, DeepSeek, Writer, Qwen) is NOT listed, so its id
+/// is answered as an identifier this emulator cannot interpret.
 fn seed_models() -> Vec<ModelEntry> {
-    let m = |model_id: &str, family: ModelFamily, supports_converse: bool, max: u32| ModelEntry {
+    // A text model served in its family's envelope.
+    let text = |model_id: &str, family: ModelFamily, supports_converse: bool, max: u32| ModelEntry {
         model_id: model_id.to_string(),
-        family,
+        family: Some(family),
+        modality: ModelModality::Text,
+        lifecycle: ModelLifecycle::Active,
         supports_converse,
         max_output_tokens: max,
     };
+    // A recognised model whose modality this emulator computes nothing for.
+    let unserved = |model_id: &str, modality: ModelModality| ModelEntry {
+        model_id: model_id.to_string(),
+        family: None,
+        modality,
+        lifecycle: ModelLifecycle::Active,
+        supports_converse: false,
+        max_output_tokens: 0,
+    };
+    // A model past its end of life: recognised, not servable.
+    let retired = |model_id: &str, modality: ModelModality| ModelEntry {
+        model_id: model_id.to_string(),
+        family: None,
+        modality,
+        lifecycle: ModelLifecycle::EndOfLife,
+        supports_converse: false,
+        max_output_tokens: 0,
+    };
+    use ModelFamily::{AnthropicMessages, CohereCommand, Llama, Mistral, Nova, TitanText};
+    use ModelModality::{Embedding, Image, Text, Video};
     vec![
-        m(
-            "anthropic.claude-3-sonnet-20240229-v1:0",
-            ModelFamily::AnthropicMessages,
-            true,
-            4096,
-        ),
-        m(
-            "anthropic.claude-3-haiku-20240307-v1:0",
-            ModelFamily::AnthropicMessages,
-            true,
-            4096,
-        ),
-        m(
-            "anthropic.claude-3-5-sonnet-20240620-v1:0",
-            ModelFamily::AnthropicMessages,
-            true,
-            8192,
-        ),
-        m("amazon.titan-text-express-v1", ModelFamily::TitanText, true, 8192),
-        m("amazon.titan-text-lite-v1", ModelFamily::TitanText, true, 4096),
-        m("amazon.nova-lite-v1:0", ModelFamily::Nova, true, 5120),
-        m("amazon.nova-pro-v1:0", ModelFamily::Nova, true, 5120),
-        m("meta.llama3-8b-instruct-v1:0", ModelFamily::Llama, true, 2048),
-        m("meta.llama3-70b-instruct-v1:0", ModelFamily::Llama, true, 2048),
-        m("mistral.mistral-7b-instruct-v0:2", ModelFamily::Mistral, true, 8192),
-        m("mistral.mixtral-8x7b-instruct-v0:1", ModelFamily::Mistral, true, 4096),
-        // Cohere Command (text) is served by InvokeModel but not by Converse.
-        m("cohere.command-text-v14", ModelFamily::CohereCommand, false, 4096),
-        m("cohere.command-r-plus-v1:0", ModelFamily::CohereCommand, true, 4096),
+        // Anthropic Claude — 4k max output tokens on Claude 3, 8k on 3.5 and
+        // 3.7 ("Inference parameters for foundation models", Anthropic Claude).
+        text("anthropic.claude-3-haiku-20240307-v1:0", AnthropicMessages, true, 4096),
+        text("anthropic.claude-3-sonnet-20240229-v1:0", AnthropicMessages, true, 4096),
+        text("anthropic.claude-3-opus-20240229-v1:0", AnthropicMessages, true, 4096),
+        text("anthropic.claude-3-5-haiku-20241022-v1:0", AnthropicMessages, true, 8192),
+        text("anthropic.claude-3-5-sonnet-20240620-v1:0", AnthropicMessages, true, 8192),
+        text("anthropic.claude-3-5-sonnet-20241022-v2:0", AnthropicMessages, true, 8192),
+        text("anthropic.claude-3-7-sonnet-20250219-v1:0", AnthropicMessages, true, 8192),
+        // Amazon Titan Text.
+        text("amazon.titan-text-lite-v1", TitanText, true, 4096),
+        text("amazon.titan-text-express-v1", TitanText, true, 8192),
+        text("amazon.titan-text-premier-v1:0", TitanText, true, 3072),
+        // Amazon Nova understanding models — 5k max output tokens.
+        text("amazon.nova-micro-v1:0", Nova, true, 5120),
+        text("amazon.nova-lite-v1:0", Nova, true, 5120),
+        text("amazon.nova-pro-v1:0", Nova, true, 5120),
+        text("amazon.nova-premier-v1:0", Nova, true, 5120),
+        // Meta Llama 3 and later — 2k max generation length.
+        text("meta.llama3-8b-instruct-v1:0", Llama, true, 2048),
+        text("meta.llama3-70b-instruct-v1:0", Llama, true, 2048),
+        text("meta.llama3-1-8b-instruct-v1:0", Llama, true, 2048),
+        text("meta.llama3-1-70b-instruct-v1:0", Llama, true, 2048),
+        text("meta.llama3-1-405b-instruct-v1:0", Llama, true, 2048),
+        text("meta.llama3-2-1b-instruct-v1:0", Llama, true, 2048),
+        text("meta.llama3-2-3b-instruct-v1:0", Llama, true, 2048),
+        text("meta.llama3-2-11b-instruct-v1:0", Llama, true, 2048),
+        text("meta.llama3-2-90b-instruct-v1:0", Llama, true, 2048),
+        text("meta.llama3-3-70b-instruct-v1:0", Llama, true, 2048),
+        // Mistral AI.
+        text("mistral.mistral-7b-instruct-v0:2", Mistral, true, 8192),
+        text("mistral.mixtral-8x7b-instruct-v0:1", Mistral, true, 4096),
+        text("mistral.mistral-small-2402-v1:0", Mistral, true, 8192),
+        text("mistral.mistral-large-2402-v1:0", Mistral, true, 8192),
+        text("mistral.mistral-large-2407-v1:0", Mistral, true, 8192),
+        // Cohere Command: the text models are InvokeModel-only, the R models
+        // are served by Converse too.
+        text("cohere.command-text-v14", CohereCommand, false, 4096),
+        text("cohere.command-light-text-v14", CohereCommand, false, 4096),
+        text("cohere.command-r-v1:0", CohereCommand, true, 4096),
+        text("cohere.command-r-plus-v1:0", CohereCommand, true, 4096),
+        // Recognised ids whose modality this emulator serves no inference for.
+        unserved("amazon.titan-embed-text-v1", Embedding),
+        unserved("amazon.titan-embed-text-v2:0", Embedding),
+        unserved("amazon.titan-embed-image-v1", Embedding),
+        unserved("cohere.embed-english-v3", Embedding),
+        unserved("cohere.embed-multilingual-v3", Embedding),
+        unserved("amazon.titan-image-generator-v1", Image),
+        unserved("amazon.titan-image-generator-v2:0", Image),
+        unserved("amazon.nova-canvas-v1:0", Image),
+        unserved("amazon.nova-reel-v1:0", Video),
+        unserved("amazon.nova-reel-v1:1", Video),
+        // Past end of life ("Model lifecycle").
+        retired("anthropic.claude-v1", Text),
+        retired("anthropic.claude-v2", Text),
+        retired("anthropic.claude-v2:1", Text),
+        retired("anthropic.claude-instant-v1", Text),
+        retired("ai21.j2-mid-v1", Text),
+        retired("ai21.j2-ultra-v1", Text),
+        retired("ai21.j2-grande-instruct", Text),
+        retired("ai21.j2-jumbo-instruct", Text),
+        retired("meta.llama2-13b-chat-v1", Text),
+        retired("meta.llama2-70b-chat-v1", Text),
+        retired("stability.stable-diffusion-xl-v0", Image),
     ]
+}
+
+/// The service's fixed message for a `modelId` it cannot interpret as naming a
+/// model it offers.
+pub const INVALID_MODEL_IDENTIFIER_MESSAGE: &str = "The provided model identifier is invalid.";
+
+/// The service's message for a model id whose model has reached end of life
+/// ("Model lifecycle" in the Amazon Bedrock User Guide).
+pub const END_OF_LIFE_MESSAGE: &str = "This model version has reached the end of its life. \
+                                       Please refer to the AWS documentation for more details.";
+
+/// Why a `modelId` cannot be served, as the modelled error the refusing
+/// operation answers with. See
+/// [`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::resolve_model_for_inference`].
+#[derive(Debug, Clone)]
+pub enum ModelRejection {
+    /// Not an identifier this service can interpret as naming a model it
+    /// offers: `ValidationException`, HTTP 400.
+    Invalid(String),
+    /// It names a model or a resource that is not available here:
+    /// `ResourceNotFoundException`, HTTP 404.
+    NotFound(String),
 }
 
 /// Geography prefixes a cross-region inference profile id puts in front of the
@@ -283,22 +487,68 @@ fn seed_models() -> Vec<ModelEntry> {
 /// inference" in the Amazon Bedrock User Guide.
 const INFERENCE_PROFILE_PREFIXES: [&str; 4] = ["us.", "eu.", "apac.", "us-gov."];
 
-/// The registry key for a `modelId` as given on the wire.
-fn normalize_model_id(model_id: &str) -> String {
-    let bare = if model_id.starts_with("arn:") {
-        match model_id.split_once("foundation-model/") {
-            Some((_, id)) => id,
-            None => return model_id.to_string(),
+/// The ARN resource prefixes of the inference resources a `modelId` may name
+/// that are NOT a base model, from the `InvokeModelIdentifier` pattern:
+/// `custom-model`, `imported-model`, `provisioned-model`,
+/// `custom-model-deployment`, `prompt`, `prompt-router`,
+/// `default-prompt-router`, and a SageMaker `endpoint`. Each is created in an
+/// account, so an ARN naming one this emulator has no record of names an absent
+/// resource rather than an unreadable identifier.
+const ACCOUNT_RESOURCE_SEGMENTS: [&str; 8] = [
+    ":custom-model/",
+    ":imported-model/",
+    ":provisioned-model/",
+    ":custom-model-deployment/",
+    ":prompt/",
+    ":prompt-router/",
+    ":default-prompt-router/",
+    ":endpoint/",
+];
+
+/// What a `modelId` as given on the wire names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelIdentifier {
+    /// A base model, whose inventory key is `key`. `named_by_arn` records that
+    /// the caller named it by ARN (a `foundation-model` or `inference-profile`
+    /// ARN), which is a resource reference: when it resolves to nothing, the
+    /// resource is absent rather than the identifier unreadable.
+    BaseModel { key: String, named_by_arn: bool },
+    /// An ARN of an account-scoped inference resource.
+    AccountResource,
+}
+
+/// Interpret a `modelId` as given on the wire, without consulting the
+/// inventory.
+fn interpret_model_id(model_id: &str) -> ModelIdentifier {
+    let (bare, named_by_arn) = if model_id.starts_with("arn:") {
+        if ACCOUNT_RESOURCE_SEGMENTS
+            .iter()
+            .any(|segment| model_id.contains(segment))
+        {
+            return ModelIdentifier::AccountResource;
+        }
+        // A foundation-model ARN, or an inference-profile ARN whose resource id
+        // is the (possibly geography-prefixed) model id.
+        match ["foundation-model/", "inference-profile/"]
+            .iter()
+            .find_map(|segment| model_id.split_once(segment))
+        {
+            Some((_, resource)) => (resource, true),
+            None => return ModelIdentifier::AccountResource,
         }
     } else {
-        model_id
+        (model_id, false)
     };
-    for prefix in INFERENCE_PROFILE_PREFIXES {
-        if let Some(stripped) = bare.strip_prefix(prefix) {
-            return stripped.to_string();
-        }
+    // A cross-region inference profile id is the base model id behind a
+    // geography prefix, and resolves to the same model.
+    let key = INFERENCE_PROFILE_PREFIXES
+        .iter()
+        .find_map(|prefix| bare.strip_prefix(prefix))
+        .unwrap_or(bare);
+    ModelIdentifier::BaseModel {
+        key: key.to_string(),
+        named_by_arn,
     }
-    bare.to_string()
 }
 
 /// The `foundation-model` ARN of a base model in `region`, as `GetAsyncInvoke`
@@ -764,6 +1014,61 @@ pub fn emulated_completion_text(model_id: &str, messages: u32, input_tokens: u32
     )
 }
 
+/// The refusal message for an `InvokeModel` body that is not even a JSON object:
+/// "You must provide the body in JSON format" is all the operation documents
+/// about a body it cannot read.
+pub const MALFORMED_BODY_MESSAGE: &str =
+    "Malformed input request, please reformat your input and try again.";
+
+/// The members a family's `InvokeModel` request body must bind.
+///
+/// One entry per required slot, as documented per family in "Inference request
+/// parameters and response fields for foundation models" in the Amazon Bedrock
+/// User Guide: the body must bind one of the slot's names (a family that takes
+/// either a raw prompt or a chat transcript has both), and the FIRST name is the
+/// one a refusal reports as the missing key. Slots are ordered with the member
+/// carrying the prompt first, so a body that binds nothing at all is reported
+/// against it.
+fn required_body_slots(family: ModelFamily) -> &'static [&'static [&'static str]] {
+    match family {
+        // Anthropic Claude Messages API: messages, max_tokens and
+        // anthropic_version are all documented Required.
+        ModelFamily::AnthropicMessages => &[&["messages"], &["max_tokens"], &["anthropic_version"]],
+        ModelFamily::TitanText => &[&["inputText"]],
+        ModelFamily::Nova => &[&["messages"]],
+        ModelFamily::Llama => &[&["prompt"]],
+        // Mistral takes either a raw prompt or a chat transcript.
+        ModelFamily::Mistral => &[&["prompt", "messages"]],
+        // Cohere Command (text) takes `prompt`, Command R takes `message`.
+        ModelFamily::CohereCommand => &[&["prompt", "message"]],
+    }
+}
+
+/// The refusal `InvokeModel` owes for a body that does not satisfy `family`'s
+/// documented request schema, or `None` when it does.
+///
+/// The body is model-specific, so this is the only place the request's own
+/// shape is checked: a body that is not a JSON object cannot be read at all,
+/// and one that omits a member the family requires is reported naming that
+/// member, as a schema violation is.
+pub fn invoke_body_violation(family: ModelFamily, body: &[u8]) -> Option<String> {
+    let Ok(serde_json::Value::Object(members)) = serde_json::from_slice::<serde_json::Value>(body)
+    else {
+        return Some(MALFORMED_BODY_MESSAGE.to_string());
+    };
+    for slot in required_body_slots(family) {
+        if slot.iter().any(|name| members.contains_key(*name)) {
+            continue;
+        }
+        let name = slot.first().copied().unwrap_or_default();
+        return Some(format!(
+            "Malformed input request: #: required key [{name}] not found, please reformat your \
+             input and try again."
+        ));
+    }
+    None
+}
+
 /// The `InvokeModel` response body for `family`, in that family's own response
 /// envelope.
 ///
@@ -804,6 +1109,11 @@ pub fn invoke_model_response_body(
                 "inputTokens": input_tokens,
                 "outputTokens": output_tokens,
                 "totalTokens": input_tokens + output_tokens,
+                // Nova reports its prompt-cache accounting on every
+                // invocation. This emulator caches no prompt, so no token was
+                // ever read from or written to a cache.
+                "cacheReadInputTokenCount": 0,
+                "cacheWriteInputTokenCount": 0,
             },
         }),
         ModelFamily::Llama => serde_json::json!({

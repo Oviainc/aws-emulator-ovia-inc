@@ -15,5 +15,7 @@
 mod action_type_catalog;
 #[path = "all/pipeline_lifecycle.rs"]
 mod pipeline_lifecycle;
+#[path = "all/stage_transitions.rs"]
+mod stage_transitions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

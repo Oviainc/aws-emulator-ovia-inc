@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEventSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEventSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation removes the stored RDS event notification subscription from
+//! this service's store, after which `DescribeEventSubscriptions` no longer finds it. It
+//! is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEventSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +136,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEventSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEventSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A subscription belongs to the region it was created in, so only that region's
+        // subscriptions are in scope for a delete signed for it.
+        let region =
+            crate::state::request_region(ctx).map_err(DeleteEventSubscriptionError::validation)?;
+        let name = input.subscription_name;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // A name this region holds no subscription under is the modelled 404 — the same
+        // answer a second delete of one subscription gets.
+        let key = (region.clone(), name.clone());
+        let Some(record) = store.event_subscriptions.get(&key) else {
+            return Err(
+                DeleteEventSubscriptionErrorModeled::SubscriptionNotFoundFault(
+                    SubscriptionNotFoundFault {
+                        message: Some(format!("Event Subscription {name} not found.")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // `InvalidEventSubscriptionStateFault` ("This error can occur if someone else is
+        // modifying a subscription") names a subscription caught mid-change. A
+        // subscription here is `active` from its create onwards and no operation leaves
+        // one in a transient state, so that state does not arise and the fault is not
+        // raised — rather than raised for a state nothing can be in.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEventSubscription"))
+        // The answer reports the subscription with the `deleting` status that says the
+        // delete was accepted; a notification rule has nothing provisioned to tear down,
+        // so the record leaves the store with this call, and every later lookup of the
+        // name is the modelled not-found above.
+        let deleted = record.deleting();
+        store
+            .event_subscriptions
+            .remove(&key)
+            .expect("the record was found above and the store is locked");
+
+        Ok(DeleteEventSubscriptionOutput {
+            event_subscription: Some(deleted.to_wire()),
+        })
     }
 }

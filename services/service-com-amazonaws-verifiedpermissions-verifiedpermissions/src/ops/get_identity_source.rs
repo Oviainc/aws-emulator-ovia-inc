@@ -143,7 +143,12 @@ pub(crate) fn configuration_detail(
 /// The DEPRECATED `details` view of a persisted configuration. Its members
 /// describe a Cognito user pool ("replaced by
 /// configuration.cognitoUserPoolConfiguration"), so an OIDC source reports none.
-fn details_for(
+///
+/// `pub(crate)` so [`crate::ops::list_identity_sources`] reports the same view of
+/// the same stored source: `IdentitySourceItemDetails` is member-identical to
+/// `IdentitySourceDetails`, so the list operation re-types this result rather
+/// than deciding a second time what the deprecated view contains.
+pub(crate) fn details_for(
     configuration: &crate::state::IdentitySourceConfiguration,
 ) -> Option<IdentitySourceDetails> {
     match configuration {

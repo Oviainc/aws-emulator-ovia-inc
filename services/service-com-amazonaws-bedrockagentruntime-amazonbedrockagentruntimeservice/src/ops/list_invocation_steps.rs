@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvocationSteps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInvocationSteps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInvocationSteps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the session's stored invocation steps, in store order,
+//! optionally filtered to one invocation. Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +160,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInvocationSteps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInvocationStepsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInvocationSteps"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListInvocationStepsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the session store is unavailable".to_string()),
+                    reason: None,
+                },
+            )
+            .into());
+        };
+
+        let guard = state.lock();
+        let key = crate::state::session_id_from_identifier(&input.session_identifier);
+        let Some(session) = guard.sessions.get(key) else {
+            return Err(ListInvocationStepsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Session with identifier {} was not found.",
+                        input.session_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `invocationIdentifier` filters to one invocation when supplied; without it
+        // every step in the session is listed.
+        let invocations: Vec<&crate::state::Invocation> = match input.invocation_identifier.as_deref()
+        {
+            Some(invocation_id) => match session.invocations.get(invocation_id) {
+                Some(invocation) => vec![invocation],
+                None => {
+                    return Err(ListInvocationStepsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "Invocation {invocation_id} was not found in session {}.",
+                                session.session_id
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => session.invocations.values().collect(),
+        };
+
+        // The cursor is the store order of the last item already handed out, so a
+        // page resumes strictly after it. It is bound to THIS listing (the session
+        // and the invocation filter), so a token issued for another one is refused
+        // rather than silently resuming at an unrelated offset. Decoded after the
+        // session and invocation are resolved, so a request naming neither a known
+        // resource nor a valid token answers 404 for the resource first.
+        let scope = crate::state::pagination_scope(
+            &session.session_id,
+            input.invocation_identifier.as_deref(),
+        );
+        let after = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_next_token(&scope, token) {
+                Some(order) => order,
+                None => {
+                    return Err(ListInvocationStepsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "nextToken is not a pagination token this service issued for \
+                                 this session and invocation"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let mut ordered: Vec<&crate::state::InvocationStepRecord> = invocations
+            .into_iter()
+            .flat_map(|invocation| invocation.steps.values())
+            .filter(|step| step.order > after)
+            .collect();
+        ordered.sort_by_key(|step| step.order);
+
+        // `maxResults` is modelled 1..1000 with a default of 10. The deserialized
+        // member is a plain `i32`, so it CANNOT distinguish an absent member from an
+        // explicit zero: both arrive as 0. Stated plainly — the boundary validator is
+        // what refuses an explicitly sent 0 (and any other out-of-range value) before
+        // this handler runs; here, 0 can therefore only be an absent member and takes
+        // the modelled default. The range check below is this handler's own
+        // defence-in-depth for every value the member CAN carry distinctly, i.e. all
+        // the non-zero ones.
+        let requested = if input.max_results == 0 {
+            crate::state::DEFAULT_LIST_PAGE
+        } else {
+            input.max_results
+        };
+        if !(crate::state::MIN_LIST_PAGE..=crate::state::MAX_LIST_PAGE).contains(&requested) {
+            return Err(ListInvocationStepsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "maxResults must be between {} and {}, got {requested}",
+                        crate::state::MIN_LIST_PAGE,
+                        crate::state::MAX_LIST_PAGE
+                    )),
+                },
+            )
+            .into());
+        }
+        let limit = requested as usize;
+        let has_more = ordered.len() > limit;
+        ordered.truncate(limit);
+
+        // A token is emitted ONLY when a further page exists.
+        let next_token = if has_more {
+            ordered
+                .last()
+                .map(|step| crate::state::encode_next_token(&scope, step.order))
+        } else {
+            None
+        };
+
+        Ok(ListInvocationStepsOutput {
+            invocation_step_summaries: ordered
+                .into_iter()
+                .map(|step| InvocationStepSummary {
+                    session_id: step.session_id.clone(),
+                    invocation_id: step.invocation_id.clone(),
+                    invocation_step_id: step.invocation_step_id.clone(),
+                    invocation_step_time: step.invocation_step_time,
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

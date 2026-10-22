@@ -192,15 +192,22 @@ pub const CLIENT_TOKEN_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 /// the model says happens once a token is forgotten.
 pub const MAX_CLIENT_TOKENS: usize = 10_000;
 
-/// The page size `ListPolicies` uses when the caller names none. The operation is
-/// `@paginated`, so an absent `maxResults` must not mean "the whole store in one
-/// response": the caller gets a bounded page plus a `nextToken`.
-pub const DEFAULT_PAGE_SIZE: usize = 50;
+/// The page size a `@paginated` list operation of this service uses when the
+/// caller names none, from each one's own `maxResults` model documentation: "If
+/// you do not specify this parameter, the operation defaults to 10 ... per
+/// response" — `ListPolicies` and `ListIdentitySources` both state it, in those
+/// words, for their own item. Every list operation here is `@paginated`, so an
+/// absent `maxResults` must not mean "the whole store in one response": the
+/// caller gets a bounded page plus a `nextToken`. ONE constant, so two list
+/// operations of one service cannot page differently.
+pub const DEFAULT_PAGE_SIZE: usize = 10;
 
-/// The largest page `ListPolicies` will build, whatever `maxResults` asks for.
-/// The model puts no upper bound on `maxResults` (`range min 1` only), so this is
-/// the response-size bound.
-pub const MAX_PAGE_SIZE: usize = 200;
+/// The largest page a list operation of this service will build, whatever
+/// `maxResults` asks for, from the next sentence of that same documentation:
+/// "You can specify a maximum of 50 ... per response." The modelled `range` on
+/// `maxResults` states only `min 1`, so this documented cap is also this
+/// emulator's response-size bound.
+pub const MAX_PAGE_SIZE: usize = 50;
 
 /// Per-service state for com-amazonaws-verifiedpermissions-verifiedpermissions. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -297,8 +304,8 @@ pub struct PolicyStore {
     /// cursor resumes where the previous page stopped.
     pub policy_templates: BTreeMap<String, PolicyTemplate>,
     /// The store's identity sources, keyed by `identitySourceId`. A `BTreeMap`
-    /// so `ListIdentitySources` enumerates in a stable order once it is
-    /// implemented.
+    /// so `ListIdentitySources` enumerates in a stable order and a pagination
+    /// cursor resumes where the previous page stopped.
     pub identity_sources: BTreeMap<String, IdentitySource>,
     /// Strictly increasing, so every id minted inside this store — a `policyId`,
     /// a `policyTemplateId` or an `identitySourceId` — is distinct. ONE counter

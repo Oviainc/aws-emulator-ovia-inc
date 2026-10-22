@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateForm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateForm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateForm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges a patch into one stored form: every `UpdateFormData` member the request
+//! carries replaces what [`crate::state::StoredForm`] held, every member it leaves out
+//! keeps its stored value, and the returned `Form` is computed from that one record —
+//! so a later `GetForm` reports exactly what this call left behind.
 //!
 //! ## Shape of an operation
 //!
@@ -83,17 +78,22 @@ use super::types::*;
 // `UpdateFormError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplifyuibuilder-amplifyuibuilder.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `UpdateFormError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplifyuibuilder#UpdateForm")]
+// The operation's MODELED errors, widened with `ResourceNotFoundException` so an
+// id that names no form is reported missing rather than dressed up as an invalid
+// parameter — the same widening `UpdateComponent` makes, and the shape `GetForm`
+// already answers for an absent form
+// (`com.amazonaws.amplifyuibuilder#ResourceNotFoundException`, HTTP 404,
+// declared in `types/shared_types.rs`).
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplifyuibuilder#UpdateForm",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateFormErrorModeled {
     InternalServerException(InternalServerException),
     InvalidParameterException(InvalidParameterException),
     ResourceConflictException(ResourceConflictException),
+    ResourceNotFoundException(ResourceNotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,18 +147,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateForm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFormErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFormErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the amplifyuibuilder form store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let patch = input.updated_form;
+        let mut store = state.lock();
+
+        // The target is resolved before anything is merged: a form is addressed by
+        // (appId, environmentName, id), so an id that names no form in the app
+        // environment the request addressed is absent
+        // (`ResourceNotFoundException`, 404 — widened in above, and the same
+        // refusal `GetForm` answers for that id). Nothing is created: an update is
+        // not an upsert.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateForm"))
+        // `clientToken` is an `@idempotencyToken`, but a merge of the same patch
+        // into the same form leaves the same form behind however often it is
+        // applied, so no token bookkeeping is needed to make a retry idempotent.
+        let Some(form) = store.form_mut(&input.app_id, &input.environment_name, &input.id) else {
+            return Err(UpdateFormErrorModeled::ResourceNotFoundException(
+                crate::state::form_not_found(&input.app_id, &input.environment_name, &input.id),
+            )
+            .into());
+        };
+
+        // Every `UpdateFormData` member is optional: one the request carries
+        // replaces what was stored, one it leaves out keeps it. `appId`,
+        // `environmentName` and `id` identify the record and are not
+        // `UpdateFormData` members at all, so they never move; neither do `tags`,
+        // which `UpdateFormData` does not carry either.
+        if let Some(name) = patch.name {
+            form.name = name;
+        }
+        if let Some(form_action_type) = patch.form_action_type {
+            form.form_action_type = form_action_type;
+        }
+        if let Some(style) = patch.style {
+            form.style = style;
+        }
+        if let Some(data_type) = patch.data_type {
+            form.data_type = data_type;
+        }
+        if let Some(fields) = patch.fields {
+            form.fields = fields;
+        }
+        if let Some(sectional_elements) = patch.sectional_elements {
+            form.sectional_elements = sectional_elements;
+        }
+        if let Some(schema_version) = patch.schema_version {
+            form.schema_version = schema_version;
+        }
+        if patch.cta.is_some() {
+            form.cta = patch.cta;
+        }
+        if patch.label_decorator.is_some() {
+            form.label_decorator = patch.label_decorator;
+        }
+
+        Ok(UpdateFormOutput {
+            entity: Some(form.to_form()),
+        })
     }
 }

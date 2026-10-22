@@ -13,6 +13,9 @@
 
 use std::sync::Arc;
 
+use service_com_amazonaws_rbin_amazonrecyclebin::state::{
+    RULE_STATUS_AVAILABLE, RULE_STATUS_PENDING, STATUS_TRANSITION,
+};
 use service_com_amazonaws_rbin_amazonrecyclebin::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -217,7 +220,8 @@ fn create_cases() -> Vec<CreateCase> {
     cases
 }
 
-/// The list members a request omitted come back as empty lists, never as a missing member.
+/// A response's list member, with a member the response does not carry read as the
+/// empty list — which `Tags` is for a rule that carries no tags.
 fn list_of(value: &serde_json::Value, member: &str) -> Vec<serde_json::Value> {
     value
         .get(member)
@@ -230,6 +234,7 @@ fn list_of(value: &serde_json::Value, member: &str) -> Vec<serde_json::Value> {
 async fn a_created_rule_is_minted_persisted_and_read_back_by_get_rule() {
     let router = router();
     for CreateCase { case, body } in create_cases() {
+        let minted_at = std::time::Instant::now();
         let (status, created) = create_rule(&router, body.clone()).await;
         assert_eq!(
             status, 201,
@@ -248,10 +253,12 @@ async fn a_created_rule_is_minted_persisted_and_read_back_by_get_rule() {
             "case {case:?}: expected the ARN to name this rule in the signed region, got {:?}",
             created["RuleArn"]
         );
+        // A freshly minted rule is not retaining resources yet, so it is reported
+        // `pending`; the clock, not this call, moves it to `available`.
         assert_eq!(
             created["Status"].as_str(),
-            Some("available"),
-            "case {case:?}: expected Status=available, got {:?}",
+            Some(RULE_STATUS_PENDING),
+            "case {case:?}: expected Status={RULE_STATUS_PENDING}, got {:?}",
             created["Status"]
         );
         // `LockState` is absent for a rule that has never been locked, and `locked` for
@@ -283,10 +290,23 @@ async fn a_created_rule_is_minted_persisted_and_read_back_by_get_rule() {
             status, 200,
             "case {case:?}: expected HTTP 200 from GetRule, got {status} / {fetched:?}"
         );
+        // `Status` is the one member the CLOCK moves, so it is read against the
+        // transition span rather than against the create response.
+        let status = fetched["Status"].as_str();
+        let expected_status = if minted_at.elapsed() < STATUS_TRANSITION {
+            RULE_STATUS_PENDING
+        } else {
+            RULE_STATUS_AVAILABLE
+        };
+        assert_eq!(
+            status,
+            Some(expected_status),
+            "case {case:?}: expected GetRule to report Status={expected_status}, \
+             got {status:?}"
+        );
         for member in [
             "Identifier",
             "RuleArn",
-            "Status",
             "ResourceType",
             "RetentionPeriod",
             "Description",

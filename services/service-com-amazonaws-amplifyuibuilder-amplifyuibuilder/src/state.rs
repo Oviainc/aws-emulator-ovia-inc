@@ -25,11 +25,11 @@
 //! already made due and never advances a job because it was polled.
 //!
 //! The form and the theme are the control plane's other app-environment
-//! resources, held the same way: `CreateForm` mints a form and `GetForm` reports
-//! it from the single [`StoredForm`] record, `CreateTheme` mints a theme and
-//! `GetTheme` reports it from the single [`StoredTheme`] record, both keyed by
-//! the same (appId, environmentName) a component is keyed by and both with the
-//! projection the model asks for.
+//! resources, held the same way: `CreateForm` mints a form, `UpdateForm` merges
+//! into it and `GetForm` reports it from the single [`StoredForm`] record,
+//! `CreateTheme` mints a theme and `GetTheme` reports it from the single
+//! [`StoredTheme`] record, both keyed by the same (appId, environmentName) a
+//! component is keyed by and both with the projection the model asks for.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -387,7 +387,7 @@ pub struct StoredForm {
 }
 
 impl StoredForm {
-    /// The `Form` the create and get operations return.
+    /// The `Form` the create, update and get operations return.
     pub fn to_form(&self) -> Form {
         Form {
             app_id: self.app_id.clone(),
@@ -696,6 +696,22 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     pub fn form(&self, app_id: &str, environment_name: &str, id: &str) -> Option<&StoredForm> {
         self.forms_in(app_id, environment_name)
             .iter()
+            .find(|form| form.id == id)
+    }
+
+    /// The form `id` names in one app environment, for a caller that changes it.
+    ///
+    /// `UpdateForm` merges into this one record, so the update and the reads
+    /// report the same copy of the form rather than two.
+    pub fn form_mut(
+        &mut self,
+        app_id: &str,
+        environment_name: &str,
+        id: &str,
+    ) -> Option<&mut StoredForm> {
+        self.forms
+            .get_mut(&(app_id.to_string(), environment_name.to_string()))?
+            .iter_mut()
             .find(|form| form.id == id)
     }
 

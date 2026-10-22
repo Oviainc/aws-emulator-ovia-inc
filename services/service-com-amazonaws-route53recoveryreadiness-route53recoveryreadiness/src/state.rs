@@ -8,7 +8,7 @@
 //! operation files agree on one implementation of each instead of carrying eight
 //! copies that can drift apart.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::ops::types::{ReadinessCheckOutput, Resource, ResourceSetOutput};
 
@@ -49,8 +49,8 @@ pub const MAX_RESULTS_MAX: i32 = 1000;
 /// more asks for it, up to [`MAX_RESULTS_MAX`].
 pub const DEFAULT_MAX_RESULTS: usize = 100;
 
-/// The maximum number of records this emulator keeps in EITHER of its caller-driven
-/// stores (resource sets, readiness checks).
+/// The maximum number of records this emulator keeps in EACH of its caller-driven
+/// stores (resource sets, readiness checks, cross-account authorizations).
 ///
 /// This is NOT an AWS service quota — Route 53 Application Recovery Controller's
 /// published limits are per-account and adjustable, and nothing here claims to
@@ -186,6 +186,13 @@ pub struct ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
     /// take a `ResourceArn` rather than a name) resolves one without scanning
     /// every map.
     pub arn_index: BTreeMap<String, ResourceKey>,
+    /// Every cross-account readiness authorization this account has in place.
+    ///
+    /// A SET, because the authorization value is the resource's whole identity (the
+    /// API carries no other member for it, and `ListCrossAccountAuthorizations`
+    /// reports a bare list of those values): the same value cannot be authorized
+    /// twice, and `BTreeSet` keeps list order — and therefore pagination — stable.
+    pub cross_account_authorizations: BTreeSet<String>,
 }
 
 /// The ARN of the resource set named `name`:
@@ -255,6 +262,26 @@ pub fn store_full_message(store: &str) -> String {
         "this emulator holds at most {MAX_RECORDS_PER_STORE} {store}; \
          delete one before creating another"
     )
+}
+
+/// Refuse a cross-account authorization value the service could never address back.
+///
+/// The model constrains `CrossAccountAuthorization` with neither `@length` nor
+/// `@pattern` (`smithy_query(query="shape", shape="CrossAccountAuthorization")`), so
+/// the boundary validator accepts any string and this is the only rule applied: the
+/// value is the resource's identity and `DeleteCrossAccountAuthorization` binds it to
+/// an `@httpLabel` (`DELETE /crossaccountauthorizations/{CrossAccountAuthorization}`),
+/// which Smithy forbids from being empty — an empty value would name a resource no
+/// later call could delete.
+pub fn validate_cross_account_authorization(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(validation_message(
+            "crossAccountAuthorization",
+            value,
+            "Member must have length greater than or equal to 1",
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse a resource list that is longer than this emulator stores, or one whose entry
@@ -354,44 +381,91 @@ pub fn page<'a, V>(
     max_results: Option<i32>,
     next_token: Option<&str>,
 ) -> Result<Page<'a, V>, String> {
-    let page_size = match max_results {
+    let start = start_key(next_token)?;
+    // `range` from the cursor's key rather than a filtered full scan, so following a
+    // cursor to the end of the store costs one walk of it and not one per page. The
+    // bound borrows as `&str`, so forming it allocates nothing.
+    let from = start.as_deref().unwrap_or("");
+    Ok(take_page(
+        records
+            .range::<str, _>((
+                ::std::ops::Bound::Included(from),
+                ::std::ops::Bound::Unbounded,
+            ))
+            .map(|(key, record)| (key.as_str(), record)),
+        page_size(max_results),
+    ))
+}
+
+/// The page of `values` the caller asked for, for a store whose record IS its key — a
+/// set of identity-only resources such as the cross-account authorizations.
+///
+/// Same page size, cursor codec and refusal as [`page`], so the two list surfaces
+/// cannot drift apart.
+pub fn page_set<'a>(
+    values: &'a BTreeSet<String>,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+) -> Result<Page<'a, String>, String> {
+    let start = start_key(next_token)?;
+    let from = start.as_deref().unwrap_or("");
+    Ok(take_page(
+        values
+            .range::<str, _>((
+                ::std::ops::Bound::Included(from),
+                ::std::ops::Bound::Unbounded,
+            ))
+            .map(|value| (value.as_str(), value)),
+        page_size(max_results),
+    ))
+}
+
+/// How many records one page carries: what the caller asked for, or
+/// [`DEFAULT_MAX_RESULTS`].
+fn page_size(max_results: Option<i32>) -> usize {
+    match max_results {
         // PURELY DEFENSIVE: `MaxResults` carries the model's `range 1..1000`, so the
         // boundary validator has already refused anything outside it and this clamp
         // cannot fire. It is here so a page size can never be zero (which would make
         // the cursor non-terminating) if the member's constraint ever changes.
         Some(n) => n.clamp(MAX_RESULTS_MIN, MAX_RESULTS_MAX) as usize,
         None => DEFAULT_MAX_RESULTS,
-    };
-    let start = match next_token {
-        Some(token) => Some(decode_cursor(token).ok_or_else(|| {
+    }
+}
+
+/// The inclusive key the page starts at, or `None` for the first page. `Err` carries a
+/// validation message for a token this service did not mint.
+fn start_key(next_token: Option<&str>) -> Result<Option<String>, String> {
+    match next_token {
+        Some(token) => Ok(Some(decode_cursor(token).ok_or_else(|| {
             validation_message(
                 "nextToken",
                 token,
                 "Member must be a pagination token returned by a previous call",
             )
-        })?),
-        None => None,
-    };
+        })?)),
+        None => Ok(None),
+    }
+}
 
+/// One page off an ordered `(key, record)` walk that already starts at the cursor: the
+/// first `page_size` records, and the cursor pointing at the record after them.
+fn take_page<'a, V>(
+    entries: impl Iterator<Item = (&'a str, &'a V)>,
+    page_size: usize,
+) -> Page<'a, V> {
     let mut page = Page {
         records: Vec::new(),
         next_token: None,
     };
-    // `range` from the cursor's key rather than a filtered full scan, so following a
-    // cursor to the end of the store costs one walk of it and not one per page. The
-    // bound borrows as `&str`, so forming it allocates nothing.
-    let from = start.as_deref().unwrap_or("");
-    for (key, record) in records.range::<str, _>((
-        ::std::ops::Bound::Included(from),
-        ::std::ops::Bound::Unbounded,
-    )) {
+    for (key, record) in entries {
         if page.records.len() == page_size {
             page.next_token = Some(encode_cursor(key));
             break;
         }
         page.records.push(record);
     }
-    Ok(page)
+    page
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

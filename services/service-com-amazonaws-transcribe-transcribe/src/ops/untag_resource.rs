@@ -142,7 +142,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 204u16;
+    // 200, not the model's `@http` `code: 204`: this service speaks awsJson1_1, an RPC
+    // protocol, so its `@http` traits are inert on the wire (`smithy_query` reports
+    // `httpBindingsInert: true` for every operation) and a success answers that
+    // protocol's own status, 200. The error side of the same rule is
+    // [`crate::scaffolded::wire_status`].
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
@@ -179,12 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(tags) = store.tags_mut(&resource) else {
-            return Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "The requested resource {} couldn't be found. Check the ARN and try \
-                     your request again.",
-                    input.resource_arn
-                )),
+            // As on the read path: an ARN naming no stored resource is this service's
+            // `BadRequestException`, named by the resource KIND the ARN's type segment
+            // denotes.
+            return Err(UntagResourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::not_found_message(crate::state::resource_kind(
+                    &resource.resource_type,
+                ))),
             })
             .into());
         };

@@ -10,6 +10,10 @@
 //! Each test states the RULE it pins and exercises it over a set of inputs that
 //! differ along what the rule generalises over (value, count, repetition, order,
 //! form, collection type), with the request from the issue report as one row.
+//!
+//! The [`Emulator`] / [`Reply`] harness here is `pub(crate)`, so this crate's other
+//! suites drive the service through exactly the same wire path instead of standing up
+//! a second one.
 
 use bytes::Bytes;
 use serde_json::{json, Value};

@@ -48,8 +48,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ClassifierMetadata, DocumentClassifierInputDataConfig, DocumentClassifierOutputDataConfig,
-    DocumentClassifierProperties, InputDataConfig, OutputDataConfig,
-    SentimentDetectionJobProperties, Tag, VpcConfig,
+    DocumentClassifierProperties, InputDataConfig, KeyPhrasesDetectionJobProperties,
+    OutputDataConfig, SentimentDetectionJobProperties, Tag, VpcConfig,
 };
 
 /// How long a freshly submitted job stays `SUBMITTED` before the clock owes it
@@ -70,6 +70,29 @@ pub const PROCESSING_SPAN: Duration = Duration::from_millis(300);
 /// still observes the intermediate `STOP_REQUESTED` state the stop reported.
 pub const STOPPING_SPAN: Duration = Duration::from_millis(300);
 
+/// The most tags a Comprehend resource can carry.
+///
+/// From the modelled documentation of the `TooManyTagsException` every
+/// `Start*DetectionJob` declares: "The request contains more tags than can be
+/// associated with a resource (50 tags per resource)."
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The refusal message for a submission carrying more tags than a resource can
+/// hold, or `None` when `tags` is within [`MAX_TAGS_PER_RESOURCE`].
+///
+/// The bound and its wording live here rather than in one operation, so every
+/// family's `Start*DetectionJob` refuses the same count the same way; each handler
+/// wraps the message in the `TooManyTagsException` its own error channel names.
+pub fn too_many_tags_message(tags: &[Tag]) -> Option<String> {
+    (tags.len() > MAX_TAGS_PER_RESOURCE).then(|| {
+        format!(
+            "The request contains {} tags, more than the {MAX_TAGS_PER_RESOURCE} tags that \
+             can be associated with a resource.",
+            tags.len()
+        )
+    })
+}
+
 /// The statuses an analysis job can never leave, out of
 /// `ops::types::JOB_STATUS_VALUES`.
 ///
@@ -79,8 +102,8 @@ pub const STOPPING_SPAN: Duration = Duration::from_millis(300);
 /// the clock a transition, so each of them is still stoppable.
 ///
 /// `COMPLETED` is listed because the modelled vocabulary has it and this record
-/// serves every job family, not because a sentiment-detection job can reach it:
-/// [`AnalysisJob::settle`] ends a started job in `FAILED`, so `COMPLETED` is
+/// serves every job family, not because a job this emulator persists can reach
+/// it: [`AnalysisJob::settle`] ends a started job in `FAILED`, so `COMPLETED` is
 /// reserved for a family whose work this emulator can genuinely perform.
 pub const TERMINAL_JOB_STATUSES: &[&str] = &["COMPLETED", "FAILED", "STOPPED"];
 
@@ -121,11 +144,13 @@ pub const MAX_DOCUMENT_CLASSIFIER_RECORDS: usize = 1000;
 ///
 /// The variant also carries the ARN resource type the family's `JobArn` uses, so
 /// the ARN form is stated once. Sibling families (dominant-language, entities,
-/// key-phrases, topics, …) are added as their own issues implement them.
+/// topics, …) are added as their own issues implement them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JobFamily {
     /// `StartSentimentDetectionJob` and its Describe/List/Stop operations.
     SentimentDetection,
+    /// `StartKeyPhrasesDetectionJob` and its Describe/List/Stop operations.
+    KeyPhrasesDetection,
 }
 
 impl JobFamily {
@@ -134,6 +159,7 @@ impl JobFamily {
     pub fn arn_resource_type(self) -> &'static str {
         match self {
             Self::SentimentDetection => "sentiment-detection-job",
+            Self::KeyPhrasesDetection => "key-phrases-detection-job",
         }
     }
 }
@@ -173,6 +199,49 @@ pub struct AnalysisJob {
     /// The `ClientRequestToken` this job was submitted under, if any. Held so the
     /// idempotency-index entry can be dropped with the record it points at.
     pub client_request_token: Option<String>,
+    /// The digest of the parameters this job was submitted with, from
+    /// [`Submission::fingerprint`]. Held for the same reason as
+    /// `client_request_token`: together they are this job's idempotency-index key.
+    pub submission_fingerprint: String,
+}
+
+/// The submitted parameters a `Start*DetectionJob` is deduplicated on, beside its
+/// `ClientRequestToken`.
+///
+/// A retried submission is one that repeats BOTH the token and the parameters: a
+/// token re-sent with the same request names the job it already created, while the
+/// same token sent with different parameters is a different submission and gets a
+/// job of its own. Nothing modelled says otherwise — `ClientRequestToken`'s
+/// documentation describes only "a unique identifier for the request" and no error
+/// is declared for a reused token — and that is the behaviour recorded for the
+/// service.
+#[derive(Debug)]
+pub struct Submission<'a> {
+    pub job_name: Option<&'a str>,
+    pub language_code: &'a str,
+    pub input_data_config: &'a InputDataConfig,
+    pub output_data_config: &'a OutputDataConfig,
+    pub data_access_role_arn: &'a str,
+    pub volume_kms_key_id: Option<&'a str>,
+    pub vpc_config: Option<&'a VpcConfig>,
+    pub tags: &'a [Tag],
+}
+
+impl Submission<'_> {
+    /// A digest over every parameter of this submission, as 32 lowercase hex
+    /// characters.
+    ///
+    /// Two submissions fingerprint alike exactly when they carry the same values
+    /// in the same members, so the digest answers "is this the same request
+    /// again?" without the index holding a copy of the request. It is taken over
+    /// the shapes' own derived debug rendering, which is total over every member
+    /// (no member can be left out of the digest by accident) and order-sensitive,
+    /// so a reordered tag or subnet list is a different submission.
+    pub fn fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(format!("{self:?}").as_bytes());
+        hex::encode(&hasher.finalize()[..16])
+    }
 }
 
 impl AnalysisJob {
@@ -256,25 +325,48 @@ impl AnalysisJob {
             self.input_data_config.s3_uri, self.output_data_config.s3_uri,
         )
     }
+}
 
-    /// Project this record into the sentiment family's modelled properties shape.
-    pub fn sentiment_detection_job_properties(&self) -> SentimentDetectionJobProperties {
-        SentimentDetectionJobProperties {
-            job_id: Some(self.job_id.clone()),
-            job_arn: Some(self.job_arn.clone()),
-            job_name: self.job_name.clone(),
-            job_status: Some(self.job_status.clone()),
-            message: self.message.clone(),
-            submit_time: Some(::aws_smithy_types::DateTime::from(self.submit_time)),
-            end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
-            input_data_config: Some(self.input_data_config.clone()),
-            output_data_config: Some(self.output_data_config.clone()),
-            language_code: Some(self.language_code.clone()),
-            data_access_role_arn: Some(self.data_access_role_arn.clone()),
-            volume_kms_key_id: self.volume_kms_key_id.clone(),
-            vpc_config: self.vpc_config.clone(),
+/// Write the record -> `*JobProperties` projection ONCE, per family shape.
+///
+/// Comprehend models a separate properties structure per job family, but the
+/// families this record serves declare exactly the same members, so each family's
+/// projection is an instantiation of this one body rather than a copy of it: a
+/// member added to [`AnalysisJob`] is reported by every family or by none.
+macro_rules! job_properties_projections {
+    ($($method:ident -> $shape:ident,)+) => {
+        impl AnalysisJob {
+            $(
+                #[doc = concat!(
+                    "Project this record into the modelled `",
+                    stringify!($shape),
+                    "` shape.",
+                )]
+                pub fn $method(&self) -> $shape {
+                    $shape {
+                        job_id: Some(self.job_id.clone()),
+                        job_arn: Some(self.job_arn.clone()),
+                        job_name: self.job_name.clone(),
+                        job_status: Some(self.job_status.clone()),
+                        message: self.message.clone(),
+                        submit_time: Some(::aws_smithy_types::DateTime::from(self.submit_time)),
+                        end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
+                        input_data_config: Some(self.input_data_config.clone()),
+                        output_data_config: Some(self.output_data_config.clone()),
+                        language_code: Some(self.language_code.clone()),
+                        data_access_role_arn: Some(self.data_access_role_arn.clone()),
+                        volume_kms_key_id: self.volume_kms_key_id.clone(),
+                        vpc_config: self.vpc_config.clone(),
+                    }
+                }
+            )+
         }
-    }
+    };
+}
+
+job_properties_projections! {
+    sentiment_detection_job_properties -> SentimentDetectionJobProperties,
+    key_phrases_detection_job_properties -> KeyPhrasesDetectionJobProperties,
 }
 
 /// One persisted custom document classifier.
@@ -417,10 +509,12 @@ pub struct ComAmazonawsComprehendComprehend20171127State {
     /// Bounded by [`MAX_ANALYSIS_JOB_RECORDS`]: insert through
     /// [`Self::insert_analysis_job`], never directly.
     pub analysis_jobs: BTreeMap<(JobFamily, String), AnalysisJob>,
-    /// The first `JobId` minted for a `(family, ClientRequestToken)` pair, so a
-    /// retried `Start*DetectionJob` resolves to the job it already created. An
+    /// The `JobId` minted for a `(family, ClientRequestToken, submission
+    /// fingerprint)` triple, so a retried `Start*DetectionJob` — the same token
+    /// with the same parameters — resolves to the job it already created, while
+    /// the same token with different parameters is a submission of its own. An
     /// entry is dropped with the job it points at.
-    pub idempotency_tokens: HashMap<(JobFamily, String), String>,
+    pub idempotency_tokens: HashMap<(JobFamily, String, String), String>,
     /// Monotonic submission counter: the source of both a job's `seq` and the
     /// uniqueness of a minted `JobId`.
     pub job_id_seq: u64,
@@ -453,8 +547,9 @@ impl ComAmazonawsComprehendComprehend20171127State {
         (self.job_id_seq, hex::encode(&digest[..16]))
     }
 
-    /// Persist a submitted job, index it under its `ClientRequestToken`, and evict
-    /// the oldest records once the store passes [`MAX_ANALYSIS_JOB_RECORDS`].
+    /// Persist a submitted job, index it under its `ClientRequestToken` and
+    /// submission fingerprint, and evict the oldest records once the store passes
+    /// [`MAX_ANALYSIS_JOB_RECORDS`].
     ///
     /// The ONE insertion path for [`Self::analysis_jobs`], so the bound cannot be
     /// bypassed by a handler. Submission never fails for the bound: AWS refuses no
@@ -463,8 +558,10 @@ impl ComAmazonawsComprehendComprehend20171127State {
     pub fn insert_analysis_job(&mut self, family: JobFamily, job: AnalysisJob) {
         let job_id = job.job_id.clone();
         if let Some(token) = job.client_request_token.clone() {
-            self.idempotency_tokens
-                .insert((family, token), job_id.clone());
+            self.idempotency_tokens.insert(
+                (family, token, job.submission_fingerprint.clone()),
+                job_id.clone(),
+            );
         }
         self.analysis_jobs.insert((family, job_id), job);
         while self.analysis_jobs.len() > MAX_ANALYSIS_JOB_RECORDS {
@@ -482,15 +579,17 @@ impl ComAmazonawsComprehendComprehend20171127State {
             let Some(oldest) = oldest else { break };
             let evicted = self.analysis_jobs.remove(&oldest);
             // Drop the index entry only while it still points at the evicted
-            // record: a later submission may have taken the same token over.
-            if let Some(token) = evicted.and_then(|job| job.client_request_token) {
-                let index_key = (oldest.0, token);
-                if self
-                    .idempotency_tokens
-                    .get(&index_key)
-                    .is_some_and(|id| *id == oldest.1)
-                {
-                    self.idempotency_tokens.remove(&index_key);
+            // record: a later submission may have taken the same key over.
+            if let Some(job) = evicted {
+                if let Some(token) = job.client_request_token {
+                    let index_key = (oldest.0, token, job.submission_fingerprint);
+                    if self
+                        .idempotency_tokens
+                        .get(&index_key)
+                        .is_some_and(|id| *id == oldest.1)
+                    {
+                        self.idempotency_tokens.remove(&index_key);
+                    }
                 }
             }
         }

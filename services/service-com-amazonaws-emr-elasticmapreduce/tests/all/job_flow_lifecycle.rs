@@ -69,20 +69,36 @@ impl Emr {
     }
 
     pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
-        let request = http::Request::builder()
+        self.call_as(Some(self.akid), operation, body).await
+    }
+
+    /// [`Emr::call`], signed by `akid` when one is given — the access key id is what
+    /// names the calling principal, so what an operation records as its caller follows
+    /// it.
+    pub(crate) async fn call_as(
+        &self,
+        akid: Option<&str>,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let mut builder = http::Request::builder()
             .method("POST")
             .uri("/")
             .header("host", "elasticmapreduce.us-east-1.amazonaws.com")
             .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("ElasticMapReduce.{operation}"))
-            .header(
+            .header("x-amz-target", format!("ElasticMapReduce.{operation}"));
+        // `None` is an UNSIGNED request — the emulator attributes it to the `default`
+        // user — while `Some` overrides this emulator's own [`Emr::with_akid`] key.
+        if let Some(akid) = akid {
+            builder = builder.header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential={}/20261022/us-east-1/\
-                     elasticmapreduce/aws4_request, SignedHeaders=host, Signature=00",
-                    self.akid
+                    "AWS4-HMAC-SHA256 Credential={akid}/20261022/us-east-1/\
+                     elasticmapreduce/aws4_request, SignedHeaders=host, Signature=00"
                 ),
-            )
+            );
+        }
+        let request = builder
             .body(bytes::Bytes::from(
                 serde_json::to_vec(&body).expect("the request body serializes"),
             ))

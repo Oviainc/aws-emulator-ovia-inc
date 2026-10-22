@@ -156,6 +156,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let region = crate::state::request_region(ctx);
+        // The request's tag keys are refused before the ACL is created: `Tag$Key` may
+        // not be null, and the `aws:` prefix is reserved for AWS.
+        if let Some(message) = crate::state::tags_rejection(input.tags.as_ref()) {
+            return Err(CreateACLErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let now = std::time::Instant::now();
         let mut state = state.lock();
         state.settle(now);
@@ -192,10 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
         };
 
-        let tags = crate::state::tag_pairs(input.tags.as_ref());
-        if !tags.is_empty() {
-            state.tags.insert(arn, tags);
-        }
+        // The request's tags, under the ARN the tagging operations resolve this
+        // resource by. An empty set leaves NO entry, so the ACL starts with exactly the
+        // tags this request gave it.
+        state.set_tags(&arn, crate::state::tag_map(input.tags.as_ref()));
         // No cluster can reference an ACL that did not exist until now, but the list
         // is derived rather than assumed empty, so one rule computes `ACL$Clusters`.
         let clusters = state.clusters_using_acl(&input.acl_name);

@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(tags) = store.tags_mut(&resource) else {
-            return Err(not_found(&input.resource_arn));
+            return Err(not_found(&resource));
         };
 
         // "a key:value pair": one value per key, so a tag whose key is already on the
@@ -223,14 +223,14 @@ fn bad_request(message: &str) -> TagResourceError {
     .into()
 }
 
-/// The modelled not-found refusal for an ARN that names no resource this account
-/// holds.
-fn not_found(arn: &str) -> TagResourceError {
-    TagResourceErrorModeled::NotFoundException(NotFoundException {
-        message: Some(format!(
-            "The requested resource {arn} couldn't be found. Check the ARN and try your \
-             request again."
-        )),
-    })
-    .into()
+/// This service's refusal for an ARN that names no resource this account holds.
+///
+/// `BadRequestException`, not the modelled `NotFoundException`: that is the shape
+/// this service's recorded not-found responses carry, and the shape whose own
+/// documentation covers an entity that "doesn't exist". The message names the KIND of
+/// resource the ARN's type segment denotes.
+fn not_found(resource: &crate::state::ResourceRef) -> TagResourceError {
+    bad_request(&crate::state::not_found_message(
+        crate::state::resource_kind(&resource.resource_type),
+    ))
 }
