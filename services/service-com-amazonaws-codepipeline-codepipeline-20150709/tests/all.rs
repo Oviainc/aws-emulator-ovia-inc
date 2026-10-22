@@ -19,3 +19,5 @@ mod pipeline_lifecycle;
 mod stage_transitions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/third_party_jobs.rs"]
+mod third_party_jobs;

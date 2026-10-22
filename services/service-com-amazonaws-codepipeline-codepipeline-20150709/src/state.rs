@@ -17,7 +17,7 @@ use crate::ops::types::{
     ActionConfigurationProperty, ActionState, ActionType, ActionTypeId, ActionTypeSettings,
     ArtifactDetails, ExecutionTrigger, PipelineDeclaration, PipelineExecution,
     PipelineExecutionSummary, PipelineMetadata, PipelineSummary, ResolvedPipelineVariable,
-    SourceRevision, StageState, Tag, TransitionState,
+    SourceRevision, StageState, Tag, ThirdPartyJob, TransitionState,
 };
 
 /// The region an ARN carries when the request names none.
@@ -30,6 +30,13 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The `codepipeline` ARN service namespace, as OPERATIONS.md records it
 /// ("ARN namespace: `codepipeline`").
 pub const ARN_SERVICE: &str = "codepipeline";
+
+/// The `ActionOwner` value an action type carries when a PARTNER owns it — the only
+/// kind of action type `PollForThirdPartyJobs` serves ("Used for partner actions
+/// only"). One of the three values the model declares, as
+/// `crate::ops::types::ACTION_OWNER_VALUES` lists them (`AWS`, `Custom`,
+/// `ThirdParty`); named here because two state rules turn on this one value.
+pub const ACTION_OWNER_THIRD_PARTY: &str = "ThirdParty";
 
 /// The `PipelineType` values the model declares
 /// (`smithy_query query="shape" shape="PipelineType"` -> `V1`, `V2`).
@@ -141,6 +148,31 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// [`BUILT_IN_ACTION_TYPES`]; [`ComAmazonawsCodepipelineCodepipeline20150709State::action_type_catalog`]
     /// is the one place the two are put in a single order.
     pub action_types: BTreeMap<ActionTypeKey, ActionTypeRecord>,
+    /// The partner integrations registered with this service: the identity of a
+    /// `ThirdParty` action type -> the AWS account id of the partner whose job worker
+    /// CodePipeline serves that action type's jobs to.
+    ///
+    /// This is what `PollForThirdPartyJobs` authorizes against, and it is NOT the
+    /// action-type catalog: `BUILT_IN_ACTION_TYPES` names the `ThirdParty` action
+    /// types a pipeline can USE, while this map names the account each one's jobs are
+    /// served to — a real partner's account, never the single account this emulator
+    /// serves. AWS registers a partner integration when the partner onboards, OUT OF
+    /// BAND: the API surface models no operation that creates one
+    /// (`CreateCustomActionType` mints an action type whose owner is `Custom`, and
+    /// `UpdateActionType` only updates one that already exists), so in the assembled
+    /// emulator the map is empty and no caller is a registered partner. Write it
+    /// through
+    /// [`register_third_party_partner`](ComAmazonawsCodepipelineCodepipeline20150709State::register_third_party_partner).
+    pub third_party_partners: BTreeMap<ActionTypeKey, String>,
+    /// The third-party jobs waiting for a partner's job worker, per action type,
+    /// oldest first — what `PollForThirdPartyJobs` reports to the registered partner.
+    ///
+    /// Queued by the action-execution plane when an execution reaches a partner
+    /// action; this slice does not run that plane (every operation of it —
+    /// `GetPipelineState`, `PutThirdPartyJobSuccessResult`, the acknowledge
+    /// operations — is still a scaffold with its own issue), so no request path
+    /// writes this map and it needs no per-request bound.
+    pub third_party_jobs: BTreeMap<ActionTypeKey, Vec<ThirdPartyJobRecord>>,
 }
 
 impl ComAmazonawsCodepipelineCodepipeline20150709State {
@@ -200,6 +232,61 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
                 .insert((pipeline_name, token), execution_id.clone());
         }
         execution_id
+    }
+
+    /// Register `account_id` as the partner CodePipeline serves the action type `id`'s
+    /// jobs to, and answer whether it was registered.
+    ///
+    /// Only a `ThirdParty` action type has a partner — an `AWS` action type is run by
+    /// AWS and a `Custom` one by the account that created it — so any other owner is
+    /// refused HERE, once, rather than by every reader.
+    pub fn register_third_party_partner(&mut self, id: &ActionTypeId, account_id: &str) -> bool {
+        if id.owner != ACTION_OWNER_THIRD_PARTY {
+            return false;
+        }
+        self.third_party_partners
+            .insert(ActionTypeKey::from_id(id), account_id.to_string());
+        true
+    }
+
+    /// The account id registered as the partner for the action type `id`, when one is.
+    ///
+    /// `None` means there is no partner integration for it at all, which is the case
+    /// for every action type in the assembled emulator.
+    pub fn third_party_partner(&self, id: &ActionTypeId) -> Option<&str> {
+        self.third_party_partners
+            .get(&ActionTypeKey::from_id(id))
+            .map(String::as_str)
+    }
+
+    /// Queue `job` as the newest third-party job waiting for the action type `id`, and
+    /// answer whether it was queued: as with a partner registration, only a
+    /// `ThirdParty` action type can have one.
+    pub fn enqueue_third_party_job(&mut self, id: &ActionTypeId, job: ThirdPartyJobRecord) -> bool {
+        if id.owner != ACTION_OWNER_THIRD_PARTY {
+            return false;
+        }
+        self.third_party_jobs
+            .entry(ActionTypeKey::from_id(id))
+            .or_default()
+            .push(job);
+        true
+    }
+
+    /// The jobs waiting for the action type `id`, oldest first and at most `limit` of
+    /// them, as `PollForThirdPartyJobs` reports them.
+    ///
+    /// A read: a polled job stays queued, because what claims a job is the
+    /// `clientToken`/`nonce` pair a worker presents to `GetThirdPartyJobDetails` and
+    /// `AcknowledgeThirdPartyJob`, not the poll that revealed it.
+    pub fn third_party_jobs_for(&self, id: &ActionTypeId, limit: usize) -> Vec<ThirdPartyJob> {
+        self.third_party_jobs
+            .get(&ActionTypeKey::from_id(id))
+            .into_iter()
+            .flatten()
+            .take(limit)
+            .map(ThirdPartyJobRecord::to_job)
+            .collect()
     }
 
     /// Forget a pipeline: the declaration, the executions still retained for it, and
@@ -743,6 +830,55 @@ impl Pipeline {
             execution_mode: self.declaration.execution_mode.clone(),
             created: Some(to_date_time(self.created)),
             updated: Some(to_date_time(self.updated)),
+        }
+    }
+}
+
+/// What the service states when the caller is not whitelisted for an action type: the
+/// four identifying fields of the action type the REQUEST asked about, in the order
+/// `ActionTypeId` declares them, each quoted.
+///
+/// A partner integration is a WHITELIST of the accounts an action type's jobs are
+/// served to, and the refusal is built from the request, so this is a template over
+/// the request's own values — never text naming one particular action type.
+pub fn not_whitelisted_message(id: &ActionTypeId) -> String {
+    format!(
+        "Not whitelisted for accessing ActionType.Category='{}' ActionType.Owner='{}' \
+         ActionType.Provider='{}' ActionType.Version='{}'",
+        id.category, id.owner, id.provider, id.version
+    )
+}
+
+/// One third-party job waiting for a partner's job worker.
+#[derive(Debug, Clone)]
+pub struct ThirdPartyJobRecord {
+    /// The job's id in CodePipeline, matching `ThirdPartyJob$jobId`'s modelled pattern
+    /// (`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).
+    pub job_id: String,
+    /// The `clientId` a worker is given for the job, matching
+    /// `ThirdPartyJob$clientId`'s modelled pattern (the same uuid form). It is the
+    /// first half of the `clientId`/`clientToken` pair the model documents: the
+    /// worker presents the matching `clientToken` to `GetThirdPartyJobDetails` and
+    /// `AcknowledgeThirdPartyJob`.
+    pub client_id: String,
+}
+
+impl ThirdPartyJobRecord {
+    /// A record of the job identified by `job_id`, to be served to the worker holding
+    /// `client_id` — what the action-execution plane queues when an execution reaches
+    /// a partner action.
+    pub fn new(job_id: impl Into<String>, client_id: impl Into<String>) -> Self {
+        Self {
+            job_id: job_id.into(),
+            client_id: client_id.into(),
+        }
+    }
+
+    /// This job as `PollForThirdPartyJobs` reports it.
+    pub fn to_job(&self) -> ThirdPartyJob {
+        ThirdPartyJob {
+            client_id: Some(self.client_id.clone()),
+            job_id: Some(self.job_id.clone()),
         }
     }
 }

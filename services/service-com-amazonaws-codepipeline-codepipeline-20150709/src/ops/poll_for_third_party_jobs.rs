@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PollForThirdPartyJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PollForThirdPartyJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PollForThirdPartyJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation serves, and to whom
+//!
+//! `PollForThirdPartyJobs` is the job worker's end of a PARTNER integration: a partner
+//! polls CodePipeline for the jobs its own action type has waiting. Two rules follow
+//! from that, and this handler is both of them:
+//!
+//! 1. **Authorization.** CodePipeline serves an action type's third-party jobs only to
+//!    the account registered as that action type's partner, so a caller that is not
+//!    that partner is refused with the common error `AccessDeniedException` (HTTP 400)
+//!    before anything is reported — whatever action type the request names and whether
+//!    or not any job is waiting. The registry it is checked against is
+//!    `state.third_party_partners`, which AWS fills when a partner onboards, out of
+//!    band: no modelled operation of this service creates an entry, so in the
+//!    assembled emulator it is empty and EVERY caller is a non-partner. That is not a
+//!    constant refusal — it is this emulator's partner registry being empty — and the
+//!    authorized branch below is the same code path over a registry that holds one.
+//!    The ORDER matters and is the real service's: a recorded call naming an action
+//!    type no catalog holds is refused this way rather than as
+//!    `ActionTypeNotFoundException`, so authorization is settled before the action
+//!    type is looked up at all.
+//! 2. **Reporting.** To the registered partner it reports the jobs waiting for that
+//!    action type, oldest first, at most `maxBatchSize` of them. It is a READ: a polled
+//!    job stays queued, because what claims a job for one worker is the
+//!    `clientToken`/`nonce` pair presented to `GetThirdPartyJobDetails` and
+//!    `AcknowledgeThirdPartyJob`, not the poll that revealed it. Jobs are queued by the
+//!    action-execution plane, which this slice does not run (its operations are still
+//!    scaffolds, each with its own issue), so the registered partner of an action type
+//!    with nothing queued is answered with no jobs rather than with an invented one.
+//!
+//! The temporary S3 credentials the doc below mentions travel in
+//! `ThirdPartyJobDetails`, which `GetThirdPartyJobDetails` returns — `ThirdPartyJob`,
+//! this operation's output element, carries only `clientId` and `jobId`.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +93,12 @@
 //!
 //! * `ActionTypeNotFoundException` (HTTP 400) — The specified action type cannot be found.
 //! * `ValidationException` (HTTP 400) — The validation was specified in an invalid format.
+//!
+//! Neither is reachable from this handler, and both variants stay on the generated
+//! error enum for the operations that will reach them: a request this far has already
+//! satisfied every modelled constraint (so there is no validation failure left to
+//! state), and an action type with no partner registration is refused as
+//! `AccessDeniedException` by rule 1 above rather than reported as not found.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -106,6 +136,17 @@ impl From<PollForThirdPartyJobsErrorModeled> for PollForThirdPartyJobsError {
     }
 }
 
+/// How many jobs a poll asks for: `maxBatchSize` when it carries a count, and every
+/// job waiting when the member is absent.
+///
+/// `MaxBatchSize` is modelled `range 1..` and the framework refuses anything below 1
+/// before this handler runs, so the conversion cannot actually fail. It is mapped to 0
+/// — no jobs — rather than to "every job" deliberately: a cap that cannot be honoured
+/// must never WIDEN the answer.
+fn poll_limit(max_batch_size: Option<i32>) -> usize {
+    max_batch_size.map_or(usize::MAX, |size| usize::try_from(size).unwrap_or(0))
+}
+
 /// The `PollForThirdPartyJobs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -140,20 +181,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PollForThirdPartyJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PollForThirdPartyJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::require_state(&*self.engine)?;
+        let action_type = &input.action_type_id;
+
+        // The one account this emulator serves — the caller's, since every request it
+        // answers is signed by it.
+        let caller = ::engine::emulator_account_id();
+
+        // Authorization first, the way the real service orders it: a caller that is
+        // not this action type's registered partner learns nothing about it, not even
+        // whether it exists. Only a `ThirdParty` action type can carry a registration
+        // (`register_third_party_partner` refuses any other owner), so an
+        // `actionTypeId` naming an `AWS` or `Custom` owner is refused here too — it is
+        // not a partner action, which is all this operation serves.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PollForThirdPartyJobs"))
+        // The guard is dropped before the response is built: nothing is awaited while
+        // it is held.
+        let jobs = {
+            let state = state.lock();
+            if state.third_party_partner(action_type) != Some(caller) {
+                // The wording the service itself states for this refusal, built from
+                // the action type the request named.
+                return Err(crate::scaffolded::Scaffolded::access_denied(
+                    crate::state::not_whitelisted_message(action_type),
+                ));
+            }
+            // How many jobs this poll asks for.
+            let limit = poll_limit(input.max_batch_size);
+            state.third_party_jobs_for(action_type, limit)
+        };
+
+        Ok(PollForThirdPartyJobsOutput {
+            // An absent list and an empty one state the same fact, and AWS omits the
+            // member.
+            jobs: (!jobs.is_empty()).then_some(jobs),
+        })
     }
 }
