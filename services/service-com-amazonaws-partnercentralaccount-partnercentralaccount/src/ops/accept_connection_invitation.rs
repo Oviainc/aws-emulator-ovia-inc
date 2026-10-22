@@ -217,9 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let invitation = state.invitations.get(&invitation_key).ok_or_else(|| {
             AcceptConnectionInvitationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Connection invitation {} was not found in catalog {}.",
-                        input.identifier, input.catalog
+                    message: crate::state::not_found_message(
+                        crate::state::RESOURCE_CONNECTION_INVITATION,
+                        &input.catalog,
+                        &input.identifier,
                     ),
                     reason: crate::state::REASON_CONNECTION_INVITATION_NOT_FOUND.to_string(),
                 },
@@ -243,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let connection_type = invitation.connection_type.clone();
+        let other_participant_identifier = invitation.other_participant_identifier.clone();
         let detail = crate::state::ConnectionTypeDetailRecord {
             created_at: now,
             inviter_email: invitation.inviter_email.clone(),
@@ -251,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             canceled_at: None,
             canceled_by: None,
             cancellation_reason: None,
-            other_participant_identifier: invitation.other_participant_identifier.clone(),
+            other_participant_identifier: other_participant_identifier.clone(),
         };
 
         let region = crate::state::request_region(ctx.parts());
@@ -277,9 +279,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             catalog: input.catalog.clone(),
             arn: crate::state::connection_arn(&region, &input.catalog, &connection_id),
             id: connection_id.clone(),
-            // The account every emulated participant presents (`engine`'s canonical
+            // The account the counterparty presents. A `SUBSIDIARY` receiver IS an
+            // AWS account id (`crate::state::receiver_is_addressable`), so that
+            // account is known; otherwise the counterparty is a profile and presents
+            // the account every emulated participant does (`engine`'s canonical
             // account id), as `AwsAccountId`'s `^[0-9]{12}$` requires.
-            other_participant_account_id: ::engine::emulator_account_id().to_string(),
+            other_participant_account_id: if crate::state::is_aws_account_id(
+                &other_participant_identifier,
+            ) {
+                other_participant_identifier.clone()
+            } else {
+                ::engine::emulator_account_id().to_string()
+            },
             updated_at: now,
             connection_types: [(connection_type, detail)].into_iter().collect(),
         };

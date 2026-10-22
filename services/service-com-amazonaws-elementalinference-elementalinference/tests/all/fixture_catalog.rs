@@ -7,107 +7,216 @@
 //! handler runs, and the response is serialized as `restJson1` — so what these tests
 //! assert is what a client sees.
 //!
-//! The rules under test, each asserted over a TABLE of inputs rather than one case:
+//! The RULE under test: a search reports exactly the fixtures the data-source catalog
+//! HOLDS that satisfy the request — the required `sport`, the `startDate` through
+//! `endDate` window of UTC days a fixture is scheduled on, and every `filters` entry —
+//! and nothing else, so a window the catalog holds no event in answers with an empty
+//! list ("The array is empty if no fixtures match", `SearchFixturesResponse$fixtures`);
+//! `GetFixture` answers for a held id and refuses any other.
 //!
-//! * `SearchFixtures` reports the fixtures the data source holds for ONE sport on
-//!   every UTC day of the window, and `GetFixture` reports the SAME record for a
-//!   `fixtureId` the search handed back — member for member, including the status the
-//!   fixture's own scheduled start puts it in;
-//! * the window is `startDate` through `endDate`, `endDate` defaulting to
-//!   `startDate`, and a window that runs backwards, exceeds seven days, or names
-//!   something that is not a UTC calendar date is a `ValidationException` (HTTP 400);
-//! * a search is paginated: at most `maxResults` fixtures per page, a `nextToken`
-//!   exactly while more remain, and the pages of a window are its whole result set in
-//!   order with nothing repeated;
-//! * a fixture appears only when it satisfies EVERY filter, and a filter is satisfied
-//!   by any one of its values matching any one of the fixture's competitors,
-//!   regardless of case;
-//! * a `fixtureId` no fixture has is `ValidationException` (HTTP 400) — the recorded
-//!   refusal for an id that names no fixture — and so is one past the modelled
-//!   length, which the boundary refuses before the handler runs.
+//! The catalog is STATE: no modelled operation creates a fixture (AWS relays them from
+//! an external sports data source), so these suites install records through the state
+//! seam `ComAmazonawsElementalinferenceElementalinferenceState::seed_fixtures` and then
+//! assert the wire answers against exactly what they installed. The ids below are
+//! deliberately opaque and sort in a different order from the fixtures' scheduled
+//! starts, so no case can pass by deriving a fixture from the shape of an id.
 
-use aws_smithy_types::date_time::Format;
-use aws_smithy_types::DateTime;
+use crate::harness::{call, router, router_with_engine};
 use serde_json::{json, Value};
+use service_com_amazonaws_elementalinference_elementalinference::ops::types::Competitor;
 use service_com_amazonaws_elementalinference_elementalinference::state::{
-    fixtures_on_day, parse_fixture_date, DataSourceSport, FIXTURE_IN_PROGRESS_SECS,
-    FIXTURE_STATUS_COMPLETED, FIXTURE_STATUS_IN_PROGRESS, FIXTURE_STATUS_SCHEDULED,
-    MAX_FIXTURES_PER_DAY, MAX_SEARCH_WINDOW_DAYS,
+    fixture_start_secs, parse_fixture_date,
+    ComAmazonawsElementalinferenceElementalinferenceState, DataSourceSport, Fixture,
+    FIXTURE_STATUS_COMPLETED, FIXTURE_STATUS_SCHEDULED, MAX_SEARCH_WINDOW_DAYS,
 };
-use service_com_amazonaws_elementalinference_elementalinference::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
-/// The region every request below is signed for.
-const REGION: &str = "us-west-2";
+/// One fixture to install in the catalog: a row of the data source's schedule.
+struct SeedRow {
+    /// The `FixtureId` the fixture is held under (modelled length 1..128).
+    id: &'static str,
+    sport: DataSourceSport,
+    /// The UTC day the fixture is scheduled on, as a `FixtureDate` (`YYYY-MM-DD`).
+    day: &'static str,
+    /// The kick-off time on that day, in UTC.
+    hour: i64,
+    minute: i64,
+    name: &'static str,
+    /// `None` for a fixture the data source gives no group for.
+    group: Option<&'static str>,
+    status: &'static str,
+    /// The competitors, each with its name and whether it is the home side.
+    competitors: &'static [(&'static str, bool)],
+}
 
-/// This service's SigV4 signing name (`OPERATIONS.md`, "Wire protocol"): the router
-/// resolves the claiming service from it.
-const SIGNING_NAME: &str = "elemental-inference";
+impl SeedRow {
+    /// The day number this row's `day` names.
+    fn epoch_day(&self) -> i64 {
+        parse_fixture_date(self.day)
+            .unwrap_or_else(|| panic!("row {:?}: {:?} is a real UTC day", self.id, self.day))
+    }
 
-/// The sports a search may name: exactly the `DataSourceSport` enum
-/// (`smithy_query(query="shape",shape="DataSourceSport")` — `basketball`,
-/// `american-football`). [`sports_are_the_modelled_enum`] pins that.
-const SPORTS: [&str; 2] = ["basketball", "american-football"];
+    /// The instant this row's fixture starts at, in seconds since the epoch.
+    fn start_secs(&self) -> i64 {
+        fixture_start_secs(self.epoch_day(), self.hour, self.minute)
+            .unwrap_or_else(|| panic!("row {:?}: the start instant is representable", self.id))
+    }
 
-/// The days the catalog is read on. They differ along what a `FixtureDate` can be —
-/// a leap day, a year end, a day decades in the past, a day decades in the future —
-/// and every one of them is far enough from any plausible run date that the
-/// fixture statuses below cannot change while a case runs.
-const DAYS: [&str; 5] = [
-    "1999-12-31",
-    "2012-06-15",
-    "2024-02-29",
-    "2088-02-29",
-    "2099-07-04",
-];
+    /// The stored record this row installs.
+    fn to_fixture(&self) -> Fixture {
+        Fixture {
+            id: self.id.to_string(),
+            sport: self.sport,
+            name: self.name.to_string(),
+            group: self.group.map(str::to_string),
+            scheduled_start_secs: self.start_secs(),
+            status: self.status.to_string(),
+            competitors: self
+                .competitors
+                .iter()
+                .map(|(name, is_home)| Competitor {
+                    name: Some((*name).to_string()),
+                    is_home: Some(*is_home),
+                })
+                .collect(),
+        }
+    }
+}
 
-/// A router serving this service alone over one shared engine.
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // These requests carry an unsigned placeholder Authorization header, which is
-    // there only so the router can resolve the signing name.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+/// The catalog these suites install.
+///
+/// The rows differ along everything the rule generalises over: both sports the
+/// `DataSourceSport` enum declares, days decades apart (a leap day, a year end, a day
+/// in the past and one in the future), days holding one, two or no fixture of a sport,
+/// kick-offs at both ends of a UTC day (midnight and the last minute), a group present
+/// and absent, two and four competitors, and statuses both inside and outside the two
+/// the model's documentation names ("For example, Scheduled or Completed",
+/// `FixtureSummary$status`) — the member is a free-form string, so a held value is
+/// reported verbatim.
+fn seed_rows() -> Vec<SeedRow> {
+    vec![
+        SeedRow {
+            id: "alpha-opener",
+            sport: DataSourceSport::Basketball,
+            day: "2024-02-29",
+            hour: 19,
+            minute: 30,
+            name: "Alpha Antelopes at Omega Owls",
+            group: None,
+            status: FIXTURE_STATUS_COMPLETED,
+            competitors: &[("Omega Owls", true), ("Alpha Antelopes", false)],
+        },
+        SeedRow {
+            id: "zeta-nightcap",
+            sport: DataSourceSport::Basketball,
+            day: "2024-02-29",
+            hour: 17,
+            minute: 0,
+            name: "Beacon Bears at Cobalt Comets",
+            group: Some("Leap Day Invitational"),
+            status: "Postponed",
+            competitors: &[("Cobalt Comets", true), ("Beacon Bears", false)],
+        },
+        SeedRow {
+            id: "mid-day-start",
+            sport: DataSourceSport::Basketball,
+            day: "2024-03-01",
+            hour: 0,
+            minute: 0,
+            name: "Delta Dolphins at Echo Eagles",
+            group: Some("Spring Series"),
+            status: FIXTURE_STATUS_SCHEDULED,
+            competitors: &[("Echo Eagles", true), ("Delta Dolphins", false)],
+        },
+        SeedRow {
+            id: "night-owl",
+            sport: DataSourceSport::Basketball,
+            day: "2024-03-01",
+            hour: 23,
+            minute: 59,
+            name: "Echo Eagles at Beacon Bears",
+            group: None,
+            status: FIXTURE_STATUS_SCHEDULED,
+            competitors: &[
+                ("Beacon Bears", true),
+                ("Echo Eagles", false),
+                ("Cobalt Comets", false),
+                ("Delta Dolphins", false),
+            ],
+        },
+        SeedRow {
+            id: "gridiron-kickoff",
+            sport: DataSourceSport::AmericanFootball,
+            day: "2024-02-29",
+            hour: 18,
+            minute: 0,
+            name: "Harbor Hornets at Granite Gladiators",
+            group: Some("Gridiron Conference"),
+            status: FIXTURE_STATUS_COMPLETED,
+            competitors: &[("Granite Gladiators", true), ("Harbor Hornets", false)],
+        },
+        SeedRow {
+            id: "gridiron-finale",
+            sport: DataSourceSport::AmericanFootball,
+            day: "2024-03-05",
+            hour: 20,
+            minute: 15,
+            name: "Iron Ibises at Juno Jackals",
+            group: None,
+            status: FIXTURE_STATUS_SCHEDULED,
+            competitors: &[("Juno Jackals", true), ("Iron Ibises", false)],
+        },
+        SeedRow {
+            id: "legacy-millennium",
+            sport: DataSourceSport::Basketball,
+            day: "1999-12-31",
+            hour: 23,
+            minute: 0,
+            name: "Cobalt Comets at Omega Owls",
+            group: Some("Millennium Classic"),
+            status: FIXTURE_STATUS_COMPLETED,
+            competitors: &[("Omega Owls", true), ("Cobalt Comets", false)],
+        },
+        SeedRow {
+            id: "future-independence",
+            sport: DataSourceSport::AmericanFootball,
+            day: "2099-07-04",
+            hour: 12,
+            minute: 0,
+            name: "Juno Jackals at Granite Gladiators",
+            group: None,
+            status: FIXTURE_STATUS_SCHEDULED,
+            competitors: &[
+                ("Granite Gladiators", true),
+                ("Juno Jackals", false),
+                ("Iron Ibises", false),
+            ],
+        },
+    ]
+}
+
+/// The row with this id.
+fn row_of(id: &str) -> SeedRow {
+    seed_rows()
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap_or_else(|| panic!("the seed table holds a row for {id:?}"))
+}
+
+/// A router over a catalog holding exactly [`seed_rows`].
+fn seeded_router() -> MultiServiceRouter {
+    let (router, engine) = router_with_engine();
+    seed(&engine, seed_rows());
     router
 }
 
-/// Send one request and return its status and parsed body (`Value::Null` when empty).
-async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let payload = body.map_or_else(Vec::new, |body| serde_json::to_vec(&body).unwrap());
-    let request = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/{SIGNING_NAME}/aws4_request, \
-                 SignedHeaders=host, Signature=deadbeef"
-            ),
-        )
-        .body(bytes::Bytes::from(payload))
-        .unwrap();
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or_else(|e| {
-            panic!(
-                "{method} {uri}: body is not JSON ({e}): {}",
-                String::from_utf8_lossy(response.body())
-            )
-        })
-    };
-    (status, parsed)
+/// Install `rows` through the state seam — the only authoring path a fixture has.
+fn seed(engine: &Arc<engine::InMemoryEngine>, rows: Vec<SeedRow>) {
+    let state = engine.state::<ComAmazonawsElementalinferenceElementalinferenceState>();
+    state
+        .lock()
+        .seed_fixtures(rows.iter().map(SeedRow::to_fixture));
 }
 
 /// `SearchFixtures`: `POST /v1/fixtures` (`OPERATIONS.md`).
@@ -120,15 +229,33 @@ async fn get_fixture(router: &MultiServiceRouter, fixture_id: &str) -> (u16, Val
     call(router, "GET", &format!("/v1/fixtures/{fixture_id}"), None).await
 }
 
-/// The fixtures of a response, as a list of JSON objects.
-fn fixtures_of(response: &Value) -> Vec<Value> {
-    response["fixtures"]
+/// A search body for one window, with the page size at the modelled maximum so a
+/// selection is never split unless the case is about paging.
+fn window_body(sport: &str, start: &str, end: Option<&str>) -> Value {
+    let mut body = json!({"sport": sport, "startDate": start, "maxResults": 100});
+    if let Some(end) = end {
+        body["endDate"] = json!(end);
+    }
+    body
+}
+
+/// The `fixtures` list of a 200 answer.
+fn fixtures_of(answer: &Value) -> Vec<Value> {
+    answer["fixtures"]
         .as_array()
-        .unwrap_or_else(|| panic!("a search response carries a fixtures array, got {response}"))
+        .unwrap_or_else(|| panic!("fixtures is a list on {answer}"))
         .clone()
 }
 
-/// A member of a fixture object, as text.
+/// The ids of the `fixtures` list, in the order the answer carries them.
+fn ids_of(answer: &Value) -> Vec<String> {
+    fixtures_of(answer)
+        .iter()
+        .map(|fixture| text(fixture, "fixtureId"))
+        .collect()
+}
+
+/// A required string member of a fixture.
 fn text(fixture: &Value, member: &str) -> String {
     fixture[member]
         .as_str()
@@ -150,290 +277,495 @@ fn start_secs(fixture: &Value) -> i64 {
     let rendered = fixture["scheduledStart"]
         .as_str()
         .unwrap_or_else(|| panic!("scheduledStart is an instant on {fixture}"));
-    DateTime::from_str(rendered, Format::DateTime)
+    aws_smithy_types::DateTime::from_str(rendered, aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_else(|e| panic!("{rendered:?} is an RFC-3339 instant: {e}"))
         .secs()
 }
 
-/// The UTC day (`YYYY-MM-DD`) an epoch-second count falls on.
-fn utc_day(secs: i64) -> String {
-    let rendered = DateTime::from_secs(secs)
-        .fmt(Format::DateTime)
-        .unwrap_or_else(|e| panic!("{secs} is an instant: {e}"));
-    rendered[..10].to_string()
-}
-
-/// Seconds since the epoch now, as the service measures a fixture's status against.
-fn now_secs() -> i64 {
-    DateTime::from(std::time::SystemTime::now()).secs()
-}
-
-/// The status rule: a fixture is `Scheduled` until its scheduled start, `InProgress`
-/// for [`FIXTURE_IN_PROGRESS_SECS`] after it, and `Completed` from then on.
-fn expected_status(scheduled_start_secs: i64, now: i64) -> &'static str {
-    if now < scheduled_start_secs {
-        FIXTURE_STATUS_SCHEDULED
-    } else if now < scheduled_start_secs + FIXTURE_IN_PROGRESS_SECS {
-        FIXTURE_STATUS_IN_PROGRESS
-    } else {
-        FIXTURE_STATUS_COMPLETED
+/// Assert that `fixture` is the projection of the seeded row `id`, member for member.
+fn assert_is_row(case: &str, fixture: &Value, id: &str) {
+    let row = row_of(id);
+    assert_eq!(
+        text(fixture, "fixtureId"),
+        row.id,
+        "case {case:?}: the fixtureId is the held id, got {fixture}"
+    );
+    assert_eq!(
+        text(fixture, "name"),
+        row.name,
+        "case {case:?}: the name is the held name, got {fixture}"
+    );
+    assert_eq!(
+        text(fixture, "status"),
+        row.status,
+        "case {case:?}: the status is the held status, got {fixture}"
+    );
+    match row.group {
+        Some(group) => assert_eq!(
+            fixture["fixtureGroup"],
+            json!(group),
+            "case {case:?}: the fixtureGroup is the held group, got {fixture}"
+        ),
+        None => assert_eq!(
+            fixture["fixtureGroup"],
+            Value::Null,
+            "case {case:?}: a fixture the data source gives no group for carries none, got {fixture}"
+        ),
     }
+    assert_eq!(
+        start_secs(fixture),
+        row.start_secs(),
+        "case {case:?}: the scheduledStart is the held instant, got {fixture}"
+    );
+    let expected_competitors: Vec<Value> = row
+        .competitors
+        .iter()
+        .map(|(name, is_home)| json!({"name": name, "isHome": is_home}))
+        .collect();
+    assert_eq!(
+        fixture["competitors"],
+        Value::Array(expected_competitors),
+        "case {case:?}: the competitors are the held competitors, in the held order, got {fixture}"
+    );
+}
+
+/// One window case: the request, and the ids the catalog selects for it.
+struct WindowCase {
+    label: &'static str,
+    sport: &'static str,
+    start: &'static str,
+    end: Option<&'static str>,
+    /// The held fixtures this window selects, in `FixtureId` order.
+    expected: &'static [&'static str],
+}
+
+/// Windows that differ along what the rule generalises over: the sport, the number of
+/// days (one, two, and the documented seven-day bound), whether the selected days hold
+/// one, several or no event, the day either side of a held event, and days decades
+/// apart. The expected ids are written out rather than computed, so a case fails if the
+/// service selects anything the catalog does not hold for it.
+fn window_cases() -> Vec<WindowCase> {
+    vec![
+        WindowCase {
+            label: "one day holding two fixtures of the sport",
+            sport: "basketball",
+            start: "2024-02-29",
+            end: None,
+            expected: &["alpha-opener", "zeta-nightcap"],
+        },
+        WindowCase {
+            label: "that same day, for the other sport",
+            sport: "american-football",
+            start: "2024-02-29",
+            end: None,
+            expected: &["gridiron-kickoff"],
+        },
+        WindowCase {
+            label: "a two-day window holding four fixtures",
+            sport: "basketball",
+            start: "2024-02-29",
+            end: Some("2024-03-01"),
+            expected: &[
+                "alpha-opener",
+                "mid-day-start",
+                "night-owl",
+                "zeta-nightcap",
+            ],
+        },
+        WindowCase {
+            label: "the day before the first held event",
+            sport: "basketball",
+            start: "2024-02-28",
+            end: None,
+            expected: &[],
+        },
+        WindowCase {
+            label: "three days the catalog holds no event on",
+            sport: "basketball",
+            start: "2024-03-02",
+            end: Some("2024-03-04"),
+            expected: &[],
+        },
+        WindowCase {
+            label: "a window whose last day holds the only event",
+            sport: "american-football",
+            start: "2024-02-28",
+            end: Some("2024-02-29"),
+            expected: &["gridiron-kickoff"],
+        },
+        WindowCase {
+            label: "a seven-day window over held and empty days: the documented bound",
+            sport: "american-football",
+            start: "2024-02-29",
+            end: Some("2024-03-06"),
+            expected: &["gridiron-finale", "gridiron-kickoff"],
+        },
+        WindowCase {
+            label: "a day decades in the past",
+            sport: "basketball",
+            start: "1999-12-31",
+            end: None,
+            expected: &["legacy-millennium"],
+        },
+        WindowCase {
+            label: "the day after that one",
+            sport: "basketball",
+            start: "2000-01-01",
+            end: None,
+            expected: &[],
+        },
+        WindowCase {
+            label: "a day decades in the future",
+            sport: "american-football",
+            start: "2099-07-04",
+            end: None,
+            expected: &["future-independence"],
+        },
+        WindowCase {
+            label: "that future day, for the other sport",
+            sport: "basketball",
+            start: "2099-07-04",
+            end: None,
+            expected: &[],
+        },
+    ]
 }
 
 /// The table's sports are exactly the values the model declares, so every case below
 /// is a case the service must accept.
 #[test]
 fn sports_are_the_modelled_enum() {
-    for sport in SPORTS {
+    let declared: Vec<&str> = DataSourceSport::ALL
+        .iter()
+        .map(|sport| sport.as_wire())
+        .collect();
+    assert_eq!(
+        declared,
+        vec!["basketball", "american-football"],
+        "the DataSourceSport enum declares exactly these two sports \
+         (smithy_query(query=\"shape\",shape=\"DataSourceSport\")), got {declared:?}"
+    );
+    for sport in &declared {
         assert!(
             DataSourceSport::from_wire(sport).is_some(),
-            "case {sport:?}: the table only names DataSourceSport values"
+            "case {sport:?}: a declared sport is a sport"
         );
     }
     assert!(
         DataSourceSport::from_wire("cricket").is_none(),
         "case \"cricket\": a value the enum does not declare is not a sport"
     );
+    assert_eq!(
+        MAX_SEARCH_WINDOW_DAYS, 7,
+        "the windows above are written against the documented seven-day bound, got \
+         {MAX_SEARCH_WINDOW_DAYS}"
+    );
 }
 
-/// A search reports the day's fixtures, and `GetFixture` reports the same record for
-/// each of their ids.
+/// A catalog nothing has seeded selects NOTHING: every window answers 200 with an
+/// empty `fixtures` list and no `nextToken`, and no id can be retrieved.
+///
+/// This is the recorded behaviour the emulator has to match — a search of a window the
+/// service has no events in reports no rows at all, rather than a card of its own.
 #[tokio::test]
-async fn search_reports_the_day_and_get_fixture_agrees_with_it() {
+async fn an_unseeded_catalog_selects_nothing() {
     let router = router();
 
-    for sport in SPORTS {
-        for day in DAYS {
-            let case = format!("{sport} on {day}");
-            let (status, found) = search(&router, json!({"sport": sport, "startDate": day})).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: SearchFixtures answers 200, got {status} with {found}"
-            );
-            assert_eq!(
-                found["nextToken"],
-                Value::Null,
-                "case {case:?}: one day fits in one page, so there is no nextToken: {found}"
-            );
+    for case in window_cases() {
+        let body = window_body(case.sport, case.start, case.end);
+        let (status, answer) = search(&router, body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: a search of an empty catalog answers 200, got {status} with {answer}",
+            case.label
+        );
+        assert_eq!(
+            fixtures_of(&answer),
+            Vec::<Value>::new(),
+            "case {:?}: an empty catalog selects no fixture for {body}, got {answer}",
+            case.label
+        );
+        assert_eq!(
+            answer["nextToken"],
+            Value::Null,
+            "case {:?}: nothing remains to page, so there is no nextToken, got {answer}",
+            case.label
+        );
+    }
 
-            let fixtures = fixtures_of(&found);
-            assert!(
-                !fixtures.is_empty() && fixtures.len() <= MAX_FIXTURES_PER_DAY,
-                "case {case:?}: the data source schedules 1..={MAX_FIXTURES_PER_DAY} fixtures a day, got {}",
-                fixtures.len()
-            );
+    for row in seed_rows() {
+        let (status, error) = get_fixture(&router, row.id).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: an id an empty catalog does not hold is refused, got {status} with {error}",
+            row.id
+        );
+        assert_eq!(
+            error["__type"],
+            json!("ValidationException"),
+            "case {:?}: that refusal is a ValidationException, got {error}",
+            row.id
+        );
+    }
+}
 
-            let mut ids = BTreeSet::new();
-            let mut previous: Option<(String, i64)> = None;
-            for fixture in &fixtures {
-                let id = text(fixture, "fixtureId");
-                assert!(
-                    ids.insert(id.clone()),
-                    "case {case:?}: every fixtureId of a day is distinct, {id:?} repeated"
-                );
-                // The id names the catalog entry: sport, UTC day, then the index.
-                let prefix = format!("{sport}-{}-", day.replace('-', ""));
-                assert!(
-                    id.starts_with(&prefix) && id.len() == prefix.len() + 2,
-                    "case {case:?}: the fixtureId is {prefix}NN, got {id:?}"
-                );
-                assert!(
-                    id.len() <= 128,
-                    "case {case:?}: a fixtureId is at most 128 characters (modelled length), got {}",
-                    id.len()
-                );
+/// A search reports exactly the held fixtures its sport and window select, in the
+/// catalog's id order, each one member for member as the catalog holds it.
+#[tokio::test]
+async fn a_search_reports_exactly_the_held_fixtures_the_window_selects() {
+    let router = seeded_router();
 
-                // The scheduled start is on the day the search asked for.
-                let start = start_secs(fixture);
-                assert_eq!(
-                    utc_day(start),
-                    day,
-                    "case {case:?}: the fixture is scheduled on {day}, got {start} ({})",
-                    utc_day(start)
-                );
-
-                // Two competitors, exactly one of them at home.
-                let competitors = fixture["competitors"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("case {case:?}: competitors is a list: {fixture}"))
-                    .clone();
-                assert_eq!(
-                    competitors.len(),
-                    2,
-                    "case {case:?}: a fixture has two competitors, got {competitors:?}"
-                );
-                let home: Vec<&Value> = competitors
-                    .iter()
-                    .filter(|competitor| competitor["isHome"] == json!(true))
-                    .collect();
-                assert_eq!(
-                    home.len(),
-                    1,
-                    "case {case:?}: exactly one competitor is at home, got {competitors:?}"
-                );
-                let names: BTreeSet<String> = competitors
-                    .iter()
-                    .map(|competitor| text(competitor, "name"))
-                    .collect();
-                assert_eq!(
-                    names.len(),
-                    2,
-                    "case {case:?}: no competitor plays itself, got {competitors:?}"
-                );
-
-                // The status follows the fixture's own scheduled start.
-                let now = now_secs();
-                assert_eq!(
-                    text(fixture, "status"),
-                    expected_status(start, now),
-                    "case {case:?}: the status follows the scheduled start {start}, got {fixture}"
-                );
-
-                // One order, ascending by id and by scheduled start together: that is
-                // the order a `nextToken` names a position in.
-                if let Some((earlier_id, earlier_start)) = &previous {
-                    assert!(
-                        earlier_id.as_str() < id.as_str() && *earlier_start < start,
-                        "case {case:?}: fixtures come back in ascending id and start order, got {earlier_id} at {earlier_start} before {id} at {start}"
-                    );
-                }
-                previous = Some((id.clone(), start));
-
-                // And the round trip: GetFixture reports this very record.
-                let (status, fetched) = get_fixture(&router, &id).await;
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: GetFixture on {id:?} answers 200, got {status} with {fetched}"
-                );
-                assert_eq!(
-                    &fetched, fixture,
-                    "case {case:?}: GetFixture on {id:?} reports the searched fixture member for member, got {fetched}"
-                );
-            }
+    for case in window_cases() {
+        let body = window_body(case.sport, case.start, case.end);
+        let (status, answer) = search(&router, body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: {body} answers 200, got {status} with {answer}",
+            case.label
+        );
+        assert_eq!(
+            ids_of(&answer),
+            case.expected,
+            "case {:?}: {body} selects exactly the held fixtures of that sport and window, \
+             in id order, got {answer}",
+            case.label
+        );
+        assert_eq!(
+            answer["nextToken"],
+            Value::Null,
+            "case {:?}: the whole selection fits one page of 100, so there is no nextToken, \
+             got {answer}",
+            case.label
+        );
+        for fixture in fixtures_of(&answer) {
+            let id = text(&fixture, "fixtureId");
+            assert_is_row(case.label, &fixture, &id);
         }
     }
 }
 
-/// The search window: `endDate` defaults to `startDate`, spans up to seven days, and
-/// anything else is refused.
+/// `GetFixture` reports the held record for every id a search handed back — the same
+/// members the search reported — and refuses every id the catalog does not hold.
 #[tokio::test]
-async fn the_window_spans_start_date_through_end_date() {
-    let router = router();
+async fn get_fixture_reports_the_held_record_and_refuses_any_other_id() {
+    let router = seeded_router();
 
-    // A window of one day through seven, each covering exactly its own days.
-    for span in 1..=MAX_SEARCH_WINDOW_DAYS {
-        let start = "2026-03-14";
-        // 2026-03-14 .. 2026-03-20: the whole span stays inside one month.
-        let end = format!("2026-03-{:02}", 13 + span);
-        let case = format!("{start} through {end} ({span} days)");
-        let (status, found) = search(
-            &router,
-            json!({"sport": "basketball", "startDate": start, "endDate": end, "maxResults": 100}),
-        )
-        .await;
+    // The round trip, over every held fixture: search its day, then fetch it by id.
+    for row in seed_rows() {
+        let case = format!("{} on {}", row.id, row.day);
+        let (status, answer) = search(&router, window_body(row.sport.as_wire(), row.day, None)).await;
         assert_eq!(
             status, 200,
-            "case {case:?}: a window of at most {MAX_SEARCH_WINDOW_DAYS} days answers 200, got {status} with {found}"
+            "case {case:?}: the search answers 200, got {status} with {answer}"
         );
-        let days: BTreeSet<String> = fixtures_of(&found)
-            .iter()
-            .map(|fixture| utc_day(start_secs(fixture)))
-            .collect();
-        let expected: BTreeSet<String> = (0..span)
-            .map(|offset| format!("2026-03-{:02}", 14 + offset))
-            .collect();
+        let searched = fixtures_of(&answer)
+            .into_iter()
+            .find(|fixture| text(fixture, "fixtureId") == row.id)
+            .unwrap_or_else(|| panic!("case {case:?}: the search reports the held fixture: {answer}"));
+
+        let (status, fetched) = get_fixture(&router, row.id).await;
         assert_eq!(
-            days, expected,
-            "case {case:?}: the search covers every day of the window and no other, got {days:?}"
+            status, 200,
+            "case {case:?}: GetFixture on a held id answers 200, got {status} with {fetched}"
         );
+        assert_eq!(
+            fetched, searched,
+            "case {case:?}: GetFixture reports the searched fixture member for member, got {fetched}"
+        );
+        assert_is_row(&case, &fetched, row.id);
     }
 
-    // An omitted endDate searches only startDate's day.
-    let (status, only_start) =
-        search(&router, json!({"sport": "basketball", "startDate": "2026-03-14"})).await;
-    assert_eq!(
-        status, 200,
-        "case \"endDate omitted\": answers 200, got {status} with {only_start}"
-    );
-    let (_, same_day) = search(
-        &router,
-        json!({"sport": "basketball", "startDate": "2026-03-14", "endDate": "2026-03-14"}),
-    )
-    .await;
-    assert_eq!(
-        only_start, same_day,
-        "case \"endDate omitted\": that is the same search as endDate == startDate, got {only_start} and {same_day}"
-    );
-
-    // A window one day past the published bound, a backwards window, and dates the
-    // modelled pattern admits but the calendar does not.
-    let refused = [
-        ("eight days", json!({"sport": "basketball", "startDate": "2026-03-14", "endDate": "2026-03-21"})),
-        ("backwards", json!({"sport": "basketball", "startDate": "2026-03-14", "endDate": "2026-03-13"})),
-        ("31 February", json!({"sport": "basketball", "startDate": "2026-02-31"})),
-        ("29 February in a common year", json!({"sport": "basketball", "startDate": "2025-02-29"})),
-        ("month 13", json!({"sport": "basketball", "startDate": "2026-13-01"})),
-        ("endDate not a date", json!({"sport": "basketball", "startDate": "2026-03-14", "endDate": "2026-04-31"})),
-        ("not YYYY-MM-DD", json!({"sport": "basketball", "startDate": "2026-3-14"})),
-        ("not a sport", json!({"sport": "cricket", "startDate": "2026-03-14"})),
-        ("maxResults below the modelled range", json!({"sport": "basketball", "startDate": "2026-03-14", "maxResults": 0})),
-        ("maxResults above the modelled range", json!({"sport": "basketball", "startDate": "2026-03-14", "maxResults": 101})),
-        ("an unmodelled filter name", json!({"sport": "basketball", "startDate": "2026-03-14", "filters": [{"name": "LEAGUE", "values": ["x"]}]})),
+    // Ids the catalog does not hold, differing in form, length and in how near they
+    // are to an id it does hold.
+    let held = "alpha-opener";
+    let cases: Vec<(String, String)> = vec![
+        (
+            "an id built like a sport and a day".to_string(),
+            "basketball-20240229-01".to_string(),
+        ),
+        (
+            "another such id, for a held day".to_string(),
+            "american-football-20240229-01".to_string(),
+        ),
+        ("no structure at all".to_string(), "nonsense".to_string()),
+        ("a single character".to_string(), "x".to_string()),
+        ("digits only".to_string(), "12345".to_string()),
+        (
+            "a held id in upper case".to_string(),
+            held.to_uppercase(),
+        ),
+        (
+            "a held id with a suffix".to_string(),
+            format!("{held}0"),
+        ),
+        (
+            "a held id with its last character dropped".to_string(),
+            held[..held.len() - 1].to_string(),
+        ),
+        (
+            "the modelled maximum length".to_string(),
+            "a".repeat(128),
+        ),
+        (
+            "one past the modelled maximum length".to_string(),
+            "a".repeat(129),
+        ),
     ];
-    for (case, body) in refused {
-        let (status, error) = search(&router, body.clone()).await;
+    for (case, id) in cases {
+        let (status, error) = get_fixture(&router, &id).await;
         assert_eq!(
             status, 400,
-            "case {case:?}: {body} is refused with 400, got {status} with {error}"
+            "case {case:?}: GetFixture on {id:?} answers 400, got {status} with {error}"
         );
         assert_eq!(
             error["__type"],
             json!("ValidationException"),
             "case {case:?}: that 400 is a ValidationException, got {error}"
         );
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("fixtureId"),
+            "case {case:?}: the refusal names the member at fault, got {error}"
+        );
     }
 
-    // 29 February in a leap year is a day, and the bound itself is accepted above.
-    let (status, leap) =
-        search(&router, json!({"sport": "basketball", "startDate": "2024-02-29"})).await;
+    // And the refusals disturbed nothing: the held fixture still answers.
+    let (status, fetched) = get_fixture(&router, held).await;
     assert_eq!(
         status, 200,
-        "case \"29 February in a leap year\": answers 200, got {status} with {leap}"
+        "case {held:?}: a held fixture still answers 200, got {status} with {fetched}"
     );
-    assert!(
-        !fixtures_of(&leap).is_empty(),
-        "case \"29 February in a leap year\": the day has fixtures, got {leap}"
-    );
+    assert_is_row("after the refusals", &fetched, held);
+}
+
+/// One filter case: the `filters` array, and the ids it narrows the window to.
+struct FilterCase {
+    label: &'static str,
+    /// One entry per `SearchFilter`, each a list of `COMPETITOR` values.
+    filters: &'static [&'static [&'static str]],
+    expected: &'static [&'static str],
+}
+
+/// Filters over the two-day basketball window, which holds four fixtures among six
+/// competitors. The rows differ along the value's case and completeness, how many
+/// values one filter carries, how many fixtures a value matches, and how many filters
+/// the request carries: "A fixture must satisfy every filter in the array in order to
+/// appear in the results. Within one filter, a fixture must match at least one of the
+/// values" (`SearchFixturesRequest$filters`).
+fn filter_cases() -> Vec<FilterCase> {
+    vec![
+        FilterCase {
+            label: "a competitor's full name",
+            filters: &[&["Omega Owls"]],
+            expected: &["alpha-opener"],
+        },
+        FilterCase {
+            label: "that name in lower case",
+            filters: &[&["omega owls"]],
+            expected: &["alpha-opener"],
+        },
+        FilterCase {
+            label: "that name in upper case",
+            filters: &[&["OMEGA OWLS"]],
+            expected: &["alpha-opener"],
+        },
+        FilterCase {
+            label: "part of that name",
+            filters: &[&["Owls"]],
+            expected: &["alpha-opener"],
+        },
+        FilterCase {
+            label: "a competitor two fixtures share",
+            filters: &[&["Beacon Bears"]],
+            expected: &["night-owl", "zeta-nightcap"],
+        },
+        FilterCase {
+            label: "one matching value among several",
+            filters: &[&["Nowhere Nobodies", "Echo Eagles"]],
+            expected: &["mid-day-start", "night-owl"],
+        },
+        FilterCase {
+            label: "a competitor nobody is",
+            filters: &[&["Nowhere Nobodies"]],
+            expected: &[],
+        },
+        FilterCase {
+            label: "a filter with no values at all",
+            filters: &[&[]],
+            expected: &[],
+        },
+        FilterCase {
+            label: "two filters, both satisfied by two fixtures",
+            filters: &[&["Beacon Bears"], &["Cobalt Comets"]],
+            expected: &["night-owl", "zeta-nightcap"],
+        },
+        FilterCase {
+            label: "three filters, satisfied by one fixture only",
+            filters: &[&["Echo Eagles"], &["Delta Dolphins"], &["Beacon Bears"]],
+            expected: &["night-owl"],
+        },
+        FilterCase {
+            label: "two filters, one of them unsatisfiable",
+            filters: &[&["Beacon Bears"], &["Nowhere Nobodies"]],
+            expected: &[],
+        },
+    ]
+}
+
+/// A fixture appears only when it satisfies EVERY filter, and one filter is satisfied
+/// by any of its values matching any of the fixture's competitors, whatever the case.
+#[tokio::test]
+async fn filters_narrow_a_window_to_the_fixtures_that_satisfy_every_one() {
+    let router = seeded_router();
+
+    for case in filter_cases() {
+        let filters: Vec<Value> = case
+            .filters
+            .iter()
+            .map(|values| json!({"name": "COMPETITOR", "values": values}))
+            .collect();
+        let mut body = window_body("basketball", "2024-02-29", Some("2024-03-01"));
+        body["filters"] = Value::Array(filters);
+        let (status, answer) = search(&router, body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: a filtered search answers 200, got {status} with {answer}",
+            case.label
+        );
+        assert_eq!(
+            ids_of(&answer),
+            case.expected,
+            "case {:?}: {body} selects exactly these fixtures, got {answer}",
+            case.label
+        );
+        for fixture in fixtures_of(&answer) {
+            let id = text(&fixture, "fixtureId");
+            assert_is_row(case.label, &fixture, &id);
+        }
+    }
 }
 
 /// Paging a window: every page is at most `maxResults` long, a `nextToken` comes back
-/// exactly while more remain, and the pages are the whole result set, in order.
+/// exactly while more remain, and the pages are the window's whole selection, in
+/// order, with nothing repeated or skipped.
 #[tokio::test]
-async fn pages_of_a_window_are_its_whole_result_set() {
-    let router = router();
-    let window = json!({"sport": "american-football", "startDate": "2026-05-01", "endDate": "2026-05-07"});
+async fn pages_of_a_window_are_its_whole_selection() {
+    let router = seeded_router();
+    let window = json!({"sport": "basketball", "startDate": "2024-02-29", "endDate": "2024-03-01"});
+    let expected = [
+        "alpha-opener",
+        "mid-day-start",
+        "night-owl",
+        "zeta-nightcap",
+    ];
 
-    let mut unpaged = window.clone();
-    unpaged["maxResults"] = json!(100);
-    let (status, all) = search(&router, unpaged).await;
-    assert_eq!(
-        status, 200,
-        "case \"one page\": answers 200, got {status} with {all}"
-    );
-    let expected: Vec<String> = fixtures_of(&all)
-        .iter()
-        .map(|fixture| text(fixture, "fixtureId"))
-        .collect();
-    assert!(
-        expected.len() > 1,
-        "case \"one page\": a seven-day window has more than one fixture, got {expected:?}"
-    );
-
-    for page_size in [1_usize, 2, 3, expected.len()] {
+    for page_size in [1_usize, 2, 3, 4, 100] {
         let case = format!("maxResults {page_size}");
         let mut collected: Vec<String> = Vec::new();
         let mut next_token: Option<String> = None;
-        // The window is bounded, so paging it can never need more requests than it
+        // The selection is bounded, so paging it can never need more requests than it
         // has fixtures plus one.
         for _ in 0..=expected.len() {
             let mut body = window.clone();
@@ -446,10 +778,7 @@ async fn pages_of_a_window_are_its_whole_result_set() {
                 status, 200,
                 "case {case:?}: a page answers 200, got {status} with {page}"
             );
-            let page_ids: Vec<String> = fixtures_of(&page)
-                .iter()
-                .map(|fixture| text(fixture, "fixtureId"))
-                .collect();
+            let page_ids = ids_of(&page);
             assert!(
                 page_ids.len() <= page_size,
                 "case {case:?}: a page holds at most {page_size} fixtures, got {page_ids:?}"
@@ -460,7 +789,8 @@ async fn pages_of_a_window_are_its_whole_result_set() {
             assert_eq!(
                 next_token.is_some(),
                 remaining > 0,
-                "case {case:?}: a nextToken comes back exactly while fixtures remain ({remaining} left), got {page}"
+                "case {case:?}: a nextToken comes back exactly while fixtures remain \
+                 ({remaining} left), got {page}"
             );
             if next_token.is_none() {
                 break;
@@ -468,7 +798,29 @@ async fn pages_of_a_window_are_its_whole_result_set() {
         }
         assert_eq!(
             collected, expected,
-            "case {case:?}: the pages are the window's whole result set, in order"
+            "case {case:?}: the pages are the window's whole selection, in order"
+        );
+    }
+
+    // A window the catalog holds nothing in pages nothing, whatever the page size.
+    for page_size in [1_usize, 100] {
+        let case = format!("an empty window with maxResults {page_size}");
+        let mut body = window_body("basketball", "2024-03-02", Some("2024-03-04"));
+        body["maxResults"] = json!(page_size);
+        let (status, answer) = search(&router, body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: answers 200, got {status} with {answer}"
+        );
+        assert_eq!(
+            ids_of(&answer),
+            Vec::<String>::new(),
+            "case {case:?}: an empty selection pages nothing, got {answer}"
+        );
+        assert_eq!(
+            answer["nextToken"],
+            Value::Null,
+            "case {case:?}: and carries no nextToken, got {answer}"
         );
     }
 
@@ -490,263 +842,165 @@ async fn pages_of_a_window_are_its_whole_result_set() {
     }
 }
 
-/// Filters: a fixture appears only when it satisfies every filter, and one filter is
-/// satisfied by any of its values matching any competitor, whatever the case.
-#[tokio::test]
-async fn filters_narrow_the_results_to_matching_competitors() {
-    let router = router();
-    let day = json!({"sport": "basketball", "startDate": "2026-06-20", "maxResults": 100});
+/// Seconds in a UTC day: a UTC day has no offset changes, so an instant's day number
+/// is its epoch-second count divided by this.
+const SECONDS_PER_DAY: i64 = 86_400;
 
-    let (_, all) = search(&router, day.clone()).await;
-    let fixtures = fixtures_of(&all);
-    let first = fixtures
-        .first()
-        .unwrap_or_else(|| panic!("the day has fixtures: {all}"));
-    let wanted_id = text(first, "fixtureId");
-    let home = text(&first["competitors"][0], "name");
-    let word = home
-        .split_whitespace()
-        .next_back()
-        .expect("a competitor name has a word in it")
-        .to_string();
-
-    // Each row: the filters, and whether the fixture above must appear.
-    let cases: Vec<(&str, Value, bool)> = vec![
-        (
-            "the competitor's own name",
-            json!([{"name": "COMPETITOR", "values": [home.clone()]}]),
-            true,
-        ),
-        (
-            "that name in lower case",
-            json!([{"name": "COMPETITOR", "values": [home.to_lowercase()]}]),
-            true,
-        ),
-        (
-            "that name in upper case",
-            json!([{"name": "COMPETITOR", "values": [home.to_uppercase()]}]),
-            true,
-        ),
-        (
-            "part of that name",
-            json!([{"name": "COMPETITOR", "values": [word.clone()]}]),
-            true,
-        ),
-        (
-            "one matching value among several",
-            json!([{"name": "COMPETITOR", "values": ["Nowhere Nobodies", home.clone()]}]),
-            true,
-        ),
-        (
-            "a competitor nobody is",
-            json!([{"name": "COMPETITOR", "values": ["Nowhere Nobodies"]}]),
-            false,
-        ),
-        (
-            "no values at all",
-            json!([{"name": "COMPETITOR", "values": []}]),
-            false,
-        ),
-        (
-            "two filters, one of them unsatisfiable",
-            json!([
-                {"name": "COMPETITOR", "values": [home.clone()]},
-                {"name": "COMPETITOR", "values": ["Nowhere Nobodies"]}
-            ]),
-            false,
-        ),
+/// The seam's instant builder keeps a fixture ON the UTC day it names, so the day a
+/// search window selects on is the day the caller meant.
+#[test]
+fn a_held_start_instant_must_be_a_time_of_the_day_it_names() {
+    let day = parse_fixture_date("2024-02-29").expect("2024-02-29 is a real UTC day");
+    // Each row: the time of day, and whether a UTC day has it.
+    let rows: [(&str, i64, i64, bool); 8] = [
+        ("midnight", 0, 0, true),
+        ("a time in the afternoon", 17, 30, true),
+        ("the last minute of the day", 23, 59, true),
+        ("the first hour past the day", 24, 0, false),
+        ("an hour no day has", 30, 0, false),
+        ("a negative hour", -1, 0, false),
+        ("the first minute past the hour range", 12, 60, false),
+        ("a negative minute", 12, -1, false),
     ];
-
-    for (case, filters, must_appear) in cases {
-        let mut body = day.clone();
-        body["filters"] = filters.clone();
-        let (status, found) = search(&router, body).await;
+    for (case, hour, minute, accepted) in rows {
+        let built = fixture_start_secs(day, hour, minute);
         assert_eq!(
-            status, 200,
-            "case {case:?}: a filtered search answers 200, got {status} with {found}"
+            built.is_some(),
+            accepted,
+            "case {case:?}: {hour}:{minute} is{} a time of a UTC day, got {built:?}",
+            if accepted { "" } else { " not" }
         );
-        let matched = fixtures_of(&found);
-        assert_eq!(
-            matched.iter().any(|fixture| text(fixture, "fixtureId") == wanted_id),
-            must_appear,
-            "case {case:?}: {filters} must{} match {wanted_id:?}, got {found}",
-            if must_appear { "" } else { " not" }
-        );
-        if !must_appear {
-            assert!(
-                matched.is_empty(),
-                "case {case:?}: no fixture satisfies {filters}, got {found}"
+        if let Some(secs) = built {
+            assert_eq!(
+                secs.div_euclid(SECONDS_PER_DAY),
+                day,
+                "case {case:?}: the instant falls on the day that was named, got {secs}"
             );
         }
-        // Whatever came back satisfies every filter, not merely the one asked about.
-        for fixture in &matched {
-            let names = fixture["competitors"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .iter()
-                .map(|competitor| text(competitor, "name").to_lowercase())
-                .collect::<Vec<String>>();
-            for filter in filters.as_array().cloned().unwrap_or_default() {
-                let values = filter["values"].as_array().cloned().unwrap_or_default();
-                assert!(
-                    values.iter().any(|value| {
-                        let value = value.as_str().unwrap_or_default().to_lowercase();
-                        names.iter().any(|name| name.contains(&value))
-                    }),
-                    "case {case:?}: {fixture} satisfies the filter {filter}"
-                );
-            }
-        }
     }
+    assert!(
+        fixture_start_secs(i64::MAX, 0, 0).is_none(),
+        "case \"a day number no calendar date has\": there is no start instant on it"
+    );
 }
 
-/// A `fixtureId` no fixture has, and one past the modelled length.
-///
-/// Both are HTTP 400 `ValidationException`: the recorded behaviour of `GetFixture` for
-/// an id that names no fixture is a validation refusal (corpus unit
-/// `elementalinference.get-fixture-not-found`), because a `fixtureId` is an opaque
-/// reference the service itself hands out, and an id past the modelled `FixtureId`
-/// length never reaches the handler at all — the boundary refuses it with the same
-/// status and code.
+/// The seam's other half: clearing the catalog puts every window back to selecting
+/// nothing, which is what a data source holding no event reports.
 #[tokio::test]
-async fn get_fixture_refuses_an_id_no_fixture_has() {
-    let router = router();
+async fn clearing_the_catalog_returns_every_window_to_an_empty_selection() {
+    let (router, engine) = router_with_engine();
+    seed(&engine, seed_rows());
+    let held = window_body("basketball", "2024-02-29", Some("2024-03-01"));
+    let (status, before) = search(&router, held).await;
+    assert_eq!(
+        status, 200,
+        "case \"before clearing\": the search answers 200, got {status} with {before}"
+    );
+    assert_eq!(
+        ids_of(&before),
+        ["alpha-opener", "mid-day-start", "night-owl", "zeta-nightcap"],
+        "case \"before clearing\": the seeded window selects its fixtures, got {before}"
+    );
 
-    // The catalogued id this table takes its near misses from.
-    let (status, found) =
-        search(&router, json!({"sport": "basketball", "startDate": "2026-03-14"})).await;
-    assert_eq!(status, 200, "a search answers 200, got {found}");
-    let catalogued = text(&fixtures_of(&found)[0], "fixtureId");
+    engine
+        .state::<ComAmazonawsElementalinferenceElementalinferenceState>()
+        .lock()
+        .clear_fixtures();
 
-    // Each row: an id no fixture has, differing in form, length and in how near it is
-    // to an id the catalog does have.
-    let mut cases: Vec<(String, String)> = vec![
-        (
-            "an index the day does not have".to_string(),
-            "basketball-20260314-99".to_string(),
-        ),
-        ("index zero".to_string(), "basketball-20260314-00".to_string()),
-        (
-            "a day that is not a date".to_string(),
-            "basketball-20260230-01".to_string(),
-        ),
-        (
-            "a sport the model does not declare".to_string(),
-            "cricket-20260314-01".to_string(),
-        ),
-        (
-            "a one-digit index".to_string(),
-            "basketball-20260314-1".to_string(),
-        ),
-        ("a short day".to_string(), "basketball-2026031-01".to_string()),
-        ("no structure at all".to_string(), "nonsense".to_string()),
-        ("a single character".to_string(), "x".to_string()),
-        ("digits only".to_string(), "12345".to_string()),
-        ("the modelled maximum length".to_string(), "a".repeat(128)),
-        (
-            "one past the modelled maximum length".to_string(),
-            "a".repeat(129),
-        ),
-        (
-            "a catalogued id in upper case".to_string(),
-            catalogued.to_uppercase(),
-        ),
-        (
-            "a catalogued id with a suffix".to_string(),
-            format!("{catalogued}0"),
-        ),
-        (
-            "a catalogued id with its last character dropped".to_string(),
-            catalogued[..catalogued.len() - 1].to_string(),
-        ),
-    ];
-    // And a row per fixture the day's card does hold, each a near miss on its index,
-    // so the refusal is not keyed to one shape of id.
-    for fixture in fixtures_of(&found) {
-        cases.push((
-            format!("a near miss on {}", text(&fixture, "fixtureId")),
-            format!("{}9", text(&fixture, "fixtureId")),
-        ));
+    for case in window_cases() {
+        let body = window_body(case.sport, case.start, case.end);
+        let (status, answer) = search(&router, body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: a search of a cleared catalog answers 200, got {status} with {answer}",
+            case.label
+        );
+        assert_eq!(
+            ids_of(&answer),
+            Vec::<String>::new(),
+            "case {:?}: a cleared catalog selects no fixture for {body}, got {answer}",
+            case.label
+        );
+        assert_eq!(
+            answer["nextToken"],
+            Value::Null,
+            "case {:?}: and pages nothing, got {answer}",
+            case.label
+        );
     }
-
-    for (case, id) in cases {
-        let (status, error) = get_fixture(&router, &id).await;
+    for row in seed_rows() {
+        let (status, error) = get_fixture(&router, row.id).await;
         assert_eq!(
             status, 400,
-            "case {case:?}: GetFixture on {id:?} answers 400, got {status} with {error}"
+            "case {:?}: a cleared catalog holds no id to retrieve, got {status} with {error}",
+            row.id
         );
         assert_eq!(
             error["__type"],
             json!("ValidationException"),
-            "case {case:?}: that 400 is a ValidationException, got {error}"
-        );
-        assert!(
-            error["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("fixtureId"),
-            "case {case:?}: the refusal names the member at fault, got {error}"
+            "case {:?}: that refusal is a ValidationException, got {error}",
+            row.id
         );
     }
-
-    // A fixture that IS in the catalog is unaffected by the refusals above.
-    let (status, fetched) = get_fixture(&router, &catalogued).await;
-    assert_eq!(
-        status, 200,
-        "case {catalogued:?}: a catalogued fixture still answers 200, got {status} with {fetched}"
-    );
-    assert_eq!(
-        fetched["fixtureId"],
-        json!(catalogued),
-        "case {catalogued:?}: GetFixture reports the id that was asked for, got {fetched}"
-    );
 }
 
-/// The status rule at each of its boundaries, over every fixture of the table's days:
-/// `Scheduled` until the scheduled start, `InProgress` for
-/// [`FIXTURE_IN_PROGRESS_SECS`] from it, `Completed` after that. The instants are
-/// chosen rather than waited for, which is why this covers the in-progress span that
-/// no fixed day can be relied on to be in.
-#[test]
-fn the_status_rule_holds_at_each_of_its_boundaries() {
-    for sport in SPORTS {
-        let catalog_sport =
-            DataSourceSport::from_wire(sport).expect("the table only names modelled sports");
-        for day in DAYS {
-            let epoch_day = parse_fixture_date(day)
-                .unwrap_or_else(|| panic!("case {day:?}: the table only names real dates"));
-            let fixtures = fixtures_on_day(catalog_sport, epoch_day);
-            assert!(
-                !fixtures.is_empty(),
-                "case {sport} on {day}: the catalog holds fixtures for every day"
-            );
-            for fixture in fixtures {
-                let start = fixture.scheduled_start_secs;
-                let rows = [
-                    ("the instant before the start", start - 1, FIXTURE_STATUS_SCHEDULED),
-                    ("the start itself", start, FIXTURE_STATUS_IN_PROGRESS),
-                    (
-                        "the last instant under way",
-                        start + FIXTURE_IN_PROGRESS_SECS - 1,
-                        FIXTURE_STATUS_IN_PROGRESS,
-                    ),
-                    (
-                        "the instant it is over",
-                        start + FIXTURE_IN_PROGRESS_SECS,
-                        FIXTURE_STATUS_COMPLETED,
-                    ),
-                ];
-                for (case, at, expected) in rows {
-                    assert_eq!(
-                        fixture.status_at(at),
-                        expected,
-                        "case {:?} at {case:?}: expected {expected}, got {}",
-                        fixture.id,
-                        fixture.status_at(at)
-                    );
-                }
-            }
-        }
-    }
+/// Reporting only: searching and retrieving fixtures changes nothing a later caller
+/// sees, and re-seeding a held id REPLACES that record rather than duplicating it.
+#[tokio::test]
+async fn reads_leave_the_catalog_as_it_was_and_re_seeding_replaces_in_place() {
+    let (router, engine) = router_with_engine();
+    seed(&engine, seed_rows());
+    let window = window_body("basketball", "2024-02-29", Some("2024-03-01"));
+
+    let (_, first) = search(&router, window.clone()).await;
+    let (_, fetched) = get_fixture(&router, "night-owl").await;
+    assert_eq!(
+        fetched["fixtureId"],
+        json!("night-owl"),
+        "GetFixture must report the id asked for, got {fetched}"
+    );
+    let (_, again) = search(&router, window.clone()).await;
+    assert_eq!(
+        first, again,
+        "case \"repeat the search\": a search and a retrieval change nothing a later caller \
+         sees, got {first} then {again}"
+    );
+
+    // The seam's replace-in-place: the same id with a different status and name.
+    seed(
+        &engine,
+        vec![SeedRow {
+            status: "Abandoned",
+            name: "Echo Eagles at Beacon Bears (abandoned)",
+            ..row_of("night-owl")
+        }],
+    );
+    let (status, updated) = search(&router, window).await;
+    assert_eq!(
+        status, 200,
+        "case \"after re-seeding\": the search answers 200, got {status} with {updated}"
+    );
+    assert_eq!(
+        ids_of(&updated),
+        ["alpha-opener", "mid-day-start", "night-owl", "zeta-nightcap"],
+        "case \"after re-seeding\": the record is replaced, not duplicated, got {updated}"
+    );
+    let replaced = fixtures_of(&updated)
+        .into_iter()
+        .find(|fixture| text(fixture, "fixtureId") == "night-owl")
+        .unwrap_or_else(|| panic!("the replaced fixture is reported: {updated}"));
+    assert_eq!(
+        text(&replaced, "status"),
+        "Abandoned",
+        "case \"after re-seeding\": the search reports the replaced record, got {replaced}"
+    );
+    let (status, refetched) = get_fixture(&router, "night-owl").await;
+    assert_eq!(
+        status, 200,
+        "case \"after re-seeding\": GetFixture answers 200, got {status} with {refetched}"
+    );
+    assert_eq!(
+        refetched, replaced,
+        "case \"after re-seeding\": GetFixture agrees with the search, got {refetched}"
+    );
 }

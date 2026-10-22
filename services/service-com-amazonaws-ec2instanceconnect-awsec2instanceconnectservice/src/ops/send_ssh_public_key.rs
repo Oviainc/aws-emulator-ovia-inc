@@ -11,15 +11,25 @@
 //!
 //! ## Decision order
 //!
-//! 1. the instance is in the registry, else `EC2InstanceNotFoundException` (404);
-//! 2. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
-//!    still launching) or `EC2InstanceStateInvalidException` (400, going down, stopped or
+//! 1. `InstanceOSUser` satisfies the `@pattern` the model declares for it — the one
+//!    constraint the framework cannot evaluate — else `InvalidArgsException`;
+//! 2. the instance is in the registry, else `EC2InstanceNotFoundException`;
+//! 3. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
+//!    still launching) or `EC2InstanceStateInvalidException` (going down, stopped or
 //!    terminated);
-//! 3. the `AvailabilityZone` the caller named, when it names one, is the instance's, else
-//!    `InvalidArgsException` (400);
-//! 4. the key is stored against (instance id, OS user), replacing whatever was there and
+//! 4. the `AvailabilityZone` the caller named, when it names one, is the instance's, else
+//!    `InvalidArgsException`;
+//! 5. the key is stored against (instance id, OS user), replacing whatever was there and
 //!    restarting the 60-second lifetime, and `Success: true` comes back with a fresh
 //!    `RequestId`.
+//!
+//! Every other modelled constraint on this operation's input is enforced by the framework
+//! before this handler runs, and `crate::service` words that refusal as the same
+//! `InvalidArgsException`.
+//!
+//! Every client error above is served with HTTP 400 whatever `@httpError` the shape
+//! carries — see [`crate::scaffolded::client_error_status`], which owns that mapping for
+//! the whole service.
 //!
 //! ## Shape of an operation
 //!
@@ -194,11 +204,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pruning cutoff cannot disagree with each other.
         let now = ::std::time::Instant::now();
 
-        // The instance must be in the registry: `EC2InstanceNotFoundException`, HTTP 404.
+        // The one modelled constraint the framework's boundary validator cannot enforce:
+        // `InstanceOSUser`'s `@pattern`, whose lookahead the `regex` crate cannot compile
+        // (see `crate::state::INSTANCE_OS_USER_PATTERN`). Enforced BEFORE any state is read
+        // — a request is not a resource lookup until its own values are legal — and refused
+        // as the modelled `InvalidArgsException`, naming the member and the constraint it
+        // broke. Every other member's bounds and patterns the boundary already enforced,
+        // and `crate::service` words those refusals as the same error.
+        if let Some(violation) = crate::state::instance_os_user_violation(&input.instance_os_user)
+        {
+            let message = crate::state::invalid_args_message(&[violation])
+                .unwrap_or_else(|| "One of the parameters is not valid.".to_string());
+            return Err(SendSSHPublicKeyErrorModeled::InvalidArgsException(
+                InvalidArgsException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The instance must be in the registry: `EC2InstanceNotFoundException`.
         let instance = state.instance(&input.instance_id).cloned().ok_or_else(|| {
             SendSSHPublicKeyErrorModeled::EC2InstanceNotFoundException(
                 EC2InstanceNotFoundException {
-                    message: Some(format!("Instance {} not found", input.instance_id)),
+                    message: Some("Instance not found.".to_string()),
                 },
             )
         })?;

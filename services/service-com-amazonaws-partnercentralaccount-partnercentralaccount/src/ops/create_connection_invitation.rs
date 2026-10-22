@@ -295,6 +295,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A receiver is addressed by an identifier of the kind the requested
+        // `ConnectionType` connects, so a receiver that is not addressable under that
+        // type is a field-level refusal of `ReceiverIdentifier`, taken before anything
+        // is minted — not an invitation nobody could ever answer.
+        if !crate::state::receiver_is_addressable(
+            &input.connection_type,
+            &input.receiver_identifier,
+        ) {
+            return Err(CreateConnectionInvitationErrorModeled::ValidationException(
+                ValidationException {
+                    message: "1 validation error detected.".to_string(),
+                    reason: crate::state::REASON_REQUEST_VALIDATION_FAILED.to_string(),
+                    error_details: Some(vec![ValidationError::FieldValidationError(
+                        FieldValidationError {
+                            name: "ReceiverIdentifier".to_string(),
+                            message: "Invalid receiver identifier for this connection type."
+                                .to_string(),
+                            code: crate::state::FIELD_CODE_INVALID_VALUE.to_string(),
+                        },
+                    )]),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         // The store a caller can grow is bounded: past the ceiling the create is
         // refused with the modelled quota error rather than accepted.

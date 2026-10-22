@@ -17,11 +17,17 @@
 //!   `SerialConsoleAccessDisabledException` reports.
 //! * `requests` — a bounded log of the calls served, so a caller can tell a recorded call
 //!   from a canned reply.
+//!
+//! It also owns the one modelled input constraint the framework's boundary validator
+//! cannot enforce — `InstanceOSUser`'s `@pattern` — because both the handler that enforces
+//! it and `service.rs`, which words the boundary's own refusals, state it the same way.
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use aws_smithy_schema_server::constraints::{path, Violation, ViolationKind};
 
 /// How long a pushed key stays usable.
 ///
@@ -39,6 +45,193 @@ pub const SERIAL_CONSOLE_PORT: i32 = 0;
 /// keeps. The log exists so a test can see that a call was recorded and that request ids do
 /// not repeat; it is bounded because a long-lived emulator must not grow a list forever.
 pub const MAX_RECORDED_REQUESTS: usize = 256;
+
+// ---------------------------------------------------------------------------
+// The one modelled constraint the boundary validator cannot enforce
+// ---------------------------------------------------------------------------
+//
+// The framework validates every constraint the model declares before a handler runs
+// (`@length`, `@range`, and any `@pattern` the `regex` crate can compile), and
+// `service.rs::override_refusal` words those refusals as this service's own
+// `InvalidArgsException`. ONE constraint escapes it: `InstanceOSUser`'s `@pattern`, whose
+// second branch opens with a lookahead, which `regex` cannot compile — and the framework
+// treats a pattern it cannot compile as matching. That member is therefore validated here,
+// and nothing else is: every other member's bounds and patterns stay the model's single
+// source of truth in the generated member schemas.
+
+/// `InstanceOSUser`'s `@pattern`, verbatim from the model
+/// (`smithy_query(query="operation",operation="SendSSHPublicKey")`).
+///
+/// Named in the refusal clause; what EVALUATES it is
+/// [`instance_os_user_satisfies_pattern`], which implements this expression branch by
+/// branch.
+pub const INSTANCE_OS_USER_PATTERN: &str = r"^(^[A-Za-z_][A-Za-z0-9\@\._-]{0,30}[A-Za-z0-9\$_-]?$)|(^(?=.{2,32}$)[0-9]{1,32}[A-Za-z\@\._-][A-Za-z0-9\@\._-]*[A-Za-z0-9\$_-]?$)$";
+
+/// The Smithy name of the member [`INSTANCE_OS_USER_PATTERN`] constrains. A clause names it
+/// lowerCamel — the spelling [`path::member`] produces — so a clause built here cannot
+/// drift from one the framework builds for the same member.
+pub const INSTANCE_OS_USER_MEMBER: &str = "InstanceOSUser";
+
+/// `InstanceOSUser`'s `@length` maximum (1..32 in the model). Used only to bound the value
+/// a refusal echoes: a longer value is refused for its length by the framework, whose
+/// `@length` check compiles perfectly well.
+pub const INSTANCE_OS_USER_MAX_LENGTH: usize = 32;
+
+/// `[A-Za-z_]` — what the pattern's first branch may open with.
+fn is_name_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+/// `[A-Za-z0-9\@\._-]` — the interior class of both branches.
+fn is_name_interior(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-')
+}
+
+/// `[A-Za-z0-9\$_-]` — the optional final character of both branches.
+fn is_name_end(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '$' | '_' | '-')
+}
+
+/// `[A-Za-z\@\._-]` — what must follow the second branch's leading digits.
+fn is_after_digits(c: char) -> bool {
+    c.is_ascii_alphabetic() || matches!(c, '@' | '.' | '_' | '-')
+}
+
+/// `[A-Za-z0-9\@\._-]{0,max_interior}[A-Za-z0-9\$_-]?` over the whole of `tail`.
+///
+/// Either every character is an interior one, or the last is a final one and everything
+/// before it is interior. One left-to-right scan, no backtracking.
+fn tail_satisfies(tail: &[char], max_interior: usize) -> bool {
+    let all_interior = tail.len() <= max_interior && tail.iter().copied().all(is_name_interior);
+    let interior_then_end = match tail.split_last() {
+        Some((last, interior)) => {
+            interior.len() <= max_interior
+                && interior.iter().copied().all(is_name_interior)
+                && is_name_end(*last)
+        }
+        None => false,
+    };
+    all_interior || interior_then_end
+}
+
+/// Whether `value` satisfies [`INSTANCE_OS_USER_PATTERN`].
+///
+/// The expression is an alternation of two self-anchored branches, so a Smithy *find* of it
+/// is a whole-value match of one of them, and each branch is a fixed sequence of character
+/// classes:
+///
+/// * `^[A-Za-z_][A-Za-z0-9\@\._-]{0,30}[A-Za-z0-9\$_-]?$` — a name opening with a letter or
+///   an underscore;
+/// * `^(?=.{2,32}$)[0-9]{1,32}[A-Za-z\@\._-][A-Za-z0-9\@\._-]*[A-Za-z0-9\$_-]?$` — a name
+///   opening with digits, at least two characters long (which is all the lookahead says),
+///   whose first non-digit is a letter or one of `@._-`.
+///
+/// It is evaluated by scanning those classes rather than by a regex engine. The `regex`
+/// crate — the linear-time engine the framework itself matches with — cannot compile the
+/// lookahead, and the merge gate's security-requirements review (analysis record MIT-4013,
+/// "Keep untrusted-input matching linear-time in per-service handlers") reports a
+/// backtracking engine on a handler's untrusted-input path as unmet, naming a hand-written
+/// validator as the alternative. The scan is a single left-to-right pass over the value, so
+/// its cost is linear in the value's length whatever the value is. The leading-digit count
+/// determines the second branch's split point uniquely, because the class that must follow
+/// those digits contains no digit.
+pub fn instance_os_user_satisfies_pattern(value: &str) -> bool {
+    let chars: Vec<char> = value.chars().collect();
+
+    // First branch: a leading name character, then the interior/final tail (at most 30
+    // interior characters, as `{0,30}` says).
+    if let Some((first, tail)) = chars.split_first() {
+        if is_name_start(*first) && tail_satisfies(tail, 30) {
+            return true;
+        }
+    }
+
+    // Second branch: the lookahead is a whole-value length assertion.
+    if !(2..=32).contains(&chars.len()) {
+        return false;
+    }
+    let digits = chars.iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    match chars.get(digits) {
+        // `[A-Za-z0-9\@\._-]*` is unbounded in the second branch, so the tail's interior
+        // length is bounded only by the value itself.
+        Some(after) if is_after_digits(*after) => tail_satisfies(&chars[digits + 1..], usize::MAX),
+        _ => false,
+    }
+}
+
+/// The `@pattern` violation `value` commits as `InstanceOSUser`, or `None` when it
+/// satisfies the pattern.
+pub fn instance_os_user_violation(value: &str) -> Option<Violation> {
+    if instance_os_user_satisfies_pattern(value) {
+        return None;
+    }
+    Some(Violation {
+        path: path::member(INSTANCE_OS_USER_MEMBER),
+        kind: ViolationKind::Pattern(INSTANCE_OS_USER_PATTERN.to_string()),
+        value: Some(echoed_within_member_length(value)),
+    })
+}
+
+/// The rejected value as a clause should show it, elided to the member's own modelled
+/// maximum.
+///
+/// A longer value is refused for its `@length` by the framework, so this only ever elides a
+/// value that could not have got here; it is bounded anyway because the caller chooses the
+/// length of what it sent and a clause interpolates it.
+fn echoed_within_member_length(value: &str) -> String {
+    let shown: String = value.chars().take(INSTANCE_OS_USER_MAX_LENGTH).collect();
+    let length = value.chars().count();
+    if length <= INSTANCE_OS_USER_MAX_LENGTH {
+        shown
+    } else {
+        format!("{shown}... [{length} characters]")
+    }
+}
+
+/// The message an `InvalidArgsException` carries for `violations`, or `None` when there are
+/// none.
+///
+/// Built by the framework's own envelope (`N validation error(s) detected: Value '<value>'
+/// at '<member>' failed to satisfy constraint: <requirement>`), so a violation this service
+/// catches in a handler is worded exactly like one the boundary validator catches. BOTH
+/// paths come through here — the handler's own check and `service.rs`'s refusal renderer —
+/// so the two cannot word the same refusal differently.
+pub fn invalid_args_message(violations: &[Violation]) -> Option<String> {
+    let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
+    aws_smithy_schema_server::envelope(&stated)
+}
+
+/// A violation as this service states it: the framework's clause, with a `@pattern` named
+/// without the anchors that bracket it.
+///
+/// A clause already says the MEMBER must satisfy the expression, so the anchors that make
+/// the model's pattern whole-string would restate the sentence; this service names the
+/// expression alone (`i-[a-f0-9]+` for `InstanceId`'s `^i-[a-f0-9]+$`). Anchors INSIDE the
+/// expression belong to it and stay. What is ENFORCED is the model's pattern, unchanged —
+/// this is the rendering of the clause only. Every other clause is the framework's,
+/// unchanged.
+fn as_stated(violation: &Violation) -> Violation {
+    match &violation.kind {
+        ViolationKind::Pattern(regex) => Violation {
+            kind: ViolationKind::Pattern(unanchored(regex).to_string()),
+            ..violation.clone()
+        },
+        _ => violation.clone(),
+    }
+}
+
+/// `regex` without a leading `^` or a trailing `$`. A trailing `$` escaped by a backslash
+/// is a literal dollar in the expression, not an anchor, so it stays.
+fn unanchored(regex: &str) -> &str {
+    let inner = regex.strip_prefix('^').unwrap_or(regex);
+    match inner.strip_suffix('$') {
+        Some(stripped) if !stripped.ends_with('\\') => stripped,
+        _ => inner,
+    }
+}
 
 /// An instance's lifecycle state, as EC2 names `instance-state-name`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -201,8 +394,14 @@ pub struct ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState {
     /// Keys pushed by `SendSerialConsoleSSHPublicKey`, keyed by (instance id, serial port).
     pub serial_console_keys: HashMap<(String, i32), PushedKey>,
     /// The account-level EC2 serial console toggle (EC2's `EnableSerialConsoleAccess` /
-    /// `DisableSerialConsoleAccess`). Enabled here so the happy path works; the
-    /// serial-console refusal reads it.
+    /// `DisableSerialConsoleAccess`), which the serial-console refusal reads.
+    ///
+    /// Starts DISABLED, which is the account's own starting value: serial-console access
+    /// is granted at the account level and is not granted until `EnableSerialConsoleAccess`
+    /// grants it — the modelled `SerialConsoleAccessDisabledException` says so itself ("To
+    /// authorize your account, run the EnableSerialConsoleAccess API"). That API belongs to
+    /// EC2, not to this service, so until the EC2 emulator implements it this field is
+    /// where it would write.
     pub serial_console_access_enabled: bool,
     /// The most recent served calls, newest last, at most [`MAX_RECORDED_REQUESTS`].
     pub requests: Vec<RequestRecord>,
@@ -277,7 +476,7 @@ impl Default for ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState
             instances: HashMap::new(),
             pushed_keys: HashMap::new(),
             serial_console_keys: HashMap::new(),
-            serial_console_access_enabled: true,
+            serial_console_access_enabled: false,
             requests: Vec::new(),
             request_id_seed: process_seed(),
             request_sequence: 0,

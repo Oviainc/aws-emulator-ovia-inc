@@ -24,13 +24,13 @@ use service_com_amazonaws_iotsitewise_awsiotsitewise::EmulatedService;
 const REGION: &str = "us-west-2";
 
 /// A router with just this service mounted on a fresh shared engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     router_with_engine().0
 }
 
 /// The same, keeping a handle on the shared engine so a test can read the store
 /// directly — the only way to observe a bound the API exposes no reader for.
-fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Pin authentication off so the suite is independent of the process-wide switch.
@@ -40,7 +40,7 @@ fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Dispatch one request and return `(status, parsed body)`.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -79,7 +79,7 @@ async fn call(
 }
 
 /// The wire error code of an error body (`__type`), or `""`.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 
@@ -112,7 +112,11 @@ fn is_modelled_id(id: &str) -> bool {
 }
 
 /// Create an asset model with `properties` and return its id.
-async fn create_model(router: &MultiServiceRouter, name: &str, properties: Value) -> String {
+pub(crate) async fn create_model(
+    router: &MultiServiceRouter,
+    name: &str,
+    properties: Value,
+) -> String {
     let (status, body) = call(
         router,
         "POST",
@@ -128,7 +132,11 @@ async fn create_model(router: &MultiServiceRouter, name: &str, properties: Value
 }
 
 /// Create an asset of `asset_model_id` and return its id.
-async fn create_asset(router: &MultiServiceRouter, name: &str, asset_model_id: &str) -> String {
+pub(crate) async fn create_asset(
+    router: &MultiServiceRouter,
+    name: &str,
+    asset_model_id: &str,
+) -> String {
     let (status, body) = call(
         router,
         "POST",
@@ -158,7 +166,7 @@ fn property_catalog() -> Value {
 }
 
 /// The property id of `name` in a `DescribeAssetModel` / `DescribeAsset` body.
-fn property_id(properties: &Value, name: &str) -> String {
+pub(crate) fn property_id(properties: &Value, name: &str) -> String {
     properties
         .as_array()
         .unwrap_or_else(|| panic!("expected a property list, got {properties}"))

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +162,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSession"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the EMR Serverless application store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let created_by = crate::state::caller_arn(ctx.parts());
+        let mut store = state.lock();
+        // A session lives inside one application, so the application it names is what
+        // this start reads every inherited member from.
+        let record = store
+            .settled_mut(&input.application_id, now)
+            .ok_or_else(|| {
+                StartSessionErrorModeled::ResourceNotFoundException(
+                    crate::state::application_not_found(),
+                )
+            })?;
+
+        // `clientToken` is `@idempotencyToken` on an `@idempotent` operation: the same
+        // token names the same session, so a retried start reports the first one rather
+        // than bringing up a second.
+        if let Some(session_id) = record.session_tokens.get(&input.client_token).cloned() {
+            if let Some(existing) = record.sessions.get(&session_id) {
+                return Ok(StartSessionOutput {
+                    application_id: existing.session.application_id.clone(),
+                    session_id: existing.session.session_id.clone(),
+                    arn: existing.session.arn.clone(),
+                });
+            }
+        }
+
+        // "This operation is supported for EMR release 7.13.0 and later": the release an
+        // application runs is the one it was created with, so a session is refused on an
+        // application whose release serves none.
+        if !crate::state::release_supports_sessions(&record.application.release_label) {
+            let (major, minor, patch) = crate::state::MIN_SESSION_RELEASE;
+            return Err(StartSessionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Release label {} does not support sessions; \
+                         Amazon EMR release {major}.{minor}.{patch} or later is required",
+                        record.application.release_label
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "The application must ... have interactive sessions enabled", which
+        // `InteractiveConfiguration$sessionEnabled` is what enables.
+        if !record.session_enabled() {
+            return Err(StartSessionErrorModeled::ValidationException(
+                ValidationException {
+                    message: "Interactive sessions are not enabled on this application: \
+                              set interactiveConfiguration.sessionEnabled"
+                        .to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The sessions one application holds are bounded, the same way its job runs
+        // are; this operation models the quota refusal, so that is what answers past
+        // the bound. It is judged BEFORE the lifecycle below, so a refused start leaves
+        // the application exactly as it found it.
+        if record.sessions.len() >= crate::state::MAX_SESSIONS_PER_APPLICATION {
+            return Err(StartSessionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Application already holds the maximum of {} sessions",
+                        crate::state::MAX_SESSIONS_PER_APPLICATION
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "The application must be in the STARTED state or have AutoStart enabled", so
+        // an application configured to start by itself is started by this call instead
+        // of refusing it. A TERMINATED application is past its lifecycle and starts for
+        // nothing, so a session asked for on one is refused. The precondition is judged
+        // against the state the application has SETTLED on, so a transition the clock
+        // still owes never refuses a call the settled application admits.
+        let settled_state = record.settled_state().to_string();
+        if settled_state == "TERMINATED" {
+            return Err(StartSessionErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Application {} is in TERMINATED state and cannot run sessions",
+                        input.application_id
+                    ),
+                },
+            )
+            .into());
+        }
+        if settled_state != "STARTED" {
+            if !record.auto_start_enabled() {
+                return Err(StartSessionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "Application is in {settled_state} state and does not start \
+                             automatically; call StartApplication first"
+                        ),
+                    },
+                )
+                .into());
+            }
+            if settled_state != "STARTING" {
+                record.application.state = "STARTING".to_string();
+                record.application.updated_at = crate::state::now_timestamp(now);
+                record.pending = Some(crate::state::PendingState {
+                    due: now + crate::state::LIFECYCLE_TRANSITION,
+                    state: "STARTED".to_string(),
+                    state_details: None,
+                });
+            }
+        }
+
+        let session_id = record.mint_session_id();
+        let arn = crate::state::session_arn(&record.application.arn, &session_id);
+        let created_at = crate::state::now_timestamp(now);
+        let session = Session {
+            application_id: record.application.application_id.clone(),
+            session_id: session_id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            // The session is accepted here and is not usable the instant this call
+            // returns; the clock owes it `STARTED` once the transition span has passed.
+            state: "SUBMITTED".to_string(),
+            state_details: crate::state::SESSION_SUBMITTED_STATE_DETAILS.to_string(),
+            // The release and the network the session runs on are the application's,
+            // never the request's.
+            release_label: record.application.release_label.clone(),
+            network_configuration: record.application.network_configuration.clone(),
+            execution_role_arn: input.execution_role_arn,
+            created_by,
+            created_at,
+            updated_at: created_at,
+            // The session has not come up, so it has no start instant and has not been
+            // idle; it has not ended either.
+            started_at: None,
+            ended_at: None,
+            idle_since: None,
+            configuration_overrides: input.configuration_overrides,
+            idle_timeout_minutes: input.idle_timeout_minutes,
+            tags: crate::state::adopt_tags(input.tags),
+            // Resource utilisation is measured while a session executes statements.
+            // Nothing executes here, so there is nothing to report.
+            total_resource_utilization: None,
+            billed_resource_utilization: None,
+            total_execution_duration_seconds: None,
+        };
+
+        record.sessions.insert(
+            session_id.clone(),
+            crate::state::SessionRecord {
+                session,
+                pending: Some(crate::state::PendingState {
+                    due: now + crate::state::LIFECYCLE_TRANSITION,
+                    state: "STARTED".to_string(),
+                    state_details: Some(
+                        crate::state::SESSION_STARTED_STATE_DETAILS.to_string(),
+                    ),
+                }),
+            },
+        );
+        record
+            .session_tokens
+            .insert(input.client_token, session_id.clone());
+
+        Ok(StartSessionOutput {
+            application_id: input.application_id,
+            session_id,
+            arn,
+        })
     }
 }

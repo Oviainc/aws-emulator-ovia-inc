@@ -1135,6 +1135,90 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// ARN syntax
+//
+// Two of the ARN shapes this service takes as INPUT constrain their value with
+// `@arnReference` alone: `QuantumTaskArn` and `DeviceArn` carry no `@pattern`, so
+// the framework's boundary validator — which does enforce the `@pattern` that
+// `JobArn`, `SpendingLimitArn` and `Association$arn` carry — has nothing to check
+// for them, and a value that is not an ARN at all reaches the handler. The two
+// helpers below are the syntax check those members are held to, so a malformed ARN
+// is refused as invalid input instead of being keyed into the store and reported as
+// a resource that does not exist.
+// ---------------------------------------------------------------------------
+
+/// The service namespace every Amazon Braket ARN carries: the model's `sigv4Name`,
+/// and the literal its own ARN patterns spell (`^arn:aws[a-z\-]*:braket:...`).
+pub const ARN_SERVICE: &str = "braket";
+
+/// The resource type a quantum-task ARN names (`QuantumTaskResource`).
+pub const ARN_RESOURCE_QUANTUM_TASK: &str = "quantum-task";
+
+/// The resource type a device ARN names (`DeviceResource`).
+pub const ARN_RESOURCE_DEVICE: &str = "device";
+
+/// Whether `value` is syntactically an Amazon Braket ARN naming `resource_type`.
+///
+/// The form required is the ARN grammar
+/// `arn:<partition>:braket:<region>:<account>:<resource-type>/<id>`:
+///
+/// * six `:`-separated fields, the first literally `arn` — the resource field is the
+///   remainder, so it may itself carry `:` and `/`;
+/// * a partition of the `aws` family, as this model's own ARN patterns spell it
+///   (`arn:aws[a-z\-]*`), which is what admits `aws-cn` and `aws-us-gov`;
+/// * the [`ARN_SERVICE`] namespace;
+/// * a region drawn from `[a-z0-9\-]` and a 12-digit account id, EITHER of which may
+///   be empty: `BraketResourceArn`'s own pattern permits an empty region, and the
+///   device ARNs Amazon Braket publishes (`arn:aws:braket:::device/...`) carry
+///   neither, so an empty field is not what makes an ARN malformed;
+/// * `resource_type`, followed by `/` and a non-empty resource id.
+///
+/// Whether a well-formed ARN names a resource this emulator actually holds is a
+/// different question, answered by the store: that is the
+/// `ResourceNotFoundException` case.
+pub fn is_braket_arn(value: &str, resource_type: &str) -> bool {
+    let mut fields = value.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some(service), Some(region), Some(account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return false;
+    };
+    let partition_is_aws = partition
+        .strip_prefix("aws")
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_lowercase() || c == '-'));
+    let region_is_well_formed = region
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    let account_is_well_formed =
+        account.is_empty() || (account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit()));
+    let resource_id = resource
+        .strip_prefix(resource_type)
+        .and_then(|rest| rest.strip_prefix('/'));
+    partition_is_aws
+        && service == ARN_SERVICE
+        && region_is_well_formed
+        && account_is_well_formed
+        && resource_id.is_some_and(|id| !id.is_empty())
+}
+
+/// Why a member outside [`is_braket_arn`] is refused: the member's name, the syntax
+/// it must satisfy and the value that missed it.
+///
+/// Built from the request, so the wording follows the rule rather than any one
+/// recorded message.
+pub fn invalid_arn_message(member: &str, resource_type: &str, value: &str) -> String {
+    format!(
+        "{member} is invalid: expected an Amazon Braket {resource_type} ARN of the form \
+         arn:aws:{ARN_SERVICE}:<region>:<account>:{resource_type}/<id>, got {value:?}"
+    )
+}
+
 /// A `SystemTime` as the modelled `Timestamp` the wire carries.
 ///
 /// The conversion is deterministic — one instant always renders to the same

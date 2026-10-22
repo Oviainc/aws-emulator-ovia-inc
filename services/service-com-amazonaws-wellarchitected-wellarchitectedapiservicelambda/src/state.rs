@@ -1257,7 +1257,7 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// The remembered import tokens in insertion order, so the ledger above evicts the
     /// one remembered longest ago first. A `HashMap` alone cannot say which that is.
     import_lens_token_order: VecDeque<String>,
-    /// Monotonic input to [`Self::mint_workload_id`]; never returned to a caller.
+    /// Monotonic input to [`Self::next_hex_id`]; never returned to a caller.
     id_counter: u64,
 }
 
