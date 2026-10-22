@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a node id under a stored network (and, on Hyperledger Fabric,
+//! under one of that network's members) and persists the node in [`crate::state`];
+//! `GetNode` and `ListNodes` project the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +172,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNode"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateNodeErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        guard.settle(now);
+
+        // "An idempotent operation completes no more than once" (`ClientRequestToken`):
+        // a token already used replays the node id its first call minted.
+        let token = crate::state::idempotency_key(Self::NAME, &input.client_request_token);
+        if let Some(created) = guard.replay_idempotent(&token) {
+            return Ok(CreateNodeOutput {
+                node_id: created.node_id.clone(),
+            });
+        }
+
+        let Some(network) = guard.networks.get(&input.network_id) else {
+            return Err(CreateNodeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "network {} does not exist on this account",
+                        input.network_id
+                    )),
+                    resource_name: Some(input.network_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // "The requested resource exists but isn't in a status that can complete the
+        // operation" (`ResourceNotReadyException`): a network still `CREATING` cannot
+        // take a node yet.
+        if network.status != crate::state::STATUS_AVAILABLE {
+            return Err(CreateNodeErrorModeled::ResourceNotReadyException(
+                ResourceNotReadyException {
+                    message: Some(format!(
+                        "network {} is {} and cannot take a node until it is {}",
+                        network.id,
+                        network.status,
+                        crate::state::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if network.nodes.len() >= crate::state::MAX_NODES_PER_NETWORK {
+            return Err(CreateNodeErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    message: Some(format!(
+                        "network {} already holds the maximum of {} nodes",
+                        network.id,
+                        crate::state::MAX_NODES_PER_NETWORK
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `MemberId` is "The unique identifier of the member that owns this node.
+        // Applies only to Hyperledger Fabric": on a Fabric network a node belongs to a
+        // member, so the request must name one and it must be a member of this network.
+        let member_id = if network.framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC {
+            let Some(member_id) = input.member_id.clone() else {
+                return Err(CreateNodeErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "MemberId is required on a {} network",
+                            crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
+                        )),
+                    },
+                )
+                .into());
+            };
+            let Some(member) = network.members.get(&member_id) else {
+                return Err(CreateNodeErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "member {member_id} does not exist on network {}",
+                            input.network_id
+                        )),
+                        resource_name: Some(member_id.clone()),
+                    },
+                )
+                .into());
+            };
+            if member.status != crate::state::STATUS_AVAILABLE {
+                return Err(CreateNodeErrorModeled::ResourceNotReadyException(
+                    ResourceNotReadyException {
+                        message: Some(format!(
+                            "member {} is {} and cannot take a node until it is {}",
+                            member.id,
+                            member.status,
+                            crate::state::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into());
+            }
+            Some(member_id)
+        } else {
+            None
+        };
+
+        // "The node inherits this parameter from the member that it belongs to"
+        // (`Node$KmsKeyArn`).
+        let kms_key_arn = member_id
+            .as_ref()
+            .and_then(|member_id| network.members.get(member_id))
+            .map(|member| member.kms_key_arn.clone());
+
+        let node_id = guard.mint_id("nd");
+        let (peer_endpoint, peer_event_endpoint) = crate::state::peer_endpoints(
+            &region,
+            &input.network_id,
+            member_id.as_deref(),
+            &node_id,
+        );
+        let configuration = input.node_configuration;
+        let node = crate::state::StoredNode {
+            id: node_id.clone(),
+            network_id: input.network_id.clone(),
+            member_id: member_id.clone(),
+            instance_type: configuration.instance_type,
+            // Stored exactly as the request named it: which zone the service would pick
+            // for a request that names none is EC2 state this emulator does not hold.
+            availability_zone: configuration.availability_zone,
+            peer_endpoint,
+            peer_event_endpoint,
+            log_publishing_configuration: configuration.log_publishing_configuration,
+            // `NodeConfiguration$StateDB` documents the default: "When using an Amazon
+            // Managed Blockchain network with Hyperledger Fabric version 1.4 or later,
+            // the default is CouchDB." The model states no other default, so CouchDB is
+            // what an omitted member takes.
+            state_db: configuration
+                .state_db
+                .unwrap_or_else(crate::state::default_state_db),
+            status: crate::state::STATUS_CREATING.to_string(),
+            available_at: now + crate::state::TRANSITION_SPAN,
+            creation_date: now,
+            tags: crate::state::map_in(input.tags),
+            arn: crate::state::node_arn(&region, &node_id),
+            kms_key_arn,
+        };
+
+        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+            return Err(CreateNodeErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+        network.nodes.insert(node_id.clone(), node);
+        guard.remember_idempotent(
+            token,
+            crate::state::CreatedIds {
+                network_id: Some(input.network_id.clone()),
+                member_id,
+                node_id: Some(node_id.clone()),
+            },
+        );
+
+        // Answer from the STORED record, so this is the id every later read of the node
+        // answers to.
+        let stored = guard
+            .networks
+            .get(&input.network_id)
+            .and_then(|network| network.nodes.get(&node_id));
+        let Some(stored) = stored else {
+            return Err(CreateNodeErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+        Ok(CreateNodeOutput {
+            node_id: Some(stored.id.clone()),
+        })
     }
 }

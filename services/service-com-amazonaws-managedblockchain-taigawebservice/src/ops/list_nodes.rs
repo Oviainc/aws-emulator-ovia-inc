@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNodes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNodes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNodes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: pages `NodeSummary` entries out of the nodes stored on one network in
+//! [`crate::state`], honouring the `memberId` and `status` filters.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +153,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNodes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNodesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNodes"))
+        // A reporting operation: the page is cut from stored state, and the one write it
+        // makes is materialising the status transitions the clock already owed.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListNodesErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let after = match crate::state::decode_cursor(input.next_token.as_deref()) {
+            Ok(after) => after,
+            Err(crate::state::MalformedCursor) => {
+                return Err(ListNodesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "nextToken is not a pagination token this operation issued"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        // This operation models no `ResourceNotFoundException`, so an id that names no
+        // network is refused as an invalid request rather than answered with an empty
+        // page, which would claim the network exists and holds no nodes.
+        let Some(network) = guard.networks.get(&input.network_id) else {
+            return Err(ListNodesErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "network {} does not exist on this account",
+                        input.network_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `MemberId` "Applies only to Hyperledger Fabric and is required for Hyperledger
+        // Fabric": on a Fabric network the listing is scoped to one member's nodes.
+        if network.framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
+            && input.member_id.is_none()
+        {
+            return Err(ListNodesErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "memberId is required on a {} network",
+                        crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A memberId that names no member of this network is as invalid as a networkId
+        // that names no network: an empty page would claim the member exists and owns no
+        // nodes.
+        if let Some(member_id) = input.member_id.as_deref() {
+            if !network.members.contains_key(member_id) {
+                return Err(ListNodesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "member {member_id} does not exist on network {}",
+                            input.network_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let selected: Vec<(String, NodeSummary)> = network
+            .nodes
+            .values()
+            .filter(|node| {
+                input.member_id.as_deref().is_none_or(|member_id| {
+                    node.member_id.as_deref() == Some(member_id)
+                }) && input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| node.status == status)
+            })
+            .map(|node| (node.id.clone(), node.to_summary()))
+            .collect();
+
+        let page = crate::state::page_of(
+            selected,
+            after.as_deref(),
+            input.max_results,
+            crate::state::NODE_MAX_RESULTS,
+        );
+
+        Ok(ListNodesOutput {
+            nodes: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }
