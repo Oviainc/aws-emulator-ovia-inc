@@ -19,5 +19,7 @@ mod configuration_lifecycle;
 mod insight_listing;
 #[path = "all/insight_reads.rs"]
 mod insight_reads;
+#[path = "all/resource_collection_health.rs"]
+mod resource_collection_health;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
