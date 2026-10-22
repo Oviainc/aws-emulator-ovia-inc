@@ -7,8 +7,12 @@
 //! account id and every handler reads (or, for `UpgradeAccountPlan`, mutates)
 //! them:
 //!
-//! * `plans` — one [`AccountPlan`] singleton per account, read by
-//!   `GetAccountPlanState` and written by `UpgradeAccountPlan`.
+//! * `plans` — one [`AccountPlan`] singleton per account, reported by
+//!   `GetAccountPlanState` and written by `UpgradeAccountPlan`. It starts EMPTY:
+//!   an account has account-plan data only once the service's one plan-writing
+//!   operation has established it, so `GetAccountPlanState` has a not-found
+//!   answer to give (see
+//!   [`ComAmazonawsFreetierAwsfreetierserviceState::settled_plan`]).
 //! * `activities` — the activity catalog, insertion-ordered so paging it is
 //!   stable. `ListAccountActivities` pages over it and `GetAccountActivity`
 //!   looks ids up in the SAME rows, so the summary and the detail view of one
@@ -16,8 +20,9 @@
 //! * `usages` — the Free Tier usage records `GetFreeTierUsage` pages and
 //!   filters, also insertion-ordered.
 //!
-//! All three are part of the store's initial value ([`Default`]), so a
-//! `@readonly` reader serves a read without writing anything.
+//! `activities` and `usages` are part of the store's initial value
+//! ([`Default`]), so a reporting operation serves a read without writing
+//! anything.
 
 use std::collections::HashMap;
 
@@ -236,17 +241,22 @@ pub struct ComAmazonawsFreetierAwsfreetierserviceState {
 }
 
 impl Default for ComAmazonawsFreetierAwsfreetierserviceState {
-    /// The store's initial value: the caller's account already on the free
-    /// plan, with the activity catalog and the usage records it can report.
+    /// The store's initial value: the activity catalog and the usage records the
+    /// account can report, and NO account-plan record.
     ///
-    /// Seeding here rather than on first read is what lets both `@readonly`
-    /// readers answer without writing: a read never changes what a later
-    /// caller sees.
+    /// An account holds account-plan data only once
+    /// [`crate::ops::upgrade_account_plan`] — the service's one plan-writing
+    /// operation — has established it; until then `GetAccountPlanState` reports
+    /// the modelled not-found error rather than a plan nothing stored.
+    ///
+    /// Seeding the two catalogs here rather than on first read is what lets both
+    /// reporting operations answer without writing: a read never changes what a
+    /// later caller sees.
     fn default() -> Self {
         let account_id = caller_account_id().to_string();
         let now = now();
         Self {
-            plans: HashMap::from([(account_id.clone(), AccountPlan::free(&account_id, now))]),
+            plans: HashMap::new(),
             activities: HashMap::from([(account_id.clone(), seed_activities(now))]),
             usages: HashMap::from([(account_id, seed_usages())]),
         }
@@ -254,9 +264,25 @@ impl Default for ComAmazonawsFreetierAwsfreetierserviceState {
 }
 
 impl ComAmazonawsFreetierAwsfreetierserviceState {
-    /// The account's plan, seeded on the free plan if this store has never seen
-    /// the account. Seeding is idempotent and yields the same plan a read would
-    /// have reported, so the first caller and every later one agree.
+    /// The account's plan as of `now`, with the expiry the clock has already made
+    /// due materialised ([`AccountPlan::settle`]), or `None` when this store
+    /// holds no plan for the account.
+    ///
+    /// The lookup a REPORTING operation uses: it answers what is stored and
+    /// never brings a plan into being, so an account with no plan data stays
+    /// that way however often it is read.
+    pub fn settled_plan(&mut self, account_id: &str, now: DateTime) -> Option<AccountPlan> {
+        let plan = self.plans.get_mut(account_id)?;
+        plan.settle(now);
+        Some(plan.clone())
+    }
+
+    /// The account's plan for writing, established on the free plan when this
+    /// store holds none.
+    ///
+    /// The lookup the plan-WRITING operation uses: establishing the record is the
+    /// mutation the caller asked for. A reporting operation must use
+    /// [`Self::settled_plan`] instead.
     pub fn plan_mut(&mut self, account_id: &str) -> &mut AccountPlan {
         self.plans
             .entry(account_id.to_string())

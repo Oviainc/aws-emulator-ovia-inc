@@ -15,13 +15,15 @@
 //!   out of the record rather than echoed;
 //! * `TagResource` merges onto, and `UntagResource` removes from, that record's
 //!   tag map, and `ListTagsForResource` reports exactly what those writes left;
-//! * an ARN naming no stored record is a modelled `ResourceNotFoundException`,
-//!   and a request outside the modelled constraints a `ValidationException`.
+//! * an ARN naming no stored record is a 404 carrying this service's own
+//!   `NotFoundException` code, and a request outside the modelled constraints a
+//!   `ValidationException`.
 //!
 //! The harness below (the router, the signed request, and the per-operation
 //! callers) is `pub(crate)` because the sibling suites in this target —
-//! `put_deployment_parameter_target` and `validation_messages` — drive the same
-//! wire path and reuse it rather than restating it.
+//! `put_deployment_parameter_target`, `validation_messages` and
+//! `not_found_error_code` — drive the same wire path and reuse it rather than
+//! restating it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -32,6 +34,11 @@ use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice
     TAG_KEY_MAX_LEN, TAG_VALUE_MAX_LEN,
 };
 use smithy_server_runtime::MultiServiceRouter;
+
+// The percent-encoder and the error-code accessor are shared by every suite of this
+// test binary; ONE copy lives in `tests/all/support.rs` and is re-exported here, so
+// the sibling suites that import them from this module keep working.
+pub(crate) use crate::support::{error_code, pct};
 
 /// The region every request below signs for; every minted ARN must carry it.
 pub(crate) const REGION: &str = "us-west-2";
@@ -84,7 +91,7 @@ pub(crate) fn provision(
 
 /// A request signed for `aws-marketplace` in [`REGION`]: the signal the router
 /// routes on and the handlers read the ARN's region from.
-fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes::Bytes> {
+pub(crate) fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes::Bytes> {
     let mut builder = http::Request::builder()
         .method(method)
         .uri(uri)
@@ -134,34 +141,6 @@ pub(crate) async fn call(
             .or_insert_with(|| Value::String(error_type));
     }
     (status, parsed)
-}
-
-/// The modelled error shape a failed call reported.
-pub(crate) fn error_code(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<no __type>")
-        // An error `__type` may be namespaced (`com.amazonaws.marketplacedeployment#Foo`).
-        .rsplit('#')
-        .next()
-        .unwrap_or("<no __type>")
-        .to_string()
-}
-
-/// Percent-encode a value the way an SDK does for one `@httpLabel` path segment
-/// or one `@httpQuery` value: everything outside RFC 3986's unreserved set. A
-/// non-greedy label may not carry a raw `/`, and a query value may not carry a
-/// raw `+` (which decodes to a space) or `&`.
-pub(crate) fn pct(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(char::from(byte));
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 pub(crate) async fn put(
@@ -631,8 +610,8 @@ async fn an_arn_that_names_no_record_is_not_found_on_every_tag_operation() {
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {body:?}"
         );
 
         let (status, body) = tag(&router, &resource_arn, &tag_map(&[("k", "v")])).await;
@@ -642,8 +621,8 @@ async fn an_arn_that_names_no_record_is_not_found_on_every_tag_operation() {
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {body:?}"
         );
 
         let (status, body) = untag(&router, &resource_arn, &["k".to_string()]).await;
@@ -653,8 +632,8 @@ async fn an_arn_that_names_no_record_is_not_found_on_every_tag_operation() {
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {body:?}"
         );
     }
 
