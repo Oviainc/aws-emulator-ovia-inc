@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports, one page at a time, the tags held in [`crate::state`] by the
+//! keyspace or table the `resourceArn` names. This is the ONLY file to touch for
+//! `ListTagsForResource`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +85,32 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `ListTagsForResource` returns, and the page size a caller that names
+/// no `maxResults` gets: the maximum of the modelled `maxResults` range (`1..1000`).
+///
+/// A resource holds at most [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, so an unlimited
+/// page is always one page — and never longer than the modelled `TagList` maximum of 60.
+pub const MAX_PAGE_SIZE: i32 = 1000;
+
+/// Encode the resume point of a page as the opaque `nextToken` the caller hands back.
+///
+/// The token names the LAST tag key on the page just returned, qualified by the resource
+/// it was issued for, and is hex-encoded so no caller can read a key out of it or build
+/// one by hand. The ARN half is hex-encoded too, so it cannot contain the `#` separator
+/// whatever the ARN or the tag key carries.
+fn encode_page_token(resource_arn: &str, tag_key: &str) -> String {
+    ::hex::encode(format!("{}#{tag_key}", ::hex::encode(resource_arn)))
+}
+
+/// The tag key a `nextToken` resumes after, or `None` when the token is not one this
+/// service issued for `resource_arn` — a token minted for a different resource resumes
+/// nothing here and is refused rather than silently ignored.
+fn decode_page_token(token: &str, resource_arn: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let (arn, key) = decoded.split_once('#')?;
+    (arn == ::hex::encode(resource_arn) && !key.is_empty()).then(|| key.to_string())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,20 +181,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+
+        // `maxResults` is modelled `1..1000`, so the boundary validator has already
+        // refused a page size outside that range; an absent one means "no limit the caller
+        // asked for", which is every tag the resource holds.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize);
+
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                decode_page_token(token, &input.resource_arn).ok_or_else(|| {
+                    ListTagsForResourceErrorModeled::ValidationException(ValidationException {
+                        message: Some(format!(
+                            "nextToken is not a pagination token this service issued for resource '{}'.",
+                            input.resource_arn
+                        )),
+                    })
+                })?,
+            ),
+        };
+
+        let mut store = state.lock();
+        // Reporting, not mutating: `settle` only materialises the status changes the clock
+        // had already made due at this instant, so this report shows what any caller would
+        // have seen now whether or not anybody read the tags.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(tags) = store.resource_tags(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::arn_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        // One page, plus one lookahead entry: the token is present exactly when a tag
+        // follows the last one on this page, so the final page carries none.
+        let mut scanned: Vec<(&String, &String)> = match resume_after.as_deref() {
+            Some(after) => tags
+                .range::<str, _>((
+                    ::std::ops::Bound::Excluded(after),
+                    ::std::ops::Bound::Unbounded,
+                ))
+                .take(page_size + 1)
+                .collect(),
+            None => tags.iter().take(page_size + 1).collect(),
+        };
+        let truncated = scanned.len() > page_size;
+        scanned.truncate(page_size);
+        let next_token = match truncated {
+            true => scanned
+                .last()
+                .map(|(key, _)| encode_page_token(&input.resource_arn, key)),
+            false => None,
+        };
+
+        Ok(ListTagsForResourceOutput {
+            next_token,
+            // The modelled `TagList` is `len 1..60`, so an empty list is not a value this
+            // member can carry: a resource holding no tags reports the member as absent.
+            tags: (!scanned.is_empty()).then(|| {
+                scanned
+                    .into_iter()
+                    .map(|(key, value)| Tag {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect()
+            }),
+        })
     }
 }

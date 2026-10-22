@@ -16,7 +16,7 @@
 //! which materialises the status transitions the clock already owes — so the
 //! per-operation files never carry a second copy of any of it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -106,6 +106,181 @@ pub const MAX_KEYSPACES: usize = 256;
 /// The most tables one keyspace holds. See [`MAX_KEYSPACES`].
 pub const MAX_TABLES_PER_KEYSPACE: usize = 256;
 
+/// The most tags one Amazon Keyspaces resource holds.
+///
+/// PUBLISHED by the service, not chosen here: the `Tag` shape's own documentation
+/// (`smithy_query(query="shape",shape="Tag")`) says "A tag is a key-value pair. You can
+/// add up to 50 tags to a single Amazon Keyspaces resource."
+///
+/// It is a different number from the modelled `TagList` bound (`len 1..60`), which caps
+/// what ONE REQUEST may carry: a request well inside the modelled bound can still carry a
+/// resource past this quota, and the request boundary cannot see that because it depends
+/// on the tags the resource already holds. Such a call is refused with the
+/// `ServiceQuotaExceededException` (HTTP 402) that every operation taking tags models.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The prefix reserved for Amazon Web Services' own tag keys.
+///
+/// From the `Tag` shape's documentation: "Amazon Web Services-assigned tag names and
+/// values are automatically assigned the `aws:` prefix, which the user cannot assign."
+/// So a caller may neither apply nor remove a key carrying it.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// A resource's tags, keyed by `Tag$key`.
+///
+/// The KEY identifies a tag, not the pair: "Each Amazon Keyspaces resource can only have
+/// up to one tag with the same key. If you try to add an existing tag (same key), the
+/// existing tag value will be updated to the new value" (`Tag$key`). A
+/// [`std::collections::BTreeMap`] for the same reason the keyspace and table maps are
+/// one: `ListTagsForResource` is `@paginated`, and a page boundary is only resumable if
+/// the iteration order is total and stable.
+pub type TagSet = BTreeMap<String, String>;
+
+/// Why a tag a caller supplied was refused. Each variant maps onto the modelled error
+/// the operations that take tags declare for it, which is why this is not a bare string:
+/// a reserved key is a 400 `ValidationException` and a breached quota a 402
+/// `ServiceQuotaExceededException`.
+#[derive(Debug, Clone)]
+pub enum TagRejection {
+    /// A key the caller may not assign ([`RESERVED_TAG_KEY_PREFIX`]).
+    ReservedKeyPrefix {
+        /// The key as supplied.
+        key: String,
+    },
+    /// The call would carry the resource past [`MAX_TAGS_PER_RESOURCE`].
+    QuotaExceeded {
+        /// How many tags the resource would have held.
+        resulting: usize,
+    },
+}
+
+impl TagRejection {
+    /// What the caller has to fix, naming the member at fault and the rule it broke.
+    pub fn message(&self) -> String {
+        match self {
+            Self::ReservedKeyPrefix { key } => format!(
+                "tags contains key '{key}': the '{RESERVED_TAG_KEY_PREFIX}' prefix is reserved for Amazon Web Services and cannot be assigned."
+            ),
+            Self::QuotaExceeded { resulting } => format!(
+                "the resource would hold {resulting} tags, which exceeds the limit of {MAX_TAGS_PER_RESOURCE} tags per resource"
+            ),
+        }
+    }
+
+    /// Whether this refusal is the quota one, so a handler picks
+    /// `ServiceQuotaExceededException` over `ValidationException`.
+    pub fn is_quota(&self) -> bool {
+        matches!(self, Self::QuotaExceeded { .. })
+    }
+}
+
+/// Merge `incoming` into the tag set `existing`, as `TagResource` does and as a create
+/// does onto the empty set.
+///
+/// A key the set already holds is an UPDATE of its value, not a second tag (`Tag$key`),
+/// so it does not count towards [`MAX_TAGS_PER_RESOURCE`] — and neither does a key the
+/// request repeats. The resulting size is therefore computed before anything is stored,
+/// which is also what makes a refused call leave the tag set exactly as it was.
+pub fn merge_tags(existing: &mut TagSet, incoming: &[Tag]) -> Result<(), TagRejection> {
+    let mut added: BTreeSet<&str> = BTreeSet::new();
+    for tag in incoming {
+        if tag.key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+            return Err(TagRejection::ReservedKeyPrefix {
+                key: tag.key.clone(),
+            });
+        }
+        if !existing.contains_key(&tag.key) {
+            added.insert(tag.key.as_str());
+        }
+    }
+    let resulting = existing.len() + added.len();
+    if resulting > MAX_TAGS_PER_RESOURCE {
+        return Err(TagRejection::QuotaExceeded { resulting });
+    }
+    for tag in incoming {
+        existing.insert(tag.key.clone(), tag.value.clone());
+    }
+    Ok(())
+}
+
+/// The tag set a create operation stores for the `tags` it was given: the same rules as
+/// [`merge_tags`], applied to a resource that holds none yet.
+pub fn new_tag_set(supplied: Option<&[Tag]>) -> Result<TagSet, TagRejection> {
+    let mut tags = TagSet::new();
+    merge_tags(&mut tags, supplied.unwrap_or_default())?;
+    Ok(tags)
+}
+
+/// Which resource an Amazon Keyspaces ARN names: the two resource forms this service
+/// mints ([`keyspace_arn`], [`table_arn`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceRef {
+    /// `arn:<partition>:cassandra:<region>:<account>:/keyspace/<name>/`.
+    Keyspace {
+        /// The keyspace the ARN names.
+        keyspace_name: String,
+    },
+    /// `arn:<partition>:cassandra:<region>:<account>:/keyspace/<ks>/table/<tbl>`.
+    Table {
+        /// The owning keyspace.
+        keyspace_name: String,
+        /// The table the ARN names.
+        table_name: String,
+    },
+}
+
+/// The resource an Amazon Keyspaces ARN names, or `None` when it names none this service
+/// has a resource form for.
+///
+/// The ARN's shape is modelled only as `^arn:(aws[a-zA-Z0-9-]*):cassandra:.+` (`ARN`), so
+/// everything after the service segment is parsed here. A keyspace and a table name
+/// cannot contain `/` (both are modelled `^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`), which is
+/// what makes the two forms unambiguous: only the keyspace form ends in `/`.
+pub fn parse_resource_arn(arn: &str) -> Option<ResourceRef> {
+    let mut segments = arn.splitn(6, ':');
+    let scheme = segments.next()?;
+    let partition = segments.next()?;
+    let service = segments.next()?;
+    let _region = segments.next()?;
+    let _account = segments.next()?;
+    let resource = segments.next()?;
+    if scheme != "arn" || !partition.starts_with("aws") || service != ARN_NAMESPACE {
+        return None;
+    }
+    let rest = resource.strip_prefix("/keyspace/")?;
+    match rest.strip_suffix('/') {
+        Some(keyspace_name) => (!keyspace_name.is_empty() && !keyspace_name.contains('/')).then(
+            || ResourceRef::Keyspace {
+                keyspace_name: keyspace_name.to_string(),
+            },
+        ),
+        None => {
+            let (keyspace_name, table_name) = rest.split_once("/table/")?;
+            (!keyspace_name.is_empty()
+                && !keyspace_name.contains('/')
+                && !table_name.is_empty()
+                && !table_name.contains('/'))
+            .then(|| ResourceRef::Table {
+                keyspace_name: keyspace_name.to_string(),
+                table_name: table_name.to_string(),
+            })
+        }
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an ARN that names no stored resource.
+///
+/// The ARN the caller supplied goes in the modelled `resourceArn` member, which is what a
+/// client reads to learn WHICH resource was missing.
+pub fn arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Resource '{resource_arn}' was not found."
+        )),
+        resource_arn: Some(resource_arn.to_string()),
+    }
+}
+
 /// Per-service state for com-amazonaws-keyspaces-keyspacesservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKeyspacesKeyspacesserviceState {
@@ -130,8 +305,9 @@ pub struct Keyspace {
     pub replication_strategy: String,
     /// `replicationSpecification.regionList`.
     pub replication_regions: Vec<String>,
-    /// The tags `CreateKeyspace` attached.
-    pub tags: Vec<Tag>,
+    /// This keyspace's tags: what `CreateKeyspace` attached, plus what `TagResource`
+    /// added and `UntagResource` removed since.
+    pub tags: TagSet,
     /// The keyspace's tables, keyed by `tableName`.
     pub tables: BTreeMap<String, Table>,
 }
@@ -169,8 +345,9 @@ pub struct Table {
     pub comment: Option<Comment>,
     /// The supplied client-side-timestamps setting, if any.
     pub client_side_timestamps: Option<ClientSideTimestamps>,
-    /// The tags `CreateTable` attached.
-    pub tags: Vec<Tag>,
+    /// This table's tags: what `CreateTable` attached, plus what `TagResource` added and
+    /// `UntagResource` removed since.
+    pub tags: TagSet,
 }
 
 impl ComAmazonawsKeyspacesKeyspacesserviceState {
@@ -225,6 +402,50 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
             });
         }
         self.next_transition_at = earliest;
+    }
+
+    /// The tags of the resource `resource_arn` names, or `None` when it names no
+    /// resource this store holds.
+    ///
+    /// The ARN is the key, not the name it embeds: a stored resource answers only to the
+    /// ARN it was minted with ([`keyspace_arn`], [`table_arn`]), so an ARN for another
+    /// partition or another Region reaches nothing here even when a resource of that
+    /// name exists.
+    pub fn resource_tags(&self, resource_arn: &str) -> Option<&TagSet> {
+        match parse_resource_arn(resource_arn)? {
+            ResourceRef::Keyspace { keyspace_name } => {
+                let keyspace = self.keyspaces.get(&keyspace_name)?;
+                (keyspace.resource_arn == resource_arn).then_some(&keyspace.tags)
+            }
+            ResourceRef::Table {
+                keyspace_name,
+                table_name,
+            } => {
+                let table = self.keyspaces.get(&keyspace_name)?.tables.get(&table_name)?;
+                (table.resource_arn == resource_arn).then_some(&table.tags)
+            }
+        }
+    }
+
+    /// The same lookup, for a tagging operation that writes.
+    pub fn resource_tags_mut(&mut self, resource_arn: &str) -> Option<&mut TagSet> {
+        match parse_resource_arn(resource_arn)? {
+            ResourceRef::Keyspace { keyspace_name } => {
+                let keyspace = self.keyspaces.get_mut(&keyspace_name)?;
+                (keyspace.resource_arn == resource_arn).then_some(&mut keyspace.tags)
+            }
+            ResourceRef::Table {
+                keyspace_name,
+                table_name,
+            } => {
+                let table = self
+                    .keyspaces
+                    .get_mut(&keyspace_name)?
+                    .tables
+                    .get_mut(&table_name)?;
+                (table.resource_arn == resource_arn).then_some(&mut table.tags)
+            }
+        }
     }
 }
 

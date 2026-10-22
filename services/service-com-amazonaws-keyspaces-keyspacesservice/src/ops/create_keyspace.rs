@@ -181,6 +181,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                 })?;
 
+        // The per-resource tag rules hold wherever a caller supplies tags, so a create
+        // applies the same ones `TagResource` does: at most
+        // `MAX_TAGS_PER_RESOURCE` tags on the resource, no reserved key, one tag per key.
+        let tags = crate::state::new_tag_set(input.tags.as_deref()).map_err(|rejection| {
+            let message = Some(rejection.message());
+            match rejection.is_quota() {
+                true => CreateKeyspaceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException { message },
+                ),
+                false => {
+                    CreateKeyspaceErrorModeled::ValidationException(ValidationException { message })
+                }
+            }
+        })?;
+
         let mut store = state.lock();
         store.settle(::std::time::SystemTime::now());
 
@@ -221,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 resource_arn: resource_arn.clone(),
                 replication_strategy,
                 replication_regions,
-                tags: input.tags.unwrap_or_default(),
+                tags,
                 tables: ::std::collections::BTreeMap::new(),
             },
         );
