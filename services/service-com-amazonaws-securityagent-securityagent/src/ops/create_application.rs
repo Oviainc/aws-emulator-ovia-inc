@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a new application: mints the application's identity, stores a record
+//! carrying every supplied input, and answers with the new `applicationId`.
 //!
 //! ## Shape of an operation
 //!
@@ -81,9 +75,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 // here — hence the `CreateApplicationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#CreateApplication")]
+//
+// `CreateApplication` lists no errors of its own, so the two service-wide shapes this
+// handler needs are widened in with `extra_errors`: `ServiceQuotaExceededException`
+// (HTTP 402, "The request exceeds a service quota") and `InternalServerException`
+// (HTTP 500).
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#CreateApplication",
+    extra_errors = ["InternalServerException", "ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateApplicationErrorModeled {
+    InternalServerException(InternalServerException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -137,18 +141,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApplicationErrorModeled::InternalServerException(InternalServerException {
+                message: "the application store is unavailable".to_string(),
+            })
+        })?;
+        // The region the derived domain names comes from the request's own credential
+        // scope, so it is read before the store is locked.
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        // Every application is a stored record, so the number of them a caller can
+        // create is bounded, as it is on the real service: past the quota this
+        // operation answers the service's own `ServiceQuotaExceededException` (HTTP 402)
+        // instead of growing the store without end.
+        if state.applications.len() >= crate::state::MAX_APPLICATIONS {
+            return Err(CreateApplicationErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the maximum number of applications ({}) for this account",
+                        crate::state::MAX_APPLICATIONS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A fresh identity per call: the id, the name and the domain are the service's
+        // to choose, so two calls are two distinct records whatever the inputs were.
+        let identity = state.mint_application_identity(&region);
+        // IAM Identity Center is configured only when the caller named an instance to
+        // associate; the application ARN inside it is the one this emulator minted.
+        let idc_configuration =
+            input
+                .idc_instance_arn
+                .as_deref()
+                .map(|instance_arn| crate::state::IdcConfig {
+                    idc_application_arn: Some(crate::state::idc_application_arn(
+                        instance_arn,
+                        identity.sequence,
+                    )),
+                    idc_instance_arn: Some(instance_arn.to_string()),
+                });
+        let application = crate::state::Application {
+            application_id: identity.application_id.clone(),
+            application_name: identity.application_name,
+            domain: identity.domain,
+            role_arn: input.role_arn,
+            default_kms_key_id: input.default_kms_key_id,
+            idc_configuration,
+            // Persisted at create time so the tagging operations have state to read.
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: ::std::time::SystemTime::now(),
+        };
+        state
+            .applications
+            .insert(identity.application_id.clone(), application);
+
+        Ok(CreateApplicationOutput {
+            application_id: identity.application_id,
+        })
     }
 }
