@@ -213,9 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             container_provider: input.container_provider,
             created_at_millis: crate::state::now_millis(),
             tags: input.tags.unwrap_or_default(),
-            // Not resolved against a security-configuration store: this service holds
-            // none yet (`CreateSecurityConfiguration` is still a stub), so the id is
-            // persisted as submitted and `DescribeVirtualCluster` reads it back.
+            // Persisted as submitted, and read back by `DescribeVirtualCluster`. Whether
+            // a virtual-cluster create resolves this reference against the
+            // security-configuration store is `CreateVirtualCluster`'s own question, not
+            // part of minting a security configuration.
             security_configuration_id: input.security_configuration_id,
             session_enabled: input.session_enabled,
             scheduler_configuration: input.scheduler_configuration,

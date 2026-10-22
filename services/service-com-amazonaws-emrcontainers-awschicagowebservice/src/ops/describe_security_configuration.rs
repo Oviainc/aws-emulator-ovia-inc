@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSecurityConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSecurityConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSecurityConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one security configuration back out of [`crate::state`]: the record
+//! `CreateSecurityConfiguration` persisted, reported as the modelled
+//! `SecurityConfiguration`. An id the store does not hold is refused with the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +138,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSecurityConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSecurityConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSecurityConfiguration"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeSecurityConfigurationError::Modeled(
+                DescribeSecurityConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the security configuration store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+        let mut state = store.lock();
+        // Reporting only. `settle` writes nothing of its own: it materialises the status
+        // transitions the clock already owed OTHER resources, which were due at this
+        // instant whether or not anybody looked. A security configuration has no status,
+        // so this call never changes one.
+        state.settle();
+
+        let Some(view) = state.security_configuration_view(&input.id) else {
+            return Err(
+                DescribeSecurityConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Security configuration {} was not found",
+                            input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeSecurityConfigurationOutput {
+            security_configuration: Some(view),
+        })
     }
 }

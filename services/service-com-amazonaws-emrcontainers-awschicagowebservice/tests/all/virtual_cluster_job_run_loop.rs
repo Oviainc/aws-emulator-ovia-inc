@@ -37,19 +37,23 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below signs for. Deliberately not the emulator's default,
 /// so an ARN that carried a hardcoded region instead of the caller's would fail.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// What one call answered.
-struct Answer {
-    status: u16,
+///
+/// `pub(crate)` because this suite's HTTP harness is the one the other suites in this
+/// test binary drive the service through too (`tests/all.rs` compiles them all into one
+/// crate), so there is a single request path under test rather than one copy per suite.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The error shape restJson1 names in `x-amzn-errortype`.
-    error_code: Option<String>,
-    body: Value,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The body of a call that must have succeeded.
-    fn ok(&self, case: &str) -> &Value {
+    pub(crate) fn ok(&self, case: &str) -> &Value {
         assert_eq!(
             self.status, 200,
             "case {case:?}: expected HTTP 200, got {} with body {}",
@@ -59,7 +63,7 @@ impl Answer {
     }
 
     /// Assert this call was refused with `code` at `status`.
-    fn refused(&self, case: &str, status: u16, code: &str) {
+    pub(crate) fn refused(&self, case: &str, status: u16, code: &str) {
         assert_eq!(
             self.status, status,
             "case {case:?}: expected HTTP {status}, got {} with body {}",
@@ -76,12 +80,12 @@ impl Answer {
 }
 
 /// The emulator under test.
-struct Emr {
+pub(crate) struct Emr {
     router: MultiServiceRouter,
 }
 
 impl Emr {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // This suite signs nothing, so pin authentication off rather than inheriting the
@@ -91,7 +95,7 @@ impl Emr {
         Self { router }
     }
 
-    async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
         let payload = match &body {
             Some(value) => serde_json::to_vec(value).expect("a JSON request body serializes"),
             None => Vec::new(),
@@ -179,7 +183,7 @@ impl Emr {
     }
 
     /// Create one plain virtual cluster and return its id.
-    async fn cluster(&self, name: &str, token: &str) -> String {
+    pub(crate) async fn cluster(&self, name: &str, token: &str) -> String {
         let answer = self
             .create_cluster(json!({
                 "name": name,
@@ -198,13 +202,13 @@ fn wait_for_the_clock() {
     std::thread::sleep(state::TRANSITION_SPAN + Duration::from_millis(250));
 }
 
-fn field<'a>(value: &'a Value, pointer: &str, case: &str) -> &'a Value {
+pub(crate) fn field<'a>(value: &'a Value, pointer: &str, case: &str) -> &'a Value {
     value
         .pointer(pointer)
         .unwrap_or_else(|| panic!("case {case:?}: response carries no {pointer}: {value}"))
 }
 
-fn text(value: &Value, pointer: &str, case: &str) -> String {
+pub(crate) fn text(value: &Value, pointer: &str, case: &str) -> String {
     field(value, pointer, case)
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: {pointer} is not a string: {value}"))
@@ -212,7 +216,7 @@ fn text(value: &Value, pointer: &str, case: &str) -> String {
 }
 
 /// A `ResourceIdString` is `^[0-9a-z]+$`, length 1..64 (the model, via `OPERATIONS.md`).
-fn assert_resource_id(case: &str, what: &str, id: &str) {
+pub(crate) fn assert_resource_id(case: &str, what: &str, id: &str) {
     let shaped = !id.is_empty()
         && id.len() <= 64
         && id
@@ -229,7 +233,7 @@ fn assert_resource_id(case: &str, what: &str, id: &str) {
 /// restJson1 carries a timestamp either as an ISO-8601 string or as epoch seconds,
 /// depending on the member's `@timestampFormat`; this accepts whichever the wire used, so
 /// the assertion is about the INSTANT and not about the framework's rendering of it.
-fn instant_millis(value: &Value, pointer: &str, case: &str) -> i64 {
+pub(crate) fn instant_millis(value: &Value, pointer: &str, case: &str) -> i64 {
     let found = field(value, pointer, case);
     if let Some(rendered) = found.as_str() {
         let parsed = DateTime::from_str(rendered, Format::DateTime).unwrap_or_else(|error| {

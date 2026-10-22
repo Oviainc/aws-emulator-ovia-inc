@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSecurityConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSecurityConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSecurityConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a security configuration and persists it in [`crate::state`]: a fresh
+//! `ResourceIdString` id, the `SecurityConfigurationArn` built from it, `createdAt = now`
+//! and the `securityConfigurationData`, `containerProvider` and `tags` the request
+//! carried. A replayed `clientToken` (`@idempotencyToken`) returns the configuration the
+//! first call minted, not a second one. `DescribeSecurityConfiguration` reads the record
+//! back.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +150,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSecurityConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSecurityConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSecurityConfiguration"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSecurityConfigurationError::Modeled(
+                CreateSecurityConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the security configuration store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx);
+        let mut state = store.lock();
+        state.settle();
+
+        // `clientToken` is `@idempotencyToken`: the same token replayed names the
+        // configuration the first call minted, so a retried create never doubles the
+        // resource.
+        let replayed = state
+            .replayed_idempotency(
+                crate::state::CREATE_SECURITY_CONFIGURATION_SCOPE,
+                &input.client_token,
+            )
+            .cloned();
+        if let Some(existing) = replayed.and_then(|id| state.security_configurations.get(&id)) {
+            return Ok(CreateSecurityConfigurationOutput {
+                id: Some(existing.id.clone()),
+                name: Some(existing.name.clone()),
+                arn: Some(existing.arn.clone()),
+            });
+        }
+
+        // The store is capped, and a security configuration has no retired form to
+        // reclaim, so at the cap the create is refused instead of growing the store
+        // without bound.
+        if !state.can_add_security_configuration() {
+            return Err(CreateSecurityConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "This emulator retains at most {} security configurations; delete one and retry",
+                        crate::state::MAX_SECURITY_CONFIGURATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_id();
+        let arn = crate::state::security_configuration_arn(&region, &id);
+        // A security configuration is a template: EMR on EKS models no status for it, so
+        // it is usable as soon as it is created and owes the clock no later transition.
+        let record = crate::state::SecurityConfigurationRecord {
+            id: id.clone(),
+            name: input.name.clone(),
+            arn: arn.clone(),
+            created_at_millis: crate::state::now_millis(),
+            security_configuration_data: input.security_configuration_data,
+            container_provider: input.container_provider,
+            tags: input.tags.unwrap_or_default(),
+            client_token: input.client_token.clone(),
+        };
+        state.insert_security_configuration(record);
+
+        Ok(CreateSecurityConfigurationOutput {
+            id: Some(id),
+            name: Some(input.name),
+            arn: Some(arn),
+        })
     }
 }

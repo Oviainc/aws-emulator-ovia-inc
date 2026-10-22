@@ -2,7 +2,8 @@
 
 //! Engine state for the com-amazonaws-emrcontainers-awschicagowebservice service.
 //!
-//! This holds the virtual-cluster / job-run core loop of EMR on EKS. Every field a
+//! This holds the virtual-cluster / job-run core loop of EMR on EKS, plus the
+//! security-configuration templates a virtual cluster can reference. Every field a
 //! describe or a list answers with is read back out of one of these records: nothing
 //! is echoed from the request that asked for it, and nothing is canned.
 //!
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     ConfigurationOverrides, ContainerProvider, JobDriver, JobRun, RetryPolicyConfiguration,
-    SchedulerConfiguration, VirtualCluster,
+    SchedulerConfiguration, SecurityConfiguration, SecurityConfigurationData, VirtualCluster,
 };
 
 /// The ARN namespace this service's ARNs carry (`OPERATIONS.md`: ARN namespace
@@ -95,11 +96,25 @@ pub const MAX_VIRTUAL_CLUSTERS: usize = 200;
 /// `StartJobRun` is refused once every slot holds a run that has not finished.
 pub const MAX_JOB_RUNS: usize = 2_000;
 
+/// The most security configurations this emulator keeps at once.
+///
+/// Not an AWS quota: the emulator's own retention cap, so the store cannot grow with the
+/// number of requests served. A security configuration has no status and so no retired
+/// form to reclaim — the only way one leaves the store is a caller deleting it — so once
+/// every slot is taken `CreateSecurityConfiguration` is refused rather than allocating
+/// further. Sized well above any plausible test or demo workload.
+pub const MAX_SECURITY_CONFIGURATIONS: usize = 200;
+
 /// The idempotency scope `CreateVirtualCluster` remembers a `clientToken` under.
 ///
 /// A token is scoped to the operation that minted the resource, so the same token on
 /// another operation is a different request.
 pub const CREATE_VIRTUAL_CLUSTER_SCOPE: &str = "CreateVirtualCluster";
+
+/// The idempotency scope `CreateSecurityConfiguration` remembers a `clientToken` under,
+/// on the same terms as [`CREATE_VIRTUAL_CLUSTER_SCOPE`]: the same token replayed names
+/// the security configuration the first call minted.
+pub const CREATE_SECURITY_CONFIGURATION_SCOPE: &str = "CreateSecurityConfiguration";
 
 /// The idempotency scope `StartJobRun` remembers a `clientToken` under: scoped to the
 /// virtual cluster as well as the operation, because the token identifies one submission
@@ -143,6 +158,16 @@ pub fn job_run_arn(region: &str, virtual_cluster_id: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("/virtualclusters/{virtual_cluster_id}/jobruns/{id}"),
+    )
+}
+
+/// `arn:aws:emr-containers:{region}:{account}:/securityconfigurations/{id}` — the
+/// `SecurityConfigurationArn` shape's pattern.
+pub fn security_configuration_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("/securityconfigurations/{id}"),
     )
 }
 
@@ -302,6 +327,44 @@ impl JobRunRecord {
     }
 }
 
+/// One security configuration, as `CreateSecurityConfiguration` persisted it.
+///
+/// It carries no state member: EMR on EKS models a security configuration as a template,
+/// with no lifecycle status, so there is no transition for the clock to owe one.
+#[derive(Debug, Clone)]
+pub struct SecurityConfigurationRecord {
+    pub id: String,
+    pub name: String,
+    pub arn: String,
+    pub created_at_millis: i64,
+    pub security_configuration_data: SecurityConfigurationData,
+    pub container_provider: Option<ContainerProvider>,
+    pub tags: HashMap<String, String>,
+    pub client_token: String,
+}
+
+impl SecurityConfigurationRecord {
+    /// The modelled `SecurityConfiguration` this record represents.
+    ///
+    /// `createdBy` stays absent: no identity created this configuration in the emulator,
+    /// so reporting one would be fabricating a principal.
+    ///
+    /// `containerProvider` is stored (the create accepts it) but is NOT a member of the
+    /// `SecurityConfiguration` shape, so nothing reports it: see the shape's members in
+    /// `ops::types::shared_types`.
+    pub fn to_security_configuration(&self) -> SecurityConfiguration {
+        SecurityConfiguration {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            created_at: Some(date_time(self.created_at_millis)),
+            created_by: None,
+            security_configuration_data: Some(self.security_configuration_data.clone()),
+            tags: Some(self.tags.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-emrcontainers-awschicagowebservice. A handler reaches it through [`service_state`].
 ///
 /// # Bounding the store
@@ -320,6 +383,8 @@ pub struct ComAmazonawsEmrcontainersAwschicagowebserviceState {
     pub virtual_clusters: HashMap<String, VirtualClusterRecord>,
     /// Job runs by `id`.
     pub job_runs: HashMap<String, JobRunRecord>,
+    /// Security configurations by `id`, capped at [`MAX_SECURITY_CONFIGURATIONS`].
+    pub security_configurations: HashMap<String, SecurityConfigurationRecord>,
     /// Job-run ids per virtual cluster, in creation order.
     pub job_runs_by_cluster: HashMap<String, Vec<String>>,
     /// `(idempotency scope, clientToken) -> minted resource id`, so a replayed
@@ -550,6 +615,39 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             .into_iter()
             .flatten()
             .filter_map(|id| self.job_runs.get(id))
+    }
+
+    /// Whether there is room for one more security configuration.
+    ///
+    /// A security configuration has no retired form to reclaim (it has no status, and only
+    /// a delete removes one), so at the cap the create is refused instead of growing the
+    /// store without bound.
+    pub fn can_add_security_configuration(&self) -> bool {
+        self.security_configurations.len() < MAX_SECURITY_CONFIGURATIONS
+    }
+
+    /// Store a freshly minted security configuration together with the idempotency entry
+    /// its `clientToken` earns, so a record can never be stored without it. A delete that
+    /// removes the record removes that entry with it.
+    pub fn insert_security_configuration(&mut self, record: SecurityConfigurationRecord) {
+        self.idempotency.insert(
+            (
+                CREATE_SECURITY_CONFIGURATION_SCOPE.to_string(),
+                record.client_token.clone(),
+            ),
+            record.id.clone(),
+        );
+        self.security_configurations
+            .insert(record.id.clone(), record);
+    }
+
+    /// The modelled `SecurityConfiguration` for this id.
+    pub fn security_configuration_view(&self, id: &str) -> Option<SecurityConfiguration> {
+        Some(
+            self.security_configurations
+                .get(id)?
+                .to_security_configuration(),
+        )
     }
 
     /// The resource id `(scope, client_token)` already minted, if this token is a replay.
