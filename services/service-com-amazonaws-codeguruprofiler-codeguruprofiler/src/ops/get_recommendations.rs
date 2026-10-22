@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the analysis of the profiling group's retained agent profiles over the
+//! requested `[startTime, endTime]` window.
+//!
+//! What this handler computes, and from what:
+//!
+//! * the window must be a window — `startTime` strictly before `endTime` — and `locale`,
+//!   when given, must be one of the BCP 47 codes the model's `Locale` shape lists; neither
+//!   rule is expressible in the model, so both are refused here with the operation's own
+//!   modelled `ValidationException` (HTTP 400);
+//! * the group must exist, or the operation answers its modelled
+//!   `ResourceNotFoundException` (HTTP 404);
+//! * `profilingGroupName` comes from the STORED group record, and
+//!   `profileStartTime`/`profileEndTime` from the receipt times of the agent profiles that
+//!   group retains inside the requested window — the profiles the analysis is about. A
+//!   window the group retains no profile in covers nothing, so the requested bounds are
+//!   reported back as the (empty) analysed span.
+//!
+//! `recommendations` and `anomalies` are reported EMPTY. This emulator stores an agent
+//! profile as the opaque payload `PostAgentProfile` uploaded (`GetProfile` hands the same
+//! bytes back byte-identical) and runs no anti-pattern matcher or anomaly detector over
+//! it: nothing here parses a profile, so there is no match and no anomaly to report.
+//! Inventing `Recommendation`/`Anomaly` entries would be output synthesised to look
+//! computed, so the modelled lists are present and empty — the honest answer for an
+//! analysis that found nothing. When this service grows a real analysis it will persist
+//! its findings against the group, and this handler will report those.
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +115,23 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The BCP 47 language codes this operation offers, from the model's own `Locale` shape
+/// doc: "BCP47 language code. Supported locales: de-DE, en-GB, en-US, es-ES, fr-FR,
+/// it-IT, ja-JP, ko-KR, pt-BR, zh-CN, zh-TW" — the same list the operation's `locale`
+/// member documents. A code outside it is refused rather than silently ignored.
+const SUPPORTED_LOCALES: &[&str] = &[
+    "de-DE", "en-GB", "en-US", "es-ES", "fr-FR", "it-IT", "ja-JP", "ko-KR", "pt-BR",
+    "zh-CN", "zh-TW",
+];
+
+/// One timestamp in the ISO 8601 form this operation's docs use, for a refusal message
+/// the caller can act on. Falls back to epoch seconds if the instant cannot be rendered,
+/// so a refusal is never lost to a formatting failure.
+fn iso8601(at: ::aws_smithy_types::DateTime) -> String {
+    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| format!("{} (epoch seconds)", at.as_secs_f64()))
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +203,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecommendations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetRecommendationsErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        // Both bounds are modelled required, so a request always names a range; what the
+        // model cannot express is that the range must be a window at all. An analysis of
+        // `[start, end]` with `start` at or after `end` spans no instant, so it is
+        // refused rather than answered with an analysis of nothing. The two instants are
+        // compared exactly (whole seconds plus sub-second nanoseconds), so a window
+        // narrower than a microsecond is still ordered correctly. The wording is the
+        // service's own for this refusal — "Interval start time (<startTime>) must be
+        // before end time (<endTime>)" — built from the request's own bounds.
+        if crate::state::instant_key(input.start_time) >= crate::state::instant_key(input.end_time)
+        {
+            return Err(GetRecommendationsErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Interval start time ({}) must be before end time ({})",
+                        iso8601(input.start_time),
+                        iso8601(input.end_time)
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `locale` selects the language the analysis is phrased in. BCP 47 tags are
+        // case-insensitive, so the comparison is too; a tag this service does not offer
+        // is refused, naming the ones it does.
+        if let Some(locale) = input.locale.as_deref() {
+            if !SUPPORTED_LOCALES
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(locale))
+            {
+                return Err(GetRecommendationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "locale {locale} is not supported: specify one of {}",
+                            SUPPORTED_LOCALES.join(", ")
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let guard = state.lock();
+        let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
+            GetRecommendationsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("no profiling group named {}", input.profiling_group_name),
+            })
+        })?;
+
+        // The span the analysed profiles cover: the earliest and latest receipt times the
+        // group retains inside the requested window. A window holding no profile covers
+        // nothing, so the requested bounds stand as the empty analysed span.
+        let (profile_start_time, profile_end_time) = group
+            .profile_span_in(input.start_time, input.end_time)
+            .unwrap_or((input.start_time, input.end_time));
+
+        Ok(GetRecommendationsOutput {
+            // From the stored record, not from the request that asked for it.
+            profiling_group_name: group.name.clone(),
+            profile_start_time,
+            profile_end_time,
+            // No anti-pattern matcher and no anomaly detector run over the stored agent
+            // profiles (see this module's header), so the analysis reports no findings
+            // rather than invented ones.
+            recommendations: Vec::new(),
+            anomalies: Vec::new(),
+        })
     }
 }

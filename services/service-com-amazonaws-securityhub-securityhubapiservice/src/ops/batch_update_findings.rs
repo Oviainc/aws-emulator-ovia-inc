@@ -7,6 +7,12 @@
 //! finding, or that the same request already named, is reported in
 //! `UnprocessedFindings` and is NOT reported as processed.
 //!
+//! A finding this operation updates is then run past the hub's `ENABLED` automation
+//! rules: Security Hub CSPM "starts applying the rule to findings and finding
+//! updates after the rule is created" (`CreateAutomationRule$RuleStatus`), so an
+//! update that brings a finding inside a rule's `Criteria` is acted on exactly as an
+//! import of the same values would be.
+//!
 //! Each finding this call changes also gets a `BATCH_UPDATE_FINDINGS` change event
 //! appended to its history, listing the ASFF fields the write changed, which is what
 //! `GetFindingHistory` reports.
@@ -227,6 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // was made, so every note it writes carries the same timestamp, and so does
         // every finding-history event the call appends.
         let note_updated_at = crate::state::now_iso8601();
+        let now_nanos = crate::state::now_nanos();
+        // The rules that act on this call, read once and in application order, so
+        // every finding it updates is evaluated against the same rule set.
+        let rules = store.enabled_rules_in_order(&(account_id.clone(), region.clone()));
         // "the ARN ... of a customer that calls BatchUpdateFindings"
         // (`FindingHistoryUpdateSource$Identity`).
         let caller = crate::state::caller_arn();
@@ -320,6 +330,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(related_findings) = input.related_findings.as_ref() {
                 finding.related_findings = Some(related_findings.clone());
             }
+            // The automation rules see the finding as the caller's update left it,
+            // which is what makes a rule act on an update that brings a finding
+            // inside its criteria.
+            crate::state::apply_automation_rules(&rules, finding, &note_updated_at, now_nanos);
             stored.updated_seq = seq;
             let updates = crate::state::finding_changes(&before, &stored.finding);
             // An update that leaves every ASFF field as it was changed nothing, so

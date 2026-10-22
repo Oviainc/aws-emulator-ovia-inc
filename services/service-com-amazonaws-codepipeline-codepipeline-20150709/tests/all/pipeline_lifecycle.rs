@@ -30,8 +30,12 @@ const ACCOUNT_ID: &str = "000000000000";
 
 /// One emulator: the shared engine, the service mounted on it, and the router that
 /// dispatches to it — exactly how `core/router` assembles the production emulator.
+///
+/// `pub(crate)` because the other suites in this test target drive the service
+/// through this same harness rather than building a second one.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -40,14 +44,29 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_codepipeline_codepipeline_20150709::EmulatedService::new(engine),
+            service_com_amazonaws_codepipeline_codepipeline_20150709::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// The one shared engine this emulator's service reads and writes, for a case
+    /// that has to put a resource in the store the handler reads without making the
+    /// calls that would create it (filling a quota, say). Every assertion still goes
+    /// through the router.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Call `operation` with `body`, signed for `region` so the handler reads the
     /// region off the SigV4 credential scope the way a real SDK request carries it.
-    async fn call_in(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_in(
+        &self,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/codepipeline/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=0123456789abcdef"
@@ -56,7 +75,7 @@ impl Emulator {
     }
 
     /// Call `operation` in the default region.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.call_in("us-east-1", operation, body).await
     }
 

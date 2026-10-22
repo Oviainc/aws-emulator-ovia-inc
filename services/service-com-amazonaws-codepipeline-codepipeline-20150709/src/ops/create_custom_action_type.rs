@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomActionType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomActionType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomActionType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a custom action type under its `(category, Custom, provider, version)`
+//! `ActionTypeId` in this account's action-type store, and answers with the stored
+//! action type — so a later `ListActionTypes` reports the same settings,
+//! configuration properties and artifact bounds.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomActionType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomActionTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomActionType"))
+        let state = crate::state::require_state(&*self.engine)?;
+
+        let configuration_properties = input.configuration_properties.unwrap_or_default();
+        // Rules the model documents for a configuration-property list but cannot
+        // state as a constraint; refused as the client error the operation models.
+        if let Err(message) =
+            crate::state::validate_configuration_properties(&configuration_properties)
+        {
+            return Err(CreateCustomActionTypeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let tags = input.tags.unwrap_or_default();
+        // A tag set no resource can carry, each defect reported as the error shape
+        // the model declares for it.
+        if let Err(problem) = crate::state::validate_tags(&tags) {
+            let message = Some(problem.message().to_string());
+            return Err(match problem {
+                crate::state::TagProblem::TooMany(_) => {
+                    CreateCustomActionTypeErrorModeled::TooManyTagsException(
+                        TooManyTagsException { message },
+                    )
+                }
+                crate::state::TagProblem::Invalid(_) => {
+                    CreateCustomActionTypeErrorModeled::InvalidTagsException(
+                        InvalidTagsException { message },
+                    )
+                }
+            }
+            .into());
+        }
+
+        let action_type_key = crate::state::ActionTypeKey {
+            category: input.category,
+            // Always `Custom`: this is an action type the account itself created.
+            owner: crate::state::ACTION_OWNER_CUSTOM.to_string(),
+            provider: input.provider,
+            version: input.version,
+        };
+        let record = crate::state::ActionTypeRecord {
+            settings: input.settings,
+            configuration_properties,
+            input_artifact_details: input.input_artifact_details,
+            output_artifact_details: input.output_artifact_details,
+            // A registration belongs to the Region its request was signed for, which
+            // is the Region `ListActionTypes$regionFilter` then selects it by.
+            region: Some(crate::state::request_region(&ctx.parts().headers)),
+            tags,
+        };
+        // Both answered members are rendered from the record about to be stored, so
+        // the answer reports the stored resource rather than the request.
+        let stored = record.to_action_type(&action_type_key);
+        // Tags are reported only when the caller applied some: an absent member and
+        // an empty list state the same fact, and AWS omits the member.
+        let stored_tags = (!record.tags.is_empty()).then(|| record.tags.clone());
+
+        {
+            // `register_action_type` is the one way into the store, and it is what
+            // enforces the account's action-type bound: it answers `false` when the
+            // account already holds `MAX_ACTION_TYPES_PER_ACCOUNT` action types and
+            // this id is not one of them — exactly the condition the only limit
+            // error this operation models states. Registering an id the account
+            // already holds REPLACES it and is always accepted: this operation
+            // models no "already exists" error, so a repeat is the same request
+            // stated twice rather than a conflict.
+            let accepted = state.lock().register_action_type(action_type_key, record);
+            if !accepted {
+                return Err(CreateCustomActionTypeErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "the number of custom action types for this account has reached \
+                             the limit of {}",
+                            crate::state::MAX_ACTION_TYPES_PER_ACCOUNT
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        Ok(CreateCustomActionTypeOutput {
+            action_type: stored,
+            tags: stored_tags,
+        })
     }
 }

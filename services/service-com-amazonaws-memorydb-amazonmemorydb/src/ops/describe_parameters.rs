@@ -161,27 +161,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
-        if input.max_results.is_some_and(|max| max < 1) {
-            // A page size below 1 names no page: refused with this operation's own
-            // modelled invalid-value error rather than served as an empty page.
+        if let Some(message) = crate::state::max_results_rejection(input.max_results) {
+            // A page size outside the window names no page: refused with this
+            // operation's own modelled invalid-value error, through the one rule every
+            // listing in this service reads the page-size window with.
             return Err(DescribeParametersErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
-                    message: Some("MaxResults must be at least 1.".to_string()),
+                    message: Some(message),
                 },
             )
             .into());
         }
+        // A parameter-group name is a case-insensitive identifier, so the name this
+        // request asks about is folded exactly as the store is keyed.
+        let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
         let mut state = state.lock();
         // The only write a describe makes: the status transitions the clock already
         // owed the stored clusters and ACLs at this instant.
         state.settle(std::time::Instant::now());
 
-        let Some(group) = state.parameter_groups.get(&input.parameter_group_name) else {
+        let Some(group) = state.parameter_groups.get(&parameter_group_name) else {
             return Err(DescribeParametersErrorModeled::ParameterGroupNotFoundFault(
                 ParameterGroupNotFoundFault {
                     message: Some(format!(
-                        "Parameter group {} not found.",
-                        input.parameter_group_name
+                        "Parameter group {parameter_group_name} not found."
                     )),
                 },
             )

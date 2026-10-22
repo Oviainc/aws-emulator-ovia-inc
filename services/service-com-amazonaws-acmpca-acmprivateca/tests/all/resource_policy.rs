@@ -61,15 +61,24 @@ fn request(operation: &str, arn: &str, policy: &str) -> Value {
     }
 }
 
-/// Policy documents spanning what the member accepts.
+/// Policy documents spanning what the member accepts, for the CA `ca_arn`: the case, the
+/// document as it is SUBMITTED and the document as the CA then DISPLAYS it.
 ///
 /// `PutPolicyRequest$Policy` is an `AWSPolicy`: "len 1..81920, pattern
 /// `^[\u{0009}\u{000A}\u{000D}\u{0020}-\u{00FF}]+$`"
 /// (`smithy_query(query="operation",operation="PutPolicy")`), i.e. JSON text of any size
 /// in that range over that character class — so the rows differ in statement count, in
 /// form (one statement object versus a list), in whitespace, in non-ASCII content up to
-/// the pattern's last code point (U+00FF) and in size, not in the CA they go to.
-fn policy_documents() -> Vec<(&'static str, String)> {
+/// the pattern's last code point (U+00FF) and in size.
+///
+/// Every row is a policy OF `ca_arn`: a statement of a CA's resource policy names that CA
+/// as its `Resource`, and the recorded refusal of a statement that names anything else
+/// ("InvalidPolicy: The supplied policy contains different resource or incorrect ARN
+/// format: <the CA>", replayed by
+/// `issues/.../20261022T185258Z-acm-pca-policy-documents-are-never-reported-listpermissions.md`)
+/// is what says so. A document a CA displays is the one submitted with the whitespace
+/// between its tokens dropped, which is why the pretty-printed row's two columns differ.
+fn policy_documents(ca_arn: &str) -> Vec<(&'static str, String, String)> {
     let one_statement = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -77,7 +86,7 @@ fn policy_documents() -> Vec<(&'static str, String)> {
             "Effect": "Allow",
             "Principal": {"AWS": "123456789012"},
             "Action": ["acm-pca:IssueCertificate", "acm-pca:GetCertificate"],
-            "Resource": "*"
+            "Resource": ca_arn
         }]
     });
     let statement_object = json!({
@@ -86,18 +95,18 @@ fn policy_documents() -> Vec<(&'static str, String)> {
             "Effect": "Allow",
             "Principal": {"AWS": "*"},
             "Action": "acm-pca:DescribeCertificateAuthority",
-            "Resource": "*"
+            "Resource": ca_arn
         }
     });
     let three_statements = json!({
         "Version": "2012-10-17",
         "Statement": [
             {"Effect": "Allow", "Principal": {"AWS": "111111111111"},
-             "Action": "acm-pca:IssueCertificate", "Resource": "*"},
+             "Action": "acm-pca:IssueCertificate", "Resource": ca_arn},
             {"Effect": "Allow", "Principal": {"AWS": "222222222222"},
-             "Action": "acm-pca:GetCertificate", "Resource": "*"},
+             "Action": "acm-pca:GetCertificate", "Resource": ca_arn},
             {"Effect": "Deny", "Principal": "*",
-             "Action": "acm-pca:DeletePolicy", "Resource": "*"}
+             "Action": "acm-pca:DeletePolicy", "Resource": ca_arn}
         ]
     });
     // U+00E9 and U+00FF are inside the pattern's `\u0020-\u00FF` range, so a document
@@ -109,7 +118,7 @@ fn policy_documents() -> Vec<(&'static str, String)> {
             "Effect": "Allow",
             "Principal": {"AWS": "333333333333"},
             "Action": "acm-pca:IssueCertificate",
-            "Resource": "*"
+            "Resource": ca_arn
         }]
     });
     // Well inside the 81920-character ceiling, and far past anything a hand-written
@@ -121,28 +130,57 @@ fn policy_documents() -> Vec<(&'static str, String)> {
             "Effect": "Allow",
             "Principal": {"AWS": "444444444444"},
             "Action": "acm-pca:IssueCertificate",
-            "Resource": "*"
+            "Resource": ca_arn
         }]
     });
+    let pretty_statement = json!({"Effect": "Allow", "Principal": {"AWS": "555555555555"},
+                                  "Action": "acm-pca:IssueCertificate", "Resource": ca_arn});
 
     vec![
-        ("one statement", one_statement.to_string()),
-        ("statement as an object", statement_object.to_string()),
-        ("three statements", three_statements.to_string()),
+        (
+            "one statement",
+            one_statement.to_string(),
+            one_statement.to_string(),
+        ),
+        (
+            "statement as an object",
+            statement_object.to_string(),
+            statement_object.to_string(),
+        ),
+        (
+            "three statements",
+            three_statements.to_string(),
+            three_statements.to_string(),
+        ),
         (
             "pretty printed with newlines and tabs",
             format!(
-                "{{\n\t\"Version\": \"2012-10-17\",\n\t\"Statement\": [\n\t\t{}\n\t]\n}}\r\n",
-                json!({"Effect": "Allow", "Principal": {"AWS": "555555555555"},
-                       "Action": "acm-pca:IssueCertificate", "Resource": "*"})
+                "{{\n\t\"Version\": \"2012-10-17\",\n\t\"Statement\": [\n\t\t{pretty_statement}\n\t]\n}}\r\n"
             ),
+            // The members keep the order the document was written in; only the whitespace
+            // between the tokens goes.
+            format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{pretty_statement}]}}"),
         ),
-        ("non-ASCII statement id", non_ascii.to_string()),
+        (
+            "non-ASCII statement id",
+            non_ascii.to_string(),
+            non_ascii.to_string(),
+        ),
         (
             "60 KB statement id",
             serde_json::to_string(&large).expect("the document serializes"),
+            serde_json::to_string(&large).expect("the document serializes"),
         ),
     ]
+}
+
+/// The smallest policy of the CA `ca_arn`, for a case that only needs one.
+fn policy_for(ca_arn: &str) -> String {
+    json!({"Version": "2012-10-17",
+           "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
+                          "Action": "acm-pca:GetCertificate",
+                          "Resource": ca_arn}]})
+    .to_string()
 }
 
 /// Documents that are not resource-based policies: "If this policy does not contain all
@@ -236,7 +274,7 @@ async fn a_policy_round_trips_through_put_get_and_delete() {
     let emulator = Emulator::new();
     let (arn, _certificate) = active_ca(&emulator, "policy-round-trip").await;
 
-    for (case, document) in policy_documents() {
+    for (case, document, displayed) in policy_documents(&arn) {
         emulator
             .ok(case, "PutPolicy", &request("PutPolicy", &arn, &document))
             .await;
@@ -246,7 +284,7 @@ async fn a_policy_round_trips_through_put_get_and_delete() {
             .await;
         let returned = string(&read, "Policy", case);
         assert_eq!(
-            returned, document,
+            returned, displayed,
             "case {case:?}: expected GetPolicy to hand back the attached document, got \
              {returned:?}"
         );
@@ -337,11 +375,7 @@ async fn a_resolvable_ca_with_no_policy_resolves_no_policy() {
 
     // The same CA takes a policy, so the refusals above are about the policy and not
     // about the CA.
-    let document = json!({"Version": "2012-10-17",
-                          "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
-                                         "Action": "acm-pca:GetCertificate",
-                                         "Resource": "*"}]})
-    .to_string();
+    let document = policy_for(&arn);
     emulator
         .ok(case, "PutPolicy", &request("PutPolicy", &arn, &document))
         .await;
@@ -355,11 +389,9 @@ async fn an_arn_naming_no_ca_resolves_no_policy() {
     // A CA exists, so the refusal is about the ARN in the request and not about an empty
     // store.
     let (existing, _certificate) = active_ca(&emulator, "unknown-ca-neighbour").await;
-    let document = json!({"Version": "2012-10-17",
-                          "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
-                                         "Action": "acm-pca:GetCertificate",
-                                         "Resource": "*"}]})
-    .to_string();
+    // The CA is resolved before the document is judged, so the document the rows carry is
+    // beside the point: what they pin is the refusal about the CA.
+    let document = policy_for(&existing);
 
     // Both ARNs satisfy the modelled `Arn` pattern and name a certificate-authority of
     // this service that was never created: one in the CA's own account and region, one in
@@ -404,11 +436,9 @@ async fn an_arn_naming_no_ca_resolves_no_policy() {
 #[tokio::test]
 async fn an_arn_of_another_resource_is_an_arn_error() {
     let emulator = Emulator::new();
-    let document = json!({"Version": "2012-10-17",
-                          "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
-                                         "Action": "acm-pca:GetCertificate",
-                                         "Resource": "*"}]})
-    .to_string();
+    // The ARN is read before anything else, so the document the rows carry is beside the
+    // point: what they pin is the refusal about the ARN.
+    let document = policy_for("arn:aws:acm-pca:eu-west-1:000000000000:certificate-authority/x");
 
     // Each row matches the modelled pattern
     // `^arn:[\w+=/,.@-]+:acm-pca:[\w+=/,.@-]*:[0-9]*:[\w+=,.@-]+(/[\w+=,.@-]+)*$`, so the
@@ -460,11 +490,7 @@ async fn an_arn_of_another_resource_is_an_arn_error() {
 async fn put_policy_refuses_a_document_that_is_not_a_policy() {
     let emulator = Emulator::new();
     let (arn, _certificate) = active_ca(&emulator, "invalid-policy").await;
-    let attached = json!({"Version": "2012-10-17",
-                          "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
-                                         "Action": "acm-pca:GetCertificate",
-                                         "Resource": "*"}]})
-    .to_string();
+    let attached = policy_for(&arn);
     emulator
         .ok("attach", "PutPolicy", &request("PutPolicy", &arn, &attached))
         .await;
@@ -505,9 +531,16 @@ async fn a_policy_belongs_to_exactly_one_ca() {
     let (first, _first_certificate) = active_ca(&emulator, "policy-owner-one").await;
     let (second, _second_certificate) = active_ca(&emulator, "policy-owner-two").await;
 
-    let documents = policy_documents();
-    let (_, first_document) = documents.first().expect("a document").clone();
-    let (_, second_document) = documents.get(2).expect("another document").clone();
+    let documents = policy_documents(&first);
+    let (_, first_document, _) = documents.first().expect("a document").clone();
+    // The replacement is a policy of the FIRST CA too: a statement of a CA's policy names
+    // that CA.
+    let (_, first_replacement, first_replacement_displayed) =
+        documents.get(2).expect("another document").clone();
+    let (_, second_document, second_displayed) = policy_documents(&second)
+        .get(2)
+        .expect("another document")
+        .clone();
 
     emulator
         .ok(
@@ -540,7 +573,7 @@ async fn a_policy_belongs_to_exactly_one_ca() {
         .ok(
             "first replaced",
             "PutPolicy",
-            &request("PutPolicy", &first, &second_document),
+            &request("PutPolicy", &first, &first_replacement),
         )
         .await;
     let read = emulator
@@ -548,7 +581,7 @@ async fn a_policy_belongs_to_exactly_one_ca() {
         .await;
     let returned = string(&read, "Policy", "first replaced");
     assert_eq!(
-        returned, second_document,
+        returned, first_replacement_displayed,
         "case \"first replaced\": expected the newest document to replace the attached one, \
          got {returned:?}"
     );
@@ -566,7 +599,7 @@ async fn a_policy_belongs_to_exactly_one_ca() {
         .await;
     let survivor_document = string(&survivor, "Policy", "delete first");
     assert_eq!(
-        survivor_document, second_document,
+        survivor_document, second_displayed,
         "case \"delete first\": expected the other CA's policy to survive, got \
          {survivor_document:?}"
     );
@@ -580,11 +613,10 @@ async fn a_policy_belongs_to_exactly_one_ca() {
 #[tokio::test]
 async fn a_ca_without_its_certificate_keeps_no_policy() {
     let emulator = Emulator::new();
-    let document = json!({"Version": "2012-10-17",
-                          "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
-                                         "Action": "acm-pca:GetCertificate",
-                                         "Resource": "*"}]})
-    .to_string();
+    // The CA is resolved before the document is judged, so the rows below pin the refusal
+    // about the CA whatever the document names; the attach further down carries a policy
+    // of the CA it goes to.
+    let document = policy_for("arn:aws:acm-pca:eu-west-1:000000000000:certificate-authority/x");
 
     // A CA read straight after `CreateCertificateAuthority` is still CREATING; one read
     // after the transition the clock owes has come due is PENDING_CERTIFICATE. Neither
@@ -652,15 +684,16 @@ async fn a_ca_without_its_certificate_keeps_no_policy() {
     // CA sentence above reports the absence rather than refusing to touch that CA.
     let case = "PENDING_CERTIFICATE CA with a policy attached";
     let (_, arn) = rows.last().expect("the pending row").clone();
+    let attachable = policy_for(&arn);
     emulator
-        .ok(case, "PutPolicy", &request("PutPolicy", &arn, &document))
+        .ok(case, "PutPolicy", &request("PutPolicy", &arn, &attachable))
         .await;
     let read = emulator
         .ok(case, "GetPolicy", &request("GetPolicy", &arn, ""))
         .await;
     let returned = string(&read, "Policy", case);
     assert_eq!(
-        returned, document,
+        returned, attachable,
         "case {case:?}: expected the attached document back, got {returned:?}"
     );
     emulator

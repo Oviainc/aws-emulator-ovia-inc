@@ -147,18 +147,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let region = crate::state::request_region(ctx);
+        // A user name is a case-insensitive identifier, so the name this request
+        // deletes is folded exactly as the store is keyed.
+        let user_name = crate::state::fold_name(&input.user_name);
         let mut state = state.lock();
         state.settle(std::time::Instant::now());
-        // The users the account ALREADY HAD before any call (MemoryDB's built-in
-        // `default` user) are materialised on first touch, exactly as `CreateUser` and
-        // `DescribeUsers` do, so a delete naming one of them acts on the user the
-        // account really has instead of answering not-found for it. The materialisation
-        // flag makes that a one-off, so the removal below is not undone by a later call.
-        state.ensure_builtin_users(&region);
+        // The resources the account ALREADY HAD before any call (MemoryDB's built-in
+        // `default` user and the `open-access` ACL holding it) are materialised on first
+        // touch, exactly as `CreateUser` and `DescribeUsers` do, so a delete naming one
+        // of them acts on the user the account really has instead of answering
+        // not-found for it. The materialisation flag makes that a one-off, so the
+        // removal below is not undone by a later call.
+        state.ensure_builtins(&region);
 
-        let Some(user) = state.users.get(&input.user_name) else {
+        // The user every MemoryDB account already has is the service's, not the
+        // caller's: it cannot be deleted.
+        if user_name == crate::state::DEFAULT_USER_NAME {
+            return Err(DeleteUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "User {user_name} is a default user and cannot be deleted."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(user) = state.users.get(&user_name) else {
             return Err(DeleteUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
-                message: Some(format!("User {} not found.", input.user_name)),
+                message: Some(format!("User {user_name} not found.")),
             })
             .into());
         };
@@ -172,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InvalidUserStateFault {
                     message: Some(format!(
                         "User {} is in status {} and cannot be deleted; it must be {}.",
-                        input.user_name,
+                        user_name,
                         user.status,
                         crate::state::user_status::ACTIVE
                     )),
@@ -183,10 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Gone from the store, so no later call reports it and `DescribeUsers` answers
         // the modelled not-found fault for its name.
-        let Some(mut user) = state.users.remove(&input.user_name) else {
+        let Some(mut user) = state.users.remove(&user_name) else {
             // Unreachable: the entry was read under this same lock just above.
             return Err(DeleteUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
-                message: Some(format!("User {} not found.", input.user_name)),
+                message: Some(format!("User {user_name} not found.")),
             })
             .into());
         };
@@ -194,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clusters": membership is held ONCE, on each ACL's `UserNames`, and a cluster
         // reaches users only through the ACL it references, so taking the name out of
         // every ACL is what removes the user from the clusters too.
-        let acl_names = state.remove_user_from_every_acl(&input.user_name);
+        let acl_names = state.remove_user_from_every_acl(&user_name);
         // Its tags go with it: a tag store keyed by an ARN nothing resolves would be
         // read by a later `ListTags` for a resource that no longer exists.
         state.tags.remove(&user.arn);

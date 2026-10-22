@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        let mut budget = stored.budget.clone();
+        let mut budget = crate::state::project_budget(stored, ::std::time::SystemTime::now());
         // "Specifies whether the response includes the filter expression associated with
         // the budget" — so it is left out until the caller asks for it.
         if !input.show_filter_expression.unwrap_or(false) {

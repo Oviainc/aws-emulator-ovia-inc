@@ -23,3 +23,5 @@ mod service_claim;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/validation_message_wording.rs"]
+mod validation_message_wording;

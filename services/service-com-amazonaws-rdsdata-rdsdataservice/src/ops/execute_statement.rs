@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteStatement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteStatement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteStatement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Runs one SQL statement against this service's data plane and reports what the
+//! engine did with it. [`crate::state`] owns that data plane: one real SQL
+//! database per (cluster, database name), run in-process by SQLite, plus the
+//! transactions open on the cluster.
+//!
+//! ## Members this operation accepts and does not act on
+//!
+//! * `schema` — the model's own doc says "Currently, the schema parameter isn't
+//!   supported", so the database name alone selects the state a statement runs
+//!   against; a schema a caller names is not a second namespace here.
+//! * `continueAfterTimeout` — "a value that indicates whether to continue running
+//!   the statement after the call times out". This data plane answers a statement
+//!   that outran its budget with the modelled `StatementTimeoutException` and
+//!   abandons it, because nothing here can go on running it after the connection
+//!   is answered, so the member changes nothing either way.
+//! * `database`, WHEN a `transactionId` is also given — the transaction already
+//!   names the database it was opened for (`BeginTransaction` stored it), and its
+//!   statements run against that one.
 //!
 //! ## Shape of an operation
 //!
@@ -231,18 +241,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteStatement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteStatementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteStatement"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ExecuteStatementError::from(ExecuteStatementErrorModeled::InternalServerErrorException(
+                InternalServerErrorException::default(),
+            ))
+        })?;
+        // The engine work is synchronous and CPU-bound, and it holds the state
+        // lock, so it runs on the blocking pool under one wall clock rather than on
+        // an async worker.
+        crate::state::in_data_plane(move || execute(&store, &input))
+            .await
+            .map_err(statement_failed)
     }
+}
+
+/// Run the statement and build the response, inside the data plane.
+fn execute(
+    store: &crate::state::Store,
+    input: &ExecuteStatementInput,
+) -> Result<ExecuteStatementOutput, crate::state::SqlError> {
+    crate::state::require_arn("resourceArn", &input.resource_arn)?;
+    crate::state::require_arn("secretArn", &input.secret_arn)?;
+    let mut state = store.lock();
+    let cluster = state.cluster_mut(&input.resource_arn)?;
+    cluster.expire_timed_out_transactions();
+    let parameters = input.parameters.clone().unwrap_or_default();
+
+    // ONE budget for this request: the deadline its statement runs under and the
+    // response bytes it may produce, shared by reading the values out of the
+    // engine and by rendering them, so the request has a single output bound.
+    let mut budget = crate::state::RequestBudget::new();
+
+    // With a `transactionId` the statement runs inside that transaction, against
+    // its own copy of the database, so its writes stay invisible to every other
+    // reader until it commits. Without one it runs against the committed database
+    // and auto-commits — what the model's doc says an untransacted call does.
+    let outcome = match input.transaction_id.as_deref() {
+        Some(transaction_id) => {
+            let transaction = cluster
+                .transactions
+                .get_mut(transaction_id)
+                .ok_or(crate::state::SqlError::TransactionNotFound)?;
+            transaction.touch();
+            transaction
+                .pending
+                .run_within(&mut budget, &input.sql, &parameters)?
+        }
+        None => cluster
+            .database_mut(&crate::state::database_key(input.database.as_ref()))?
+            .run_within(&mut budget, &input.sql, &parameters)?,
+    };
+
+    let mut output = ExecuteStatementOutput::default();
+    if outcome.has_result_set() {
+        // `formattedRecords` "is only present when the formatRecordsAs parameter
+        // is set to JSON", and `records` / `columnMetadata` are blank then.
+        if format_as_json(input.format_records_as.as_deref()) {
+            output.formatted_records = Some(outcome.formatted_records(&mut budget)?);
+        } else {
+            output.records = Some(outcome.records(crate::state::ReturnTypes::from_options(
+                input.result_set_options.as_ref(),
+            )));
+            if input.include_result_metadata {
+                output.column_metadata = Some(outcome.column_metadata());
+            }
+        }
+    } else {
+        // A statement with no result set is DML or DDL: it reports the rows it
+        // changed and any key the engine generated for them. A statement that
+        // RETURNED a result set leaves `numberOfRecordsUpdated` at the modelled
+        // default instead — "a SELECT does not set it" is stated here, by not
+        // setting it, rather than left to the serializer omitting a zero.
+        output.number_of_records_updated = outcome.records_updated;
+        output.generated_fields = Some(outcome.generated_fields());
+    }
+    // An access record for the data plane: who was addressed and what the engine
+    // did. The statement text and the secret are NOT recorded — both carry caller
+    // secrets.
+    tracing::info!(
+        resource_arn = %input.resource_arn,
+        database = input.database.as_deref().unwrap_or(""),
+        in_transaction = input.transaction_id.is_some(),
+        records_updated = outcome.records_updated,
+        rows_returned = outcome.rows.len(),
+        "rds-data executed a statement"
+    );
+    Ok(output)
+}
+
+/// `formatRecordsAs=JSON`. The model's `RecordsFormatType` is `NONE | JSON`, and
+/// `NONE` — the documented default — returns the result set in `records`.
+fn format_as_json(format: Option<&str>) -> bool {
+    format.is_some_and(|format| format.eq_ignore_ascii_case("JSON"))
+}
+
+/// Report a statement that did not run as the error this operation models for it.
+fn statement_failed(error: crate::state::SqlError) -> ExecuteStatementError {
+    let message = Some(error.message());
+    match error {
+        crate::state::SqlError::TransactionNotFound => {
+            ExecuteStatementErrorModeled::TransactionNotFoundException(
+                TransactionNotFoundException { message },
+            )
+        }
+        crate::state::SqlError::Timeout => {
+            ExecuteStatementErrorModeled::StatementTimeoutException(StatementTimeoutException {
+                message,
+                db_connection_id: 0,
+            })
+        }
+        crate::state::SqlError::ResultTooLarge | crate::state::SqlError::UnsupportedResult(_) => {
+            ExecuteStatementErrorModeled::UnsupportedResultException(UnsupportedResultException {
+                message,
+            })
+        }
+        crate::state::SqlError::Unavailable(detail) => {
+            tracing::error!(%detail, "the rds-data data plane could not serve a statement");
+            ExecuteStatementErrorModeled::InternalServerErrorException(
+                InternalServerErrorException::default(),
+            )
+        }
+        // This emulator is out of its own room, which is not the caller's
+        // request being wrong: the model's `ServiceUnavailableError` (503) is
+        // what says the service could not serve it. The shape carries no
+        // members, so which cap it was is logged rather than returned.
+        crate::state::SqlError::Capacity(detail) => {
+            tracing::warn!(%detail, "the rds-data data plane is at a stored-object cap");
+            ExecuteStatementErrorModeled::ServiceUnavailableError(
+                ServiceUnavailableError::default(),
+            )
+        }
+        crate::state::SqlError::Engine(_)
+        | crate::state::SqlError::MissingParameter(_)
+        | crate::state::SqlError::UnsupportedParameter(_)
+        | crate::state::SqlError::InvalidRequest(_) => {
+            ExecuteStatementErrorModeled::BadRequestException(BadRequestException { message })
+        }
+    }
+    .into()
 }

@@ -19,6 +19,8 @@ mod certificate_authority_tags;
 mod delete_certificate_authority;
 #[path = "all/permissions.rs"]
 mod permissions;
+#[path = "all/policy_documents.rs"]
+mod policy_documents;
 #[path = "all/private_ca_lifecycle.rs"]
 mod private_ca_lifecycle;
 #[path = "all/resource_policy.rs"]

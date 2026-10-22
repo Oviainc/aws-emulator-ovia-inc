@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetOnPremisesInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetOnPremisesInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the stored `InstanceInfo` of each name in a batch, within the
+//! documented batch limit.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetOnPremisesInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +68,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How many instance names one batch may carry, as the model documents for the
+/// member
+/// (`smithy_query(query="doc",shape="BatchGetOnPremisesInstancesInput",member="instanceNames")`:
+/// "The maximum number of instance names you can specify is 25").
+const MAX_BATCH_INSTANCE_NAMES: usize = 25;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -144,18 +145,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetOnPremisesInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetOnPremisesInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetOnPremisesInstances"))
+        let _ = ctx;
+        let names = input.instance_names;
+        // The batch precondition comes FIRST: a batch above the limit is refused
+        // whatever the names in it are, and nothing about the store is read for
+        // it.
+        if names.len() > MAX_BATCH_INSTANCE_NAMES {
+            return Err(
+                BatchGetOnPremisesInstancesErrorModeled::BatchLimitExceededException(
+                    BatchLimitExceededException {
+                        message: Some(format!(
+                            "The maximum number of names you can specify for instanceNames is \
+                             {MAX_BATCH_INSTANCE_NAMES}, but {} were specified",
+                            names.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A batch has to name at least one instance, and every name in it has to
+        // be a name: an empty list is the same refusal as an absent
+        // `instanceNames`, and a name outside the form CodeDeploy accepts is the
+        // same refusal the single-instance operations answer for one.
+        if names.is_empty() {
+            return Err(
+                BatchGetOnPremisesInstancesErrorModeled::InstanceNameRequiredException(
+                    InstanceNameRequiredException {
+                        message: Some(
+                            "The minimum number of required on-premises instance names was not \
+                             specified"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        for name in &names {
+            match crate::state::check_instance_name(name) {
+                Ok(()) => {}
+                Err(crate::state::NameRefusal::Missing) => {
+                    return Err(
+                        BatchGetOnPremisesInstancesErrorModeled::InstanceNameRequiredException(
+                            InstanceNameRequiredException {
+                                message: Some(
+                                    "An on-premises instance name was not specified".to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+                Err(crate::state::NameRefusal::Malformed) => {
+                    return Err(
+                        BatchGetOnPremisesInstancesErrorModeled::InvalidInstanceNameException(
+                            InvalidInstanceNameException {
+                                message: Some(format!(
+                                    "The on-premises instance name {name} was specified in an \
+                                     invalid format"
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            }
+        }
+
+        // One entry per name the store holds a record for, in the order the
+        // request listed them. A name with no record is simply not reported:
+        // this operation models no "not registered" error, so a batch is not
+        // refused because one of its names is unknown.
+        let infos = crate::state::with_state(&*self.engine, |state| {
+            names
+                .iter()
+                .filter_map(|name| state.on_premises_instances.get(name))
+                .map(crate::state::instance_info)
+                .collect::<Vec<_>>()
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(BatchGetOnPremisesInstancesOutput {
+            instance_infos: Some(infos),
+        })
     }
 }

@@ -399,7 +399,7 @@ async fn an_error_body_carries_the_condition_code_and_the_header_carries_the_sha
             case.shape,
             "case {:?}: the exception shape name travels in x-amzn-errortype, got {:?}",
             case.case,
-            answer.error_type
+            answer.header("x-amzn-errortype")
         );
         assert_eq!(
             body_shape(&answer),

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOrderableClusterOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOrderableClusterOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOrderableClusterOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the catalog of cluster options this service offers: every combination
+//! of an offered engine version, a cluster type and a node type, each paired with
+//! the Availability Zones of the Region the request was signed for. The engine
+//! versions come from the same seeded catalog `DescribeClusterVersions` reports,
+//! which is what makes the input's "Must be one of the version returned from
+//! DescribeClusterVersions" hold. Filtered by `ClusterVersion` and `NodeType`,
+//! paginated through the same opaque `Marker` cursor as the other `Describe*`
+//! operations, and writing NOTHING: no transition is ever owed on this catalog.
 //!
 //! ## Shape of an operation
 //!
@@ -102,9 +102,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeOrderableClusterOptionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeOrderableClusterOptions")]
+// `DependentServiceUnavailableFault` is widened in: the model lists no error for
+// this operation at all, but the service declares the shape, and it is the only
+// modelled way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeOrderableClusterOptions",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeOrderableClusterOptionsErrorModeled {
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -158,18 +165,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOrderableClusterOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOrderableClusterOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOrderableClusterOptions"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeOrderableClusterOptionsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "such as the EC2 Availability Zones (AZ) in the specific Amazon Web
+        // Services Region that you can specify": the zones an option offers are
+        // the zones of the Region this request was signed for.
+        let zones: Vec<AvailabilityZone> = st::region_availability_zones(&st::request_region(ctx))
+            .into_iter()
+            .map(|name| AvailabilityZone {
+                name: Some(name),
+                // Redshift publishes no platform list for an orderable option's
+                // zones, and the member is optional.
+                supported_platforms: None,
+            })
+            .collect();
+
+        // A pure read of the seeded engine-version catalog: no transition is ever
+        // owed on it, so this operation settles nothing and writes nothing.
+        let store = state.lock();
+
+        // The catalog, in a stable order: engine version (as the store offers
+        // them, so `DescribeClusterVersions` and this operation cannot disagree
+        // about which versions exist), then node type, then cluster type, each
+        // list in the order the model documents it. Neither documented list
+        // restricts the other — `ClusterType` is "multi-node | single-node" for
+        // every node type the service offers — so the catalog is their full
+        // product, and the request's `ClusterVersion` / `NodeType` filters SELECT
+        // from it rather than refusing ("Default: All versions"): a filter that
+        // matches nothing selects nothing.
+        let mut options: Vec<OrderableClusterOption> = Vec::new();
+        for offered in &store.cluster_versions {
+            let Some(cluster_version) = offered.cluster_version.as_deref() else {
+                continue;
+            };
+            if input
+                .cluster_version
+                .as_deref()
+                .is_some_and(|wanted| wanted != cluster_version)
+            {
+                continue;
+            }
+            for node_type in st::ORDERABLE_NODE_TYPES {
+                if input
+                    .node_type
+                    .as_deref()
+                    .is_some_and(|wanted| wanted != node_type)
+                {
+                    continue;
+                }
+                for cluster_type in st::ORDERABLE_CLUSTER_TYPES {
+                    options.push(OrderableClusterOption {
+                        cluster_version: Some(cluster_version.to_string()),
+                        cluster_type: Some(cluster_type.to_string()),
+                        node_type: Some(node_type.to_string()),
+                        availability_zones: Some(zones.clone()),
+                    });
+                }
+            }
+        }
+
+        // The same `MaxRecords` window and opaque cursor every paginated Redshift
+        // `Describe*` shares, so a marker one page hands out resumes the next.
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, options.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeOrderableClusterOptionsOutput {
+            orderable_cluster_options: Some(options[start..end].to_vec()),
+            marker: next_marker,
+        })
     }
 }

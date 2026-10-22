@@ -53,13 +53,18 @@ struct Row {
 
 /// Rows differ along the schema `Type`, the form of `Content`, whether the optional
 /// members are present, the shape of the schema name, and the binding language.
+///
+/// Each row's content declares the event it describes (`x-amazon-events-source` /
+/// `x-amazon-events-detail-type`), which is what a registry indexes a schema under and
+/// so what `SearchSchemas` — one of the operations whose timestamps this table collects —
+/// selects on.
 fn rows() -> Vec<Row> {
     vec![
         Row {
             case: "openapi-minimal",
             schema: "demo-schema",
             schema_type: "OpenApi3",
-            content: r#"{"openapi":"3.0.0"}"#,
+            content: r##"{"openapi":"3.0.0","components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-source":"my.timestamps","x-amazon-events-detail-type":"Demo Schema"}}}}"##,
             with_metadata: false,
             language: "Java8",
         },
@@ -67,7 +72,7 @@ fn rows() -> Vec<Row> {
             case: "jsonschema-with-description-and-tags",
             schema: "order.placed_v1",
             schema_type: "JSONSchemaDraft4",
-            content: r#"{"$schema":"http://json-schema.org/draft-04/schema#","type":"object"}"#,
+            content: r##"{"$schema":"http://json-schema.org/draft-04/schema#","type":"object","x-amazon-events-source":"my.timestamps","x-amazon-events-detail-type":"Order Placed"}"##,
             with_metadata: true,
             language: "Python36",
         },
@@ -75,7 +80,7 @@ fn rows() -> Vec<Row> {
             case: "non-ascii-content",
             schema: "unicode-schema",
             schema_type: "OpenApi3",
-            content: r#"{"openapi":"3.0.0","info":{"title":"caf\u00e9"}}"#,
+            content: r##"{"openapi":"3.0.0","info":{"title":"caf\u00e9"},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-source":"my.timestamps","x-amazon-events-detail-type":"Caf\u00e9 Served"}}}}"##,
             with_metadata: true,
             language: "TypeScript3",
         },
@@ -317,6 +322,8 @@ async fn every_date_time_member_is_an_rfc3339_string() {
     }
 
     // SearchSchemas — the member sits TWO levels down, in a list nested under a list.
+    // A search reports the schemas the registry INDEXES, which is every row here:
+    // each one's content declares the event it describes.
     let searched = emulator
         .call(
             "GET",

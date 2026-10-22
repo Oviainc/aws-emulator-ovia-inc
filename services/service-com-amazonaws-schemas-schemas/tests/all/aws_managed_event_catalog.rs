@@ -296,20 +296,22 @@ async fn paging_the_catalogue_walks_every_member_exactly_once() {
     }
 }
 
-/// RULE: `SearchSchemas` over the catalogue reports the members whose name or document
-/// carries every keyword, each with the ARN of the asking region and its stored
-/// version.
+/// RULE: `SearchSchemas` over the catalogue reports the members whose DECLARED event
+/// keywords — the event source and detail type their documents record — carry every
+/// keyword, each with the ARN of the asking region and its stored version.
 #[tokio::test]
 async fn searching_the_catalogue_reports_members_with_their_arns() {
     let emulator = Emulator::new();
 
-    // Rows: a keyword that is a source namespace, one that is a word of a document,
-    // two keywords that must BOTH occur, and a keyword nothing carries.
+    // Rows: a keyword that is a source namespace, keywords of an event's detail type,
+    // a source and detail-type pair that must BOTH occur, and a keyword nothing
+    // declares. A search selects on what the registry indexes a schema under — the
+    // event source and detail type its document declares — not on the schema's name.
     let cases: Vec<(&str, Option<&str>)> = vec![
-        ("aws.ecs@ECSTaskStateChange", Some("aws.ecs@ECSTaskStateChange")),
-        ("ECSTaskStateChange", Some("aws.ecs@ECSTaskStateChange")),
+        ("aws.ecs", Some("aws.ecs@ECSTaskStateChange")),
+        ("task,state", Some("aws.ecs@ECSTaskStateChange")),
         (
-            "aws.s3@ObjectCreated,etag",
+            "aws.s3,object,created",
             Some("aws.s3@ObjectCreated"),
         ),
         ("no-such-keyword-anywhere", None),

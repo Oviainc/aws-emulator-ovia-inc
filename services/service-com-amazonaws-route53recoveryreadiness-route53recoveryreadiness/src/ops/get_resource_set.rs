@@ -167,10 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.resource_set_name)
             .ok_or_else(|| {
                 GetResourceSetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource set {} not found.",
-                        input.resource_set_name
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
             })?;
 

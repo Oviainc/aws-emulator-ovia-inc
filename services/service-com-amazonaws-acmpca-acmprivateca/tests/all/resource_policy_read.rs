@@ -8,10 +8,13 @@
 //! `InvalidArnException` when the ARN names no private CA of this service, and it leaves
 //! the stored policy exactly as it found it.
 //!
-//! The policy is ATTACHED here by writing the CA record in the shared engine, because
-//! `PutPolicy` is still a scaffold stub
-//! (`issues/things-that-do-not-work/20261022T143159Z-acm-pca-putpolicy-stub.md`), as is
-//! `DeletePolicy` (`...-acm-pca-deletepolicy-stub.md`). Every read goes over the wire
+//! The policy is ATTACHED here by writing the CA record in the shared engine rather than
+//! through `PutPolicy`: what is under test is `GetPolicy`'s REPORTING, over documents
+//! including ones no attach would accept, so the rows are not limited to what `PutPolicy`
+//! takes. The attach-then-display path over the wire is driven by `policy_documents`.
+//! `DeletePolicy` is still a scaffold stub
+//! (`issues/things-that-do-not-work/20261022T143159Z-acm-pca-deletepolicy-stub.md`).
+//! Every read goes over the wire
 //! through the same router the emulator boots, so what is asserted is what a client sees.
 
 use std::sync::Arc;
@@ -44,7 +47,7 @@ const POLICY_MIN_LENGTH: usize = 1;
 const POLICY_MAX_LENGTH: usize = 81_920;
 
 /// One emulator with this service mounted, keeping the engine so a test can persist a
-/// policy the way `PutPolicy` will once it is implemented.
+/// policy beside the wire and read it back through `GetPolicy`.
 struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
@@ -148,8 +151,9 @@ impl Emulator {
         );
     }
 
-    /// Persist `policy` on the CA `ca_arn` names — what `PutPolicy` will do once it is
-    /// implemented.
+    /// Persist `policy` on the CA `ca_arn` names, beside the wire: this suite pins what
+    /// `GetPolicy` reports for whatever is stored, including documents `PutPolicy` would
+    /// refuse to attach.
     fn attach_policy(&self, case: &str, ca_arn: &str, policy: &str) {
         let state = service_state(&*self.engine).expect("the private CA store is reachable");
         let mut state = state.lock();

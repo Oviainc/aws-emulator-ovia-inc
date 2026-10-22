@@ -15,6 +15,11 @@
 //! documented constraints is reported in `FailedFindings` with the member and
 //! constraint it broke.
 //!
+//! A finding that is stored is first run past the hub's `ENABLED` automation rules:
+//! "Security Hub CSPM starts applying the rule to findings and finding updates after
+//! the rule is created" (`CreateAutomationRule$RuleStatus`), so the record this
+//! operation persists is the finding as those rules left it.
+//!
 //! Every stored write also appends a `BATCH_IMPORT_FINDINGS` change event to that
 //! finding's history — the creating import, and any later re-import that changes an
 //! ASFF field — which is what `GetFindingHistory` reports.
@@ -434,6 +439,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One instant for the whole batch: every finding in it was received together.
         let received_at = crate::state::now_iso8601();
+        let now_nanos = crate::state::now_nanos();
+        // The rules that act on this batch, read once and in application order, so
+        // every finding in it is evaluated against the same rule set even while the
+        // findings map is being written.
+        let rules = store.enabled_rules_in_order(&(account_id.clone(), region.clone()));
         let mut success_count: i32 = 0;
         let mut failed_findings: Vec<ImportFindingsError> = Vec::new();
 
@@ -467,6 +477,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(severity) = finding.severity.as_mut() {
                 crate::state::complete_severity(severity);
             }
+
+            // The rules act on the finding as it will be stored, so a later read
+            // sees exactly what the rules left: an `ENABLED` rule whose `Criteria`
+            // the finding matches updates the fields its action names, and a
+            // terminal match stops the walk.
+            crate::state::apply_automation_rules(&rules, &mut finding, &received_at, now_nanos);
 
             let seq = store.next_write_seq();
             // "the ARN of a partner that calls BatchImportFindings"

@@ -91,6 +91,21 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The finding-filter predicates and attribute accessors are shape-level, not
+// operation-level: `GetFindings$Filters` and an automation rule's `Criteria` are two
+// member sets over the same filter shapes and the same `AwsSecurityFinding`, so both
+// evaluate them through `crate::state` rather than each carrying a copy.
+use crate::state::{
+    boolean_attribute, boolean_filters_match, check_string_filter_combination, date_attribute,
+    date_filters_match, date_range_nanos, number_attribute, number_filters_match,
+    string_filters_match, MAX_FILTER_ATTRIBUTES, MAX_FILTER_VALUES_PER_ATTRIBUTE,
+};
+
+/// The finding attribute accessor an insight's grouping also asks, re-exported under
+/// the path it has always been reached by (`crate::ops::get_findings::string_attribute`)
+/// now that the accessors themselves live in [`crate::state`].
+pub(crate) use crate::state::string_attribute;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,15 +179,6 @@ fn decode_next_token(token: &str) -> Option<usize> {
     crate::state::decode_list_token(NEXT_TOKEN_PREFIX, token)
 }
 
-/// The `StringFilterComparison` values that select findings which HAVE the filter
-/// value; `StringFilter$Comparison` documents them as joined by `OR` on one field.
-const POSITIVE_STRING_COMPARISONS: [&str; 3] = ["EQUALS", "PREFIX", "CONTAINS"];
-
-/// The `StringFilterComparison` values that select findings which do NOT have the
-/// filter value; `StringFilter$Comparison` documents them as joined by `AND` on one
-/// field.
-const NEGATIVE_STRING_COMPARISONS: [&str; 3] = ["NOT_EQUALS", "PREFIX_NOT_EQUALS", "NOT_CONTAINS"];
-
 /// The string-valued finding attributes this slice can filter and sort on. The
 /// names are the `AwsSecurityFindingFilters` member names, which are also the names
 /// `SortCriterion$Field` uses.
@@ -244,296 +250,6 @@ fn is_sortable_field(field: &str) -> bool {
     date_attribute(&probe, field).is_some()
         || number_attribute(&probe, field).is_some()
         || string_attribute(&probe, field).is_some()
-}
-
-/// Does `value` satisfy `comparison` against `filter_value`, read as the positive
-/// form of the comparison? `NOT_*` comparisons are evaluated by negating their
-/// positive twin, which is why they share one function.
-fn positive_form_matches(value: &str, filter_value: &str, comparison: &str) -> bool {
-    match comparison {
-        "EQUALS" | "NOT_EQUALS" => value == filter_value,
-        "PREFIX" | "PREFIX_NOT_EQUALS" => value.starts_with(filter_value),
-        // Filter values are case sensitive (`StringFilter$Value`).
-        "CONTAINS" | "NOT_CONTAINS" => value.contains(filter_value),
-        _ => false,
-    }
-}
-
-/// The comparison a `StringFilter` asks for; `EQUALS` when the member is absent, the
-/// only comparison that reads a bare value as itself.
-fn comparison_of(filter: &StringFilter) -> &str {
-    filter.comparison.as_deref().unwrap_or("EQUALS")
-}
-
-/// Refuse the filter combinations `StringFilter$Comparison` documents as errors:
-/// "You can't have both a `CONTAINS` filter and a `NOT_CONTAINS` filter on the same
-/// field. Similarly, you can't provide both an `EQUALS` filter and a `NOT_EQUALS` or
-/// `PREFIX_NOT_EQUALS` filter on the same field. ... `CONTAINS` filters can only be
-/// used with other `CONTAINS` filters. `NOT_CONTAINS` filters can only be used with
-/// other `NOT_CONTAINS` filters."
-///
-/// `CONTAINS_WORD` is refused here too: that comparison "works only in the
-/// `GetFindingsV2`, `GetFindingStatisticsV2`, `GetResourcesV2`, and
-/// `GetResourcesStatisticsV2` APIs".
-fn check_string_filter_combination(attribute: &str, filters: &[StringFilter]) -> Result<(), String> {
-    let comparisons: Vec<&str> = filters.iter().map(comparison_of).collect();
-    if comparisons.contains(&"CONTAINS_WORD") {
-        return Err(format!(
-            "Filter {attribute}: the CONTAINS_WORD comparison is not supported by GetFindings"
-        ));
-    }
-    // A comparison that is neither a positive nor a negative form names no predicate
-    // this operation can evaluate. Refusing it is what keeps a filtered request from
-    // quietly answering an unfiltered page.
-    if let Some(unknown) = comparisons.iter().find(|c| {
-        !POSITIVE_STRING_COMPARISONS.contains(c) && !NEGATIVE_STRING_COMPARISONS.contains(c)
-    }) {
-        return Err(format!(
-            "Filter {attribute}: {unknown} is not a StringFilterComparison GetFindings evaluates"
-        ));
-    }
-    let has = |wanted: &str| comparisons.contains(&wanted);
-    if has("CONTAINS") && comparisons.iter().any(|c| *c != "CONTAINS") {
-        return Err(format!(
-            "Filter {attribute}: CONTAINS filters can only be used with other CONTAINS filters"
-        ));
-    }
-    if has("NOT_CONTAINS") && comparisons.iter().any(|c| *c != "NOT_CONTAINS") {
-        return Err(format!(
-            "Filter {attribute}: NOT_CONTAINS filters can only be used with other NOT_CONTAINS filters"
-        ));
-    }
-    if has("EQUALS") && (has("NOT_EQUALS") || has("PREFIX_NOT_EQUALS")) {
-        return Err(format!(
-            "Filter {attribute}: an EQUALS filter cannot be combined with a NOT_EQUALS or PREFIX_NOT_EQUALS filter on the same field"
-        ));
-    }
-    Ok(())
-}
-
-/// Evaluate one field's string filters against every value the finding carries for
-/// that field (a list-valued attribute such as `Type` carries several).
-fn string_filters_match(values: &[&str], filters: &[StringFilter]) -> bool {
-    let mut saw_positive = false;
-    let mut positive_hit = false;
-    for filter in filters {
-        let Some(filter_value) = filter.value.as_deref() else {
-            continue;
-        };
-        let comparison = comparison_of(filter);
-        let any_value_matches = values
-            .iter()
-            .any(|value| positive_form_matches(value, filter_value, comparison));
-        if POSITIVE_STRING_COMPARISONS.contains(&comparison) {
-            saw_positive = true;
-            positive_hit |= any_value_matches;
-        } else if NEGATIVE_STRING_COMPARISONS.contains(&comparison) && any_value_matches {
-            // Negative filters are joined by AND: one hit excludes the finding.
-            return false;
-        }
-    }
-    !saw_positive || positive_hit
-}
-
-/// Evaluate one field's number filters. Several filters on one field are joined by
-/// `OR`, matching the string-filter rule; the bounds within one filter are joined by
-/// `AND`.
-fn number_filters_match(value: Option<f64>, filters: &[NumberFilter]) -> bool {
-    if filters.is_empty() {
-        return true;
-    }
-    let Some(value) = value else {
-        return false;
-    };
-    filters.iter().any(|filter| {
-        // `NumberFilter$Eq` is an equality predicate on the value the finding
-        // carries, so this is EXACT equality on purpose: the filtered attributes
-        // (`Confidence`, `Criticality`, `SeverityNormalized`, `SeverityProduct`) are
-        // compared to the value the caller sent, not approximated.
-        filter.eq.is_none_or(|eq| value == eq)
-            && filter.gte.is_none_or(|gte| value >= gte)
-            && filter.lte.is_none_or(|lte| value <= lte)
-            && filter.gt.is_none_or(|gt| value > gt)
-            && filter.lt.is_none_or(|lt| value < lt)
-    })
-}
-
-/// Evaluate one field's date filters, joined by `OR` like the other filter kinds.
-/// `Start`/`End` are absolute inclusive bounds; a `DateRange` is relative to `now`,
-/// `WITHIN` the window or `OLDER_THAN` it ("If you don't specify a value, the default
-/// is `WITHIN`" — `DateRange$Comparison`).
-fn date_filters_match(
-    attribute: &str,
-    value: Option<&str>,
-    filters: &[DateFilter],
-    now_nanos: i128,
-) -> Result<bool, String> {
-    if filters.is_empty() {
-        return Ok(true);
-    }
-    let Some(instant) = value.and_then(crate::state::parse_iso8601_nanos) else {
-        return Ok(false);
-    };
-    let mut any = false;
-    for filter in filters {
-        let mut matches = true;
-        if let Some(start) = filter.start.as_deref() {
-            let start = crate::state::parse_iso8601_nanos(start)
-                .ok_or_else(|| format!("Filter {attribute}: Start must be an ISO-8601 timestamp"))?;
-            matches &= instant >= start;
-        }
-        if let Some(end) = filter.end.as_deref() {
-            let end = crate::state::parse_iso8601_nanos(end)
-                .ok_or_else(|| format!("Filter {attribute}: End must be an ISO-8601 timestamp"))?;
-            matches &= instant <= end;
-        }
-        if let Some(range) = filter.date_range.as_ref() {
-            let window = date_range_nanos(attribute, range)?;
-            let boundary = now_nanos - window;
-            matches &= match range.comparison.as_deref().unwrap_or("WITHIN") {
-                "WITHIN" => instant >= boundary,
-                "OLDER_THAN" => instant < boundary,
-                other => {
-                    return Err(format!(
-                        "Filter {attribute}: DateRange.Comparison {other} is not a supported comparison"
-                    ))
-                }
-            };
-        }
-        any |= matches;
-    }
-    Ok(any)
-}
-
-/// The width of a `DateRange` in nanoseconds. `DateRangeUnit` models `DAYS` only, and
-/// a range names a window, so its `Value` is required and cannot be negative.
-fn date_range_nanos(attribute: &str, range: &DateRange) -> Result<i128, String> {
-    let Some(value) = range.value else {
-        return Err(format!(
-            "Filter {attribute}: DateRange.Value is required when DateRange is set"
-        ));
-    };
-    if value < 0 {
-        return Err(format!(
-            "Filter {attribute}: DateRange.Value must not be negative, got {value}"
-        ));
-    }
-    let value = i128::from(value);
-    match range.unit.as_deref().unwrap_or("DAYS") {
-        "DAYS" => Ok(value * 24 * 60 * 60 * 1_000_000_000),
-        other => Err(format!(
-            "Filter {attribute}: DateRange.Unit {other} is not a supported unit"
-        )),
-    }
-}
-
-/// Evaluate one field's boolean filters, joined by `OR`.
-fn boolean_filters_match(value: Option<bool>, filters: &[BooleanFilter]) -> bool {
-    if filters.is_empty() {
-        return true;
-    }
-    filters
-        .iter()
-        .any(|filter| filter.value.is_none_or(|wanted| value == Some(wanted)))
-}
-
-/// The value(s) a finding carries for a string-valued finding attribute, or `None`
-/// when the attribute is not one this slice knows. The attribute names are the
-/// `AwsSecurityFindingFilters` member names, which are also the names
-/// `SortCriterion$Field` uses.
-///
-/// `pub(crate)` because grouping an insight's findings asks the same question of a
-/// finding that filtering and sorting do; these accessors stay the ONE source of
-/// truth for which attribute names resolve to a value.
-pub(crate) fn string_attribute<'a>(
-    finding: &'a AwsSecurityFinding,
-    attribute: &str,
-) -> Option<Vec<&'a str>> {
-    let one = |value: Option<&'a str>| Some(value.into_iter().collect::<Vec<&'a str>>());
-    match attribute {
-        "Id" => one(Some(finding.id.as_str())),
-        "ProductArn" => one(Some(finding.product_arn.as_str())),
-        "AwsAccountId" => one(Some(finding.aws_account_id.as_str())),
-        "AwsAccountName" => one(finding.aws_account_name.as_deref()),
-        "GeneratorId" => one(Some(finding.generator_id.as_str())),
-        "Region" => one(finding.region.as_deref()),
-        "ProductName" => one(finding.product_name.as_deref()),
-        "CompanyName" => one(finding.company_name.as_deref()),
-        "Title" => one(Some(finding.title.as_str())),
-        "Description" => one(Some(finding.description.as_str())),
-        "SourceUrl" => one(finding.source_url.as_deref()),
-        "SeverityLabel" => one(finding.severity.as_ref().and_then(|s| s.label.as_deref())),
-        "RecordState" => one(finding.record_state.as_deref()),
-        "WorkflowState" => one(finding.workflow_state.as_deref()),
-        "WorkflowStatus" => one(finding.workflow.as_ref().and_then(|w| w.status.as_deref())),
-        "VerificationState" => one(finding.verification_state.as_deref()),
-        "ComplianceStatus" => one(finding.compliance.as_ref().and_then(|c| c.status.as_deref())),
-        "ComplianceSecurityControlId" => one(finding
-            .compliance
-            .as_ref()
-            .and_then(|c| c.security_control_id.as_deref())),
-        "RecommendationText" => one(finding
-            .remediation
-            .as_ref()
-            .and_then(|r| r.recommendation.as_ref())
-            .and_then(|r| r.text.as_deref())),
-        "NoteText" => one(finding.note.as_ref().map(|n| n.text.as_str())),
-        "NoteUpdatedBy" => one(finding.note.as_ref().map(|n| n.updated_by.as_str())),
-        "Type" => Some(
-            finding
-                .types
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .map(String::as_str)
-                .collect(),
-        ),
-        _ => None,
-    }
-}
-
-/// The value a finding carries for a number-valued finding attribute; the outer
-/// `None` means the attribute is not one this slice knows.
-fn number_attribute(finding: &AwsSecurityFinding, attribute: &str) -> Option<Option<f64>> {
-    match attribute {
-        "Confidence" => Some(finding.confidence.map(f64::from)),
-        "Criticality" => Some(finding.criticality.map(f64::from)),
-        "SeverityNormalized" => Some(
-            finding
-                .severity
-                .as_ref()
-                .and_then(|s| s.normalized)
-                .map(f64::from),
-        ),
-        "SeverityProduct" => Some(finding.severity.as_ref().and_then(|s| s.product)),
-        _ => None,
-    }
-}
-
-/// The value a finding carries for a timestamp-valued finding attribute; the outer
-/// `None` means the attribute is not one this slice knows.
-fn date_attribute<'a>(
-    finding: &'a AwsSecurityFinding,
-    attribute: &str,
-) -> Option<Option<&'a str>> {
-    match attribute {
-        "CreatedAt" => Some(Some(finding.created_at.as_str())),
-        "UpdatedAt" => Some(Some(finding.updated_at.as_str())),
-        "FirstObservedAt" => Some(finding.first_observed_at.as_deref()),
-        "LastObservedAt" => Some(finding.last_observed_at.as_deref()),
-        "ProcessedAt" => Some(finding.processed_at.as_deref()),
-        "NoteUpdatedAt" => Some(finding.note.as_ref().map(|n| n.updated_at.as_str())),
-        _ => None,
-    }
-}
-
-/// The value a finding carries for a boolean-valued finding attribute; the outer
-/// `None` means the attribute is not one this slice knows.
-fn boolean_attribute(finding: &AwsSecurityFinding, attribute: &str) -> Option<Option<bool>> {
-    match attribute {
-        "Sample" => Some(finding.sample),
-        _ => None,
-    }
 }
 
 /// The `AwsSecurityFindingFilters` members this slice evaluates, paired with the
@@ -852,13 +568,6 @@ pub(crate) fn unsupported_filter_member(
     set.into_iter()
         .find_map(|(name, present)| present.then_some(name))
 }
-
-/// `GetFindings$Filters`: "You can filter by up to 10 finding attributes."
-const MAX_FILTER_ATTRIBUTES: usize = 10;
-
-/// `GetFindings$Filters`: "For each attribute, you can provide up to 20 filter
-/// values."
-const MAX_FILTER_VALUES_PER_ATTRIBUTE: usize = 20;
 
 /// Refuse a `Filters` the model's own rules reject, BEFORE any finding is examined:
 /// whether a request is valid cannot depend on what happens to be stored, so an

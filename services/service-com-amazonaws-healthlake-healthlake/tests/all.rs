@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/control_plane_error_semantics.rs"]
 mod control_plane_error_semantics;
+#[path = "all/error_envelopes.rs"]
+mod error_envelopes;
 #[path = "all/fhir_datastore_lifecycle.rs"]
 mod fhir_datastore_lifecycle;
 #[path = "all/state_roundtrip.rs"]

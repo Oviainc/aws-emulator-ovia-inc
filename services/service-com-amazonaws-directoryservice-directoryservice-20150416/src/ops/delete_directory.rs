@@ -161,6 +161,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reused", so it stays reserved against the id it was created for and a later
         // `CreateAlias` asking for it is refused.
 
+        // A snapshot is a snapshot OF this directory, so it does not outlive it: real
+        // Directory Service deletes a directory's snapshots with the directory ("all
+        // snapshots of a directory are deleted when the directory is deleted"), and
+        // keeping them would leave records naming an id no caller can resolve — and a
+        // store a create/delete cycle could grow without end.
+        store
+            .snapshots
+            .retain(|_, snapshot| snapshot.directory_id != removed.directory_id);
+
         Ok(DeleteDirectoryOutput {
             directory_id: Some(removed.directory_id),
         })

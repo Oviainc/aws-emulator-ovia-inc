@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/cache_cluster_lifecycle.rs"]
 mod cache_cluster_lifecycle;
+#[path = "all/service_updates.rs"]
+mod service_updates;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

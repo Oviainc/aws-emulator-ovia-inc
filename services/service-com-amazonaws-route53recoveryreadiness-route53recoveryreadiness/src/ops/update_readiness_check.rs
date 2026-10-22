@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReadinessCheck
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReadinessCheck`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReadinessCheck::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Repoints the readiness check stored under this name at another resource set and
+//! reports it back out of the store, or answers the modelled
+//! `ResourceNotFoundException` when this account has no check by that name.
+//!
+//! An update REPLACES the resource set the check watches; the check's ARN, name and
+//! tags are unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +149,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReadinessCheck` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReadinessCheckErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReadinessCheck"))
+        let _ = ctx;
+        // The resource-set reference's input shape is plain `__string`, so the boundary
+        // validator did not apply the rule the OUTPUT shape states.
+        crate::state::validate_name("ResourceSetName", &input.resource_set_name).map_err(
+            |message| {
+                UpdateReadinessCheckErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+            },
+        )?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateReadinessCheckErrorModeled::InternalServerException(InternalServerException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let record = state
+            .readiness_checks
+            .get_mut(&input.readiness_check_name)
+            .ok_or_else(|| {
+                UpdateReadinessCheckErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+            })?;
+        record.resource_set_name = input.resource_set_name;
+
+        // Reported out of the store, so what the caller sees is what a later
+        // `GetReadinessCheck` will see.
+        Ok(UpdateReadinessCheckOutput {
+            readiness_check_arn: Some(record.arn.clone()),
+            readiness_check_name: Some(record.name.clone()),
+            resource_set: Some(record.resource_set_name.clone()),
+            tags: record.modeled_tags(),
+        })
     }
 }

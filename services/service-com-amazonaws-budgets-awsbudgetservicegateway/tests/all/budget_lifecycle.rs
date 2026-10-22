@@ -36,7 +36,7 @@ pub(crate) fn router() -> MultiServiceRouter {
 
 /// As [`router`], plus the shared engine it was built from, so a test can seed the
 /// store directly instead of driving tens of thousands of requests to reach a quota.
-fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false).register_service(
@@ -47,7 +47,11 @@ fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// Call one operation and return `(status, body)`. The body is `Value::Null` when the
 /// response carried no bytes.
-pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -87,7 +91,7 @@ pub(crate) fn is_error(body: &Value, exception: &str) -> bool {
 
 /// Structural JSON equality that compares numbers by value, so a timestamp sent as
 /// `1704067200` still matches one rendered as `1704067200.0`.
-fn same(left: &Value, right: &Value) -> bool {
+pub(crate) fn same(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
         (Value::Array(a), Value::Array(b)) => {
@@ -279,6 +283,24 @@ fn lifecycle_rows() -> Vec<Row> {
     ]
 }
 
+/// Structural CONTAINMENT: every member of `expected` appears in `actual` with an equal
+/// value, recursively. A read reports the members the SERVICE fills in beside the ones
+/// the caller sent — a `TimePeriod` the caller left half-specified comes back with its
+/// defaulted `End`, and a `COST` budget's `CostTypes` with every member the model gives a
+/// default — so what was sent is a subset of what is read back, not an equal. The
+/// defaults themselves are asserted in `tests/all/budget_read_projection.rs`.
+pub(crate) fn carries(expected: &Value, actual: &Value) -> bool {
+    match (expected, actual) {
+        (Value::Object(want), Value::Object(got)) => want
+            .iter()
+            .all(|(member, value)| got.get(member).is_some_and(|seen| carries(value, seen))),
+        (Value::Array(want), Value::Array(got)) => {
+            want.len() == got.len() && want.iter().zip(got).all(|(x, y)| carries(x, y))
+        }
+        _ => same(expected, actual),
+    }
+}
+
 /// Assert that `read` carries every member of `sent`, plus a `LastUpdatedTime` the
 /// service stamped. `FilterExpression` is excluded: it is only returned when the
 /// caller sets `ShowFilterExpression`, which its own test covers.
@@ -289,8 +311,8 @@ fn assert_read_back(case: &str, sent: &Value, read: &Value) {
         }
         let actual = read.get(member).unwrap_or(&Value::Null);
         assert!(
-            same(expected, actual),
-            "case {case:?}: expected {member} = {expected}, got {actual}"
+            carries(expected, actual),
+            "case {case:?}: expected {member} to carry {expected}, got {actual}"
         );
     }
     let stamped = read.get("LastUpdatedTime").and_then(Value::as_f64);
@@ -424,12 +446,14 @@ async fn a_budget_round_trips_through_its_whole_lifecycle() {
         );
         assert_read_back(case, &row.updated, &body["Budget"]);
         // A member the update dropped is gone, not merged from the previous version.
-        for member in [
-            "BudgetLimit",
-            "PlannedBudgetLimits",
-            "TimePeriod",
-            "CostFilters",
-        ] {
+        for member in ["BudgetLimit", "PlannedBudgetLimits", "CostFilters"] {
+            // ...except the `BudgetLimit` of a planned-limit budget, which the read
+            // DERIVES from the planned entry in force (`Budget$PlannedBudgetLimits`:
+            // "DescribeBudget and DescribeBudgets response along with
+            // PlannedBudgetLimits also contain BudgetLimit"). Its own suite covers it.
+            if member == "BudgetLimit" && row.updated.get("PlannedBudgetLimits").is_some() {
+                continue;
+            }
             if row.updated.get(member).is_none() {
                 let leftover = body["Budget"].get(member);
                 assert!(
@@ -439,6 +463,26 @@ async fn a_budget_round_trips_through_its_whole_lifecycle() {
                 );
             }
         }
+        // `TimePeriod` is the one member an update cannot drop — a budget always covers a
+        // period — so an update that omits it gets the service's default back, never the
+        // period the previous version carried.
+        if row.updated.get("TimePeriod").is_none() {
+            let period = &body["Budget"]["TimePeriod"];
+            assert!(
+                period.get("Start").and_then(Value::as_f64).is_some()
+                    && period.get("End").and_then(Value::as_f64).is_some(),
+                "case {case:?}: expected an update that dropped TimePeriod to default it, \
+                 got {period}"
+            );
+            if let Some(previous) = row.budget.get("TimePeriod") {
+                assert!(
+                    !carries(previous, period),
+                    "case {case:?}: expected the defaulted period, not the previous \
+                     {previous}, got {period}"
+                );
+            }
+        }
+
         // The notifications are the budget's own resources; the update left them alone.
         let (_, after) = call(&router, "DescribeNotificationsForBudget", &describe).await;
         assert_eq!(

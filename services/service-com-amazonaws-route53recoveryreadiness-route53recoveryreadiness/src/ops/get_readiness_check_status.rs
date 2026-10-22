@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReadinessCheckStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReadinessCheckStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReadinessCheckStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the readiness status of the readiness check stored under this name, or the
+//! modelled `ResourceNotFoundException` when this account has no check by that name —
+//! on EVERY call, since this is a report and it writes nothing.
+//!
+//! Nothing in this emulator audits the real AWS resources the watched resource set
+//! names, so no readiness rule has ever been evaluated against them: the status is
+//! [`crate::state::READINESS_UNKNOWN`] — what AWS reports for a check whose first audit
+//! has not completed — and there is no per-resource result to report, which is why
+//! `Resources` is empty rather than carrying a verdict and a "last checked" time for an
+//! audit that never ran.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +157,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReadinessCheckStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReadinessCheckStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReadinessCheckStatus"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetReadinessCheckStatusErrorModeled::InternalServerException(InternalServerException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        if !state.readiness_checks.contains_key(&input.readiness_check_name) {
+            return Err(
+                GetReadinessCheckStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A cursor is only ever one this service minted, whatever it points at.
+        crate::state::validate_next_token(input.next_token.as_deref()).map_err(|message| {
+            GetReadinessCheckStatusErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        Ok(GetReadinessCheckStatusOutput {
+            messages: None,
+            // No audit has run, so there is no page of resource results and no page to
+            // resume from.
+            next_token: None,
+            readiness: Some(crate::state::READINESS_UNKNOWN.to_string()),
+            resources: Some(Vec::new()),
+        })
     }
 }

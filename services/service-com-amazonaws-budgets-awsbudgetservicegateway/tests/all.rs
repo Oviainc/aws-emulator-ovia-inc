@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/budget_lifecycle.rs"]
 mod budget_lifecycle;
+#[path = "all/budget_read_projection.rs"]
+mod budget_read_projection;
 #[path = "all/client_error_envelopes.rs"]
 mod client_error_envelopes;
 #[path = "all/state_roundtrip.rs"]

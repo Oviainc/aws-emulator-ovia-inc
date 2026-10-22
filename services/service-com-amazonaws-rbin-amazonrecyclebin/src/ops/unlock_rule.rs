@@ -185,13 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(rule) = store.rules.get_mut(&input.identifier) else {
             return Err(UnlockRuleErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Retention rule with ID {} not found",
-                        input.identifier
-                    )),
-                    reason: Some("RULE_NOT_FOUND".to_string()),
-                },
+                crate::state::rule_not_found(&input.identifier),
             )
             .into());
         };
@@ -205,14 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already `unlocked`, and one already serving its unlock delay have no lock to
         // release, so the request can't be completed.
         if rule.lock_state.as_deref() != Some(crate::state::LOCK_STATE_LOCKED) {
-            return Err(UnlockRuleErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Retention rule with ID {} is not locked (lock state {})",
-                    rule.identifier,
-                    rule.lock_state.as_deref().unwrap_or("null")
-                )),
-                reason: Some("INVALID_RULE_STATE".to_string()),
-            })
+            return Err(UnlockRuleErrorModeled::ConflictException(
+                crate::state::rule_state_conflict(
+                    crate::state::BlockedAction::Unlock,
+                    &rule.identifier,
+                    crate::state::BlockingCondition::NotLocked,
+                ),
+            )
             .into());
         }
 

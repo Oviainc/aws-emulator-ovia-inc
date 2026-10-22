@@ -243,18 +243,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut budget = input.budget;
-        // "The last time that you updated this budget" — stamped by the service, so a
-        // value the caller sent is replaced rather than echoed.
-        budget.last_updated_time = Some(::aws_smithy_types::DateTime::from(
-            ::std::time::SystemTime::now(),
-        ));
+        // The members the service, not the caller, decides — the `LastUpdatedTime` it
+        // stamps, the defaulted `TimePeriod` / `CostTypes`, and the `HealthStatus` — are
+        // materialised here, so every later read reports what was stored rather than
+        // recomputing anything per request.
+        crate::state::stamp_service_owned(&mut budget, ::std::time::SystemTime::now(), None);
         let notifications = input
             .notifications_with_subscribers
             .unwrap_or_default()
             .into_iter()
-            .map(|supplied| crate::state::StoredNotification {
-                notification: supplied.notification,
-                subscribers: supplied.subscribers,
+            .map(|supplied| {
+                let mut notification = supplied.notification;
+                crate::state::stamp_notification(&mut notification);
+                crate::state::StoredNotification {
+                    notification,
+                    subscribers: supplied.subscribers,
+                }
             })
             .collect();
         store.budgets.insert(

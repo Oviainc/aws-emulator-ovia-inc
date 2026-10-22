@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BeginTransaction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BeginTransaction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BeginTransaction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Opens a SQL transaction on this service's data plane: it takes the
+//! transaction's own copy of the database it was opened for, mints the opaque id
+//! the caller quotes on later calls, and STORES both in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +180,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BeginTransaction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BeginTransactionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BeginTransaction"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BeginTransactionError::from(BeginTransactionErrorModeled::InternalServerErrorException(
+                InternalServerErrorException::default(),
+            ))
+        })?;
+        // Taking the transaction's snapshot is engine work, so it runs on the
+        // blocking pool under one wall clock rather than on an async worker.
+        crate::state::in_data_plane(move || begin(&store, &input))
+            .await
+            .map_err(request_failed)
     }
+}
+
+/// Open the transaction, inside the data plane.
+fn begin(
+    store: &crate::state::Store,
+    input: &BeginTransactionInput,
+) -> Result<BeginTransactionOutput, crate::state::SqlError> {
+    crate::state::require_arn("resourceArn", &input.resource_arn)?;
+    crate::state::require_arn("secretArn", &input.secret_arn)?;
+    let mut state = store.lock();
+    let cluster = state.cluster_mut(&input.resource_arn)?;
+    cluster.expire_timed_out_transactions();
+    // The id is stored with the cluster, secret, database and schema it was opened
+    // for, together with the copy of the database the transaction writes into — a
+    // returned id that is not stored would name nothing.
+    let transaction_id = crate::state::Transaction::open(
+        cluster,
+        &input.resource_arn,
+        &input.secret_arn,
+        input.database.as_ref(),
+        input.schema.as_ref(),
+    )?;
+    Ok(BeginTransactionOutput {
+        transaction_id: Some(transaction_id),
+    })
+}
+
+/// Report a request that could not be served as the error this operation models
+/// for it.
+fn request_failed(error: crate::state::SqlError) -> BeginTransactionError {
+    let message = Some(error.message());
+    match error {
+        crate::state::SqlError::Timeout => {
+            BeginTransactionErrorModeled::StatementTimeoutException(StatementTimeoutException {
+                message,
+                db_connection_id: 0,
+            })
+        }
+        crate::state::SqlError::Unavailable(detail) => {
+            tracing::error!(%detail, "the rds-data data plane could not open a transaction");
+            BeginTransactionErrorModeled::InternalServerErrorException(
+                InternalServerErrorException::default(),
+            )
+        }
+        crate::state::SqlError::Capacity(detail) => {
+            tracing::warn!(%detail, "the rds-data data plane is at a stored-object cap");
+            BeginTransactionErrorModeled::ServiceUnavailableError(
+                ServiceUnavailableError::default(),
+            )
+        }
+        _ => BeginTransactionErrorModeled::BadRequestException(BadRequestException { message }),
+    }
+    .into()
 }

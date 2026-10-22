@@ -18,11 +18,14 @@
 //!   nothing;
 //! * an occurrence the clock had already made due moved the target's bounds at the instant
 //!   it was owed, so it is materialised before the action is removed rather than lost with
-//!   it.
+//!   it, while an occurrence still AHEAD of the delete never fires at all: the removal
+//!   cancels it;
+//! * a name at either published `ScheduledActionName` length bound round-trips through the
+//!   delete, and one past the ceiling names no stored action.
 
 use serde_json::{json, Value};
 
-use super::emulator::{error_code, error_message, Emulator};
+use super::emulator::{at_schedule_in, error_code, error_message, Emulator};
 
 /// One row of the deletion catalog: the scalable dimension of the target the action hangs
 /// off, and the schedule expression the action carries.
@@ -382,17 +385,7 @@ async fn an_occurrence_already_due_is_applied_before_the_action_is_removed() {
     // An `at` expression a couple of seconds out: once that instant passes the occurrence
     // was owed whether or not anybody called, so deleting the action afterwards must not
     // take the movement with it.
-    let at = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
-    let seconds = at
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .expect("an instant after the epoch")
-        .as_secs();
-    let schedule = format!(
-        "at({})",
-        chrono::DateTime::from_timestamp(seconds as i64, 0)
-            .expect("a representable instant")
-            .format("%Y-%m-%dT%H:%M:%S")
-    );
+    let (schedule, at) = at_schedule_in(std::time::Duration::from_secs(2));
     let mut body = request(&target, "due-shortly");
     body["Schedule"] = json!(schedule);
     body["ScalableTargetAction"] = json!({"MinCapacity": 6, "MaxCapacity": 9});
@@ -438,4 +431,144 @@ async fn an_occurrence_already_due_is_applied_before_the_action_is_removed() {
              delete, got {described:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_deleted_action_never_fires_an_occurrence_that_was_still_ahead() {
+    let emulator = Emulator::empty();
+    // Two dimensions of one table, each carrying the SAME action: the one on the read
+    // dimension is deleted while its occurrence is still ahead, and the one on the write
+    // dimension is the control that shows the occurrence did arrive.
+    let deleted_from = emulator
+        .given_target("dynamodb:table:ReadCapacityUnits", 1, 10)
+        .await;
+    let kept = emulator
+        .given_target("dynamodb:table:WriteCapacityUnits", 1, 10)
+        .await;
+
+    let case = "an occurrence still ahead of the delete";
+    let (schedule, at) = at_schedule_in(std::time::Duration::from_secs(5));
+    for target in [&deleted_from, &kept] {
+        let mut body = request(target, "due-shortly");
+        body["Schedule"] = json!(schedule);
+        body["ScalableTargetAction"] = json!({"MinCapacity": 6, "MaxCapacity": 30});
+        let (status, response) = emulator.call("PutScheduledAction", body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected PutScheduledAction to answer 200, got {status} {response:?}"
+        );
+    }
+
+    let (status, response) = emulator
+        .call("DeleteScheduledAction", request(&deleted_from, "due-shortly"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the delete to answer 200, got {status} {response:?}"
+    );
+
+    // Past the instant both actions were scheduled for.
+    let remaining = at
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default();
+    tokio::time::sleep(remaining + std::time::Duration::from_millis(1_500)).await;
+
+    for (which, target, expected_min) in [
+        ("the action that was kept", &kept, 6),
+        ("the action that was deleted", &deleted_from, 1),
+    ] {
+        let (status, response) = emulator
+            .call("DescribeScalableTargets", target.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} ({which}): expected DescribeScalableTargets to answer 200, got \
+             {status} {response:?}"
+        );
+        let described = &response["ScalableTargets"][0];
+        assert_eq!(
+            described["MinCapacity"],
+            json!(expected_min),
+            "case {case:?} ({which}): expected MinCapacity {expected_min}, got {described:?}"
+        );
+    }
+
+    // The movement that did not happen left no scaling activity behind for the deleted
+    // action's target either.
+    let (status, response) = emulator
+        .call("DescribeScalingActivities", deleted_from.clone())
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected DescribeScalingActivities to answer 200, got {status} \
+         {response:?}"
+    );
+    let activities = response["ScalingActivities"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !activities.iter().any(|activity| {
+            activity["Cause"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("due-shortly")
+        }),
+        "case {case:?}: expected no activity for the deleted action, got {activities:?}"
+    );
+}
+
+/// The published bounds of the name a scheduled action can carry: `ScheduledActionName` is
+/// `@length(min: 1, max: 256)`
+/// (`smithy_query(query="shape",shape="com.amazonaws.applicationautoscaling#ScheduledActionName")`).
+const MIN_NAME_CHARS: usize = 1;
+/// See [`MIN_NAME_CHARS`].
+const MAX_NAME_CHARS: usize = 256;
+
+#[tokio::test]
+async fn a_name_at_either_published_length_bound_is_deletable_and_one_past_it_is_not() {
+    let emulator = Emulator::empty();
+    let target = emulator
+        .given_target("dynamodb:table:ReadCapacityUnits", 1, 10)
+        .await;
+
+    for (case, chars) in [
+        ("the shortest name", MIN_NAME_CHARS),
+        ("one inside the ceiling", MAX_NAME_CHARS - 1),
+        ("the longest name", MAX_NAME_CHARS),
+    ] {
+        let name = "n".repeat(chars);
+        put(&emulator, &target, &name, "rate(5 minutes)", case).await;
+        let (status, response) = emulator
+            .call("DeleteScheduledAction", request(&target, &name))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} ({chars} characters): expected the delete to answer 200, got {status} \
+             {response:?}"
+        );
+        let names = names_on(&emulator, &target, case).await;
+        assert!(
+            names.is_empty(),
+            "case {case:?} ({chars} characters): expected the action to be gone, got {names:?}"
+        );
+    }
+
+    // A name longer than any action can carry is still a legal `DeleteScheduledAction`
+    // member — the request's own `ScheduledActionName` is bounded at 1600 — and it names no
+    // stored action, so it is refused as a missing object rather than accepted.
+    let case = "one past the ceiling";
+    let name = "n".repeat(MAX_NAME_CHARS + 1);
+    let (status, response) = emulator
+        .call("DeleteScheduledAction", request(&target, &name))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} {response:?}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "ObjectNotFoundException",
+        "case {case:?}: expected the name to be refused as a missing object, got {response:?}"
+    );
 }

@@ -69,9 +69,51 @@
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — This error is thrown when the requested
 //!   resource is not found.
+//!
+//! ## Beside the model
+//!
+//! The recorded 200 carries two further top-level members the model declares on no
+//! shape — `accountId` and `onboardingGeneration` — projected out of the stored record
+//! through [`crate::state::RecordedMembers`], exactly as `CreateDomain` does.
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The member `accountId` is written under, beside the modelled members.
+///
+/// RECORDED behaviour: `GetDomainOutput` declares ten members (`domainId` … `tags`)
+/// and no `accountId` (`smithy_query(query="shape", shape="GetDomainOutput")`), so
+/// there is no generated field for it and this schema is what names it on the wire.
+/// Index 10 is the first free member index after those ten (0..=9). See
+/// [`crate::state::RecordedMembers`].
+const ACCOUNT_ID_MEMBER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.connecthealth#GetDomainOutput$accountId",
+        "com.amazonaws.connecthealth",
+        "accountId",
+    ),
+    ::aws_smithy_schema::ShapeType::String,
+    "accountId",
+    10,
+);
+
+/// The member `onboardingGeneration` is written under — the next free index after
+/// [`ACCOUNT_ID_MEMBER`], and recorded-only for the same reason.
+const ONBOARDING_GENERATION_MEMBER: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.connecthealth#GetDomainOutput$onboardingGeneration",
+            "com.amazonaws.connecthealth",
+            "onboardingGeneration",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "onboardingGeneration",
+        11,
+    );
+
+/// What `GetDomain` answers: the modelled `GetDomainOutput` plus the recorded
+/// top-level `accountId` and `onboardingGeneration`.
+pub type GetDomainResponse = crate::state::RecordedMembers<GetDomainOutput>;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -128,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetDomain<Eng>
 {
     type Input = GetDomainInput;
-    type Output = GetDomainOutput;
+    type Output = GetDomainResponse;
     type Error = GetDomainError;
 
     const NAME: &'static str = "GetDomain";
@@ -165,27 +207,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let tags = store.tags_for(&domain.arn);
-        Ok(GetDomainOutput {
-            domain_id: domain.domain_id.clone(),
-            arn: domain.arn.clone(),
-            name: domain.name.clone(),
-            kms_key_arn: domain.kms_key_arn.clone(),
-            encryption_context: Some(EncryptionContext {
-                encryption_type: domain.encryption_type.as_wire().to_string(),
+        let tags = store.reported_tags(&domain.arn);
+        Ok(GetDomainResponse {
+            payload: GetDomainOutput {
+                domain_id: domain.domain_id.clone(),
+                arn: domain.arn.clone(),
+                name: domain.name.clone(),
                 kms_key_arn: domain.kms_key_arn.clone(),
-            }),
-            status: domain.status.as_wire().to_string(),
-            web_app_url: domain.web_app_url.clone(),
-            web_app_configuration: domain.web_app_configuration.as_ref().map(|config| {
-                WebAppConfiguration {
-                    ehr_role: config.ehr_role.clone(),
-                    idc_application_id: config.idc_application_id.clone(),
-                    idc_region: config.idc_region.clone(),
-                }
-            }),
-            created_at: crate::state::to_timestamp(domain.created_at),
-            tags: (!tags.is_empty()).then(|| tags.into_iter().collect()),
+                encryption_context: Some(EncryptionContext {
+                    encryption_type: domain.encryption_type.as_wire().to_string(),
+                    kms_key_arn: domain.kms_key_arn.clone(),
+                }),
+                status: domain.status.as_wire().to_string(),
+                web_app_url: domain.web_app_url.clone(),
+                web_app_configuration: domain.web_app_configuration.as_ref().map(|config| {
+                    WebAppConfiguration {
+                        ehr_role: config.ehr_role.clone(),
+                        idc_application_id: config.idc_application_id.clone(),
+                        idc_region: config.idc_region.clone(),
+                    }
+                }),
+                created_at: crate::state::to_timestamp(domain.created_at),
+                // A resource with no tags has an EMPTY tag map, not an absent one.
+                tags: Some(tags),
+            },
+            members: vec![
+                crate::state::RecordedMember::Text(&ACCOUNT_ID_MEMBER, domain.account_id.clone()),
+                crate::state::RecordedMember::Text(
+                    &ONBOARDING_GENERATION_MEMBER,
+                    domain.onboarding_generation.as_wire().to_string(),
+                ),
+            ],
         })
     }
 }

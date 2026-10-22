@@ -31,3 +31,5 @@ mod user_lifecycle;
 mod user_updates;
 #[path = "all/users.rs"]
 mod users;
+#[path = "all/users_acls_name_rules.rs"]
+mod users_acls_name_rules;

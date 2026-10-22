@@ -17,6 +17,8 @@ mod abort_environment_update;
 mod application_version_updates;
 #[path = "all/application_versions.rs"]
 mod application_versions;
+#[path = "all/describe_application_versions.rs"]
+mod describe_application_versions;
 #[path = "all/dns_availability.rs"]
 mod dns_availability;
 #[path = "all/environment_operations.rs"]

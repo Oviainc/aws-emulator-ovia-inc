@@ -16,17 +16,43 @@
 //! Unification is what makes a sample of events, rather than one event, worth sending:
 //!
 //! * a member every sampled event carries is `required`; one only some carry is not;
-//! * a position seen as both an integer and a fractional number widens to `number`,
-//!   because every integer is a number;
+//! * every JSON number is a `number`: a sample that happened to carry `3` at a
+//!   position is no evidence that the position only ever carries integral values, and
+//!   `number` is what the document AWS returns types a sampled number as;
 //! * a position also seen as `null` is nullable, spelled with OpenAPI 3.0's `nullable`
 //!   keyword and with draft-04's `["<type>", "null"]` type union;
 //! * a position two events disagree about (a string in one, an object in another), and
 //!   one nothing but `null` or an empty array was ever seen at, carries no `type` at
 //!   all — the empty schema, which admits any value.
 //!
+//! ## How the document is written
+//!
+//! The document is not just a set of keywords, it is an ORDERED JSON text, and clients
+//! hash, diff and generate code from it:
+//!
+//! * a nested object is HOISTED into its own named schema under
+//!   `components/schemas`, named after the member it sits at, and the member refers to
+//!   it with `$ref` — so a client generating code from the document gets a reusable
+//!   type per nested object instead of one anonymous inline shape. OpenAPI is where
+//!   that mechanism lives, so it is what `Type=OpenApi3` gets; a draft-04 document has
+//!   no components section and keeps the nested object inline.
+//! * the root schema comes first under `components/schemas`, followed by the schemas
+//!   hoisted out of it; within a schema, `type` comes before `required` before
+//!   `properties`; and `required` is in [`in_required_order`].
+//!
 //! Nothing is persisted: this operation names no registry and no schema, and a schema
 //! enters this service's store only through `CreateSchema`. So the handler neither
 //! reads nor writes the service state.
+//!
+//! ## What one request may ask for
+//!
+//! The sample itself is bounded by the MODEL: `Events` is `@length(min: 1, max: 10)`
+//! and an entry `@length(min: 1, max: 100000)`, so the framework refuses more than a
+//! megabyte of sampled events before this handler runs. What the model does not bound is
+//! how many distinct OBJECTS a sample of that size describes, and each one becomes a
+//! named schema the document holds — so `crate::state::MAX_INFERRED_SCHEMAS` caps that,
+//! refused with `BadRequestException` before the document is written. Within those
+//! bounds the whole inference is linear in the sample and allocates one name per schema.
 //!
 //! ## Shape of an operation
 //!
@@ -91,9 +117,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,6 +179,18 @@ use crate::state::JSON_SCHEMA_DRAFT4_URI as JSON_SCHEMA_DRAFT4;
 /// The `format` both dialects give a string that carries an RFC-3339 timestamp.
 const DATE_TIME_FORMAT: &str = "date-time";
 
+/// What a member whose schema was hoisted into `components/schemas` refers to it by:
+/// the JSON pointer into the document's own components section.
+const COMPONENT_REF_PREFIX: &str = "#/components/schemas/";
+
+/// The name a hoisted schema takes when the member it sits at yields none — a member
+/// named with no letter and no digit at all.
+const UNNAMEABLE_COMPONENT_NAME: &str = "Nested";
+
+/// How many buckets the hash table that holds a `required` list starts with, before
+/// any growth. See [`in_required_order`].
+const DEFAULT_HASH_TABLE_BUCKETS: usize = 16;
+
 /// Which document the request's `Type` asks for.
 ///
 /// The two values are [`TYPE_VALUES`], the model's `Type` enum. They differ in more
@@ -193,9 +231,8 @@ enum Kind {
     /// this position was always empty. The sample names no type.
     Unconstrained,
     Boolean,
-    /// Every number seen here was integral.
-    Integer,
-    /// At least one number seen here had a fractional part.
+    /// A JSON number was seen here. Integral or not: a sample shows what a position
+    /// held, never that it will only ever hold integers, and `number` admits both.
     Number,
     String {
         /// Every string seen here was an RFC-3339 timestamp.
@@ -253,10 +290,7 @@ impl Kind {
             // Already irreconcilable: a third sample cannot narrow it.
             (Self::Conflicting, _) | (_, Self::Conflicting) => Self::Conflicting,
             (Self::Boolean, Self::Boolean) => Self::Boolean,
-            (Self::Integer, Self::Integer) => Self::Integer,
-            // Every integer is a number, so a position seen as both is a number —
-            // not a conflict.
-            (Self::Integer | Self::Number, Self::Integer | Self::Number) => Self::Number,
+            (Self::Number, Self::Number) => Self::Number,
             // `date-time` is claimed only when EVERY string seen here was one: a
             // single free-form string makes the member a plain string.
             (Self::String { date_time: left }, Self::String { date_time: right }) => Self::String {
@@ -299,13 +333,7 @@ fn observe(value: &Value) -> Observed {
             nullable: true,
         },
         Value::Bool(_) => Observed::of(Kind::Boolean),
-        // `is_f64` is true exactly for a number that did not fit an integer: a
-        // fractional value, or one outside `i64`/`u64`.
-        Value::Number(number) => Observed::of(if number.is_f64() {
-            Kind::Number
-        } else {
-            Kind::Integer
-        }),
+        Value::Number(_) => Observed::of(Kind::Number),
         Value::String(text) => Observed::of(Kind::String {
             date_time: is_date_time(text),
         }),
@@ -343,129 +371,373 @@ fn is_date_time(text: &str) -> bool {
     .any(|format| ::aws_smithy_types::DateTime::from_str(text, format).is_ok())
 }
 
-/// Render an observation as one schema node in `dialect`.
+/// One JSON value of the document this operation writes.
 ///
-/// An empty map is the empty schema: it constrains nothing, which is the honest
-/// answer for a position the sample disagreed about or never showed a value at.
-fn render(observed: &Observed, dialect: Dialect) -> Map<String, Value> {
-    let mut node = Map::new();
+/// Written with its own node type rather than [`serde_json::Value`] because the ORDER
+/// of an object's members is part of the document: `serde_json::Map` is a SORTED map,
+/// which cannot express `type` before `required` before `properties`, nor the root
+/// schema before the schemas hoisted out of it. These members keep the order they were
+/// added in, and are serialized in it.
+#[derive(Debug, Clone, PartialEq)]
+enum Node {
+    Text(String),
+    Flag(bool),
+    List(Vec<Node>),
+    Object(Vec<(String, Node)>),
+}
+
+impl Node {
+    /// A JSON string node.
+    fn text(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+
+    /// This node as the JSON text that goes on the wire.
+    ///
+    /// Infallible in practice: the only failures `serde_json` reports here are a
+    /// non-string map key and a writer error, and this node's keys are `String` and
+    /// the writer is an in-memory buffer.
+    fn to_json(&self) -> String {
+        ::serde_json::to_string(self).expect("a Node serializes into a String buffer")
+    }
+}
+
+impl ::serde::Serialize for Node {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use ::serde::ser::{SerializeMap, SerializeSeq};
+        match self {
+            Self::Text(text) => serializer.serialize_str(text),
+            Self::Flag(flag) => serializer.serialize_bool(*flag),
+            Self::List(items) => {
+                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    sequence.serialize_element(item)?;
+                }
+                sequence.end()
+            }
+            Self::Object(members) => {
+                let mut map = serializer.serialize_map(Some(members.len()))?;
+                for (name, value) in members {
+                    map.serialize_entry(name, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+/// The named schemas a document carries beside its root one, and the names already
+/// taken in it.
+#[derive(Debug, Default)]
+struct Components {
+    /// The schemas hoisted out of the root, each appended once it is finished — so a
+    /// schema appears after the ones it refers to, and the root (which is written in
+    /// front of all of them) after every schema it reaches.
+    hoisted: Vec<(String, Node)>,
+    /// Every name this document has already given a schema, the root's included.
+    taken: BTreeSet<String>,
+    /// Per base name, the next spelling of it to try. A monotone counter per base, so
+    /// the whole document's naming costs one map lookup and amortised one probe per
+    /// schema, rather than one probe per schema ALREADY named after that base —
+    /// which, over a sample the caller chooses, would be quadratic in the number of
+    /// same-named positions it carries.
+    next_suffix: BTreeMap<String, u32>,
+}
+
+impl Components {
+    /// Take a free name for the schema of the nested object at member `member`.
+    ///
+    /// Two members of the same name at two positions describe two schemas, so the
+    /// second one takes the next free spelling of that name (`Detail`, `Detail2`, …)
+    /// rather than silently replacing the first. Cheap and terminating: each base's
+    /// counter only ever moves forward, past both the names it has handed out and any
+    /// a differently-named member happened to take, and the whole document carries at
+    /// most [`crate::state::MAX_INFERRED_SCHEMAS`] names.
+    fn reserve(&mut self, member: &str) -> String {
+        let base = component_name(member);
+        loop {
+            let suffix = self.next_suffix.entry(base.clone()).or_insert(1);
+            let candidate = if *suffix == 1 {
+                base.clone()
+            } else {
+                format!("{base}{suffix}")
+            };
+            match suffix.checked_add(1) {
+                Some(next) => *suffix = next,
+                // Past `u32::MAX` spellings of one base name there is no next one to
+                // try. Unreachable — the schema cap refuses a sample long before — and
+                // answering with this candidate is what keeps the loop from spinning on
+                // a counter that cannot move.
+                None => return candidate,
+            }
+            if self.taken.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
+    }
+}
+
+/// The name the schema of a nested object at member `member` is given: the member's
+/// name as a type name is spelled, each word capitalised and the separators dropped
+/// (`detail` → `Detail`, `order-line` → `OrderLine`).
+fn component_name(member: &str) -> String {
+    let mut name = String::new();
+    for word in member.split(|c: char| !c.is_alphanumeric()) {
+        let mut characters = word.chars();
+        if let Some(first) = characters.next() {
+            name.extend(first.to_uppercase());
+            name.push_str(characters.as_str());
+        }
+    }
+    if name.is_empty() {
+        return UNNAMEABLE_COMPONENT_NAME.to_string();
+    }
+    name
+}
+
+/// How many object positions a unified description holds — the number of schemas the
+/// document will name and write (the root included).
+///
+/// Counted off the unified description rather than off the request, so what is bounded
+/// is the work the document costs: ten events of one shape describe one object, not ten.
+/// Linear in the description, which is itself bounded by the model's own cap on the
+/// sample.
+fn object_positions(observed: &Observed) -> usize {
     match &observed.kind {
-        Kind::Unconstrained | Kind::Conflicting => return node,
+        Kind::Object(shape) => {
+            1 + shape
+                .members
+                .values()
+                .map(|(_, held)| object_positions(held))
+                .sum::<usize>()
+        }
+        Kind::Array(items) => object_positions(items),
+        Kind::Unconstrained | Kind::Boolean | Kind::Number | Kind::String { .. } | Kind::Conflicting => 0,
+    }
+}
+
+/// Render the schema of ONE position, as the member named `member` of the object above
+/// it (or as the document's root schema).
+///
+/// A nested object is hoisted into its own named schema and referred to with `$ref`,
+/// which is the reusable type a client generating code from the document gets. Only
+/// where the dialect HAS a components section, and only for a position that is an
+/// object and nothing else: in OpenAPI 3.0 a `$ref` has no siblings, so hoisting a
+/// position the sample also showed `null` at would drop the `nullable` it showed.
+fn render_member(
+    observed: &Observed,
+    dialect: Dialect,
+    member: &str,
+    components: &mut Components,
+) -> Node {
+    let hoistable = dialect == Dialect::OpenApi3
+        && !observed.nullable
+        && matches!(observed.kind, Kind::Object(_));
+    if !hoistable {
+        return Node::Object(render(observed, dialect, member, components));
+    }
+    // The name is taken BEFORE the body is rendered, so a nested object of the same
+    // name deeper down cannot take this one's name; the entry is appended AFTER, so
+    // it follows the schemas it refers to.
+    let name = components.reserve(member);
+    let body = Node::Object(render(observed, dialect, member, components));
+    components.hoisted.push((name.clone(), body));
+    Node::Object(vec![(
+        "$ref".to_string(),
+        Node::Text(format!("{COMPONENT_REF_PREFIX}{name}")),
+    )])
+}
+
+/// The keywords of one schema node, in the order the document carries them.
+///
+/// No keywords at all is the empty schema: it constrains nothing, which is the honest
+/// answer for a position the sample disagreed about or never showed a value at.
+fn render(
+    observed: &Observed,
+    dialect: Dialect,
+    member: &str,
+    components: &mut Components,
+) -> Vec<(String, Node)> {
+    let mut node: Vec<(String, Node)> = Vec::new();
+    match &observed.kind {
+        Kind::Unconstrained | Kind::Conflicting => {}
         Kind::Boolean => write_type(&mut node, "boolean", observed.nullable, dialect),
-        Kind::Integer => write_type(&mut node, "integer", observed.nullable, dialect),
         Kind::Number => write_type(&mut node, "number", observed.nullable, dialect),
         Kind::String { date_time } => {
             write_type(&mut node, "string", observed.nullable, dialect);
             if *date_time {
-                node.insert(
-                    "format".to_string(),
-                    Value::String(DATE_TIME_FORMAT.to_string()),
-                );
+                node.push(("format".to_string(), Node::text(DATE_TIME_FORMAT)));
             }
         }
         Kind::Array(items) => {
             write_type(&mut node, "array", observed.nullable, dialect);
-            node.insert("items".to_string(), Value::Object(render(items, dialect)));
+            // Every element of the array sits at one position, which is the array's
+            // own member as far as naming goes: an array of objects at `orders` holds
+            // the schema named for `orders`.
+            node.push((
+                "items".to_string(),
+                render_member(items, dialect, member, components),
+            ));
         }
         Kind::Object(shape) => {
             write_type(&mut node, "object", observed.nullable, dialect);
             // A member is required when EVERY object seen at this position carried
-            // it; one that only some carried is optional.
-            let required: Vec<Value> = shape
-                .members
-                .iter()
-                .filter(|(_, (seen, _))| *seen >= shape.samples)
-                .map(|(name, _)| Value::String(name.clone()))
-                .collect();
-            // Neither dialect allows an empty `required` array, so an object with
-            // no member common to the whole sample carries no `required` at all.
+            // it; one that only some carried is optional. Neither dialect allows an
+            // empty `required` array, so an object with no member common to the whole
+            // sample carries no `required` at all.
+            let required = in_required_order(
+                shape
+                    .members
+                    .iter()
+                    .filter(|(_, (seen, _))| *seen >= shape.samples)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+            );
             if !required.is_empty() {
-                node.insert("required".to_string(), Value::Array(required));
+                node.push((
+                    "required".to_string(),
+                    Node::List(required.into_iter().map(Node::Text).collect()),
+                ));
             }
-            node.insert(
+            node.push((
                 "properties".to_string(),
-                Value::Object(
+                Node::Object(
                     shape
                         .members
                         .iter()
-                        .map(|(name, (_, member))| {
-                            (name.clone(), Value::Object(render(member, dialect)))
+                        .map(|(name, (_, held))| {
+                            (name.clone(), render_member(held, dialect, name, components))
                         })
                         .collect(),
                 ),
-            );
+            ));
         }
     }
     node
 }
 
+/// The member names of a `required` list, in the order the document lists them.
+///
+/// That order is neither the sample's nor alphabetical. AWS holds a schema's required
+/// member names in a hash SET and writes them out in ITS iteration order, which groups
+/// the names by hash bucket — the order the `AWSEvent` envelope of every schema AWS
+/// publishes is listed in (see [`crate::state::aws_managed_schemas`], which the unit
+/// test below pins this function against). It is a deterministic function of the names
+/// themselves, so it is reproduced rather than guessed: the document is the product of
+/// this operation, and clients hash, diff and generate code from its text.
+///
+/// `names` arrives in sorted order (it is collected from a sorted map), which is the
+/// order the names go into the set — and which is what decides the order of two names
+/// that share a bucket.
+///
+/// What this is pinned by, and what it therefore assumes: the published envelope is the
+/// one member set this repository holds AWS's own bytes for (every catalogue entry lists
+/// the same nine names), and reproducing it takes both the bucket grouping and that
+/// sorted insertion order. A set of names AWS inserted in some other order would be
+/// written in some other order than this, and nothing available here would show it; the
+/// envelope's nine names and the recorded three-member sample both come out exactly
+/// right, which is the whole of the evidence. The model is also only as detailed as that
+/// evidence needs: it reproduces the bucket grouping and the table's growth, and not what
+/// a hash table does to a bucket that grows long (a chain of eight or more in a table of
+/// sixty-four or more is reordered in the original), so a `required` list of some fifty
+/// members or more may be ordered differently there. Both limits are this function's, so
+/// a document whose order ever disagrees with AWS's is traceable to here.
+fn in_required_order(mut names: Vec<String>) -> Vec<String> {
+    let buckets = hash_table_buckets(names.len());
+    // A stable sort by bucket: names that fall in one bucket keep the order they were
+    // inserted in, which is what a bucket's chain holds them in.
+    names.sort_by_key(|name| hash_bucket(name, buckets));
+    names
+}
+
+/// `java.lang.String.hashCode`: `h = 31 * h + c` over the string's UTF-16 code units,
+/// wrapping at 32 bits.
+fn string_hash(text: &str) -> u32 {
+    text.encode_utf16().fold(0u32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(unit))
+    })
+}
+
+/// Which of `buckets` buckets a name falls in: its hash spread by its own high half,
+/// masked to the table size.
+fn hash_bucket(name: &str, buckets: usize) -> usize {
+    let hash = string_hash(name);
+    let spread = hash ^ (hash >> 16);
+    (spread as usize) & (buckets - 1)
+}
+
+/// How many buckets a hash table holding `count` names has: the default sixteen,
+/// doubled while the count would pass the three-quarters load factor the table grows
+/// at.
+fn hash_table_buckets(count: usize) -> usize {
+    let mut buckets = DEFAULT_HASH_TABLE_BUCKETS;
+    while count.saturating_mul(4) > buckets.saturating_mul(3) {
+        buckets = buckets.saturating_mul(2);
+    }
+    buckets
+}
+
 /// Write a node's `type`, in the spelling `dialect` uses for a position that also
 /// held `null`.
-fn write_type(node: &mut Map<String, Value>, name: &str, nullable: bool, dialect: Dialect) {
-    let named = Value::String(name.to_string());
-    let r#type = match (nullable, dialect) {
-        (false, _) => named,
+fn write_type(node: &mut Vec<(String, Node)>, name: &str, nullable: bool, dialect: Dialect) {
+    let named = Node::text(name);
+    match (nullable, dialect) {
+        (false, _) => node.push(("type".to_string(), named)),
         // OpenAPI 3.0 has no `null` type: a nullable position is the type plus the
         // `nullable` keyword.
         (true, Dialect::OpenApi3) => {
-            node.insert("nullable".to_string(), Value::Bool(true));
-            named
+            node.push(("type".to_string(), named));
+            node.push(("nullable".to_string(), Node::Flag(true)));
         }
         // JSON Schema draft-04 has no `nullable` keyword: a nullable position is a
         // union of the type with `null`.
-        (true, Dialect::JsonSchemaDraft4) => {
-            Value::Array(vec![named, Value::String("null".to_string())])
-        }
-    };
-    node.insert("type".to_string(), r#type);
+        (true, Dialect::JsonSchemaDraft4) => node.push((
+            "type".to_string(),
+            Node::List(vec![named, Node::text("null")]),
+        )),
+    }
 }
 
 /// Wrap the inferred schema in the document envelope `dialect` defines.
-fn document(root: &Observed, dialect: Dialect) -> Value {
-    let schema = render(root, dialect);
+fn document(root: &Observed, dialect: Dialect) -> Node {
+    let mut components = Components::default();
+    // The root's name is taken before anything is hoisted, so a member of the same
+    // name is hoisted under another name rather than over the root.
+    components.taken.insert(ROOT_SCHEMA_NAME.to_string());
+    let schema = Node::Object(render(root, dialect, ROOT_SCHEMA_NAME, &mut components));
     match dialect {
         // An OpenAPI document describes an API, so the inferred shape is a component
         // schema; there are no operations to describe, hence the empty `paths`.
         Dialect::OpenApi3 => {
-            let mut schemas = Map::new();
-            schemas.insert(ROOT_SCHEMA_NAME.to_string(), Value::Object(schema));
-            let mut components = Map::new();
-            components.insert("schemas".to_string(), Value::Object(schemas));
-            let mut info = Map::new();
-            info.insert(
-                "version".to_string(),
-                Value::String(DOCUMENT_VERSION.to_string()),
-            );
-            info.insert(
-                "title".to_string(),
-                Value::String(ROOT_SCHEMA_NAME.to_string()),
-            );
-            let mut document = Map::new();
-            document.insert(
-                "openapi".to_string(),
-                Value::String(OPENAPI_VERSION.to_string()),
-            );
-            document.insert("info".to_string(), Value::Object(info));
-            document.insert("paths".to_string(), Value::Object(Map::new()));
-            document.insert("components".to_string(), Value::Object(components));
-            Value::Object(document)
+            let mut schemas = vec![(ROOT_SCHEMA_NAME.to_string(), schema)];
+            schemas.append(&mut components.hoisted);
+            Node::Object(vec![
+                ("openapi".to_string(), Node::text(OPENAPI_VERSION)),
+                (
+                    "info".to_string(),
+                    Node::Object(vec![
+                        ("version".to_string(), Node::text(DOCUMENT_VERSION)),
+                        ("title".to_string(), Node::text(ROOT_SCHEMA_NAME)),
+                    ]),
+                ),
+                ("paths".to_string(), Node::Object(Vec::new())),
+                (
+                    "components".to_string(),
+                    Node::Object(vec![("schemas".to_string(), Node::Object(schemas))]),
+                ),
+            ])
         }
         // A JSON Schema document IS the schema: the dialect and the name go beside
         // the inferred keywords rather than wrapping them.
         Dialect::JsonSchemaDraft4 => {
-            let mut document = Map::new();
-            document.insert(
-                "$schema".to_string(),
-                Value::String(JSON_SCHEMA_DRAFT4.to_string()),
-            );
-            document.insert(
-                "title".to_string(),
-                Value::String(ROOT_SCHEMA_NAME.to_string()),
-            );
-            for (keyword, value) in schema {
-                document.insert(keyword, value);
+            let mut node = vec![
+                ("$schema".to_string(), Node::text(JSON_SCHEMA_DRAFT4)),
+                ("title".to_string(), Node::text(ROOT_SCHEMA_NAME)),
+            ];
+            if let Node::Object(keywords) = schema {
+                node.extend(keywords);
             }
-            Value::Object(document)
+            Node::Object(node)
         }
     }
 }
@@ -533,7 +805,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Unify the whole sample into one description, then render it once: the
         // events describe the same position, so this is the same join the elements
-        // of an array go through.
+        // of an array go through. The sample's size is the model's bound (ten entries
+        // of at most 100000 bytes), enforced before this handler runs.
         let mut root = Observed::of(Kind::Unconstrained);
         for (index, event) in input.events.iter().enumerate() {
             // `serde_json` refuses an event that is not JSON — including one nested
@@ -568,8 +841,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             root = root.merge(observe(&event));
         }
 
+        // How many schemas the unified sample describes — one per object position,
+        // which is what the document names and writes. Counted off the unified
+        // description, so a sample that repeats one shape in ten events counts it
+        // once, and checked BEFORE the document is written. See
+        // `crate::state::MAX_INFERRED_SCHEMAS`.
+        let schemas = object_positions(&root);
+        if schemas > crate::state::MAX_INFERRED_SCHEMAS {
+            return Err(GetDiscoveredSchemaErrorModeled::BadRequestException(
+                crate::state::too_many_inferred_schemas(schemas),
+            )
+            .into());
+        }
+
         Ok(GetDiscoveredSchemaOutput {
-            content: Some(document(&root, dialect).to_string()),
+            content: Some(document(&root, dialect).to_json()),
         })
     }
 }
@@ -598,11 +884,141 @@ mod tests {
         let merged = observe(&Value::String("x".to_string()))
             .merge(observe(&serde_json::json!({"a": 1})));
         for dialect in [Dialect::OpenApi3, Dialect::JsonSchemaDraft4] {
-            let rendered = render(&merged, dialect);
+            let mut components = Components::default();
+            let rendered = render(&merged, dialect, "m", &mut components);
             assert!(
                 rendered.is_empty(),
                 "case {dialect:?}: a disagreeing position must constrain nothing, got {rendered:?}"
             );
         }
+    }
+
+    /// The `required` order this operation writes is the one AWS's own documents
+    /// carry: the `AWSEvent` envelope of every schema the service-owned catalogue
+    /// publishes lists its nine members in it, and that list is AWS's own — so this
+    /// pins [`in_required_order`] against AWS's bytes rather than against this test's
+    /// expectation.
+    #[test]
+    fn required_is_ordered_as_the_published_aws_event_envelope() {
+        let mut envelopes = 0;
+        for published in crate::state::aws_managed_schemas() {
+            let document: Value = serde_json::from_str(&published.content).unwrap_or_else(|e| {
+                panic!("case {}: the catalogue is JSON ({e})", published.name)
+            });
+            let envelope = &document["components"]["schemas"]
+                [crate::state::EVENT_ENVELOPE_COMPONENT]["required"];
+            let published_order: Vec<String> = envelope
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("case {}: the envelope lists its members", published.name)
+                })
+                .iter()
+                .map(|name| name.as_str().unwrap_or_default().to_string())
+                .collect();
+            // The names as this operation holds them before it writes them: the
+            // keys of a sorted map.
+            let mut sorted = published_order.clone();
+            sorted.sort();
+            let ordered = in_required_order(sorted);
+            assert_eq!(
+                ordered, published_order,
+                "case {}: expected {published_order:?}, got {ordered:?}",
+                published.name
+            );
+            envelopes += 1;
+        }
+        assert!(
+            envelopes > 0,
+            "the catalogue must publish at least one envelope to pin the order against"
+        );
+    }
+
+    /// Whatever the names, a `required` list is exactly the member set it was given:
+    /// the order is a permutation, never a filter, and it does not depend on the
+    /// order the names were handed over in.
+    #[test]
+    fn the_required_order_is_a_permutation_of_the_members() {
+        // Rows: one name, names in one bucket and names across many, a count past the
+        // load factor the table grows at (so the table is a bigger one), names
+        // differing only in case, and non-ASCII names.
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            ("one member", vec!["m".to_string()]),
+            (
+                "the recorded sample's members",
+                vec!["detail".to_string(), "id".to_string(), "name".to_string()],
+            ),
+            (
+                "more members than the table's load factor allows",
+                (0..40).map(|index| format!("member-{index:02}")).collect(),
+            ),
+            (
+                "names differing only in case",
+                vec!["Id".to_string(), "iD".to_string(), "id".to_string()],
+            ),
+            (
+                "non-ASCII names",
+                vec!["caf\u{e9}".to_string(), "\u{30b9}\u{30ad}\u{30fc}".to_string()],
+            ),
+        ];
+        for (case, names) in cases {
+            let mut sorted = names.clone();
+            sorted.sort();
+            let ordered = in_required_order(sorted.clone());
+            let mut back = ordered.clone();
+            back.sort();
+            assert_eq!(
+                back, sorted,
+                "case {case:?}: the order must keep every member exactly once, got {ordered:?}"
+            );
+            // The same names, listed again, are written in the same order: the order
+            // is a function of the names alone, so one sample always yields one
+            // document.
+            assert_eq!(
+                in_required_order(sorted),
+                ordered,
+                "case {case:?}: the order must be a function of the names alone"
+            );
+        }
+    }
+
+    /// A hoisted schema is named after the member it sits at, and two positions of the
+    /// same name get two names rather than one schema.
+    #[test]
+    fn a_hoisted_schema_is_named_after_its_member() {
+        for (member, expected) in [
+            ("detail", "Detail"),
+            ("order", "Order"),
+            ("order-line", "OrderLine"),
+            ("order_line_item", "OrderLineItem"),
+            ("detail.sub", "DetailSub"),
+            ("ALLCAPS", "ALLCAPS"),
+            ("caf\u{e9}", "Caf\u{e9}"),
+            ("--", UNNAMEABLE_COMPONENT_NAME),
+            ("", UNNAMEABLE_COMPONENT_NAME),
+        ] {
+            let derived = component_name(member);
+            assert_eq!(
+                derived, expected,
+                "case {member:?}: expected {expected:?}, got {derived:?}"
+            );
+        }
+
+        let mut components = Components::default();
+        components.taken.insert(ROOT_SCHEMA_NAME.to_string());
+        let names: Vec<String> = (0..3).map(|_| components.reserve("detail")).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Detail".to_string(),
+                "Detail2".to_string(),
+                "Detail3".to_string()
+            ],
+            "two positions of one name must not share a schema, got {names:?}"
+        );
+        assert_eq!(
+            components.reserve(ROOT_SCHEMA_NAME),
+            format!("{ROOT_SCHEMA_NAME}2"),
+            "a member named like the root must not take the root's name"
+        );
     }
 }

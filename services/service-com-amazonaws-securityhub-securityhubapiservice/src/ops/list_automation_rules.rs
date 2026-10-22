@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAutomationRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAutomationRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAutomationRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the metadata of every automation rule [`crate::state`] holds for the
+//! caller's account and Region — `ENABLED` and `DISABLED` alike — in the order
+//! Security Hub CSPM applies them, paged with an opaque `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +130,42 @@ impl<Eng> ListAutomationRules<Eng> {
     }
 }
 
+/// `MaxResults`' upper bound (`@range(min: 1, max: 100)` on `MaxResults`), which is
+/// also the page size used when the caller names none.
+pub const MAX_RESULTS_LIMIT: usize = 100;
+
+/// Marker this operation's opaque `NextToken` carries, so a token minted for
+/// another list — or a value a caller invented — is rejected rather than read as an
+/// offset.
+const NEXT_TOKEN_PREFIX: &str = "securityhub:automationrules:";
+
+/// A `NextToken` resuming at `offset` in the ordered result.
+fn encode_next_token(offset: usize) -> String {
+    crate::state::encode_list_token(NEXT_TOKEN_PREFIX, offset)
+}
+
+/// The offset a `NextToken` resumes at, or `None` when it is not one this operation
+/// minted.
+fn decode_next_token(token: &str) -> Option<usize> {
+    crate::state::decode_list_token(NEXT_TOKEN_PREFIX, token)
+}
+
+/// The `AutomationRulesMetadata` a stored rule reports: the configuration members
+/// without `Criteria` and `Actions`, which only `BatchGetAutomationRules` returns.
+fn rule_metadata(rule: &crate::state::AutomationRule) -> AutomationRulesMetadata {
+    AutomationRulesMetadata {
+        rule_arn: Some(rule.rule_arn.clone()),
+        rule_status: Some(rule.rule_status.clone()),
+        rule_order: Some(rule.rule_order),
+        rule_name: Some(rule.rule_name.clone()),
+        description: Some(rule.description.clone()),
+        is_terminal: Some(rule.is_terminal),
+        created_at: Some(rule.created_at),
+        updated_at: Some(rule.updated_at),
+        created_by: Some(rule.created_by.clone()),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListAutomationRules<Eng>
 {
@@ -153,18 +183,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAutomationRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAutomationRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAutomationRules"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAutomationRulesError::Modeled(ListAutomationRulesErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+        let invalid_input = |message: String| {
+            ListAutomationRulesError::Modeled(
+                ListAutomationRulesErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                }),
+            )
+        };
+
+        let hub = crate::state::hub_key(ctx);
+        let store = state.lock();
+        if !store.hubs.contains_key(&hub) {
+            return Err(ListAutomationRulesErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {} is not subscribed to Security Hub CSPM in Region {}",
+                        hub.0, hub.1
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let rules = store.rules_in_order(&hub);
+
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator already refuses a value outside it; clamping here keeps the page
+        // bounded even if this handler is reached another way.
+        let page_size = input.max_results.map_or(MAX_RESULTS_LIMIT, |requested| {
+            usize::try_from(requested)
+                .unwrap_or(MAX_RESULTS_LIMIT)
+                .clamp(1, MAX_RESULTS_LIMIT)
+        });
+        let offset = match input.next_token.as_deref() {
+            Some(token) => decode_next_token(token).ok_or_else(|| {
+                invalid_input("NextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+        if offset > rules.len() {
+            return Err(invalid_input(
+                "NextToken refers to a position past the end of the result set".to_string(),
+            ));
+        }
+
+        let page: Vec<AutomationRulesMetadata> = rules
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(rule_metadata)
+            .collect();
+        let next_offset = offset + page.len();
+        let next_token = (next_offset < rules.len()).then(|| encode_next_token(next_offset));
+
+        Ok(ListAutomationRulesOutput {
+            automation_rules_metadata: Some(page),
+            next_token,
+        })
     }
 }

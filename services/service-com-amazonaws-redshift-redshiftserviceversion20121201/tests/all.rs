@@ -17,5 +17,7 @@ mod cluster_lifecycle;
 mod cluster_parameter_groups;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
+#[path = "all/orderable_cluster_options.rs"]
+mod orderable_cluster_options;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

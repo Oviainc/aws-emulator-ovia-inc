@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeServiceUpdates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeServiceUpdates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeServiceUpdates::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -77,6 +73,8 @@
 //!   were specified.
 //! * `InvalidParameterValueException` (HTTP 400) — The value for a parameter is invalid.
 //! * `ServiceUpdateNotFoundFault` (HTTP 404) — The service update doesn't exist
+
+use std::time::SystemTime;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -151,18 +149,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeServiceUpdates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeServiceUpdatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeServiceUpdates"))
+        // A pure read. The catalog is published rather than created, and an
+        // update's `ServiceUpdateStatus` follows from its dates and the clock,
+        // so this handler writes nothing: a later caller sees exactly what it
+        // would have seen had this call never happened.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+        let now = SystemTime::now();
+
+        // `MaxRecords` and `Marker` carry no modelled constraint, so the
+        // boundary validator passes anything; this operation models
+        // `InvalidParameterValueException` for a value it cannot serve, which is
+        // the channel for both.
+        let page_size = crate::state::unbounded_page_size(input.max_records)
+            .map_err(invalid_parameter_value)?;
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(invalid_parameter_value(format!(
+                        "Invalid value {marker} for Marker."
+                    )))
+                }
+            },
+            None => None,
+        };
+
+        // `ServiceUpdateStatus` filters the answer down to the statuses it
+        // names. Its member is a modelled enum, so a filter naming a value
+        // outside `available | cancelled | expired` is already refused by the
+        // boundary validator and cannot reach here.
+        let statuses = input.service_update_status.unwrap_or_default();
+        let matches_status = |update: &crate::state::ServiceUpdateRecord| {
+            statuses.is_empty() || statuses.iter().any(|status| status == update.status(now))
+        };
+
+        let store = state.lock();
+
+        // `ServiceUpdateName` is "the unique ID of the service update", so a
+        // name no published update carries is the modelled not-found rather
+        // than an empty page; pagination does not apply to a single-record
+        // lookup.
+        if let Some(name) = input.service_update_name.as_deref() {
+            let Some(update) = store.service_updates.get(name) else {
+                return Err(
+                    DescribeServiceUpdatesErrorModeled::ServiceUpdateNotFoundFault(
+                        ServiceUpdateNotFoundFault {
+                            message: Some(format!("Service update {name} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let page = if matches_status(update) {
+                vec![update.to_modeled(now)]
+            } else {
+                Vec::new()
+            };
+            return Ok(DescribeServiceUpdatesOutput {
+                marker: None,
+                service_updates: Some(page),
+            });
+        }
+
+        let mut page: Vec<ServiceUpdate> = Vec::new();
+        let mut marker = None;
+        for (key, update) in store.service_updates.iter().filter(|(key, update)| {
+            resume_from.as_ref().is_none_or(|from| *key >= from) && matches_status(update)
+        }) {
+            if page.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from.
+                marker = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(update.to_modeled(now));
+        }
+
+        Ok(DescribeServiceUpdatesOutput {
+            marker,
+            service_updates: Some(page),
+        })
     }
+}
+
+/// `message` as this operation's modelled `InvalidParameterValueException`.
+fn invalid_parameter_value(message: String) -> DescribeServiceUpdatesError {
+    DescribeServiceUpdatesErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

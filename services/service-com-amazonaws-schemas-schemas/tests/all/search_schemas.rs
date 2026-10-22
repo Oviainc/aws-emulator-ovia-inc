@@ -2,6 +2,13 @@
 
 //! End-to-end HTTP tests for `SearchSchemas`.
 //!
+//! RULE under test: a search selects the schemas of the named registry by the event
+//! keywords each one DECLARES — the event source and detail type an EventBridge schema
+//! document records in its `x-amazon-events-source` / `x-amazon-events-detail-type`
+//! extensions — matched case-insensitively as substrings, every requested keyword
+//! having to occur. A schema that declares no event keyword is selected by no search,
+//! and neither a schema's name nor the rest of its document text is searched.
+//!
 //! Every case drives the real wire path: a signed `restJson1` request through
 //! `MultiServiceRouter::dispatch`, exactly as the production router serves it. The
 //! schemas a search reports are created through `CreateSchema` and read back through
@@ -20,33 +27,63 @@ use super::registry_schema_lifecycle::{
 /// The registry every case below searches.
 const REGISTRY: &str = "search-registry";
 
-/// One schema the table creates: its name and the content stored for version 1.
+/// One schema the table creates.
 ///
-/// Rows differ along everything the keyword rule generalises over: where the keyword
-/// occurs (name only, content only, both), the case of the stored text, and the
-/// alphabet and form of the content.
-const STORED: &[(&str, &str, &str)] = &[
-    // (schema name, Type, Content)
-    (
-        "order.placed_v1",
-        "OpenApi3",
-        r#"{"title":"OrderPlaced","type":"object"}"#,
-    ),
-    (
-        "order.cancelled_v1",
-        "JSONSchemaDraft4",
-        r#"{"title":"OrderCancelled","type":"object"}"#,
-    ),
-    // The keyword "order" occurs in this schema's CONTENT and not in its name.
-    (
-        "payment-received",
-        "OpenApi3",
-        r#"{"title":"PaymentReceived","detail":"an order id"}"#,
-    ),
-    ("inventory", "OpenApi3", r#"{"openapi":"3.0.0"}"#),
-    // The smallest document there is beyond `{}`: its text contributes a keyword
-    // ("object") that this schema's NAME does not carry.
-    ("Mixed-CASE-Name", "OpenApi3", r#"{"type":"object"}"#),
+/// Rows differ along everything the keyword rule generalises over: which of the two
+/// extensions carries the keyword, where in the document they sit (an `OpenApi3`
+/// component, a draft-04 document's own root), the case of the declared text, and
+/// whether the schema declares any event keyword at all.
+struct Stored {
+    /// The schema's name. Two rows carry a keyword in the NAME that nothing declares,
+    /// because a name is not what a search matches.
+    name: &'static str,
+    /// A member of `TYPE_VALUES`.
+    schema_type: &'static str,
+    content: &'static str,
+    /// One keyword that selects exactly this row, for the summary assertions;
+    /// `None` for a row no keyword can select.
+    selector: Option<&'static str>,
+}
+
+/// The schemas every case below searches over.
+const STORED: &[Stored] = &[
+    // Declares its event in the `AWSEvent` component, as a discovered OpenAPI schema
+    // does.
+    Stored {
+        name: "orders.placed",
+        schema_type: "OpenApi3",
+        content: r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"OrderPlaced"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-detail-type":"Order Placed v1","x-amazon-events-source":"my.orders","properties":{"detail":{"$ref":"#/components/schemas/OrderPlaced"}}},"OrderPlaced":{"type":"object","properties":{"id":{"type":"string"}}}}}}"##,
+        selector: Some("placed"),
+    },
+    // Declares the same source at the root of a draft-04 document: the extensions are
+    // a property of the component that describes the event, wherever it sits.
+    Stored {
+        name: "orders.cancelled",
+        schema_type: "JSONSchemaDraft4",
+        content: r##"{"$schema":"http://json-schema.org/draft-04/schema#","title":"OrderCancelled","x-amazon-events-source":"my.orders","x-amazon-events-detail-type":"Order Cancelled","type":"object"}"##,
+        selector: Some("cancelled"),
+    },
+    Stored {
+        name: "payments",
+        schema_type: "OpenApi3",
+        content: r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"PaymentReceived"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-source":"my.payments","x-amazon-events-detail-type":"Payment Received","properties":{}}}}}"#,
+        selector: Some("received"),
+    },
+    // Declares its event in upper case, and is selected by a lower-case keyword.
+    Stored {
+        name: "MiXeD-case",
+        schema_type: "OpenApi3",
+        content: r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Mixed"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-source":"my.MIXED","x-amazon-events-detail-type":"Case SHIFTED","properties":{}}}}}"#,
+        selector: Some("shifted"),
+    },
+    // Declares NO event: a document a caller wrote by hand. Its name and its text both
+    // carry "orders", and no search selects it.
+    Stored {
+        name: "orders-report",
+        schema_type: "OpenApi3",
+        content: r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Orders report"},"paths":{},"components":{"schemas":{"Report":{"type":"object","properties":{"orders":{"type":"array","items":{"type":"string"}}}}}}}"#,
+        selector: None,
+    },
 ];
 
 /// `GET /v1/registries/name/{registry}/schemas/search?keywords=…`, with the few
@@ -61,67 +98,68 @@ fn search_uri(registry: &str, keywords: &str) -> String {
 /// Create `REGISTRY` and every row of [`STORED`] in it.
 async fn seed(emulator: &Emulator) {
     create_registry(emulator, REGISTRY).await;
-    for (name, schema_type, content) in STORED {
+    for stored in STORED {
         let created = emulator
             .call(
                 "POST",
-                &schema_uri(REGISTRY, name),
-                Some(json!({"Content": content, "Type": schema_type})),
+                &schema_uri(REGISTRY, stored.name),
+                Some(json!({"Content": stored.content, "Type": stored.schema_type})),
             )
             .await;
         assert_eq!(
             created.status, 201,
-            "case {name:?}: expected 201 from CreateSchema, got {} {:?}",
-            created.status, created.body
+            "case {:?}: expected 201 from CreateSchema, got {} {:?}",
+            stored.name, created.status, created.body
         );
     }
 }
 
-/// RULE: a search reports exactly the schemas of the named registry whose own text —
-/// the schema name and the content of every stored version — includes EVERY keyword
-/// the request names, matched as a case-insensitive substring; a request that names no
-/// keyword limits nothing.
+/// RULE: a search reports exactly the schemas of the named registry whose DECLARED
+/// event keywords include EVERY keyword the request names, matched as a
+/// case-insensitive substring; a schema that declares none is reported by no search.
 #[tokio::test]
-async fn keywords_select_exactly_the_schemas_whose_text_includes_every_one() {
+async fn keywords_select_exactly_the_schemas_that_declare_them() {
     let emulator = Emulator::new();
     seed(&emulator).await;
 
     // Results come back in the registry's key order, which is byte order over the
-    // schema names: upper case sorts before lower case.
+    // schema names: upper case sorts before lower case. `orders-report` declares no
+    // event, so it is in none of these.
     let everything = vec![
-        "Mixed-CASE-Name",
-        "inventory",
-        "order.cancelled_v1",
-        "order.placed_v1",
-        "payment-received",
+        "MiXeD-case",
+        "orders.cancelled",
+        "orders.placed",
+        "payments",
     ];
 
     for (keywords, expected) in [
-        // One keyword in the name of two schemas and in the content of a third.
-        (
-            "order",
-            vec!["order.cancelled_v1", "order.placed_v1", "payment-received"],
-        ),
+        // The whole declared source, and a substring of it.
+        ("my.orders", vec!["orders.cancelled", "orders.placed"]),
+        ("orders", vec!["orders.cancelled", "orders.placed"]),
         // Matching is case-insensitive on both sides.
-        (
-            "ORDER",
-            vec!["order.cancelled_v1", "order.placed_v1", "payment-received"],
-        ),
-        ("mixed-case", vec!["Mixed-CASE-Name"]),
-        // A keyword that occurs only in the stored content.
-        ("openapi", vec!["inventory"]),
-        ("3.0.0", vec!["inventory"]),
-        // Every keyword must occur, so a second keyword only narrows.
-        ("order placed", vec!["order.placed_v1"]),
-        ("order,cancelled", vec!["order.cancelled_v1"]),
-        ("order zzz", vec![]),
-        // A substring, not a prefix and not an exact name.
-        ("placed_v1", vec!["order.placed_v1"]),
-        ("laced", vec!["order.placed_v1"]),
-        // No keyword at all limits nothing.
+        ("ORDERS", vec!["orders.cancelled", "orders.placed"]),
+        ("mixed", vec!["MiXeD-case"]),
+        ("SHIFTED", vec!["MiXeD-case"]),
+        // A keyword of the declared detail type rather than of the source.
+        ("placed", vec!["orders.placed"]),
+        ("payment received", vec!["payments"]),
+        // Every keyword must occur, so a second keyword only narrows: one from the
+        // source and one from the detail type.
+        ("orders placed", vec!["orders.placed"]),
+        ("my,cancelled", vec!["orders.cancelled"]),
+        ("orders zzz", vec![]),
+        // A schema's NAME is not searched: two rows carry "report" in their name or
+        // their document text and neither declares it.
+        ("report", vec![]),
+        ("orders-report", vec![]),
+        // Nor is the rest of the document: this row's text carries "Report" and an
+        // `orders` property, and it declares no event at all.
+        ("openapi", vec![]),
+        ("3.0.0", vec![]),
+        // A request that names no keyword limits nothing, which is every schema the
+        // registry indexes.
         ("", everything.clone()),
-        // Nothing stored includes this.
-        ("no-schema-says-this", vec![]),
+        ("no-event-says-this", vec![]),
     ] {
         let answer = emulator.call("GET", &search_uri(REGISTRY, keywords), None).await;
         assert_eq!(
@@ -150,9 +188,16 @@ async fn a_match_reports_the_stored_schema_and_its_versions() {
     let emulator = Emulator::new();
     seed(&emulator).await;
 
-    for (name, schema_type, _) in STORED {
-        // Each row is selected on its own exact name, so the search returns just it.
-        let answer = emulator.call("GET", &search_uri(REGISTRY, name), None).await;
+    for stored in STORED {
+        // The rows a keyword can select: one that declares no event is reported by no
+        // search, which the selection test above pins.
+        let Some(selector) = stored.selector else {
+            continue;
+        };
+        let name = stored.name;
+        let answer = emulator
+            .call("GET", &search_uri(REGISTRY, selector), None)
+            .await;
         assert_eq!(
             answer.status, 200,
             "case {name:?}: expected 200, got {} {:?}",
@@ -164,7 +209,7 @@ async fn a_match_reports_the_stored_schema_and_its_versions() {
         assert_eq!(
             matches.len(),
             1,
-            "case {name:?}: a schema's own name selects exactly it, got {matches:?}"
+            "case {name:?}: the keyword {selector:?} declares only this schema, got {matches:?}"
         );
         let summary = &matches[0];
 
@@ -176,7 +221,7 @@ async fn a_match_reports_the_stored_schema_and_its_versions() {
         );
         assert_eq!(
             summary["SchemaName"].as_str(),
-            Some(*name),
+            Some(name),
             "case {name:?}: the summary names the stored schema, got {:?}",
             summary["SchemaName"]
         );
@@ -191,7 +236,7 @@ async fn a_match_reports_the_stored_schema_and_its_versions() {
             .as_array()
             .unwrap_or_else(|| panic!("case {name:?}: expected a SchemaVersions array in {summary:?}"));
         // One entry per version this service holds. `CreateSchema` stores version 1
-        // and `UpdateSchema` is still a scaffold (its own stub issue), so one.
+        // and nothing here updates the schema, so one.
         assert_eq!(
             versions.len(),
             1,
@@ -205,7 +250,7 @@ async fn a_match_reports_the_stored_schema_and_its_versions() {
         );
         assert_eq!(
             versions[0]["Type"].as_str(),
-            Some(*schema_type),
+            Some(stored.schema_type),
             "case {name:?}: the version reports the stored Type, got {:?}",
             versions[0]["Type"]
         );
@@ -229,7 +274,9 @@ async fn a_match_reports_the_stored_schema_and_its_versions() {
         );
 
         // And it does not move between reads.
-        let again = emulator.call("GET", &search_uri(REGISTRY, name), None).await;
+        let again = emulator
+            .call("GET", &search_uri(REGISTRY, selector), None)
+            .await;
         assert_eq!(
             again.body["Schemas"][0]["SchemaVersions"][0]["CreatedDate"],
             versions[0]["CreatedDate"],
@@ -267,21 +314,22 @@ fn timestamp_secs(value: &Value, case: &str) -> i64 {
 async fn following_next_token_walks_a_search_exactly_once() {
     let emulator = Emulator::new();
     create_registry(&emulator, REGISTRY).await;
-    // Seven schemas the keyword matches and seven it excludes, interleaved, so a
-    // page boundary can fall between two matches with a non-match on either side.
+    // Seven schemas declaring the keyword's event and seven declaring another,
+    // interleaved, so a page boundary can fall between two matches with a non-match on
+    // either side.
     let mut matching: Vec<String> = Vec::new();
     for index in 0..7 {
         let name = format!("order-{index:02}");
-        create(&emulator, &name, r#"{"a":1}"#).await;
+        create(&emulator, &name, "my.orders").await;
         matching.push(name);
-        create(&emulator, &format!("other-{index:02}"), r#"{"b":2}"#).await;
+        create(&emulator, &format!("other-{index:02}"), "my.widgets").await;
     }
     matching.sort();
 
     for limit in [None, Some(1), Some(2), Some(7), Some(10)] {
         let walked = walk(
             &emulator,
-            &search_uri(REGISTRY, "order"),
+            &search_uri(REGISTRY, "orders"),
             limit,
             schema_names,
         )
@@ -293,7 +341,20 @@ async fn following_next_token_walks_a_search_exactly_once() {
     }
 }
 
-async fn create(emulator: &Emulator, name: &str, content: &str) {
+/// Create a schema declaring `source` as the event source it describes.
+async fn create(emulator: &Emulator, name: &str, source: &str) {
+    let content = json!({
+        "openapi": "3.0.0",
+        "info": {"version": "1.0.0", "title": name},
+        "paths": {},
+        "components": {"schemas": {"AWSEvent": {
+            "type": "object",
+            "x-amazon-events-source": source,
+            "x-amazon-events-detail-type": "Paged Event",
+            "properties": {},
+        }}},
+    })
+    .to_string();
     let created = emulator
         .call(
             "POST",
@@ -317,14 +378,14 @@ async fn a_token_or_limit_a_search_cannot_serve_is_refused() {
     seed(&emulator).await;
 
     let first = emulator
-        .call("GET", &format!("{}&limit=1", search_uri(REGISTRY, "order")), None)
+        .call("GET", &format!("{}&limit=1", search_uri(REGISTRY, "orders")), None)
         .await;
     assert_eq!(first.status, 200, "expected 200, got {:?}", first.body);
     let token = first
         .body
         .get("NextToken")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("three schemas match, so page 1 of 1 carries a token: {:?}", first.body))
+        .unwrap_or_else(|| panic!("two schemas declare this event, so page 1 of 2 carries a token: {:?}", first.body))
         .to_string();
 
     // Rows: the token's own search resumes; every other selection, and an unusable
@@ -332,7 +393,7 @@ async fn a_token_or_limit_a_search_cannot_serve_is_refused() {
     let resumed = emulator
         .call(
             "GET",
-            &format!("{}&limit=1&nextToken={token}", search_uri(REGISTRY, "order")),
+            &format!("{}&limit=1&nextToken={token}", search_uri(REGISTRY, "orders")),
             None,
         )
         .await;
@@ -345,9 +406,9 @@ async fn a_token_or_limit_a_search_cannot_serve_is_refused() {
     for case in [
         format!("{}&limit=1&nextToken={token}", search_uri(REGISTRY, "placed")),
         format!("{}&limit=1&nextToken={token}", search_uri(REGISTRY, "")),
-        format!("{}&limit=1&nextToken=not-a-token", search_uri(REGISTRY, "order")),
-        format!("{}&limit=0", search_uri(REGISTRY, "order")),
-        format!("{}&limit=-1", search_uri(REGISTRY, "order")),
+        format!("{}&limit=1&nextToken=not-a-token", search_uri(REGISTRY, "orders")),
+        format!("{}&limit=0", search_uri(REGISTRY, "orders")),
+        format!("{}&limit=-1", search_uri(REGISTRY, "orders")),
     ] {
         let answer = emulator.call("GET", &case, None).await;
         assert_eq!(
@@ -376,10 +437,11 @@ async fn a_search_naming_more_keywords_than_the_cap_is_refused() {
     let cap = service_com_amazonaws_schemas_schemas::state::MAX_KEYWORDS_PER_SEARCH;
     // Rows: two keywords, each side of the published bound, and one past it.
     for (count, expected) in [(2, 200), (cap - 1, 200), (cap, 200), (cap + 1, 400)] {
-        // Every keyword occurs in `order.placed_v1`, so a request at the cap is a
-        // search that still has an answer to give, not an empty one.
+        // Every keyword occurs in what `orders.placed` declares (source `my.orders`,
+        // detail type `Order Placed v1`), so a request at the cap is a search that
+        // still has an answer to give, not an empty one.
         let keywords: Vec<String> = (0..count)
-            .map(|index| ["order", "placed", "title", "object", "v1"][index % 5].to_string())
+            .map(|index| ["orders", "placed", "v1", "my", "order"][index % 5].to_string())
             .collect();
         let answer = emulator
             .call("GET", &search_uri(REGISTRY, &keywords.join(" ")), None)
@@ -392,8 +454,8 @@ async fn a_search_naming_more_keywords_than_the_cap_is_refused() {
         if expected == 200 {
             assert_eq!(
                 schema_names(&answer),
-                vec!["order.placed_v1"],
-                "case {count} keyword(s): every keyword occurs in exactly one schema"
+                vec!["orders.placed"],
+                "case {count} keyword(s): every keyword is declared by exactly one schema"
             );
         } else {
             assert_eq!(
@@ -428,7 +490,7 @@ async fn searching_a_registry_that_does_not_exist_is_a_404() {
             );
         }
         let answer = emulator
-            .call("GET", &search_uri(registry, "order"), None)
+            .call("GET", &search_uri(registry, "orders"), None)
             .await;
         assert_eq!(
             answer.status, 404,
@@ -453,7 +515,7 @@ async fn a_search_changes_nothing() {
     let before = emulator
         .call("GET", &format!("/v1/registries/name/{REGISTRY}/schemas"), None)
         .await;
-    for keywords in ["order", "", "no-schema-says-this", "openapi"] {
+    for keywords in ["orders", "", "no-event-says-this", "placed"] {
         let answer = emulator.call("GET", &search_uri(REGISTRY, keywords), None).await;
         assert_eq!(
             answer.status, 200,

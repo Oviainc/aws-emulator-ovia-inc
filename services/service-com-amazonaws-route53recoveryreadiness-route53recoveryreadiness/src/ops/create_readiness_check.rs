@@ -186,6 +186,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
+        // THE ACCOUNT-ELIGIBILITY GATE. The readiness feature is closed to accounts
+        // that do not already use it, so a syntactically valid create passes input
+        // validation (above) and is then denied account-wide — before any record is
+        // written, so nothing exists afterwards for a list or a get to report.
+        state.check_create_allowed().map_err(|message| {
+            CreateReadinessCheckErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(message.to_string()),
+            })
+        })?;
+
         if state
             .readiness_checks
             .contains_key(&input.readiness_check_name)

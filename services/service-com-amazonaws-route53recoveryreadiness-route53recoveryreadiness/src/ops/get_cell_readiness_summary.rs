@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCellReadinessSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCellReadinessSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCellReadinessSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the readiness of the cell stored under this name, aggregated over the
+//! readiness checks that watch a resource scoped to it (its own ARN or the ARN of a
+//! cell nested inside it, transitively), or the modelled `ResourceNotFoundException`
+//! when this account has no cell by that name. A reporting operation: it writes
+//! nothing.
+//!
+//! Nothing in this emulator audits the real AWS resources a resource set names, so no
+//! readiness rule has ever been evaluated: every readiness it reports is
+//! [`crate::state::READINESS_UNKNOWN`], and so is the aggregate of them.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +155,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCellReadinessSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCellReadinessSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCellReadinessSummary"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCellReadinessSummaryErrorModeled::InternalServerException(InternalServerException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        if !state.cells.contains_key(&input.cell_name) {
+            return Err(GetCellReadinessSummaryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // One summary per readiness check that watches a resource scoped to this cell,
+        // keyed by check name so the page order — and therefore the cursor — is the same
+        // on every call.
+        let summaries: ::std::collections::BTreeMap<String, ReadinessCheckSummary> = state
+            .readiness_check_names_in_cell(&input.cell_name)
+            .into_iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    ReadinessCheckSummary {
+                        readiness: Some(crate::state::READINESS_UNKNOWN.to_string()),
+                        readiness_check_name: Some(name),
+                    },
+                )
+            })
+            .collect();
+
+        let page = crate::state::page(&summaries, input.max_results, input.next_token.as_deref())
+            .map_err(|message| {
+                GetCellReadinessSummaryErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+            })?;
+
+        Ok(GetCellReadinessSummaryOutput {
+            next_token: page.next_token,
+            // The aggregate of parts that are all UNKNOWN is UNKNOWN — as it is for a
+            // cell no check watches yet.
+            readiness: Some(crate::state::READINESS_UNKNOWN.to_string()),
+            readiness_checks: Some(page.records.into_iter().cloned().collect()),
+        })
     }
 }

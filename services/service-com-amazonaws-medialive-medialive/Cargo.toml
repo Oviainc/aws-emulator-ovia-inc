@@ -8,6 +8,11 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# Hex encoding, for the lowercase-hex request id a response reports when it carries
+# none of its own (`src/service/error_envelope.rs`).
+hex = { workspace = true }
+# SHA-256: mixes a per-process counter and the current instant into that request id.
+sha2 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -26,8 +31,8 @@ tracing = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` for the one case that lets the clock move between two failures.
+tokio = { workspace = true, features = ["time"] }
 # Percent-encodes the URI path labels the group suite's reads carry, rather than
 # carrying a second hand-written encoder. Pinned here rather than through
 # `[workspace.dependencies]` because the root manifest is not editable from a

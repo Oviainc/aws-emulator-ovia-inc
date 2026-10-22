@@ -17,3 +17,8 @@ mod error_semantics;
 mod lexicons_and_speech;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+// The synthesis-task fixtures the task suites share.
+#[path = "all/support.rs"]
+mod support;
+#[path = "all/synthesis_tasks.rs"]
+mod synthesis_tasks;

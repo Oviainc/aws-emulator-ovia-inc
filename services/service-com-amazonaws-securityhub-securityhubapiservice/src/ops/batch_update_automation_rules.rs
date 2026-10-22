@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateAutomationRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateAutomationRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateAutomationRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the stored automation rules the request names: every member an
+//! `UpdateAutomationRulesRequestItem` carries replaces that member of the rule, and
+//! a member it omits leaves the rule as it was. A rule ARN that names no rule in the
+//! caller's account and Region is reported in `UnprocessedAutomationRules` rather
+//! than refusing the whole batch.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateAutomationRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateAutomationRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateAutomationRules"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchUpdateAutomationRulesError::Modeled(
+                BatchUpdateAutomationRulesErrorModeled::InternalException(InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                }),
+            )
+        })?;
+        let invalid_input = |message: String| {
+            BatchUpdateAutomationRulesError::Modeled(
+                BatchUpdateAutomationRulesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        code: Some("InvalidInputException".to_string()),
+                    },
+                ),
+            )
+        };
+
+        let hub = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&hub) {
+            return Err(
+                BatchUpdateAutomationRulesErrorModeled::InvalidAccessException(
+                    InvalidAccessException {
+                        message: Some(format!(
+                            "Account {} is not subscribed to Security Hub CSPM in Region {}",
+                            hub.0, hub.1
+                        )),
+                        code: Some("InvalidAccessException".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every item is checked before any rule is written: whether a request is
+        // valid cannot depend on how far through the batch the server got, so a
+        // criteria or action this emulator cannot evaluate refuses the call without
+        // leaving half the rules updated.
+        for item in &input.update_automation_rules_request_items {
+            if let Some(criteria) = item.criteria.as_ref() {
+                if let Some(member) = crate::state::unsupported_criteria_member(criteria) {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                        "BatchUpdateAutomationRules Criteria {member}"
+                    )));
+                }
+                if let Err(message) = crate::state::validate_criteria(criteria) {
+                    return Err(invalid_input(message));
+                }
+            }
+            // Same cap as the create: an update may not grow a stored rule past the
+            // size a create was held to.
+            if let Some(message) = crate::state::rule_text_violation(
+                item.rule_name.as_deref(),
+                item.description.as_deref(),
+            ) {
+                return Err(invalid_input(message));
+            }
+            for action in item.actions.as_deref().unwrap_or_default() {
+                let Some(action_type) = action.r#type.as_deref() else {
+                    return Err(invalid_input(
+                        "Actions: every action must carry a Type".to_string(),
+                    ));
+                };
+                if action_type != crate::state::ACTION_TYPE_FINDING_FIELDS_UPDATE {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                        "BatchUpdateAutomationRules action type {action_type}"
+                    )));
+                }
+                if action.finding_fields_update.is_none() {
+                    return Err(invalid_input(format!(
+                        "Actions: a {} action must carry FindingFieldsUpdate",
+                        crate::state::ACTION_TYPE_FINDING_FIELDS_UPDATE
+                    )));
+                }
+            }
+            if let Some(status) = item.rule_status.as_deref() {
+                if status != crate::state::RULE_STATUS_ENABLED
+                    && status != crate::state::RULE_STATUS_DISABLED
+                {
+                    return Err(invalid_input(format!(
+                        "RuleStatus {status} is not a RuleStatus value"
+                    )));
+                }
+            }
+        }
+
+        // One instant for the whole call: every rule it changes was updated together.
+        let updated_at = crate::state::now_date_time();
+        let mut processed: Vec<String> = Vec::new();
+        let mut unprocessed: Vec<UnprocessedAutomationRule> = Vec::new();
+
+        for item in input.update_automation_rules_request_items {
+            let key = crate::state::AutomationRuleKey {
+                account_id: hub.0.clone(),
+                region: hub.1.clone(),
+                rule_arn: item.rule_arn.clone(),
+            };
+            let Some(rule) = store.automation_rules.get_mut(&key) else {
+                unprocessed.push(UnprocessedAutomationRule {
+                    rule_arn: Some(item.rule_arn.clone()),
+                    error_code: Some(crate::state::RULE_ERROR_CODE_NOT_FOUND),
+                    error_message: Some(format!(
+                        "No automation rule with ARN {} exists in this account and Region",
+                        item.rule_arn
+                    )),
+                });
+                continue;
+            };
+
+            if let Some(rule_status) = item.rule_status {
+                rule.rule_status = rule_status;
+            }
+            if let Some(rule_order) = item.rule_order {
+                rule.rule_order = rule_order;
+            }
+            if let Some(rule_name) = item.rule_name {
+                rule.rule_name = rule_name;
+            }
+            if let Some(description) = item.description {
+                rule.description = description;
+            }
+            if let Some(is_terminal) = item.is_terminal {
+                rule.is_terminal = is_terminal;
+            }
+            if let Some(criteria) = item.criteria {
+                rule.criteria = criteria;
+            }
+            if let Some(actions) = item.actions {
+                rule.actions = actions;
+            }
+            rule.updated_at = updated_at;
+
+            processed.push(item.rule_arn);
+        }
+
+        Ok(BatchUpdateAutomationRulesOutput {
+            // `AutomationRulesArnsList` is modelled `@length(min: 1)`, so a call that
+            // processed nothing reports no list rather than an empty one.
+            processed_automation_rules: (!processed.is_empty()).then_some(processed),
+            unprocessed_automation_rules: Some(unprocessed),
+        })
     }
 }

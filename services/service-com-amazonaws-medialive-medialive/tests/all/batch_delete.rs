@@ -90,8 +90,8 @@ async fn security_group(router: &MultiServiceRouter, case: &str) -> String {
     )
     .await;
     assert_eq!(
-        status, 200,
-        "case {case:?}: CreateInputSecurityGroup: expected 200, got {status}: {response}"
+        status, 201,
+        "case {case:?}: CreateInputSecurityGroup: expected 201, got {status}: {response}"
     );
     response["securityGroup"]["id"]
         .as_str()

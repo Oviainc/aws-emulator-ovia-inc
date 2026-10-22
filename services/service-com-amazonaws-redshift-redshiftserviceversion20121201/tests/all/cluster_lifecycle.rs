@@ -86,8 +86,22 @@ impl Emulator {
         });
     }
 
-    /// POST one awsQuery action with these form parameters.
+    /// POST one awsQuery action with these form parameters, signed for [`REGION`].
     pub(crate) async fn call(&self, action: &str, params: &[(&str, &str)]) -> Answer {
+        self.call_in_region(REGION, action, params).await
+    }
+
+    /// POST one awsQuery action with these form parameters, signed for `region`.
+    ///
+    /// The Region reaches a handler only through the request's SigV4 credential
+    /// scope, so a suite asserting a Region-derived value drives the call through
+    /// here rather than building its own request.
+    pub(crate) async fn call_in_region(
+        &self,
+        region: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Answer {
         let mut body = format!("Action={action}&Version=2012-12-01");
         for (name, value) in params {
             body.push('&');
@@ -97,12 +111,12 @@ impl Emulator {
         }
         let request = http::Request::builder()
             .method("POST")
-            .uri("https://redshift.us-west-2.amazonaws.com/")
+            .uri(format!("https://redshift.{region}.amazonaws.com/"))
             .header("content-type", "application/x-www-form-urlencoded")
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/redshift/aws4_request, SignedHeaders=host, Signature=0"
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/redshift/aws4_request, SignedHeaders=host, Signature=0"
                 ),
             )
             .body(bytes::Bytes::from(body))

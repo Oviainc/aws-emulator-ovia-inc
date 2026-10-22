@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInputSecurityGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInputSecurityGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInputSecurityGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes an input security group: the delete answers with the group and the
+//! state its users imply, and the group moves to the terminal `DELETED` state
+//! every read after the call reports.
 //!
 //! ## Shape of an operation
 //!
@@ -54,6 +48,16 @@
 //! ## Input
 //!
 //! * `InputSecurityGroupId` (__string) **required** — The Input Security Group to delete
+//!
+//! ## Output
+//!
+//! The model gives `DeleteInputSecurityGroupResponse` no members at all, but the
+//! recorded wire response carries the group's representation — the same flat
+//! projection `DescribeInputSecurityGroupResponse` declares, reporting the state
+//! the group's users imply rather than the terminal `DELETED` the delete writes.
+//! The wire is the authority where it and the model disagree, so this operation
+//! serialises through that modelled flat projection; see the note on
+//! `OUTPUT_SCHEMA` below.
 //!
 //! ## Errors
 //!
@@ -132,12 +136,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DeleteInputSecurityGroup<Eng>
 {
     type Input = DeleteInputSecurityGroupInput;
-    type Output = DeleteInputSecurityGroupOutput;
+    // The group's own representation, NOT the memberless
+    // `DeleteInputSecurityGroupOutput` the model declares: the recorded response
+    // to `DELETE /prod/inputSecurityGroups/{InputSecurityGroupId}` carries a
+    // body, and the shape of a group reported FLAT is exactly what
+    // `DescribeInputSecurityGroupResponse` models. Serialising through that
+    // modelled shape keeps every member name, type and `jsonName` the model's
+    // own, rather than inventing an output shape the model does not declare —
+    // the same seam `DeleteInput` uses for a deleted input.
+    type Output = DescribeInputSecurityGroupOutput;
     type Error = DeleteInputSecurityGroupError;
 
     const NAME: &'static str = "DeleteInputSecurityGroup";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_INPUT_SECURITY_GROUP_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_INPUT_SECURITY_GROUP_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DESCRIBE_INPUT_SECURITY_GROUP_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
@@ -145,18 +157,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInputSecurityGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInputSecurityGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // A group's state is derived from what uses it, so this handler depends on
+        // the channel and input stores: `settle` materialises the transitions the
+        // clock had already made due, which were owed whether or not this delete
+        // ran.
+        state.settle(now);
+
+        let Some(group) = state
+            .input_security_groups
+            .get_mut(&input.input_security_group_id)
+        else {
+            return Err(DeleteInputSecurityGroupErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Input security group not found: {}",
+                        input.input_security_group_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `DELETED` is terminal and the group keeps it: the record stays in the
+        // account, so `DescribeInputSecurityGroup` goes on reporting it in that
+        // state rather than reporting a deleted group as live and reusable. A
+        // repeated delete is idempotent — the state the caller asks for is the
+        // stored one, and neither the model nor this operation's documentation
+        // ("Deletes an Input Security Group") gives a second delete a refusal.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInputSecurityGroup"))
+        // DELIBERATELY unlike `BatchDelete`'s per-group delete
+        // (`ops::batch_delete::delete_input_security_group`), which refuses a
+        // group a resource still uses with its own `BAD_REQUEST` failure result:
+        // that refusal belongs to the batch's recorded per-resource failure
+        // channel, while THIS operation models no conflict error, its doc states
+        // no such precondition, and no recording shows it refusing — so a group
+        // something still uses is deleted here. Change one of the two only with
+        // evidence for that path.
+        crate::state::delete_input_security_group(group);
+
+        // The response is the group, read back out of the store — never assembled
+        // from the request. Its `State` is the one the group's USERS imply
+        // (`IDLE` while nothing references it, `IN_USE` while something does),
+        // which is what the recorded delete response carries both for a group
+        // this call deleted and for one an earlier call already deleted; the
+        // deletion itself is what every read AFTER this call reports, because a
+        // group has no transient deletion state of its own
+        // (`InputSecurityGroupState`: IDLE | IN_USE | UPDATING | DELETED).
+        let reported = state
+            .input_security_group_usage_description(&input.input_security_group_id)
+            .ok_or_else(unavailable)?;
+
+        Ok(crate::state::input_security_group_description_output!(
+            DescribeInputSecurityGroupOutput,
+            reported
+        ))
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to delete the group from. A modelled server error, never
+/// a fresh engine (which would drop the deletion when this request returns).
+fn unavailable() -> DeleteInputSecurityGroupError {
+    DeleteInputSecurityGroupErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

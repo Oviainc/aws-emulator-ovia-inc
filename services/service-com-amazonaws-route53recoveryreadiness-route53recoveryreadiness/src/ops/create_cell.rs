@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCell
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCell`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCell::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a cell under this name — the ARN the service mints for it, the ARNs of the
+//! cells nested inside it and its tags — and reports it back out of the store.
+//!
+//! A create of a readiness resource passes the ACCOUNT-ELIGIBILITY GATE
+//! ([`crate::state::ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState::check_create_allowed`]):
+//! the feature is closed to accounts that do not already use it, so a valid request is
+//! denied with `AccessDeniedException` unless this account is eligible.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +155,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCell` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCellErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCell"))
+        let _ = ctx;
+        // `CellName`'s input shape is plain `__string`, so the boundary validator did
+        // not apply the rule the OUTPUT shape states; this is where it is applied.
+        crate::state::validate_name("CellName", &input.cell_name).map_err(|message| {
+            CreateCellErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+        // CC-02 growth bound: one accepted record must not be arbitrarily large.
+        crate::state::validate_nested_cells(input.cells.as_ref())
+            .and_then(|()| crate::state::validate_tags(input.tags.as_ref()))
+            .map_err(|message| {
+                CreateCellErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+            })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCellErrorModeled::InternalServerException(InternalServerException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // THE ACCOUNT-ELIGIBILITY GATE. The readiness feature is closed to accounts
+        // that do not already use it, so a syntactically valid create passes input
+        // validation (above) and is then denied account-wide — before any record is
+        // written, so nothing exists afterwards for a list or a get to report.
+        state.check_create_allowed().map_err(|message| {
+            CreateCellErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(message.to_string()),
+            })
+        })?;
+
+        if state.cells.contains_key(&input.cell_name) {
+            return Err(CreateCellErrorModeled::ConflictException(ConflictException {
+                message: Some(format!("A cell named {} already exists.", input.cell_name)),
+            })
+            .into());
+        }
+
+        // CC-02 growth bound: the store must not grow per request without a ceiling.
+        if state.cells.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreateCellErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::store_full_message("cells")),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::cell_arn(&input.cell_name);
+        let record = crate::state::CellRecord {
+            arn: arn.clone(),
+            name: input.cell_name.clone(),
+            nested_cell_arns: input.cells.unwrap_or_default(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+        state.arn_index.insert(
+            arn,
+            crate::state::ResourceKey::Cell(input.cell_name.clone()),
+        );
+        state.cells.insert(input.cell_name.clone(), record);
+
+        // Read the response back out of the store, so what the caller sees is what a
+        // later `GetCell` will see. `ParentReadinessScopes` is derived from the other
+        // stored cells rather than stored, so a cell created inside an existing one
+        // reports that containment immediately.
+        let stored = &state.cells[&input.cell_name];
+        let parent_readiness_scopes = state.parent_readiness_scopes(&stored.arn);
+        Ok(CreateCellOutput {
+            cell_arn: Some(stored.arn.clone()),
+            cell_name: Some(stored.name.clone()),
+            cells: Some(stored.nested_cell_arns.clone()),
+            parent_readiness_scopes: Some(parent_readiness_scopes),
+            tags: stored.modeled_tags(),
+        })
     }
 }

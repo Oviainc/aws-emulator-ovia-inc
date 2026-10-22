@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIdMappingWorkflows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIdMappingWorkflows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages over the stored ID mapping workflows in `workflowName` order, built by
+//! iterating the store: `maxResults` bounds the page and the `nextToken` a page
+//! returns is the name of the first record it did NOT return, so the next call
+//! resumes exactly where the previous one ended and the final page carries no token.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIdMappingWorkflows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read — it never writes to the store — serving ONLY
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::id_mapping_workflows`],
+//! which is a separate namespace from the matching workflows `ListMatchingWorkflows`
+//! pages over.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +147,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIdMappingWorkflows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIdMappingWorkflowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIdMappingWorkflows"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListIdMappingWorkflowsErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `NextToken` is wider than the resource names this service mints
+        // as page tokens, so a token it never issued is refused rather than served as
+        // an arbitrary suffix of the collection.
+        if input
+            .next_token
+            .as_deref()
+            .is_some_and(|token| !crate::state::is_issued_page_token(token))
+        {
+            return Err(ListIdMappingWorkflowsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("Invalid nextToken".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A pure read over the store, in the map's own (name) order.
+        let store = state.lock();
+        let (workflow_summaries, next_token) = crate::state::page(
+            store
+                .id_mapping_workflows
+                .iter()
+                .map(|(workflow_name, stored)| {
+                    (
+                        workflow_name.clone(),
+                        IdMappingWorkflowSummary {
+                            workflow_name: stored.workflow_name.clone(),
+                            workflow_arn: stored.workflow_arn.clone(),
+                            created_at: stored.created_at,
+                            updated_at: stored.updated_at,
+                        },
+                    )
+                }),
+            input.next_token.as_deref(),
+            crate::state::page_size(input.max_results, MAX_RESULTS),
+        );
+
+        Ok(ListIdMappingWorkflowsOutput {
+            workflow_summaries: Some(workflow_summaries),
+            next_token,
+        })
     }
 }
+
+/// The largest page `ListIdMappingWorkflows` serves, and the page it serves a caller
+/// that set no bound: `maxResults` is modelled `range ..25`
+/// (`smithy_query(query="operation",operation="ListIdMappingWorkflows")`).
+const MAX_RESULTS: usize = 25;

@@ -4,6 +4,19 @@
 //!
 //! Attaches a resource-based policy to a registry and answers from the stored value.
 //!
+//! ## What the store keeps, and what this call answers
+//!
+//! `Policy` is an opaque JSON DOCUMENT (`@mediaType("application/json")`), so what is
+//! STORED is the document's JSON content rather than the text a caller's renderer
+//! produced: it is re-encoded on the way in by `crate::state::canonical_json`, which
+//! drops insignificant whitespace and keeps the member order. That is what every later
+//! `GetResourcePolicy` reports, so a caller that hashes or diffs a policy ROUND-TRIP —
+//! the standard way to detect drift — sees no change between reads.
+//!
+//! This call's own response states what the call did: the document it was handed, and
+//! the revision it minted for it. A write answers for its request; a read answers from
+//! the store.
+//!
 //! ## Revisions, and the `RevisionId` precondition
 //!
 //! The stored policy carries a revision id, minted fresh on every successful write
@@ -206,6 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // What the store keeps and every later read reports: the document's JSON
+        // content, re-encoded, rather than the text one caller's renderer produced.
+        // See `crate::state::canonical_json`.
+        let document = crate::state::canonical_json(&policy).map_err(|error| {
+            PutResourcePolicyError::from(PutResourcePolicyErrorModeled::BadRequestException(
+                crate::state::policy_not_json(&format!(
+                    "the value sent is not well-formed JSON ({error})"
+                )),
+            ))
+        })?;
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutResourcePolicyError::from(
                 PutResourcePolicyErrorModeled::InternalServerErrorException(
@@ -246,21 +270,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&registry_name)
             .expect("the registry read above is still present under the same lock");
         registry.policy = Some(crate::state::ResourcePolicy {
-            // Stored verbatim: `GetResourcePolicy` must report the document the
-            // caller sent, not a re-rendering of it.
-            document: policy,
-            revision_id: minted_revision,
+            // The document's JSON content, as `crate::state::canonical_json` encoded
+            // it above: `GetResourcePolicy` reports what the store holds, so the
+            // write is where the bytes a read reports are decided.
+            document,
+            revision_id: minted_revision.clone(),
         });
 
-        // Answer from the STORED policy, so this response can only ever describe what
-        // `GetResourcePolicy` will report.
-        let stored = registry
-            .policy
-            .as_ref()
-            .expect("the policy written above is present");
+        // The write answers the document it was HANDED, and the revision the write
+        // minted for it: this response states what this call did, where a read states
+        // what the store holds. The two differ only in the document's spacing — the
+        // store keeps its JSON content — and only until the caller sends back what a
+        // read reported, which is already its own stored form.
         Ok(PutResourcePolicyOutput {
-            policy: Some(stored.document.clone()),
-            revision_id: Some(stored.revision_id.clone()),
+            policy: Some(policy),
+            revision_id: Some(minted_revision),
         })
     }
 }

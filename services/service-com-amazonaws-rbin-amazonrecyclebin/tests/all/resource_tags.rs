@@ -9,8 +9,8 @@
 //! exercises them. The rules under test:
 //!
 //! * a tagging call addresses its retention rule by the ARN this service MINTED, and an
-//!   ARN no stored rule carries is HTTP 404 `ResourceNotFoundException`
-//!   (`Reason: RULE_NOT_FOUND`) on every one of the three operations;
+//!   ARN no stored rule carries is HTTP 404 `ResourceNotFoundException` naming the ARN
+//!   the request addressed, on every one of the three operations;
 //! * `TagResource` is an UPSERT keyed by tag key: a key the rule already carries takes
 //!   the new value, a key it does not carry is added, every other key survives, and no
 //!   other rule's tags move;
@@ -81,7 +81,8 @@ fn authorization() -> String {
 /// Written out rather than reached for from `percent_encoding`, for the reason
 /// `services/service-com-amazonaws-pcaconnectorscep-pcaconnectorscep/tests/all/connector_lifecycle.rs`
 /// documents for its own copy of this helper: a test-only encoder is not worth a new
-/// dev-dependency.
+/// dev-dependency. `pub(crate)` so the sibling suites of this one test target address a
+/// rule by ARN through the same encoder.
 pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -154,8 +155,9 @@ pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -
     .await
 }
 
-/// `POST /tags/{ResourceArn}` with `Tags` in the body — `TagResource`.
-async fn tag_resource(
+/// `POST /tags/{ResourceArn}` with `Tags` in the body — `TagResource`. `pub(crate)` so
+/// the sibling suites of this one test target tag a rule through the same request shape.
+pub(crate) async fn tag_resource(
     router: &MultiServiceRouter,
     resource_arn: &str,
     tags: &[(String, String)],
@@ -171,7 +173,8 @@ async fn tag_resource(
 
 /// `DELETE /tags/{ResourceArn}?tagKeys=..&tagKeys=..` — `UntagResource`. `TagKeys` is
 /// bound to `@httpQuery("tagKeys")`, so each key travels as its own query pair.
-async fn untag_resource(
+/// `pub(crate)` for the same reason as [`tag_resource`].
+pub(crate) async fn untag_resource(
     router: &MultiServiceRouter,
     resource_arn: &str,
     tag_keys: &[String],
@@ -248,7 +251,8 @@ type UpsertRow = (&'static str, TagPairs, Tags);
 /// One row of a removal table: the case, the keys it unassigns, the tags it must leave.
 type RemovalRow = (&'static str, Vec<String>, Tags);
 
-fn pairs(tags: &[(&str, &str)]) -> TagPairs {
+/// The `(key, value)` pairs one request assigns, as [`tag_resource`] takes them.
+pub(crate) fn pairs(tags: &[(&str, &str)]) -> TagPairs {
     tags.iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect()
@@ -260,7 +264,8 @@ fn expected(tags: &[(&str, &str)]) -> Tags {
         .collect()
 }
 
-fn keys(keys: &[&str]) -> Vec<String> {
+/// The tag keys one request unassigns, as [`untag_resource`] takes them.
+pub(crate) fn keys(keys: &[&str]) -> Vec<String> {
     keys.iter().map(|key| (*key).to_string()).collect()
 }
 
@@ -819,10 +824,10 @@ async fn the_tag_operations_answer_resource_not_found_for_an_arn_no_rule_carries
             "case {case:?}: ListTagsForResource expected ResourceNotFoundException, got {body:?}"
         );
         assert_eq!(
-            body["Reason"].as_str(),
-            Some("RULE_NOT_FOUND"),
-            "case {case:?}: ListTagsForResource expected Reason RULE_NOT_FOUND, got {:?}",
-            body["Reason"]
+            body["Message"].as_str(),
+            Some(format!("Recycle Bin Rule '{arn}' does not exist.").as_str()),
+            "case {case:?}: ListTagsForResource must name the ARN the request addressed, got {:?}",
+            body["Message"]
         );
 
         let (status, body) = tag_resource(&router, &arn, &pairs(&[("env", "dev")])).await;
