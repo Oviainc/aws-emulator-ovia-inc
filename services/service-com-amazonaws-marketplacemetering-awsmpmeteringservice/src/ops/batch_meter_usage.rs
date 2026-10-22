@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchMeterUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchMeterUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchMeterUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Processes a seller's usage records against the SAME ledger `MeterUsage` writes to,
+//! and answers one `UsageRecordResult` per input record, in input order, with a
+//! `Status` computed from that ledger:
+//!
+//! * `Success` — the record was accepted; its `MeteringRecordId` is the id the record
+//!   is stored under (the id of the earlier record when this one repeats it, because
+//!   "Identical requests are idempotent and can be retried with the same records or a
+//!   subset of records").
+//! * `CustomerNotSubscribed` — the record's customer is not entitled to the product.
+//! * `DuplicateRecord` — "A previously metered UsageRecord had the same customer,
+//!   dimension, and time, but a different quantity."
+//!
+//! Anything that makes the REQUEST invalid rather than one record unbillable is a
+//! modelled operation error and no record is written: an unknown `ProductCode`, an
+//! unpublished dimension, allocations that do not add up, a record naming no customer
+//! at all, or a timestamp outside the window — "For BatchMeterUsage, if any of the
+//! records are outside of the allowed range, the entire batch is not processed."
+//!
+//! ## Not implemented yet: the license-named integration
+//!
+//! `BatchMeterUsageRequest$ProductCode` documents a second integration style — "For
+//! new integrations using LicenseArn (Concurrent Agreements), do NOT include
+//! ProductCode at the request level. The LicenseArn in each UsageRecord identifies
+//! both the product and the specific agreement." Resolving a product and an agreement
+//! from `UsageRecord$LicenseArn` needs license state this emulator does not hold yet
+//! (the bootstrap issue defers richer `LicenseArn` resolution to its own issue), so
+//! this slice serves only the product-named style: a request that names no
+//! `ProductCode` resolves no product and is refused with `InvalidProductCodeException`
+//! rather than quietly metering against a product nobody named. A stored `LicenseArn`
+//! is carried on the record untouched; it is never validated, so no
+//! `InvalidLicenseException` is produced.
 //!
 //! ## Shape of an operation
 //!
@@ -216,18 +239,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchMeterUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchMeterUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchMeterUsage"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchMeterUsageErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the metering store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // "Each BatchMeterUsage request is for only one product": every record is
+        // metered against this one published product, so an unknown code fails the
+        // whole call. The member carries a `""` default, which names no product either.
+        let product_code = input.product_code.clone().unwrap_or_default();
+        // Only the two sets the decisions below read are taken out of the store, so the
+        // immutable borrow ends before the ledger writes without copying the whole
+        // product record.
+        let (dimensions, entitled_customers) = {
+            let product = state.products.get(&product_code).ok_or_else(|| {
+                BatchMeterUsageErrorModeled::InvalidProductCodeException(
+                    InvalidProductCodeException {
+                        message: Some(format!(
+                            "The product code {product_code} does not match the product code used for publishing the product"
+                        )),
+                    },
+                )
+            })?;
+            (
+                product.dimensions.clone(),
+                product.entitled_customers.clone(),
+            )
+        };
+
+        // Whole-batch validation first: a request that is invalid is not partly
+        // applied, so nothing is written until every record has been checked.
+        let now = crate::state::now_epoch_secs();
+        for record in &input.usage_records {
+            let timestamp_secs = record.timestamp.secs();
+            if timestamp_secs > now
+                || timestamp_secs < now - crate::state::BATCH_METER_USAGE_BACKDATING_SECS
+            {
+                return Err(BatchMeterUsageErrorModeled::TimestampOutOfBoundsException(
+                    TimestampOutOfBoundsException {
+                        message: Some(format!(
+                            "The timestamp value passed in the UsageRecord is out of allowed range: usage may be metered for up to {} hours in the past and not in the future",
+                            crate::state::BATCH_METER_USAGE_BACKDATING_SECS / 3600
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !dimensions.contains(&record.dimension) {
+                return Err(BatchMeterUsageErrorModeled::InvalidUsageDimensionException(
+                    InvalidUsageDimensionException {
+                        message: Some(format!(
+                            "The usage dimension {} does not match one of the UsageDimensions associated with product {product_code}",
+                            record.dimension
+                        )),
+                    },
+                )
+                .into());
+            }
+            if let Some(message) = crate::state::allocations_problem(
+                record.usage_allocations.as_deref().unwrap_or_default(),
+                record.quantity.unwrap_or(0),
+            ) {
+                return Err(
+                    BatchMeterUsageErrorModeled::InvalidUsageAllocationsException(
+                        InvalidUsageAllocationsException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if record_customer(record).is_none() {
+                return Err(
+                    BatchMeterUsageErrorModeled::InvalidCustomerIdentifierException(
+                        InvalidCustomerIdentifierException {
+                            message: Some(
+                                "Each UsageRecord must identify its customer by CustomerIdentifier or CustomerAWSAccountId"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut results = Vec::with_capacity(input.usage_records.len());
+        for record in input.usage_records {
+            let customer = record_customer(&record)
+                .unwrap_or_default()
+                .to_string();
+            let timestamp_secs = record.timestamp.secs();
+            let quantity = record.quantity.unwrap_or(0);
+
+            // Not entitled: the record is reported back unhonored, and nothing is
+            // written for it.
+            if !entitled_customers.contains(&customer) {
+                results.push(UsageRecordResult {
+                    usage_record: Some(record),
+                    metering_record_id: None,
+                    status: Some(crate::state::STATUS_CUSTOMER_NOT_SUBSCRIBED.to_string()),
+                });
+                continue;
+            }
+
+            let already_metered = state
+                .dedup_entry(&product_code, &customer, &record.dimension, timestamp_secs)
+                .cloned();
+            let (status, metering_record_id) = match already_metered {
+                Some(entry) if entry.quantity != quantity => {
+                    (crate::state::STATUS_DUPLICATE_RECORD, None)
+                }
+                Some(entry) => (
+                    crate::state::STATUS_SUCCESS,
+                    Some(entry.metering_record_id),
+                ),
+                None => {
+                    let metering_record_id = state.mint_metering_record_id();
+                    state.record_usage(crate::state::MeteringRecord {
+                        metering_record_id: metering_record_id.clone(),
+                        product_code: product_code.clone(),
+                        customer_identifier: customer,
+                        customer_aws_account_id: record.customer_aws_account_id.clone(),
+                        dimension: record.dimension.clone(),
+                        quantity,
+                        timestamp_secs,
+                        usage_allocations: record.usage_allocations.clone().unwrap_or_default(),
+                        created_at: ::std::time::SystemTime::now(),
+                    });
+                    (crate::state::STATUS_SUCCESS, Some(metering_record_id))
+                }
+            };
+            results.push(UsageRecordResult {
+                usage_record: Some(record),
+                metering_record_id,
+                status: Some(status.to_string()),
+            });
+        }
+
+        Ok(BatchMeterUsageOutput {
+            results: Some(results),
+            // Every record that passed validation was attempted against the ledger in
+            // this call, so none is left for the caller to retry.
+            unprocessed_records: Some(Vec::new()),
+        })
     }
+}
+
+/// The customer a record meters usage for: its `CustomerIdentifier` when it carries a
+/// non-empty one (the member has a `""` default, which identifies nobody), otherwise
+/// its `CustomerAWSAccountId`. `None` is a record that names no customer at all.
+fn record_customer(record: &UsageRecord) -> Option<&str> {
+    record
+        .customer_identifier
+        .as_deref()
+        .filter(|identifier| !identifier.is_empty())
+        .or(record.customer_aws_account_id.as_deref())
 }

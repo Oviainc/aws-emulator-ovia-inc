@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the stored services as `ServiceSummary`s, honouring the modelled filters
+//! and `@paginated` window. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServices"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListServicesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` must be one this service issued; anything else is a bad request,
+        // not an empty page. `None` means "start from the beginning".
+        let resume_from: Option<u64> = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(
+                        ListServicesErrorModeled::ValidationException(forged_token()).into()
+                    );
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 1..100` with a default of 100, so the boundary
+        // refuses anything outside the range and supplies the default for a request that
+        // omits it. A value that still arrives outside the range is refused here rather
+        // than quietly served at some other page size.
+        let page_size = if (crate::state::MAX_RESULTS_MIN..=crate::state::MAX_RESULTS_MAX)
+            .contains(&input.max_results)
+        {
+            input.max_results as usize
+        } else {
+            return Err(ListServicesErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "maxResults must be between {} and {}",
+                    crate::state::MAX_RESULTS_MIN,
+                    crate::state::MAX_RESULTS_MAX
+                ),
+                reason: Some("INVALID_FIELD_VALUE".to_string()),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "maxResults".to_string(),
+                    message: format!(
+                        "must be between {} and {}",
+                        crate::state::MAX_RESULTS_MIN,
+                        crate::state::MAX_RESULTS_MAX
+                    ),
+                }]),
+            })
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A token is valid only if it names a position this store actually handed out
+        // (positions start at 1), so a well-formed token this service never issued is
+        // refused rather than answered with a page.
+        if let Some(position) = resume_from {
+            if position == 0 || position > store.highest_sequence() {
+                return Err(
+                    ListServicesErrorModeled::ValidationException(forged_token()).into()
+                );
+            }
+        }
+
+        store.materialise_all(now);
+        let matched: Vec<&crate::state::ServiceRecord> = store
+            .in_creation_order()
+            .into_iter()
+            .filter(|record| record.sequence >= resume_from.unwrap_or(0))
+            .filter(|record| matches_filters(record, &input))
+            .collect();
+
+        Ok(ListServicesOutput {
+            service_summaries: matched
+                .iter()
+                .take(page_size)
+                .map(|record| record.to_summary())
+                .collect(),
+            // The token names where the NEXT page resumes, and is emitted only when
+            // there is one: the last page carries no token.
+            next_token: matched
+                .get(page_size)
+                .map(|record| crate::state::encode_page_token(record.sequence)),
+        })
     }
+}
+
+/// The refusal for a `nextToken` this service did not issue: the member is named and its
+/// rule stated, the way the boundary validator words a refusal.
+fn forged_token() -> ValidationException {
+    ValidationException {
+        message: "nextToken is not a token this service issued".to_string(),
+        reason: Some("INVALID_FIELD_VALUE".to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "nextToken".to_string(),
+            message: "must be a nextToken returned by a previous ListServices call".to_string(),
+        }]),
+    }
+}
+
+/// Whether `record` satisfies every filter the request supplied.
+///
+/// Each modelled filter is an equality test against the stored record; an absent filter
+/// constrains nothing. `systemArn` and `userJourneyId` look inside the service's
+/// `associatedSystems`, which is where a service's system and user-journey links live.
+fn matches_filters(record: &crate::state::ServiceRecord, input: &ListServicesInput) -> bool {
+    let wrong_policy = input
+        .policy_arn
+        .as_ref()
+        .is_some_and(|wanted| record.policy_arn.as_ref() != Some(wanted));
+    let wrong_status = input
+        .assessment_status
+        .as_ref()
+        .is_some_and(|wanted| &record.assessment_status != wanted);
+    let wrong_account = input
+        .account_id
+        .as_ref()
+        .is_some_and(|wanted| &record.account_id != wanted);
+    let wrong_ou = input
+        .ou_id
+        .as_ref()
+        .is_some_and(|wanted| record.ou_id.as_ref() != Some(wanted));
+    let wrong_system = input.system_arn.as_ref().is_some_and(|wanted| {
+        !record
+            .associated_systems
+            .iter()
+            .any(|system| &system.system_arn == wanted)
+    });
+    let wrong_journey = input.user_journey_id.as_ref().is_some_and(|wanted| {
+        !record.associated_systems.iter().any(|system| {
+            system
+                .user_journey_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(wanted))
+        })
+    });
+    !(wrong_policy
+        || wrong_status
+        || wrong_account
+        || wrong_ou
+        || wrong_system
+        || wrong_journey)
 }

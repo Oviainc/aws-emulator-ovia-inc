@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListContacts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListContacts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListContacts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +147,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListContacts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListContactsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListContacts"))
+        /// Names this listing inside its pagination tokens, so a token another listing
+        /// issued is not accepted here.
+        const LISTING: &str = "contacts";
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListContactsErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // A filter this emulator cannot evaluate is REFUSED, not silently satisfied: no
+        // contact in state can carry an ephemeris while `CreateEphemeris` and its
+        // siblings answer 501, so an `ephemeris` filter would otherwise select nothing
+        // and a caller could not tell "no contact uses it" from "the filter was never
+        // applied". It is refused with the operation's own modelled
+        // `InvalidParameterException`, naming the member.
+        // TODO: evaluate this against the contact's own ephemeris once the ephemeris
+        // operations land.
+        if input.ephemeris.is_some() {
+            return Err(ListContactsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "ephemeris filtering is not available: no contact can reference an \
+                         ephemeris until the ephemeris operations are implemented"
+                            .to_string(),
+                    ),
+                    parameter_name: Some("ephemeris".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The window a listing searches runs forwards: a request whose `endTime`
+        // precedes its `startTime` describes no interval at all, so it is refused rather
+        // than answered with the empty page the overlap test would produce.
+        if input.end_time.as_secs_f64() < input.start_time.as_secs_f64() {
+            return Err(ListContactsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some("endTime must not precede startTime".to_string()),
+                    parameter_name: Some("endTime".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The operation's own documentation states the rule: "If statusList contains
+        // AVAILABLE, the request must include groundStation, missionprofileArn, and
+        // satelliteArn" — an availability search is for one antenna/satellite pairing
+        // under one mission profile, not a store-wide scan. A request that asks for
+        // AVAILABLE without all three is refused, naming the member it left out.
+        if input.status_list.iter().any(|status| status == "AVAILABLE") {
+            let missing = [
+                ("groundStation", input.ground_station.is_none()),
+                ("missionProfileArn", input.mission_profile_arn.is_none()),
+                ("satelliteArn", input.satellite_arn.is_none()),
+            ]
+            .into_iter()
+            .find_map(|(member, absent)| absent.then_some(member));
+            if let Some(member) = missing {
+                return Err(ListContactsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "{member} is required when statusList contains AVAILABLE"
+                        )),
+                        parameter_name: Some(member.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // An offset counts within the FILTERED sequence, so the filters are part of the
+        // scope its token is issued under: resuming with a different status list,
+        // window or filter is refused rather than landing at an offset into a different
+        // sequence. The status list is sorted first, so naming the same statuses in
+        // another order is the same scope.
+        let mut statuses = input.status_list.clone();
+        statuses.sort();
+        let scope = crate::state::page_scope(
+            LISTING,
+            &[
+                statuses.join(","),
+                input.start_time.as_secs_f64().to_string(),
+                input.end_time.as_secs_f64().to_string(),
+                input.ground_station.clone().unwrap_or_default(),
+                input.satellite_arn.clone().unwrap_or_default(),
+                input.mission_profile_arn.clone().unwrap_or_default(),
+            ],
+        );
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
+                ListContactsErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(
+                        "nextToken was not issued by a previous ListContacts call with these \
+                         filters"
+                            .to_string(),
+                    ),
+                    parameter_name: Some("nextToken".to_string()),
+                })
+            })?,
+        };
+
+        let window_start = input.start_time.as_secs_f64();
+        let window_end = input.end_time.as_secs_f64();
+
+        let mut guard = state.lock();
+        // Apply every SCHEDULING -> SCHEDULED move already due, so the status filter
+        // sees the status in force now.
+        guard.settle_due_contacts();
+
+        // Ordered by contact id: a page boundary is only stable over a stable order.
+        let mut ids: Vec<&String> = guard.contacts.keys().collect();
+        ids.sort();
+        let items: Vec<ContactData> = ids
+            .into_iter()
+            .filter_map(|id| guard.contacts.get(id))
+            .filter(|contact| input.status_list.contains(&contact.contact_status))
+            // A contact is in the window when its own window overlaps it.
+            .filter(|contact| {
+                contact.end_time.as_secs_f64() >= window_start
+                    && contact.start_time.as_secs_f64() <= window_end
+            })
+            .filter(|contact| {
+                input
+                    .ground_station
+                    .as_ref()
+                    .is_none_or(|name| *name == contact.ground_station)
+            })
+            .filter(|contact| {
+                input
+                    .satellite_arn
+                    .as_ref()
+                    .is_none_or(|arn| contact.satellite_arn.as_ref() == Some(arn))
+            })
+            .filter(|contact| {
+                input
+                    .mission_profile_arn
+                    .as_ref()
+                    .is_none_or(|arn| *arn == contact.mission_profile_arn)
+            })
+            .map(|contact| ContactData {
+                contact_id: Some(contact.contact_id.clone()),
+                mission_profile_arn: Some(contact.mission_profile_arn.clone()),
+                satellite_arn: contact.satellite_arn.clone(),
+                start_time: Some(contact.start_time),
+                end_time: Some(contact.end_time),
+                pre_pass_start_time: Some(contact.pre_pass_start_time),
+                post_pass_end_time: Some(contact.post_pass_end_time),
+                ground_station: Some(contact.ground_station.clone()),
+                contact_status: Some(contact.contact_status.clone()),
+                // Nothing in this emulator has failed a contact, tracked a pass or run
+                // a dataflow, so the members reporting those carry nothing.
+                error_message: None,
+                maximum_elevation: None,
+                region: Some(contact.region.clone()),
+                tags: contact.response_tags(),
+                visibility_start_time: None,
+                visibility_end_time: None,
+                ephemeris: None,
+                version: Some(contact.version()),
+            })
+            .collect();
+
+        let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
+
+        Ok(ListContactsOutput {
+            next_token,
+            contact_list: Some(page),
+        })
     }
 }

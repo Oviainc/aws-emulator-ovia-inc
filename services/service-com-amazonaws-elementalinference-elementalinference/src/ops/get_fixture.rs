@@ -6,8 +6,16 @@
 //!
 //! The catalog lives in [`crate::state`] and is the same one `SearchFixtures`
 //! projects, so a fixture this operation returns agrees member for member with the
-//! `FixtureSummary` that search reported for it. An id no catalog entry has is
-//! `ResourceNotFoundException` (HTTP 404).
+//! `FixtureSummary` that search reported for it.
+//!
+//! An id no catalog entry has is the modelled `ValidationException` (HTTP 400), which
+//! is the refusal the recorded behaviour of this operation shows for an id that names
+//! no fixture (corpus unit `elementalinference.get-fixture-not-found`), and not the
+//! `ResourceNotFoundException` the model also declares: a `fixtureId` is an opaque
+//! reference the service itself hands out (`SearchFixtures`, or a feed's clipping
+//! output), so one the data source does not recognise is a bad input rather than a
+//! resource that used to exist. Authorization is not emulated here — no caller
+//! identity is inspected, so the modelled `AccessDeniedException` is not reachable.
 //!
 //! ## Shape of an operation
 //!
@@ -180,9 +188,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = &self.engine;
 
         let Some(fixture) = crate::state::fixture_by_id(&input.fixture_id) else {
-            return Err(GetFixtureErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No fixture with id {} exists.", input.fixture_id),
+            // A `fixtureId` the data source does not recognise is refused as INPUT,
+            // not reported as a missing resource: the recorded behaviour of this
+            // operation for an id that names no fixture is error code
+            // `ValidationException` (HTTP 400). The message names the member at fault
+            // without echoing the value, as this service's not-found wording does
+            // (`crate::state::NOT_FOUND_MESSAGE`).
+            return Err(GetFixtureErrorModeled::ValidationException(
+                ValidationException {
+                    message: "The fixtureId that you specified is not valid. Obtain a \
+                              fixtureId from SearchFixtures, or from the clipping output \
+                              of a feed."
+                        .to_string(),
                 },
             )
             .into());

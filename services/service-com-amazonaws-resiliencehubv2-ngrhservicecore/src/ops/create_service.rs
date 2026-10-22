@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a service and STORES it, so every later `GetService` / `ListServices` /
+//! `UpdateService` reads what this call wrote. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +160,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateService"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateServiceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same call returns the
+        // service the first one created rather than creating a second one.
+        if let Some(arn) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotency.get(token))
+            .cloned()
+        {
+            if let Some(record) = store.resolve(&arn, now) {
+                return Ok(CreateServiceOutput {
+                    service: record.to_service(),
+                });
+            }
+        }
+
+        // A service name is unique within the account: a second service under a name
+        // already taken is a conflict, not a second service.
+        if let Some(existing) = store.service_names.get(&input.name) {
+            return Err(CreateServiceErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "A service named {} already exists in this account: {existing}",
+                    input.name
+                ),
+            })
+            .into());
+        }
+
+        // The store is BOUNDED before it is written: every create grows `services` by one
+        // entry carrying caller-supplied payload, so a caller that repeats this call would
+        // otherwise grow the process's memory without limit. At the ceiling the create is
+        // refused with the quota error this operation models. The two secondary indexes
+        // are bounded by the same ceiling — `service_names` holds exactly one entry per
+        // stored service and `idempotency` at most one (a replayed token returns above,
+        // and `DeleteService` prunes the tokens naming the record it removed).
+        if store.services.len() >= crate::state::MAX_SERVICES {
+            return Err(CreateServiceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of services for this account has been reached: {}. \
+                         Delete a service before creating another.",
+                        crate::state::MAX_SERVICES
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let service_arn = crate::state::mint_service_arn(&region);
+        let sequence = store.next_sequence();
+        let mut record = crate::state::ServiceRecord {
+            service_arn: service_arn.clone(),
+            name: input.name.clone(),
+            description: input.description,
+            associated_systems: input.associated_systems.unwrap_or_default(),
+            policy_arn: input.policy_arn,
+            regions: input.regions,
+            permission_model: Some(input.permission_model),
+            dependency_discovery: None,
+            dependency_discovery_due: None,
+            report_configuration: input.report_configuration,
+            dev_ops_agent_configuration: None,
+            dev_ops_agent_due: None,
+            kms_key_id: input.kms_key_id,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            assessment_status: crate::state::ASSESSMENT_STATUS_NOT_STARTED.to_string(),
+            open_findings_count: 0,
+            resolved_findings_count: 0,
+            ou_id: None,
+            account_id: ::engine::emulator_account_id().to_string(),
+            created_at: now,
+            updated_at: now,
+            sequence,
+        };
+        if let Some(requested) = input.dependency_discovery.as_deref() {
+            record.set_dependency_discovery(requested, now);
+        }
+        if let Some(requested) = input.dev_ops_agent_configuration.as_ref() {
+            record.link_dev_ops_agent(requested, now);
+        }
+
+        store
+            .service_names
+            .insert(record.name.clone(), service_arn.clone());
+        if let Some(token) = input.client_token {
+            store.idempotency.insert(token, service_arn.clone());
+        }
+        let service = record.to_service();
+        store.services.insert(service_arn, record);
+        Ok(CreateServiceOutput { service })
     }
 }

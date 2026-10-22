@@ -156,6 +156,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The record as it existed at delete time.
-        Ok(DeleteAppOutput { app: removed.app })
+        Ok(DeleteAppOutput {
+            app: AppProjection::written(removed.app),
+        })
     }
 }

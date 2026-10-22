@@ -22,7 +22,7 @@ pub struct ListBranchesInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.amplify#ListBranchesResult")]
 #[derive(Debug, Clone, Default)]
 pub struct ListBranchesOutput {
-    pub branches: Vec<Branch>,
+    pub branches: Vec<BranchProjection>,
     pub next_token: Option<String>,
 }
 

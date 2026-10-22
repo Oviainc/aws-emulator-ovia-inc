@@ -3,7 +3,8 @@
 //! @op UpdateWorkload
 //! IMPLEMENTED: merges the members the request carries into the stored record — an
 //! absent member is left untouched, never nulled — refreshes `UpdatedAt`, and returns
-//! the full updated `Workload`.
+//! the full updated `Workload`. The path `WorkloadId` is resolved by lookup, so an id
+//! no workload carries — whatever its syntax — is `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -223,11 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !store.workloads.contains_key(&input.workload_id) {
             return Err(UpdateWorkloadErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No workload exists with id {}", input.workload_id),
-                    resource_id: input.workload_id.clone(),
-                    resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::workload_not_found(&input.workload_id),
             )
             .into());
         }
@@ -239,18 +236,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(new_name) => {
                 let normalized = crate::state::normalize_workload_name(new_name);
-                match store.workload_name_index.get(&normalized) {
-                    Some(owner) if *owner != input.workload_id => {
-                        return Err(UpdateWorkloadErrorModeled::ConflictException(
-                            ConflictException {
-                                message: format!(
-                                    "A workload named {new_name:?} already exists in this account and Region"
-                                ),
-                                resource_id: owner.clone(),
-                                resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
-                            },
-                        )
-                        .into());
+                match store.workload_holding_name(new_name) {
+                    Some((existing_name, owner)) if owner != input.workload_id => {
+                        let collision = crate::state::workload_name_conflict(existing_name, owner);
+                        return Err(
+                            UpdateWorkloadErrorModeled::ConflictException(collision).into()
+                        );
                     }
                     _ => Some(normalized),
                 }
@@ -272,11 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(record) = store.workloads.get_mut(&input.workload_id) else {
             return Err(UpdateWorkloadErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No workload exists with id {}", input.workload_id),
-                    resource_id: input.workload_id.clone(),
-                    resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::workload_not_found(&input.workload_id),
             )
             .into());
         };

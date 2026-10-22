@@ -91,6 +91,16 @@ pub struct ConflictException {
     pub resource_type: String,
 }
 
+/// The service-wide server fault (`@error("server")`, HTTP 500, `@retryable`). Declared
+/// on the service rather than on one operation, so a handler names it through
+/// `extra_errors` on its own `#[operation_error]` enum.
+#[smithy_macros::smithy(shape = "com.amazonaws.backupsearch#InternalServerException")]
+#[derive(Debug, Clone, Default)]
+pub struct InternalServerException {
+    pub message: String,
+    pub retry_after_seconds: Option<i32>,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.backupsearch#ServiceQuotaExceededException")]
 #[derive(Debug, Clone, Default)]
 pub struct ServiceQuotaExceededException {

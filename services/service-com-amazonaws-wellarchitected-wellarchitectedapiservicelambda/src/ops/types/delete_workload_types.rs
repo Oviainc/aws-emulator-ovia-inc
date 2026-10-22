@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wellarchitected-wellarchitectedapiservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#DeleteWorkloadInput")]
+// `WorkloadId` is a path label this operation RESOLVES; see the note in
+// `get_workload_types.rs`. The lookup in `ops::delete_workload` answers the modelled
+// 404 for an id that names no workload, so the boundary validator must not refuse it
+// with a 400 first. `ClientRequestToken` is still validated.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wellarchitected#DeleteWorkloadInput",
+    skip_validation = ["WorkloadId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DeleteWorkloadInput {
     pub workload_id: String,

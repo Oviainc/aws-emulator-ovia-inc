@@ -22,4 +22,18 @@ handler returns an error, so it never has to construct a value.
 // SKIPPED: DeleteSupportPermit — shape missing from model: smithy.api#Unit
 // SKIPPED: GetSupportPermit — shape missing from model: smithy.api#Unit
 // SKIPPED: ListSupportPermitRequests — shape missing from model: smithy.api#Unit
+
+## Hand-authored since
+
+`CreateSupportPermit`, `DeleteSupportPermit`, `GetSupportPermit` and
+`ListSupportPermits` are now implemented in `ops/<op>.rs` and bound to the
+service: the decline reason was that `ActionSet` and `ResourceSet` each carry a
+union member targeting the Smithy PRELUDE shape `smithy.api#Unit`, which the
+JSON AST does not serialize, so the generator could not type it. The model now
+carries the prelude's own definition of that shape and the four handlers are
+written by hand.
+
+`ListSupportPermitRequests` is still unwired and answers the framework's
+unroutable-operation path; it will be filed as its own gap issue.
+
 // SKIPPED: ListSupportPermits — shape missing from model: smithy.api#Unit

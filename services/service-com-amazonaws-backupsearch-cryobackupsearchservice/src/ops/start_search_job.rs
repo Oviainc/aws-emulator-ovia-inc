@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSearchJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSearchJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a search job and PERSISTS it in [`crate::state`]: an opaque
+//! `SearchJobIdentifier`, the `search-job/<id>` ARN built from it, the server clock's
+//! `CreationTime`, the submitted `SearchScope`/`ItemFilters`/`Name`/`EncryptionKeyArn`/
+//! `Tags`, and `Status = RUNNING`. The members it answers with are read back out of
+//! that record, so `GetSearchJob` reports the same values.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSearchJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ClientToken` is idempotent: the same token with the same body answers with the job
+//! the first call minted, and the same token with a different body is a
+//! `ConflictException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +92,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{SearchJob, SEARCH_JOB_RESOURCE};
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -103,12 +106,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // here — hence the `StartSearchJobError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupsearch#StartSearchJob")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupsearch#StartSearchJob",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum StartSearchJobErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    /// Declared on the service, not on this operation: the store this emulator keeps
+    /// its search jobs in could not be reached, which is a server fault.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -162,18 +171,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSearchJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSearchJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSearchJob"))
+        let now = SystemTime::now();
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        let mut state = state.lock();
+        state.settle(now);
+
+        let fingerprint = request_fingerprint(&input).map_err(|reason| {
+            StartSearchJobError::from(StartSearchJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!("could not record the StartSearchJob request: {reason}"),
+                    retry_after_seconds: None,
+                },
+            ))
+        })?;
+
+        // `ClientToken` idempotency: the same token with the same body answers with the
+        // job the first call minted and creates nothing; with a different body it is a
+        // conflict, because that token already names another job.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(job) = state.job_by_client_token(token) {
+                if job.request_fingerprint != fingerprint {
+                    return Err(StartSearchJobErrorModeled::ConflictException(ConflictException {
+                        message: format!(
+                            "ClientToken '{token}' was already used for a different StartSearchJob request"
+                        ),
+                        resource_id: job.identifier.clone(),
+                        resource_type: SEARCH_JOB_RESOURCE.to_string(),
+                    })
+                    .into());
+                }
+                return Ok(StartSearchJobOutput {
+                    search_job_arn: Some(job.arn.clone()),
+                    creation_time: Some(job.creation_time),
+                    search_job_identifier: Some(job.identifier.clone()),
+                });
+            }
+        }
+
+        // The tags this job would be stored with have to fit the caps bounding one
+        // record, so a create cannot grow a stored job without bound.
+        let tags = input.tags.clone().unwrap_or_default();
+        for (key, value) in &tags {
+            crate::state::check_tag_entry(key, value)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        crate::state::check_tag_count(tags.len())
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // This store holds its jobs for the life of the process and only this operation
+        // adds one, so it is capped: past the cap the service's own quota error is the
+        // honest answer (`crate::state::MAX_SEARCH_JOBS`).
+        if state.is_full() {
+            return Err(StartSearchJobErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} search jobs",
+                        crate::state::MAX_SEARCH_JOBS
+                    ),
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: SEARCH_JOB_RESOURCE.to_string(),
+                    service_code: ctx.identity().signing_name().to_string(),
+                    // AWS publishes no quota code for this limit, which it documents as
+                    // adjustable; this names the quota the emulator enforces.
+                    quota_code: "SearchJobsPerAccount".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let identifier = state.mint_identifier();
+        let arn = crate::state::search_job_arn(
+            ctx.identity().signing_name(),
+            &crate::state::request_region(ctx),
+            &identifier,
+        );
+
+        // What the scan has to get through. A recovery point exists for this account
+        // only once the Backup data plane holds one, and this emulator holds none, so
+        // the scope is empty and these totals are the size of that empty set — counted,
+        // not invented. The progress starts at nothing scanned.
+        let search_scope_summary = SearchScopeSummary {
+            total_recovery_points_to_scan_count: Some(0),
+            total_items_to_scan_count: Some(0),
+        };
+        let current_search_progress = CurrentSearchProgress {
+            recovery_points_scanned_count: Some(0),
+            items_scanned_count: Some(0),
+            items_matched_count: Some(0),
+        };
+
+        let job = SearchJob {
+            identifier: identifier.clone(),
+            arn,
+            name: input.name.clone(),
+            // A new search job is RUNNING; the clock owes it COMPLETED once the scan's
+            // span has passed (`crate::state::TRANSITION_DELAY`).
+            status: crate::state::RUNNING.to_string(),
+            creation_time: crate::state::timestamp(now),
+            completion_time: None,
+            status_message: None,
+            encryption_key_arn: input.encryption_key_arn.clone(),
+            search_scope: input.search_scope.clone(),
+            // `@required` on GetSearchJob's output: a job started with no item filters
+            // filtered on nothing, which is an `ItemFilters` holding no filter.
+            item_filters: input.item_filters.clone().unwrap_or_default(),
+            search_scope_summary,
+            current_search_progress,
+            // The matches recorded so far: nothing is in scope, so the scan finds none.
+            results: Vec::new(),
+            tags,
+            client_token: input.client_token.clone(),
+            request_fingerprint: fingerprint,
+            next_status_due: Some((now + crate::state::TRANSITION_DELAY, crate::state::COMPLETED)),
+        };
+        state.insert_job(job);
+
+        // Answer out of the STORED record, so this response cannot differ from what
+        // GetSearchJob reports for the same job.
+        let stored = state.job(&identifier).ok_or_else(store_unavailable)?;
+        Ok(StartSearchJobOutput {
+            search_job_arn: Some(stored.arn.clone()),
+            creation_time: Some(stored.creation_time),
+            search_job_identifier: Some(stored.identifier.clone()),
+        })
+    }
+}
+
+/// The server fault to answer with when this emulator's search-job store cannot be
+/// reached: a 500 the caller is told to retry, never an empty success.
+fn store_unavailable() -> StartSearchJobError {
+    StartSearchJobErrorModeled::InternalServerException(InternalServerException {
+        message: crate::state::STORE_UNAVAILABLE.to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// A canonical rendering of this request's body, stored with the job so a later call
+/// under the same `ClientToken` can be told apart: the same body is a repeat, a
+/// different body is a conflict.
+///
+/// The body is re-serialized with the protocol's own JSON codec — so exactly the
+/// modelled members are compared, however the client sent them — with every object's
+/// members put in key order, because a JSON object's member order is not part of the
+/// request while a list's order is.
+fn request_fingerprint(input: &StartSearchJobInput) -> Result<String, String> {
+    use ::aws_smithy_schema::codec::{Codec, FinishSerializer};
+    use ::aws_smithy_schema::serde::ShapeSerializer;
+
+    let mut serializer =
+        ::aws_smithy_schema_server::json::JsonCodec::rest_json().create_serializer();
+    serializer
+        .write_struct(super::types::START_SEARCH_JOB_INPUT_SCHEMA, input)
+        .map_err(|error| error.to_string())?;
+    let json = serializer.finish();
+    let value: ::serde_json::Value =
+        ::serde_json::from_slice(&json).map_err(|error| error.to_string())?;
+    ::serde_json::to_string(&key_ordered(&value)).map_err(|error| error.to_string())
+}
+
+/// `value` rebuilt with every object's members in key order, so two bodies differing
+/// only in member order render identically.
+///
+/// The ordering is imposed here rather than left to `serde_json::Map`, whose iteration
+/// order is sorted only while nothing in the build enables the crate's `preserve_order`
+/// feature; inserting in sorted order is correct either way.
+fn key_ordered(value: &::serde_json::Value) -> ::serde_json::Value {
+    match value {
+        ::serde_json::Value::Object(members) => {
+            let ordered: ::std::collections::BTreeMap<String, ::serde_json::Value> = members
+                .iter()
+                .map(|(name, member)| (name.clone(), key_ordered(member)))
+                .collect();
+            ::serde_json::Value::Object(ordered.into_iter().collect())
+        }
+        ::serde_json::Value::Array(elements) => {
+            ::serde_json::Value::Array(elements.iter().map(key_ordered).collect())
+        }
+        scalar => scalar.clone(),
     }
 }

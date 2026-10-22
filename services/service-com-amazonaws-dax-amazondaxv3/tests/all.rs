@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/dax_cluster_lifecycle.rs"]
 mod dax_cluster_lifecycle;
+#[path = "all/dax_parameter_groups.rs"]
+mod dax_parameter_groups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

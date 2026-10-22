@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a queue from its farm in this service's store, with the jobs held under it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `DeleteQueue` DOES model a `ConflictException`, but what the real service refuses with
+//! it is a queue that is still associated with something outside itself (a fleet, a
+//! limit) — associations this slice does not persist, since every
+//! `*QueueFleetAssociation` / `*QueueLimitAssociation` operation is still scaffolded. The
+//! jobs held under the queue are reached only through it, so they go with it rather than
+//! blocking the delete.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +147,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteQueue"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteQueueErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        if store.farm(&input.farm_id).is_none() {
+            return Err(DeleteQueueErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        // A queue of another farm is not reachable through this farm's path, so removing
+        // it from THIS farm is the whole deletion; the jobs held under it go with it.
+        let removed_queue = store
+            .farms
+            .get_mut(&input.farm_id)
+            .and_then(|farm| farm.queues.remove(&input.queue_id));
+        let Some(removed_queue) = removed_queue else {
+            return Err(DeleteQueueErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        };
+
+        // The client tokens of the queue and of its jobs are released with them, so the
+        // idempotency record cannot grow past the resources it describes, and the
+        // template bytes those jobs held go back to the store's budget.
+        let mut removed = vec![removed_queue.queue_id.clone()];
+        let mut released_template_bytes = 0;
+        for job in removed_queue.jobs.values() {
+            removed.push(job.job_id.clone());
+            released_template_bytes += job.template.as_deref().map_or(0, str::len);
+        }
+        store.forget_resources(&removed);
+        store.release_template_bytes(released_template_bytes);
+
+        Ok(DeleteQueueOutput {})
     }
 }

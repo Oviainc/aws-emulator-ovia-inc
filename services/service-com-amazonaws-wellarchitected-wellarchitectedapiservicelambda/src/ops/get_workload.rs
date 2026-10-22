@@ -2,8 +2,10 @@
 
 //! @op GetWorkload
 //! IMPLEMENTED: rebuilds the `Workload` from the stored record, or answers
-//! `ResourceNotFoundException` (404) when no workload carries the id. Reporting only —
-//! it never writes.
+//! `ResourceNotFoundException` (404) when no workload carries the id — including an id
+//! that does not satisfy the modelled `WorkloadId` pattern, because the path id is
+//! resolved by lookup rather than refused by input validation. Reporting only — it
+//! never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -148,11 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let record = store.workloads.get(&input.workload_id).ok_or_else(|| {
-            GetWorkloadErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("No workload exists with id {}", input.workload_id),
-                resource_id: input.workload_id.clone(),
-                resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
-            })
+            GetWorkloadErrorModeled::ResourceNotFoundException(crate::state::workload_not_found(
+                &input.workload_id,
+            ))
         })?;
 
         Ok(GetWorkloadOutput {

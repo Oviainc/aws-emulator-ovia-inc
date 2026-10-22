@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op MeterUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `MeterUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`MeterUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends one metering record to this service's ledger and returns the
+//! `MeteringRecordId` it stored the record under. Everything the answer depends on
+//! is persisted state: the product's published dimensions and entitled customers,
+//! the hour bucket the reported `Timestamp` falls in, and the `ClientToken` the
+//! request arrived with.
+//!
+//! * The same (product, customer, dimension, hour) reported again with the SAME
+//!   quantity replays the stored id — "The Timestamp request parameter is rounded
+//!   down to the hour and used to enforce this once-per-hour rule for idempotency" —
+//!   and with a DIFFERENT quantity is a `DuplicateRequestException`.
+//! * A `ClientToken` seen before replays its stored id when every other member
+//!   matches, and is an `IdempotencyConflictException` (HTTP 409) when one does not.
+//! * `DryRun` validates and returns without writing anything, so no later dedup or
+//!   `BatchMeterUsage` call can see the dry-run request; with nothing recorded there
+//!   is no record id to report. `MeterUsageRequest$DryRun` reads "Checks whether you
+//!   have the permissions required for the action, but does not make the request. If
+//!   you have the permissions, the request returns `DryRunOperation`; otherwise, it
+//!   returns `UnauthorizedException`", but this model declares NEITHER shape — not as
+//!   an error of this operation, not anywhere in the service — and `MeterUsageResult`
+//!   has only the optional `MeteringRecordId` to answer in. The emulator verifies the
+//!   request's signature before a handler runs, so a dry run that reaches here has the
+//!   permissions: it is reported as the success that made no request, with the one
+//!   optional output member left out because no record was stored. Answering an
+//!   unmodelled `DryRunOperation` code, or inventing a record id for a record that
+//!   does not exist, would both be worse.
 //!
 //! ## Shape of an operation
 //!
@@ -230,18 +247,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `MeterUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(MeterUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("MeterUsage"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            MeterUsageErrorModeled::InternalServiceErrorException(InternalServiceErrorException {
+                message: Some("the metering store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The buyer's credentials sign this call, so the usage is metered against the
+        // caller's own account: the one canonical account this emulator vends.
+        let customer = ::engine::emulator_account_id().to_string();
+        let quantity = input.usage_quantity.unwrap_or(0);
+        let timestamp_secs = input.timestamp.secs();
+        let allocations = input.usage_allocations.clone().unwrap_or_default();
+
+        let product = state.products.get(&input.product_code).ok_or_else(|| {
+            MeterUsageErrorModeled::InvalidProductCodeException(InvalidProductCodeException {
+                message: Some(format!(
+                    "The product code {} does not match the product code used for publishing the product",
+                    input.product_code
+                )),
+            })
+        })?;
+        if !product.entitled_customers.contains(&customer) {
+            return Err(MeterUsageErrorModeled::CustomerNotEntitledException(
+                CustomerNotEntitledException {
+                    message: Some(format!(
+                        "Customer {customer} does not have a valid subscription for product {}",
+                        input.product_code
+                    )),
+                },
+            )
+            .into());
+        }
+        if !product.dimensions.contains(&input.usage_dimension) {
+            return Err(MeterUsageErrorModeled::InvalidUsageDimensionException(
+                InvalidUsageDimensionException {
+                    message: Some(format!(
+                        "The usage dimension {} does not match one of the UsageDimensions associated with product {}",
+                        input.usage_dimension, input.product_code
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The reported instant must lie inside the window the model states for this
+        // operation: no later than now, and no earlier than six hours ago.
+        let now = crate::state::now_epoch_secs();
+        if timestamp_secs > now || timestamp_secs < now - crate::state::METER_USAGE_BACKDATING_SECS
+        {
+            return Err(MeterUsageErrorModeled::TimestampOutOfBoundsException(
+                TimestampOutOfBoundsException {
+                    message: Some(format!(
+                        "Timestamp is out of the allowed range: usage may be metered for up to {} hours in the past and not in the future",
+                        crate::state::METER_USAGE_BACKDATING_SECS / 3600
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if let Some(message) = crate::state::allocations_problem(&allocations, quantity) {
+            return Err(MeterUsageErrorModeled::InvalidUsageAllocationsException(
+                InvalidUsageAllocationsException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // `DryRun` checks the request and stops: nothing is written, so neither this
+        // operation's de-duplication nor `BatchMeterUsage` can ever see it, and there is
+        // no stored record to name a `MeteringRecordId` for.
+        if input.dry_run.unwrap_or(false) {
+            return Ok(MeterUsageOutput {
+                metering_record_id: None,
+            });
+        }
+
+        let fingerprint = crate::state::meter_usage_fingerprint(
+            &input.product_code,
+            &input.usage_dimension,
+            timestamp_secs,
+            quantity,
+            &allocations,
+        );
+        if let Some(entry) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.idempotency.get(token))
+        {
+            if entry.request_fingerprint != fingerprint {
+                return Err(MeterUsageErrorModeled::IdempotencyConflictException(
+                    IdempotencyConflictException {
+                        message: Some(
+                            "The ClientToken is being used for multiple requests".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            return Ok(MeterUsageOutput {
+                metering_record_id: Some(entry.metering_record_id.clone()),
+            });
+        }
+
+        // Already metered for this product, customer, dimension and hour: the same
+        // quantity is the idempotent replay the model documents, a different one is a
+        // duplicate request, because a recorded value cannot be modified.
+        let already_metered = state
+            .dedup_entry(
+                &input.product_code,
+                &customer,
+                &input.usage_dimension,
+                timestamp_secs,
+            )
+            .cloned();
+        let metering_record_id = match already_metered {
+            Some(entry) if entry.quantity != quantity => {
+                return Err(MeterUsageErrorModeled::DuplicateRequestException(
+                    DuplicateRequestException {
+                        message: Some(format!(
+                            "A metering record has already been emitted for dimension {} in this hour with a different usage quantity",
+                            input.usage_dimension
+                        )),
+                    },
+                )
+                .into());
+            }
+            Some(entry) => entry.metering_record_id,
+            None => {
+                let metering_record_id = state.mint_metering_record_id();
+                state.record_usage(crate::state::MeteringRecord {
+                    metering_record_id: metering_record_id.clone(),
+                    product_code: input.product_code.clone(),
+                    customer_identifier: customer,
+                    customer_aws_account_id: Some(::engine::emulator_account_id().to_string()),
+                    dimension: input.usage_dimension.clone(),
+                    quantity,
+                    timestamp_secs,
+                    usage_allocations: allocations,
+                    created_at: ::std::time::SystemTime::now(),
+                });
+                metering_record_id
+            }
+        };
+
+        if let Some(token) = input.client_token {
+            state.idempotency.record(
+                token,
+                crate::state::IdempotencyEntry {
+                    request_fingerprint: fingerprint,
+                    metering_record_id: metering_record_id.clone(),
+                },
+            );
+        }
+
+        Ok(MeterUsageOutput {
+            metering_record_id: Some(metering_record_id),
+        })
     }
 }

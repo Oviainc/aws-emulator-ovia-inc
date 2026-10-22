@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Rewrites the metadata of an application already in the catalogue — the members the
+//! request carries, and only those — in [`crate::state`], and answers out of the stored
+//! record so a later GetApplication/ListApplications reports the rewrite.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -57,6 +53,8 @@
 //!   application.
 //! * `Author` (__string) — The name of the author publishing the app. Minimum length=1.
 //!   Maximum length=127. Pattern "^[a-z0-9](([a-z0-9]|-(?!-))*[a-z0-9])?$";
+//!   (the model carries NO `@pattern` on this member and the service accepts any text
+//!   within the documented length — see `crate::state::validate_author`)
 //! * `Description` (__string) — The description of the application. Minimum length=1. Maximum
 //!   length=256
 //! * `HomePageUrl` (__string) — A URL with more information about the application, for
@@ -111,6 +109,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::Artifact;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -185,18 +184,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplication"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateApplicationErrorModeled::InternalServerErrorException(
+                crate::state::internal_server_error("the service state is unavailable"),
+            )
+            .into());
+        };
+
+        // The members this patch carries are the ones CreateApplication accepts, so they
+        // are held to the same documented bounds, from the same place (`crate::state`) —
+        // an absent member is not being rewritten and is not validated.
+        if let Some(author) = input.author.as_deref() {
+            crate::state::validate_author(author).map_err(bad_request)?;
+        }
+        if let Some(description) = input.description.as_deref() {
+            crate::state::validate_description(description).map_err(bad_request)?;
+        }
+        if let Some(labels) = input.labels.as_deref() {
+            crate::state::validate_labels(labels).map_err(bad_request)?;
+        }
+        // "You can specify only one of readmeBody and readmeUrl; otherwise, an error
+        // results" (`smithy_query(query="doc", shape="CreateApplicationRequest",
+        // member="ReadmeBody")`), and an inline body is bounded before it is retained.
+        if input.readme_body.is_some() && input.readme_url.is_some() {
+            let (body_member, url_member) = Artifact::Readme.members();
+            return Err(bad_request(format!(
+                "You can specify only one of {body_member} and {url_member}."
+            )));
+        }
+        crate::state::bounded_bytes(
+            "ReadmeBody",
+            input.readme_body.as_ref(),
+            crate::state::MAX_ARTIFACT_BYTES,
+        )
+        .map_err(bad_request)?;
+
+        let mut store = state.lock();
+        let Some(application) = store.applications.get_mut(&input.application_id) else {
+            return Err(UpdateApplicationErrorModeled::NotFoundException(crate::state::not_found(
+                crate::state::ErrorCode::ApplicationNotFound,
+                crate::state::application_not_found_message(&input.application_id),
+            ))
+            .into());
+        };
+
+        // A PATCH rewrites the members it names and leaves every other one as stored. A
+        // `Labels` list the request carries REPLACES the stored list, including when it is
+        // empty: the member is the whole list, not an addition to it.
+        if let Some(author) = input.author.clone() {
+            application.author = author;
+        }
+        if let Some(description) = input.description.clone() {
+            application.description = description;
+        }
+        if let Some(home_page_url) = input.home_page_url.clone() {
+            application.home_page_url = Some(home_page_url);
+        }
+        if let Some(labels) = input.labels.clone() {
+            application.labels = labels;
+        }
+        if input.readme_body.is_some() || input.readme_url.is_some() {
+            // The readme is stored as the caller's link, or as the locator minted for a
+            // body supplied inline — the same resolution the create performs.
+            let readme_url = crate::state::resolve_artifact_url(
+                input.readme_body.as_ref(),
+                input.readme_url.as_ref(),
+                &application.region,
+                &application.name,
+                None,
+                Artifact::Readme,
+            );
+            application.readme_url = readme_url;
+            application.readme_body = input.readme_body.clone();
+        }
+
+        // Answer from the STORED record, so what this call returns is exactly what a
+        // later GetApplication reads.
+        let summary = application.summary();
+        Ok(UpdateApplicationOutput {
+            application_id: Some(summary.application_id),
+            author: Some(summary.author),
+            creation_time: summary.creation_time,
+            description: Some(summary.description),
+            home_page_url: summary.home_page_url,
+            is_verified_author: Some(application.is_verified_author),
+            labels: summary.labels,
+            license_url: application.license_url.clone(),
+            name: Some(summary.name),
+            readme_url: application.readme_url.clone(),
+            spdx_license_id: summary.spdx_license_id,
+            verified_author_url: application.verified_author_url.clone(),
+            version: application
+                .latest()
+                .map(|version| version.version(&input.application_id)),
+        })
     }
+}
+
+/// The 400 this operation answers for a parameter outside the bounds the service
+/// documents but the model does not express as a constraint trait.
+fn bad_request(message: String) -> UpdateApplicationError {
+    UpdateApplicationErrorModeled::BadRequestException(crate::state::bad_request(message)).into()
 }

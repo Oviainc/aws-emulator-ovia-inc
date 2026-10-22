@@ -167,7 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A pure read, scoped to ONE app: the branches are read out of that app's own
-        // map, so no other app's branch can appear in the page.
+        // map, so no other app's branch can appear in the page. Each element is
+        // projected the way a read reports a branch, so a listed branch and a
+        // `GetBranch` of the same branch agree member for member.
         let store = state.lock();
         let app = store.apps.get(&input.app_id).ok_or_else(|| {
             ListBranchesErrorModeled::NotFoundException(NotFoundException {
@@ -179,9 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let (branches, next_token) = crate::state::page(
-            app.branches
-                .iter()
-                .map(|(branch_name, branch)| (branch_name.clone(), branch.clone())),
+            app.branches.iter().map(|(branch_name, branch)| {
+                (
+                    branch_name.clone(),
+                    BranchProjection::reported(branch.clone()),
+                )
+            }),
             input.next_token.as_deref(),
             crate::state::page_size(input.max_results, MAX_RESULTS),
         );

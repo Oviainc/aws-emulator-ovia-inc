@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/app_branch_lifecycle.rs"]
 mod app_branch_lifecycle;
+#[path = "all/app_branch_projection.rs"]
+mod app_branch_projection;
 #[path = "all/branch_deletion_visibility.rs"]
 mod branch_deletion_visibility;
 #[path = "all/state_roundtrip.rs"]

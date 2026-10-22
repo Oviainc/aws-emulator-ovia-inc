@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSearchJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSearchJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSearchJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one persisted search job: the record `StartSearchJob` stored, with the
+//! status the clock has made due by the time of the call. An identifier this account
+//! holds no job for is a `ResourceNotFoundException` (404), never an empty 200.
 //!
 //! ## Shape of an operation
 //!
@@ -99,6 +93,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::SEARCH_JOB_RESOURCE;
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -110,10 +107,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupsearch-cryobackup
 // here — hence the `GetSearchJobError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupsearch#GetSearchJob")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupsearch#GetSearchJob",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetSearchJobErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    /// Declared on the service, not on this operation: the store this emulator keeps
+    /// its search jobs in could not be reached, which is a server fault.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -165,20 +168,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSearchJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSearchJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSearchJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSearchJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        // Materialise what the clock already owed this job before reporting it; this
+        // writes nothing a later caller would not have seen anyway.
+        state.settle(SystemTime::now());
+
+        let job = state.job(&input.search_job_identifier).ok_or_else(|| {
+            GetSearchJobError::from(GetSearchJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no search job with identifier '{}' exists",
+                        input.search_job_identifier
+                    ),
+                    resource_id: input.search_job_identifier.clone(),
+                    resource_type: SEARCH_JOB_RESOURCE.to_string(),
+                },
+            ))
+        })?;
+
+        Ok(GetSearchJobOutput {
+            name: job.name.clone(),
+            search_scope_summary: Some(job.search_scope_summary.clone()),
+            current_search_progress: Some(job.current_search_progress.clone()),
+            status_message: job.status_message.clone(),
+            encryption_key_arn: job.encryption_key_arn.clone(),
+            completion_time: job.completion_time,
+            status: job.status.clone(),
+            search_scope: job.search_scope.clone(),
+            item_filters: job.item_filters.clone(),
+            creation_time: job.creation_time,
+            search_job_identifier: job.identifier.clone(),
+            search_job_arn: job.arn.clone(),
+        })
     }
 }

@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination tokens: hex-encode the resume key so a `NextToken` is not a
+# readable (or hand-buildable) position.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
+# `tokio::time::sleep` for the test that waits out an accelerator's deployment.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

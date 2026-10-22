@@ -237,9 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             default_domain: format!("{app_id}.amplifyapp.com"),
             app_id,
             name: input.name,
+            // `tags` is echoed exactly as the request set it: the create response
+            // carries the member only when the request carried it, and a later read
+            // reports the app's tag map (see `AppProjection::reported`).
             tags: input.tags,
             // The @required members below have no value in a request that omits
-            // them, so the record carries the empty value of the member's type.
+            // them. The record holds the empty value of the member's type, which is
+            // what `AppProjection` reports as JSON `null`.
             description: input.description.unwrap_or_default(),
             repository: input.repository.unwrap_or_default(),
             platform: input.platform.unwrap_or_else(|| DEFAULT_PLATFORM.to_string()),
@@ -249,24 +253,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             iam_service_role_arn: input.iam_service_role_arn,
             environment_variables: input.environment_variables.unwrap_or_default(),
             enable_branch_auto_build: input.enable_branch_auto_build.unwrap_or(false),
-            enable_branch_auto_deletion: input.enable_branch_auto_deletion,
+            // Every feature flag below is OFF on an app created without it, and an
+            // app Amplify created has a definite answer for each: the flag carries
+            // `false`, never nothing at all.
+            enable_branch_auto_deletion: Some(input.enable_branch_auto_deletion.unwrap_or(false)),
             enable_basic_auth: input.enable_basic_auth.unwrap_or(false),
             basic_auth_credentials: input.basic_auth_credentials,
-            custom_rules: input.custom_rules,
+            // The redirect/rewrite rules and the custom header document are
+            // collections the app always has: empty until a request supplies one.
+            custom_rules: Some(input.custom_rules.unwrap_or_default()),
             // A production branch is a property of a DEPLOYED branch, and a new app
             // has no branches at all.
             production_branch: None,
             build_spec: input.build_spec,
-            custom_headers: input.custom_headers,
-            enable_auto_branch_creation: input.enable_auto_branch_creation,
+            custom_headers: Some(input.custom_headers.unwrap_or_default()),
+            enable_auto_branch_creation: Some(input.enable_auto_branch_creation.unwrap_or(false)),
             auto_branch_creation_patterns: input.auto_branch_creation_patterns,
             auto_branch_creation_config: input.auto_branch_creation_config,
             // `repositoryCloneMethod` is documented "for internal use": Amplify sets
             // it from the credential kind it used to reach the repository, and this
             // emulator reaches no repository.
             repository_clone_method: None,
-            // App$cacheConfig: "If you don't specify the cache configuration type,
-            // Amplify uses the default AMPLIFY_MANAGED setting."
+            // An app always has a cache configuration; an app created without one
+            // gets the type the model calls the default setting.
             cache_config: Some(input.cache_config.unwrap_or_else(|| CacheConfig {
                 r#type: DEFAULT_CACHE_CONFIG_TYPE.to_string(),
             })),
@@ -274,7 +283,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // which creating an app does not do.
             webhook_create_time: None,
             waf_configuration: None,
-            job_config: input.job_config,
+            // An app always has a job configuration: the build instance size its
+            // jobs run on, which defaults to the size the model documents.
+            job_config: Some(input.job_config.unwrap_or_else(|| JobConfig {
+                build_compute_type: DEFAULT_BUILD_COMPUTE_TYPE.to_string(),
+            })),
         };
 
         // `accessToken` / `oauthToken` are deliberately NOT persisted: both members
@@ -283,7 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .apps
             .insert(app.app_id.clone(), crate::state::AmplifyApp::new(app.clone()));
 
-        Ok(CreateAppOutput { app })
+        Ok(CreateAppOutput {
+            app: AppProjection::written(app),
+        })
     }
 }
 
@@ -295,10 +310,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// ("For a static app, set the platform type to WEB").
 const DEFAULT_PLATFORM: &str = "WEB";
 
-/// The cache configuration an app created without one gets, per `App$cacheConfig`:
-/// "If you don't specify the cache configuration `type`, Amplify uses the default
-/// `AMPLIFY_MANAGED` setting."
-const DEFAULT_CACHE_CONFIG_TYPE: &str = "AMPLIFY_MANAGED";
+/// The cache configuration type an app created without one gets.
+///
+/// `CacheConfig$type` documents the two types and which one applies by default:
+/// "The `AMPLIFY_MANAGED_NO_COOKIES` cache configuration type is the same as
+/// `AMPLIFY_MANAGED`, except that it excludes all cookies from the cache key. This is
+/// the default setting." (`smithy_query(query="shape",shape="CacheConfig")`.)
+///
+/// `App$cacheConfig`'s own prose still names `AMPLIFY_MANAGED` as the default; the
+/// member that defines the types is the more specific statement, and the recorded
+/// AWS response for an app created without a cache configuration is
+/// `AMPLIFY_MANAGED_NO_COOKIES`.
+const DEFAULT_CACHE_CONFIG_TYPE: &str = "AMPLIFY_MANAGED_NO_COOKIES";
+
+/// The build instance size the jobs of an app created without a `jobConfig` run on.
+///
+/// `JobConfig$buildComputeType`: "Amplify supports three instance sizes:
+/// `STANDARD_8GB`, `LARGE_16GB`, and `XLARGE_72GB`. If you don't specify a value,
+/// Amplify uses the `STANDARD_8GB` default."
+/// (`smithy_query(query="shape",shape="JobConfig")`.)
+const DEFAULT_BUILD_COMPUTE_TYPE: &str = "STANDARD_8GB";
 
 /// How many apps may exist at once, past which `CreateApp` answers the modelled
 /// `LimitExceededException` (HTTP 429, "A resource could not be created because

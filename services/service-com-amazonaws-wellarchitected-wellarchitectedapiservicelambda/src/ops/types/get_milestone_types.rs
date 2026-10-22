@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wellarchitected-wellarchitectedapiservicelambda.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#GetMilestoneInput")]
+// Both path labels of this operation are RESOLVED, not validated: the milestone is
+// looked up by the `(WorkloadId, MilestoneNumber)` pair in `ops::get_milestone`, which
+// answers the modelled 404 `ResourceNotFoundException` naming the composite
+// `<workloadId>.<milestoneNumber>` for a pair that was never recorded. See the note in
+// `get_workload_types.rs`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.wellarchitected#GetMilestoneInput",
+    skip_validation = ["WorkloadId", "MilestoneNumber"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetMilestoneInput {
     pub workload_id: String,

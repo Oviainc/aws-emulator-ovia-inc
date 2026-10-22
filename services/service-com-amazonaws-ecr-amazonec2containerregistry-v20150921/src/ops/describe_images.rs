@@ -154,6 +154,11 @@ fn fault_error(fault: crate::state::Fault) -> DescribeImagesErrorModeled {
                 message,
             })
         }
+        // The tag faults belong to the tagging operations; this read validates no tag,
+        // and its model declares no tag error to report one with.
+        crate::state::Fault::InvalidTagParameter(_) | crate::state::Fault::TooManyTags(_) => {
+            DescribeImagesErrorModeled::ServerException(ServerException { message })
+        }
     }
 }
 
