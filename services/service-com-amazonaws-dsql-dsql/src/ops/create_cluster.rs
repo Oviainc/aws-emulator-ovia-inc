@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and persists a cluster: a fresh lowercase-ULID `identifier`, the ARN and
+//! endpoint derived from it and the request's region, `CREATING` with the clock
+//! owing it `ACTIVE`, and the `tags` / `kmsEncryptionKey` / `multiRegionProperties`
+//! / `policy` the caller supplied. A repeated `clientToken` returns the cluster the
+//! first call minted rather than minting a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -137,12 +134,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `CreateClusterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#CreateCluster")]
+// The operation's MODELED errors, plus the service-common `InternalServerException`
+// widened in with `extra_errors`: the service declares it for every operation (its
+// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
+// per-operation list the macro checks against does not repeat it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#CreateCluster",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateClusterErrorModeled {
     ConflictException(ConflictException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -196,18 +201,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // `@idempotencyToken`: a repeat of the same call returns the result of the
+        // original one and has no additional effect.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = state
+                .create_client_tokens
+                .get(token)
+                .and_then(|identifier| state.clusters.get(identifier))
+            {
+                return Ok(created_cluster_output(existing));
+            }
+        }
+
+        // The store is bounded: once it is full a further create is refused with
+        // this operation's own `ServiceQuotaExceededException` rather than growing
+        // the emulator's heap. Checked AFTER the idempotency lookup, so a repeat of
+        // a request already served still answers from the store at the ceiling.
+        if state.clusters.len() >= crate::state::MAX_CLUSTERS {
+            return Err(CreateClusterErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of clusters ({}) has already been created.",
+                        crate::state::MAX_CLUSTERS
+                    ),
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: "cluster".to_string(),
+                    service_code: "dsql".to_string(),
+                    quota_code: "clusters-per-account".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let identifier = state.mint_cluster_identifier();
+        let cluster = crate::state::Cluster {
+            arn: crate::state::cluster_arn(&region, &identifier),
+            status: crate::state::STATUS_CREATING.to_string(),
+            creation_time: now,
+            deletion_protection_enabled: input.deletion_protection_enabled,
+            encryption_details: Some(crate::state::encryption_details(
+                &region,
+                input.kms_encryption_key.as_deref(),
+            )),
+            kms_encryption_key: input.kms_encryption_key.clone(),
+            multi_region_properties: input.multi_region_properties.clone(),
+            endpoint: Some(crate::state::cluster_endpoint(&region, &identifier)),
+            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+            // A policy supplied at creation is stored with its first version, so
+            // GetClusterPolicy has it to report once that operation is implemented.
+            policy_version: input.policy.as_ref().map(|_| "1".to_string()),
+            policy: input.policy.clone(),
+            // The clock, not a later caller, owes this cluster its ACTIVE status.
+            pending: Some(crate::state::PendingTransition {
+                due_at: now + crate::state::SETTLE_AFTER,
+                next_status: crate::state::STATUS_ACTIVE,
+            }),
+            delete_client_token: None,
+            identifier: identifier.clone(),
+        };
+
+        let created = created_cluster_output(&cluster);
+        state.clusters.insert(identifier.clone(), cluster);
+        if let Some(token) = input.client_token {
+            state.record_create_token(token, &identifier);
+        }
+        Ok(created)
+    }
+}
+
+/// `CreateClusterOutput` read off a persisted cluster: every member of the output
+/// is a field of the stored record, so a repeat of an idempotent call renders the
+/// same answer from the same state.
+fn created_cluster_output(cluster: &crate::state::Cluster) -> CreateClusterOutput {
+    CreateClusterOutput {
+        identifier: cluster.identifier.clone(),
+        arn: cluster.arn.clone(),
+        status: cluster.status.clone(),
+        creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
+        multi_region_properties: cluster.multi_region_properties.clone(),
+        encryption_details: cluster.encryption_details.clone(),
+        deletion_protection_enabled: cluster.deletion_protection_enabled,
+        endpoint: cluster.endpoint.clone(),
     }
 }
