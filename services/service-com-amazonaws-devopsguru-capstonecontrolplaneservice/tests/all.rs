@@ -17,5 +17,7 @@ mod account_health;
 mod configuration_lifecycle;
 #[path = "all/insight_listing.rs"]
 mod insight_listing;
+#[path = "all/insight_reads.rs"]
+mod insight_reads;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
