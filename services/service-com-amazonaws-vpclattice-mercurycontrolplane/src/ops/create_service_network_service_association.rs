@@ -142,13 +142,18 @@ impl From<CreateServiceNetworkServiceAssociationErrorModeled> for CreateServiceN
     }
 }
 
-/// HTTP 404 for an identifier that names no persisted resource of `kind`.
-fn not_found(identifier: &str, kind: &str) -> CreateServiceNetworkServiceAssociationError {
+/// HTTP 404 for an identifier that names no persisted resource of `kind`, with AWS's
+/// not-found message construction over the submitted identifier
+/// ([`crate::state::ResourceKind::not_found_message`]).
+fn not_found(
+    identifier: &str,
+    kind: crate::state::ResourceKind,
+) -> CreateServiceNetworkServiceAssociationError {
     CreateServiceNetworkServiceAssociationErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: format!("{kind} {identifier} not found"),
+            message: kind.not_found_message(identifier),
             resource_id: identifier.to_string(),
-            resource_type: kind.to_string(),
+            resource_type: kind.arn_kind().to_string(),
         },
     )
     .into()
@@ -288,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(not_found(
                 &input.service_identifier,
-                crate::state::KIND_SERVICE,
+                crate::state::ResourceKind::Service,
             ));
         };
         let Some(network_id) =
@@ -296,7 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(not_found(
                 &input.service_network_identifier,
-                crate::state::KIND_SERVICE_NETWORK,
+                crate::state::ResourceKind::ServiceNetwork,
             ));
         };
 

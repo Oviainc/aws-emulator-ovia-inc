@@ -21,3 +21,5 @@ mod ops_name_bindings;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_flow.rs"]
+mod update_flow;

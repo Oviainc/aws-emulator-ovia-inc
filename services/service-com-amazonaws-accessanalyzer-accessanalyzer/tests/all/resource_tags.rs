@@ -15,55 +15,30 @@
 //! length bound and one past it), and how many calls the set was built up over. The
 //! recorded `Owner`/`team-a`-style single-tag round trip is one row.
 
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_accessanalyzer_accessanalyzer::state::{
     MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
 };
 
 // The wire harness is shared by every suite in this target; see `tests/all/harness.rs`.
+// The three tagging calls (and the `@httpLabel` encoding they need) live there, so this
+// suite and `no_content_responses.rs` drive the same ones.
 use crate::harness::{expected_arn, Emulator, Reply};
-
-/// A `resourceArn` encoded for the `{resourceArn}` httpLabel the tagging operations bind
-/// it to, the way an SDK encodes a label: every character outside the unreserved set is
-/// percent-escaped, so the ARN's own `:` and `/` do not read as path structure.
-fn label(value: &str) -> String {
-    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
-}
 
 /// `POST /tags/{resourceArn}` with the given tag map.
 async fn tag_resource(emulator: &Emulator, resource_arn: &str, tags: &Value) -> Reply {
-    emulator
-        .send(
-            "POST",
-            &format!("/tags/{}", label(resource_arn)),
-            Some(json!({ "tags": tags })),
-        )
-        .await
+    emulator.tag_resource(resource_arn, tags).await
 }
 
 /// `GET /tags/{resourceArn}`.
 async fn list_tags(emulator: &Emulator, resource_arn: &str) -> Reply {
-    emulator
-        .send("GET", &format!("/tags/{}", label(resource_arn)), None)
-        .await
+    emulator.list_tags_for_resource(resource_arn).await
 }
 
 /// `DELETE /tags/{resourceArn}?tagKeys=…`, one query entry per key (`tagKeys` is an
 /// `@httpQuery` list).
 async fn untag_resource(emulator: &Emulator, resource_arn: &str, keys: &[&str]) -> Reply {
-    let query = keys
-        .iter()
-        .map(|key| format!("tagKeys={}", label(key)))
-        .collect::<Vec<_>>()
-        .join("&");
-    emulator
-        .send(
-            "DELETE",
-            &format!("/tags/{}?{query}", label(resource_arn)),
-            None,
-        )
-        .await
+    emulator.untag_resource(resource_arn, keys).await
 }
 
 /// Create an `ACCOUNT` analyzer, optionally carrying create-time tags, and answer the
@@ -240,8 +215,8 @@ async fn tagging_merges_into_the_tag_set_and_reads_back() {
         for tags in &calls {
             let reply = tag_resource(&emulator, &arn, &tag_object(tags)).await;
             assert_eq!(
-                reply.status, 200,
-                "case {case:?}: expected TagResource to answer 200, got {reply:?}"
+                reply.status, 204,
+                "case {case:?}: expected TagResource to answer 204 No Content, got {reply:?}"
             );
             assert_eq!(
                 reply.code(),
@@ -350,8 +325,8 @@ async fn untagging_removes_only_the_named_keys() {
         for keys in &calls {
             let reply = untag_resource(&emulator, &arn, keys).await;
             assert_eq!(
-                reply.status, 200,
-                "case {case:?}: expected UntagResource to answer 200, got {reply:?}"
+                reply.status, 204,
+                "case {case:?}: expected UntagResource to answer 204 No Content, got {reply:?}"
             );
         }
 
@@ -407,9 +382,9 @@ async fn an_untagged_resource_reports_an_empty_tag_set() {
 
     // Once a tag has been added and removed again, the set is empty once more.
     let tagged = tag_resource(&emulator, &arn, &json!({ "a": "1" })).await;
-    assert_eq!(tagged.status, 200, "tagging it: got {tagged:?}");
+    assert_eq!(tagged.status, 204, "tagging it: got {tagged:?}");
     let untagged = untag_resource(&emulator, &arn, &["a"]).await;
-    assert_eq!(untagged.status, 200, "untagging it: got {untagged:?}");
+    assert_eq!(untagged.status, 204, "untagging it: got {untagged:?}");
     let read_back = emulator.get_analyzer("never_tagged").await;
     assert_eq!(
         read_back
@@ -574,8 +549,8 @@ async fn a_tag_outside_the_restrictions_is_refused() {
         let reply = tag_resource(&emulator, &arn, &tag_object(&tags)).await;
         match refusal {
             None => assert_eq!(
-                reply.status, 200,
-                "case {case:?}: expected the call to be accepted, got {reply:?}"
+                reply.status, 204,
+                "case {case:?}: expected the call to be accepted with 204, got {reply:?}"
             ),
             Some(code) => {
                 assert_eq!(
@@ -606,7 +581,7 @@ async fn the_tag_set_of_a_resource_is_bounded() {
         .collect();
     let reply = tag_resource(&emulator, &arn, &tag_object(&full)).await;
     assert_eq!(
-        reply.status, 200,
+        reply.status, 204,
         "a resource takes {MAX_TAGS_PER_RESOURCE} tags, got {reply:?}"
     );
 
@@ -630,8 +605,8 @@ async fn the_tag_set_of_a_resource_is_bounded() {
     // accepted even with the set full.
     let reply = tag_resource(&emulator, &arn, &json!({ "k0": "rewritten" })).await;
     assert_eq!(
-        reply.status, 200,
-        "overwriting a held key with the set full: expected 200, got {reply:?}"
+        reply.status, 204,
+        "overwriting a held key with the set full: expected 204, got {reply:?}"
     );
     let listed = list_tags(&emulator, &arn).await;
     assert_eq!(

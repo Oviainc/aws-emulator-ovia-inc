@@ -123,12 +123,15 @@ impl From<DeleteServiceErrorModeled> for DeleteServiceError {
     }
 }
 
-/// HTTP 404 for an identifier that names no persisted service.
+/// HTTP 404 for an identifier that names no persisted service, with AWS's not-found
+/// message construction over the submitted identifier
+/// ([`crate::state::ResourceKind::not_found_message`]).
 fn not_found(identifier: &str) -> DeleteServiceError {
+    const KIND: crate::state::ResourceKind = crate::state::ResourceKind::Service;
     DeleteServiceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("service {identifier} not found"),
+        message: KIND.not_found_message(identifier),
         resource_id: identifier.to_string(),
-        resource_type: crate::state::KIND_SERVICE.to_string(),
+        resource_type: KIND.arn_kind().to_string(),
     })
     .into()
 }

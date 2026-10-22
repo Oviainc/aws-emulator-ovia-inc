@@ -29,6 +29,9 @@ mod input_lifecycle;
 #[path = "all/input_security_group.rs"]
 mod input_security_group;
 
+#[path = "all/multiplex_lifecycle.rs"]
+mod multiplex_lifecycle;
+
 #[path = "all/sdi_source_lifecycle.rs"]
 mod sdi_source_lifecycle;
 

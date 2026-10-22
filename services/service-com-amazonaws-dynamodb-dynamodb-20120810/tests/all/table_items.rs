@@ -35,7 +35,7 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/us-ea
 const EXPECTED_ARN_PREFIX: &str = "arn:aws:dynamodb:us-east-1:000000000000:table/";
 
 /// One emulator holding only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -44,7 +44,11 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Send one operation and return its HTTP status and parsed body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -62,7 +66,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// Send one operation that must succeed.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let (status, parsed) = call(router, operation, &body).await;
     assert_eq!(
         status, 200,
@@ -73,7 +77,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value 
 
 /// Create a table from `(attribute, key type, attribute type)` rows and wait for the
 /// `CREATING` -> `ACTIVE` transition the clock owes it.
-async fn create_active_table(
+pub(crate) async fn create_active_table(
     router: &MultiServiceRouter,
     name: &str,
     keys: &[(&str, &str, &str)],

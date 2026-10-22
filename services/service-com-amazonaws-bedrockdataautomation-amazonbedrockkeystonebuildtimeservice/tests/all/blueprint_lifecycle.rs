@@ -13,14 +13,14 @@
 
 use std::sync::Arc;
 
-use aws_smithy_types::date_time::Format;
-use aws_smithy_types::DateTime;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimeservice::state;
 use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimeservice::state::ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState as ServiceState;
 use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimeservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::support::{encode_label, error_code, string_at, timestamp_at};
 
 /// A SigV4 `Authorization` header for this service's signing name (`bedrock`,
 /// per `OPERATIONS.md`). `can_handle` resolves the route key from it, and the
@@ -46,22 +46,6 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
-}
-
-/// Percent-encode a `@httpLabel` value the way an AWS SDK does: everything
-/// outside the unreserved set, so an ARN's `:` and `/` stay inside one path
-/// segment.
-fn encode_label(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char);
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
 }
 
 /// Dispatch one request and return its status and decoded JSON body (`Value::Null`
@@ -122,44 +106,6 @@ async fn get_blueprint(router: &MultiServiceRouter, arn: &str, body: &Value) -> 
 
 async fn list_blueprints(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "POST", "/blueprints/", body).await
-}
-
-fn string_at(value: &Value, member: &str, case: &str) -> String {
-    value
-        .get(member)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("case {case:?}: member {member:?} missing from {value:?}"))
-        .to_string()
-}
-
-/// Parse a modeled `date-time` member into comparable (seconds, nanos).
-fn timestamp_at(value: &Value, member: &str, case: &str) -> (i64, u32) {
-    let raw = value.get(member).unwrap_or_else(|| {
-        panic!("case {case:?}: timestamp {member:?} missing from {value:?}")
-    });
-    let parsed = match raw {
-        Value::String(text) => DateTime::from_str(text, Format::DateTime)
-            .unwrap_or_else(|e| panic!("case {case:?}: {member:?} = {text:?} is not a date-time: {e}")),
-        Value::Number(epoch) => DateTime::from_secs_f64(
-            epoch
-                .as_f64()
-                .unwrap_or_else(|| panic!("case {case:?}: {member:?} = {epoch:?} is not numeric")),
-        ),
-        other => panic!("case {case:?}: {member:?} = {other:?} is not a timestamp"),
-    };
-    (parsed.secs(), parsed.subsec_nanos())
-}
-
-/// The `x-amzn-errortype`-equivalent carried in a restJson1 error body.
-fn error_code(payload: &Value) -> String {
-    payload
-        .get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<no __type>")
-        .rsplit(['#', ':'])
-        .next()
-        .unwrap_or("<no __type>")
-        .to_string()
 }
 
 /// Structural check of a minted blueprint ARN against the modeled

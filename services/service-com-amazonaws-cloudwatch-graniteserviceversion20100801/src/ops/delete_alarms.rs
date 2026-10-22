@@ -189,12 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names are still deleted." (DeleteAlarms documentation) — so the names that do
         // exist are removed, and the call still reports the ones that did not with the
         // modelled `ResourceNotFound`.
+        //
+        // The alarm's HISTORY is deliberately left in place: "CloudWatch retains the
+        // history of an alarm even if you delete the alarm" (`DescribeAlarmHistory`
+        // documentation), so only the 14-day retention window ever removes it.
         let mut missing: Vec<&str> = Vec::new();
         for name in &input.alarm_names {
             if store.alarms.remove(name).is_none() {
                 missing.push(name.as_str());
-            } else {
-                store.alarm_history.remove(name);
             }
         }
         missing.sort_unstable();

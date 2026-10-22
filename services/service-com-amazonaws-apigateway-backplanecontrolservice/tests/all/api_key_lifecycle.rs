@@ -153,7 +153,7 @@ async fn a_created_api_key_is_persisted_and_read_back_member_for_member() {
         );
         assert_eq!(
             created["tags"],
-            request.get("tags").cloned().unwrap_or(Value::Null),
+            request.get("tags").cloned().unwrap_or(json!({})),
             "case {case}: tags must report the request's map, got {:?}",
             created["tags"]
         );
@@ -161,9 +161,10 @@ async fn a_created_api_key_is_persisted_and_read_back_member_for_member() {
             created["createdDate"].is_number() && created["lastUpdatedDate"].is_number(),
             "case {case}: expected both timestamps, got {created:?}"
         );
-        assert!(
-            created["stageKeys"].is_null(),
-            "case {case}: a key created with no stageKeys has none, got {:?}",
+        assert_eq!(
+            created["stageKeys"],
+            json!([]),
+            "case {case}: a key created with no stageKeys reports an empty list, got {:?}",
             created["stageKeys"]
         );
 

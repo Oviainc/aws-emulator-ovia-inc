@@ -199,6 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // within one region of the account, so the region the request is signed
         // for is part of the record's identity.
         let region = crate::state::request_region(ctx.parts());
+        // The URL the created service announces must be the endpoint the caller
+        // reached this emulator on, so it is read off THIS request.
+        let endpoint = crate::state::request_endpoint(ctx.parts());
 
         // `serviceName`, `power` and `scale` are modelled `@required` members,
         // the name carries the modelled length and pattern and `scale` the
@@ -323,7 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_deployment_version: if deployment.is_some() { 2 } else { 1 },
                 owed,
             };
-            let view = service.view();
+            let view = service.view(endpoint.as_deref());
             store.insert_container_service(service);
             Ok(CreateContainerServiceOutput {
                 container_service: Some(view),
