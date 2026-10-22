@@ -98,15 +98,38 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // EKS states that class of refusal as `InvalidParameterException` — "The
+        // specified parameter is invalid. Review the available parameters for the
+        // API request." — which nearly every operation that takes input declares,
+        // rather than as the framework's generic `ValidationException`. So a
+        // `CreateCluster` whose `name` breaks the modelled
+        // `^[0-9A-Za-z][A-Za-z0-9\-_]*$` pattern or its 1..100 length answers
+        // 400 `InvalidParameterException`, as the real service does.
+        //
+        // The seam is per SERVICE, not per operation, so the two tag operations —
+        // the only ones here that model `BadRequestException` instead — are also
+        // worded this way; the status is 400 either way, which is what a client
+        // branches on first. The framework's message already names the member and
+        // the constraint it broke, so it is kept verbatim.
+        //
+        // Wording the refusal per OPERATION is not reachable from here:
+        // `Refusal` (vendor/smithy-server-runtime/src/pre_dispatch.rs) carries
+        // only the violations, no operation identity, and a refusal is raised
+        // before any operation is named. So this picks the code the majority of
+        // this service's operations declare rather than guessing at the member
+        // paths in the violations.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidParameterException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "invalid request".to_string()),
+            }),
+            // Authentication refusals belong to the framework: the emulator, not a
+            // service, verifies signatures.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
