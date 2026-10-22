@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpc
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpc`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a VPC from the request's CIDR block, stores it as the modelled
+//! [`Vpc`] shape, and answers it in `pending` with the instant the clock owes it
+//! `available` recorded beside it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::vpc_available_at`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpc::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +181,282 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpc` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpc"))
+        use crate::state;
+        use std::time::Instant;
+
+        // Two request shapes this emulator holds no state for at all, so a 501 ("nobody
+        // has written this yet") is the honest answer rather than a refusal that blames
+        // the caller: there is no IPAM pool store to allocate a CIDR out of (every IPAM
+        // operation is still a scaffold), and no VPC Encryption Control resource to create
+        // (`CreateVpcEncryptionControl` is still a scaffold too).
+        if input.ipv4_ipam_pool_id.is_some()
+            || input.ipv6_ipam_pool_id.is_some()
+            || input.ipv4_netmask_length.is_some()
+            || input.ipv6_netmask_length.is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateVpc with an IPAM-allocated CIDR block",
+            ));
+        }
+        if input.vpc_encryption_control.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateVpc with a VPC encryption control configuration",
+            ));
+        }
+
+        // "A VPC must have an associated IPv4 CIDR block. You can choose an IPv4 CIDR
+        // block or an IPAM-allocated IPv4 CIDR block." No IPAM pool was named, so the
+        // request has to carry the block itself.
+        let Some(requested_cidr) = input.cidr_block.as_deref().filter(|cidr| !cidr.is_empty())
+        else {
+            return Err(state::missing_parameter(
+                "Either 'cidrBlock' or 'ipv4IpamPoolId' must be specified",
+            ));
+        };
+        // "We modify the specified CIDR block to its canonical form" (CidrBlock), within
+        // the published VPC block size.
+        let cidr_block = match state::canonical_vpc_ipv4_cidr(requested_cidr) {
+            Ok(canonical) => canonical,
+            Err(state::CidrProblem::Malformed) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({requested_cidr}) for parameter cidrBlock is invalid. \
+                     This is not a valid CIDR block."
+                )))
+            }
+            Err(state::CidrProblem::PrefixLength) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "The CIDR '{requested_cidr}' is invalid. The allowed block size is \
+                     between a /{min} netmask and /{max} netmask.",
+                    min = state::MIN_VPC_IPV4_PREFIX,
+                    max = state::MAX_VPC_IPV4_PREFIX,
+                )))
+            }
+        };
+
+        // "Default: default" (InstanceTenancy), and "Important: The host value cannot be
+        // used with this parameter. Use the default or dedicated values only."
+        let tenancy = input
+            .instance_tenancy
+            .as_deref()
+            .unwrap_or(state::DEFAULT_INSTANCE_TENANCY);
+        if tenancy != state::DEFAULT_INSTANCE_TENANCY && tenancy != state::TENANCY_DEDICATED {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({tenancy}) for parameter instanceTenancy is invalid. \
+                 Use the default or dedicated values only."
+            )));
+        }
+
+        // The IPv6 members' own documented combination rules.
+        let amazon_provided = input.amazon_provided_ipv6_cidr_block.unwrap_or(false);
+        if amazon_provided && input.ipv6_cidr_block.is_some() {
+            // "You cannot specify the range of IP addresses, or the size of the CIDR
+            // block" (AmazonProvidedIpv6CidrBlock).
+            return Err(state::invalid_parameter_combination(
+                "You cannot specify Ipv6CidrBlock with AmazonProvidedIpv6CidrBlock",
+            ));
+        }
+        if amazon_provided && input.ipv6_pool.is_some() {
+            // Same rule from the other side: Amazon picking the block is incompatible with
+            // naming the pool it must come out of.
+            return Err(state::invalid_parameter_combination(
+                "You cannot specify Ipv6Pool with AmazonProvidedIpv6CidrBlock",
+            ));
+        }
+        if input.ipv6_cidr_block_network_border_group.is_some() && !amazon_provided {
+            // "You must set AmazonProvidedIpv6CidrBlock to true to use this parameter"
+            // (Ipv6CidrBlockNetworkBorderGroup).
+            return Err(state::invalid_parameter_combination(
+                "You must set AmazonProvidedIpv6CidrBlock to true to specify \
+                 Ipv6CidrBlockNetworkBorderGroup",
+            ));
+        }
+        if input.ipv6_cidr_block.is_some() && input.ipv6_pool.is_none() {
+            // "You must also specify Ipv6Pool in the request" (Ipv6CidrBlock).
+            return Err(state::invalid_parameter_combination(
+                "You must specify Ipv6Pool when you specify Ipv6CidrBlock",
+            ));
+        }
+        if input.ipv6_pool.is_some() && input.ipv6_cidr_block.is_none() {
+            // Letting "Amazon choose the IPv6 CIDR block for you" out of a named pool
+            // needs that pool's free space, and this emulator holds no address pools
+            // (every pool operation is still a scaffold).
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateVpc with an IPv6 CIDR block chosen from an address pool",
+            ));
+        }
+        let requested_ipv6 = match input.ipv6_cidr_block.as_deref() {
+            None => None,
+            Some(block) => match state::canonical_ipv6_cidr(block) {
+                Ok(canonical) => Some(canonical),
+                Err(_) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({block}) for parameter ipv6CidrBlock is invalid. \
+                         This is not a valid IPv6 CIDR block."
+                    )))
+                }
+            },
+        };
+
+        // "The tags to assign to the VPC" — "you must specify the resource type to tag,
+        // otherwise the request will fail" (TagSpecification), and the only type this
+        // action tags is the VPC it creates.
+        let mut tags: Vec<Tag> = Vec::new();
+        for specification in input.tag_specifications.iter().flatten() {
+            match specification.resource_type.as_deref() {
+                Some(state::RESOURCE_TYPE_VPC) => {
+                    tags.extend(specification.tags.clone().unwrap_or_default());
+                }
+                Some(other) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "'{other}' is not a valid resource type for tagging on CreateVpc"
+                    )))
+                }
+                None => {
+                    return Err(state::missing_parameter(
+                        "Tag specification resource type must have a value",
+                    ))
+                }
+            }
+        }
+        // A count of VPCs is not a bound on the caller-chosen bytes each one holds, so the
+        // tag payload is bounded here the way `CreateTags` bounds its own: at most the
+        // documented number of tags per resource, each key and value within its documented
+        // length, and no key given twice ("Tag keys must be unique per resource", so two
+        // entries for one key have no defined winner).
+        if tags.len() > state::MAX_TAGS_PER_RESOURCE {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "The request carries {} tags, above the maximum of {max} per resource",
+                tags.len(),
+                max = state::MAX_TAGS_PER_RESOURCE,
+            )));
+        }
+        let mut keys_seen: ::std::collections::BTreeSet<&str> =
+            ::std::collections::BTreeSet::new();
+        for tag in &tags {
+            let key = tag.key.as_deref().unwrap_or_default();
+            if key.is_empty() {
+                return Err(state::invalid_parameter_value("A tag key cannot be empty"));
+            }
+            if key.starts_with(state::RESERVED_TAG_PREFIX) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Tag key '{key}' is invalid: the '{prefix}' prefix is reserved",
+                    prefix = state::RESERVED_TAG_PREFIX,
+                )));
+            }
+            if !keys_seen.insert(key) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Tag key '{key}' is given more than once; tag keys must be unique"
+                )));
+            }
+            state::validate_tag_size(key, tag.value.as_deref().unwrap_or_default())?;
+        }
+        // The bytes this VPC would add to the store, charged against the crate's one
+        // byte budget below so the store is bounded in bytes and not only in records.
+        let tag_payload_bytes = state::tag_list_bytes(&tags);
+        // The caller-chosen strings an IPv6 association retains, charged against the same
+        // budget as the tags: the pool id, the network border group and the block itself
+        // are all request-sized.
+        let ipv6_payload_bytes = requested_ipv6.as_deref().map_or(0, str::len)
+            + input.ipv6_pool.as_deref().map_or(0, str::len)
+            + input
+                .ipv6_cidr_block_network_border_group
+                .as_deref()
+                .map_or(0, str::len);
+        let payload_bytes = tag_payload_bytes.saturating_add(ipv6_payload_bytes);
+
+        let vpcs = state::require_service_state(&*self.engine)?;
+        let region = state::request_region(ctx.parts());
+        let mut store = vpcs.lock();
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_vpc_capacity() {
+            return Err(state::vpc_limit_exceeded());
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (DryRun).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The record itself, built the one way this crate builds a VPC — the primary IPv4
+        // block is associated as soon as the VPC exists, and it is the VPC that is still
+        // `pending`. Only `CreateDefaultVpc` creates the Region's default VPC, so this one
+        // is not the default.
+        // `insert_vpc` charges the tag bytes against the store's budget itself, so no
+        // writer can store them uncharged.
+        let vpc_id = store.insert_vpc(
+            &cidr_block,
+            false,
+            tenancy,
+            state::VPC_STATE_PENDING,
+            tags,
+        );
+        // What the clock now owes this VPC: `available`, one TRANSITION_DELAY from now —
+        // the same span, off the same monotonic clock, as an instance's pending move.
+        store
+            .vpc_available_at
+            .insert(vpc_id.clone(), Instant::now() + state::TRANSITION_DELAY);
+
+        // The IPv6 association, when the request asked for one. Its state starts at
+        // `associating`: like the VPC's own, the clock owes it `associated`.
+        if amazon_provided || requested_ipv6.is_some() {
+            let association_id = store.next_id("vpc-cidr-assoc");
+            let (ipv6_cidr_block, ipv6_pool, ip_source) = match requested_ipv6 {
+                Some(block) => (block, input.ipv6_pool.clone(), state::IP_SOURCE_BYOIP),
+                None => (store.mint_amazon_ipv6_cidr(), None, state::IP_SOURCE_AMAZON),
+            };
+            let association = VpcIpv6CidrBlockAssociation {
+                association_id: Some(association_id),
+                ipv6_cidr_block: Some(ipv6_cidr_block),
+                ipv6_cidr_block_state: Some(VpcCidrBlockState {
+                    state: Some(state::CIDR_BLOCK_STATE_ASSOCIATING.to_string()),
+                    status_message: None,
+                }),
+                // "The name of the location from which we advertise the IPV6 CIDR block":
+                // the Region the request was made in unless it named a narrower location.
+                network_border_group: Some(
+                    input
+                        .ipv6_cidr_block_network_border_group
+                        .clone()
+                        .unwrap_or(region),
+                ),
+                ipv6_pool,
+                ipv6_address_attribute: Some(state::IPV6_ADDRESS_PUBLIC.to_string()),
+                ip_source: Some(ip_source.to_string()),
+            };
+            if let Some(vpc) = store.vpcs.get_mut(&vpc_id) {
+                vpc.ipv6_cidr_block_association_set = Some(vec![association]);
+            } else {
+                // The VPC was inserted a few lines above, so this cannot happen — and if
+                // it ever did, the request must not answer 200 with the IPv6 block the
+                // caller asked for silently missing.
+                return Err(state::internal_error(
+                    "the VPC just created could not be read back to associate its IPv6 CIDR block",
+                ));
+            }
+            // The caller-chosen strings this association retains, charged against the
+            // budget the check above reserved them in.
+            store.add_stored_bytes(ipv6_payload_bytes);
+        }
+
+        // The answer is the record as it was stored, so `CreateVpc` and `DescribeVpcs`
+        // cannot drift apart.
+        let Some(vpc) = store.vpcs.get(&vpc_id).cloned() else {
+            return Err(state::internal_error(
+                "the VPC just created could not be read back",
+            ));
+        };
+        Ok(CreateVpcOutput { vpc: Some(vpc) })
     }
 }
