@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteArchiveRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteArchiveRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteArchiveRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named archive rule from the analyzer that holds it, so the next
+//! `GetArchiveRule` for it is the modelled 404 and the next `ListArchiveRules` no longer
+//! carries it.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteArchiveRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteArchiveRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteArchiveRule"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteArchiveRuleErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let mut state = state.lock();
+
+        // Each refusal carries a fixed text and reports WHICH resource was missing in the
+        // modelled `resourceId`/`resourceType` members, so an absent analyzer and an
+        // absent rule are told apart by `resourceType`, not by prose.
+        let analyzer = state.analyzers.get_mut(&input.analyzer_name).ok_or_else(|| {
+            DeleteArchiveRuleErrorModeled::ResourceNotFoundException(
+                crate::state::analyzer_not_found(&input.analyzer_name),
+            )
+        })?;
+
+        // The rule leaves state here, which is what makes the delete observable: every
+        // later read of it resolves nothing and answers the modelled 404.
+        if analyzer.archive_rules.remove(&input.rule_name).is_none() {
+            return Err(DeleteArchiveRuleErrorModeled::ResourceNotFoundException(
+                crate::state::archive_rule_not_found(&input.rule_name),
+            )
+            .into());
+        }
+        // The rule name is free again, so a create of it must not resolve through the
+        // idempotency record of the create that made the deleted one.
+        analyzer
+            .archive_rule_tokens
+            .forget_where(|recorded| recorded == &input.rule_name);
+
+        Ok(DeleteArchiveRuleOutput)
     }
 }

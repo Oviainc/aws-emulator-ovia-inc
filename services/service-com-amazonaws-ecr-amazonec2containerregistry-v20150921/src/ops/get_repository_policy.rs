@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRepositoryPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRepositoryPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRepositoryPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the repository policy `SetRepositoryPolicy` stored on one repository of
+//! this emulator's registry, read from the repository's record in [`crate::state`] and
+//! changing nothing. A repository that carries no policy is reported with
+//! `RepositoryPolicyNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +114,22 @@ impl From<GetRepositoryPolicyErrorModeled> for GetRepositoryPolicyError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> GetRepositoryPolicyErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            GetRepositoryPolicyErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // `ImageNotFound` cannot arise here: this operation resolves no image.
+        _ => GetRepositoryPolicyErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
 /// The `GetRepositoryPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,18 +166,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRepositoryPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRepositoryPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRepositoryPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRepositoryPolicyErrorModeled::ServerException(ServerException {
+                message: Some("the ecr repository store is unavailable".to_string()),
+            })
+            .into());
+        };
+        let _ = ctx;
+
+        // `registryId` names the registry holding the repository; this emulator serves
+        // exactly one registry — its own account's.
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        // A read: the stored record answers it, and nothing in the store changes.
+        let store = state.lock();
+        let repo = store
+            .repository(&input.repository_name)
+            .map_err(fault_error)?;
+        let Some(policy_text) = repo.policy_text.clone() else {
+            return Err(
+                GetRepositoryPolicyErrorModeled::RepositoryPolicyNotFoundException(
+                    RepositoryPolicyNotFoundException {
+                        message: Some(crate::state::repository_policy_not_found_message(
+                            &repo.name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetRepositoryPolicyOutput {
+            registry_id: Some(repo.registry_id.clone()),
+            repository_name: Some(repo.name.clone()),
+            policy_text: Some(policy_text),
+        })
     }
 }

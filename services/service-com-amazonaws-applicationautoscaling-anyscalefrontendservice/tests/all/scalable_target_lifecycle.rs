@@ -27,7 +27,8 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// socket path uses.
 ///
 /// `pub(crate)` so every suite in this test target drives the emulator the same way
-/// rather than growing a second harness (see `tests/all/tags.rs`).
+/// rather than growing a second harness (see `tests/all/tags.rs` and
+/// `tests/all/scheduled_action_lifecycle.rs`).
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }

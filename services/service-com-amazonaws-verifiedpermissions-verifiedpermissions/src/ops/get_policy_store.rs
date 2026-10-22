@@ -118,8 +118,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_date: store.last_updated_date,
             description: store.description.clone(),
             deletion_protection: Some(store.deletion_protection.clone()),
-            // `cedarVersion` is reported only once a schema pins it, and
-            // `PutSchema` is a later slice, so no store carries one yet.
+            // `cedarVersion` is a property of the policy store that no modelled
+            // request member sets — neither `CreatePolicyStore` nor `PutSchema`
+            // carries one — so there is nothing persisted to report.
             cedar_version: None,
             // The tags are reported only when the request asked for them.
             tags: input

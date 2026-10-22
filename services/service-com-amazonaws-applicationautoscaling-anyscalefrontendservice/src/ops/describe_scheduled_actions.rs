@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeScheduledActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeScheduledActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeScheduledActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -186,20 +177,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeScheduledActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeScheduledActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeScheduledActions"))
+        use crate::state::{
+            check_dimension_namespace, check_dimension_requires_resource_id, check_enum,
+            decode_next_token, encode_next_token, page_size, take_page, ScheduledActionKey,
+            TargetKey,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeScheduledActionsErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "this service is mounted on an engine that holds no state".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        check_enum(
+            "serviceNamespace",
+            &input.service_namespace,
+            SERVICE_NAMESPACE_VALUES,
+        )
+        .map_err(validation)?;
+        if let Some(dimension) = input.scalable_dimension.as_deref() {
+            check_enum("scalableDimension", dimension, SCALABLE_DIMENSION_VALUES)
+                .map_err(validation)?;
+            check_dimension_namespace(&input.service_namespace, dimension).map_err(validation)?;
+        }
+        check_dimension_requires_resource_id(
+            input.resource_id.as_deref(),
+            input.scalable_dimension.as_deref(),
+        )
+        .map_err(validation)?;
+        let page_size = page_size(input.max_results).map_err(validation)?;
+
+        // The token carries the full identity of the last action the previous page
+        // emitted — its target plus its name — so this page resumes at the next key.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let Some(fields) = decode_next_token(token, 4) else {
+                    return Err(
+                        DescribeScheduledActionsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some("The next token supplied was invalid.".to_string()),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                Some(ScheduledActionKey {
+                    target: TargetKey {
+                        service_namespace: fields[0].clone(),
+                        resource_id: fields[1].clone(),
+                        scalable_dimension: fields[2].clone(),
+                    },
+                    scheduled_action_name: fields[3].clone(),
+                })
+            }
+        };
+
+        let state = state.lock();
+        // Every filter the request carries narrows the set; they intersect rather than
+        // widen it, and the stored action is returned as persisted.
+        let matching: Vec<ScheduledAction> = state
+            .scheduled_actions
+            .iter()
+            .filter(|(key, _)| key.target.service_namespace == input.service_namespace)
+            .filter(|(key, _)| {
+                input
+                    .resource_id
+                    .as_ref()
+                    .is_none_or(|resource_id| &key.target.resource_id == resource_id)
+            })
+            .filter(|(key, _)| {
+                input
+                    .scalable_dimension
+                    .as_ref()
+                    .is_none_or(|dimension| &key.target.scalable_dimension == dimension)
+            })
+            .filter(|(key, _)| match input.scheduled_action_names.as_deref() {
+                // The model bounds `ScheduledActionNames` at 0..50, so an empty list is
+                // legal and narrows nothing.
+                None | Some([]) => true,
+                Some(names) => names.contains(&key.scheduled_action_name),
+            })
+            .filter(|(key, _)| resume_after.as_ref().is_none_or(|after| *key > after))
+            .map(|(_, action)| action.clone())
+            .collect();
+
+        let (scheduled_actions, next_token) = take_page(matching, page_size, |action| {
+            encode_next_token(&[
+                &action.service_namespace,
+                &action.resource_id,
+                action.scalable_dimension.as_deref().unwrap_or_default(),
+                &action.scheduled_action_name,
+            ])
+        });
+
+        Ok(DescribeScheduledActionsOutput {
+            scheduled_actions: Some(scheduled_actions),
+            next_token,
+        })
     }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> DescribeScheduledActionsError {
+    DescribeScheduledActionsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
 }

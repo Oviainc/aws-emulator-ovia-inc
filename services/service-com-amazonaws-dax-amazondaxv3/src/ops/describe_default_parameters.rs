@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDefaultParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDefaultParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDefaultParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the DAX caching software's system-defined parameters — the catalog
+//! [`crate::state::DEFAULT_PARAMETERS`], which every parameter view in this service
+//! renders from, so one parameter has one definition here. Each is reported with the
+//! value the SYSTEM defines for it and `Source` `system`; this operation writes
+//! nothing, so a later caller sees exactly what this one saw.
+//!
+//! The catalog is paged by `MaxResults`/`NextToken` through the shared
+//! [`crate::state::page`] helper, in the one stable order the catalog is kept in (by
+//! parameter name). A `MaxResults` outside the documented 20..=100 window, and a
+//! `NextToken` this service did not issue, are refused with the modelled
+//! `InvalidParameterValueException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +151,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDefaultParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDefaultParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDefaultParameters"))
+        let _ = ctx;
+        // The default parameters are system-defined, so this read needs no per-account
+        // record; resolving the store still keeps the "mounted on a store that holds
+        // this service" contract every other handler in this crate follows.
+        let _state = crate::state::store(&*self.engine, Self::NAME)?;
+
+        // "The value for MaxResults must be between 20 and 100" (`MaxResults`). DAX
+        // answers the recorded, request-independent template for this rejection.
+        if let Some(max_results) = input.max_results {
+            if !(crate::state::MIN_MAX_RESULTS..=crate::state::MAX_MAX_RESULTS)
+                .contains(&max_results)
+            {
+                return Err(
+                    DescribeDefaultParametersErrorModeled::InvalidParameterValueException(
+                        crate::state::invalid_max_results(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A continuation token this service did not issue is refused, rather than
+        // answering an arbitrary page with a 200.
+        let start_from = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_token(token) {
+                Some(from) => Some(from),
+                None => {
+                    return Err(
+                        DescribeDefaultParametersErrorModeled::InvalidParameterValueException(
+                            crate::state::invalid_next_token(Self::NAME),
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        let names = crate::state::default_parameter_names();
+        let (page, next_token) =
+            crate::state::page(&names, input.max_results, start_from.as_deref());
+        let parameters = page
+            .iter()
+            .filter_map(|name| crate::state::default_parameter(name))
+            .map(crate::state::ParameterDefinition::default_view)
+            .collect();
+
+        Ok(DescribeDefaultParametersOutput {
+            next_token,
+            parameters: Some(parameters),
+        })
     }
 }

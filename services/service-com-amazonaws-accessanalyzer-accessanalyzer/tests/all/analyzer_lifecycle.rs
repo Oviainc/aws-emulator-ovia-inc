@@ -165,8 +165,9 @@ async fn an_analyzer_reads_back_as_it_was_created() {
         );
         assert_eq!(
             analyzer.get("tags"),
-            tags.as_ref(),
-            "case {case:?}: tags must be exactly what create supplied, got {:?}",
+            Some(tags.clone().unwrap_or_else(|| json!({}))).as_ref(),
+            "case {case:?}: tags must be the map create supplied, or the empty map when it \
+             supplied none, got {:?}",
             analyzer.get("tags")
         );
         assert_eq!(

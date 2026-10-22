@@ -14,7 +14,8 @@
 //! * `queues` is capped at [`MAX_QUEUES`] and `jobs` at [`MAX_JOBS`]; a create past the
 //!   cap is refused with the modelled `ServiceQuotaExceededException` (HTTP 402) instead
 //!   of growing the store. `idempotency` holds at most one entry per stored job, so it
-//!   is bounded by `MAX_JOBS` too.
+//!   is bounded by `MAX_JOBS` too, and `endpoints` \u2014 one account endpoint per region a
+//!   request was signed for \u2014 is capped at [`MAX_ENDPOINTS`] the same way.
 //! * Every lookup is an O(log n) `BTreeMap` probe; no handler clones the whole store.
 //! * [`ComAmazonawsMediaconvertMediaconvertState::settle`] — the only work a reporting
 //!   operation does — touches ONLY the jobs whose due instant has already passed, by
@@ -85,6 +86,15 @@ pub const ACCELERATION_STATUS_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 /// `ReservationPlanStatus` values (`smithy_query(query="shape",shape="ReservationPlanStatus")`).
 pub const RESERVATION_PLAN_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// `DescribeEndpointsMode` values (`smithy_query(query="shape",shape="DescribeEndpointsMode")`).
+///
+/// Its doc: "Specify DEFAULT for this operation to return your endpoints if any exist,
+/// or to create an endpoint for you and return it if one doesn't already exist. Specify
+/// GET_ONLY to return your endpoints if any exist, or an empty list if none exist."
+pub const DESCRIBE_ENDPOINTS_MODE_DEFAULT: &str = "DEFAULT";
+/// See [`DESCRIBE_ENDPOINTS_MODE_DEFAULT`].
+pub const DESCRIBE_ENDPOINTS_MODE_GET_ONLY: &str = "GET_ONLY";
+
 /// How long a `ClientRequestToken` keeps naming the job it first created.
 ///
 /// `ClientRequestToken`'s own documentation: "If you reuse a client request token within
@@ -103,6 +113,22 @@ pub const MAX_QUEUES: usize = 1_000;
 /// How many jobs this store holds before `CreateJob` is refused. A chosen capacity
 /// bound, as [`MAX_QUEUES`] is, and the ceiling on every walk over the job set.
 pub const MAX_JOBS: usize = 10_000;
+
+/// How many per-region account endpoints this store mints before `DescribeEndpoints`
+/// refuses to mint another.
+///
+/// The region comes from the request's SigV4 credential scope, so the set of regions an
+/// account endpoint can be minted for is caller-driven and needs a ceiling. A CHOSEN
+/// capacity bound, not a documented AWS quota, far above the number of AWS regions; past
+/// it the refusal uses the error the model already declares for it,
+/// `ServiceQuotaExceededException`.
+pub const MAX_ENDPOINTS: usize = 100;
+
+/// The documented ceiling on `DescribeEndpoints`' `MaxResults`: "Optional. Max number of
+/// endpoints, up to twenty, that will be returned at one time." The member itself is a
+/// bare `__integer` in the model, so nothing refuses an out-of-window value before the
+/// handler runs.
+pub const MAX_ENDPOINT_RESULTS: i32 = 20;
 
 /// The term of a reserved queue's pricing plan. `PricingPlan`'s own documentation:
 /// "Reserved pricing requires a 12-month commitment", and `Commitment` models exactly
@@ -150,6 +176,24 @@ pub fn queue_arn(region: &str, name: &str) -> String {
 /// `arn:aws:mediaconvert:<region>:<account>:jobs/<id>`.
 pub fn job_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("jobs/{id}"))
+}
+
+/// The account's MediaConvert API endpoint URL in `region`.
+///
+/// MediaConvert gives an account its own subdomain of the regional service host —
+/// `https://<account-specific-label>.mediaconvert.<region>.amazonaws.com` — and
+/// `DescribeEndpoints` is how a caller reads it. The label here is the first four bytes
+/// of SHA-256 over the account id and the region, so it is DERIVED from the account and
+/// region and from nothing else: identical on every call in a region, different between
+/// regions, and never drawn from a clock or a random source. It is also persisted on
+/// first use ([`ComAmazonawsMediaconvertMediaconvertState::ensure_endpoint`]), so the URL
+/// a later caller reads is the one an earlier call stored.
+pub fn account_endpoint_url(region: &str) -> String {
+    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(
+        format!("{}:{region}", ::engine::emulator_account_id()).as_bytes(),
+    );
+    let label = ::hex::encode(&digest[..4]);
+    format!("https://{label}.mediaconvert.{region}.amazonaws.com")
 }
 
 /// The queue name a caller named, whether they gave the name or the queue's ARN.
@@ -379,6 +423,11 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     pub queues: BTreeMap<String, QueueRecord>,
     /// Jobs by `Id`. At most [`MAX_JOBS`] entries.
     pub jobs: BTreeMap<String, JobRecord>,
+    /// The account's API endpoint URL per region, keyed by the region of the request
+    /// that first asked for it in `DEFAULT` mode. At most [`MAX_ENDPOINTS`] entries.
+    /// Only `DescribeEndpoints` in `DEFAULT` mode adds one; nothing ever rewrites one,
+    /// which is what makes the URL a caller reads back stable.
+    pub endpoints: BTreeMap<String, String>,
     /// `ClientRequestToken` -> the job it created, so `CreateJob` is idempotent for
     /// [`IDEMPOTENCY_WINDOW`]. One entry per stored job at most, so it is bounded by
     /// [`MAX_JOBS`].
@@ -424,6 +473,9 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
         Self {
             queues,
             jobs: BTreeMap::new(),
+            // No account endpoint exists until a `DescribeEndpoints` in `DEFAULT` mode
+            // creates one, so `GET_ONLY` on a fresh account answers an empty list.
+            endpoints: BTreeMap::new(),
             idempotency: BTreeMap::new(),
             pending: BTreeSet::new(),
             job_sequence: 0,
@@ -535,6 +587,32 @@ impl ComAmazonawsMediaconvertMediaconvertState {
                 return candidate;
             }
         }
+    }
+
+    /// The account endpoint already stored for `region`, or `None` when none has been
+    /// created there yet. A pure read: `GET_ONLY` mode goes through this and writes
+    /// nothing.
+    pub fn endpoint(&self, region: &str) -> Option<&str> {
+        self.endpoints.get(region).map(String::as_str)
+    }
+
+    /// The account endpoint for `region`, creating and persisting it on the first ask.
+    ///
+    /// This is the write `DescribeEndpoints`' `DEFAULT` mode documents: "return your
+    /// endpoints if any exist, or to create an endpoint for you and return it if one
+    /// doesn't already exist." An endpoint already stored is returned UNCHANGED, so the
+    /// URL is stable for the life of the account. `None` once the store holds
+    /// [`MAX_ENDPOINTS`] regions and this one is not among them.
+    pub fn ensure_endpoint(&mut self, region: &str) -> Option<&str> {
+        if !self.endpoints.contains_key(region) && self.endpoints.len() >= MAX_ENDPOINTS {
+            return None;
+        }
+        Some(
+            self.endpoints
+                .entry(region.to_string())
+                .or_insert_with(|| account_endpoint_url(region))
+                .as_str(),
+        )
     }
 
     /// Whether the store is at [`MAX_QUEUES`] and can hold no further queue.

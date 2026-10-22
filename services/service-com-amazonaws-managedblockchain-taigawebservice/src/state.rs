@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Accessor, Invitation, Member, MemberFabricAttributes, MemberFrameworkAttributes,
-    MemberLogPublishingConfiguration, Network, NetworkFabricAttributes,
+    MemberLogPublishingConfiguration, MemberSummary, Network, NetworkFabricAttributes,
     NetworkFrameworkAttributes, NetworkSummary, Node, NodeFabricAttributes,
     NodeFrameworkAttributes, NodeLogPublishingConfiguration, NodeSummary, Proposal,
     ProposalActions, VotingPolicy,
@@ -142,6 +142,10 @@ pub const NETWORK_MAX_RESULTS: i32 = 10;
 /// used when a caller names none.
 pub const NODE_MAX_RESULTS: i32 = 20;
 
+/// `ListMembers`'s `MaxResults` upper bound, from its `@range(1, 20)`. Also the page size
+/// used when a caller names none.
+pub const MEMBER_MAX_RESULTS: i32 = 20;
+
 /// `ListInvitations`'s `MaxResults` upper bound, from its `@range(1, 100)`. Also the page
 /// size used when a caller names none.
 pub const INVITATION_MAX_RESULTS: i32 = 100;
@@ -158,6 +162,16 @@ pub const MAX_NETWORKS: usize = 1_000;
 /// How many nodes this emulator will hold on one network, for the same reason as
 /// [`MAX_NETWORKS`]; `CreateNode` models `ResourceLimitExceededException` for it.
 pub const MAX_NODES_PER_NETWORK: usize = 1_000;
+
+/// How many members this emulator will hold on one network, for the same reason as
+/// [`MAX_NETWORKS`]: a member record carries owned strings and a tag map, so the map a
+/// create inserts into needs a ceiling of its own or a caller looping on member creates
+/// grows this process's memory without bound. Enforced by
+/// [`StoredNetwork::insert_member`], the only path that adds a member to a network. The
+/// number is NOT a fidelity claim about the published per-network member quota, which the
+/// real service refuses with the same `ResourceLimitExceededException` this ceiling
+/// answers.
+pub const MAX_MEMBERS_PER_NETWORK: usize = 1_000;
 
 /// How many proposals this emulator will hold on one network.
 ///
@@ -233,7 +247,28 @@ pub struct StoredNetwork {
     pub proposals: BTreeMap<String, StoredProposal>,
 }
 
+/// A member could not be added: the network already holds [`MAX_MEMBERS_PER_NETWORK`] of
+/// them. A handler answers it with the modelled `ResourceLimitExceededException`.
+#[derive(Debug, Clone, Copy)]
+pub struct MemberLimitExceeded;
+
 impl StoredNetwork {
+    /// Add `member` to this network, refusing once the network already holds
+    /// [`MAX_MEMBERS_PER_NETWORK`] of them.
+    ///
+    /// Every path that adds a member goes through here — `CreateNetwork`'s first member
+    /// today, and whatever later implements `CreateMember` — so the member map cannot
+    /// grow without bound however many creates a caller loops on. Replacing a member id
+    /// the network already holds is not growth, so it is always allowed.
+    pub fn insert_member(&mut self, member: StoredMember) -> Result<(), MemberLimitExceeded> {
+        if !self.members.contains_key(&member.id) && self.members.len() >= MAX_MEMBERS_PER_NETWORK
+        {
+            return Err(MemberLimitExceeded);
+        }
+        self.members.insert(member.id.clone(), member);
+        Ok(())
+    }
+
     /// Materialise the status transitions the clock already owes this network and
     /// everything on it.
     ///
@@ -344,6 +379,31 @@ impl StoredMember {
             tags: Some(map_out(&self.tags)),
             arn: Some(self.arn.clone()),
             kms_key_arn: Some(self.kms_key_arn.clone()),
+        }
+    }
+
+    /// Whether this member belongs to the account under emulation
+    /// (`MemberSummary$IsOwned`: "whether the member is owned by your Amazon Web Services
+    /// account or a different Amazon Web Services account").
+    ///
+    /// Read off the account segment of the member's STORED ARN, which the call that
+    /// created the member minted once: that ARN is this emulator's record of which
+    /// account holds the member, so a member ever stored for another account reports
+    /// `false` without this needing to change.
+    pub fn is_owned(&self) -> bool {
+        arn_account_id(&self.arn) == Some(::engine::emulator_account_id())
+    }
+
+    /// The modelled `MemberSummary` for this record, as `ListMembers` returns it.
+    pub fn to_summary(&self) -> MemberSummary {
+        MemberSummary {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            status: Some(self.status.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            is_owned: Some(self.is_owned()),
+            arn: Some(self.arn.clone()),
         }
     }
 }
@@ -1023,6 +1083,12 @@ pub fn page_of<T>(
 /// documents `CouchDB` as the default.
 pub fn default_state_db() -> String {
     DEFAULT_STATE_DB.to_string()
+}
+
+/// The account segment of an ARN (`arn:<partition>:<service>:<region>:<account>:<rest>`),
+/// or `None` when the string carries no non-empty one.
+fn arn_account_id(arn: &str) -> Option<&str> {
+    arn.split(':').nth(4).filter(|account| !account.is_empty())
 }
 
 /// A stored tag map as the modelled `OutputTagMap`.

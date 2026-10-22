@@ -2,9 +2,21 @@
 
 //! How this service puts a persisted [`App`] or [`Branch`] on the wire.
 //!
-//! Amplify answers with a COMPLETE record. Two properties of that record cannot be
-//! expressed by the generated serializer alone, and both are what this module adds:
+//! Amplify answers with a COMPLETE record. Three properties of that record cannot be
+//! expressed by the generated serializer alone, and all three are what this module
+//! adds:
 //!
+//! * **Every modelled member reaches the wire.** The generated serializer skips an
+//!   `Option` member that holds `None`, so `Branch$buildSpec`,
+//!   `Branch$sourceBranch`, `App$productionBranch` — every optional member a record
+//!   has no value for — would be absent from the body, while Amplify sends the key
+//!   with JSON `null`. A client dereferencing such a member gets `undefined` instead
+//!   of `null`, and a list element ends up a different SHAPE from the same record
+//!   fetched on its own. The projection therefore writes JSON `null` for every
+//!   modelled member the record itself did not write, and completes the nested
+//!   `Branch$backend` the same way (`{"stackArn": null}`). A structure the CALLER
+//!   configures is the one exception — it is echoed with the members that
+//!   configuration carries; see [`nested_shape`].
 //! * **A member the service has no value for is JSON `null`.** `App$description`,
 //!   `App$repository`, `App$environmentVariables`, `Branch$description`,
 //!   `Branch$activeJobId`, `Branch$customDomains`, `Branch$environmentVariables` and
@@ -21,8 +33,9 @@
 //!   the tags the request set.
 //!
 //! Everything else about the walk stays generated: the projection wraps the record's
-//! own [`SerializableStruct`] impl rather than re-listing its members, so a member
-//! added to the model reaches the wire without touching this file.
+//! own [`SerializableStruct`] impl rather than re-listing its members, and the member
+//! list it completes against is the record's own [`Schema`], so a member added to the
+//! model reaches the wire without touching this file.
 //!
 //! Every operation that answers with an app or a branch — single record or list
 //! element — answers through these two types, so a `ListBranches` element and a
@@ -90,11 +103,12 @@ impl SerializableStruct for AppProjection {
         serializer: &mut dyn ShapeSerializer,
     ) -> ::std::result::Result<(), SerdeError> {
         let unvalued = self.unvalued_members();
-        let mut projecting = Unvalued {
-            inner: serializer,
+        CompleteRecord {
+            record: &self.0,
+            shape: APP_SHAPE,
             unvalued: &unvalued,
-        };
-        self.0.serialize_members(&mut projecting)
+        }
+        .serialize_members(serializer)
     }
 }
 
@@ -122,9 +136,9 @@ impl BranchProjection {
         Self(branch)
     }
 
-    /// The branch as a REPORTING operation (`GetBranch`, `ListBranches`) answers it:
-    /// the stored record plus the tag map every read carries. The stored record is
-    /// untouched.
+    /// The branch as a REPORTING operation (`GetBranch`, `ListBranches`) or an
+    /// UPDATE (`UpdateBranch`) answers it: the stored record plus the tag map every
+    /// one of those answers carries. The stored record is untouched.
     pub fn reported(mut branch: Branch) -> Self {
         branch.tags = Some(branch.tags.unwrap_or_default());
         Self(branch)
@@ -164,11 +178,12 @@ impl SerializableStruct for BranchProjection {
         serializer: &mut dyn ShapeSerializer,
     ) -> ::std::result::Result<(), SerdeError> {
         let unvalued = self.unvalued_members();
-        let mut projecting = Unvalued {
-            inner: serializer,
+        CompleteRecord {
+            record: &self.0,
+            shape: BRANCH_SHAPE,
             unvalued: &unvalued,
-        };
-        self.0.serialize_members(&mut projecting)
+        }
+        .serialize_members(serializer)
     }
 }
 
@@ -182,29 +197,112 @@ impl DeserializableStruct for BranchProjection {
     }
 }
 
-/// A [`ShapeSerializer`] that writes the members in `unvalued` as JSON `null` and
-/// passes every other write straight through.
+/// The shape schema of each structure this projection completes, as the member list
+/// `Complete::fill_absent` walks. Taking it from the record's own generated
+/// [`Schema`] is what keeps this file out of the way of a model change: a member
+/// added to `App`, `Branch` or `Backend` appears here on its own.
+static APP_SHAPE: &Schema = &App::SCHEMA;
+static BRANCH_SHAPE: &Schema = &Branch::SCHEMA;
+static BACKEND_SHAPE: &Schema = &Backend::SCHEMA;
+
+/// The shape a STRUCTURE member of a completed record targets, for the members whose
+/// target this projection completes too — `Branch$backend`, which Amplify answers as
+/// `{"stackArn": null}` rather than `{}` for a branch whose Gen 2 deployment has not
+/// provisioned a CloudFormation stack.
+///
+/// The lookup is keyed by the PARENT shape as well as the member name, so an entry
+/// cannot mis-fire on a same-named member of another shape.
+///
+/// A structure the CALLER configures (`App$autoBranchCreationConfig`,
+/// `App$cacheConfig`, `App$jobConfig`, `App$wafConfiguration`,
+/// `App$productionBranch`) is NOT completed: it is echoed with the members the
+/// configuration carries, which is what `tests/all/app_branch_updates.rs` pins and
+/// what every recording of this service shows. A member whose target is not a
+/// structure, or a structure inside a list (whose element member is named `member`),
+/// answers `None` and is written exactly as the record wrote it.
+fn nested_shape(parent: &Schema, member: &Schema) -> Option<&'static Schema> {
+    match (parent.shape_id().shape_name(), member.member_name()?) {
+        ("Branch", "backend") => Some(BACKEND_SHAPE),
+        _ => None,
+    }
+}
+
+/// `record`, written so that EVERY member of `shape` reaches the wire: the members
+/// the record writes itself, the ones named in `unvalued` as JSON `null`, and the
+/// ones it wrote nothing for as JSON `null` too.
+struct CompleteRecord<'r> {
+    record: &'r dyn SerializableStruct,
+    shape: &'static Schema,
+    unvalued: &'r [&'static str],
+}
+
+impl SerializableStruct for CompleteRecord<'_> {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ShapeSerializer,
+    ) -> ::std::result::Result<(), SerdeError> {
+        let mut completing = Complete {
+            inner: serializer,
+            shape: self.shape,
+            unvalued: self.unvalued,
+            written: Vec::new(),
+        };
+        self.record.serialize_members(&mut completing)?;
+        completing.fill_absent()
+    }
+}
+
+/// A [`ShapeSerializer`] that writes the members in `unvalued` as JSON `null`, notes
+/// which members the record wrote, and passes every other write straight through.
 ///
 /// It wraps the serializer the framework hands to `serialize_members`, so the record
 /// writes its members exactly as the model says and only the named ones are
-/// re-projected. A nested shape is written by the inner serializer, so nothing below
-/// this structure is affected.
-struct Unvalued<'s, 'n> {
+/// re-projected. A nested structure this service completes is re-wrapped (see
+/// [`nested_shape`]); anything else below this structure is written by the inner
+/// serializer untouched.
+struct Complete<'s, 'n> {
     inner: &'s mut dyn ShapeSerializer,
+    shape: &'static Schema,
     unvalued: &'n [&'static str],
+    /// The `member_index` of every member the record wrote — the identity the
+    /// generated schema gives a member, so noting one allocates nothing.
+    written: Vec<usize>,
 }
 
-impl Unvalued<'_, '_> {
+impl Complete<'_, '_> {
     /// Is `member` one of the members this record has no value for?
     fn has_no_value(&self, member: &Schema) -> bool {
         member
             .member_name()
             .is_some_and(|name| self.unvalued.contains(&name))
     }
+
+    /// Note that the record wrote `member`, whatever it wrote for it.
+    fn written_member(&mut self, member: &Schema) {
+        if let Some(index) = member.member_index() {
+            self.written.push(index);
+        }
+    }
+
+    /// Write JSON `null` for every member of this record's shape that the record
+    /// wrote nothing for.
+    fn fill_absent(&mut self) -> ::std::result::Result<(), SerdeError> {
+        let shape = self.shape;
+        for member in shape.members() {
+            let Some(index) = member.member_index() else {
+                continue;
+            };
+            if !self.written.contains(&index) {
+                self.inner.write_null(member)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Emit the [`ShapeSerializer`] methods that write a struct member: `null` for a
-/// member with no value, otherwise the write the record asked for.
+/// member with no value, otherwise the write the record asked for — and in both cases
+/// a note that the member reached the wire.
 ///
 /// Every member write is routed through the same check — a member is a member
 /// whatever its type — so the projection cannot be right for a string and wrong for
@@ -217,6 +315,7 @@ macro_rules! null_or_pass_through {
                 schema: &Schema,
                 $($arg: $ty),*
             ) -> ::std::result::Result<(), SerdeError> {
+                self.written_member(schema);
                 if self.has_no_value(schema) {
                     return self.inner.write_null(schema);
                 }
@@ -226,9 +325,8 @@ macro_rules! null_or_pass_through {
     };
 }
 
-impl ShapeSerializer for Unvalued<'_, '_> {
+impl ShapeSerializer for Complete<'_, '_> {
     null_or_pass_through! {
-        fn write_struct(value: &dyn SerializableStruct);
         fn write_list(
             write_elements: &dyn Fn(&mut dyn ShapeSerializer)
                 -> ::std::result::Result<(), SerdeError>
@@ -252,7 +350,33 @@ impl ShapeSerializer for Unvalued<'_, '_> {
         fn write_document(value: &Document);
     }
 
+    /// A nested structure is written as completely as the record carrying it: the
+    /// value is re-wrapped in a [`CompleteRecord`] over its own shape, so its unset
+    /// members are JSON `null` instead of missing keys.
+    fn write_struct(
+        &mut self,
+        schema: &Schema,
+        value: &dyn SerializableStruct,
+    ) -> ::std::result::Result<(), SerdeError> {
+        self.written_member(schema);
+        if self.has_no_value(schema) {
+            return self.inner.write_null(schema);
+        }
+        match nested_shape(self.shape, schema) {
+            Some(shape) => self.inner.write_struct(
+                schema,
+                &CompleteRecord {
+                    record: value,
+                    shape,
+                    unvalued: &[],
+                },
+            ),
+            None => self.inner.write_struct(schema, value),
+        }
+    }
+
     fn write_null(&mut self, schema: &Schema) -> ::std::result::Result<(), SerdeError> {
+        self.written_member(schema);
         self.inner.write_null(schema)
     }
 }

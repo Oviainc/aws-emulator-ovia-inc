@@ -153,6 +153,27 @@ pub struct PolicyStore {
     pub policies: BTreeMap<String, Policy>,
     /// Strictly increasing, so every minted `policyId` in this store is distinct.
     pub next_id_seq: u64,
+    /// The Cedar schema `PutSchema` stored, when one has been stored. A store
+    /// holds at most ONE schema — `PutSchema` "creates or updates" it — so this
+    /// is an `Option`, not a map.
+    pub schema: Option<StoredSchema>,
+}
+
+/// The one Cedar schema a policy store holds: the text exactly as `PutSchema`
+/// received it, plus the namespaces read out of it and its own timestamps.
+#[derive(Debug, Clone)]
+pub struct StoredSchema {
+    /// The Cedar schema JSON, byte-identical to what `PutSchema` was given, so
+    /// `GetSchema` reports the caller's own text back.
+    pub cedar_json: String,
+    /// The namespaces the schema declares, in the order the parse reported them.
+    pub namespaces: Vec<String>,
+    /// When the store's FIRST schema was put: the model documents this as "the
+    /// date and time that the schema was originally created", so a later
+    /// `PutSchema` on the same store keeps it.
+    pub created_date: DateTime,
+    /// When the schema was last put.
+    pub last_updated_date: DateTime,
 }
 
 /// One policy in a store. `statement` is the Cedar text exactly as it arrived;

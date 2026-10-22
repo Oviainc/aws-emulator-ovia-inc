@@ -302,6 +302,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             image_scanning_config: input.image_scanning_configuration,
             encryption_config: encryption,
             tags: Vec::new(),
+            // A new repository carries no repository policy until
+            // `SetRepositoryPolicy` applies one.
+            policy_text: None,
             images: ::std::collections::BTreeMap::new(),
             tag_index: ::std::collections::BTreeMap::new(),
         };
