@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportHypervisorConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportHypervisorConfiguration`'s real behaviour. Implement it here — this is
+//! Connects to a hypervisor by importing its configuration: mints one hypervisor record
+//! in [`crate::state`] for the host the request names and hands back its ARN. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportHypervisorConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -92,11 +86,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `ImportHypervisorConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#ImportHypervisorConfiguration")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#ImportHypervisorConfiguration",
+    extra_errors = ["ValidationException", "InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ImportHypervisorConfigurationErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,18 +149,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportHypervisorConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportHypervisorConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ImportHypervisorConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    error_code: None,
+                    message: Some(
+                        "Backup gateway state is unavailable on this engine.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // Every modelled constraint on this input — `Name`'s and `Host`'s length and
+        // pattern, the `@sensitive` `Username` / `Password`, `KmsKeyArn`'s ARN pattern —
+        // is refused by the boundary validator before `handle` runs. What the model does
+        // NOT express is the tag rules, which `tag_map` states and refuses.
+        let tags = crate::state::tag_map(input.tags.as_deref().unwrap_or(&[])).map_err(
+            |message| {
+                ImportHypervisorConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        error_code: None,
+                        message: Some(message),
+                    },
+                )
+            },
+        )?;
+
+        // A hypervisor is regional, so its ARN carries the region the caller signed for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // One guard spans the host lookup, the ceiling check and the insert, so two
+        // concurrent imports of one host cannot both pass a check only one of them
+        // should.
+        let mut store = state.lock();
+
+        // The record stands for the machine reachable at `Host`, so a host this service
+        // has already imported cannot take a second record: that is the modelled
+        // `ConflictException` (HTTP 409), refused BEFORE anything is written.
+        if store.hypervisor_by_host(&input.host).is_some() {
+            return Err(ImportHypervisorConfigurationErrorModeled::ConflictException(
+                ConflictException {
+                    error_code: crate::state::HYPERVISOR_ALREADY_EXISTS.to_string(),
+                    message: Some(crate::state::HYPERVISOR_ALREADY_EXISTS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        if store.hypervisor_count() >= crate::state::MAX_STORED_HYPERVISORS {
+            // Not an AWS quota: the emulator's own store ceiling, refused the way the
+            // sibling `CreateGateway` refuses its own (`MAX_STORED_GATEWAYS`) so one
+            // service answers one way for the one condition.
+            return Err(ImportHypervisorConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    error_code: None,
+                    message: Some(format!(
+                        "This emulator stores at most {} hypervisors and already holds \
+                         that many; delete one before importing another.",
+                        crate::state::MAX_STORED_HYPERVISORS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The record is read back OUT of the store after the insert, so the ARN below is
+        // the key the store now holds — not a string built from this request. The import
+        // starts the activation: the record is minted `PENDING` with the instant it falls
+        // due, which is what a later `GetHypervisor` reports from.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportHypervisorConfiguration"))
+        // `Username` and `Password` are `@sensitive` credentials no response member
+        // carries, so they are not persisted: nothing in this service reads them, and a
+        // credential a store does not hold cannot leak out of one.
+        let imported = store.import_hypervisor(
+            &region,
+            crate::state::HypervisorConfiguration {
+                name: input.name.clone(),
+                host: input.host.clone(),
+                kms_key_arn: input.kms_key_arn.clone(),
+                tags,
+            },
+            ::std::time::SystemTime::now(),
+        );
+
+        Ok(ImportHypervisorConfigurationOutput {
+            hypervisor_arn: Some(imported.arn),
+        })
     }
 }

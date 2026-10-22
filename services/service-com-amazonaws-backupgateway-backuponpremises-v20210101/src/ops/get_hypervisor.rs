@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetHypervisor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetHypervisor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetHypervisor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the hypervisor an ARN names, built from the record persisted in
+//! [`crate::state`]. `@readonly`: it writes nothing, and the `State` it reports is
+//! derived from the stored record and the clock, so reading never moves it. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -82,10 +77,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `GetHypervisorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#GetHypervisor")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#GetHypervisor",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetHypervisorErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -139,18 +138,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetHypervisor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetHypervisorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetHypervisor"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetHypervisorErrorModeled::InternalServerException(InternalServerException {
+                error_code: None,
+                message: Some("Backup gateway state is unavailable on this engine.".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        // `HypervisorArn`'s length and pattern are refused by the boundary validator
+        // before `handle` runs, so reaching here means the ARN is well formed; whether it
+        // names a hypervisor is a fact of the STORE, which is what this lookup asks.
+        let Some(hypervisor) = state.hypervisor(&input.hypervisor_arn) else {
+            // This operation resolves exactly one resource type, so an ARN it cannot
+            // resolve is a missing HYPERVISOR whatever else the ARN spells — and this
+            // service answers that with the modelled `ResourceNotFoundException` at HTTP
+            // 400 carrying `ErrorCode` `HypervisorNotFound`
+            // (`crate::state::MissingResource`), the one place the status and the code
+            // are chosen together.
+            let missing = crate::state::MissingResource::Hypervisor;
+            let error =
+                GetHypervisorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.hypervisor_arn)),
+                });
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
+        };
+
+        // The record as it stands at this instant: every member comes out of the store,
+        // and `State` is the state the stored activation instant has already made due —
+        // computed, not advanced by this call.
+        Ok(GetHypervisorOutput {
+            hypervisor: Some(hypervisor.details_as_of(::std::time::SystemTime::now())),
+        })
     }
 }

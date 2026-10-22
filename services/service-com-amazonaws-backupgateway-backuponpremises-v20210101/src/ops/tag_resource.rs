@@ -157,12 +157,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Tagging MERGES: a key the resource already carries is overwritten, not
         // duplicated, and a key it does not carry is added.
         //
-        // The ARN is resolved against the resource it NAMES, and an ARN with no record
-        // behind it takes the refusal that resource type carries: the same modelled
-        // `ResourceNotFoundException` shape throughout, but a missing hypervisor is
-        // answered 400 with `ErrorCode` `HypervisorNotFound` where every other type
+        // The ARN is resolved against the resource it NAMES — this service tags gateways
+        // and hypervisors alike, so one lookup spans both stores — and an ARN with no
+        // record behind it takes the refusal that resource type carries: the same
+        // modelled `ResourceNotFoundException` shape throughout, but a missing hypervisor
+        // is answered 400 with `ErrorCode` `HypervisorNotFound` where every other type
         // takes the shape's own 404 (`crate::state::MissingResource`).
-        let Some(gateway) = state.gateway_mut(&input.resource_arn) else {
+        let Some(merged) = state.merge_resource_tags(&input.resource_arn, &input.tags) else {
             let missing = crate::state::MissingResource::for_arn(&input.resource_arn);
             let error = TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -175,16 +176,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => error.into(),
             });
         };
-        let merged = crate::state::merged_tags(&gateway.tags, &input.tags).map_err(|message| {
+        // The tag rules the model's own traits cannot express; nothing is written when
+        // they refuse.
+        let resource_arn = merged.map_err(|message| {
             TagResourceErrorModeled::ValidationException(ValidationException {
                 error_code: None,
                 message: Some(message),
             })
         })?;
-        gateway.tags = merged;
 
         Ok(TagResourceOutput {
-            resource_arn: Some(gateway.arn.clone()),
+            resource_arn: Some(resource_arn),
         })
     }
 }

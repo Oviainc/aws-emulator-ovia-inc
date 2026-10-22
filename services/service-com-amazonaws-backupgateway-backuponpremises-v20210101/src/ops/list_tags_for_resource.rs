@@ -151,12 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
-        // The ARN is resolved against the resource it NAMES, and an ARN with no record
-        // behind it takes the refusal that resource type carries: the same modelled
-        // `ResourceNotFoundException` shape throughout, but a missing hypervisor is
-        // answered 400 with `ErrorCode` `HypervisorNotFound` where every other type
+        // The ARN is resolved against the resource it NAMES — this service tags gateways
+        // and hypervisors alike, so one lookup spans both stores — and an ARN with no
+        // record behind it takes the refusal that resource type carries: the same
+        // modelled `ResourceNotFoundException` shape throughout, but a missing hypervisor
+        // is answered 400 with `ErrorCode` `HypervisorNotFound` where every other type
         // takes the shape's own 404 (`crate::state::MissingResource`).
-        let Some(gateway) = state.gateway(&input.resource_arn) else {
+        let Some((resource_arn, tags)) = state.resource_tags(&input.resource_arn) else {
             let missing = crate::state::MissingResource::for_arn(&input.resource_arn);
             let error = ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -170,12 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         };
 
-        // The persisted tags, including any the create call carried. An untagged
-        // resource answers with an empty list rather than an absent member: the resource
-        // exists and carries no tags, which is a different fact from "unknown".
+        // The persisted tags, including any the create or import call carried. An
+        // untagged resource answers with an empty list rather than an absent member: the
+        // resource exists and carries no tags, which is a different fact from "unknown".
         Ok(ListTagsForResourceOutput {
-            resource_arn: Some(gateway.arn.clone()),
-            tags: Some(gateway.tag_list()),
+            resource_arn: Some(resource_arn),
+            tags: Some(tags),
         })
     }
 }

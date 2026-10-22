@@ -20,13 +20,19 @@
 //! copies. They reuse the MODELLED shapes
 //! ([`MaintenanceStartTime`], [`BandwidthRateLimitInterval`]) rather than mirroring
 //! them, so a member cannot drift between what is stored and what is serialised.
+//!
+//! The second resource this store owns is the **hypervisor** ([`StoredHypervisor`]),
+//! keyed by its own ARN: `GetHypervisor` resolves it out of that map and reports the
+//! record, and the state it reports is derived from the record and the clock
+//! ([`StoredHypervisor::state_as_of`]) so a read never moves it.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    BandwidthRateLimitInterval, Gateway, GatewayDetails, MaintenanceStartTime, Tag,
+    BandwidthRateLimitInterval, Gateway, GatewayDetails, HypervisorDetails, MaintenanceStartTime,
+    Tag,
 };
 
 /// This service's ARN namespace (`smithy_query(query="service_info")`:
@@ -79,6 +85,44 @@ pub const GATEWAY_SOFTWARE_VERSION: &str = "2-0-0";
 /// The only `GatewayType` the model declares (`GATEWAY_TYPE_VALUES`).
 pub const BACKUP_VM: &str = "BACKUP_VM";
 
+/// `HypervisorState` right after a hypervisor configuration is imported, before the
+/// service has reached the host.
+///
+/// One of the four values the modelled enum declares — `PENDING`, `ONLINE`, `OFFLINE`,
+/// `ERROR` (`smithy_query(query="shape",shape="HypervisorState")`), whose documented
+/// order the `HypervisorDetails$State` doc restates.
+pub const HYPERVISOR_PENDING: &str = "PENDING";
+
+/// `HypervisorState` once the service has reached the hypervisor host. See
+/// [`HYPERVISOR_PENDING`].
+pub const HYPERVISOR_ONLINE: &str = "ONLINE";
+
+/// How long a freshly imported hypervisor stays [`HYPERVISOR_PENDING`] before it is
+/// [`HYPERVISOR_ONLINE`].
+///
+/// A CHOSEN span, not a documented one: AWS states no duration for the activation an
+/// import starts, only that a hypervisor's state passes through `PENDING`. It is
+/// non-zero so a caller that reads straight after an import still observes `PENDING`,
+/// and short enough that a caller which waits sees `ONLINE`. Nothing sleeps for it — the
+/// due instant is stored and every read compares the clock against it
+/// ([`StoredHypervisor::state_as_of`]).
+pub const HYPERVISOR_PENDING_FOR: Duration = Duration::from_millis(500);
+
+/// `ConflictException$ErrorCode` for an import naming a host this service has already
+/// imported a hypervisor for, and the sentence that states it.
+///
+/// A hypervisor IS its host: the record stands for the machine reachable at that address,
+/// so importing the same host twice cannot mint a second one — `ConflictException` is the
+/// modelled "the operation cannot proceed because it is not supported"
+/// (`smithy_query(query="shape",shape="ConflictException")`), whose `ErrorCode` member is
+/// REQUIRED and documented as "a description of why the operation is not supported". AWS
+/// publishes no vocabulary for that member, so this value names the condition.
+pub const HYPERVISOR_ALREADY_EXISTS: &str = "HypervisorAlreadyExists";
+
+/// See [`HYPERVISOR_ALREADY_EXISTS`].
+pub const HYPERVISOR_ALREADY_EXISTS_MESSAGE: &str =
+    "A hypervisor has already been imported for this host.";
+
 /// The largest number of gateways this emulator keeps.
 ///
 /// A ceiling, not an AWS quota: `CreateGateway` is the one operation that grows resident
@@ -86,6 +130,12 @@ pub const BACKUP_VM: &str = "BACKUP_VM";
 /// a create past the ceiling is refused rather than served. The same bound the other
 /// services in this workspace use for a caller-driven store.
 pub const MAX_STORED_GATEWAYS: usize = 1_000;
+
+/// The largest number of hypervisors this emulator keeps, for the same reason as
+/// [`MAX_STORED_GATEWAYS`]: `ImportHypervisorConfiguration` grows resident memory one
+/// record per call, so the store is bounded and an import past the ceiling is refused
+/// rather than served.
+pub const MAX_STORED_HYPERVISORS: usize = 1_000;
 
 /// The page size `ListGateways` uses when a request names no `MaxResults`, and the
 /// largest page it will return whatever `MaxResults` asks for.
@@ -183,14 +233,119 @@ impl StoredGateway {
 
     /// The persisted tags as the modelled `Tags` list, in key order.
     pub fn tag_list(&self) -> Vec<Tag> {
-        self.tags
-            .iter()
-            .map(|(key, value)| Tag {
-                key: key.clone(),
-                value: value.clone(),
-            })
-            .collect()
+        tag_list(&self.tags)
     }
+}
+
+/// A stored tag map as the modelled `Tags` list, in key order. One rendering for every
+/// resource this service tags.
+fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// One persisted hypervisor.
+///
+/// Keyed in the store by [`StoredHypervisor::arn`], the identity every hypervisor
+/// operation takes (`GetHypervisor`, `UpdateHypervisor`, `DeleteHypervisor` all name a
+/// `ServerArn`). The members are exactly the ones `HypervisorDetails` reports
+/// (`smithy_query(query="shape",shape="HypervisorDetails")`), so a read serialises the
+/// record rather than recomputing anything from the request — the hypervisor's
+/// credentials are NOT among them and are not kept here.
+#[derive(Debug, Clone)]
+pub struct StoredHypervisor {
+    /// The hypervisor's ARN — the store's key. The generated id is its
+    /// `hypervisor/<id>` suffix and is not kept beside it: one source of truth for the
+    /// identity.
+    pub arn: String,
+    /// `HypervisorDetails$Name`.
+    pub name: String,
+    /// `HypervisorDetails$Host` — an IP address or an FQDN.
+    pub host: String,
+    /// `HypervisorDetails$KmsKeyArn`, absent unless the import named one.
+    pub kms_key_arn: Option<String>,
+    /// `HypervisorDetails$LogGroupArn`, absent until `UpdateHypervisor` sets one.
+    pub log_group_arn: Option<String>,
+    /// `HypervisorDetails$State` as last PERSISTED; what a read reports is
+    /// [`StoredHypervisor::state_as_of`], which also accounts for the activation the
+    /// clock has already made due.
+    pub state: String,
+    /// When this record's [`HYPERVISOR_PENDING`] state becomes [`HYPERVISOR_ONLINE`],
+    /// or `None` for a record whose state no longer moves on its own.
+    pub online_due: Option<SystemTime>,
+    /// `LastSuccessfulMetadataSyncTime`, absent until a metadata sync has succeeded.
+    pub last_successful_metadata_sync_time: Option<SystemTime>,
+    /// `LatestMetadataSyncStatus` — a `SyncMetadataStatus` value — absent until a
+    /// metadata sync has been started.
+    pub latest_metadata_sync_status: Option<String>,
+    /// `LatestMetadataSyncStatusMessage`.
+    pub latest_metadata_sync_status_message: Option<String>,
+    /// When this record was created.
+    pub created_time: SystemTime,
+    /// The resource's tags, by key — the same representation [`StoredGateway::tags`]
+    /// uses, so the tagging operations treat both resources alike.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl StoredHypervisor {
+    /// The `HypervisorState` this hypervisor is in at `now`.
+    ///
+    /// An import leaves the hypervisor [`HYPERVISOR_PENDING`] with the instant its
+    /// activation falls due; the clock alone moves it to [`HYPERVISOR_ONLINE`], so the
+    /// state a read reports is a function of the record and the current time and is the
+    /// same for every reader — no call has to poll for the transition to happen, and a
+    /// read does not cause it.
+    pub fn state_as_of(&self, now: SystemTime) -> &str {
+        if self.state == HYPERVISOR_PENDING && self.online_due.is_some_and(|due| now >= due) {
+            HYPERVISOR_ONLINE
+        } else {
+            &self.state
+        }
+    }
+
+    /// This record as the `HypervisorDetails` shape `GetHypervisor` returns, as of `now`.
+    pub fn details_as_of(&self, now: SystemTime) -> HypervisorDetails {
+        HypervisorDetails {
+            host: Some(self.host.clone()),
+            hypervisor_arn: Some(self.arn.clone()),
+            kms_key_arn: self.kms_key_arn.clone(),
+            name: Some(self.name.clone()),
+            log_group_arn: self.log_group_arn.clone(),
+            state: Some(self.state_as_of(now).to_string()),
+            last_successful_metadata_sync_time: self
+                .last_successful_metadata_sync_time
+                .map(date_time),
+            latest_metadata_sync_status_message: self.latest_metadata_sync_status_message.clone(),
+            latest_metadata_sync_status: self.latest_metadata_sync_status.clone(),
+        }
+    }
+
+    /// The persisted tags as the modelled `Tags` list, in key order.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        tag_list(&self.tags)
+    }
+}
+
+/// What an import asks for a hypervisor to be created with: the members
+/// `ImportHypervisorConfiguration` takes that a later read reports
+/// (`smithy_query(query="operation",operation="ImportHypervisorConfiguration")`). Its
+/// `Username` / `Password` are `@sensitive` credentials no response member carries, so
+/// they are deliberately absent here and never persisted.
+#[derive(Debug, Clone, Default)]
+pub struct HypervisorConfiguration {
+    /// `Name` — required by the import's input.
+    pub name: String,
+    /// `Host` — required by the import's input.
+    pub host: String,
+    /// `KmsKeyArn`, optional.
+    pub kms_key_arn: Option<String>,
+    /// `Tags` — "the tags of the hypervisor configuration to import" — by key, as
+    /// [`tag_map`] validated them.
+    pub tags: BTreeMap<String, String>,
 }
 
 /// One page of `ListGateways`: the records it returns and the token that resumes after
@@ -221,6 +376,12 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// something OUTSIDE the API put in this registry, and a key nothing issued is
     /// refused — see [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::activation_key_issued`].
     activation_keys: BTreeMap<String, SystemTime>,
+    /// Hypervisors by ARN. A `BTreeMap` for the same reason as `gateways`: the key order
+    /// is total and stable, so `ListHypervisors` can paginate over it once it is
+    /// implemented.
+    hypervisors: BTreeMap<String, StoredHypervisor>,
+    /// Monotonic counter behind the `hypervisor/<id>` ARN suffix.
+    next_hypervisor_id: u64,
 }
 
 impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
@@ -335,6 +496,124 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             gateways,
             next_token,
         }
+    }
+
+    /// Persist a hypervisor for `configuration` and hand back the record as it is now
+    /// STORED — read out of the map after the insert, so the ARN that comes back is the
+    /// key the store holds rather than a string built from the request.
+    ///
+    /// The record is minted [`HYPERVISOR_PENDING`] with the instant its activation falls
+    /// due ([`HYPERVISOR_PENDING_FOR`] after `now`): on AWS an imported hypervisor is not
+    /// reachable the moment the import returns, and the state a read reports is derived
+    /// from that stored instant rather than advanced by anything a caller does.
+    ///
+    /// `ImportHypervisorConfiguration` is the operation that performs this: its handler
+    /// resolves the host, bounds the store and then calls here, so the record a caller
+    /// gets an ARN for is the one this map holds.
+    pub fn import_hypervisor(
+        &mut self,
+        region: &str,
+        configuration: HypervisorConfiguration,
+        now: SystemTime,
+    ) -> StoredHypervisor {
+        let hypervisor_id = format!("hv-{:016x}", self.next_hypervisor_id);
+        self.next_hypervisor_id += 1;
+        let arn = ::engine::emulator_arn(
+            ARN_SERVICE,
+            &arn_region(region),
+            &format!("{HYPERVISOR_RESOURCE_TYPE}/{hypervisor_id}"),
+        );
+        let record = StoredHypervisor {
+            arn: arn.clone(),
+            name: configuration.name,
+            host: configuration.host,
+            kms_key_arn: configuration.kms_key_arn,
+            log_group_arn: None,
+            state: HYPERVISOR_PENDING.to_string(),
+            online_due: Some(now + HYPERVISOR_PENDING_FOR),
+            last_successful_metadata_sync_time: None,
+            latest_metadata_sync_status: None,
+            latest_metadata_sync_status_message: None,
+            created_time: now,
+            tags: configuration.tags,
+        };
+        // `or_insert` hands back a reference INTO the map, so the record returned is the
+        // one the store now holds; the id counter makes the key fresh, so this always
+        // inserts.
+        self.hypervisors.entry(arn).or_insert(record).clone()
+    }
+
+    /// The hypervisor stored under `arn`, if any.
+    ///
+    /// The ONE lookup every hypervisor operation resolves its `ServerArn` through: an ARN
+    /// with no record behind it is absent here, whether it was never imported or has been
+    /// deleted, which is the same answer the real service gives for both.
+    pub fn hypervisor(&self, arn: &str) -> Option<&StoredHypervisor> {
+        self.hypervisors.get(arn)
+    }
+
+    /// The hypervisor stored under `arn`, for in-place mutation.
+    pub fn hypervisor_mut(&mut self, arn: &str) -> Option<&mut StoredHypervisor> {
+        self.hypervisors.get_mut(arn)
+    }
+
+    /// Remove the hypervisor stored under `arn`, returning the record that was removed.
+    pub fn remove_hypervisor(&mut self, arn: &str) -> Option<StoredHypervisor> {
+        self.hypervisors.remove(arn)
+    }
+
+    /// How many hypervisors are stored.
+    pub fn hypervisor_count(&self) -> usize {
+        self.hypervisors.len()
+    }
+
+    /// The hypervisor stored for `host`, if any.
+    ///
+    /// A hypervisor record stands for the machine reachable at its host, so the host is
+    /// what an import resolves against before minting a second record for it.
+    pub fn hypervisor_by_host(&self, host: &str) -> Option<&StoredHypervisor> {
+        self.hypervisors
+            .values()
+            .find(|hypervisor| hypervisor.host == host)
+    }
+
+    /// The ARN `arn` is stored under and the tags the resource it names carries, or
+    /// `None` for an ARN this store holds no record for.
+    ///
+    /// The tagging operations take any of this service's resources in one `ResourceARN`
+    /// member, so they resolve it through this one lookup rather than knowing which map
+    /// holds which kind: the ARN comes back out of the store, so what a response echoes
+    /// is the key the store holds.
+    pub fn resource_tags(&self, arn: &str) -> Option<(String, Vec<Tag>)> {
+        if let Some(gateway) = self.gateways.get(arn) {
+            return Some((gateway.arn.clone(), gateway.tag_list()));
+        }
+        let hypervisor = self.hypervisors.get(arn)?;
+        Some((hypervisor.arn.clone(), hypervisor.tag_list()))
+    }
+
+    /// Merge `requested` into the tags of the resource `arn` names, and hand back the ARN
+    /// the store holds it under.
+    ///
+    /// `None` for an ARN this store holds no record for; `Err` for tags the model's own
+    /// traits cannot refuse ([`merged_tags`]), in which case NOTHING is written. Spans
+    /// both resource types for the same reason as [`resource_tags`].
+    pub fn merge_resource_tags(
+        &mut self,
+        arn: &str,
+        requested: &[Tag],
+    ) -> Option<Result<String, String>> {
+        if let Some(gateway) = self.gateways.get_mut(arn) {
+            return Some(merged_tags(&gateway.tags, requested).map(|merged| {
+                gateway.tags = merged;
+                gateway.arn.clone()
+            }));
+        }
+        let hypervisor = self.hypervisors.get_mut(arn)?;
+        Some(merged_tags(&hypervisor.tags, requested).map(|merged| {
+            hypervisor.tags = merged;
+            hypervisor.arn.clone()
+        }))
     }
 }
 
@@ -458,9 +737,8 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
 pub enum MissingResource {
     /// A `hypervisor/<id>` ARN with no hypervisor behind it.
     ///
-    /// This service holds no hypervisors yet — `ImportHypervisorConfiguration`, the one
-    /// operation that creates one, is still scaffolded and answers 501 under its own
-    /// stub issue — so for now every hypervisor ARN reaches this arm.
+    /// The store holds hypervisors ([`StoredHypervisor`]), so this arm is reached for a
+    /// hypervisor ARN the store has no record under — never for one it does.
     Hypervisor,
     /// Every other resource type, including a `gateway/<id>` ARN with no gateway
     /// behind it.
