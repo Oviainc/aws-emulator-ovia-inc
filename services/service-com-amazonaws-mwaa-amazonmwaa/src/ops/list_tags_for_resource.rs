@@ -151,18 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a report may make: the transitions the clock already owes.
         store.settle(now);
 
-        let stored = store
-            .environment_by_arn(&input.resource_arn)
-            .ok_or_else(|| {
-                ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Environment {} could not be found",
-                            input.resource_arn
-                        )),
-                    },
-                )
-            })?;
+        let stored = store.environment_by_arn(&input.resource_arn).ok_or_else(|| {
+            // The same refusal the other two tagging operations answer for the same
+            // lookup: HTTP 404 with the published wire code `NotFoundException`.
+            crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
+        })?;
 
         // `TagMap` is `@length(1, 50)`, so an untagged environment reports no `Tags`
         // member rather than an empty map outside that bound.

@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record.
         store.remove(&input.name).ok_or_else(|| {
             DeleteEnvironmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Environment {} could not be found", input.name)),
+                message: Some(crate::state::environment_not_found_message(&input.name)),
             })
         })?;
         Ok(DeleteEnvironmentOutput {})
