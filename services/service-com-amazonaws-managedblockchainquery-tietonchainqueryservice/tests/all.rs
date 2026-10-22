@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/asset_contracts.rs"]
 mod asset_contracts;
+#[path = "all/batch_token_balance.rs"]
+mod batch_token_balance;
 #[path = "all/chain_query_slice.rs"]
 mod chain_query_slice;
 #[path = "all/error_contract.rs"]
