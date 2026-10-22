@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves a stored task towards `STOPPED`: `desiredStatus` becomes `STOPPED` at once and
+//! `lastStatus` becomes `DEACTIVATING` with `stoppingAt` recorded (the
+//! `Task$stoppingAt` doc: "the time when the task transitions from the `RUNNING` state
+//! to `STOPPING`"). Reaching `STOPPED` is owed by the clock — see `crate::state` — so a
+//! later `DescribeTasks` observes it.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +164,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopTaskErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        if !guard.clusters.contains_key(&cluster_name) {
+            return Err(StopTaskErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::task_arn_from_reference(&region, &cluster_name, &input.task);
+        let in_cluster = guard
+            .tasks
+            .get(&arn)
+            .is_some_and(|task| task.cluster_name == cluster_name);
+        if !in_cluster {
+            return Err(StopTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "the referenced task {:?} was not found in cluster {cluster_name:?}",
+                        input.task
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let stopping_at = crate::state::now();
+        let task = guard
+            .tasks
+            .get_mut(&arn)
+            .expect("the task was just found in this cluster");
+
+        // Stopping a task that has already been asked to stop changes nothing: the stop
+        // is already recorded and the clock owns the rest of the transition.
+        if task.desired_status != crate::state::STATUS_STOPPED {
+            task.desired_status = crate::state::STATUS_STOPPED.to_string();
+            task.last_status = crate::state::STATUS_DEACTIVATING.to_string();
+            task.stopping_at = Some(stopping_at);
+            task.stopped_reason = Some(
+                input
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_STOPPED_REASON.to_string()),
+            );
+            task.stop_code = Some(crate::state::STOP_CODE_USER_INITIATED.to_string());
+            task.stopped_due_at = Some(now + crate::state::TRANSITION_SPAN);
+            // A task asked to stop never reaches RUNNING: the start it was still
+            // waiting for is cancelled, not merely overtaken.
+            task.running_due_at = None;
+            // The operation's own doc: "Any tags associated with the task will be
+            // deleted."
+            task.tags.clear();
+            task.version += 1;
+            for container in &mut task.containers {
+                container.last_status = crate::state::STATUS_DEACTIVATING.to_string();
+            }
+        }
+
+        // `StopTask` has no `include` member to narrow the response with, so the task it
+        // just mutated is reported with its tags.
+        Ok(StopTaskOutput {
+            task: Some(task.view(true)),
+        })
     }
 }

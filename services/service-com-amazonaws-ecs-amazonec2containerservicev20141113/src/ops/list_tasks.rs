@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the ARNs of STORED tasks, filtered as the request asks and paged in a stable
+//! order. A reporting operation: the only write it performs is materialising the
+//! lifecycle transitions the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +191,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTasks"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTasksErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        // "This value can be between 1 and 100."
+        if let Some(max_results) = input.max_results {
+            if !(1..=crate::state::MAX_LIST_PAGE_SIZE).contains(&max_results) {
+                return Err(ListTasksErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "maxResults must be between 1 and {}; got {max_results}",
+                            crate::state::MAX_LIST_PAGE_SIZE
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Services and container instances cannot exist in this slice — nothing
+        // registers one — so a filter that names one names something absent, which is
+        // what each of these modelled errors reports.
+        if let Some(service_name) = input.service_name.as_deref() {
+            return Err(ListTasksErrorModeled::ServiceNotFoundException(
+                ServiceNotFoundException {
+                    message: Some(format!("service {service_name:?} was not found")),
+                },
+            )
+            .into());
+        }
+        if let Some(container_instance) = input.container_instance.as_deref() {
+            return Err(ListTasksErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "container instance {container_instance:?} was not found"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        // "The default status filter is RUNNING, which shows tasks that Amazon ECS has
+        // set the desired status to RUNNING."
+        let desired_status = input
+            .desired_status
+            .clone()
+            .unwrap_or_else(|| crate::state::STATUS_RUNNING.to_string());
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.clusters.contains_key(&cluster_name) {
+            return Err(ListTasksErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                },
+            )
+            .into());
+        }
+
+        let mut matching: Vec<String> = guard
+            .tasks
+            .values()
+            .filter(|task| task.cluster_name == cluster_name)
+            .filter(|task| task.desired_status == desired_status)
+            .filter(|task| {
+                input
+                    .family
+                    .as_deref()
+                    .is_none_or(|family| task.family == family)
+            })
+            .filter(|task| {
+                input
+                    .started_by
+                    .as_deref()
+                    .is_none_or(|started_by| task.started_by.as_deref() == Some(started_by))
+            })
+            .filter(|task| {
+                input
+                    .launch_type
+                    .as_deref()
+                    .is_none_or(|launch_type| task.launch_type.as_deref() == Some(launch_type))
+            })
+            // A daemon cannot exist in this slice, so no task belongs to one and a
+            // `daemonName` filter selects nothing.
+            .filter(|_| input.daemon_name.is_none())
+            .map(|task| task.task_arn.clone())
+            .collect();
+        // Task ARNs end in a zero-padded, monotonically minted id, so sorting them puts
+        // the tasks in creation order and gives paging a stable sequence to walk.
+        matching.sort();
+
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
+        // The token is the ARN the next page starts at, so a page is unaffected by
+        // tasks added or removed before it.
+        let start = match input.next_token.as_deref() {
+            Some(token) => matching.partition_point(|arn| arn.as_str() < token),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+        let task_arns = matching[start.min(matching.len())..end].to_vec();
+        let next_token = matching.get(end).cloned();
+
+        Ok(ListTasksOutput {
+            task_arns: Some(task_arns),
+            next_token,
+        })
     }
 }

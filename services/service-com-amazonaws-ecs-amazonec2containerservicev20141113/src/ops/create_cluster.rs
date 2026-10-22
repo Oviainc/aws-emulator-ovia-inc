@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a cluster and stores it; every response member is built from the stored
+//! record. A second create of a name that already exists returns the STORED cluster
+//! rather than adding a duplicate entry under the same name.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +119,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The values `ClusterSetting$value` accepts, from that member's own doc: "The
+/// supported values are `enhanced`, `enabled`, and `disabled`." The setting NAME is a
+/// closed enum the boundary validator already refuses outside, but the value is a free
+/// string the service constrains itself.
+const CLUSTER_SETTING_VALUES: [&str; 3] = ["enhanced", "enabled", "disabled"];
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -197,18 +197,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateClusterErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "If you don't specify a name for your cluster, you create a cluster that's
+        // named default."
+        let name = input
+            .cluster_name
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_CLUSTER_NAME.to_string());
+        if !crate::state::is_valid_name(&name) {
+            return Err(CreateClusterErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "clusterName must be 1 to {} letters, numbers, underscores or \
+                         hyphens; got {name:?}",
+                        crate::state::MAX_NAME_LENGTH
+                    )),
+                },
+            )
+            .into());
+        }
+
+        for setting in input.settings.iter().flatten() {
+            let value = setting.value.as_deref().unwrap_or_default();
+            if !CLUSTER_SETTING_VALUES.contains(&value) {
+                return Err(CreateClusterErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "settings value must be one of {}; got {value:?}",
+                            CLUSTER_SETTING_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        // A cluster name identifies the cluster, so creating one that already exists is
+        // not a second cluster: the stored record is reported back unchanged.
+        if let Some(existing) = guard.clusters.get(&name) {
+            let view = guard.cluster_view(existing, crate::state::ClusterFields::all());
+            return Ok(CreateClusterOutput {
+                cluster: Some(view),
+            });
+        }
+
+        if guard.clusters.len() >= crate::state::MAX_CLUSTERS {
+            return Err(CreateClusterErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "this emulator holds at most {} clusters; delete one before creating \
+                     another",
+                    crate::state::MAX_CLUSTERS
+                )),
+            })
+            .into());
+        }
+
+        let record = crate::state::ClusterRecord {
+            name: name.clone(),
+            arn: crate::state::cluster_arn(&crate::state::request_region(ctx), &name),
+            status: crate::state::CLUSTER_ACTIVE.to_string(),
+            tags: input.tags.clone().unwrap_or_default(),
+            settings: input.settings.clone().unwrap_or_default(),
+            configuration: input.configuration.clone(),
+            capacity_providers: input.capacity_providers.clone().unwrap_or_default(),
+            default_capacity_provider_strategy: input
+                .default_capacity_provider_strategy
+                .clone()
+                .unwrap_or_default(),
+        };
+        let view = guard.cluster_view(&record, crate::state::ClusterFields::all());
+        guard.clusters.insert(name, record);
+
+        Ok(CreateClusterOutput {
+            cluster: Some(view),
+        })
     }
 }

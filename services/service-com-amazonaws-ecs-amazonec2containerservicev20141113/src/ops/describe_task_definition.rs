@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTaskDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTaskDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTaskDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the STORED task-definition revision named by `taskDefinition` — a family, a
+//! `family:revision`, or a task-definition ARN. The reader for
+//! `RegisterTaskDefinition`, implemented here so a registration can be read back.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +157,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTaskDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTaskDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTaskDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeTaskDefinitionErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        let Some((family, requested_revision)) =
+            crate::state::parse_task_definition_reference(&input.task_definition)
+        else {
+            return Err(DescribeTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(format!(
+                        "taskDefinition must be a family, family:revision or \
+                         task-definition ARN; got {:?}",
+                        input.task_definition
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "If TAGS is specified, the tags are included in the response. If this field
+        // is omitted, tags aren't included in the response."
+        let include_tags = input
+            .include
+            .iter()
+            .flatten()
+            .any(|field| field == "TAGS");
+
+        let guard = state.lock();
+        // "To determine the latest ACTIVE revision in a family, you can specify the
+        // family name."
+        let record = match requested_revision {
+            Some(revision) => guard.task_definitions.get(&(family, revision)),
+            None => guard.latest_active_revision(&family),
+        };
+        let Some(record) = record else {
+            return Err(DescribeTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(format!(
+                        "unable to describe task definition {:?}",
+                        input.task_definition
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeTaskDefinitionOutput {
+            task_definition: Some(record.view()),
+            tags: if include_tags {
+                Some(record.tags.clone())
+            } else {
+                None
+            },
+        })
     }
 }

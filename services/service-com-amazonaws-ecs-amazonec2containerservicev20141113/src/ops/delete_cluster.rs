@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored cluster and reports it with `status: INACTIVE` — the
+//! `Cluster$status` doc: "INACTIVE: The cluster has been deleted." A cluster that still
+//! holds a task that has not stopped is refused with `ClusterContainsTasksException`.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +173,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCluster"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteClusterErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.clusters.contains_key(&cluster_name) {
+            return Err(DeleteClusterErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                },
+            )
+            .into());
+        }
+
+        if guard.cluster_has_active_tasks(&cluster_name) {
+            return Err(DeleteClusterErrorModeled::ClusterContainsTasksException(
+                ClusterContainsTasksException {
+                    message: Some(format!(
+                        "cluster {cluster_name:?} still contains tasks that have not \
+                         stopped"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut record = guard
+            .clusters
+            .remove(&cluster_name)
+            .expect("the cluster was just found in the store");
+        record.status = crate::state::CLUSTER_INACTIVE.to_string();
+        // The tasks the cluster held have all stopped; they go with it, so a later
+        // ListTasks cannot report tasks of a cluster that no longer exists.
+        guard.tasks.retain(|_, task| task.cluster_name != cluster_name);
+        let view = guard.cluster_view(&record, crate::state::ClusterFields::all());
+
+        Ok(DeleteClusterOutput {
+            cluster: Some(view),
+        })
     }
 }
