@@ -24,13 +24,15 @@
 //! this binary's crate root, so it is reached through `crate::state_machine_lifecycle`.
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_sfn_awsstepfunctions::service::wire;
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
     ENCRYPTION_TYPE_AWS_OWNED_KEY, INCLUDED_DATA_ALL_DATA, INCLUDED_DATA_METADATA_ONLY,
     LOG_LEVEL_OFF, METADATA_ONLY_DEFINITION,
 };
 
 use crate::state_machine_lifecycle::{
-    create_machine, string, Emulator, HELLO_DEFINITION, PAST_THE_DELETE_DELAY, ROLE_ARN,
+    create_machine, discriminated, string, Emulator, HELLO_DEFINITION, PAST_THE_DELETE_DELAY,
+    ROLE_ARN,
 };
 
 /// Every value `LogLevel` declares, from the model
@@ -241,19 +243,25 @@ async fn describe_reports_every_configuration_structure_at_its_effective_value()
         let arn = string(&created, "stateMachineArn");
         let described = describe(&emulator, &arn).await;
 
+        // Each structure is compared WITH the type discriminator this service puts
+        // on it, so the wire shape is asserted whole; the discriminator rule itself
+        // is `tests/all/nested_type_discriminator.rs`.
+        let logging = discriminated("LoggingConfiguration", logging.clone());
+        let tracing = discriminated("TracingConfiguration", tracing.clone());
+        let encryption = discriminated("EncryptionConfiguration", encryption.clone());
         assert_eq!(
             described.get("loggingConfiguration"),
-            Some(logging),
+            Some(&logging),
             "case {case:?}: expected loggingConfiguration {logging}, got {described:?}"
         );
         assert_eq!(
             described.get("tracingConfiguration"),
-            Some(tracing),
+            Some(&tracing),
             "case {case:?}: expected tracingConfiguration {tracing}, got {described:?}"
         );
         assert_eq!(
             described.get("encryptionConfiguration"),
-            Some(encryption),
+            Some(&encryption),
             "case {case:?}: expected encryptionConfiguration {encryption}, got {described:?}"
         );
         // A freshly created state machine has no revision: nothing has revised it.
@@ -474,17 +482,24 @@ async fn describe_reports_a_published_version_by_the_same_rules() {
         Some(JSONATA_DEFINITION),
         "expected the version's own definition, got {described:?}"
     );
-    for (member, expected) in [
+    for (member, shape, expected) in [
         (
             "loggingConfiguration",
+            "LoggingConfiguration",
             json!({ "level": LOG_LEVEL_OFF, "includeExecutionData": false }),
         ),
-        ("tracingConfiguration", json!({ "enabled": false })),
+        (
+            "tracingConfiguration",
+            "TracingConfiguration",
+            json!({ "enabled": false }),
+        ),
         (
             "encryptionConfiguration",
+            "EncryptionConfiguration",
             json!({ "type": ENCRYPTION_TYPE_AWS_OWNED_KEY }),
         ),
     ] {
+        let expected = discriminated(shape, expected);
         assert_eq!(
             described.get(member),
             Some(&expected),
@@ -638,9 +653,18 @@ async fn update_state_machine_persists_what_it_names_and_revises_the_record() {
             "case {case:?}: expected the read to report revisionId {revision:?}, got {described:?}"
         );
         for (member, value) in expected.as_object().expect("an object of members") {
+            // A configuration structure is compared WITH the type discriminator the
+            // wire puts on it; every other member here is a scalar or a map.
+            let value = match wire::DISCRIMINATED_MEMBERS
+                .iter()
+                .find(|(name, _)| name == member)
+            {
+                Some((_, shape)) => discriminated(shape, value.clone()),
+                None => value.clone(),
+            };
             assert_eq!(
                 described.get(member),
-                Some(value),
+                Some(&value),
                 "case {case:?}: expected {member} {value}, got {described:?}"
             );
         }
