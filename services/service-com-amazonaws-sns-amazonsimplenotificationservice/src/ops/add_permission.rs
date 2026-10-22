@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddPermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddPermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddPermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +67,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
+
+/// The length of an Amazon Web Services account id: 12 digits.
+const ACCOUNT_ID_LEN: usize = 12;
+
+/// Whether `account_id` is an Amazon Web Services account id — the only principal
+/// `AddPermission` names ("The Amazon Web Services account IDs of the users
+/// (principals) who will be given access", `AWSAccountId` doc).
+fn is_account_id(account_id: &str) -> bool {
+    account_id.len() == ACCOUNT_ID_LEN && account_id.bytes().all(|b| b.is_ascii_digit())
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -165,20 +167,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddPermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddPermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddPermission"))
+        let invalid_parameter = |message: String| -> Self::Error {
+            AddPermissionErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        if let Some(bad) = input
+            .aws_account_id
+            .iter()
+            .find(|account_id| !is_account_id(account_id))
+        {
+            return Err(invalid_parameter(format!(
+                "Invalid parameter: AWSAccountId Reason: an Amazon Web Services account id is \
+                 {ACCOUNT_ID_LEN} digits: {bad}"
+            )));
+        }
+        if let Some(bad) = input
+            .action_name
+            .iter()
+            .find(|action| action.is_empty() || action.contains(':'))
+        {
+            return Err(invalid_parameter(format!(
+                "Invalid parameter: ActionName Reason: an action name is an Amazon SNS action, \
+                 unqualified: {bad}"
+            )));
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(AddPermissionErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        let Some(topic) = store.topics.get_mut(&input.topic_arn) else {
+            return Err(AddPermissionErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let Some(mut policy) = topic.policy_document() else {
+            return Err(invalid_parameter(format!(
+                "Invalid parameter: Policy Reason: the access policy of {} is not a policy \
+                 document this operation can add a statement to",
+                input.topic_arn
+            )));
+        };
+        let statement = state::permission_statement(
+            &input.label,
+            &input.aws_account_id,
+            &input.action_name,
+            &input.topic_arn,
+        );
+        // "A unique identifier for the new policy statement" (`Label` doc): the label
+        // IS the statement's `Sid`, so the grant a label names is ONE statement. A
+        // repeated label therefore replaces that statement where it stands rather than
+        // adding a second one under the same identifier — the call is idempotent in
+        // its label, which is what lets a caller re-apply a grant it already made.
+        // Pinned by the recorded sns-topic-access-policy-permission-management
+        // fixture, whose second AddPermission of one label is answered 200.
+        match policy.position_of(&input.label) {
+            Some(position) => policy.statement[position] = statement,
+            None => policy.statement.push(statement),
+        }
+        let document = policy.to_json();
+        if let Some(refusal) = state::attribute_write_refusal(
+            state::TOPIC_RECORD,
+            &topic.attributes,
+            state::POLICY_ATTRIBUTE,
+            Some(&document),
+        ) {
+            return Err(invalid_parameter(refusal));
+        }
+        topic.store_policy(&policy);
+
+        Ok(AddPermissionOutput)
     }
 }

@@ -14,7 +14,9 @@
 
 use serde_json::{json, Value};
 
-use crate::hosting_loop::{create_fleet, ec2_fleet, wait_for_due_transitions, GameLift};
+use crate::hosting_loop::{
+    anywhere_fleet, create_fleet, ec2_fleet, wait_for_due_transitions, GameLift,
+};
 
 /// A managed fleet request whose runtime configuration asks for `processes` concurrent
 /// server processes, deployed to `locations` beyond the home Region.
@@ -33,19 +35,6 @@ fn managed_fleet(name: &str, processes: i64, locations: &[&str]) -> Value {
             .collect::<Vec<_>>());
     }
     request
-}
-
-/// An Anywhere fleet request deployed to `locations`, which `CreateFleet` requires for
-/// this compute type.
-fn anywhere_fleet(name: &str, locations: &[&str]) -> Value {
-    json!({
-        "Name": name,
-        "ComputeType": "ANYWHERE",
-        "Locations": locations
-            .iter()
-            .map(|location| json!({"Location": location}))
-            .collect::<Vec<_>>(),
-    })
 }
 
 /// How many game sessions `DescribeGameSessions` reports for a fleet, optionally narrowed

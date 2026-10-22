@@ -464,13 +464,19 @@ async fn create_topic_persists_attributes_and_tags() {
     );
 }
 
-/// The `<Attributes>` map of a GetTopicAttributes response.
-fn attribute_map(answer: &Answer) -> std::collections::HashMap<String, String> {
+/// The `<Attributes>` entries of a GetTopicAttributes response, IN DOCUMENT ORDER:
+/// each `<entry>`'s key paired with its own value.
+pub(crate) fn attribute_entries(answer: &Answer) -> Vec<(String, String)> {
     answer
         .elements("key")
         .into_iter()
         .zip(answer.elements("value"))
         .collect()
+}
+
+/// The `<Attributes>` map of a GetTopicAttributes response.
+pub(crate) fn attribute_map(answer: &Answer) -> std::collections::HashMap<String, String> {
+    attribute_entries(answer).into_iter().collect()
 }
 
 /// Subscribe over every protocol the model documents: it persists a subscription under

@@ -23,9 +23,11 @@ const T0: f64 = 1_767_225_600.0;
 /// handler is what refuses it.
 const UNMINTED_REPORT_ID: &str = "report-0123456789abcdef0";
 
-/// One row of the Create table: the class spans both service types, an absent
-/// and a present `EndTime`, windows of different lengths, and zero, one and
-/// several tags.
+/// One row of the Create table: the class spans both service types, both forms
+/// of the immutable resource id a data source is addressed by (`db-` for an
+/// instance, `cluster-` for a cluster) at different token lengths, an absent and
+/// a present `EndTime`, windows of different lengths, and zero, one and several
+/// tags.
 struct CreateCase {
     service_type: &'static str,
     identifier: &'static str,
@@ -58,7 +60,7 @@ const CREATE_CASES: &[CreateCase] = &[
     },
     CreateCase {
         service_type: "DOCDB",
-        identifier: "d",
+        identifier: "cluster-ABCDEFGHIJKL",
         start_time: T0,
         end_time: Some(T0 + 1.0),
         tags: &[],
@@ -308,8 +310,9 @@ async fn status_is_running_until_the_clock_owes_succeeded() {
 }
 
 /// RULE: a report id is resolved within the resource it was created for; an id
-/// no resource holds is `InvalidArgumentException` (HTTP 400), never a hollow
-/// success.
+/// no resource holds is the uniform `NotAuthorizedException` (HTTP 400) — the
+/// same answer as a resource the caller may not see, so neither discloses the
+/// other — and never a hollow success.
 #[tokio::test]
 async fn get_and_delete_refuse_an_id_the_resource_does_not_hold() {
     let emulator = emulator();
@@ -418,8 +421,8 @@ async fn get_and_delete_refuse_an_id_the_resource_does_not_hold() {
             );
             assert_eq!(
                 answer.error_code(),
-                "InvalidArgumentException",
-                "case {label} / {operation}: expected InvalidArgumentException, got {:?}",
+                "NotAuthorizedException",
+                "case {label} / {operation}: expected NotAuthorizedException, got {:?}",
                 answer.body
             );
         }
@@ -829,8 +832,8 @@ async fn delete_removes_the_report_from_get_and_from_list() {
         .await;
         assert_eq!(
             get.error_code(),
-            "InvalidArgumentException",
-            "case get after delete #{index}: expected InvalidArgumentException, got {} {:?}",
+            "NotAuthorizedException",
+            "case get after delete #{index}: expected NotAuthorizedException, got {} {:?}",
             get.status,
             get.body
         );

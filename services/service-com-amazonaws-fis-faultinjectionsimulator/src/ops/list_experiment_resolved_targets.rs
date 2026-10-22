@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExperimentResolvedTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExperimentResolvedTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one page of the targets the named experiment RESOLVED when it was started.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExperimentResolvedTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The resolution itself is a snapshot held on the experiment record
+//! (`crate::state::ExperimentRecord::resolved_targets`, computed by
+//! `crate::state::resolve_targets`), so this operation only reads, filters and paginates
+//! it: two reads at any instant report the same page.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +143,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExperimentResolvedTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExperimentResolvedTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExperimentResolvedTargets"))
+        // A resolved target carries the ARN its target named and no ARN this service
+        // mints, so nothing here reads the request's credential scope.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The token is the position in the experiment's resolution the next page resumes
+        // at, behind this operation's marker, so anything without that marker — or
+        // carrying a value that is no position — was never issued by this operation.
+        let resume_at = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::resolved_target_page_token_index(token) {
+                Some(index) => index,
+                None => {
+                    return Err(
+                        ListExperimentResolvedTargetsErrorModeled::ValidationException(
+                            crate::state::invalid_input(
+                                "nextToken is not a token returned by \
+                                 ListExperimentResolvedTargets",
+                            ),
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        let page_size = crate::state::page_size(input.max_results);
+        // A pure read: the resolution was computed when the experiment was started, so
+        // this call settles, mints and moves nothing.
+        let store = state.lock();
+
+        // The resolved targets belong to an experiment: with no such experiment there is
+        // nothing to enumerate.
+        let Some(experiment) = store.experiments.get(&input.experiment_id) else {
+            return Err(
+                ListExperimentResolvedTargetsErrorModeled::ResourceNotFoundException(
+                    crate::state::experiment_not_found(&input.experiment_id),
+                )
+                .into(),
+            );
+        };
+
+        let mut resolved_targets =
+            Vec::with_capacity(page_size.min(experiment.resolved_targets.len()));
+        let mut next_token = None;
+        for (index, resolved) in experiment.resolved_targets.iter().enumerate() {
+            // Resume at the position the token names, which indexes the experiment's
+            // WHOLE resolution — so a token means the same thing whatever `targetName`
+            // the resumed request filters by.
+            if index < resume_at {
+                continue;
+            }
+            // The filter is applied BEFORE the page is cut, so a page holds `maxResults`
+            // matching targets and the token only names one the filter admits.
+            if input
+                .target_name
+                .as_deref()
+                .is_some_and(|wanted| resolved.target_name.as_deref() != Some(wanted))
+            {
+                continue;
+            }
+            if resolved_targets.len() >= page_size {
+                next_token = Some(crate::state::resolved_target_page_token(index));
+                break;
+            }
+            resolved_targets.push(resolved.clone());
+        }
+
+        Ok(ListExperimentResolvedTargetsOutput {
+            resolved_targets: Some(resolved_targets),
+            next_token,
+        })
     }
 }

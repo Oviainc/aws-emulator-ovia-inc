@@ -271,15 +271,24 @@ use super::types::*;
 // `HeadObjectError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `HeadObjectError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#HeadObject")]
+// The operation's MODELED errors, widened with `extra_errors` by the two 404 shapes
+// this SERVICE models for an address that does not exist. `HeadObject`'s own error,
+// `NotFound`, carries NO `@httpError` trait
+// (`smithy_query(query="shape", shape="NotFound")`: `httpErrorDefaulted: true`), so
+// rendering it would answer HTTP 400 for an object that merely does not exist, while
+// S3 answers 404 to a HEAD of an absent object. `NoSuchBucket` and `NoSuchKey` are
+// modelled `@httpError(404)` and name exactly which part of the address is missing,
+// so they are what this handler refuses with; the status is what a client branches on
+// here, since a HEAD response carries no error document.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#HeadObject",
+    extra_errors = ["NoSuchBucket", "NoSuchKey"]
+)]
 #[derive(Debug)]
 pub enum HeadObjectErrorModeled {
     NotFound(NotFound),
+    NoSuchBucket(NoSuchBucket),
+    NoSuchKey(NoSuchKey),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it

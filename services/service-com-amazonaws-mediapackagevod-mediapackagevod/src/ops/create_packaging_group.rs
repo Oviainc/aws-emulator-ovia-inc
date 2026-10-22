@@ -166,19 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         if input.id.is_empty() {
-            return Err(CreatePackagingGroupErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some("Id must not be empty.".to_string()),
-                },
+            return Err(crate::scaffolded::UnprocessableEntity::member(
+                "id",
+                "must not be empty",
             )
             .into());
         }
         if state.packaging_groups.contains_key(&input.id) {
             return Err(CreatePackagingGroupErrorModeled::UnprocessableEntityException(
                 UnprocessableEntityException {
-                    message: Some(format!(
-                        "A PackagingGroup with Id {} already exists.",
-                        input.id
+                    message: Some(crate::scaffolded::already_exists_message(
+                        "PackagingGroup",
+                        &input.id,
                     )),
                 },
             )

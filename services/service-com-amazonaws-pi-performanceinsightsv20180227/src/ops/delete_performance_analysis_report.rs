@@ -2,13 +2,14 @@
 
 //! @op DeletePerformanceAnalysisReport
 //! IMPLEMENTED: removes the stored report (and the tags filed under its ARN), so a
-//! later Get fails and a later List no longer includes it. An unknown id is
-//! `InvalidArgumentException` (HTTP 400).
+//! later Get fails and a later List no longer includes it.
 //!
-//! Authorization is NOT emulated: the emulator holds no IAM principals or
-//! policies, so the modelled `NotAuthorizedException` is never the answer and a
-//! well-formed delete of a stored report is performed. That is a deliberate,
-//! documented divergence, not a permission decision.
+//! A request that addresses no data source this account may see, or an
+//! `AnalysisReportId` the addressed data source does not hold, is refused with
+//! the modelled `NotAuthorizedException` (HTTP 400) carrying this service's
+//! uniform message, which discloses nothing about whether the report exists
+//! (see [`crate::state::is_data_source_identifier`] and
+//! [`crate::state::NOT_AUTHORIZED_MESSAGE`]).
 //!
 //! ## Shape of an operation
 //!
@@ -158,25 +159,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
+        // Gated before the store is reached: a delete against a data source
+        // this account may not see removes nothing.
+        if !crate::state::is_data_source_identifier(&input.identifier) {
+            return Err(not_authorized());
+        }
+
         let removed = state.lock().remove_report(
             &input.service_type,
             &input.identifier,
             &input.analysis_report_id,
         );
         if !removed {
-            return Err(
-                DeletePerformanceAnalysisReportErrorModeled::InvalidArgumentException(
-                    InvalidArgumentException {
-                        message: Some(format!(
-                            "AnalysisReportId {} was not found for the resource {}.",
-                            input.analysis_report_id, input.identifier
-                        )),
-                    },
-                )
-                .into(),
-            );
+            // The same uniform refusal as an unauthorized data source: the id is
+            // a well-formed `AnalysisReportId`, so an id this data source does
+            // not hold is an authorization outcome, and the message must not say
+            // that a report of that id was "not found for" a named resource.
+            return Err(not_authorized());
         }
 
         Ok(DeletePerformanceAnalysisReportOutput {})
     }
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal this service answers
+/// for a data source the caller may not see and for a report the addressed data
+/// source does not hold — one error for both, so neither discloses the other.
+fn not_authorized() -> DeletePerformanceAnalysisReportError {
+    DeletePerformanceAnalysisReportErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
 }

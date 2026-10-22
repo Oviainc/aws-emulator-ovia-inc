@@ -220,10 +220,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it blanks a composite model's own properties as well as the top-level list:
         // a caller that asked not to be sent property definitions must not receive
         // them by the composite-model route.
-        let composite_models = (!record.composite_models.is_empty()).then(|| {
-            record
-                .composite_models
+        //
+        // Both views report the composite models this asset model holds DIRECTLY —
+        // the ones nested inside no other composite model. That is what the
+        // summaries member documents: "The list of the immediate child custom
+        // composite model summaries for the asset model"
+        // (`smithy_query(query="doc", shape="DescribeAssetModelResponse",
+        // member="assetModelCompositeModelSummaries")`). `assetModelCompositeModels`
+        // is documented only as "The list of composite asset models for the asset
+        // model", so holding it to the same depth is this emulator's CHOICE: the
+        // two views of one stored list then agree, and a nested composite model is
+        // reported by the composite model it sits in, through
+        // `DescribeAssetModelCompositeModel`, which is the only operation whose
+        // output carries the nesting.
+        let top_level = record.top_level_composite_model_ids();
+        let composite_models = (!top_level.is_empty()).then(|| {
+            top_level
                 .iter()
+                .filter_map(|id| record.composite_model(id))
                 .map(|composite| AssetModelCompositeModel {
                     properties: if input.exclude_properties {
                         None
@@ -235,24 +249,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         });
         // The summaries are the SAME stored composite models, viewed by id/name/type
-        // and their path from the model root (one segment: the composite model itself,
-        // since a top-level composite model has no parent). Derived here rather than
-        // withheld, so the two views of one stored list cannot disagree.
-        let composite_model_summaries = (!record.composite_models.is_empty()).then(|| {
-            record
-                .composite_models
+        // and their path from the model root. Derived through the shared helper
+        // rather than withheld, so the two views of one stored list cannot disagree.
+        let composite_model_summaries = (!top_level.is_empty()).then(|| {
+            top_level
                 .iter()
-                .map(|composite| AssetModelCompositeModelSummary {
-                    id: composite.id.clone().unwrap_or_default(),
-                    external_id: composite.external_id.clone(),
-                    name: composite.name.clone(),
-                    r#type: composite.r#type.clone(),
-                    description: composite.description.clone(),
-                    path: Some(vec![AssetModelCompositeModelPathSegment {
-                        id: composite.id.clone(),
-                        name: Some(composite.name.clone()),
-                    }]),
-                })
+                .filter_map(|id| record.composite_model_summary(id))
                 .collect()
         });
 
@@ -277,7 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             asset_model_status: record.status(now),
             asset_model_version: Some(record.version.to_string()),
             interface_details: None,
-            e_tag: None,
+            // The entity tag of the definition just reported, computed from it:
+            // this is the tag the `If-Match` precondition on an asset-model write
+            // compares against, so a caller can read it here and write it back.
+            e_tag: Some(crate::state::asset_model_etag(record)),
         })
     }
 }

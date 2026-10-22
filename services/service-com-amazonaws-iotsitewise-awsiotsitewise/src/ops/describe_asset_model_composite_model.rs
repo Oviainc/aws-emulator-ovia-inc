@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAssetModelCompositeModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAssetModelCompositeModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAssetModelCompositeModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one composite model of an asset model, from the asset model's stored
+//! record — a read, so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -187,20 +181,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAssetModelCompositeModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAssetModelCompositeModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAssetModelCompositeModel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAssetModelCompositeModelError::Modeled(
+                DescribeAssetModelCompositeModelErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let store = state.lock();
+        // Both id members are `CustomID` labels: a raw UUID or `externalId:<id>`.
+        let asset_model_id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+        let record = store
+            .asset_models
+            .get(&asset_model_id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+
+        // `assetModelVersion` selects the LATEST (the default) or the ACTIVE
+        // version. This emulator keeps ONE version of an asset model, so ACTIVE
+        // resolves to it once the transition the clock owes has fallen due, and to
+        // nothing while the model is still CREATING or UPDATING.
+        let version = input.asset_model_version.as_deref().unwrap_or("LATEST");
+        if version == "ACTIVE" && record.state(now) != crate::state::STATE_ACTIVE {
+            return Err(DescribeAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "The asset model {asset_model_id} has no ACTIVE version yet; it is {}.",
+                        record.state(now)
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let composite_model_id = record
+            .resolve_composite_model_id(&input.asset_model_composite_model_id)
+            .ok_or_else(|| composite_not_found(&input.asset_model_composite_model_id))?;
+        let composite = record
+            .composite_model(&composite_model_id)
+            .ok_or_else(|| composite_not_found(&input.asset_model_composite_model_id))?;
+
+        // A component-model-based composite model has no properties of its own:
+        // the component model it reuses provides them, so they are read from that
+        // model's stored record rather than copied at create time.
+        let composed = record.composed_asset_model_id(&composite_model_id);
+        let properties = match composed {
+            Some(composed) => store
+                .asset_models
+                .get(composed)
+                .map(|component| component.properties.clone())
+                .unwrap_or_default(),
+            None => composite.properties.clone().unwrap_or_default(),
+        };
+        // The composition relationship this composite model was created with, which
+        // only a component-model-based one has.
+        let composition_details = composed.map(|composed| CompositionDetails {
+            composition_relationship: Some(vec![CompositionRelationshipItem {
+                id: Some(composed.to_string()),
+            }]),
+        });
+
+        Ok(DescribeAssetModelCompositeModelOutput {
+            asset_model_id: asset_model_id.clone(),
+            asset_model_composite_model_id: composite_model_id.clone(),
+            asset_model_composite_model_external_id: composite.external_id.clone(),
+            asset_model_composite_model_path: record.composite_model_path(&composite_model_id),
+            asset_model_composite_model_name: composite.name.clone(),
+            asset_model_composite_model_description: composite
+                .description
+                .clone()
+                .unwrap_or_default(),
+            asset_model_composite_model_type: composite.r#type.clone(),
+            asset_model_composite_model_properties: properties,
+            composition_details,
+            // The summaries are the composite models nested DIRECTLY inside this
+            // one — `DescribeAssetModel`'s own summaries member is documented as
+            // "the list of the immediate child custom composite model summaries",
+            // and this is that member at the next level down. Derived through the
+            // shared helper so the two views of one stored composite model cannot
+            // disagree.
+            asset_model_composite_model_summaries: record
+                .composite_model_children(&composite_model_id)
+                .iter()
+                .filter_map(|child| record.composite_model_summary(child))
+                .collect(),
+            // No action is stored against a composite model, so none is reported:
+            // `ExecuteAction` and `ListActions` are not implemented yet.
+            action_definitions: None,
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the asset model label that
+/// resolved to nothing.
+fn model_not_found(label: &str) -> DescribeAssetModelCompositeModelError {
+    DescribeAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: format!("The asset model {label} could not be found."),
+        },
+    )
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the composite model label that
+/// resolved to nothing on this asset model.
+fn composite_not_found(label: &str) -> DescribeAssetModelCompositeModelError {
+    DescribeAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: format!("The composite model {label} could not be found."),
+        },
+    )
+    .into()
 }

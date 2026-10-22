@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAsset
-//! IMPLEMENTED: ingests an Asset into an existing PackagingGroup. Refuses an unknown
-//! `PackagingGroupId` with `NotFoundException` (404), persists the asset, and answers
-//! with the record just stored plus the `EgressEndpoints` DERIVED from the packaging
-//! configurations attached to that group.
+//! IMPLEMENTED: ingests an Asset into an existing PackagingGroup. Refuses a
+//! `PackagingGroupId` that resolves to nothing as a request-parameter violation —
+//! `UnprocessableEntityException` (422) attributing it to that member — persists the
+//! asset, and answers with the record just stored plus the `EgressEndpoints` DERIVED
+//! from the packaging configurations attached to that group.
 //!
 //! ## Shape of an operation
 //!
@@ -169,29 +170,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         if input.id.is_empty() {
-            return Err(CreateAssetErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some("Id must not be empty.".to_string()),
-                },
+            return Err(crate::scaffolded::UnprocessableEntity::member(
+                "id",
+                "must not be empty",
             )
             .into());
         }
+        // An id in the request BODY that resolves to nothing is a violation of that
+        // PARAMETER, not a missing addressed resource: the request addresses
+        // `/assets`, which exists. So it is the 422 that names the member, not a 404.
         if !state
             .packaging_groups
             .contains_key(&input.packaging_group_id)
         {
-            return Err(CreateAssetErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "PackagingGroup with Id {} does not exist.",
-                    input.packaging_group_id
-                )),
-            })
+            return Err(crate::scaffolded::UnprocessableEntity::member(
+                "packagingGroupId",
+                "does not exist",
+            )
             .into());
         }
         if state.assets.contains_key(&input.id) {
             return Err(CreateAssetErrorModeled::UnprocessableEntityException(
                 UnprocessableEntityException {
-                    message: Some(format!("An Asset with Id {} already exists.", input.id)),
+                    message: Some(crate::scaffolded::already_exists_message(
+                        "Asset", &input.id,
+                    )),
                 },
             )
             .into());

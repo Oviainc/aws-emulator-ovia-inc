@@ -15,6 +15,8 @@
 mod asset_hierarchies;
 #[path = "all/asset_lifecycle.rs"]
 mod asset_lifecycle;
+#[path = "all/asset_model_composite_model.rs"]
+mod asset_model_composite_model;
 #[path = "all/asset_model_properties.rs"]
 mod asset_model_properties;
 #[path = "all/asset_property_update.rs"]

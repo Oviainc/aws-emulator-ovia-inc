@@ -790,9 +790,10 @@ async fn creates_are_refused_at_each_capacity_bound() {
     }
 }
 
-/// Every operation that names a resource answers `NotFoundException` (404) for an id
-/// nothing is stored under, and a create that reuses a stored id is refused as
-/// unprocessable (422) rather than overwriting it.
+/// Every operation that ADDRESSES a resource by id answers `NotFoundException` (404)
+/// for an id nothing is stored under, while a create that reuses a stored id — or
+/// names a `packagingGroupId` in its body that resolves to nothing — is refused as
+/// unprocessable (422) rather than overwriting or inventing anything.
 #[tokio::test]
 async fn missing_and_duplicate_resources_are_refused_with_the_modelled_errors() {
     let router = router();
@@ -816,35 +817,37 @@ async fn missing_and_duplicate_resources_are_refused_with_the_modelled_errors() 
             "/packaging_groups/nope".into(),
             None,
         ),
-        (
-            "CreateAsset, unknown group",
-            "POST",
-            "/assets".into(),
-            Some(json!({
-                "id": "orphan",
-                "packagingGroupId": "nope",
-                "sourceArn": "arn:aws:s3:::test-bucket/orphan.smil",
-                "sourceRoleArn": "arn:aws:iam::000000000000:role/MediaPackageVod",
-            })),
-        ),
-        (
-            "CreatePackagingConfiguration, unknown group",
-            "POST",
-            "/packaging_configurations".into(),
-            Some(json!({
-                "id": "orphan-cfg",
-                "packagingGroupId": "nope",
-                "hlsPackage": { "hlsManifests": [{}] },
-            })),
-        ),
     ];
     for (case, method, path, body) in not_found {
         let (status, response) = call(&router, method, &path, body).await;
         assert_eq!(status, 404, "case {case:?}: got {status}, body {response}");
     }
 
-    // (case, path, body) that must be refused as unprocessable.
+    // (case, path, body) that must be refused as unprocessable. A `packagingGroupId`
+    // that resolves to nothing belongs here rather than with the 404s: it arrives in
+    // the request BODY, so it is a violation of that PARAMETER, while the 404 above
+    // belongs to the resource a request ADDRESSES. `tests/all/error_responses.rs`
+    // pins the body each refusal carries.
     let unprocessable: Vec<(&str, &str, Value)> = vec![
+        (
+            "CreateAsset, unknown group",
+            "/assets",
+            json!({
+                "id": "orphan",
+                "packagingGroupId": "nope",
+                "sourceArn": "arn:aws:s3:::test-bucket/orphan.smil",
+                "sourceRoleArn": "arn:aws:iam::000000000000:role/MediaPackageVod",
+            }),
+        ),
+        (
+            "CreatePackagingConfiguration, unknown group",
+            "/packaging_configurations",
+            json!({
+                "id": "orphan-cfg",
+                "packagingGroupId": "nope",
+                "hlsPackage": { "hlsManifests": [{}] },
+            }),
+        ),
         (
             "CreatePackagingGroup, id already stored",
             "/packaging_groups",

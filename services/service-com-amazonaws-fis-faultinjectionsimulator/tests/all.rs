@@ -19,6 +19,8 @@ mod delete_target_account_configuration;
 mod experiment_lifecycle;
 #[path = "all/experiment_target_account_configurations.rs"]
 mod experiment_target_account_configurations;
+#[path = "all/list_experiment_resolved_targets.rs"]
+mod list_experiment_resolved_targets;
 #[path = "all/list_experiment_target_account_configurations.rs"]
 mod list_experiment_target_account_configurations;
 #[path = "all/list_target_account_configurations.rs"]
