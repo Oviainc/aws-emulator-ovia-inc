@@ -486,10 +486,25 @@ impl Repository {
         self.last_modified_date = renamed;
     }
 
-    /// The commit a `commitSpecifier` names: a branch name, or the id of a commit
-    /// this repository holds. `None` when it names neither.
+    /// The commit a `commitSpecifier` names. `CommitName` documents the forms as
+    /// "the branch, tag, HEAD, or other fully qualified reference used to identify
+    /// a commit", so a branch name, the fully qualified reference of a branch
+    /// (`refs/heads/<branch>`), `HEAD` (the repository's default branch) and the id
+    /// of a commit this repository holds all resolve here. `None` when the
+    /// specifier names none of them. This repository holds no tags, so a tag
+    /// reference resolves to nothing until tags are stored.
     pub fn resolve_commit(&self, specifier: &str) -> Option<&Commit> {
+        // A branch of that literal name comes first, so the reference forms below
+        // only resolve what the bare name could not — a repository that really
+        // holds a branch called `HEAD` is still addressable by name.
         if let Some(branch) = self.branches.get(specifier) {
+            return self.commits.get(&branch.commit_id);
+        }
+        let referenced = match specifier {
+            "HEAD" => self.default_branch.as_deref(),
+            other => other.strip_prefix("refs/heads/"),
+        };
+        if let Some(branch) = referenced.and_then(|name| self.branches.get(name)) {
             return self.commits.get(&branch.commit_id);
         }
         self.commits.get(specifier)
@@ -785,8 +800,11 @@ pub fn blob_id(content: &[u8]) -> String {
     git_object_id("blob", content)
 }
 
-/// The git mode of a modeled `fileMode`.
-fn git_mode(file_mode: &str) -> &'static str {
+/// The git mode of a modeled `fileMode`: the numeric file mode permission code a
+/// git tree entry carries, which is what `BlobMetadata.mode` reports (`100644`
+/// read/write, `100755` read/write/execute, `120000` a symlink — see
+/// `smithy_query(query="doc",shape="BlobMetadata",member="mode")`).
+pub fn git_mode(file_mode: &str) -> &'static str {
     match file_mode {
         FILE_MODE_EXECUTABLE => "100755",
         FILE_MODE_SYMLINK => "120000",
