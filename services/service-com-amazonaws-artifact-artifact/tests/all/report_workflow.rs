@@ -25,7 +25,6 @@ use serde_json::Value;
 use service_com_amazonaws_artifact_artifact::state::TERM_GRANT_CAPACITY;
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
-
 /// The bounds `MaxResultsAttribute` declares (`@range(min: 1, max: 300)`), spelled out
 /// here rather than imported from the crate so a wrong bound in `src/state.rs` fails.
 const MAX_RESULTS_FLOOR: i32 = 1;
@@ -259,6 +258,22 @@ async fn walk_reports(router: &MultiServiceRouter, page_size: i32) -> Vec<Value>
     panic!("case maxResults={page_size}: pagination did not terminate over {} reports", CATALOG.len());
 }
 
+/// The instant a `TimestampAttribute` member names, in seconds since the Unix epoch.
+///
+/// The member is `@timestampFormat("date-time")`, so the wire form is an RFC 3339 STRING:
+/// anything else (a JSON number of epoch seconds, say) fails the case here rather than
+/// being quietly compared.
+fn instant(case: &str, member: &str, value: &Value) -> i64 {
+    let text = value.as_str().unwrap_or_else(|| {
+        panic!("case {case:?}: {member} must be an RFC 3339 date-time string, got {value:?}")
+    });
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: {member} must parse as a date-time ({error}), got {text:?}")
+        })
+        .secs()
+}
+
 #[tokio::test]
 async fn list_reports_serves_the_persisted_catalog_identically_on_every_call() {
     let router = emulator();
@@ -368,10 +383,12 @@ async fn list_reports_serves_the_persisted_catalog_identically_on_every_call() {
             );
         }
         // The reporting period is the stored window, and it is a window: start strictly
-        // before end.
+        // before end. Both members target `TimestampAttribute`
+        // (`@timestampFormat("date-time")`), so they arrive as RFC 3339 STRINGS and are
+        // compared as the instants they name.
         let (start, end) = (
-            actual["periodStart"].as_i64().unwrap_or_default(),
-            actual["periodEnd"].as_i64().unwrap_or_default(),
+            instant(case, "periodStart", &actual["periodStart"]),
+            instant(case, "periodEnd", &actual["periodEnd"]),
         );
         assert!(
             start > 0 && start < end,
