@@ -11,8 +11,9 @@
 //! A created instance is a complete contact center, so this handler also provisions the
 //! resources an instance is born with — the default contact flows, the default
 //! `STANDARD` queue and the hours of operation that queue is attached to — through
-//! [`crate::state::seed_instance_defaults`], which is why `ListContactFlows` and
-//! `ListQueues` answer non-empty for an instance nobody has created anything in.
+//! [`crate::state::seed_instance_defaults`], which is why `ListContactFlows`,
+//! `ListQueues` and `ListHoursOfOperations` answer non-empty for an instance nobody has
+//! created anything in.
 //!
 //! The model marks only `IdentityManagementType` and the two call flags required, and
 //! states no conditional rule tying `InstanceAlias` or `DirectoryId` to a chosen

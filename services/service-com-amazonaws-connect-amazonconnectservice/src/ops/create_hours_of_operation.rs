@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHoursOfOperation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHoursOfOperation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHoursOfOperation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an hours of operation inside its instance from the request's members and
+//! stores it, so every later `DescribeHoursOfOperation` / `ListHoursOfOperations`
+//! answers from the store. An unknown instance — or a parent id the instance does not
+//! hold — is a 404, a name the instance already uses is a 409, and a create past the
+//! emulator's own per-instance bound is a 429.
 //!
+//! ## Shape of an operation
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -168,18 +166,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHoursOfOperation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHoursOfOperationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHoursOfOperation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateHoursOfOperationErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Amazon Connect store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Minted before the instance is borrowed, so the borrow below is the only one.
+        // Identifiers need not be contiguous: a refused create simply leaves its id
+        // unused.
+        let id = store.mint_resource_id();
+        let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
+            CreateHoursOfOperationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Instance not found: {}", input.instance_id)),
+                },
+            )
+        })?;
+
+        // An hours-of-operation name is unique within its instance.
+        if instance.hours_of_operation_id_named(&input.name).is_some() {
+            return Err(CreateHoursOfOperationErrorModeled::DuplicateResourceException(
+                DuplicateResourceException {
+                    message: Some(format!(
+                        "An hours of operation with the name {} already exists",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: an hours of operation is kept for the life of the
+        // process, so a create that would grow this instance's map past the quota is
+        // refused.
+        if instance.hours_of_operations.len() >= crate::state::HOURS_OF_OPERATIONS_PER_INSTANCE_QUOTA
+        {
+            return Err(CreateHoursOfOperationErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of hours of operation ({}) for this instance \
+                         has been reached; delete one before creating another",
+                        crate::state::HOURS_OF_OPERATIONS_PER_INSTANCE_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A parent reference names another hours of operation of the same instance, so
+        // one the instance does not hold is as absent as an unknown instance.
+        // `ParentHoursOfOperationConfig` models its `HoursOfOperationId` as optional, so
+        // an entry that carries none names no parent at all: a parameter this operation
+        // cannot act on, which is what `InvalidParameterException` reports.
+        let mut parent_ids: Vec<String> = Vec::new();
+        for config in input.parent_hours_of_operation_configs.unwrap_or_default() {
+            match config.hours_of_operation_id {
+                Some(parent_id) => parent_ids.push(parent_id),
+                None => {
+                    return Err(CreateHoursOfOperationErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "Each ParentHoursOfOperationConfigs entry must name a \
+                                 HoursOfOperationId"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+        for parent_id in &parent_ids {
+            if !instance.hours_of_operations.contains_key(parent_id) {
+                return Err(CreateHoursOfOperationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Hours of operation not found: {parent_id} in instance {}",
+                            instance.id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The ARN is built from the instance that holds it; see
+        // `crate::state::hours_of_operation_arn`.
+        let arn = crate::state::hours_of_operation_arn(&instance.arn, &id);
+        let record = crate::state::HoursOfOperationRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            description: input.description,
+            time_zone: input.time_zone,
+            config: input.config,
+            parent_ids,
+            tags: crate::state::tags_in(input.tags),
+            last_modified_time: now,
+            last_modified_region: region,
+        };
+        instance.hours_of_operations.insert(id.clone(), record);
+
+        Ok(CreateHoursOfOperationOutput {
+            hours_of_operation_id: Some(id),
+            hours_of_operation_arn: Some(arn),
+        })
     }
 }
