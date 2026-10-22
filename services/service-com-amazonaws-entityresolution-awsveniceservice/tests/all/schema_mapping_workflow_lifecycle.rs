@@ -177,7 +177,7 @@ fn list_member<'a>(record: &'a Value, member: &str) -> &'a Vec<Value> {
 }
 
 /// A timestamp member, as epoch seconds.
-fn timestamp_member(record: &Value, member: &str) -> f64 {
+pub(crate) fn timestamp_member(record: &Value, member: &str) -> f64 {
     record
         .get(member)
         .and_then(Value::as_f64)
@@ -185,10 +185,16 @@ fn timestamp_member(record: &Value, member: &str) -> f64 {
 }
 
 /// The ARN Entity Resolution generates for `kind`/`name`, per the modelled
-/// `SchemaMappingArn` / `MatchingWorkflowArn` patterns
-/// (`arn:aws:entityresolution:<region>:<account>:(schemamapping|matchingworkflow)/<name>`).
-fn expected_arn(kind: &str, name: &str) -> String {
+/// `SchemaMappingArn` / `MatchingWorkflowArn` / `IdMappingWorkflowArn` patterns
+/// (`arn:aws:entityresolution:<region>:<account>:(schemamapping|matchingworkflow|idmappingworkflow)/<name>`).
+pub(crate) fn expected_arn(kind: &str, name: &str) -> String {
     format!("arn:aws:entityresolution:{REGION}:{ACCOUNT_ID}:{kind}/{name}")
+}
+
+/// The account id every emulated ARN carries, exposed so a sibling suite can build the
+/// ARNs of OTHER services (a Glue table, a KMS key) without a second constant.
+pub(crate) fn account_id() -> &'static str {
+    ACCOUNT_ID
 }
 
 /// One `CreateSchemaMapping` request plus what the rule says must come back from it

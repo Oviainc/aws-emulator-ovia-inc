@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIdMappingWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIdMappingWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIdMappingWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `workflowArn` for a new ID mapping workflow and PERSISTS the record, with
+//! its `createdAt`/`updatedAt` stamps, in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::id_mapping_workflows`];
+//! every config member of the response is read back out of the stored record, so
+//! `GetIdMappingWorkflow` cannot disagree with it. "Each IdMappingWorkflow must have a
+//! unique workflow name", so re-creating an existing `workflowName` is refused with
+//! the modelled `ConflictException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +188,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIdMappingWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIdMappingWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIdMappingWorkflow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateIdMappingWorkflowErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the Entity Resolution emulator has no state store attached".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // One instant for both stamps: a workflow that has only just been created has
+        // not been updated since, so `createdAt` and `updatedAt` are equal.
+        let created = crate::state::now();
+
+        let mut store = state.lock();
+
+        // The name is the primary key, so the conflict is decided BEFORE anything is
+        // minted or stored: a refused create leaves the store exactly as it was. The
+        // namespace is this resource's own — an ID mapping workflow and a matching
+        // workflow of the same name are different resources with different ARNs.
+        if store.id_mapping_workflows.contains_key(&input.workflow_name) {
+            return Err(CreateIdMappingWorkflowErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        crate::state::messages::CREATE_ID_MAPPING_WORKFLOW_CONFLICT.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The quota is enforced BEFORE anything is minted or stored, so the store can
+        // never grow past a fixed bound however many creates a caller issues, and a
+        // refused create leaves it exactly as it was. `DeleteIdMappingWorkflow`
+        // releases an entry, so the bound is self-healing.
+        if store.id_mapping_workflows.len() >= crate::state::MAX_ID_MAPPING_WORKFLOWS {
+            return Err(CreateIdMappingWorkflowErrorModeled::ExceedsLimitException(
+                ExceedsLimitException {
+                    message: Some(format!(
+                        "The number of ID mapping workflows has reached the quota of {} for this \
+                         account and Region",
+                        crate::state::MAX_ID_MAPPING_WORKFLOWS
+                    )),
+                    quota_name: Some(crate::state::ID_MAPPING_WORKFLOWS_QUOTA_NAME.to_string()),
+                    quota_value: crate::state::quota_value(
+                        crate::state::MAX_ID_MAPPING_WORKFLOWS,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let workflow_name = input.workflow_name;
+        let record = crate::state::IdMappingWorkflow {
+            workflow_arn: ::emulator_server::emulator_arn(
+                "entityresolution",
+                &region,
+                &format!("idmappingworkflow/{workflow_name}"),
+            ),
+            workflow_name: workflow_name.clone(),
+            description: input.description,
+            input_source_config: input.input_source_config,
+            output_source_config: input.output_source_config,
+            id_mapping_techniques: input.id_mapping_techniques,
+            incremental_run_config: input.incremental_run_config,
+            // `roleArn` is modelled with `default: ""`, so a request that carries none
+            // stores — and later serves — the empty string rather than a missing member.
+            role_arn: input.role_arn.unwrap_or_default(),
+            created_at: created,
+            updated_at: created,
+            tags: input.tags,
+        };
+        store
+            .id_mapping_workflows
+            .insert(workflow_name.clone(), record);
+
+        // Answered from the STORED record, not from the request object: a reader and
+        // this response therefore cannot disagree about what was created.
+        let stored = &store.id_mapping_workflows[&workflow_name];
+        Ok(CreateIdMappingWorkflowOutput {
+            workflow_name: stored.workflow_name.clone(),
+            workflow_arn: stored.workflow_arn.clone(),
+            description: stored.description.clone(),
+            input_source_config: stored.input_source_config.clone(),
+            output_source_config: stored.output_source_config.clone(),
+            id_mapping_techniques: stored.id_mapping_techniques.clone(),
+            incremental_run_config: stored.incremental_run_config.clone(),
+            role_arn: Some(stored.role_arn.clone()),
+        })
     }
 }

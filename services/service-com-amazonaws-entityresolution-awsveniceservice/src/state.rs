@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-entityresolution-awsveniceservice service.
 //!
-//! Two control-plane resources are persisted here, and every member of each record
+//! Three control-plane resources are persisted here, and every member of each record
 //! is the MODELLED type of the member it is returned on, so a reader clones what the
 //! writer stored and the two cannot drift: `CreateSchemaMapping` followed by
 //! `GetSchemaMapping` returns the created record field-for-field.
@@ -16,7 +16,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ops::types::{
-    IncrementalRunConfig, InputSource, OutputSource, ResolutionTechniques, SchemaInputAttribute,
+    IdMappingIncrementalRunConfig, IdMappingTechniques, IdMappingWorkflowInputSource,
+    IdMappingWorkflowOutputSource, IncrementalRunConfig, InputSource, OutputSource,
+    ResolutionTechniques, SchemaInputAttribute,
 };
 
 /// One schema mapping as this service persists it.
@@ -55,9 +57,34 @@ pub struct MatchingWorkflow {
     pub tags: Option<HashMap<String, String>>,
 }
 
+/// One ID mapping workflow as this service persists it.
+///
+/// `role_arn` is a plain `String` rather than an `Option<String>` because
+/// `IdMappingRoleArn` is modelled with `default: ""`
+/// (`smithy_query(query="operation",operation="CreateIdMappingWorkflow")`), so a
+/// request that carries no role is the empty string and not a distinct "absent"
+/// state. `output_source_config` and `incremental_run_config` have NO modelled
+/// default, so absent stays absent for them.
+#[derive(Debug, Clone)]
+pub struct IdMappingWorkflow {
+    /// The name the workflow is keyed by, as the caller supplied it.
+    pub workflow_name: String,
+    /// The ARN minted when the workflow was created.
+    pub workflow_arn: String,
+    pub description: Option<String>,
+    pub input_source_config: Vec<IdMappingWorkflowInputSource>,
+    pub output_source_config: Option<Vec<IdMappingWorkflowOutputSource>>,
+    pub id_mapping_techniques: IdMappingTechniques,
+    pub incremental_run_config: Option<IdMappingIncrementalRunConfig>,
+    pub role_arn: String,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub updated_at: ::aws_smithy_types::DateTime,
+    pub tags: Option<HashMap<String, String>>,
+}
+
 /// Per-service state for com-amazonaws-entityresolution-awsveniceservice. A handler reaches it through [`service_state`].
 ///
-/// Both maps are `BTreeMap`s, not `HashMap`s, because both list operations are
+/// Every map is a `BTreeMap`, not a `HashMap`, because the list operations are
 /// `@paginated` and a page boundary is only meaningful over a stable order: the
 /// `nextToken` a page returns is the key of the first record it did NOT return, so
 /// the next call resumes at that key.
@@ -67,6 +94,13 @@ pub struct ComAmazonawsEntityresolutionAwsveniceserviceState {
     pub schema_mappings: BTreeMap<String, SchemaMapping>,
     /// Every matching workflow that exists, keyed by `workflowName`.
     pub matching_workflows: BTreeMap<String, MatchingWorkflow>,
+    /// Every ID mapping workflow that exists, keyed by `workflowName`.
+    ///
+    /// A SEPARATE namespace from [`Self::matching_workflows`]: the two resources have
+    /// their own ARN types (`matchingworkflow/…` vs `idmappingworkflow/…`), their own
+    /// create/get/list/delete operations and their own URI prefixes, so the same name
+    /// can name one of each.
+    pub id_mapping_workflows: BTreeMap<String, IdMappingWorkflow>,
 }
 
 /// The text this service puts in a response `message` member.
@@ -114,6 +148,20 @@ pub mod messages {
     /// [`CREATE_SCHEMA_MAPPING_CONFLICT`] and spelled with the resource type
     /// `ConflictException`'s doc names ("Workflow already exists").
     pub const CREATE_MATCHING_WORKFLOW_CONFLICT: &str = "MatchingWorkflow already exists.";
+
+    /// `CreateIdMappingWorkflow`'s `ConflictException$message` (HTTP 400) when the
+    /// `workflowName` is already taken — the refusal its own doc describes ("Each
+    /// IdMappingWorkflow must have a unique workflow name"). Not itself recorded; it is
+    /// this operation's own constant, in the same form as the recorded
+    /// [`CREATE_SCHEMA_MAPPING_CONFLICT`] and spelled with the resource type the API
+    /// uses for it (`IdMappingWorkflow`).
+    pub const CREATE_ID_MAPPING_WORKFLOW_CONFLICT: &str = "IdMappingWorkflow already exists.";
+
+    /// `GetIdMappingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404). Not
+    /// itself recorded; this reader follows the same constant, no-name form as the
+    /// recorded [`GET_SCHEMA_MAPPING_NOT_FOUND`], spelled with the resource type the
+    /// API uses for it.
+    pub const GET_ID_MAPPING_WORKFLOW_NOT_FOUND: &str = "IdMappingWorkflow Not Found";
 
     /// `DeleteSchemaMapping`'s `ConflictException$message` (HTTP 400) when a matching
     /// workflow still names the schema in its `inputSourceConfig` — the refusal this
@@ -171,9 +219,22 @@ pub const MAX_MATCHING_WORKFLOWS: usize = 100;
 /// `ExceedsLimitException$quotaName`.
 pub const MATCHING_WORKFLOWS_QUOTA_NAME: &str = "Matching workflows";
 
+/// How many ID mapping workflows this emulator lets exist at once, past which
+/// `CreateIdMappingWorkflow` answers the modelled `ExceedsLimitException` (HTTP 402).
+///
+/// AWS Entity Resolution publishes an adjustable per-account, per-Region quota named
+/// "ID mapping workflows"; this is the default this emulator enforces for it. As with
+/// the matching-workflow bound, `DeleteIdMappingWorkflow` releases an entry, so the
+/// bound needs no TTL or eviction.
+pub const MAX_ID_MAPPING_WORKFLOWS: usize = 100;
+
+/// The name of the quota [`MAX_ID_MAPPING_WORKFLOWS`] enforces, reported on
+/// `ExceedsLimitException$quotaName`.
+pub const ID_MAPPING_WORKFLOWS_QUOTA_NAME: &str = "ID mapping workflows";
+
 /// A quota value as `ExceedsLimitException$quotaValue` models it (an `Integer`).
 ///
-/// Both maxima are small constants, so the conversion cannot fail; it is written
+/// Every maximum is a small constant, so the conversion cannot fail; it is written
 /// without a panic so a handler stays total.
 pub fn quota_value(maximum: usize) -> Option<i32> {
     i32::try_from(maximum).ok()
