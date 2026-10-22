@@ -167,7 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
-        let budgets = crate::state::budgets_for_account(&store, &input.account_id);
+        let budgets = crate::state::budgets_for_account(
+            &store,
+            &input.account_id,
+            ::std::time::SystemTime::now(),
+        );
         let (page, next_token) = crate::state::page(
             &budgets,
             input.max_results,

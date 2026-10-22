@@ -194,9 +194,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut budget = input.new_budget;
-        budget.last_updated_time = Some(::aws_smithy_types::DateTime::from(
+        // The same service-owned members the create path stamps. The `HealthStatus` the
+        // budget already carried is kept: the operational state of the billing view it
+        // derives from did not change because the caller edited the budget.
+        crate::state::stamp_service_owned(
+            &mut budget,
             ::std::time::SystemTime::now(),
-        ));
+            stored.budget.health_status.clone(),
+        );
         stored.budget = budget;
 
         Ok(UpdateBudgetOutput {})
