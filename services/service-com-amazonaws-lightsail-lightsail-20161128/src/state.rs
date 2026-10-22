@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AccessKey, AccessKeyLastUsed, AccessRules, AccountLevelBpaSync, AddOn, AddOnRequest,
-    AvailabilityZone, Blueprint, Bucket,
-    BucketAccessLogConfig, BucketBundle, BucketCorsConfig, BucketCorsRule, BucketState, Container,
+    AvailabilityZone, Blueprint, Bucket, BucketAccessLogConfig, BucketBundle, BucketCorsConfig,
+    BucketCorsRule, BucketState, Bundle, Container,
     ContainerImage,
     ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
@@ -363,28 +363,125 @@ pub const MAX_OPERATION_HISTORY: usize = 2_000;
 pub const INSTANCE_PAGE_SIZE: usize = 10;
 
 // ---------------------------------------------------------------------------
+// Catalog paging
+// ---------------------------------------------------------------------------
+
+/// One page of `reported`: at most `page_size` entries from the one `page_token`
+/// names onward, and the id of the first entry of the page after it — present
+/// only while entries remain.
+///
+/// A page token NAMES an entry (through `id_of`) rather than carrying an index,
+/// so a catalog that gained or lost an entry between two pages cannot make the
+/// walk skip or repeat another one. `None` is the answer when the token names no
+/// entry of `reported`: there is no page to report, which the caller turns into a
+/// refusal. An absent token asks for the first page.
+///
+/// Shared by every published catalog this service pages (blueprints, instance
+/// bundles), so each one walks its catalog exactly the same way.
+///
+/// TOTAL on every input, including an arbitrary caller-supplied token: the token
+/// is only ever COMPARED against each entry's id, the start comes from
+/// `position`, so it is an index this slice holds, the page is taken by
+/// `skip`/`take` rather than by a slice range, and the next page's first index is
+/// a `saturating_add` — so there is no indexing, no slicing, no unwrap and no
+/// arithmetic that can overflow or panic, and a token naming no entry answers
+/// `None`.
+fn catalog_page<T: Clone>(
+    reported: &[T],
+    page_size: usize,
+    page_token: Option<&str>,
+    id_of: impl Fn(&T) -> Option<&str>,
+) -> Option<(Vec<T>, Option<String>)> {
+    // A page carries at least one entry, so a walk over a non-empty catalog
+    // always advances.
+    let page_size = page_size.max(1);
+    let start = match page_token {
+        None => 0,
+        Some(token) => reported.iter().position(|entry| id_of(entry) == Some(token))?,
+    };
+    let page = reported
+        .iter()
+        .skip(start)
+        .take(page_size)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_page_token = reported
+        .get(start.saturating_add(page_size))
+        .and_then(|entry| id_of(entry).map(str::to_string));
+    Some((page, next_page_token))
+}
+
+// ---------------------------------------------------------------------------
 // Bundles
 // ---------------------------------------------------------------------------
 
-/// The hardware and monthly transfer one Lightsail bundle size provides.
+/// One Lightsail instance plan size: "a set of specs describing your virtual
+/// private server (or instance)" (the modelled `Bundle` documentation).
 ///
 /// A bundle id is `<size>_<major>_<minor>`, optionally with a platform token
 /// (`micro_win_2_0`), so the leading token names the size and the rest names the
-/// bundle's version. The figures are the published Lightsail instance plans:
-/// each step doubles RAM, and the vCPU count, SSD size and data transfer follow
-/// the plan table.
-#[derive(Debug, Clone, Copy)]
+/// bundle's version. ONE entry here therefore describes a size: the hardware and
+/// the monthly transfer every plan of that size provides, plus the monthly price
+/// of that size on each platform — the same hardware costs more on Windows
+/// Server, which carries an operating-system licence.
+///
+/// This is a PUBLISHED catalog, not per-account state: every account sees the
+/// same plans and no operation in this service creates, changes or retires one.
+/// That is why it is a `const` table beside the blueprint and Region catalogs,
+/// and why `GetBundles` reports it without reading or writing a stored resource.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BundleSpec {
-    /// The leading token of every bundle id that maps here.
+    /// The leading token of every bundle id that maps here, and the plan's
+    /// `Bundle$instanceType` — "The instance type (`micro`)".
     pub size: &'static str,
+    /// `Bundle$cpuCount` — "The number of vCPUs included in the bundle".
     pub cpu_count: i32,
+    /// `Bundle$ramSizeInGb` — "The amount of RAM in GB".
     pub ram_size_in_gb: f32,
+    /// `Bundle$diskSizeInGb` — "The size of the SSD".
     pub disk_size_in_gb: i32,
-    /// `InstanceNetworking$monthlyTransfer.gbPerMonthAllocated`, in GB.
+    /// `InstanceNetworking$monthlyTransfer.gbPerMonthAllocated` and
+    /// `Bundle$transferPerMonthInGb` — "The data transfer rate per month in GB".
     pub transfer_gb_per_month: i32,
+    /// `Bundle$power` — "A numeric value that represents the power of the
+    /// bundle", compared against a blueprint's `minPower` to decide whether the
+    /// blueprint runs on the plan.
+    pub power: i32,
+    /// `Bundle$price` — "The price in US dollars of the bundle" — for the
+    /// Linux/Unix plan of this size.
+    pub price_usd_per_month: f32,
+    /// `Bundle$price` for the Windows plan of this size.
+    pub windows_price_usd_per_month: f32,
+    /// `Bundle$isActive` — "A Boolean value indicating whether the bundle is
+    /// active". A plan generation the service has retired stays in this table
+    /// with `false` so an instance already running on it still resolves, while
+    /// `GetBundles` reports it only when asked to include inactive bundles.
+    pub is_active: bool,
+    /// `Bundle$supportedAppCategories` — "Virtual computer blueprints that are
+    /// supported by a Lightsail for Research bundle", of which the member's own
+    /// documentation says "This parameter only applies to Lightsail for Research
+    /// resources".
+    ///
+    /// The categories are the PLAN's, exactly as its platforms are, so they are
+    /// carried by the entry and never taken from the request. A standard instance
+    /// plan supports none, which is why it is empty on every entry of
+    /// [`BUNDLE_SPECS`] and the reported member is then absent.
+    pub app_categories: &'static [&'static str],
 }
 
-/// Every bundle size this slice serves. See [`BundleSpec`] for the source.
+/// Every instance plan size this service serves, smallest first.
+///
+/// SOURCE: the Lightsail instance-plan table (the "Instances" plans of the
+/// Lightsail pricing page, which `GetBundles` answers from) — each step doubles
+/// RAM while the vCPU count, SSD size and monthly data transfer follow the plan
+/// table, the Linux/Unix monthly price doubles with the plan from the $5 micro
+/// plan up, and the Windows price of the same size adds that platform's licence.
+/// The `power` values are the ones Lightsail publishes for its plans: they rise
+/// with the plan, from 300 for the smallest through 500 for `micro` (the value
+/// the modelled `Blueprint$minPower` documentation's own example names) and then
+/// a further 1000 per doubling step.
+///
+/// Lightsail has retired none of these sizes, so every entry is active.
 pub const BUNDLE_SPECS: &[BundleSpec] = &[
     BundleSpec {
         size: "nano",
@@ -392,6 +489,11 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         ram_size_in_gb: 0.5,
         disk_size_in_gb: 20,
         transfer_gb_per_month: 1_024,
+        power: 300,
+        price_usd_per_month: 3.5,
+        windows_price_usd_per_month: 8.0,
+        is_active: true,
+        app_categories: &[],
     },
     BundleSpec {
         size: "micro",
@@ -399,6 +501,11 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         ram_size_in_gb: 1.0,
         disk_size_in_gb: 40,
         transfer_gb_per_month: 2_048,
+        power: 500,
+        price_usd_per_month: 5.0,
+        windows_price_usd_per_month: 12.0,
+        is_active: true,
+        app_categories: &[],
     },
     BundleSpec {
         size: "small",
@@ -406,6 +513,11 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         ram_size_in_gb: 2.0,
         disk_size_in_gb: 60,
         transfer_gb_per_month: 3_072,
+        power: 1_000,
+        price_usd_per_month: 10.0,
+        windows_price_usd_per_month: 20.0,
+        is_active: true,
+        app_categories: &[],
     },
     BundleSpec {
         size: "medium",
@@ -413,6 +525,11 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         ram_size_in_gb: 4.0,
         disk_size_in_gb: 80,
         transfer_gb_per_month: 4_096,
+        power: 2_000,
+        price_usd_per_month: 20.0,
+        windows_price_usd_per_month: 40.0,
+        is_active: true,
+        app_categories: &[],
     },
     BundleSpec {
         size: "large",
@@ -420,6 +537,11 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         ram_size_in_gb: 8.0,
         disk_size_in_gb: 160,
         transfer_gb_per_month: 5_120,
+        power: 3_000,
+        price_usd_per_month: 40.0,
+        windows_price_usd_per_month: 70.0,
+        is_active: true,
+        app_categories: &[],
     },
     BundleSpec {
         size: "xlarge",
@@ -427,6 +549,11 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         ram_size_in_gb: 16.0,
         disk_size_in_gb: 320,
         transfer_gb_per_month: 6_144,
+        power: 4_000,
+        price_usd_per_month: 80.0,
+        windows_price_usd_per_month: 120.0,
+        is_active: true,
+        app_categories: &[],
     },
     BundleSpec {
         size: "2xlarge",
@@ -434,6 +561,11 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         ram_size_in_gb: 32.0,
         disk_size_in_gb: 640,
         transfer_gb_per_month: 7_168,
+        power: 5_000,
+        price_usd_per_month: 160.0,
+        windows_price_usd_per_month: 240.0,
+        is_active: true,
+        app_categories: &[],
     },
     BundleSpec {
         size: "4xlarge",
@@ -441,6 +573,11 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         ram_size_in_gb: 64.0,
         disk_size_in_gb: 1_280,
         transfer_gb_per_month: 8_192,
+        power: 6_000,
+        price_usd_per_month: 320.0,
+        windows_price_usd_per_month: 480.0,
+        is_active: true,
+        app_categories: &[],
     },
 ];
 
@@ -460,6 +597,190 @@ pub fn bundle_sizes() -> String {
     BUNDLE_SPECS
         .iter()
         .map(|spec| spec.size)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The generation token the bundle ids this service publishes carry — the
+/// `<major>_<minor>` tail of a bundle id, as the modelled `Bundle$bundleId`
+/// documentation's `micro_x_x` shows.
+///
+/// A plan size is served at one generation at a time, so the generation is a
+/// property of the CATALOG rather than of a size. An instance created on another
+/// generation of a size this service serves still resolves its hardware, because
+/// [`bundle_spec`] resolves a bundle id by its leading size token.
+pub const BUNDLE_GENERATION: &str = "3_0";
+
+/// The token a Windows bundle id carries between its size and its generation
+/// (`micro_win_2_0`), which is what distinguishes the Windows plan of a size from
+/// its Linux/Unix plan.
+pub const BUNDLE_WINDOWS_TOKEN: &str = "win";
+
+/// The platforms every plan size is published for, in the order a page reports
+/// them, from the modelled `InstancePlatform` enum: "You can only launch a
+/// `WINDOWS` bundle on a blueprint that supports the `WINDOWS` platform.
+/// `LINUX_UNIX` blueprints require a `LINUX_UNIX` bundle"
+/// (`Bundle$supportedPlatforms`), so a size is a separate bundle on each.
+pub const BUNDLE_PLATFORMS: &[&str] = &[PLATFORM_LINUX_UNIX, PLATFORM_WINDOWS];
+
+/// `Bundle$publicIpv4AddressCount` of every plan this catalog publishes — "an
+/// integer that indicates the public ipv4 address count included in the bundle,
+/// the value is either 0 or 1".
+///
+/// Every published plan is a standard plan that includes one public IPv4 address;
+/// 0 is the count of an IPv6-only plan, which this service publishes none of.
+pub const BUNDLE_PUBLIC_IPV4_ADDRESS_COUNT: i32 = 1;
+
+/// How many bundles one `GetBundles` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more bundles remain. It is above the
+/// published catalog's size, so the whole catalog is answered in one page — as
+/// AWS answers it — and the paging walk still holds for a catalog that outgrows
+/// it.
+pub const BUNDLE_PAGE_SIZE: usize = 50;
+
+/// The id a plan of `size` carries on `platform` at `generation`: the size token,
+/// the platform token of a Windows plan, then the generation
+/// ([`BUNDLE_WINDOWS_TOKEN`], [`BUNDLE_GENERATION`]).
+pub fn bundle_id(size: &str, platform: &str, generation: &str) -> String {
+    if platform == PLATFORM_WINDOWS {
+        format!("{size}_{BUNDLE_WINDOWS_TOKEN}_{generation}")
+    } else {
+        format!("{size}_{generation}")
+    }
+}
+
+/// The friendly name of a plan of `size` — `Bundle$name`, "A friendly name for
+/// the bundle (`Micro`)".
+///
+/// DERIVED from the size token, as that documented example shows (`micro` ->
+/// `Micro`): the token title-cased, with an `xlarge` token written `XLarge`
+/// because its leading `x` abbreviates "extra" rather than starting a word
+/// (`2xlarge` -> `2XLarge`).
+pub fn bundle_size_name(size: &str) -> String {
+    if let Some(multiplier) = size.strip_suffix("xlarge") {
+        return format!("{multiplier}XLarge");
+    }
+    let mut chars = size.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+impl BundleSpec {
+    /// The monthly price of this plan on `platform`: the Windows price on
+    /// Windows, the Linux/Unix one otherwise.
+    pub fn price(&self, platform: &str) -> f32 {
+        if platform == PLATFORM_WINDOWS {
+            self.windows_price_usd_per_month
+        } else {
+            self.price_usd_per_month
+        }
+    }
+
+    /// This plan on `platform` as the modelled `Bundle`.
+    pub fn view(&self, platform: &str) -> Bundle {
+        Bundle {
+            bundle_id: Some(bundle_id(self.size, platform, BUNDLE_GENERATION)),
+            instance_type: Some(self.size.to_string()),
+            name: Some(bundle_size_name(self.size)),
+            price: Some(self.price(platform)),
+            cpu_count: Some(self.cpu_count),
+            ram_size_in_gb: Some(self.ram_size_in_gb),
+            disk_size_in_gb: Some(self.disk_size_in_gb),
+            transfer_per_month_in_gb: Some(self.transfer_gb_per_month),
+            power: Some(self.power),
+            is_active: Some(self.is_active),
+            supported_platforms: Some(vec![platform.to_string()]),
+            // `supportedAppCategories` is the plan's OWN data, like its platform:
+            // a standard plan publishes none and reports the member absent.
+            supported_app_categories: (!self.app_categories.is_empty()).then(|| {
+                self.app_categories
+                    .iter()
+                    .map(|category| (*category).to_string())
+                    .collect()
+            }),
+            public_ipv4_address_count: Some(BUNDLE_PUBLIC_IPV4_ADDRESS_COUNT),
+        }
+    }
+}
+
+/// The Lightsail for Research instance plans this service publishes.
+///
+/// A SEPARATE catalog from [`BUNDLE_SPECS`], exactly as [`LFR_BLUEPRINTS`] is
+/// separate from [`BLUEPRINTS`]: `GetBundles$appCategory` is documented as
+/// "Returns a list of bundles that are specific to Lightsail for Research. You
+/// must use this parameter to view Lightsail for Research bundles", so the two
+/// catalogs are disjoint and the request's category selects between them (see
+/// [`bundle_catalog`]).
+///
+/// This emulator publishes no Lightsail for Research plan, so the catalog is
+/// EMPTY and a request naming a category reports no bundle. An entry here would
+/// have to name a real Research plan; inventing one would make `GetBundles`
+/// report a plan no Research blueprint runs on.
+pub const LFR_BUNDLE_SPECS: &[BundleSpec] = &[];
+
+/// The catalog a `GetBundles` request naming `app_category` reports from: the
+/// Lightsail for Research plans when it names a category, the instance plans when
+/// it names none.
+///
+/// The VALUE is not re-checked here: `appCategory` targets the modelled
+/// `AppCategory` enum, whose value set the centralized constraint walk enforces
+/// before any handler runs, so every category that reaches this function is one
+/// the model admits.
+pub fn bundle_catalog(app_category: Option<&str>) -> &'static [BundleSpec] {
+    match app_category {
+        Some(_) => LFR_BUNDLE_SPECS,
+        None => BUNDLE_SPECS,
+    }
+}
+
+/// The bundles a `GetBundles` call reports out of `specs`: every active plan of
+/// every size on each platform of [`BUNDLE_PLATFORMS`], plus the inactive
+/// (retired) ones when `include_inactive` is set.
+///
+/// Every member of a reported bundle is the entry's own — the request selects the
+/// catalog and the slice, and nothing it carries is reported back as plan data.
+///
+/// The order is `specs`' own, each size's platforms in [`BUNDLE_PLATFORMS`]'
+/// order, so two reads answer identically. Taking the catalog as an argument is
+/// what lets the slice rule be exercised against a catalog that holds a retired
+/// plan, which the published one does not.
+pub fn bundles_from(specs: &[BundleSpec], include_inactive: bool) -> Vec<Bundle> {
+    specs
+        .iter()
+        .filter(|spec| include_inactive || spec.is_active)
+        .flat_map(|spec| BUNDLE_PLATFORMS.iter().map(|platform| spec.view(platform)))
+        .collect()
+}
+
+/// The bundles a `GetBundles` call reports: [`bundles_from`] over the catalog
+/// [`bundle_catalog`] selects.
+pub fn bundles(include_inactive: bool, app_category: Option<&str>) -> Vec<Bundle> {
+    bundles_from(bundle_catalog(app_category), include_inactive)
+}
+
+/// One page of `reported`, by the same token walk every published catalog of this
+/// service uses ([`catalog_page`]): a `GetBundles` page token is the bundle id a
+/// previous page reported as `nextPageToken`.
+pub fn bundle_page(
+    reported: &[Bundle],
+    page_size: usize,
+    page_token: Option<&str>,
+) -> Option<(Vec<Bundle>, Option<String>)> {
+    catalog_page(reported, page_size, page_token, |bundle| {
+        bundle.bundle_id.as_deref()
+    })
+}
+
+/// The bundle ids `reported` holds, for a refusal that has to tell the caller
+/// what a page token may name.
+pub fn reported_bundle_ids(reported: &[Bundle]) -> String {
+    reported
+        .iter()
+        .filter_map(|bundle| bundle.bundle_id.clone())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1380,29 +1701,17 @@ pub fn blueprints(include_inactive: bool, app_category: Option<&str>) -> Vec<Blu
 /// another one. `None` is the answer when the token names no blueprint of
 /// `reported`: there is no page to report, which the caller turns into a refusal.
 /// An absent token asks for the first page.
+///
+/// The walk itself is [`catalog_page`], shared with this service's other paged
+/// catalogs; only the member a token names is this catalog's own.
 pub fn blueprint_page(
     reported: &[Blueprint],
     page_size: usize,
     page_token: Option<&str>,
 ) -> Option<(Vec<Blueprint>, Option<String>)> {
-    // A page carries at least one entry, so a walk over a non-empty catalog
-    // always advances.
-    let page_size = page_size.max(1);
-    let start = match page_token {
-        None => 0,
-        Some(token) => reported
-            .iter()
-            .position(|blueprint| blueprint.blueprint_id.as_deref() == Some(token))?,
-    };
-    let page = reported[start..]
-        .iter()
-        .take(page_size)
-        .cloned()
-        .collect::<Vec<_>>();
-    let next_page_token = reported
-        .get(start + page_size)
-        .and_then(|blueprint| blueprint.blueprint_id.clone());
-    Some((page, next_page_token))
+    catalog_page(reported, page_size, page_token, |blueprint| {
+        blueprint.blueprint_id.as_deref()
+    })
 }
 
 /// The blueprint ids `reported` holds, for a refusal that has to tell the caller

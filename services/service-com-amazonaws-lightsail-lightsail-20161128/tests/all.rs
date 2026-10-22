@@ -19,6 +19,8 @@ mod bucket_access_keys;
 mod bucket_bundles;
 #[path = "all/bucket_lifecycle.rs"]
 mod bucket_lifecycle;
+#[path = "all/bundle_catalog.rs"]
+mod bundle_catalog;
 #[path = "all/container_image_registry.rs"]
 mod container_image_registry;
 #[path = "all/container_service_lifecycle.rs"]

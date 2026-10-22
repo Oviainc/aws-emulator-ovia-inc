@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBundles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBundles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports this service's published instance-plan catalog: every plan size
+//! [`crate::state::BUNDLE_SPECS`] holds, on each platform it is served for, that is
+//! still active — plus the inactive (retired) ones when the caller asks for them —
+//! one page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBundles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A bundle is service-wide published data, not a per-caller record: it is the same
+//! for every caller, and no operation in this service creates, changes or retires
+//! one. So the catalog lives beside this service's other published tables (bucket
+//! bundles, blueprint families, regions) in [`crate::state`], and this operation
+//! reads no stored resource and writes nothing — reporting it cannot change what a
+//! later caller sees.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +178,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBundles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBundlesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBundles"))
+        // The catalog is service-wide published data (see this module's docs), so
+        // neither the store nor the request metadata takes part in the answer.
+        let _ = (ctx, &self.engine);
+
+        // `appCategory` carries the modelled `AppCategory` enum's value set, which
+        // the centralized request walk checks BEFORE this handler runs — a value
+        // outside it is already a 400 `ValidationException` — so reaching here
+        // means the category is one the model names. It selects the catalog: "You
+        // must use this parameter to view Lightsail for Research bundles".
+        let app_category = input.app_category.as_deref();
+
+        // `includeInactive` is "A Boolean value that indicates whether to include
+        // inactive (unavailable) bundles in the response of your request", and the
+        // member is optional — so an absent flag reports the active bundles only,
+        // exactly as `false` does.
+        let include_inactive = input.include_inactive.unwrap_or(false);
+        let reported = crate::state::bundles(include_inactive, app_category);
+
+        // An absent — or empty — `pageToken` asks for the first page.
+        let page_token = input.page_token.as_deref().filter(|token| !token.is_empty());
+        let (bundles, next_page_token) =
+            crate::state::bundle_page(&reported, crate::state::BUNDLE_PAGE_SIZE, page_token)
+                .ok_or_else(|| invalid_page_token(page_token.unwrap_or_default(), &reported))?;
+
+        Ok(GetBundlesOutput {
+            // A page always reports a list, empty or not: the caller asked what
+            // the catalog holds, and an absent member would say nothing.
+            bundles: Some(bundles),
+            next_page_token,
+        })
     }
+}
+
+/// The modelled `InvalidInputException` (HTTP 400), documented as "user input does
+/// not conform to the validation rules of an input field".
+///
+/// `pageToken` names no bundle of the list this request asks for, so there is no
+/// page to answer: a page token is the bundle id a previous page reported as
+/// `nextPageToken`, and the ids of that list are what the refusal names.
+fn invalid_page_token(token: &str, reported: &[Bundle]) -> GetBundlesError {
+    GetBundlesErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(format!(
+            "pageToken {token:?} does not name a bundle of this request's catalog; a page \
+             token is the bundle id a previous page reported as nextPageToken, one of: {}",
+            crate::state::reported_bundle_ids(reported)
+        )),
+        ..Default::default()
+    })
+    .into()
 }
