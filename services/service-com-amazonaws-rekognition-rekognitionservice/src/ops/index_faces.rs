@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op IndexFaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `IndexFaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stores one face per supplied image in the named collection and answers with the
+//! `FaceRecord` it persisted — the minted `FaceId` and `ImageId`, and the
+//! `ExternalImageId` carried through.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`IndexFaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! No face detector runs in this process, so this operation does not detect. It treats
+//! each supplied image as contributing exactly ONE face and records that face's
+//! IDENTITY; it reports no value a detector would have had to measure, so `Face`'s
+//! `BoundingBox` and `Confidence`, the whole of `FaceDetail` (including every member
+//! `DetectionAttributes` selects) and `OrientationCorrection` are absent rather than
+//! filled in with an unmeasured number. Everything it does report is what it stored, so
+//! `ListFaces`, `DescribeCollection`, `SearchFaces` and `DeleteFaces` see exactly these
+//! faces.
+//!
+//! For the same reason, the two inputs that only a detector could act on have no
+//! effect here and are not pretended to: `QualityFilter` names a quality bar, but
+//! nothing measures a face's quality, so no face is ever filtered out by it; and
+//! `DetectionAttributes` selects members of `FaceDetail`, which is reported by no
+//! record at all. Both are accepted — they constrain nothing the store needs — and the
+//! answer is the same whatever they say.
 //!
 //! ## Shape of an operation
 //!
@@ -251,18 +261,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `IndexFaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(IndexFacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("IndexFaces"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            IndexFacesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the Rekognition collection store is unavailable".to_string()),
+                ..InternalServerError::default()
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The resource is resolved before the request's own parameters, so a call
+        // naming a collection that does not exist is answered as not found whatever
+        // else is wrong with it.
+        let collection = state
+            .collections
+            .get_mut(&input.collection_id)
+            .ok_or_else(|| {
+                IndexFacesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!(
+                        "The collection id: {} does not exist",
+                        input.collection_id
+                    )),
+                    ..ResourceNotFoundException::default()
+                })
+            })?;
+
+        // An `Image` carries its content either inline or as an S3 object, and the
+        // model marks both members optional, so a request naming neither reaches the
+        // handler and is refused here rather than at the boundary. An S3 object is
+        // identified by its bucket and key: without both there is no object to read.
+        let signature = crate::state::image_signature(&input.image).ok_or_else(|| {
+            match input.image.s3_object.as_ref() {
+                Some(_) => IndexFacesErrorModeled::InvalidS3ObjectException(
+                    InvalidS3ObjectException {
+                        message: Some(
+                            "Unable to get object metadata from S3. Check object key, region and/or access permissions."
+                                .to_string(),
+                        ),
+                        ..InvalidS3ObjectException::default()
+                    },
+                ),
+                None => IndexFacesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "Request has invalid parameters: Image must carry either Bytes or S3Object"
+                                .to_string(),
+                        ),
+                        ..InvalidParameterException::default()
+                    },
+                ),
+            }
+        })?;
+
+        // `MaxFaces` caps how many of the image's faces are indexed, the rest being
+        // reported as `UnindexedFaces` with `EXCEEDS_MAX_FACES`. One face per image is
+        // all this emulator has, so a cap of one or more leaves nothing over; the cap
+        // is applied rather than ignored so the rule holds whatever the count is.
+        let max_faces = input.max_faces.map_or(usize::MAX, |max| {
+            // A value that is not a cap at all (a negative one, which the modelled
+            // range 1.. refuses at the boundary) asks for no faces, as the clamps in
+            // `search_faces` and `state::page_size` do.
+            usize::try_from(max).unwrap_or(0)
+        });
+        let indexed = usize::min(1, max_faces);
+
+        // The store is held in memory, so a collection has a capacity: past it an
+        // index is refused with the modelled quota error rather than allowed to grow
+        // the process without limit. The check precedes the write, so a refused
+        // request stores nothing.
+        if collection.faces.len() + indexed > crate::state::MAX_FACES_PER_COLLECTION {
+            return Err(IndexFacesErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The collection {} holds the maximum of {} faces",
+                        input.collection_id,
+                        crate::state::MAX_FACES_PER_COLLECTION
+                    )),
+                    ..ServiceQuotaExceededException::default()
+                },
+            )
+            .into());
+        }
+
+        let face_model_version = collection.face_model_version.clone();
+        // One `ImageId` per call: it identifies the image this request submitted, and
+        // every face indexed from it shares it.
+        let image_id = crate::state::new_image_id();
+        let mut records = Vec::with_capacity(indexed);
+        // The faces the cap left no room for are reported rather than dropped: that is
+        // what `UnindexedFaces` is for, and `EXCEEDS_MAX_FACES` is the reason the model
+        // names for it. Reachable only through a `MaxFaces` of 0, which the modelled
+        // range 1.. refuses at the boundary — so the list is normally empty, and the
+        // image's one face is never silently lost if that ever changes.
+        let unindexed: Vec<UnindexedFace> = if indexed == 0 {
+            vec![UnindexedFace {
+                reasons: Some(vec!["EXCEEDS_MAX_FACES".to_string()]),
+                // Nothing measured a face detail here; see `FaceRecord` below.
+                face_detail: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        for _ in 0..indexed {
+            let face = crate::state::StoredFace {
+                face_id: crate::state::new_face_id(),
+                image_id: image_id.clone(),
+                external_image_id: input.external_image_id.clone(),
+                index_faces_model_version: face_model_version.clone(),
+                user_id: None,
+                signature,
+                sequence: collection.next_sequence,
+            };
+            collection.next_sequence += 1;
+            records.push(FaceRecord {
+                face: Some(face.modeled()),
+                // Every member of `FaceDetail` is something a detector measures, and
+                // nothing measured it here, so no detail is reported at all.
+                face_detail: None,
+            });
+            collection.faces.push(face);
+        }
+
+        Ok(IndexFacesOutput {
+            face_records: Some(records),
+            // Null for every collection on a face model later than 3.0, per the
+            // member's own documentation.
+            orientation_correction: None,
+            face_model_version: Some(face_model_version),
+            unindexed_faces: Some(unindexed),
+        })
     }
 }

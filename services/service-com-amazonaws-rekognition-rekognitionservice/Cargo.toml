@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The digest that tells whether two indexed faces came from the same image, and the
+# one the minted `FaceId` / `ImageId` are built from.
+sha2 = { workspace = true }
+# Opaque list-pagination cursors: the next page's start key, hex-encoded.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
