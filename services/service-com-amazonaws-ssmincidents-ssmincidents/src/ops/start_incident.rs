@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartIncident
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartIncident`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartIncident::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -104,13 +95,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssmincidents-ssminciden
 // here — hence the `StartIncidentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssmincidents#StartIncident")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssmincidents#StartIncident",
+    // The service models `ServiceQuotaExceededException` (`CreateReplicationSet`
+    // declares it) but this operation does not list it. Widened in so the handler can
+    // refuse once the store holds `MAX_INCIDENT_RECORDS` records, which is what keeps
+    // the memory a caller can make this process hold bounded.
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum StartIncidentErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -166,18 +165,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartIncident` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartIncidentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartIncident"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartIncidentErrorModeled::InternalServerException(InternalServerException {
+                message: "the ssm-incidents state store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: a replay answers with the incident the
+        // first call created rather than starting a second one.
+        let client_token = input.client_token.as_deref();
+        if let Some(arn) = state.replayed_arn(Self::NAME, client_token) {
+            return Ok(StartIncidentOutput {
+                incident_record_arn: arn,
+            });
+        }
+
+        let plan = state
+            .response_plans
+            .get(&input.response_plan_arn)
+            .cloned()
+            .ok_or_else(|| {
+                StartIncidentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!(
+                        "Response plan {} could not be found",
+                        input.response_plan_arn
+                    ),
+                    resource_identifier: Some(input.response_plan_arn.clone()),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_RESPONSE_PLAN.to_string()),
+                })
+            })?;
+
+        // Deduplication, as `IncidentTemplate$dedupeString` documents it: "The string
+        // Incident Manager uses to prevent the same root cause from creating multiple
+        // incidents in the same account. ... If you specify a deduplication string,
+        // Incident Manager searches for open incidents that contain the same string in
+        // the dedupeString field when it creates the incident. If a duplicate is
+        // detected, Incident Manager deduplicates the newer incident into the existing
+        // incident." The scope is the ACCOUNT, not the response plan, so the search
+        // spans every stored record: two plans sharing a dedupe string describe the
+        // same root cause and fold together. The oldest matching OPEN incident is the
+        // one the newer incident folds into, so the answer is stable under replay.
+        if let Some(dedupe) = plan.incident_template.dedupe_string.as_deref() {
+            let existing = state
+                .incident_records
+                .values()
+                .filter(|record| {
+                    record.status == crate::state::STATUS_OPEN && record.dedupe_string == dedupe
+                })
+                // Borrowed comparison: no allocation per candidate under the lock.
+                .min_by(|left, right| {
+                    (
+                        crate::state::timestamp_key(&left.creation_time),
+                        left.arn.as_str(),
+                    )
+                        .cmp(&(
+                            crate::state::timestamp_key(&right.creation_time),
+                            right.arn.as_str(),
+                        ))
+                })
+                .map(|record| record.arn.clone());
+            if let Some(arn) = existing {
+                state.remember_arn(Self::NAME, client_token, &arn);
+                return Ok(StartIncidentOutput {
+                    incident_record_arn: arn,
+                });
+            }
+        }
+
+        // The store holds at most `MAX_INCIDENT_RECORDS` records, so no sequence of
+        // requests can make this process hold incident memory without limit.
+        if !state.accepts_another_incident_record() {
+            return Err(StartIncidentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The account has reached its quota of {} incident records",
+                        crate::state::MAX_INCIDENT_RECORDS
+                    ),
+                    resource_identifier: Some(plan.arn.clone()),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_INCIDENT_RECORD.to_string()),
+                    service_code: SERVICE_CODE_VALUES
+                        .first()
+                        .map(|code| (*code).to_string())
+                        .unwrap_or_default(),
+                    quota_code: crate::state::QUOTA_CODE_INCIDENT_RECORDS.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let arn = crate::state::incident_record_arn(&plan.name, &id);
+        let principal = crate::state::caller_principal(&ctx.parts().headers);
+        let started_at = crate::state::now();
+
+        // `title` and `impact` default from the plan's template and are overridden by
+        // the request; everything else the template carries is inherited as-is.
+        let template = plan.incident_template;
+        let record = crate::state::IncidentRecordEntry {
+            arn: arn.clone(),
+            response_plan_arn: plan.arn.clone(),
+            title: input.title.unwrap_or_else(|| template.title.clone()),
+            summary: template.summary.clone(),
+            status: crate::state::STATUS_OPEN.to_string(),
+            impact: input.impact.unwrap_or(template.impact),
+            creation_time: started_at,
+            resolved_time: None,
+            last_modified_time: started_at,
+            last_modified_by: principal.clone(),
+            // A template without a dedupeString leaves Incident Manager to generate
+            // one; the record's own id is unique to this incident, so it never folds a
+            // later incident into this one.
+            dedupe_string: template.dedupe_string.clone().unwrap_or_else(|| id.clone()),
+            incident_record_source: IncidentRecordSource {
+                created_by: principal,
+                // `invokedBy` is the service principal that assumed the role in
+                // `createdBy`; a direct StartIncident call has none, so it stays blank.
+                invoked_by: None,
+                resource_arn: input
+                    .trigger_details
+                    .as_ref()
+                    .and_then(|trigger| trigger.trigger_arn.clone()),
+                source: input.trigger_details.as_ref().map_or_else(
+                    || crate::state::MANUAL_INCIDENT_SOURCE.to_string(),
+                    |trigger| trigger.source.clone(),
+                ),
+            },
+            chat_channel: plan.chat_channel.clone(),
+            notification_targets: template.notification_targets.clone(),
+            incident_tags: template.incident_tags.clone().unwrap_or_default(),
+            timeline_events: Vec::new(),
+            related_items: input.related_items.unwrap_or_default(),
+        };
+
+        state.incident_records.insert(arn.clone(), record);
+        state.remember_arn(Self::NAME, client_token, &arn);
+
+        Ok(StartIncidentOutput {
+            incident_record_arn: arn,
+        })
     }
 }
