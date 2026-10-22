@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     ConflictException, Milestone, MilestoneSummary, ResourceNotFoundException, Workload,
     WorkloadDiscoveryConfig, WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput,
-    WorkloadSummary, RISK_VALUES,
+    WorkloadShareSummary, WorkloadSummary, RISK_VALUES,
 };
 
 /// `Workload$ImprovementStatus` before any lens review has been answered. The
@@ -212,6 +212,34 @@ pub const WORKLOAD_RESOURCE_TYPE: &str = "WORKLOAD";
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
 /// milestone.
 pub const MILESTONE_RESOURCE_TYPE: &str = "MILESTONE";
+
+/// `ConflictException$ResourceType` for a share of a workload. The share is a resource
+/// of its own — it has its own `ShareId` — and `ShareResourceType`
+/// (`smithy_query(query="shape", shape="ShareResourceType")`) names the shared resource
+/// kind `WORKLOAD`, so a share of one is named here by what it is.
+pub const WORKLOAD_SHARE_RESOURCE_TYPE: &str = "WORKLOAD_SHARE";
+
+/// `ShareStatus` a newly created workload share carries.
+///
+/// A share is mediated by a workload invitation — "Shared access to a workload is not
+/// removed until the workload invitation is deleted" (`CreateWorkloadShare` doc) — so a
+/// share the sharer has just created is waiting on the principal it was offered to, and
+/// `PENDING` is the `ShareStatus` member for exactly that
+/// (`smithy_query(query="shape", shape="ShareStatus")`). Nothing the CLOCK does moves it:
+/// it leaves `PENDING` only when the recipient answers the invitation
+/// (`UpdateShareInvitation`, still a stub with its own issue).
+pub const DEFAULT_SHARE_STATUS: &str = "PENDING";
+
+/// The most shares one workload holds in this emulator.
+///
+/// The Well-Architected Tool meters workload shares per workload and
+/// `CreateWorkloadShare` models `ServiceQuotaExceededException` (HTTP 402, "The user has
+/// reached their resource quota") for the case; the real quota is adjustable through
+/// Service Quotas, so the number here is this emulator's own ceiling rather than a value
+/// read off a doc page. It is what bounds the share map's growth — one share per
+/// principal per workload, and every create token is 1:1 with a live share — and it sits
+/// far above any realistic client workflow, so a caller never meets it by accident.
+pub const MAX_SHARES_PER_WORKLOAD: usize = 1_000;
 
 /// `ResourceNotFoundException$ResourceType` for the review of one lens in one workload
 /// — the resource `ListAnswers` and the other per-lens reads resolve. The modelled
@@ -523,8 +551,11 @@ impl WorkloadRecord {
             non_aws_regions: Some(self.non_aws_regions.clone()),
             architectural_design: self.architectural_design.clone(),
             review_owner: self.review_owner.clone(),
-            // Only a workload shared through a share invitation carries these, and
-            // workload shares are still a stub.
+            // Only the workload AS THE RECIPIENT SEES IT carries these: they describe
+            // the share invitation the recipient was offered. A share can now be created
+            // (`CreateWorkloadShare`), but the invitation flow that accepts one —
+            // `ListShareInvitations` / `UpdateShareInvitation` — is still a stub with its
+            // own issue, so no caller here is ever a share recipient.
             review_restriction_date: None,
             share_invitation_id: None,
             is_review_owner_update_acknowledged: Some(self.is_review_owner_update_acknowledged),
@@ -1146,6 +1177,53 @@ pub struct CreateMilestoneToken {
     pub fingerprint: String,
 }
 
+/// One stored share of a workload: the principal the workload was shared WITH, the
+/// permission that principal was granted, and where the share stands.
+///
+/// A share is its own resource, identified by its `ShareId`, and it belongs to the
+/// workload it shares — `shared_by` is that workload's owning account, the principal that
+/// did the sharing. It is recorded (rather than re-derived) because it is the modelled
+/// `WorkloadShare$SharedBy` member, which the `WorkloadShare` shape carries and
+/// `WorkloadShareSummary` does not: the operations that return that shape
+/// (`UpdateWorkloadShare`, `DeleteWorkloadShare`, the share-invitation flow) are still
+/// stubs with their own issues, so the share the sharer created already remembers who
+/// shared it when one of them is implemented.
+#[derive(Debug, Clone)]
+pub struct WorkloadShareRecord {
+    pub share_id: String,
+    pub workload_id: String,
+    pub shared_by: String,
+    pub shared_with: String,
+    pub permission_type: String,
+    pub status: String,
+    pub status_message: Option<String>,
+}
+
+impl WorkloadShareRecord {
+    /// The `WorkloadShareSummary` projection `ListWorkloadShares` pages over.
+    pub fn to_summary(&self) -> WorkloadShareSummary {
+        WorkloadShareSummary {
+            share_id: Some(self.share_id.clone()),
+            shared_with: Some(self.shared_with.clone()),
+            permission_type: Some(self.permission_type.clone()),
+            status: Some(self.status.clone()),
+            // "Optional message to compliment the Status field"
+            // (`WorkloadShareSummary$StatusMessage` doc): a share that is simply waiting
+            // on its invitation has nothing to add to its status.
+            status_message: self.status_message.clone(),
+        }
+    }
+}
+
+/// What a `CreateWorkloadShare` idempotency token resolves to: the share the original
+/// request created, plus that request's parameter fingerprint.
+#[derive(Debug, Clone)]
+pub struct CreateWorkloadShareToken {
+    pub workload_id: String,
+    pub share_id: String,
+    pub fingerprint: String,
+}
+
 /// Per-service state for com-amazonaws-wellarchitected-wellarchitectedapiservicelambda. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
@@ -1156,6 +1234,12 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     pub milestones: HashMap<String, BTreeMap<i32, MilestoneRecord>>,
     /// `CreateMilestone`'s `ClientRequestToken` -> what the original request recorded.
     pub create_milestone_tokens: HashMap<String, CreateMilestoneToken>,
+    /// Every share recorded against a workload, keyed by `WorkloadId` then by `ShareId`.
+    /// A `BTreeMap` because `ShareId` order is the stable order `ListWorkloadShares`
+    /// pages over.
+    pub workload_shares: HashMap<String, BTreeMap<String, WorkloadShareRecord>>,
+    /// `CreateWorkloadShare`'s `ClientRequestToken` -> what the original request created.
+    pub create_workload_share_tokens: HashMap<String, CreateWorkloadShareToken>,
     /// Normalized workload name -> `WorkloadId`. Backs the documented "name must be
     /// unique within an account within a Region; spaces and capitalization are
     /// ignored" rule.
@@ -1192,6 +1276,23 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         }
     }
 
+    /// A fresh `ShareId`: 32 lowercase hex characters, as `^[0-9a-f]{32}$` requires, and
+    /// unused by any share this store holds. A `ShareId` identifies the share on its own
+    /// (`DeleteWorkloadShare` resolves one by id), so uniqueness is checked over every
+    /// workload's shares rather than within one workload.
+    pub fn mint_share_id(&mut self) -> String {
+        loop {
+            let id = self.next_hex_id();
+            if !self
+                .workload_shares
+                .values()
+                .any(|shares| shares.contains_key(&id))
+            {
+                return id;
+            }
+        }
+    }
+
     /// A fresh lens id: 32 lowercase hex characters, the form the `LensAlias` doc's
     /// custom lens ARN ends in (`…:lens/0123456789abcdef01234567890abcdef`), and unused
     /// by any stored lens. Minted the same way, from the store and the clock.
@@ -1205,7 +1306,8 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     }
 
     /// The next 32-lowercase-hex candidate id: a per-store counter and the wall clock,
-    /// hashed, so it is never derived from the request.
+    /// hashed, so it is never derived from the request. The callers above are what check
+    /// a candidate against the resources they mint for.
     fn next_hex_id(&mut self) -> String {
         self.id_counter = self.id_counter.wrapping_add(1);
         let nanos = SystemTime::now()
@@ -1287,6 +1389,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.milestones.remove(workload_id);
         self.create_milestone_tokens
             .retain(|_, token| token.workload_id != workload_id);
+        // A share shares THIS workload, so it cannot outlive it either.
+        self.workload_shares.remove(workload_id);
+        self.create_workload_share_tokens
+            .retain(|_, token| token.workload_id != workload_id);
         Some(record)
     }
 
@@ -1317,6 +1423,37 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .and_then(|recorded| recorded.keys().next_back().copied())
             .unwrap_or(0)
             .saturating_add(1)
+    }
+
+    /// Every share recorded against `workload_id`, in `ShareId` order.
+    pub fn workload_shares_of(&self, workload_id: &str) -> Vec<&WorkloadShareRecord> {
+        self.workload_shares
+            .get(workload_id)
+            .map(|shares| shares.values().collect())
+            .unwrap_or_default()
+    }
+
+    /// The share `share_id` of `workload_id`, if the workload holds it.
+    pub fn workload_share(
+        &self,
+        workload_id: &str,
+        share_id: &str,
+    ) -> Option<&WorkloadShareRecord> {
+        self.workload_shares.get(workload_id)?.get(share_id)
+    }
+
+    /// The share of `workload_id` the principal `shared_with` already holds, if it holds
+    /// one: a principal holds at most one share of one workload, so this is what a second
+    /// share request for the same principal collides with.
+    pub fn workload_share_with(
+        &self,
+        workload_id: &str,
+        shared_with: &str,
+    ) -> Option<&WorkloadShareRecord> {
+        self.workload_shares
+            .get(workload_id)?
+            .values()
+            .find(|share| share.shared_with == shared_with)
     }
 }
 
@@ -1364,6 +1501,19 @@ pub fn decode_next_token(token: &str) -> Option<(String, String)> {
     let name = cursor.get("n")?.as_str()?.to_string();
     let id = cursor.get("i")?.as_str()?.to_string();
     Some((name, id))
+}
+
+/// Encode a `ListWorkloadShares` cursor: the last `ShareId` served, in the same opaque
+/// scheme as [`encode_next_token`]. Shares are enumerated in `ShareId` order, so that id
+/// is the whole cursor.
+pub fn encode_share_next_token(share_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "s": share_id }))
+}
+
+/// The `ShareId` a `ListWorkloadShares` `NextToken` points just past, or `None` when the
+/// token is not one this service issued.
+pub fn decode_share_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("s")?.as_str()?.to_string())
 }
 
 /// Encode a `ListMilestones` cursor: the `MilestoneNumber` of the last milestone the
@@ -1666,6 +1816,21 @@ pub fn idempotency_token_conflict(
         &format!(
             "A request with ClientRequestToken {client_request_token} was already \
              submitted with different parameters."
+        ),
+    )
+}
+
+/// [`conflict`] for a principal a workload is already shared with: a share is the grant
+/// of one permission on one workload to one principal, so the principal already holding
+/// one is what a second share request for it collides with. `existing` is the share that
+/// is in the way, which `resource_id` names so the caller can update or delete it.
+pub fn workload_share_conflict(existing: &WorkloadShareRecord) -> ConflictException {
+    conflict(
+        WORKLOAD_SHARE_RESOURCE_TYPE,
+        existing.share_id.clone(),
+        &format!(
+            "The workload with ID {} is already shared with {}.",
+            existing.workload_id, existing.shared_with
         ),
     )
 }

@@ -213,6 +213,28 @@ impl Client {
     pub(crate) async fn list(&self, body: Value) -> Answer {
         self.send("POST", "/workloadsSummaries", Some(body)).await
     }
+
+    /// `CreateWorkloadShare`: `POST /workloads/{WorkloadId}/shares`.
+    pub(crate) async fn create_share(&self, workload_id: &str, body: Value) -> Answer {
+        self.send(
+            "POST",
+            &format!("/workloads/{workload_id}/shares"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `ListWorkloadShares`: `GET /workloads/{WorkloadId}/shares`, with every filter and
+    /// paging member bound to the query string. `query` is passed as sent, empty for a
+    /// request that names none.
+    pub(crate) async fn list_shares(&self, workload_id: &str, query: &str) -> Answer {
+        let uri = if query.is_empty() {
+            format!("/workloads/{workload_id}/shares")
+        } else {
+            format!("/workloads/{workload_id}/shares?{query}")
+        };
+        self.send("GET", &uri, None).await
+    }
 }
 
 /// Percent-encode a value so it survives as ONE path segment: everything RFC 3986 does
