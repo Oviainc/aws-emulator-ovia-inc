@@ -182,12 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let group = store.group(&input.identifier).ok_or_else(|| {
             GetInvestigationGroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no investigation group matches identifier '{}'",
-                        input.identifier
-                    )),
-                },
+                crate::state::investigation_group_not_found(),
             )
         })?;
 

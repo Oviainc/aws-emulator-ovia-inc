@@ -172,12 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let group = store.group_mut(&input.identifier).ok_or_else(|| {
             PutInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no investigation group matches identifier '{}'",
-                        input.identifier
-                    )),
-                },
+                crate::state::investigation_group_not_found(),
             )
         })?;
 
