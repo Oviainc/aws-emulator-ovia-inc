@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTopicAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTopicAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTopicAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +73,95 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::TopicRecord;
+use std::collections::HashMap;
+
+/// The topic attribute holding the access policy a caller set.
+const POLICY_ATTRIBUTE: &str = "Policy";
+
+/// The topic attribute holding the delivery policy a caller set.
+const DELIVERY_POLICY_ATTRIBUTE: &str = "DeliveryPolicy";
+
+/// The topic attribute holding the display name a caller set.
+const DISPLAY_NAME_ATTRIBUTE: &str = "DisplayName";
+
+/// The access policy of a topic whose owner has set none: the one SNS generates,
+/// which allows the topic's own account every topic action.
+fn default_policy(topic: &TopicRecord) -> String {
+    serde_json::json!({
+        "Version": "2008-10-17",
+        "Id": "__default_policy_ID",
+        "Statement": [{
+            "Sid": "__default_statement_ID",
+            "Effect": "Allow",
+            "Principal": { "AWS": "*" },
+            "Action": [
+                "SNS:GetTopicAttributes",
+                "SNS:SetTopicAttributes",
+                "SNS:AddPermission",
+                "SNS:RemovePermission",
+                "SNS:DeleteTopic",
+                "SNS:Subscribe",
+                "SNS:ListSubscriptionsByTopic",
+                "SNS:Publish"
+            ],
+            "Resource": topic.arn,
+            "Condition": {
+                "StringEquals": { "AWS:SourceOwner": topic.owner }
+            }
+        }]
+    })
+    .to_string()
+}
+
+/// SNS's own delivery policy for HTTP/S endpoints: a linear retry of 3 attempts
+/// 20 seconds apart. It is the "system defaults" an `EffectiveDeliveryPolicy` is
+/// taken over (`GetTopicAttributesResponse$Attributes` doc).
+fn system_delivery_policy() -> serde_json::Value {
+    serde_json::json!({
+        "http": {
+            "defaultHealthyRetryPolicy": {
+                "minDelayTarget": 20,
+                "maxDelayTarget": 20,
+                "numRetries": 3,
+                "numMaxDelayRetries": 0,
+                "numNoDelayRetries": 0,
+                "numMinDelayRetries": 0,
+                "backoffFunction": "linear"
+            },
+            "disableSubscriptionOverrides": false
+        }
+    })
+}
+
+/// Overlay `override_with` onto `base`, member by member: an object merges into an
+/// object, anything else replaces. This is what makes an `EffectiveDeliveryPolicy`
+/// the topic's own policy "taking system defaults into account" rather than either
+/// one alone.
+fn merge_json(base: &mut serde_json::Value, override_with: serde_json::Value) {
+    match (base, override_with) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(override_with)) => {
+            for (key, value) in override_with {
+                merge_json(base.entry(key).or_insert(serde_json::Value::Null), value);
+            }
+        }
+        (base, override_with) => *base = override_with,
+    }
+}
+
+/// The effective delivery policy: the system defaults with the topic's own
+/// `DeliveryPolicy` laid over them.
+fn effective_delivery_policy(topic: &TopicRecord) -> String {
+    let mut effective = system_delivery_policy();
+    if let Some(configured) = topic
+        .attributes
+        .get(DELIVERY_POLICY_ATTRIBUTE)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    {
+        merge_json(&mut effective, configured);
+    }
+    effective.to_string()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,20 +233,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTopicAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTopicAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTopicAttributes"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTopicAttributesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = store.lock();
+
+        let Some(topic) = store.topics.get(&input.topic_arn) else {
+            return Err(GetTopicAttributesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!("Topic does not exist: {}", input.topic_arn)),
+                },
+            )
+            .into());
+        };
+
+        // Start from what the caller set, then add the attributes SNS itself computes.
+        let mut attributes: HashMap<String, String> = topic.attributes.clone();
+        let (confirmed, pending) = store.subscription_counts(&topic.arn);
+        attributes.insert("TopicArn".to_string(), topic.arn.clone());
+        attributes.insert("Owner".to_string(), topic.owner.clone());
+        attributes.insert(
+            DISPLAY_NAME_ATTRIBUTE.to_string(),
+            topic
+                .attributes
+                .get(DISPLAY_NAME_ATTRIBUTE)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        attributes.insert("SubscriptionsConfirmed".to_string(), confirmed.to_string());
+        attributes.insert("SubscriptionsPending".to_string(), pending.to_string());
+        attributes.insert(
+            "SubscriptionsDeleted".to_string(),
+            topic.subscriptions_deleted.to_string(),
+        );
+        attributes.insert(
+            POLICY_ATTRIBUTE.to_string(),
+            topic
+                .attributes
+                .get(POLICY_ATTRIBUTE)
+                .cloned()
+                .unwrap_or_else(|| default_policy(topic)),
+        );
+        attributes.insert(
+            "EffectiveDeliveryPolicy".to_string(),
+            effective_delivery_policy(topic),
+        );
+
+        Ok(GetTopicAttributesOutput {
+            attributes: Some(attributes),
+        })
     }
 }

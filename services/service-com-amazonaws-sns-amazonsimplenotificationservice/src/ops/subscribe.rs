@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Subscribe
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Subscribe`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Subscribe::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! NOT YET EVALUATED: a `FilterPolicy` in `Attributes` is persisted with the
+//! subscription but no delivery decision reads it, so `Publish` records every message
+//! against every confirmed subscription of the topic. Nothing a client can call reads
+//! the delivery log yet, so no response misreports a filtered delivery today;
+//! evaluating the filter-policy language is its own gap issue, together with
+//! `ConfirmSubscription` and `SetSubscriptionAttributes`.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +120,48 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{self, SubscriptionRecord};
+
+/// Every protocol SNS delivers a notification over, from the `SubscribeInput$Protocol`
+/// doc (`smithy_query(query="doc",shape="SubscribeInput",member="Protocol")`).
+const PROTOCOLS: &[&str] = &[
+    "http",
+    "https",
+    "email",
+    "email-json",
+    "sms",
+    "sqs",
+    "application",
+    "lambda",
+    "firehose",
+];
+
+/// The protocols whose subscriber has to confirm the subscription before SNS delivers
+/// to it: the ones addressed by a URL or an email address, which SNS cannot know the
+/// owner of until the subscriber calls `ConfirmSubscription`. Every other protocol
+/// addresses an AWS resource the caller already owns, so it is confirmed at once.
+const PROTOCOLS_NEEDING_CONFIRMATION: &[&str] = &["http", "https", "email", "email-json"];
+
+/// What SNS answers instead of the ARN for a subscription that is not confirmed yet,
+/// unless `ReturnSubscriptionArn` asks for the ARN in all cases
+/// (`SubscribeResponse$SubscriptionArn` doc).
+const PENDING_CONFIRMATION: &str = "pending confirmation";
+
+/// The refusal for a subscription record whose attribute map would cross the
+/// per-record byte ceiling, or `None` when it fits.
+fn oversized(attributes: &std::collections::HashMap<String, String>) -> Option<SubscribeError> {
+    let held = state::attribute_bytes(attributes);
+    (held > state::MAX_ATTRIBUTE_BYTES_PER_RECORD).then(|| {
+        SubscribeErrorModeled::InvalidParameterException(InvalidParameterException {
+            message: Some(format!(
+                "Invalid parameter: Attributes - a subscription holds at most {} bytes of \
+                 Attributes: {held}",
+                state::MAX_ATTRIBUTE_BYTES_PER_RECORD
+            )),
+        })
+        .into()
+    })
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -196,20 +236,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Subscribe` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SubscribeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Subscribe"))
+        let protocol = input.protocol.to_ascii_lowercase();
+        if !PROTOCOLS.contains(&protocol.as_str()) {
+            return Err(SubscribeErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid parameter: Protocol - must be one of {}: {}",
+                        PROTOCOLS.join(", "),
+                        input.protocol
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(SubscribeErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        if !store.topics.contains_key(&input.topic_arn) {
+            return Err(SubscribeErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("Topic does not exist: {}", input.topic_arn)),
+            })
+            .into());
+        }
+
+        // Subscribe is idempotent in the endpoint: one topic holds at most one
+        // subscription per (protocol, endpoint) pair, so re-subscribing the same
+        // endpoint answers with the subscription that already exists.
+        let existing = store
+            .subscriptions_of(&input.topic_arn)
+            .into_iter()
+            .find(|sub| sub.protocol == protocol && sub.endpoint == input.endpoint)
+            .map(|sub| (sub.arn.clone(), sub.pending_confirmation));
+
+        let attributes = input.attributes.unwrap_or_default();
+        // SNS defines a closed set of subscription attribute names and refuses any
+        // other; the closed set is also what keeps one subscription record from
+        // growing for ever.
+        if let Some(unknown) = attributes
+            .keys()
+            .find(|name| !state::is_subscription_attribute(name))
+        {
+            return Err(SubscribeErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid parameter: Attributes Reason: unknown attribute name: {unknown}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (arn, pending_confirmation) = match existing {
+            Some((arn, pending_confirmation)) => {
+                // The attributes a re-subscribe carries are APPLIED to the subscription
+                // that already exists, the way SetSubscriptionAttributes would apply
+                // them, so no caller input is dropped under a success status. The
+                // merged map is measured BEFORE it is stored, so a repeated
+                // re-subscribe cannot grow this one record past the ceiling.
+                let mut merged = store
+                    .subscriptions
+                    .get(&arn)
+                    .map(|held| held.attributes.clone())
+                    .unwrap_or_default();
+                for (name, value) in attributes {
+                    merged.insert(name, value);
+                }
+                if let Some(refusal) = oversized(&merged) {
+                    return Err(refusal);
+                }
+                if let Some(held) = store.subscriptions.get_mut(&arn) {
+                    held.attributes = merged;
+                }
+                (arn, pending_confirmation)
+            }
+            None => {
+                if let Some(refusal) = oversized(&attributes) {
+                    return Err(refusal);
+                }
+                if store.subscriptions.len() >= state::MAX_RECORDS_PER_STORE {
+                    return Err(
+                        SubscribeErrorModeled::SubscriptionLimitExceededException(
+                            SubscriptionLimitExceededException {
+                                message: Some(state::limit_exceeded_message("subscriptions")),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                let pending_confirmation =
+                    PROTOCOLS_NEEDING_CONFIRMATION.contains(&protocol.as_str());
+                let arn = {
+                    let id = store.next_unique_id();
+                    state::subscription_arn(&input.topic_arn, &id)
+                };
+                store.subscriptions.insert(
+                    arn.clone(),
+                    SubscriptionRecord {
+                        arn: arn.clone(),
+                        topic_arn: input.topic_arn.clone(),
+                        protocol,
+                        endpoint: input.endpoint,
+                        owner: state::owner_account_id(),
+                        attributes,
+                        pending_confirmation,
+                        created_at: std::time::SystemTime::now(),
+                    },
+                );
+                (arn, pending_confirmation)
+            }
+        };
+
+        // An unconfirmed subscription's ARN is withheld unless the caller asked for it.
+        let reported = if pending_confirmation && !input.return_subscription_arn {
+            PENDING_CONFIRMATION.to_string()
+        } else {
+            arn
+        };
+        Ok(SubscribeOutput {
+            subscription_arn: Some(reported),
+        })
     }
 }

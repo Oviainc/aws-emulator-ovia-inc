@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTopic
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTopic`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTopic::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -103,6 +94,52 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{self, TopicRecord};
+use std::collections::HashMap;
+
+/// The attribute that asks for a FIFO topic.
+const FIFO_TOPIC_ATTRIBUTE: &str = "FifoTopic";
+
+/// The suffix a FIFO topic's name carries, and the longest name SNS accepts — both
+/// shared with the ARN reader in [`crate::state`], which uses the same rule to tell a
+/// topic ARN from another SNS ARN.
+const FIFO_SUFFIX: &str = state::FIFO_SUFFIX;
+const MAX_TOPIC_NAME_LEN: usize = state::MAX_TOPIC_NAME_LEN;
+
+/// "Can't add more than 50 tags to a topic" (`TagLimitExceededException` doc).
+const MAX_TAGS_PER_TOPIC: usize = 50;
+
+/// The refusal for a topic record whose attribute or tag map would cross the
+/// per-record byte ceiling, or `None` when it fits.
+fn oversized(
+    attributes: &HashMap<String, String>,
+    tags: &HashMap<String, String>,
+) -> Option<CreateTopicError> {
+    let refuse = |what: &str, held: usize, ceiling: usize| {
+        Some(
+            CreateTopicErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(format!(
+                    "Invalid parameter: {what} - a topic holds at most {ceiling} bytes of \
+                     {what}: {held}"
+                )),
+            })
+            .into(),
+        )
+    };
+    let attribute_bytes = state::attribute_bytes(attributes);
+    if attribute_bytes > state::MAX_ATTRIBUTE_BYTES_PER_RECORD {
+        return refuse(
+            "Attributes",
+            attribute_bytes,
+            state::MAX_ATTRIBUTE_BYTES_PER_RECORD,
+        );
+    }
+    let tag_bytes = state::attribute_bytes(tags);
+    if tag_bytes > state::MAX_TAG_BYTES_PER_TOPIC {
+        return refuse("Tags", tag_bytes, state::MAX_TAG_BYTES_PER_TOPIC);
+    }
+    None
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -180,18 +217,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTopic` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTopicErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTopic"))
+        if !state::topic_name_is_valid(&input.name) {
+            return Err(CreateTopicErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid parameter: Name - topic names must be 1 to {MAX_TOPIC_NAME_LEN} \
+                         characters of ASCII letters, numbers, underscores and hyphens, and a \
+                         FIFO topic name must end with {FIFO_SUFFIX}: {}",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let attributes = input.attributes.unwrap_or_default();
+        // SNS defines a closed set of topic attribute names and refuses any other; the
+        // closed set is also what keeps one topic record from growing for ever.
+        if let Some(unknown) = attributes
+            .keys()
+            .find(|name| !state::is_topic_attribute(name))
+        {
+            return Err(CreateTopicErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid parameter: Attributes Reason: unknown attribute name: {unknown}"
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(policy) = input.data_protection_policy.as_deref() {
+            if policy.len() > state::MAX_DATA_PROTECTION_POLICY_LEN {
+                return Err(CreateTopicErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid parameter: DataProtectionPolicy - at most {} characters: {}",
+                            state::MAX_DATA_PROTECTION_POLICY_LEN,
+                            policy.len()
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        let fifo_requested = attributes
+            .get(FIFO_TOPIC_ATTRIBUTE)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let is_fifo = fifo_requested || input.name.ends_with(FIFO_SUFFIX);
+        if is_fifo && !input.name.ends_with(FIFO_SUFFIX) {
+            return Err(CreateTopicErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid parameter: Name - a FIFO topic name must end with {FIFO_SUFFIX}: {}",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > MAX_TAGS_PER_TOPIC {
+            return Err(CreateTopicErrorModeled::TagLimitExceededException(
+                TagLimitExceededException {
+                    message: Some(format!(
+                        "Can't add more than {MAX_TAGS_PER_TOPIC} tags to a topic"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTopicErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = state::request_region(ctx.parts());
+        let arn = state::topic_arn(&region, &input.name);
+
+        let mut store = store.lock();
+        // CreateTopic is idempotent: "if the requester already owns a topic with the
+        // specified name, that topic's ARN is returned without creating a new topic"
+        // (CreateTopic doc). Idempotent means the request asks for what the topic
+        // already is: a re-create that asks for a DIFFERENT value of an attribute the
+        // topic holds is not idempotent, and is refused rather than silently ignored.
+        if let Some(existing) = store.topics.get(&arn) {
+            if let Some((name, requested)) = attributes.iter().find(|(name, requested)| {
+                existing
+                    .attributes
+                    .get(*name)
+                    .is_some_and(|held| held != *requested)
+            }) {
+                return Err(CreateTopicErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid parameter: Attributes Reason: a topic with the name {} \
+                             already exists with a different {name}: requested {requested}, \
+                             held {}",
+                            input.name,
+                            existing.attributes.get(name).cloned().unwrap_or_default()
+                        )),
+                    },
+                )
+                .into());
+            }
+            // What the re-create carries beyond the conflict check is APPLIED to the
+            // topic that already exists — an attribute it does not hold yet, a tag, a
+            // data-protection policy — the way Set*Attributes/TagResource/
+            // PutDataProtectionPolicy would apply it, so no caller input is dropped
+            // under a success status. The merged maps are measured BEFORE they are
+            // stored, so a repeated re-create cannot grow this one record past the
+            // per-record ceilings.
+            let mut merged_attributes = existing.attributes.clone();
+            for (name, value) in &attributes {
+                merged_attributes.insert(name.clone(), value.clone());
+            }
+            let mut merged_tags = existing.tags.clone();
+            for tag in &tags {
+                merged_tags.insert(tag.key.clone(), tag.value.clone());
+            }
+            if merged_tags.len() > MAX_TAGS_PER_TOPIC {
+                return Err(CreateTopicErrorModeled::TagLimitExceededException(
+                    TagLimitExceededException {
+                        message: Some(format!(
+                            "Can't add more than {MAX_TAGS_PER_TOPIC} tags to a topic"
+                        )),
+                    },
+                )
+                .into());
+            }
+            if let Some(refusal) = oversized(&merged_attributes, &merged_tags) {
+                return Err(refusal);
+            }
+            let topic = store
+                .topics
+                .get_mut(&arn)
+                .expect("the topic was just found under this ARN");
+            topic.attributes = merged_attributes;
+            topic.tags = merged_tags;
+            if let Some(policy) = input.data_protection_policy {
+                topic.data_protection_policy = Some(policy);
+            }
+        } else {
+            if store.topics.len() >= state::MAX_RECORDS_PER_STORE {
+                return Err(CreateTopicErrorModeled::TopicLimitExceededException(
+                    TopicLimitExceededException {
+                        message: Some(state::limit_exceeded_message("topics")),
+                    },
+                )
+                .into());
+            }
+            let mut stored_attributes = attributes;
+            if is_fifo {
+                stored_attributes.insert(FIFO_TOPIC_ATTRIBUTE.to_string(), "true".to_string());
+            }
+            let stored_tags: HashMap<String, String> = tags
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect();
+            if let Some(refusal) = oversized(&stored_attributes, &stored_tags) {
+                return Err(refusal);
+            }
+            let topic = TopicRecord {
+                arn: arn.clone(),
+                name: input.name.clone(),
+                owner: state::owner_account_id(),
+                attributes: stored_attributes,
+                tags: stored_tags,
+                data_protection_policy: input.data_protection_policy,
+                is_fifo,
+                created_at: std::time::SystemTime::now(),
+                subscriptions_deleted: 0,
+            };
+            store.topics.insert(arn.clone(), topic);
+        }
+
+        Ok(CreateTopicOutput {
+            topic_arn: Some(arn),
+        })
     }
 }
