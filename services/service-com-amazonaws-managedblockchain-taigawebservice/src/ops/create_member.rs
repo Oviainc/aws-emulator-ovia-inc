@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMember
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMember`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMember::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the network and the invitation the request names against
+//! [`crate::state`], then mints and persists the member described by
+//! `MemberConfiguration` and marks the invitation accepted. `GetMember` projects the
+//! same record.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,220 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMember` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMemberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMember"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateMemberErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        guard.settle(now);
+
+        // "An idempotent operation completes no more than one time"
+        // (`ClientRequestToken`): a token already used replays the member id its first
+        // call minted instead of joining the network twice.
+        let token = crate::state::idempotency_key(Self::NAME, &input.client_request_token);
+        if let Some(created) = guard.replay_idempotent(&token) {
+            return Ok(CreateMemberOutput {
+                member_id: created.member_id.clone(),
+            });
+        }
+
+        // The network is resolved ONCE: "The unique identifier of the network in which
+        // the member is created" must name a network that exists, so one that does not is
+        // the modelled 404 and nothing is created. The facts the rules below read are
+        // copied out here, so the write path can take the single mutable borrow it needs.
+        let Some(network) = guard.networks.get(&input.network_id) else {
+            return Err(CreateMemberErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Network {} not found.", input.network_id)),
+                    // `ResourceNotFoundException$ResourceName` is an `ArnString`
+                    // (`^arn:.+:.+:.+:.+:.+$`), so it names the requested resource in ARN
+                    // form rather than by bare id.
+                    resource_name: Some(crate::state::network_arn(&region, &input.network_id)),
+                },
+            )
+            .into());
+        };
+        let framework = network.framework.clone();
+        let network_status = network.status.clone();
+        let name_taken = network
+            .members
+            .values()
+            .any(|member| member.name == input.member_configuration.name);
+
+        // This operation "Applies only to Hyperledger Fabric", and a network of any other
+        // framework has no members to create.
+        if framework != crate::state::FRAMEWORK_HYPERLEDGER_FABRIC {
+            return Err(CreateMemberErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "CreateMember applies only to {} networks; network {} is {}",
+                        crate::state::FRAMEWORK_HYPERLEDGER_FABRIC,
+                        input.network_id,
+                        framework
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The requested resource exists but isn't in a status that can complete the
+        // operation" (`ResourceNotReadyException`): a network still `CREATING` cannot
+        // take a member yet.
+        if network_status != crate::state::STATUS_AVAILABLE {
+            return Err(CreateMemberErrorModeled::ResourceNotReadyException(
+                ResourceNotReadyException {
+                    message: Some(format!(
+                        "network {} is {network_status} and cannot take a member until it is {}",
+                        input.network_id,
+                        crate::state::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The unique identifier of the invitation that is sent to the member to join the
+        // network": the invitation must exist, must have been issued to THIS account and
+        // onto THIS network, and must still be usable — after its `ExpirationDate` "the
+        // invitee can no longer create a member and join the network using this
+        // InvitationId". One issued to another account or onto another network is not this
+        // caller's to use here, so it is as good as absent.
+        let account = ::engine::emulator_account_id();
+        let Some(invitation) = guard.invitations.get(&input.invitation_id).filter(|invitation| {
+            invitation.principal == account && invitation.network_id == input.network_id
+        }) else {
+            return Err(CreateMemberErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Invitation {} not found for network {}.",
+                        input.invitation_id, input.network_id
+                    )),
+                    resource_name: Some(crate::state::invitation_arn(
+                        &region,
+                        &input.invitation_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        if !invitation.is_usable() {
+            return Err(CreateMemberErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "invitation {} is {} and cannot be used to create a member",
+                        invitation.id, invitation.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A member name identifies the member within its network, so a name the network
+        // already holds is "a resource request issued for a resource that already exists".
+        if name_taken {
+            return Err(CreateMemberErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "network {} already holds a member named {}",
+                        input.network_id, input.member_configuration.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let member_id = guard.mint_id("m");
+        let member_configuration = input.member_configuration;
+        // "Undefined or empty string - By default, use an KMS key that is owned and
+        // managed by Amazon Web Services on your behalf"
+        // (`MemberConfiguration$KmsKeyArn`), which `Member$KmsKeyArn` reports as the
+        // sentinel `"AWS Owned KMS Key"`.
+        let kms_key_arn = member_configuration
+            .kms_key_arn
+            .filter(|arn| !arn.is_empty())
+            .unwrap_or_else(|| crate::state::AWS_OWNED_KMS_KEY.to_string());
+        let member = crate::state::StoredMember {
+            id: member_id.clone(),
+            network_id: input.network_id.clone(),
+            name: member_configuration.name,
+            description: member_configuration.description,
+            // The admin password the request carries is never stored: nothing may report
+            // it back.
+            admin_username: member_configuration
+                .framework_configuration
+                .fabric
+                .map(|fabric| fabric.admin_username),
+            ca_endpoint: crate::state::ca_endpoint(&region, &input.network_id, &member_id),
+            log_publishing_configuration: member_configuration.log_publishing_configuration,
+            status: crate::state::STATUS_CREATING.to_string(),
+            available_at: now + crate::state::TRANSITION_SPAN,
+            creation_date: now,
+            tags: crate::state::map_in(member_configuration.tags),
+            arn: crate::state::member_arn(&region, &member_id),
+            kms_key_arn,
+        };
+
+        // One mutable borrow for the write. `StoredNetwork::insert_member` is the only
+        // path that adds a member to a network, and it is what keeps the member map at or
+        // under `crate::state::MAX_MEMBERS_PER_NETWORK`; the refusal is the modelled
+        // `ResourceLimitExceededException`.
+        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+            return Err(CreateMemberErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+        if network.insert_member(member).is_err() {
+            return Err(CreateMemberErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    message: Some(format!(
+                        "network {} already holds the maximum of {} members",
+                        input.network_id,
+                        crate::state::MAX_MEMBERS_PER_NETWORK
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "ACCEPTING - The invitee has begun creating a member, and creation hasn't yet
+        // completed" (`InvitationStatus`); the clock owes it `ACCEPTED` when the member
+        // it created finishes creating.
+        if let Some(invitation) = guard.invitations.get_mut(&input.invitation_id) {
+            invitation.status = crate::state::INVITATION_STATUS_ACCEPTING.to_string();
+            invitation.accepted_at = Some(now + crate::state::TRANSITION_SPAN);
+        }
+
+        guard.remember_idempotent(
+            token,
+            crate::state::CreatedIds {
+                network_id: Some(input.network_id.clone()),
+                member_id: Some(member_id.clone()),
+                node_id: None,
+                accessor_id: None,
+                proposal_id: None,
+            },
+        );
+
+        // Answer from the STORED record, so this is the id every later read of the member
+        // answers to.
+        let stored = guard
+            .networks
+            .get(&input.network_id)
+            .and_then(|network| network.members.get(&member_id));
+        let Some(stored) = stored else {
+            return Err(CreateMemberErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+        Ok(CreateMemberOutput {
+            member_id: Some(stored.id.clone()),
+        })
     }
 }

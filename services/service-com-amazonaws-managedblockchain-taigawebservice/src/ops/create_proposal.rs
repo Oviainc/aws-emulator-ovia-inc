@@ -290,8 +290,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This is the CreationDate plus the ProposalDurationInHours that is specified in
         // the ProposalThresholdPolicy" (`Proposal$ExpirationDate`): the duration is the
         // one the network was created with, kept exactly as it was specified.
-        let expiration_date =
-            crate::state::proposal_duration(&network.voting_policy).map(|duration| now + duration);
+        let expiration_date = network
+            .voting_policy
+            .as_ref()
+            .and_then(crate::state::proposal_duration)
+            .map(|duration| now + duration);
 
         let proposal_id = guard.mint_proposal_id(&input.network_id);
         let proposal = crate::state::StoredProposal {
