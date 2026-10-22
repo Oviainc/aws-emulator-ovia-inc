@@ -43,6 +43,8 @@ mod object_tagging;
 mod object_versioning;
 #[path = "all/object_write_and_read_back.rs"]
 mod object_write_and_read_back;
+#[path = "all/object_write_tagging_header.rs"]
+mod object_write_tagging_header;
 #[path = "all/objects.rs"]
 mod objects;
 #[path = "all/state_roundtrip.rs"]

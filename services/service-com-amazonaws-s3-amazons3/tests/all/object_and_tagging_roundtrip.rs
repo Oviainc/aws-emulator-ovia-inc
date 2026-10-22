@@ -648,7 +648,6 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
             "a server-side-encryption request",
             &[("x-amz-server-side-encryption", "aws:kms")][..],
         ),
-        ("an object tag set", &[("x-amz-tagging", "a=b")][..]),
         (
             "an object lock mode",
             &[("x-amz-object-lock-mode", "GOVERNANCE")][..],
