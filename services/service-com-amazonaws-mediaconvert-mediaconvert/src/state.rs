@@ -56,9 +56,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AccelerationSettings, HopDestination, Job, JobSettings, JobTemplate, JobTemplateSettings,
-    Output, Policy, Preset, PresetSettings, Queue, ReservationPlan, ReservationPlanSettings,
-    Timing,
+    AccelerationSettings, HopDestination, Job, JobMessages, JobSettings, JobTemplate,
+    JobTemplateSettings, Output, Policy, Preset, PresetSettings, Queue, ReservationPlan,
+    ReservationPlanSettings, Timing,
 };
 
 /// The built-in queue a job with no `Queue` member is sent to.
@@ -147,6 +147,48 @@ pub const LIST_BY_SYSTEM: &str = "SYSTEM";
 pub const ACCELERATION_MODE_DISABLED: &str = "DISABLED";
 /// See [`ACCELERATION_MODE_DISABLED`].
 pub const ACCELERATION_STATUS_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
+
+/// `BillingTagsSource` values (`smithy_query(query="shape",shape="BillingTagsSource")`):
+/// "The tag type that AWS Billing and Cost Management will use to sort your AWS Elemental
+/// MediaConvert costs". `JOB` is the SERVICE DEFAULT — `CreateJob$BillingTagsSource`'s own
+/// doc: "Leave blank to use the default value, Job."
+pub const BILLING_TAGS_SOURCE_JOB: &str = "JOB";
+
+/// `ShareStatus` values (`smithy_query(query="shape",shape="ShareStatus")`): "A job's share
+/// status can be NOT_SHARED, INITIATED, or SHARED". A job no resource share has been
+/// created for is `NOT_SHARED`.
+pub const SHARE_STATUS_NOT_SHARED: &str = "NOT_SHARED";
+
+/// The `Priority` a job or job template created without one carries.
+///
+/// `CreateJob$Priority`'s own documentation: "If you don't specify a priority, the service
+/// uses the default value 0" — and `CreateJobTemplate$Priority` says the same. The member
+/// is service-applied, never absent, so it is stored rather than left empty.
+pub const DEFAULT_PRIORITY: i32 = 0;
+
+/// The `StatusUpdateInterval` a job or job template created without one carries.
+///
+/// The member's doc gives the cadence in seconds ("Set the interval, in seconds, between
+/// status updates") but states no default; MediaConvert's own default status-update cadence
+/// is 60 seconds, which is the value the recorded wire corpus shows on every job and job
+/// template created without the member. `StatusUpdateInterval` declares `SECONDS_60`.
+pub const DEFAULT_STATUS_UPDATE_INTERVAL: &str = "SECONDS_60";
+
+/// The number of jobs a queue created without `ConcurrentJobs` can process concurrently.
+///
+/// `CreateQueue$ConcurrentJobs` is optional ("For on-demand queues, the value you enter is
+/// constrained by your service quotas for Maximum concurrent jobs, per on-demand queue"),
+/// and the service fills it in from the account's quota when the request omits it: the
+/// member is never absent from a `Queue`. The model declares no default, so this is the
+/// account-default concurrency the recorded wire corpus shows for a queue created without
+/// the member.
+pub const DEFAULT_CONCURRENT_JOBS: i32 = 200;
+
+/// The number of Elemental Inference feeds a queue created without
+/// `MaximumConcurrentFeeds` can process concurrently: none. `__integerMin0` makes zero the
+/// bottom of the member's range, and zero is what the recorded corpus shows for a queue
+/// whose request omitted it.
+pub const DEFAULT_MAXIMUM_CONCURRENT_FEEDS: i32 = 0;
 
 /// `ReservationPlanStatus` values (`smithy_query(query="shape",shape="ReservationPlanStatus")`).
 pub const RESERVATION_PLAN_STATUS_ACTIVE: &str = "ACTIVE";
@@ -463,6 +505,20 @@ pub fn parse_resource_arn(arn: &str) -> Option<TaggedResource> {
     }
 }
 
+/// The `AccelerationSettings` a job or job template created without the member carries.
+///
+/// Accelerated transcoding is opt-in, so a resource whose request said nothing about it is
+/// not accelerated — `AccelerationStatus`'s doc names that state: "For jobs that have
+/// Acceleration (AccelerationMode) set to DISABLED, AccelerationStatus is always
+/// NOT_APPLICABLE." The structure's one member is required, so the service-applied value
+/// is the whole structure with `Mode` [`ACCELERATION_MODE_DISABLED`], which is what the
+/// recorded corpus shows.
+pub fn default_acceleration_settings() -> AccelerationSettings {
+    AccelerationSettings {
+        mode: ACCELERATION_MODE_DISABLED.to_string(),
+    }
+}
+
 /// A timestamp as the model's `__timestampUnix` (`epoch-seconds`) renders it.
 ///
 /// Truncated to whole seconds so the wire value is the integer epoch-seconds field the
@@ -527,8 +583,12 @@ pub struct QueueRecord {
     pub pricing_plan: String,
     pub status: String,
     pub queue_type: String,
-    pub concurrent_jobs: Option<i32>,
-    pub maximum_concurrent_feeds: Option<i32>,
+    /// Always a value: the service fills it from the account's quota when the request
+    /// omits it ([`DEFAULT_CONCURRENT_JOBS`]), so `Queue$ConcurrentJobs` is never absent.
+    pub concurrent_jobs: i32,
+    /// Always a value, as `concurrent_jobs` is
+    /// ([`DEFAULT_MAXIMUM_CONCURRENT_FEEDS`] when the request omits it).
+    pub maximum_concurrent_feeds: i32,
     pub reservation_plan: Option<ReservationPlan>,
     pub created_at: SystemTime,
     pub last_updated: SystemTime,
@@ -540,11 +600,11 @@ impl QueueRecord {
     pub fn view(&self, region: &str, submitted_jobs: i32, progressing_jobs: i32) -> Queue {
         Queue {
             arn: Some(queue_arn(region, &self.name)),
-            concurrent_jobs: self.concurrent_jobs,
+            concurrent_jobs: Some(self.concurrent_jobs),
             created_at: Some(epoch_seconds(self.created_at)),
             description: self.description.clone(),
             last_updated: Some(epoch_seconds(self.last_updated)),
-            maximum_concurrent_feeds: self.maximum_concurrent_feeds,
+            maximum_concurrent_feeds: Some(self.maximum_concurrent_feeds),
             name: self.name.clone(),
             pricing_plan: Some(self.pricing_plan.clone()),
             progressing_jobs_count: Some(progressing_jobs),
@@ -644,10 +704,15 @@ pub struct JobTemplateRecord {
     pub category: Option<String>,
     pub description: Option<String>,
     pub queue: Option<String>,
-    pub priority: Option<i32>,
+    /// Always a value: service-applied ([`DEFAULT_PRIORITY`]) when the request omits it.
+    pub priority: i32,
     pub settings: JobTemplateSettings,
-    pub status_update_interval: Option<String>,
-    pub acceleration_settings: Option<AccelerationSettings>,
+    /// Always a value: service-applied ([`DEFAULT_STATUS_UPDATE_INTERVAL`]) when the
+    /// request omits it.
+    pub status_update_interval: String,
+    /// Always a value: service-applied ([`default_acceleration_settings`]) when the
+    /// request omits it.
+    pub acceleration_settings: AccelerationSettings,
     pub hop_destinations: Vec<HopDestination>,
     /// [`TYPE_SYSTEM`] for a built-in template, [`TYPE_CUSTOM`] for one a caller created.
     pub template_type: String,
@@ -664,10 +729,10 @@ impl JobTemplateRecord {
             category: None,
             description: None,
             queue: None,
-            priority: None,
+            priority: DEFAULT_PRIORITY,
             settings: JobTemplateSettings::default(),
-            status_update_interval: None,
-            acceleration_settings: None,
+            status_update_interval: DEFAULT_STATUS_UPDATE_INTERVAL.to_string(),
+            acceleration_settings: default_acceleration_settings(),
             hop_destinations: Vec::new(),
             template_type: TYPE_SYSTEM.to_string(),
             created_at: at,
@@ -679,7 +744,7 @@ impl JobTemplateRecord {
     /// The modelled `JobTemplate`.
     pub fn view(&self, region: &str) -> JobTemplate {
         JobTemplate {
-            acceleration_settings: self.acceleration_settings.clone(),
+            acceleration_settings: Some(self.acceleration_settings.clone()),
             arn: Some(job_template_arn(region, &self.name)),
             category: self.category.clone(),
             created_at: Some(epoch_seconds(self.created_at)),
@@ -687,10 +752,10 @@ impl JobTemplateRecord {
             hop_destinations: Some(self.hop_destinations.clone()),
             last_updated: Some(epoch_seconds(self.last_updated)),
             name: self.name.clone(),
-            priority: self.priority,
+            priority: Some(self.priority),
             queue: self.queue.clone(),
             settings: self.settings.clone(),
-            status_update_interval: self.status_update_interval.clone(),
+            status_update_interval: Some(self.status_update_interval.clone()),
             r#type: Some(self.template_type.clone()),
         }
     }
@@ -715,14 +780,27 @@ pub struct JobRecord {
     pub id: String,
     pub role: String,
     pub settings: JobSettings,
+    /// The NAME of the queue this job was submitted to — this store's key for it, which
+    /// is why a job outlives the queue's deletion. `Job$Queue` is projected as that
+    /// queue's ARN; see [`Self::view`].
     pub queue: String,
     pub job_template: Option<String>,
-    pub priority: Option<i32>,
+    /// Always a value: service-applied ([`DEFAULT_PRIORITY`]) when the request omits it.
+    pub priority: i32,
     pub status: String,
     pub created_at: SystemTime,
-    pub status_update_interval: Option<String>,
-    pub billing_tags_source: Option<String>,
-    pub acceleration_settings: Option<AccelerationSettings>,
+    /// Always a value: service-applied ([`DEFAULT_STATUS_UPDATE_INTERVAL`]) when the
+    /// request omits it.
+    pub status_update_interval: String,
+    /// Always a value: service-applied ([`BILLING_TAGS_SOURCE_JOB`]) when the request
+    /// omits it.
+    pub billing_tags_source: String,
+    /// Always a value: service-applied ([`default_acceleration_settings`]) when the
+    /// request omits it.
+    pub acceleration_settings: AccelerationSettings,
+    /// Whether this job has been shared, which `CreateResourceShare` is what moves — so
+    /// a job nothing has shared is [`SHARE_STATUS_NOT_SHARED`].
+    pub share_status: String,
     pub hop_destinations: Vec<HopDestination>,
     pub job_engine_version_requested: Option<String>,
     pub simulate_reserved_queue: Option<String>,
@@ -833,10 +911,10 @@ impl JobRecord {
     /// The modelled `Job`.
     pub fn view(&self, region: &str) -> Job {
         Job {
-            acceleration_settings: self.acceleration_settings.clone(),
+            acceleration_settings: Some(self.acceleration_settings.clone()),
             acceleration_status: self.acceleration_status(),
             arn: Some(job_arn(region, &self.id)),
-            billing_tags_source: self.billing_tags_source.clone(),
+            billing_tags_source: Some(self.billing_tags_source.clone()),
             client_request_token: self.client_request_token.clone(),
             created_at: Some(epoch_seconds(self.created_at)),
             current_phase: None,
@@ -851,19 +929,29 @@ impl JobRecord {
             job_percent_complete: None,
             job_template: self.job_template.clone(),
             last_share_details: None,
-            messages: None,
+            // "Provides messages from the service about jobs that you have already
+            // successfully submitted": the container is always reported, and this service
+            // has produced no informational or warning message about the job, so both
+            // lists are empty rather than absent.
+            messages: Some(JobMessages {
+                info: Some(Vec::new()),
+                warning: Some(Vec::new()),
+            }),
             output_group_details: None,
-            priority: self.priority,
-            queue: Some(self.queue.clone()),
+            priority: Some(self.priority),
+            // A job's queue member is the ARN of the queue it was submitted to, built from
+            // the stored queue name and the reading request's region — as every other ARN
+            // this service reports is.
+            queue: Some(queue_arn(region, &self.queue)),
             // A job is never hopped between queues here, so its hopping history is empty.
             queue_transitions: Some(Vec::new()),
             retry_count: Some(0),
             role: self.role.clone(),
             settings: self.settings.clone(),
-            share_status: None,
+            share_status: Some(self.share_status.clone()),
             simulate_reserved_queue: self.simulate_reserved_queue.clone(),
             status: Some(self.status.clone()),
-            status_update_interval: self.status_update_interval.clone(),
+            status_update_interval: Some(self.status_update_interval.clone()),
             timing: Some(self.timing.view()),
             user_metadata: Some(self.user_metadata.clone().into_iter().collect()),
             warnings: Some(Vec::new()),
@@ -874,12 +962,7 @@ impl JobRecord {
     /// For a job that asked for acceleration the status is decided by probing the
     /// input, which never happens here, so it stays absent.
     fn acceleration_status(&self) -> Option<String> {
-        let mode = self
-            .acceleration_settings
-            .as_ref()
-            .map(|settings| settings.mode.as_str())
-            .unwrap_or(ACCELERATION_MODE_DISABLED);
-        (mode == ACCELERATION_MODE_DISABLED)
+        (self.acceleration_settings.mode == ACCELERATION_MODE_DISABLED)
             .then(|| ACCELERATION_STATUS_NOT_APPLICABLE.to_string())
     }
 }
@@ -1187,8 +1270,8 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
                 pricing_plan: PRICING_PLAN_ON_DEMAND.to_string(),
                 status: QUEUE_STATUS_ACTIVE.to_string(),
                 queue_type: QUEUE_TYPE_SYSTEM.to_string(),
-                concurrent_jobs: None,
-                maximum_concurrent_feeds: None,
+                concurrent_jobs: DEFAULT_CONCURRENT_JOBS,
+                maximum_concurrent_feeds: DEFAULT_MAXIMUM_CONCURRENT_FEEDS,
                 reservation_plan: None,
                 created_at: now,
                 last_updated: now,

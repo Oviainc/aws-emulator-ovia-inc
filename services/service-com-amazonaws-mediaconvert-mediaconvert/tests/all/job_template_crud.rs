@@ -11,7 +11,10 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_mediaconvert_mediaconvert::ops::types::JobTemplateSettings;
-use service_com_amazonaws_mediaconvert_mediaconvert::state::{JobTemplateRecord, TYPE_CUSTOM};
+use service_com_amazonaws_mediaconvert_mediaconvert::state::{
+    default_acceleration_settings, JobTemplateRecord, DEFAULT_PRIORITY,
+    DEFAULT_STATUS_UPDATE_INTERVAL, TYPE_CUSTOM,
+};
 use service_com_amazonaws_mediaconvert_mediaconvert::ComAmazonawsMediaconvertMediaconvertState;
 
 // The router, the SigV4 scope, the reply decoding, the ARN helper and the request helpers
@@ -107,9 +110,10 @@ async fn a_created_job_template_reads_back_through_get() {
                 "category": null,
                 "description": null,
                 "queue": null,
-                "priority": null,
-                "statusUpdateInterval": null,
-                "accelerationSettings": null,
+                // The three members the service applies when the request omits them.
+                "priority": 0,
+                "statusUpdateInterval": "SECONDS_60",
+                "accelerationSettings": { "mode": "DISABLED" },
                 "hopDestinations": [],
             }),
             inputs: 1,
@@ -1179,10 +1183,10 @@ async fn creating_past_the_store_capacity_is_a_quota_refusal() {
                     category: Some("bulk".to_string()),
                     description: None,
                     queue: None,
-                    priority: None,
+                    priority: DEFAULT_PRIORITY,
                     settings: JobTemplateSettings::default(),
-                    status_update_interval: None,
-                    acceleration_settings: None,
+                    status_update_interval: DEFAULT_STATUS_UPDATE_INTERVAL.to_string(),
+                    acceleration_settings: default_acceleration_settings(),
                     hop_destinations: Vec::new(),
                     template_type: TYPE_CUSTOM.to_string(),
                     created_at: seeded_at,

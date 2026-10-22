@@ -24,7 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use service_com_amazonaws_mediaconvert_mediaconvert::ops::types::JobTemplateSettings;
 use service_com_amazonaws_mediaconvert_mediaconvert::state::{
-    JobTemplateRecord, TYPE_CUSTOM, TYPE_SYSTEM,
+    default_acceleration_settings, JobTemplateRecord, DEFAULT_PRIORITY,
+    DEFAULT_STATUS_UPDATE_INTERVAL, TYPE_CUSTOM, TYPE_SYSTEM,
 };
 use service_com_amazonaws_mediaconvert_mediaconvert::{
     ComAmazonawsMediaconvertMediaconvertState, EmulatedService,
@@ -197,10 +198,10 @@ fn seed_custom(emulator: &Emulator, name: &str, category: Option<&str>, created_
                 category: category.map(str::to_string),
                 description: Some(format!("{name} description")),
                 queue: None,
-                priority: None,
+                priority: DEFAULT_PRIORITY,
                 settings: JobTemplateSettings::default(),
-                status_update_interval: None,
-                acceleration_settings: None,
+                status_update_interval: DEFAULT_STATUS_UPDATE_INTERVAL.to_string(),
+                acceleration_settings: default_acceleration_settings(),
                 hop_destinations: Vec::new(),
                 template_type: TYPE_CUSTOM.to_string(),
                 created_at,
@@ -569,6 +570,11 @@ async fn each_listed_template_is_projected_from_the_stored_record() {
             "type": TYPE_CUSTOM,
             "hopDestinations": [],
             "settings": {},
+            // The members the service applies to every template, which the seeded record
+            // carries exactly as a created one does.
+            "priority": DEFAULT_PRIORITY,
+            "statusUpdateInterval": DEFAULT_STATUS_UPDATE_INTERVAL,
+            "accelerationSettings": { "mode": default_acceleration_settings().mode },
         });
         assert_eq!(
             item, expected,
