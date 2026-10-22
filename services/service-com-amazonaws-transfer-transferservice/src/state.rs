@@ -4,8 +4,8 @@
 //!
 //! Everything AWS Transfer Family's server + user + web app + AS2 profile + connector
 //! + host-key lifecycle needs to answer a read from stored state lives here: the
-//! resource maps (servers, their users and host keys, the web apps, the AS2 profiles,
-//! the connectors, and the
+//! resource maps (servers, their users and host keys, the web apps `ListWebApps`
+//! pages, the AS2 profiles, the connectors, and the
 //! workflows a server's
 //! `WorkflowDetails` attach), the
 //! id-minting counter, the
@@ -2230,7 +2230,8 @@ pub struct Access {
 /// custom URL or the default one), and the IAM Identity Center application the create
 /// registered. So `DescribeWebApp` projects the stored record without re-applying a
 /// default, and the identity-provider and endpoint details are kept in the `Described*`
-/// shapes the readers answer with.
+/// shapes the readers answer with. `ListWebApps` pages this map in `WebAppId` order and
+/// projects `ListedWebApp` from the same record.
 #[derive(Debug, Clone)]
 pub struct WebApp {
     pub web_app_id: String,
@@ -2480,7 +2481,8 @@ impl ComAmazonawsTransferTransferserviceState {
     ///
     /// `ServerId` is `^s-([0-9a-f]{17})$`, `SshPublicKeyId` is `^key-[0-9a-f]{17}$`,
     /// `HostKeyId` is `^hostkey-[0-9a-f]{17}$`,
-    /// `ConnectorId` is `^c-([0-9a-f]{17})$` and `ProfileId` is `^p-([0-9a-f]{17})$`,
+    /// `ConnectorId` is `^c-([0-9a-f]{17})$`, `ProfileId` is `^p-([0-9a-f]{17})$` and
+    /// `WebAppId` is `^webapp-[0-9a-f]{17}$`,
     /// so all of them are this shape;
     /// `{:017x}` is exactly 17 lowercase hex digits for every
     /// counter value below 16^17, which a counter incremented once per created

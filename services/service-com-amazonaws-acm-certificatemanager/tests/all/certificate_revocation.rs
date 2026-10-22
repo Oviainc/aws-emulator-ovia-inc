@@ -111,7 +111,7 @@ fn make_validation_due_now(engine: &Arc<engine::InMemoryEngine>) {
 /// so the test writes the single boolean the emulator itself stores — exactly the
 /// record that operation will leave behind — and drives the revocation and every read
 /// of it over the wire.
-fn mark_exported(engine: &Arc<engine::InMemoryEngine>, arn: &str) {
+pub(crate) fn mark_exported(engine: &Arc<engine::InMemoryEngine>, arn: &str) {
     let store = engine.state::<ComAmazonawsAcmCertificatemanagerState>();
     let mut store = store.lock();
     store

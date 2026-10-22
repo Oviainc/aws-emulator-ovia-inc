@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketEncryption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketEncryption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketEncryption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the named bucket's default encryption configuration: the
+//! `ServerSideEncryptionConfiguration` the last `PutBucketEncryption` associated with it,
+//! or the SSE-S3 default every general purpose bucket carries until one does.
 //!
 //! ## Shape of an operation
 //!
@@ -111,9 +106,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 // here — hence the `GetBucketEncryptionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetBucketEncryption")]
+// Widened by `NoSuchBucket`: the model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetBucketEncryption")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetBucketEncryption",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetBucketEncryptionErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -167,18 +173,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketEncryption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketEncryptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketEncryption"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`GetBucketEncryptionRequest$ExpectedBucketOwner`): this emulator serves one
+        // account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about a bucket the emulator cannot look up, and the
+            // widened-in error would not be a true statement about it. The scaffold's 501
+            // says what is true: this emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetBucketEncryption",
+            ));
+        };
+
+        // Read-only: the guard is taken, the rules are copied out, and nothing is written
+        // — a later caller sees exactly what this one saw. A bucket that no
+        // `PutBucketEncryption` has configured reports the SSE-S3 default, which is
+        // COMPUTED here rather than stored on first read: "By default, all buckets have a
+        // default encryption configuration that uses server-side encryption with Amazon S3
+        // managed keys (SSE-S3)" (this operation's own documentation).
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(GetBucketEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let rules: Vec<crate::state::BucketEncryptionRule> = match bucket.encryption() {
+            Some(configured) => configured.to_vec(),
+            None => vec![crate::state::default_encryption_rule()],
+        };
+
+        Ok(GetBucketEncryptionOutput {
+            server_side_encryption_configuration: Some(ServerSideEncryptionConfiguration {
+                rules: rules
+                    .iter()
+                    .map(|rule| ServerSideEncryptionRule {
+                        // The container is reported exactly when a default algorithm is
+                        // stored, because `SSEAlgorithm` is REQUIRED inside it
+                        // (`smithy_query(query="shape",shape="ServerSideEncryptionByDefault")`).
+                        apply_server_side_encryption_by_default: rule
+                            .sse_algorithm
+                            .clone()
+                            .map(|sse_algorithm| ServerSideEncryptionByDefault {
+                                sse_algorithm,
+                                kms_master_key_id: rule.kms_master_key_id.clone(),
+                            }),
+                        bucket_key_enabled: rule.bucket_key_enabled,
+                        blocked_encryption_types: rule.blocked_encryption_types.clone().map(
+                            |encryption_type| BlockedEncryptionTypes {
+                                encryption_type: Some(encryption_type),
+                            },
+                        ),
+                    })
+                    .collect(),
+            }),
+        })
     }
 }
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransformJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransformJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransformJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a batch transform job: validates the sizing rules the service documents but
+//! does not model, refuses a duplicate name (`ResourceInUse`) or a `ModelName` no stored
+//! model answers to (`ResourceNotFound`), then persists the job as `InProgress` with the
+//! instant the clock owes it a terminal status, and answers its ARN.
+//!
+//! The run itself needs the model's inference container, which this emulator does not
+//! run, so the job reaches the modelled `Failed` with a `FailureReason` that says so
+//! rather than a `Completed` that would claim an S3 object nothing wrote — see
+//! [`crate::state::TRANSFORM_NOT_RUN_FAILURE`]. `DescribeTransformJob` materialises that
+//! transition when the clock has made it due.
 //!
 //! ## Shape of an operation
 //!
@@ -210,18 +212,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransformJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransformJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        if let Some(refusal) = payload_violation(&input) {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "transform-job", &input.transform_job_name);
+
+        let mut store = state.lock();
+        // A name already taken is refused before the quota is consulted: the request adds
+        // no record, so "the store is full" is not why it fails.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransformJob"))
+        // "The name must be unique within an Amazon Web Services Region in an Amazon Web
+        // Services account" (`TransformJobName`'s model doc): a name already taken is
+        // refused with the modelled in-use error, never overwritten — otherwise the
+        // caller reads a 200 for a job it did not create and loses the one it did.
+        if store.transform_jobs.contains_key(&input.transform_job_name) {
+            return Err(CreateTransformJobErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "Transform job names must be unique within an Amazon Web Services \
+                     account and Amazon Web Services Region: \"{arn}\" already exists."
+                )),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `TransformJobName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.transform_jobs_below_quota() {
+            return Err(CreateTransformJobErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for transform jobs is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::TRANSFORM_JOB_QUOTA,
+                        store.transform_jobs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        // "ModelName must be the name of an existing Amazon SageMaker model within an
+        // Amazon Web Services Region in an Amazon Web Services account" (this operation's
+        // model doc), so a job naming no stored model is refused with the modelled
+        // not-found error and nothing is persisted.
+        if !store.models.contains_key(&input.model_name) {
+            let model_arn = crate::state::resource_arn(&region, "model", &input.model_name);
+            return Err(CreateTransformJobErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Could not find model \"{model_arn}\".")),
+            })
+            .into());
+        }
+
+        // The job starts out `InProgress` and is due to reach a terminal status a span
+        // later: stored, never slept on. See `state::TRANSFORM_NOT_RUN_FAILURE` for which
+        // terminal status it reaches and why.
+        let now = ::std::time::SystemTime::now();
+        store.transform_jobs.insert(
+            input.transform_job_name.clone(),
+            crate::state::TransformJob {
+                name: input.transform_job_name.clone(),
+                arn: arn.clone(),
+                model_name: input.model_name.clone(),
+                status: crate::state::TRANSFORM_STATUS_IN_PROGRESS.to_string(),
+                failure_reason: None,
+                max_concurrent_transforms: resolved_max_concurrent_transforms(
+                    input.max_concurrent_transforms,
+                ),
+                model_client_config: input.model_client_config,
+                max_payload_in_mb: resolved_max_payload_in_mb(input.max_payload_in_mb),
+                batch_strategy: input.batch_strategy,
+                environment: input.environment,
+                transform_input: with_input_defaults(input.transform_input),
+                transform_output: input.transform_output,
+                data_capture_config: input.data_capture_config,
+                transform_resources: input.transform_resources,
+                data_processing: input.data_processing,
+                experiment_config: input.experiment_config,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                transform_end_time: None,
+                ends_at: now + crate::state::TRANSFORM_JOB_SETTLES_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateTransformJobOutput {
+            transform_job_arn: arn,
+        })
     }
+}
+
+/// `MaxConcurrentTransforms` as the service resolves it: the request's value, or the
+/// documented default when it is unset or zero (see
+/// [`crate::state::DEFAULT_MAX_CONCURRENT_TRANSFORMS`], which quotes the doc sentence).
+fn resolved_max_concurrent_transforms(requested: Option<i32>) -> i32 {
+    match requested {
+        Some(0) | None => crate::state::DEFAULT_MAX_CONCURRENT_TRANSFORMS,
+        Some(value) => value,
+    }
+}
+
+/// The `TransformInput` the job stores: the request's, with the documented `None`
+/// defaults resolved for the two members whose docs state one (see
+/// [`crate::state::DEFAULT_NONE`]).
+fn with_input_defaults(mut transform_input: TransformInput) -> TransformInput {
+    transform_input.compression_type = Some(
+        transform_input
+            .compression_type
+            .unwrap_or_else(|| crate::state::DEFAULT_NONE.to_string()),
+    );
+    transform_input.split_type = Some(
+        transform_input
+            .split_type
+            .unwrap_or_else(|| crate::state::DEFAULT_NONE.to_string()),
+    );
+    transform_input
+}
+
+/// `MaxPayloadInMB` as the service resolves it: the request's value, or the documented
+/// default when it is unset (see [`crate::state::DEFAULT_MAX_PAYLOAD_IN_MB`], which
+/// quotes the doc sentence).
+fn resolved_max_payload_in_mb(requested: Option<i32>) -> i32 {
+    requested.unwrap_or(crate::state::DEFAULT_MAX_PAYLOAD_IN_MB)
+}
+
+/// Refuse a payload sizing the service documents but the model does not constrain, or
+/// `None` when the request is within both bounds.
+///
+/// `MaxPayloadInMB`'s doc: "The value of MaxPayloadInMB cannot be greater than 100 MB.
+/// If you specify the MaxConcurrentTransforms parameter, the value of
+/// (MaxConcurrentTransforms * MaxPayloadInMB) also cannot exceed 100 MB." The model
+/// bounds the member only from below (`range 0..`), so the ceiling is the handler's to
+/// enforce. The doc conditions the product rule on `MaxConcurrentTransforms` being
+/// specified — a value of 0 means "unset" (see [`resolved_max_concurrent_transforms`]) —
+/// and bounds it against the payload the service uses, which is the documented default
+/// when the request named none.
+fn payload_violation(input: &CreateTransformJobInput) -> Option<String> {
+    let ceiling = crate::state::MAX_PAYLOAD_IN_MB_CEILING;
+    if let Some(payload) = input.max_payload_in_mb.filter(|payload| *payload > ceiling) {
+        return Some(format!(
+            "MaxPayloadInMB must be at most {ceiling} MB, got {payload}."
+        ));
+    }
+    let concurrency = input.max_concurrent_transforms.filter(|value| *value > 0)?;
+    let payload = resolved_max_payload_in_mb(input.max_payload_in_mb);
+    (payload.saturating_mul(concurrency) > ceiling).then(|| {
+        format!(
+            "MaxConcurrentTransforms * MaxPayloadInMB must be at most {ceiling} MB, got \
+             {concurrency} * {payload}."
+        )
+    })
 }

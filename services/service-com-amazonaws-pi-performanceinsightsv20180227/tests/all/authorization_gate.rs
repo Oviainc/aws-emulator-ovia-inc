@@ -15,8 +15,8 @@
 //! Every row below is one input of that class: the table spans the forms an
 //! identifier can take (a name, a bare word, a lowercase token, a bare token
 //! with no kind prefix, an empty token, an uppercased prefix, a numeric string),
-//! both service types, and all five implemented operations. The recorded probe
-//! identifier is ONE row among them.
+//! both service types, and every implemented operation that names a data source.
+//! The recorded probe identifier is ONE row among them.
 
 use serde_json::{json, Value};
 
@@ -128,6 +128,16 @@ fn requests(service_type: &str, identifier: &str, report_id: &str) -> Vec<(&'sta
         (
             "ListPerformanceAnalysisReports",
             json!({"ServiceType": service_type, "Identifier": identifier}),
+        ),
+        (
+            // `os` is the one metric type documented for "All engines", so this
+            // row is otherwise valid under both service types.
+            "ListAvailableResourceMetrics",
+            json!({
+                "ServiceType": service_type,
+                "Identifier": identifier,
+                "MetricTypes": ["os"],
+            }),
         ),
         (
             "GetPerformanceAnalysisReport",
