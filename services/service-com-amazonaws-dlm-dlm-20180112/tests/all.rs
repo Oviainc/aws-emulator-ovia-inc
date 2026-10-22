@@ -17,5 +17,7 @@ mod error_paths;
 mod execution_role_pass_role;
 #[path = "all/lifecycle_policy_crud.rs"]
 mod lifecycle_policy_crud;
+#[path = "all/policy_read_projection.rs"]
+mod policy_read_projection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

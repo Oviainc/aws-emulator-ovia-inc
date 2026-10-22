@@ -71,6 +71,51 @@ pub const IMAGE_POLICY_TYPE: &str = "IMAGE_MANAGEMENT";
 /// policy" and `STANDARD` as "To create a custom policy".
 pub const SIMPLIFIED_POLICY_LANGUAGE: &str = "SIMPLIFIED";
 
+/// The `PolicyLanguage` value that marks a policy as a CUSTOM one:
+/// `PolicyDetails$PolicyLanguage` documents `STANDARD` as "To create a custom
+/// policy".
+pub const STANDARD_POLICY_LANGUAGE: &str = "STANDARD";
+
+/// The policy type of an event-based policy: `PolicyDetails$PolicyType`
+/// documents `EVENT_BASED_POLICY` as the type that "performs specific actions
+/// when a defined event occurs". A policy of this type has no schedules and no
+/// resource locations, so none of the custom snapshot/AMI defaults below belong
+/// to it.
+pub const EVENT_BASED_POLICY_TYPE: &str = "EVENT_BASED_POLICY";
+
+/// Where a custom snapshot or AMI policy's targets live when the request states
+/// no `PolicyDetails$ResourceLocations`, and where a schedule creates its
+/// snapshots when it states no `CreateRule$Location`: both members name the
+/// in-Region location `CLOUD` ("If the source resources are located in a Region,
+/// specify `CLOUD`", and `CreateRule$Location` documents "Default: `CLOUD`").
+pub const CLOUD_LOCATION: &str = "CLOUD";
+
+/// Whether a schedule copies the source resource's tags when the request states
+/// no `Schedule$CopyTags`: the member targets the model's non-nullable `CopyTags`
+/// boolean (as against the `CopyTagsNullable` the optional copy-tags members
+/// target), and `CopyTags` is documented "If you do not specify a value, the
+/// default is false."
+pub const DEFAULT_SCHEDULE_COPY_TAGS: bool = false;
+
+/// Whether a cross-Region snapshot or AMI copy carries the source's user-defined
+/// tags when the copy rule states no `CrossRegionCopyRule$CopyTags`.
+///
+/// The member has no documented default, but a read of a policy whose copy rule
+/// stated none reports the flag ON: a cross-Region copy carries the source's tags
+/// unless the rule turns that off. Like the members above, it is materialized at
+/// create, so a rule that states `false` keeps `false`.
+pub const DEFAULT_COPY_TAGS_ON_COPY: bool = true;
+
+/// The value a schedule rule's interval carries when the request states none.
+///
+/// `CreateRule$Interval` and `RetainRule$Interval` come back as `0` on a read of
+/// a policy whose schedule stated neither — a cron-driven creation rule and a
+/// count-based retention rule respectively — so the service materializes the
+/// integer zero for them rather than leaving them out. Only the two interval
+/// members are stamped: nothing is invented for a member no recorded read shows
+/// the service filling in.
+pub const UNSET_RULE_INTERVAL: i32 = 0;
+
 /// The creation frequency a default policy runs at when the request names none:
 /// `CreateInterval` documents "If you do not specify a value, the default is 1."
 pub const DEFAULT_CREATE_INTERVAL: i32 = 1;
@@ -182,6 +227,83 @@ fn iam_arn_parts(arn: &str) -> Option<(&str, &str)> {
 /// holds is released by `DeleteLifecyclePolicy`.
 pub const POLICY_QUOTA: usize = 1_000;
 
+/// The `PolicyDetails` this service STORES for a policy whose configuration was
+/// stated as a `PolicyDetails` structure: the submitted structure with every
+/// member the service itself materializes stamped onto it.
+///
+/// Amazon Data Lifecycle Manager fills a custom policy's omitted configuration
+/// members in when it accepts the policy, and a read then reports the stored
+/// configuration — the submitted members unchanged plus the materialized ones.
+/// So the stamping happens here, where a create or an update writes the record,
+/// and never in a read projection.
+///
+/// What is stamped, and why:
+///
+/// * `PolicyLanguage` — `STANDARD`, which `PolicyDetails$PolicyLanguage`
+///   documents as the language of a custom policy.
+/// * `ResourceLocations` — `[CLOUD]`, the in-Region location. The member is
+///   `@length(min: 1, max: 1)`, so a read of a custom snapshot or AMI policy
+///   reports exactly one location.
+/// * per schedule — `CopyTags` false, the two rule intervals' zero,
+///   `CreateRule$Location` `CLOUD` (its documented default) for a SNAPSHOT policy
+///   only, since that member is `[Custom snapshot policies only]`, and a
+///   cross-Region copy rule's `CopyTags`. This applies to EVERY element of
+///   `Schedules` (`@length(min: 1, max: 4)`) and of `CrossRegionCopyRules`, not
+///   just the first.
+///
+/// What is NOT stamped: a member for which neither the model, the documentation
+/// nor a recorded read states a value the service fills in — a count, an
+/// interval unit, a nested deprecate/archive/fast-restore rule's members. They
+/// keep exactly what the request stated, because inventing one would be
+/// fabrication.
+pub fn materialized_policy_details(mut details: PolicyDetails) -> PolicyDetails {
+    if details.policy_language.as_deref() == Some(SIMPLIFIED_POLICY_LANGUAGE) {
+        // A DEFAULT policy's configuration. Its `[Default policies only]`
+        // defaults are the documented ones, which
+        // [`LifecyclePolicyRecord::effective_policy_details`] reports from the
+        // record's own body parameters.
+        return details;
+    }
+    details
+        .policy_language
+        .get_or_insert_with(|| STANDARD_POLICY_LANGUAGE.to_string());
+
+    // Resource locations and schedules are `[Custom snapshot and AMI policies
+    // only]`; an event-based policy configures an `EventSource` and `Actions`
+    // instead, so it carries neither.
+    let event_based = details.policy_type.as_deref() == Some(EVENT_BASED_POLICY_TYPE)
+        || details.event_source.is_some();
+    if event_based {
+        return details;
+    }
+    // `CreateRule$Location` is `[Custom snapshot policies only]`, so an AMI
+    // policy's creation rule has no location to report. `PolicyDetails$PolicyType`
+    // is what states the type, and "the default is `EBS_SNAPSHOT_MANAGEMENT`".
+    let creates_snapshots = details.policy_type.as_deref() != Some(IMAGE_POLICY_TYPE);
+
+    details
+        .resource_locations
+        .get_or_insert_with(|| vec![CLOUD_LOCATION.to_string()]);
+    for schedule in details.schedules.iter_mut().flatten() {
+        schedule.copy_tags.get_or_insert(DEFAULT_SCHEDULE_COPY_TAGS);
+        if let Some(create_rule) = schedule.create_rule.as_mut() {
+            if creates_snapshots {
+                create_rule
+                    .location
+                    .get_or_insert_with(|| CLOUD_LOCATION.to_string());
+            }
+            create_rule.interval.get_or_insert(UNSET_RULE_INTERVAL);
+        }
+        if let Some(retain_rule) = schedule.retain_rule.as_mut() {
+            retain_rule.interval.get_or_insert(UNSET_RULE_INTERVAL);
+        }
+        for copy_rule in schedule.cross_region_copy_rules.iter_mut().flatten() {
+            copy_rule.copy_tags.get_or_insert(DEFAULT_COPY_TAGS_ON_COPY);
+        }
+    }
+    details
+}
+
 /// One Amazon Data Lifecycle Manager lifecycle policy, as this emulator persists
 /// it. Every member a read operation reports comes from here, never from the
 /// request being served.
@@ -195,9 +317,10 @@ pub struct LifecyclePolicyRecord {
     pub description: String,
     /// One of `GettablePolicyStateValues` (`ENABLED` | `DISABLED` | `ERROR`).
     pub state: String,
-    /// "The description of the status" — reported only for a policy whose state
-    /// carries one, which in this emulator no policy does: nothing moves a
-    /// policy into `ERROR`.
+    /// "The description of the status", when some failure path has recorded one.
+    /// Nothing in this emulator moves a policy into `ERROR`, so no policy
+    /// carries one and [`LifecyclePolicyRecord::wire_status_message`] reports the
+    /// policy's activation state instead.
     pub status_message: Option<String>,
     pub execution_role_arn: String,
     pub date_created: SystemTime,
@@ -346,13 +469,15 @@ impl LifecyclePolicyRecord {
             .collect()
     }
 
-    /// The policy's tags as the wire map, or `None` when it carries none:
-    /// `TagMap` is modelled `@length(min: 1, max: 200)`, so an EMPTY map is not
-    /// a value this member admits — an untagged policy reports no member at all.
+    /// The policy's tags as the wire map.
+    ///
+    /// A policy with no tags reports the EMPTY map, not an absent member: the
+    /// read path reports the tag set a policy holds, and a client must be able to
+    /// tell "no tags" from "not reported" without a second call. `TagMap`'s
+    /// `@length(min: 1, max: 200)` bounds what a request may SEND — the
+    /// validating walk runs on operation inputs only — and says nothing about
+    /// what a read reports.
     pub fn wire_tags(&self) -> Option<HashMap<String, String>> {
-        if self.tags.is_empty() {
-            return None;
-        }
         Some(
             self.tags
                 .iter()
@@ -361,13 +486,26 @@ impl LifecyclePolicyRecord {
         )
     }
 
+    /// "The description of the status" this policy reports.
+    ///
+    /// It describes the policy's CURRENT status, so a policy that carries no
+    /// failure description reports its activation state — the same
+    /// `GettablePolicyStateValues` member `State` reports. Nothing in this
+    /// emulator runs a policy, so [`LifecyclePolicyRecord::status_message`] is
+    /// set only if some future failure path records one, and it wins when it is.
+    pub fn wire_status_message(&self) -> String {
+        self.status_message
+            .clone()
+            .unwrap_or_else(|| self.state.clone())
+    }
+
     /// The `LifecyclePolicy` projection `GetLifecyclePolicy` returns.
     pub fn to_policy(&self) -> LifecyclePolicy {
         LifecyclePolicy {
             policy_id: Some(self.policy_id.clone()),
             description: Some(self.description.clone()),
             state: Some(self.state.clone()),
-            status_message: self.status_message.clone(),
+            status_message: Some(self.wire_status_message()),
             execution_role_arn: Some(self.execution_role_arn.clone()),
             date_created: Some(::aws_smithy_types::DateTime::from(self.date_created)),
             date_modified: Some(::aws_smithy_types::DateTime::from(self.date_modified)),
