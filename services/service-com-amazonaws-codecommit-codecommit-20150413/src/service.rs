@@ -133,6 +133,11 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "A commit ID was not specified.",
         ),
         ("commitId", _) => ("InvalidCommitIdException", "The specified commit ID is not valid."),
+        ("blobId", _) if missing => (
+            "BlobIdRequiredException",
+            "A blob ID is required, but was not specified.",
+        ),
+        ("blobId", _) => ("InvalidBlobIdException", "The specified blob is not valid."),
         ("commitMessage", ViolationKind::MaxLength(_)) => (
             "CommitMessageLengthExceededException",
             "The commit message is too long.",

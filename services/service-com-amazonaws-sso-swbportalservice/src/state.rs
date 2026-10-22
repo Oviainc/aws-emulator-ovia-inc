@@ -9,10 +9,11 @@
 //! / [`ComAmazonawsSsoSwbportalserviceState::put_account`]; no handler ever synthesizes
 //! an account, a role or a session.
 //!
-//! This module also owns the two rules every handler shares, so neither is written
-//! twice: resolving a presented access token to a usable session
-//! ([`ComAmazonawsSsoSwbportalserviceState::session`]) and cutting a sorted listing into
-//! a page with an opaque cursor ([`page_of`]).
+//! This module also owns the rules every handler shares, so none is written twice:
+//! resolving a presented access token to a usable session
+//! ([`ComAmazonawsSsoSwbportalserviceState::session`]), wording the refusal when it
+//! resolves to nothing ([`unauthorized_session`]), and cutting a sorted listing into a
+//! page with an opaque cursor ([`page_of`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -42,6 +43,28 @@ impl Session {
     /// `UnauthorizedException` for it.
     pub fn is_usable_at(&self, now: SystemTime) -> bool {
         self.active && self.expires_at > now
+    }
+}
+
+/// The message the portal's authentication gate rejects a presented bearer token with.
+///
+/// The gate is one gate: it answers the same `UnauthorizedException` whatever operation
+/// was addressed, whatever the token looked like and whatever else the request carried,
+/// so the text is a constant of the service and never derived from the request. The
+/// Smithy model types `UnauthorizedException$message` as an optional `ErrorDescription`
+/// without stating a text; this is the one the Portal API is recorded answering, on all
+/// four bound operations and every class of unusable token.
+pub const INVALID_SESSION_MESSAGE: &str = "Session token not found or invalid";
+
+/// The portal's one authentication refusal, for a presented access token that names no
+/// usable sign-in session (unknown, logged out or expired alike).
+///
+/// Every handler returns THIS value — wrapped in its own operation's error enum — rather
+/// than a message of its own, so the gate cannot drift per operation and nothing about
+/// the request or the emulator's wiring leaks into it.
+pub fn unauthorized_session() -> crate::ops::types::UnauthorizedException {
+    crate::ops::types::UnauthorizedException {
+        message: Some(INVALID_SESSION_MESSAGE.to_string()),
     }
 }
 
@@ -172,7 +195,8 @@ impl ComAmazonawsSsoSwbportalserviceState {
     /// The session `access_token` names, when it is one this service still serves at
     /// `now`. `None` covers all three unauthorized cases alike — unknown token,
     /// logged-out session, expired session — because the API distinguishes none of
-    /// them.
+    /// them. Word the refusal with [`unauthorized_session`], never with a message of
+    /// the operation's own.
     pub fn session(&self, access_token: &str, now: SystemTime) -> Option<&Session> {
         let resolved = self
             .sessions
