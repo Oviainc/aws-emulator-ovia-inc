@@ -17,3 +17,5 @@ mod channel_lifecycle;
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stream_key_read.rs"]
+mod stream_key_read;
