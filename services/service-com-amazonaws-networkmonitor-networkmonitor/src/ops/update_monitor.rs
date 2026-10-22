@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the `aggregationPeriod` of the monitor [`crate::state`] holds under
+//! this name, then reports that STORED record — so a later `GetMonitor` reads
+//! back exactly what this call answered. A name no monitor is stored under is
+//! refused with the modelled 404 `ResourceNotFoundException`, and an
+//! `aggregationPeriod` outside the documented value list
+//! ([`crate::state::AGGREGATION_PERIODS`], which the shape's own
+//! `@range(min: 30)` cannot express) with the modelled 400
+//! `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +122,34 @@ impl From<UpdateMonitorErrorModeled> for UpdateMonitorError {
     }
 }
 
+/// This service's modelled `ValidationException` (HTTP 400), carrying `message`.
+///
+/// Used for the one rule the model documents in prose but its constraints
+/// cannot express: the `aggregationPeriod` value list.
+fn validation(message: String) -> UpdateMonitorError {
+    UpdateMonitorErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's answer, read out of the STORED monitor record.
+fn output_for(monitor: &crate::state::Monitor) -> UpdateMonitorOutput {
+    UpdateMonitorOutput {
+        monitor_arn: monitor.monitor_arn.clone(),
+        monitor_name: monitor.monitor_name.clone(),
+        state: monitor.state.clone(),
+        aggregation_period: Some(monitor.aggregation_period),
+        tags: Some(
+            monitor
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+    }
+}
+
 /// The `UpdateMonitor` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,18 +186,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMonitor"))
+        let _ = ctx;
+        // `monitorName`'s length bound and `@pattern`, and `aggregationPeriod`'s
+        // `@range(min: 30)`, are refused by the framework BEFORE this handler
+        // runs, so reaching here means the input satisfies each of them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateMonitorErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the networkmonitor monitor store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // The documented value list, applied to the REQUIRED member: the same
+        // rule `CreateMonitor` applies, so a period a create would refuse is not
+        // reachable through an update either.
+        let aggregation_period =
+            crate::state::resolve_aggregation_period(Some(input.aggregation_period))
+                .map_err(validation)?;
+
+        let mut store = state.lock();
+        // The `PENDING` -> `ACTIVE` transition the clock already owed this
+        // monitor, materialised before the record is reported — the same write
+        // `GetMonitor` performs, owed at its due instant whether or not anybody
+        // called.
+        store.settle_monitor(&input.monitor_name, now);
+        let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
+            UpdateMonitorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("monitor {} does not exist", input.monitor_name)),
+            })
+        })?;
+
+        // `modifiedAt` moves only when the stored period actually changes, so a
+        // repeat of the same update (the model marks this operation
+        // `@idempotent`) leaves the record exactly as it was.
+        if monitor.aggregation_period != aggregation_period {
+            monitor.aggregation_period = aggregation_period;
+            monitor.modified_at = now;
+        }
+        // Answered from the STORED record, so what the caller is told is what a
+        // later `GetMonitor` reads back.
+        Ok(output_for(monitor))
     }
 }
