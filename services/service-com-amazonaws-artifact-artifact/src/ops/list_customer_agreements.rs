@@ -165,13 +165,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The token is the customer-agreement id the next page starts at, so anything
-        // that is not one was never issued by this operation.
+        // that is not one was never issued by this operation. A token this service did
+        // not issue is refused with the service's one fixed invalid-token text, the same
+        // as every other token member.
         if let Some(token) = input.next_token.as_deref() {
             if !crate::state::is_customer_agreement_id(token) {
                 return Err(ListCustomerAgreementsErrorModeled::ValidationException(
-                    crate::state::invalid_token(
-                        "nextToken is not a token returned by ListCustomerAgreements",
-                    ),
+                    crate::state::invalid_token(),
                 )
                 .into());
             }
