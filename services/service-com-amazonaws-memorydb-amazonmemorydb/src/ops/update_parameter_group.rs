@@ -187,6 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A parameter-group name is a case-insensitive identifier, so the name this
+        // request updates is folded exactly as the store is keyed.
+        let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
         let mut state = state.lock();
         // Besides this update's own write, the only one: the status transitions the
         // clock already owed the stored clusters and ACLs at this instant.
@@ -199,13 +202,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             UpdateParameterGroupErrorModeled::ParameterGroupNotFoundFault(
                 ParameterGroupNotFoundFault {
                     message: Some(format!(
-                        "Parameter group {} not found.",
-                        input.parameter_group_name
+                        "Parameter group {parameter_group_name} not found."
                     )),
                 },
             )
         };
-        let Some(group) = state.parameter_groups.get(&input.parameter_group_name) else {
+        let Some(group) = state.parameter_groups.get(&parameter_group_name) else {
             return Err(not_found().into());
         };
         let family = group.family.clone();
@@ -258,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             applied.insert(parameter.name.to_string(), value);
         }
 
-        let Some(group) = state.parameter_groups.get_mut(&input.parameter_group_name) else {
+        let Some(group) = state.parameter_groups.get_mut(&parameter_group_name) else {
             // The group was looked up under the same lock that is still held, so this
             // cannot be reached; refusing beats answering with an unpersisted group.
             return Err(not_found().into());

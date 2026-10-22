@@ -16,11 +16,33 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The SQL engine this service's data plane runs on: caller statements are parsed,
+# planned and executed by SQLite in-process, never by a hand-written SQL subset.
+# DELIBERATE: `bundled` compiles SQLite's C sources here (libsqlite3-sys + `cc` run
+# on the build host) rather than linking whatever the host happens to ship, so the
+# engine version is pinned by Cargo.lock and reproducible.
+# `backup` copies a database for a transaction's snapshot, `column_decltype`
+# supplies the declared type of each result column for `columnMetadata`, `hooks`
+# installs BOTH the progress handler that bounds a statement and the default-deny
+# authorizer that confines it, and `limits` sets the engine's size, depth and
+# ATTACH limits. Every escape this re-opens is closed in `Database::open` (see the
+# `src/state.rs` module docs): ATTACH/DETACH (and so `VACUUM INTO`), PRAGMA,
+# foreign virtual tables and the file-touching SQL functions are refused by the
+# authorizer, extension loading is off, defensive mode is on, and memory, value
+# size, statement size, expression depth and query complexity are all capped.
+rusqlite = { version = "0.37", features = ["bundled", "backup", "column_decltype", "hooks", "limits"] }
+# Opaque, unique transaction identifiers for BeginTransaction.
+uuid = { version = "1", features = ["v4"] }
+# The calendar and clock behind the DATE/TIME/TIMESTAMP `typeHint`s: a hinted
+# string is accepted only if this crate parses it as the date or time the model's
+# documented format names, so no date arithmetic or format parsing is written
+# here. Same version the rest of the tree pins.
+time = { version = "0.3.55", default-features = false, features = ["parsing", "macros", "std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

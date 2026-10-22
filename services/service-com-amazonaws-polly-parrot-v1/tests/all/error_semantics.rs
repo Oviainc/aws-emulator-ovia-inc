@@ -14,10 +14,11 @@ use bytes::Bytes;
 use service_com_amazonaws_polly_parrot_v1::ops::put_lexicon::MAX_LEXEME_CHARACTERS;
 use service_com_amazonaws_polly_parrot_v1::service::errors;
 use service_com_amazonaws_polly_parrot_v1::state::{
-    service_state, PendingTaskStatus, StoredSynthesisTask, TASK_COMPLETION_DELAY,
+    PendingTaskStatus, StoredSynthesisTask, TASK_COMPLETION_DELAY,
 };
 
 use crate::lexicons_and_speech::{error_code, json, Polly};
+use crate::support::{seed_task, stored_task};
 
 /// The `message` an error response carries, absent when the error carries none.
 fn error_message(response: &http::Response<Bytes>) -> Option<String> {
@@ -74,41 +75,6 @@ fn pls_with_replacement(element: &str, length: usize) -> String {
          <lexeme><grapheme>G</grapheme><{element}>{}</{element}></lexeme></lexicon>",
         "x".repeat(length)
     )
-}
-
-/// A synthesis task as a start call would have recorded it. Rows below override the
-/// members they are about.
-fn stored_task(task_id: &str, created: SystemTime) -> StoredSynthesisTask {
-    StoredSynthesisTask {
-        task_id: task_id.to_string(),
-        engine: "standard".to_string(),
-        output_format: "mp3".to_string(),
-        output_uri: format!("s3://polly-output/{task_id}.mp3"),
-        creation_time: created,
-        request_characters: 11,
-        sns_topic_arn: None,
-        lexicon_names: Vec::new(),
-        sample_rate: Some("22050".to_string()),
-        speech_mark_types: Vec::new(),
-        text_type: "text".to_string(),
-        voice_id: "Joanna".to_string(),
-        language_code: None,
-        task_status: "inProgress".to_string(),
-        task_status_reason: None,
-        pending_status: None,
-    }
-}
-
-/// Put a task in the store the way a start call would.
-///
-/// `StartSpeechSynthesisTask` is still scaffolded (it has its own stub issue), so the
-/// read path is seeded through the shared engine rather than through that call.
-fn seed_task(polly: &Polly, task: &StoredSynthesisTask) {
-    let state = service_state(&**polly.engine()).expect("the in-memory engine carries the state");
-    state
-        .lock()
-        .synthesis_tasks
-        .insert(task.task_id.clone(), task.clone());
 }
 
 /// RULE: a read of a resource that does not exist is refused with the modelled

@@ -26,6 +26,33 @@ service-com-amazonaws-rdsdata-rdsdataservice/
     └── ops/              # ONE FILE PER OPERATION
 ```
 
+## Data plane
+
+The five implemented operations (`ExecuteStatement`, `BatchExecuteStatement`,
+`BeginTransaction`, `CommitTransaction`, `RollbackTransaction`) are a front end
+over a real SQL engine: `src/state.rs` holds one in-process SQLite database per
+(cluster `resourceArn`, `database` name) and the transactions open on each
+cluster, and every statement is parsed, planned and executed by that engine.
+Nothing matches on SQL text. `ExecuteSql` (deprecated in the model) is still
+scaffolded and answers 501.
+
+Because caller SQL runs on a real engine, `Database::open` — the only place a
+connection is created — takes the engine's host reach away before any statement
+can use it, and bounds what one request may consume. The module docs in
+`src/state.rs` list every measure and why; in summary:
+
+| Concern | How it is answered |
+|---|---|
+| Host filesystem | default-deny authorizer: `ATTACH`/`DETACH` (and so `VACUUM INTO`), foreign virtual tables, the file-touching SQL functions and every unconsidered action are refused; `SQLITE_LIMIT_ATTACHED` is 0 |
+| Loadable code | `rusqlite`'s `load_extension` feature is not enabled, and the `load_extension` SQL function is refused |
+| Engine configuration | only the `table_info`/`table_xinfo` pragmas are allowed (they read this database's own schema); defensive mode on, untrusted schema |
+| Memory | `max_page_count` (64 MiB per database), `SQLITE_LIMIT_LENGTH`, and caps on stored clusters, databases and open transactions |
+| CPU | one statement deadline per REQUEST, enforced by the engine's progress handler, plus an outer wall clock; the whole unit runs on the blocking pool, never on an async worker |
+| Statement complexity | `SQLITE_LIMIT_SQL_LENGTH`, `SQLITE_LIMIT_EXPR_DEPTH`, `SQLITE_LIMIT_COMPOUND_SELECT`, `SQLITE_LIMIT_VARIABLE_NUMBER`, and a cap on `parameterSets` per call |
+| Output | the 1 MB result-set cap the model documents, checked before each value is copied out of the engine |
+
+`tests/all/sql_data_api.rs` asserts each of these refusals end to end.
+
 ## Implementing an operation
 
 Each file in `src/ops/` owns exactly one operation and declares which one

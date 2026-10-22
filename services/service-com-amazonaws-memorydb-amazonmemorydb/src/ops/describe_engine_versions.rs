@@ -168,13 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         }
-        if input.max_results.is_some_and(|max| max < 1) {
-            // The same refusal the other listings in this service make for a page size
-            // below 1, carried by this operation's own modelled 400.
+        if let Some(message) = crate::state::max_results_rejection(input.max_results) {
+            // A page size outside the window names no page: the same refusal every
+            // other listing in this service makes, carried by this operation's own
+            // modelled 400.
             return Err(
                 DescribeEngineVersionsErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some("MaxResults must be at least 1.".to_string()),
+                        message: Some(message),
                     },
                 )
                 .into(),

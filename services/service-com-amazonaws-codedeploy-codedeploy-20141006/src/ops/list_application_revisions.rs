@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplicationRevisions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplicationRevisions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists an application's registered revisions, filtered, sorted and paged as the
+//! request asked.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplicationRevisions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +185,200 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplicationRevisions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationRevisionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplicationRevisions"))
+        let _ = ctx;
+        // A key prefix filters the objects WITHIN a bucket, so it says nothing on
+        // its own: the cross-member precondition is this operation's own
+        // `BucketNameFilterRequiredException`, and it is checked before any
+        // state is read.
+        if input.s3_key_prefix.is_some() && input.s3_bucket.is_none() {
+            return Err(
+                ListApplicationRevisionsErrorModeled::BucketNameFilterRequiredException(
+                    BucketNameFilterRequiredException {
+                        message: Some(
+                            "A bucket name filter is required when a key prefix filter is \
+                             specified, but was not provided"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A bucket filter that is present has to name a bucket; `sortBy`,
+        // `sortOrder` and `deployed` are modelled value sets, so the boundary
+        // already refused anything outside them.
+        if input.s3_bucket.as_deref().is_some_and(str::is_empty) {
+            return Err(
+                ListApplicationRevisionsErrorModeled::InvalidBucketNameFilterException(
+                    InvalidBucketNameFilterException {
+                        message: Some(
+                            "The bucket name filter was specified in an invalid format: it names \
+                             no bucket"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let name = input.application_name;
+        let token = input.next_token;
+        let filter = Filter {
+            bucket: input.s3_bucket,
+            key_prefix: input.s3_key_prefix,
+            deployed: input.deployed,
+        };
+        let sort = Sort {
+            by: input.sort_by,
+            order: input.sort_order,
+        };
+
+        let found = crate::state::with_state(&*self.engine, |state| {
+            let Some(application) = state.applications.get(&name) else {
+                return Err(ListApplicationRevisionsErrorModeled::ApplicationDoesNotExistException(
+                    ApplicationDoesNotExistException {
+                        message: Some(format!("No application found for name {name}")),
+                    },
+                ));
+            };
+            // The revision keys that ARE the target revision of a deployment
+            // group, which is what the `deployed` filter selects on: ONE walk of
+            // the deployment index, whatever the page carries.
+            let targeted: ::std::collections::HashSet<String> =
+                crate::state::target_revision_keys(state, application)
+                    .into_values()
+                    .collect();
+            // Registration order first, so revisions the sort cannot separate
+            // keep a deterministic order and a page is stable.
+            let mut keys: Vec<String> = application
+                .revision_order
+                .iter()
+                .filter(|key| {
+                    application
+                        .revisions
+                        .get(*key)
+                        .is_some_and(|revision| filter.matches(revision, &targeted, key.as_str()))
+                })
+                .cloned()
+                .collect();
+            sort.apply(&mut keys, application);
+            let Some((page, next_token)) = crate::state::paginate(&keys, token.as_deref()) else {
+                return Err(ListApplicationRevisionsErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some("The next token was specified in an invalid format".to_string()),
+                    },
+                ));
+            };
+            let revisions = page
+                .iter()
+                .filter_map(|key| application.revisions.get(key))
+                .map(|revision| revision.revision.clone())
+                .collect::<Vec<_>>();
+            Ok((revisions, next_token))
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let (revisions, next_token) = found?;
+        Ok(ListApplicationRevisionsOutput {
+            revisions: Some(revisions),
+            next_token,
+        })
+    }
+}
+
+/// The `ListStateFilterAction` values, which say what to do with a revision that
+/// IS the target revision of a deployment group
+/// (`smithy_query(query="doc",shape="ListApplicationRevisionsInput",member="deployed")`).
+const DEPLOYED_INCLUDE: &str = "include";
+/// See [`DEPLOYED_INCLUDE`].
+const DEPLOYED_EXCLUDE: &str = "exclude";
+
+/// The `ApplicationRevisionSortBy` values that sort on a revision's USE
+/// (`smithy_query(query="shape",shape="ApplicationRevisionSortBy")`:
+/// registerTime | firstUsedTime | lastUsedTime).
+const SORT_BY_FIRST_USED_TIME: &str = "firstUsedTime";
+/// See [`SORT_BY_FIRST_USED_TIME`].
+const SORT_BY_LAST_USED_TIME: &str = "lastUsedTime";
+
+/// The `SortOrder` value that reverses the sort
+/// (`smithy_query(query="shape",shape="SortOrder")`: ascending | descending;
+/// "If not specified, the results are sorted in ascending order").
+const SORT_ORDER_DESCENDING: &str = "descending";
+
+/// Which of an application's revisions this request asked for.
+struct Filter {
+    bucket: Option<String>,
+    key_prefix: Option<String>,
+    deployed: Option<String>,
+}
+
+impl Filter {
+    /// Whether `revision`, registered under `key`, is one this request asked
+    /// for. `targeted` holds the keys of the revisions that are the target
+    /// revision of a deployment group.
+    fn matches(
+        &self,
+        revision: &crate::state::ApplicationRevision,
+        targeted: &::std::collections::HashSet<String>,
+        key: &str,
+    ) -> bool {
+        // The S3 filters select on the revision's location, so a revision that
+        // is not in S3 at all matches neither of them.
+        if self.bucket.is_some() || self.key_prefix.is_some() {
+            let Some(s3) = &revision.revision.s3_location else {
+                return false;
+            };
+            if let Some(bucket) = &self.bucket {
+                if s3.bucket.as_deref() != Some(bucket.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(prefix) = &self.key_prefix {
+                if !s3.key.as_deref().unwrap_or_default().starts_with(prefix) {
+                    return false;
+                }
+            }
+        }
+        match self.deployed.as_deref() {
+            Some(DEPLOYED_INCLUDE) => targeted.contains(key),
+            Some(DEPLOYED_EXCLUDE) => !targeted.contains(key),
+            // `ignore`, and the absent filter: every revision.
+            _ => true,
+        }
+    }
+}
+
+/// How this request asked for its revisions to be ordered.
+struct Sort {
+    by: Option<String>,
+    order: Option<String>,
+}
+
+impl Sort {
+    /// Order `keys` as this request asked. A `sortBy` the request did not name
+    /// leaves the registration order the caller's revisions were collected in,
+    /// which the model allows ("If not specified or set to null, the results are
+    /// returned in an arbitrary order") and which pages stably.
+    fn apply(&self, keys: &mut [String], application: &crate::state::Application) {
+        if let Some(by) = self.by.as_deref() {
+            // A stable sort, so revisions sharing a timestamp — and the ones
+            // with no timestamp at all, for a revision no deployment has used —
+            // keep their registration order.
+            keys.sort_by_key(|key| {
+                application.revisions.get(key).and_then(|revision| match by {
+                    SORT_BY_FIRST_USED_TIME => revision.first_used_time_ms,
+                    SORT_BY_LAST_USED_TIME => revision.last_used_time_ms,
+                    // `registerTime`, the enum's remaining value, which every
+                    // registered revision has.
+                    _ => Some(revision.register_time_ms),
+                })
+            });
+        }
+        if self.order.as_deref() == Some(SORT_ORDER_DESCENDING) {
+            keys.reverse();
+        }
     }
 }

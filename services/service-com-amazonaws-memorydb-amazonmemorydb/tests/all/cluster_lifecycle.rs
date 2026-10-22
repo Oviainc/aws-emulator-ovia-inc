@@ -828,7 +828,9 @@ async fn listings_page_over_the_whole_set_for_any_page_size() {
     }
     assert_eq!(
         seen,
-        vec!["page-acl", "page-acl-b", "page-acl-c"],
+        // The built-in `open-access` ACL every MemoryDB account already has pages with
+        // the created ones, and sorts first.
+        vec!["open-access", "page-acl", "page-acl-b", "page-acl-c"],
         "case {:?}: paging must yield every ACL once, in name order",
         "acl paging"
     );
@@ -1077,13 +1079,13 @@ async fn resolution_and_conflict_faults_come_from_state() {
             "DescribeACLs",
             json!({ "NextToken": "zzz-no-such-position" }),
             400,
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
         (
             "DescribeACLs",
             json!({ "MaxResults": 0 }),
             400,
-            "ValidationException",
+            "InvalidParameterValueException",
         ),
     ];
 

@@ -71,9 +71,53 @@
 //! ## Errors
 //!
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request exceeds a service quota.
+//!
+//! ## Beside the model
+//!
+//! The recorded 201 carries two further top-level members the model declares on no
+//! shape — `accountId`, the domain's owning account, and `onboardingGeneration`, the
+//! provisioning-generation discriminator — both projected out of the stored record
+//! through [`crate::state::RecordedMembers`]. See [`ACCOUNT_ID_MEMBER`].
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The member `accountId` is written under, beside the modelled members.
+///
+/// RECORDED behaviour: `CreateDomainOutput` declares `domainId`, `arn`, `name`,
+/// `kmsKeyArn`, `encryptionContext`, `status`, `webAppUrl`, `webAppConfiguration` and
+/// `createdAt` and nothing else (`smithy_query(query="shape",
+/// shape="CreateDomainOutput")`), so there is no generated field for `accountId` and
+/// this schema is what names it on the wire. Index 9 is the first free member index
+/// after those nine (0..=8). See [`crate::state::RecordedMembers`].
+const ACCOUNT_ID_MEMBER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.connecthealth#CreateDomainOutput$accountId",
+        "com.amazonaws.connecthealth",
+        "accountId",
+    ),
+    ::aws_smithy_schema::ShapeType::String,
+    "accountId",
+    9,
+);
+
+/// The member `onboardingGeneration` is written under — the next free index after
+/// [`ACCOUNT_ID_MEMBER`], and recorded-only for the same reason.
+const ONBOARDING_GENERATION_MEMBER: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.connecthealth#CreateDomainOutput$onboardingGeneration",
+            "com.amazonaws.connecthealth",
+            "onboardingGeneration",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "onboardingGeneration",
+        10,
+    );
+
+/// What `CreateDomain` answers: the modelled `CreateDomainOutput` plus the recorded
+/// top-level `accountId` and `onboardingGeneration`.
+pub type CreateDomainResponse = crate::state::RecordedMembers<CreateDomainOutput>;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -130,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for CreateDomain<Eng>
 {
     type Input = CreateDomainInput;
-    type Output = CreateDomainOutput;
+    type Output = CreateDomainResponse;
     type Error = CreateDomainError;
 
     const NAME: &'static str = "CreateDomain";
@@ -229,11 +273,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let domain = crate::state::Domain {
             domain_id: domain_id.clone(),
             arn: arn.clone(),
+            account_id: crate::state::owning_account_id(),
+            // Every domain this emulator creates is onboarded through the one
+            // provisioning path it implements; the generation is fixed here, at
+            // creation, and read back from the record by every response.
+            onboarding_generation: crate::state::OnboardingGeneration::Legacy,
             name: input.name,
             kms_key_arn: input.kms_key_arn,
             encryption_type,
             status: crate::state::DomainStatus::Active,
             purge_due_at: None,
+            deleted_at: None,
             web_app_url,
             web_app_configuration,
             created_at: now,
@@ -252,25 +302,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `or_insert` hands back the record it STORED, so every field rendered below is
         // read out of the store rather than echoed from the request.
         let stored = store.domains.entry(domain_id).or_insert(domain);
-        Ok(CreateDomainOutput {
-            domain_id: stored.domain_id.clone(),
-            arn: stored.arn.clone(),
-            name: stored.name.clone(),
-            kms_key_arn: stored.kms_key_arn.clone(),
-            encryption_context: Some(EncryptionContext {
-                encryption_type: stored.encryption_type.as_wire().to_string(),
+        Ok(CreateDomainResponse {
+            payload: CreateDomainOutput {
+                domain_id: stored.domain_id.clone(),
+                arn: stored.arn.clone(),
+                name: stored.name.clone(),
                 kms_key_arn: stored.kms_key_arn.clone(),
-            }),
-            status: stored.status.as_wire().to_string(),
-            web_app_url: stored.web_app_url.clone(),
-            web_app_configuration: stored.web_app_configuration.as_ref().map(|config| {
-                WebAppConfiguration {
-                    ehr_role: config.ehr_role.clone(),
-                    idc_application_id: config.idc_application_id.clone(),
-                    idc_region: config.idc_region.clone(),
-                }
-            }),
-            created_at: crate::state::to_timestamp(stored.created_at),
+                encryption_context: Some(EncryptionContext {
+                    encryption_type: stored.encryption_type.as_wire().to_string(),
+                    kms_key_arn: stored.kms_key_arn.clone(),
+                }),
+                status: stored.status.as_wire().to_string(),
+                web_app_url: stored.web_app_url.clone(),
+                web_app_configuration: stored.web_app_configuration.as_ref().map(|config| {
+                    WebAppConfiguration {
+                        ehr_role: config.ehr_role.clone(),
+                        idc_application_id: config.idc_application_id.clone(),
+                        idc_region: config.idc_region.clone(),
+                    }
+                }),
+                created_at: crate::state::to_timestamp(stored.created_at),
+            },
+            members: vec![
+                crate::state::RecordedMember::Text(&ACCOUNT_ID_MEMBER, stored.account_id.clone()),
+                crate::state::RecordedMember::Text(
+                    &ONBOARDING_GENERATION_MEMBER,
+                    stored.onboarding_generation.as_wire().to_string(),
+                ),
+            ],
         })
     }
 }

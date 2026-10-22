@@ -48,6 +48,15 @@
 //!
 //! * `InputId` (__string) **required** — Unique ID of the input
 //!
+//! ## Output
+//!
+//! The model gives `DeleteInputResponse` no members at all, but the recorded wire
+//! response carries the deleted input's full representation — the same flat
+//! projection `DescribeInputResponse` declares, and the same shape
+//! `DeleteChannelResponse` declares for a deleted channel. The wire is the
+//! authority where it and the model disagree, so this operation serialises
+//! through that modelled flat projection; see the note on `OUTPUT_SCHEMA` below.
+//!
 //! ## Errors
 //!
 //! * `BadGatewayException` (HTTP 502) — Placeholder documentation for BadGatewayException
@@ -127,12 +136,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DeleteInput<Eng>
 {
     type Input = DeleteInputInput;
-    type Output = DeleteInputOutput;
+    // The deleted input's own representation, NOT the memberless
+    // `DeleteInputOutput` the model declares: the recorded response to
+    // `DELETE /prod/inputs/{InputId}` is the input's flat projection, which is
+    // exactly the shape `DescribeInputResponse` models (and what
+    // `DeleteChannelResponse` models for a channel). Serialising through that
+    // modelled shape keeps every member name, type and `jsonName` the model's
+    // own, rather than inventing an output shape the model does not declare.
+    type Output = DescribeInputOutput;
     type Error = DeleteInputError;
 
     const NAME: &'static str = "DeleteInput";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_INPUT_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_INPUT_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DESCRIBE_INPUT_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
@@ -187,11 +203,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(unavailable)?;
         crate::state::begin_delete_input(record, now);
 
-        // `DeleteInputResponse` carries no members at all
-        // (`smithy_query(query="operation", operation="DeleteInput")`), so the
-        // success is an empty body at HTTP 200; the effect is readable through
-        // `DescribeInput`.
-        Ok(DeleteInputOutput {})
+        // The response is the deleted input, read back out of the store after the
+        // deletion was written — so its `State` is the one that was just stored
+        // (`DELETING`, or `DELETED` on a repeat whose clock has already run) and
+        // every other member is the stored record's, never this request's. A
+        // client that reads `state` to learn the input entered `DELETING` has its
+        // starting state for a delete-then-wait flow, and the same projection a
+        // later `DescribeInput` reports.
+        let deleted = state
+            .input_description(&input.input_id)
+            .ok_or_else(unavailable)?;
+        Ok(crate::state::input_description_output!(
+            DescribeInputOutput,
+            deleted
+        ))
     }
 }
 

@@ -171,15 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        Ok(DescribeInputSecurityGroupOutput {
-            arn: group.arn,
-            id: group.id,
-            inputs: group.inputs,
-            state: group.state,
-            tags: group.tags,
-            whitelist_rules: group.whitelist_rules,
-            channels: group.channels,
-        })
+        Ok(crate::state::input_security_group_description_output!(
+            DescribeInputSecurityGroupOutput,
+            group
+        ))
     }
 }
 
