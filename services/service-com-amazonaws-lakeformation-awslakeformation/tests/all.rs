@@ -17,5 +17,7 @@ mod lf_tags;
 mod permissions;
 #[path = "all/registered_resources.rs"]
 mod registered_resources;
+#[path = "all/revoke_default_grant.rs"]
+mod revoke_default_grant;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

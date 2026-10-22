@@ -10,6 +10,15 @@
 //! and is refused with the modelled `InvalidInputException`, so a caller is never told a
 //! permission it still holds was removed.
 //!
+//! One grant is not a record: a Data Catalog DATABASE is created carrying the account's
+//! "use only IAM access control" default — `ALL` to `IAM_ALLOWED_PRINCIPALS` — which no
+//! `GrantPermissions` call made, so there is nothing in `permission_grants` to trim. It is
+//! held on top of whatever was granted explicitly, and a revoke that names it is
+//! remembered in `revoked_default_grants`, so the default is revocable exactly once while
+//! an explicit grant on the same resource is trimmed as usual. See
+//! [`crate::state::default_database_grant`] for what the default covers and why it stops
+//! at databases.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -105,8 +114,8 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-lakeformation-awslakefo
 pub enum RevokePermissionsErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
     EntityNotFoundException(EntityNotFoundException),
-    InternalServiceException(InternalServiceException),
     InvalidInputException(InvalidInputException),
+    InternalServiceException(InternalServiceException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -212,25 +221,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Everything the grantee does not hold, whether because the grant does not exist
         // at all or because it never carried these permissions: both are "there is
-        // nothing here to revoke", so both are refused the same way.
+        // nothing here to revoke", so both are refused the same way. A resource that was
+        // created carrying the account's default grant holds that grant until it is
+        // revoked, even though no record was ever written for it.
         let mut store = state.lock();
+        // The creation-time default, unless a revoke already took it away. It is not a
+        // record, so it is held ON TOP of whatever `GrantPermissions` wrote: a principal
+        // that was granted SELECT on a database created under the IAM-access-control
+        // default holds both.
+        let default_grant =
+            crate::state::default_database_grant(&resource, principal, condition.as_deref())
+                .filter(|_| !store.revoked_default_grants.contains(&key));
         let held = store.permission_grants.get(&key);
-        let missing = match held {
-            Some(grant) => {
-                let mut missing =
-                    crate::state::missing_permissions(&grant.permissions, &permissions);
-                missing.extend(crate::state::missing_permissions(
-                    &grant.permissions_with_grant_option,
-                    &permissions_with_grant_option,
-                ));
-                missing
-            }
-            None => permissions
-                .iter()
-                .chain(permissions_with_grant_option.iter())
-                .cloned()
-                .collect(),
-        };
+        let mut held_permissions: Vec<String> = held
+            .map(|grant| grant.permissions.clone())
+            .unwrap_or_default();
+        if let Some(default) = &default_grant {
+            held_permissions.extend(default.iter().cloned());
+        }
+        // The default grant carries no grant option, so only a record can hold one.
+        let held_with_grant_option: Vec<String> = held
+            .map(|grant| grant.permissions_with_grant_option.clone())
+            .unwrap_or_default();
+        let mut missing = crate::state::missing_permissions(&held_permissions, &permissions);
+        missing.extend(crate::state::missing_permissions(
+            &held_with_grant_option,
+            &permissions_with_grant_option,
+        ));
         if !missing.is_empty() {
             // The message AWS answers this with, as the recorded trace shows it: fixed
             // prose (the doubled "does not" is the real service's own wording) followed
@@ -243,24 +260,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let Some(grant) = store.permission_grants.get_mut(&key) else {
-            // Unreachable: `missing` is every requested permission when the record is
-            // absent, which the refusal above already answered.
-            return Err(invalid(
-                "Grantee has no permissions on the requested resource".to_string(),
-            ));
-        };
-        crate::state::remove_permissions(&mut grant.permissions, &permissions);
-        crate::state::remove_permissions(
-            &mut grant.permissions_with_grant_option,
-            &permissions_with_grant_option,
-        );
-        // A record with nothing left in either set is no longer a grant: drop it, so a
-        // later `ListPermissions` reports no entry rather than an entry with no
-        // permissions.
-        let emptied = grant.permissions.is_empty() && grant.permissions_with_grant_option.is_empty();
-        if emptied {
-            store.permission_grants.remove(&key);
+        // Taking a default grant away leaves no record to trim, so what is left behind is
+        // the memory that it is gone — a record of its own, under its own ceiling
+        // (`crate::state::MAX_REVOKED_DEFAULT_GRANTS`), since its key is a
+        // request-supplied database name.
+        let revokes_default = default_grant
+            .as_ref()
+            .is_some_and(|default| default.iter().any(|granted| permissions.contains(granted)));
+        if revokes_default {
+            if store.revoked_default_grants.len() >= crate::state::MAX_REVOKED_DEFAULT_GRANTS
+                && !store.revoked_default_grants.contains(&key)
+            {
+                return Err(invalid(format!(
+                    "The revoke of the default grant could not be recorded: {} revoked \
+                     default grants are already held, the maximum is {}",
+                    store.revoked_default_grants.len(),
+                    crate::state::MAX_REVOKED_DEFAULT_GRANTS
+                )));
+            }
+            store.revoked_default_grants.insert(key.clone());
+        }
+
+        let mut emptied = true;
+        if let Some(grant) = store.permission_grants.get_mut(&key) {
+            crate::state::remove_permissions(&mut grant.permissions, &permissions);
+            crate::state::remove_permissions(
+                &mut grant.permissions_with_grant_option,
+                &permissions_with_grant_option,
+            );
+            // A record with nothing left in either set is no longer a grant: drop it, so a
+            // later `ListPermissions` reports no entry rather than an entry with no
+            // permissions.
+            emptied = grant.permissions.is_empty() && grant.permissions_with_grant_option.is_empty();
+            if emptied {
+                store.permission_grants.remove(&key);
+            }
         }
 
         // The audit record for a state change: who, what, where, outcome. No secret and
@@ -280,3 +314,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(RevokePermissionsOutput {})
     }
 }
+

@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-lakeformation-awslakeformation service.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -151,7 +151,8 @@ impl PermissionGrant {
 ///
 /// A permission grant is durable in the same way — only `RevokePermissions` releases one
 /// — and `GrantPermissions`, its single inserting site, refuses a record past
-/// [`MAX_PERMISSION_GRANTS`].
+/// [`MAX_PERMISSION_GRANTS`]. `revoked_default_grants` is a record of the same kind and
+/// counts against the same ceiling, checked where `RevokePermissions` inserts into it.
 ///
 /// `registered_resources` is bounded the same way, by [`MAX_REGISTERED_RESOURCES`] checked
 /// in `RegisterResource`, the single site that inserts into it.
@@ -165,6 +166,13 @@ pub struct ComAmazonawsLakeformationAwslakeformationState {
     /// reason: `ListPermissions` pages through it in key order and its continuation
     /// token names the key the previous page stopped on.
     pub permission_grants: BTreeMap<String, PermissionGrant>,
+    /// The [`grant_key`]s whose creation-time default grant has been revoked.
+    ///
+    /// A default grant ([`default_database_grant`]) is not a record: nothing granted it,
+    /// so there is nothing in `permission_grants` for `RevokePermissions` to trim. What
+    /// the revoke leaves behind is this memory that the grant is gone, which is what
+    /// makes the default revocable exactly once.
+    pub revoked_default_grants: BTreeSet<String>,
     /// Resource ARN -> its registration. A `BTreeMap` for the same reason: `ListResources`
     /// pages over a stable, sorted order, and `DescribeResource` is an exact-ARN lookup.
     pub registered_resources: BTreeMap<String, RegisteredResource>,
@@ -217,6 +225,76 @@ pub const MAX_LF_TAG_CATALOGS: usize = 100;
 /// grow resident state past it. A create that would pass it answers the modelled
 /// `ResourceNumberLimitExceededException`. Emulator-chosen, like the ceilings above.
 pub const MAX_LF_TAGS_TOTAL: usize = 10_000;
+
+/// The principal the data lake settings' default grant names: AWS's own group standing
+/// for "every IAM principal that IAM itself allows", spelled exactly like this on the
+/// wire.
+pub const IAM_ALLOWED_PRINCIPALS: &str = "IAM_ALLOWED_PRINCIPALS";
+
+/// The one permission the "use only IAM access control" default grant carries.
+///
+/// From the model, not chosen: `DataLakeSettings$CreateDatabaseDefaultPermissions`
+/// documents that "A value that assigns ALL to IAM_ALLOWED_PRINCIPALS indicates access
+/// control by IAM permissions. This is referred to as the setting \"Use only IAM access
+/// control\", and is for backward compatibility with the Glue permission model", and that
+/// "The only permitted values are an empty array or an array that contains a single JSON
+/// object that grants ALL to IAM_ALLOWED_PRINCIPALS"
+/// (`smithy_query(query="doc",shape="DataLakeSettings",member="CreateDatabaseDefaultPermissions")`).
+pub const DEFAULT_IAM_ACCESS_CONTROL_PERMISSION: &str = "ALL";
+
+/// The grant a Data Catalog DATABASE is created carrying, until a revoke takes it away:
+/// `ALL` to `IAM_ALLOWED_PRINCIPALS`, the account's "use only IAM access control" default
+/// (see [`DEFAULT_IAM_ACCESS_CONTROL_PERMISSION`]). `None` — nothing is held by default —
+/// for anything that default does not cover.
+///
+/// Why it stops at databases: the default a resource is created with comes from the
+/// account's data lake settings for a DATABASE
+/// (`DataLakeSettings$CreateDatabaseDefaultPermissions`), but for a TABLE it comes from
+/// the parent database's own `CreateTableDefaultPermissions` in the Data Catalog — which
+/// is another service's state and not readable from here — so a table holds nothing until
+/// something grants it. The database default is this service's own setting, so it is the
+/// one this store can answer for.
+///
+/// It is rendered per request rather than written when the database is created, because
+/// this store never sees a database being created. That is observationally the same:
+/// `RevokePermissions` is the only call that can take the default away, and what it leaves
+/// behind is recorded in `revoked_default_grants`, which answers every later call.
+///
+/// Two consequences of having no view of the Data Catalog, both deliberate:
+///
+/// * Every database NAME carries the default, including one that was never created, so a
+///   revoke against a database that does not exist answers 200 where the real service
+///   answers `EntityNotFoundException`. Refusing that would need the catalog's list of
+///   databases, which is the glue service's state; a later change that can read it should
+///   check existence here.
+/// * `ListPermissions` does not report default grants, which is what its own documentation
+///   says it does: "This operation returns only those permissions that have been explicitly
+///   granted" (`smithy_query(query="doc",shape="ListPermissions")`). A default grant is
+///   held but was never granted by a call, so a reader that enumerates records is right to
+///   omit it — and with no set of databases to enumerate, a request that NAMES one is the
+///   only thing that can render its default.
+pub fn default_database_grant(
+    resource: &Resource,
+    principal: &str,
+    condition: Option<&str>,
+) -> Option<Vec<String>> {
+    // The default carries no condition, so a condition-scoped request addresses a
+    // different grant from the default one.
+    if resource.database.is_none() || principal != IAM_ALLOWED_PRINCIPALS || condition.is_some() {
+        return None;
+    }
+    Some(vec![DEFAULT_IAM_ACCESS_CONTROL_PERMISSION.to_string()])
+}
+
+/// The most revoked-default records this store will hold, beside the explicit grants
+/// [`MAX_PERMISSION_GRANTS`] bounds.
+///
+/// A revoked default is keyed by a request-supplied database name, so it needs a ceiling
+/// of its own for the same reason the grant store does; it gets a separate one so neither
+/// store's capacity depends on how full the other is. `RevokePermissions`, the single site
+/// that inserts one, refuses past this ceiling with its modelled `InvalidInputException`.
+/// Emulator-chosen, like the ceilings above.
+pub const MAX_REVOKED_DEFAULT_GRANTS: usize = 10_000;
 
 /// The most data-lake locations this store will hold registrations for.
 ///
