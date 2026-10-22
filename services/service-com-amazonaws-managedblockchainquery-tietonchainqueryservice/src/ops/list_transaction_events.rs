@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTransactionEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTransactionEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the events one transaction emitted, out of that network's ledger
+//! (`crate::state::NetworkLedger`), in emission order — which is the order they are
+//! stored in. Every event is projected from the STORED record by
+//! `crate::state::StoredTransaction::events`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTransactionEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation models no `ResourceNotFoundException`, so a transaction the ledger
+//! does not hold is an empty `events` list rather than a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +165,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTransactionEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTransactionEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTransactionEvents"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTransactionEventsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let state = state.lock();
+
+        // The same rule `GetTransaction` applies: exactly one of
+        // `transactionHash`/`transactionId`, and `transactionId` only on the Bitcoin
+        // networks.
+        let selector = crate::state::TransactionSelector::from_input(
+            &input.network,
+            input.transaction_hash.as_deref(),
+            input.transaction_id.as_deref(),
+        )
+        .map_err(ListTransactionEventsErrorModeled::ValidationException)?;
+
+        // The event's position within the transaction is what identifies it: an event
+        // has no identifier of its own, and the order is the emission order the ledger
+        // stores them in, so the position is stable across pages.
+        let all: Vec<(String, TransactionEvent)> = state
+            .ledger(&input.network)
+            .and_then(|ledger| selector.resolve(ledger))
+            .map(crate::state::StoredTransaction::events)
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(position, event)| (position.to_string(), event))
+            .collect();
+
+        let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListTransactionEventsErrorModeled::ValidationException(
+                    crate::state::invalid_page_token(&error),
+                )
+            })?;
+
+        Ok(ListTransactionEventsOutput {
+            events: page.items,
+            next_token: page.next_token,
+        })
     }
 }

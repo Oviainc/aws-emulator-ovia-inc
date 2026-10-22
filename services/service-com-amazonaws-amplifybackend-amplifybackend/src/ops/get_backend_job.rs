@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBackendJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBackendJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBackendJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads back the job a mutating call recorded, by (AppId, BackendEnvironmentName,
+//! JobId); an id this app never minted answers `NotFoundException` (404). Jobs outlive
+//! the environment they ran against, so a lookup after `DeleteBackend` still resolves.
+//!
+//! Reporting, with ONE write: it materialises the completion the clock already made
+//! due (see `BackendJob::settle`), which was owed at that instant whether or not
+//! anybody read the job.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +152,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBackendJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBackendJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBackendJob"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetBackendJobError::from(GetBackendJobErrorModeled::GatewayTimeoutException(
+                crate::state::store_unavailable(),
+            ))
+        })?;
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        let app = store.app_mut(&input.app_id).ok_or_else(|| {
+            GetBackendJobError::from(GetBackendJobErrorModeled::NotFoundException(
+                crate::state::not_found(
+                    crate::state::RESOURCE_TYPE_BACKEND,
+                    format!("no backend exists for app {}", input.app_id),
+                ),
+            ))
+        })?;
+        let job = app
+            .job_mut(&input.backend_environment_name, &input.job_id)
+            .ok_or_else(|| {
+                GetBackendJobError::from(GetBackendJobErrorModeled::NotFoundException(
+                    crate::state::not_found(
+                        crate::state::RESOURCE_TYPE_BACKEND_JOB,
+                        format!(
+                            "no job {} exists for backend environment {} of app {}",
+                            input.job_id, input.backend_environment_name, input.app_id
+                        ),
+                    ),
+                ))
+            })?;
+
+        job.settle(now);
+
+        Ok(GetBackendJobOutput {
+            app_id: Some(job.app_id.clone()),
+            backend_environment_name: Some(job.backend_environment_name.clone()),
+            create_time: Some(crate::state::format_time(job.create_time)),
+            error: job.error.clone(),
+            job_id: Some(job.job_id.clone()),
+            operation: Some(job.operation.clone()),
+            status: Some(job.status.clone()),
+            update_time: Some(crate::state::format_time(job.update_time)),
+        })
     }
 }

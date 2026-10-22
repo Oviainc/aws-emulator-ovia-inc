@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The fixture ledger's hashes and addresses are SHA-256 digests, and a `nextToken` is
+# hex-encoded, so both crates are used from `src/`.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

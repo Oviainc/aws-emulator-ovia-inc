@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateRepository
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateRepository`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateRepository::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,6 +155,102 @@ impl<Eng> AssociateRepository<Eng> {
     }
 }
 
+/// The prefix every S3 repository bucket name carries.
+///
+/// From `S3Repository$BucketName`'s own documentation: "The name of the S3 bucket used for
+/// associating a new S3 repository. It must begin with `codeguru-reviewer-`."
+const S3_BUCKET_PREFIX: &str = "codeguru-reviewer-";
+
+/// The association facts a `Repository` input determines.
+///
+/// `Repository` is modelled as a structure but behaves as a union: exactly one of its four
+/// members names the repository, and which one it is *is* the `ProviderType`.
+struct ResolvedRepository {
+    name: String,
+    owner: Option<String>,
+    provider_type: String,
+    connection_arn: Option<String>,
+    s3_repository_details: Option<S3RepositoryDetails>,
+}
+
+impl ResolvedRepository {
+    fn from_input(repository: &Repository) -> Result<Self, AssociateRepositoryError> {
+        let set = [
+            repository.code_commit.is_some(),
+            repository.bitbucket.is_some(),
+            repository.git_hub_enterprise_server.is_some(),
+            repository.s3_bucket.is_some(),
+        ]
+        .into_iter()
+        .filter(|member| *member)
+        .count();
+        // The model cannot express "exactly one of", so the service enforces it here.
+        if set != 1 {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Repository must set exactly one of CodeCommit, Bitbucket, \
+                 GitHubEnterpriseServer or S3Bucket; {set} were set"
+            )));
+        }
+
+        // Provider names are the `ProviderType` enum's own values — see
+        // `super::types::PROVIDER_TYPE_VALUES`.
+        if let Some(code_commit) = &repository.code_commit {
+            return Ok(Self {
+                name: code_commit.name.clone(),
+                // "For an Amazon Web Services CodeCommit repository, this is the Amazon Web
+                // Services account ID of the account that owns the repository."
+                // (RepositoryAssociation$Owner)
+                owner: Some(::engine::emulator_account_id().to_string()),
+                provider_type: "CodeCommit".to_string(),
+                connection_arn: None,
+                s3_repository_details: None,
+            });
+        }
+        if let Some(bitbucket) = &repository.bitbucket {
+            return Ok(Self::third_party("Bitbucket", bitbucket));
+        }
+        if let Some(enterprise) = &repository.git_hub_enterprise_server {
+            return Ok(Self::third_party("GitHubEnterpriseServer", enterprise));
+        }
+        let s3 = repository
+            .s3_bucket
+            .as_ref()
+            .expect("exactly one Repository member is set");
+        // "The name of the S3 bucket used for associating a new S3 repository. It must begin
+        // with `codeguru-reviewer-`." (S3Repository$BucketName) — documented, not modelled,
+        // so the service enforces it.
+        if !s3.bucket_name.starts_with(S3_BUCKET_PREFIX) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Repository.S3Bucket.BucketName must begin with {S3_BUCKET_PREFIX}"
+            )));
+        }
+        Ok(Self {
+            name: s3.name.clone(),
+            // "For an S3 repository, it can be the username or Amazon Web Services account
+            // ID." (RepositoryAssociation$Owner)
+            owner: Some(::engine::emulator_account_id().to_string()),
+            provider_type: "S3Bucket".to_string(),
+            connection_arn: None,
+            s3_repository_details: Some(S3RepositoryDetails {
+                bucket_name: Some(s3.bucket_name.clone()),
+                code_artifacts: None,
+            }),
+        })
+    }
+
+    /// A Bitbucket / GitHub Enterprise Server repository: owner and CodeStar Connections
+    /// connection come from the request.
+    fn third_party(provider_type: &str, repository: &ThirdPartySourceRepository) -> Self {
+        Self {
+            name: repository.name.clone(),
+            owner: Some(repository.owner.clone()),
+            provider_type: provider_type.to_string(),
+            connection_arn: Some(repository.connection_arn.clone()),
+            s3_repository_details: None,
+        }
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for AssociateRepository<Eng>
 {
@@ -181,18 +268,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateRepository` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateRepositoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateRepository"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateRepositoryError::Modeled(
+                AssociateRepositoryErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the repository-association store is unavailable".to_string()),
+                }),
+            )
+        })?;
+        let resolved = ResolvedRepository::from_input(&input.repository)?;
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // One live association per repository: a second one for the same
+        // provider/owner/name while the first is still active conflicts.
+        let repository_key = (
+            resolved.provider_type.clone(),
+            resolved.owner.clone(),
+            resolved.name.clone(),
+        );
+
+        // A retry carrying the ClientRequestToken of an earlier call is the SAME
+        // association, never a second one — that is what @idempotencyToken buys the caller.
+        // It replays only the request the token was first used for: the same token naming a
+        // DIFFERENT repository is a conflict, not a success for the first one, so the
+        // idempotency key cannot mask a request that was never served.
+        if let Some(existing) = input
+            .client_request_token
+            .as_deref()
+            .and_then(|token| store.association_for_token(token))
+        {
+            if existing.repository_key() != repository_key {
+                return Err(AssociateRepositoryErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "ClientRequestToken was already used to associate repository {} as {}; \
+                         it cannot be reused for a different repository",
+                        existing.name, existing.association_arn
+                    )),
+                })
+                .into());
+            }
+            return Ok(AssociateRepositoryOutput {
+                repository_association: Some(existing.to_wire()),
+                tags: existing.wire_tags(),
+            });
+        }
+
+        if let Some(existing) = store.active_association_for(&repository_key) {
+            return Err(AssociateRepositoryErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "repository {} is already associated with CodeGuru Reviewer as {}",
+                    resolved.name, existing.association_arn
+                )),
+            })
+            .into());
+        }
+
+        // The store is capacity-bounded, so a caller cannot grow it without limit: at the
+        // cap the service declines the request rather than accepting a resource it would
+        // then have to keep.
+        if store.associations_at_capacity() {
+            return Err(AssociateRepositoryErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(format!(
+                    "this emulator holds at most {} repository associations; \
+                     disassociate one before associating another",
+                    crate::state::MAX_ASSOCIATIONS
+                )),
+            })
+            .into());
+        }
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let association_id = store.mint_resource_id();
+        let association_arn = crate::state::association_arn(&region, &association_id);
+        let association = crate::state::Association {
+            // Assigned by the store on insert.
+            seq: 0,
+            association_id,
+            association_arn,
+            name: resolved.name,
+            owner: resolved.owner,
+            provider_type: resolved.provider_type,
+            connection_arn: resolved.connection_arn,
+            // CodeGuru Reviewer answers this call with the NON-terminal `Associating`
+            // (it is still setting up notifications and source-code access); the clock
+            // owes the move to `Associated`.
+            state: "Associating".to_string(),
+            state_reason: None,
+            created_time_stamp: now,
+            last_updated_time_stamp: now,
+            kms_key_details: input.kms_key_details,
+            s3_repository_details: resolved.s3_repository_details,
+            tags: input.tags.unwrap_or_default(),
+            client_request_token: input.client_request_token,
+            pending: Some(crate::state::PendingTransition::to_state("Associated", None)),
+        };
+
+        // `insert_association` answers with the STORED record, so what this call returns is
+        // exactly what a later Describe/List reads back.
+        let stored = store.insert_association(association);
+        Ok(AssociateRepositoryOutput {
+            repository_association: Some(stored.to_wire()),
+            tags: stored.wire_tags(),
+        })
     }
 }
