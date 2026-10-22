@@ -20,9 +20,12 @@
 //! cluster that holds it.
 //!
 //! A cluster's configuration also changes after creation: an update operation
-//! (`UpdateConnectivity`) records a [`PendingUpdate`] on the cluster, and
-//! [`Cluster::settle`] folds it into the record once the clock owes its
-//! completion — so one place decides what every reader then reports.
+//! (`UpdateConnectivity`, `UpdateStorage`) records a [`PendingUpdate`] on the
+//! cluster, and [`Cluster::settle`] folds it into the record once the clock owes
+//! its completion — so one place decides what every reader then reports. The
+//! operation itself is kept in the cluster-operation registry, which is what its
+//! `ClusterOperationArn` names and what `DescribeClusterOperation` renders with
+//! [`ClusterOperation::to_cluster_operation_info`].
 //!
 //! The channel registry lives beside it, keyed by channel ARN and indexed by
 //! (cluster ARN, channel name) — a channel is a sub-resource of the cluster it
@@ -45,15 +48,16 @@ use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    BrokerNodeGroupInfo, BrokerSoftwareInfo, ChannelLoggingInfo, ClientAuthentication, ClusterInfo,
-    ConfigurationInfo, ConnectivityInfo, CreateChannelInput, CreateClusterInput,
-    CreateReplicatorInput, DescribeChannelOutput, EncryptionAtRest, EncryptionConfiguration,
-    EncryptionInTransit, EncryptionInfo, IcebergDestinationConfiguration, JmxExporter,
-    JmxExporterInfo, KafkaCluster, KafkaClusterDescription, KafkaClusterSummary, LogDelivery,
-    LoggingInfo, NodeExporter, NodeExporterInfo, OpenMonitoring, OpenMonitoringInfo, Prometheus,
-    PrometheusInfo, Provisioned, Rebalancing, ReplicationInfo, ReplicationInfoDescription,
-    ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, TopicConfiguration,
-    ZookeeperAccess,
+    BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerSoftwareInfo, ChannelLoggingInfo,
+    ClientAuthentication, ClusterInfo, ClusterOperationInfo, ConfigurationInfo, ConnectivityInfo,
+    CreateChannelInput, CreateClusterInput, CreateReplicatorInput, DescribeChannelOutput,
+    EBSStorageInfo, EncryptionAtRest, EncryptionConfiguration, EncryptionInTransit, EncryptionInfo,
+    IcebergDestinationConfiguration, JmxExporter, JmxExporterInfo, KafkaCluster,
+    KafkaClusterDescription, KafkaClusterSummary, LogDelivery, LoggingInfo, MutableClusterInfo,
+    NodeExporter, NodeExporterInfo, OpenMonitoring, OpenMonitoringInfo, Prometheus, PrometheusInfo,
+    Provisioned, ProvisionedThroughput, Rebalancing, ReplicationInfo, ReplicationInfoDescription,
+    ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, StorageInfo,
+    TopicConfiguration, ZookeeperAccess,
 };
 
 /// How long after `CreateCluster` a new cluster becomes `ACTIVE`.
@@ -64,8 +68,51 @@ use crate::ops::types::{
 /// the state errors that go with it) while a caller that waits sees `ACTIVE`.
 pub const CLUSTER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
-/// How long a cluster update (`UpdateConnectivity` and the sibling update
-/// operations) stays in flight before the cluster leaves `UPDATING`.
+/// The smallest EBS data-volume size a broker may be given, from the `range` on
+/// `EBSStorageInfo$VolumeSize` (`__integerMin1Max16384`, 1..16384) in the model.
+pub const MIN_VOLUME_SIZE_GB: i32 = 1;
+
+/// The largest EBS data-volume size a broker may be given, from the same `range`.
+///
+/// `UpdateStorageRequest$VolumeSizeGB` is a plain `__integer`, so the boundary
+/// validator lets any value through: the range belongs to the stored
+/// `EBSStorageInfo$VolumeSize` the update writes, and the handler is what
+/// enforces it.
+pub const MAX_VOLUME_SIZE_GB: i32 = 16_384;
+
+/// How many cluster operations the registry keeps for one cluster, newest first.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota: every update call adds
+/// one operation record, so an unbounded history would grow the store with the
+/// number of calls. Sized well past any realistic client script's update count;
+/// a caller holding an ARN evicted past it reads the same `NotFoundException` as
+/// for an operation that never existed.
+pub const MAX_OPERATIONS_PER_CLUSTER: usize = 64;
+
+/// The `OperationType` an `UpdateStorage` call records, which is the API name in
+/// the SCREAMING_SNAKE_CASE form MSK's cluster-operation types take.
+pub const OPERATION_TYPE_UPDATE_STORAGE: &str = "UPDATE_STORAGE";
+
+/// The state MSK reports for a cluster operation that is still running.
+pub const OPERATION_STATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+
+/// The state MSK reports for a cluster operation that has finished.
+pub const OPERATION_STATE_COMPLETE: &str = "UPDATE_COMPLETE";
+
+/// The `ClusterState` of a cluster whose brokers are serving and which accepts an
+/// update. One of the model's `ClusterState` values
+/// (`crate::ops::types::CLUSTER_STATE_VALUES`), as are the two below.
+pub const CLUSTER_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The `ClusterState` of a cluster that is being provisioned.
+pub const CLUSTER_STATE_CREATING: &str = "CREATING";
+
+/// The `ClusterState` of a cluster an accepted update is still being applied to.
+pub const CLUSTER_STATE_UPDATING: &str = "UPDATING";
+
+/// How long a cluster update (`UpdateConnectivity`, `UpdateStorage` and the
+/// sibling update operations) stays in flight before the cluster leaves
+/// `UPDATING`.
 ///
 /// CHOSEN, not documented: the real service reconfigures brokers over minutes.
 /// The project fixes an emulated clock-owed transition at 250–750 ms, so a caller
@@ -434,6 +481,11 @@ pub struct Cluster {
     pub zookeeper_connect_string: String,
     pub zookeeper_connect_string_tls: String,
     pub brokers: Vec<BrokerNode>,
+    /// The ARNs of this cluster's recorded operations, oldest first. It is the
+    /// cluster's own index into the operation registry, which is what keeps the
+    /// history bound a walk of ONE cluster's operations rather than of every
+    /// operation the registry holds.
+    pub operation_arns: Vec<String>,
     /// Whether Apache ZooKeeper access is turned on, as
     /// `UpdateConnectivity`'s `ZookeeperAccess` leaves it. A cluster is
     /// provisioned with access on. The model reports this setting through
@@ -477,6 +529,95 @@ pub enum ClusterChange {
         connectivity_info: Option<ConnectivityInfo>,
         zookeeper_access: Option<ZookeeperAccess>,
     },
+    /// `UpdateStorage`: the brokers' EBS volume size, their provisioned
+    /// throughput, the cluster's storage mode, or any combination the request
+    /// named.
+    Storage(StorageChange),
+}
+
+/// The storage attributes one update call asked to change. A member left `None`
+/// is one the request did not name, which the update leaves as it is.
+#[derive(Debug, Clone, Default)]
+pub struct StorageChange {
+    /// The EBS data-volume size each broker is to be given, in GiB.
+    pub volume_size_gb: Option<i32>,
+    /// The EBS provisioned-throughput setting the volumes are to run with.
+    pub provisioned_throughput: Option<ProvisionedThroughput>,
+    /// The `StorageMode` the cluster is to run in.
+    pub storage_mode: Option<String>,
+}
+
+impl StorageChange {
+    /// Whether the request named no storage attribute at all, so there is
+    /// nothing for an update to do.
+    pub fn is_empty(&self) -> bool {
+        self.volume_size_gb.is_none()
+            && self.provisioned_throughput.is_none()
+            && self.storage_mode.is_none()
+    }
+}
+
+/// One cluster operation: the record an update call leaves behind, which is what
+/// its `ClusterOperationArn` names.
+#[derive(Debug, Clone)]
+pub struct ClusterOperation {
+    pub arn: String,
+    pub cluster_arn: String,
+    /// The region the operation ran in — the signing region of the call that
+    /// started it, and the region segment of its ARN.
+    pub region: String,
+    /// A `ClusterOperationInfo$OperationType` value.
+    pub operation_type: String,
+    pub creation_time: SystemTime,
+    /// The instant the clock owes this operation its completion. STORED, never
+    /// slept on: the reported state is a function of it and the reading instant.
+    pub end_due: SystemTime,
+    /// The attributes this operation changes, as they were before it ran.
+    pub source_cluster_info: MutableClusterInfo,
+    /// The same attributes, as the operation sets them.
+    pub target_cluster_info: MutableClusterInfo,
+}
+
+impl ClusterOperation {
+    /// The operation's state at `now`: MSK reports a running update as
+    /// `UPDATE_IN_PROGRESS` and a finished one as `UPDATE_COMPLETE`.
+    pub fn operation_state(&self, now: SystemTime) -> &'static str {
+        if now >= self.end_due {
+            OPERATION_STATE_COMPLETE
+        } else {
+            OPERATION_STATE_IN_PROGRESS
+        }
+    }
+
+    /// The operation as `ClusterOperationInfo`, the shape
+    /// `DescribeClusterOperation` reports.
+    ///
+    /// `EndTime` is reported only once the operation has finished, since an
+    /// operation still running has not ended.
+    pub fn to_cluster_operation_info(&self, now: SystemTime) -> ClusterOperationInfo {
+        ClusterOperationInfo {
+            // The id of the API request that triggered the operation is the
+            // caller's, and this emulator mints none.
+            client_request_id: None,
+            cluster_arn: Some(self.cluster_arn.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            end_time: (now >= self.end_due)
+                .then(|| ::aws_smithy_types::DateTime::from(self.end_due)),
+            // Nothing fails an emulated update, so there is no error to describe.
+            error_info: None,
+            operation_arn: Some(self.arn.clone()),
+            operation_state: Some(self.operation_state(now).to_string()),
+            // No step list: this emulator runs no broker-by-broker steps, and
+            // reporting invented ones would describe work nothing did.
+            operation_steps: None,
+            operation_type: Some(self.operation_type.clone()),
+            source_cluster_info: Some(self.source_cluster_info.clone()),
+            target_cluster_info: Some(self.target_cluster_info.clone()),
+            // A VPC connection is described only by the operations that manage
+            // one.
+            vpc_connection_info: None,
+        }
+    }
 }
 
 /// A channel streaming one cluster topic to Amazon S3 or Apache Iceberg, holding
@@ -1014,6 +1155,9 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// Monotonic counter feeding the ARN and DNS suffixes, so each cluster gets a
     /// distinct identity and a rebuilt emulator reproduces the same ones.
     pub next_cluster_suffix: u64,
+    /// Every cluster operation an update call recorded, keyed by its own ARN.
+    /// `BTreeMap` so a reader walking the history has one total order.
+    pub cluster_operations: BTreeMap<String, ClusterOperation>,
     /// Every live topic, keyed by (cluster ARN, topic name). A topic name is
     /// unique within its cluster, and the `BTreeMap` groups one cluster's topics
     /// contiguously in name order — the order `ListTopics` pages through.
@@ -1095,6 +1239,10 @@ impl ComAmazonawsKafkaKafkaState {
     /// Remove the cluster `arn` names from every index, handing it back. The one
     /// removal path, for the same reason.
     ///
+    /// Its operation history goes with it: an operation names the cluster it ran
+    /// on, so keeping records of a cluster nobody can reach would grow the store
+    /// without bound.
+    ///
     /// A topic belongs to the cluster whose brokers hold it, so the cluster's
     /// topics leave with it: nothing in the registry can outlive its cluster.
     ///
@@ -1106,6 +1254,9 @@ impl ComAmazonawsKafkaKafkaState {
         let cluster = self.clusters.remove(arn)?;
         self.cluster_arn_by_name
             .remove(&(cluster.region.clone(), cluster.name.clone()));
+        for operation_arn in &cluster.operation_arns {
+            self.cluster_operations.remove(operation_arn);
+        }
         self.topics.retain(|(topic_cluster, _), _| topic_cluster != arn);
         if let Some(count) = self.clusters_per_region.get_mut(&cluster.region) {
             *count = count.saturating_sub(1);
@@ -1172,6 +1323,71 @@ impl ComAmazonawsKafkaKafkaState {
         }
         cluster.settle(now);
         Some(cluster)
+    }
+
+    /// The cluster operation `arn` names, as an endpoint for `region` sees it —
+    /// `None` for an operation of another region, exactly as for an absent one.
+    pub fn cluster_operation_in(&self, region: &str, arn: &str) -> Option<&ClusterOperation> {
+        self.cluster_operations
+            .get(arn)
+            .filter(|operation| operation.region == region)
+    }
+
+    /// Start a storage update on the cluster `arn` names, as an endpoint for
+    /// `region` sees it: record the cluster operation, move the cluster to
+    /// `UPDATING`, and hand it the change the clock will apply at
+    /// [`CLUSTER_UPDATE_DELAY`]. Answers the new operation's ARN, or `None` when
+    /// this region holds no cluster for `arn`.
+    ///
+    /// The cluster is resolved through [`Self::settled_cluster_in_mut`], so a
+    /// writer is scoped to its own region exactly as every reader is, and it
+    /// updates a record whose clock-owed transitions have landed.
+    ///
+    /// The one path that starts an update, so the operation record, the cluster's
+    /// pending change, its active operation ARN and its operation history cannot
+    /// drift apart. The history is bounded here: the records past
+    /// [`MAX_OPERATIONS_PER_CLUSTER`] are the cluster's own oldest, so the trim
+    /// costs one walk of THAT cluster's history rather than of the registry.
+    pub fn start_storage_update(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+        change: StorageChange,
+    ) -> Option<String> {
+        let cluster = self.settled_cluster_in_mut(region, arn, now)?;
+        let cluster_arn = cluster.arn.clone();
+        let operation_region = cluster.region.clone();
+        let source_cluster_info = cluster.storage_cluster_info();
+        let target_cluster_info = cluster.storage_cluster_info_after(&change);
+        // The cluster mints the operation's ARN and holds the pending change,
+        // the same way `UpdateConnectivity` starts its own: one in-flight update
+        // per cluster, whatever began it.
+        let operation_arn = cluster.begin_storage_update(now, change);
+        let operation = ClusterOperation {
+            arn: operation_arn.clone(),
+            cluster_arn,
+            region: operation_region,
+            operation_type: OPERATION_TYPE_UPDATE_STORAGE.to_string(),
+            creation_time: now,
+            end_due: now + CLUSTER_UPDATE_DELAY,
+            source_cluster_info,
+            target_cluster_info,
+        };
+        cluster.operation_arns.push(operation_arn.clone());
+        // The history is bounded: anything past the ceiling is this cluster's
+        // own oldest record.
+        let excess = cluster
+            .operation_arns
+            .len()
+            .saturating_sub(MAX_OPERATIONS_PER_CLUSTER);
+        let evicted: Vec<String> = cluster.operation_arns.drain(..excess).collect();
+        self.cluster_operations
+            .insert(operation_arn.clone(), operation);
+        for stale in evicted {
+            self.cluster_operations.remove(&stale);
+        }
+        Some(operation_arn)
     }
 
     /// How many topics the cluster `cluster_arn` names holds as a reader at
@@ -1733,7 +1949,7 @@ impl Cluster {
             kafka_version: input.kafka_version,
             creation_time: now,
             active_due: now + CLUSTER_ACTIVATION_DELAY,
-            state: "CREATING".to_string(),
+            state: CLUSTER_STATE_CREATING.to_string(),
             // The stored count is the one the broker list was built from, so the
             // record can never describe more brokers than it holds.
             number_of_broker_nodes: broker_count,
@@ -1760,6 +1976,7 @@ impl Cluster {
                 PORT_ZOOKEEPER_TLS,
             ),
             brokers,
+            operation_arns: Vec::new(),
             // A provisioned cluster comes up with ZooKeeper access on; only
             // `UpdateConnectivity` turns it off.
             zookeeper_access_enabled: true,
@@ -1777,22 +1994,22 @@ impl Cluster {
     /// nothing here depends on who called or when they called it, only on the
     /// instants already stored.
     pub fn settle(&mut self, now: SystemTime) {
-        if self.state == "CREATING" && now >= self.active_due {
-            self.state = "ACTIVE".to_string();
+        if self.state == CLUSTER_STATE_CREATING && now >= self.active_due {
+            self.state = CLUSTER_STATE_ACTIVE.to_string();
         }
         match self.pending_update.take() {
             // An update completes only for a cluster that is still `UPDATING`
             // because of it. Any other state means something else now owns the
             // record, so the change is dropped rather than folded into a
             // cluster that has moved on.
-            Some(update) if now >= update.due && self.state == "UPDATING" => {
+            Some(update) if now >= update.due && self.state == CLUSTER_STATE_UPDATING => {
                 self.apply_change(update.change);
                 // "When this update operation is successful, it generates a new
                 // cluster version" (`CurrentVersion` on every update request),
                 // so the version token follows the new revision.
                 self.revision += 1;
                 self.current_version = current_version_token(&self.arn, self.revision);
-                self.state = "ACTIVE".to_string();
+                self.state = CLUSTER_STATE_ACTIVE.to_string();
             }
             // Due but no longer this cluster's business: dropped, changing
             // nothing.
@@ -1800,6 +2017,98 @@ impl Cluster {
             // Still in flight: put it back exactly as it was.
             pending => self.pending_update = pending,
         }
+    }
+
+    /// The EBS data-volume size each broker's drive is stored with, when the
+    /// cluster's configuration names one.
+    pub fn volume_size_gb(&self) -> Option<i32> {
+        self.ebs_storage_info()
+            .and_then(|ebs| ebs.volume_size)
+    }
+
+    /// The EBS provisioned-throughput setting the cluster's volumes are stored
+    /// with, when its configuration names one.
+    pub fn provisioned_throughput(&self) -> Option<&ProvisionedThroughput> {
+        self.ebs_storage_info()
+            .and_then(|ebs| ebs.provisioned_throughput.as_ref())
+    }
+
+    fn ebs_storage_info(&self) -> Option<&EBSStorageInfo> {
+        self.broker_node_group_info
+            .storage_info
+            .as_ref()
+            .and_then(|storage| storage.ebs_storage_info.as_ref())
+    }
+
+    /// The cluster's storage attributes as the `MutableClusterInfo` a cluster
+    /// operation reports: the attributes a storage update can change, and only
+    /// those, since an operation describes what it touches rather than the whole
+    /// cluster.
+    pub fn storage_cluster_info(&self) -> MutableClusterInfo {
+        storage_cluster_info(
+            self.volume_size_gb(),
+            self.provisioned_throughput().cloned(),
+            &self.storage_mode,
+        )
+    }
+
+    /// The same attributes as `change` leaves them: a member the change does not
+    /// name keeps the stored value.
+    pub fn storage_cluster_info_after(&self, change: &StorageChange) -> MutableClusterInfo {
+        storage_cluster_info(
+            change.volume_size_gb.or_else(|| self.volume_size_gb()),
+            change
+                .provisioned_throughput
+                .clone()
+                .or_else(|| self.provisioned_throughput().cloned()),
+            change
+                .storage_mode
+                .as_deref()
+                .unwrap_or(&self.storage_mode),
+        )
+    }
+
+    /// Write `change` into the stored configuration, so every reader reports the
+    /// settings the cluster now runs with. A member the change does not name is
+    /// left exactly as it was.
+    fn apply_storage_change(&mut self, change: StorageChange) {
+        if change.volume_size_gb.is_some() || change.provisioned_throughput.is_some() {
+            let ebs = self
+                .broker_node_group_info
+                .storage_info
+                .get_or_insert_with(StorageInfo::default)
+                .ebs_storage_info
+                .get_or_insert_with(EBSStorageInfo::default);
+            if let Some(volume_size) = change.volume_size_gb {
+                ebs.volume_size = Some(volume_size);
+            }
+            if let Some(throughput) = change.provisioned_throughput {
+                ebs.provisioned_throughput = Some(throughput);
+            }
+        }
+        if let Some(storage_mode) = change.storage_mode {
+            self.storage_mode = storage_mode;
+        }
+    }
+
+    /// Start a storage update: the cluster enters `UPDATING` with the returned
+    /// operation as its active one, and the submitted storage settings become
+    /// its own when [`Self::settle`] finds the operation due — the same
+    /// acceptance the real service gives an `UpdateStorage` call, which reports
+    /// the new volume size, throughput or storage mode and the new cluster
+    /// version only once that operation finishes.
+    ///
+    /// A member `change` does not name is left alone, so an update of one
+    /// storage attribute does not reset the others.
+    pub fn begin_storage_update(&mut self, now: SystemTime, change: StorageChange) -> String {
+        let operation_arn = self.operation_arn(self.revision + 1);
+        self.pending_update = Some(PendingUpdate {
+            operation_arn: operation_arn.clone(),
+            due: now + CLUSTER_UPDATE_DELAY,
+            change: ClusterChange::Storage(change),
+        });
+        self.state = CLUSTER_STATE_UPDATING.to_string();
+        operation_arn
     }
 
     /// Start a connectivity update: the cluster enters `UPDATING` with the
@@ -1829,7 +2138,7 @@ impl Cluster {
                 zookeeper_access,
             },
         });
-        self.state = "UPDATING".to_string();
+        self.state = CLUSTER_STATE_UPDATING.to_string();
         operation_arn
     }
 
@@ -1851,6 +2160,7 @@ impl Cluster {
                     self.zookeeper_access_enabled = access.enabled.unwrap_or(true);
                 }
             }
+            ClusterChange::Storage(change) => self.apply_storage_change(change),
         }
     }
 
@@ -2143,6 +2453,31 @@ fn default_kafka_kms_key_arn(region: &str) -> String {
     )
 }
 
+/// The storage attributes a cluster operation reports, as `MutableClusterInfo`.
+///
+/// A volume size and throughput belong to the brokers, so they are reported
+/// through `BrokerEBSVolumeInfo`; `StorageMode` belongs to the cluster. Every
+/// other member is left unset: an operation describes the attributes it changes,
+/// not the whole cluster.
+fn storage_cluster_info(
+    volume_size_gb: Option<i32>,
+    provisioned_throughput: Option<ProvisionedThroughput>,
+    storage_mode: &str,
+) -> MutableClusterInfo {
+    MutableClusterInfo {
+        broker_ebs_volume_info: Some(vec![BrokerEBSVolumeInfo {
+            // "The broker identifier must be set to the keyword ALL. This means
+            // the changes apply to all the brokers in the cluster."
+            // (`BrokerEBSVolumeInfo`'s model documentation.)
+            kafka_broker_node_id: "ALL".to_string(),
+            provisioned_throughput,
+            volume_size_gb,
+        }]),
+        storage_mode: Some(storage_mode.to_string()),
+        ..MutableClusterInfo::default()
+    }
+}
+
 /// The `OpenMonitoringInfo` a request submits, as the `OpenMonitoring` shape a
 /// reader reports. The two carry the same Prometheus exporter switches under
 /// different shape names, and an exporter nobody asked for is off.
@@ -2324,6 +2659,37 @@ fn is_kafka_arn_for(value: &str, kind: &str) -> bool {
     )
 }
 
+/// Whether `value` is shaped like an MSK cluster-operation ARN —
+/// `arn:<partition>:kafka:<region>:<account>:cluster-operation/<cluster
+/// name>/<cluster id>/<operation id>`, the form
+/// [`Cluster::operation_arn`] mints and `ClusterOperationArn` carries.
+///
+/// Same distinction as above: a value that is not an ARN of this kind is a bad
+/// request, while a well-formed one the registry does not hold is a resource
+/// that cannot be found.
+pub fn is_cluster_operation_arn(value: &str) -> bool {
+    let Some(resource) = kafka_arn_resource(value) else {
+        return false;
+    };
+    let mut segments = resource.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (
+            Some("cluster-operation"),
+            Some(name),
+            Some(cluster_id),
+            Some(operation_id),
+            None
+        ) if !name.is_empty() && !cluster_id.is_empty() && !operation_id.is_empty()
+    )
+}
+
 /// Whether `value` is shaped like an MSK channel ARN —
 /// `arn:<partition>:kafka:<region>:<account>:channel/<cluster>/<cluster-id>/<name>/<id>`,
 /// the form [`Channel::streaming`] mints: a channel is a sub-resource of the
@@ -2362,9 +2728,10 @@ pub fn is_channel_arn(value: &str) -> bool {
 
 /// The resource part of `value` when it is an ARN of THIS service in some
 /// partition, region and account — `arn:<partition>:kafka:<region>:<account>:`
-/// followed by the resource — and `None` otherwise. The one ARN parse the
-/// `is_*_arn` predicates share, so they cannot disagree about the five fields in
-/// front of the resource.
+/// followed by the resource — and `None` otherwise. Borrowed from `value` and
+/// split by the caller, so a predicate on the hot path of every reader allocates
+/// nothing. The one ARN parse the `is_*_arn` predicates share, so they cannot
+/// disagree about the five fields in front of the resource.
 fn kafka_arn_resource(value: &str) -> Option<&str> {
     let mut fields = value.splitn(6, ':');
     let (

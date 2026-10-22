@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfiguredTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfiguredTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfiguredTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an account-level configured table and persists it, so a later
+//! `GetConfiguredTable` reports exactly what was created.
+//!
+//! Every member the SERVICE decides is computed, never echoed: `id` is a fresh UUID,
+//! `arn` is built from the request's region and the emulator account, `createTime` /
+//! `updateTime` are the creation instant, `tableType` is the `TableReferenceType` of the
+//! `TableReference` union variant the request carried
+//! (`crate::state::table_reference_type`), and `analysisRuleTypes` starts empty because a
+//! configured table is created with no analysis rules.
+//!
+//! The one documented rule the model cannot express is enforced here with the modelled
+//! `ValidationException`: `selectedAnalysisMethods`, "when configured, you must specify
+//! at least two analysis methods" (`crate::state::MIN_SELECTED_ANALYSIS_METHODS`).
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +175,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfiguredTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfiguredTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfiguredTable"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateConfiguredTableErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `SelectedAnalysisMethods` carries no length constraint in the model, so the
+        // boundary validator cannot refuse a one-method list: the documented minimum is
+        // enforced here, on the number of DISTINCT methods the list configures.
+        if let Some(selected) = input.selected_analysis_methods.as_deref() {
+            let distinct = st::distinct_selected_analysis_methods(selected);
+            if distinct < st::MIN_SELECTED_ANALYSIS_METHODS {
+                return Err(CreateConfiguredTableErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "selectedAnalysisMethods must specify at least {} analysis methods, got {distinct}",
+                            st::MIN_SELECTED_ANALYSIS_METHODS
+                        )),
+                        reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "selectedAnalysisMethods".to_string(),
+                            message: format!(
+                                "when configured, you must specify at least {} analysis methods",
+                                st::MIN_SELECTED_ANALYSIS_METHODS
+                            ),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = st::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // Last, AFTER the request checks, so a bad request still answers 400 at the cap:
+        // the store grows by one configured table per call and lives for the life of the
+        // process, so past the cap the service answers the quota error it models rather
+        // than accepting another entry. See `st::MAX_CONFIGURED_TABLES` — the cap and
+        // these quota identifiers are the emulator's own, not values AWS publishes.
+        if store.configured_tables.len() >= st::MAX_CONFIGURED_TABLES {
+            return Err(
+                CreateConfiguredTableErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "the number of configured tables would exceed the limit of {}",
+                            st::MAX_CONFIGURED_TABLES
+                        ),
+                        quota_name: "ConfiguredTables".to_string(),
+                        quota_value: st::MAX_CONFIGURED_TABLES as f64,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = st::new_uuid();
+        let arn = st::configured_table_arn(&region, &id);
+        let created_at = st::now();
+        let configured_table = ConfiguredTable {
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            description: input.description,
+            table_type: Some(st::table_reference_type(&input.table_reference).to_string()),
+            table_reference: input.table_reference,
+            create_time: created_at,
+            update_time: created_at,
+            // A configured table is created with no analysis rules; the analysis-rule
+            // operations are what add a type to this list.
+            analysis_rule_types: Vec::new(),
+            analysis_method: input.analysis_method,
+            allowed_columns: input.allowed_columns,
+            selected_analysis_methods: input.selected_analysis_methods,
+        };
+
+        if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
+            store.tags.insert(arn, tags);
+        }
+        store.configured_tables.insert(id.clone(), configured_table);
+        store.configured_table_order.push(id.clone());
+
+        // Answer from the store, so the response is the persisted resource rather than a
+        // value computed beside it.
+        let Some(configured_table) = store.configured_tables.get(&id).cloned() else {
+            return Err(CreateConfiguredTableErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("configured table {id} was not persisted")),
+                },
+            )
+            .into());
+        };
+        Ok(CreateConfiguredTableOutput { configured_table })
     }
 }

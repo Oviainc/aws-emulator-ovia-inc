@@ -27,6 +27,8 @@ mod resource_tags;
 mod session_endpoint;
 #[path = "all/session_lifecycle.rs"]
 mod session_lifecycle;
+#[path = "all/session_termination.rs"]
+mod session_termination;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_application.rs"]

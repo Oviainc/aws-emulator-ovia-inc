@@ -242,6 +242,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             CreateEnvironmentError::internal_failure("the Elastic Beanstalk store is unavailable")
         })?;
         let mut store = state.lock();
+        // Every event this call records belongs to this one request's activity.
+        let request_id = crate::state::new_request_id();
         // A name freed by an environment whose termination the clock has already
         // completed is available again, so settle those first.
         store.materialize_due_transitions();
@@ -402,14 +404,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             date_terminated: None,
             tags: input.tags.clone().unwrap_or_default(),
             // The launch the clock owes: `Launching` -> `Ready`.
-            pending_status: Some(crate::state::PendingStatus::completion_to_ready()),
+            pending_status: Some(crate::state::PendingStatus::launch_completion(
+                &request_id,
+                &environment_name,
+            )),
         };
 
         let output = crate::state::environment_description!(CreateEnvironmentOutput, &environment);
+        let subject = environment.event_subject();
         store
             .environment_name_index
             .insert(environment_name, environment_id.clone());
         store.environments.insert(environment_id, environment);
+
+        // The launch has STARTED here; the event for its completion is recorded
+        // when the clock makes that completion due.
+        store.record_event(
+            &request_id,
+            crate::state::SEVERITY_INFO,
+            "createEnvironment is starting.",
+            subject,
+        );
 
         Ok(output)
     }

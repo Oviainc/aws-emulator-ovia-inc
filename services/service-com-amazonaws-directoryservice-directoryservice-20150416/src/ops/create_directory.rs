@@ -169,7 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The Region this directory is created in — its `Primary` one — is the one the
+        // request was signed for; `ctx` is where a request's credential scope is read.
+        let primary_region = crate::state::region_from_request(ctx.parts());
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
@@ -255,6 +257,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sso_enabled: false,
             desired_number_of_domain_controllers: None,
             tags,
+            primary_region,
+            // `AddRegion` (still scaffolded) is what replicates a directory to another
+            // Region; a fresh directory exists in its primary Region only.
+            additional_regions: ::std::collections::BTreeSet::new(),
+            // `AddIpRoutes` is what routes an address block to this directory.
+            ip_routes: ::std::collections::BTreeMap::new(),
+            // `EnableLDAPS` / `EnableClientAuthentication` (both still scaffolded) are
+            // what record a setting for a type; nothing is configured at create.
+            ldaps_settings: ::std::collections::BTreeMap::new(),
+            client_authentication_settings: ::std::collections::BTreeMap::new(),
             // `RegisterEventTopic` is what associates an Amazon SNS topic with the
             // directory; a fresh directory publishes to none.
             event_topics: ::std::collections::BTreeMap::new(),
