@@ -51,8 +51,8 @@ const DEFAULT_USER: &str = "default";
 /// users with Access Control Lists": "must be at least 16 characters and no more than
 /// 128 characters in length"), mirrored from `crate::state::MIN_PASSWORD_LEN` /
 /// `MAX_PASSWORD_LEN`. Each is exercised AT the bound and one past it.
-const MIN_PASSWORD_LEN: usize = 16;
-const MAX_PASSWORD_LEN: usize = 128;
+pub(crate) const MIN_PASSWORD_LEN: usize = 16;
+pub(crate) const MAX_PASSWORD_LEN: usize = 128;
 
 /// The most passwords one user may hold: `Authentication$PasswordCount` — "The number
 /// of passwords belonging to the user. The maximum is two."
@@ -60,15 +60,17 @@ const MAX_PASSWORDS_PER_USER: usize = 2;
 
 /// An access string that is valid for every user the suite creates (MemoryDB's
 /// "full access" string: enabled, all keys, all channels, all commands).
-const FULL_ACCESS: &str = "on ~* &* +@all";
+pub(crate) const FULL_ACCESS: &str = "on ~* &* +@all";
 
 /// An `AuthenticationMode` of type `password` carrying `passwords`.
-fn password_mode(passwords: &[&str]) -> Value {
+///
+/// `pub(crate)` so the update suite refuses the SAME modes through the same builder.
+pub(crate) fn password_mode(passwords: &[&str]) -> Value {
     json!({ "Type": "password", "Passwords": passwords })
 }
 
 /// A password of exactly `length` characters that breaks none of the other rules.
-fn password_of_length(length: usize) -> String {
+pub(crate) fn password_of_length(length: usize) -> String {
     "Aa1!".chars().cycle().take(length).collect()
 }
 

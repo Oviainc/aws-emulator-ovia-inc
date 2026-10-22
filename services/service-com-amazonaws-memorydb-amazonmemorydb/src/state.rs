@@ -216,6 +216,7 @@ pub mod acl_status {
 /// user a later call can still read.
 pub mod user_status {
     pub const ACTIVE: &str = "active";
+    pub const MODIFYING: &str = "modifying";
     pub const DELETING: &str = "deleting";
 }
 
@@ -299,6 +300,12 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
                 acl.settles_at = None;
             }
         }
+        for user in self.users.values_mut() {
+            if user.settles_at.is_some_and(|due| now >= due) {
+                user.status = user_status::ACTIVE.to_string();
+                user.settles_at = None;
+            }
+        }
     }
 
     /// Materialise the users this account ALREADY HAD before any call: MemoryDB
@@ -323,6 +330,9 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
                 access_string: DEFAULT_USER_ACCESS_STRING.to_string(),
                 authentication_type: NO_PASSWORD_AUTHENTICATION.to_string(),
                 password_count: None,
+                // The account's own user is ready before any call, so the clock owes
+                // it no transition.
+                settles_at: None,
                 arn: user_arn(region, DEFAULT_USER_NAME),
             },
         );
@@ -509,6 +519,12 @@ pub struct StoredUser {
     /// `Authentication$PasswordCount`: "The number of passwords belonging to the
     /// user", absent for a user that authenticates without one.
     pub password_count: Option<i32>,
+    /// When the clock owes this user [`user_status::ACTIVE`] again, or `None` once it
+    /// is settled. Set by the operation that moves the user off `active` (an update
+    /// answers with it `modifying`), and materialised by [`settle`].
+    ///
+    /// [`settle`]: ComAmazonawsMemorydbAmazonmemorydbState::settle
+    pub settles_at: Option<Instant>,
     pub arn: String,
 }
 

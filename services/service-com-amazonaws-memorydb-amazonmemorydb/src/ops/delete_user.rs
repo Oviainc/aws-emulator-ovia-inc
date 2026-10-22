@@ -164,9 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Only a user AWS reports `active` can be deleted: one already on its way out,
         // or mid-update, is refused with the modelled state fault rather than deleted
-        // twice. Every user this store holds is `active` today (`CreateUser` answers
-        // with it usable at once, and a delete removes it outright), so this guard
-        // states the rule for whichever operation first parks a user off `active`.
+        // twice. `UpdateUser` is what parks a user off `active` (it answers `modifying`
+        // until the clock owes it `active` again), and a delete removes the user
+        // outright, so this guard is what a delete racing an update answers.
         if user.status != crate::state::user_status::ACTIVE {
             return Err(DeleteUserErrorModeled::InvalidUserStateFault(
                 InvalidUserStateFault {
