@@ -153,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
@@ -162,13 +161,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `resourceArn` is "the ARN for the Step Functions state machine or
         // activity", so an ARN of another service — or of another Step Functions
-        // resource type, such as an execution — is an ARN this operation cannot
-        // read, which is what `InvalidArn` reports.
-        let Some(target) = crate::state::parse_taggable_arn(&input.resource_arn) else {
-            return Err(TagResourceErrorModeled::InvalidArn(InvalidArn {
-                message: Some(crate::state::untaggable_arn_message(&input.resource_arn)),
-            })
-            .into());
+        // resource type, such as an execution, or of another region — is an ARN this
+        // operation cannot read, which is what `InvalidArn` reports, before any
+        // resource resolution.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let target = match crate::state::read_taggable_arn(&input.resource_arn, &endpoint_region) {
+            Ok(target) => target,
+            Err(message) => {
+                return Err(TagResourceErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(message),
+                })
+                .into())
+            }
         };
 
         // `tags` carries no modelled length bound, so the REQUEST chooses how many

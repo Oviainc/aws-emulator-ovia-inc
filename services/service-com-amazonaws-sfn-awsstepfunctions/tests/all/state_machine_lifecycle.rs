@@ -83,12 +83,12 @@ impl Emulator {
         Self::in_region(REGION)
     }
 
-    fn in_region(region: &str) -> Self {
+    pub(crate) fn in_region(region: &str) -> Self {
         Self::on_engine(Arc::new(engine::InMemoryEngine::new()), region)
     }
 
     /// Another client of the SAME store, signing for a different region.
-    fn in_region_on(other: &Self, region: &str) -> Self {
+    pub(crate) fn in_region_on(other: &Self, region: &str) -> Self {
         Self::on_engine(Arc::clone(&other.engine), region)
     }
 
@@ -353,7 +353,9 @@ async fn describe_state_machine_refuses_an_unknown_or_malformed_arn() {
 
     // Rows vary along the SHAPE of the ARN: well formed but naming nothing, naming
     // another region/account/partition, a qualifier this emulator never mints, and
-    // text that is not an ARN of this service at all.
+    // text that is not an ARN of this service at all. An ARN of another REGION is a
+    // defect in the request, not a resource that is absent — see
+    // `tests/all/arn_validation.rs` for that rule over every operation.
     let cases: Vec<(&str, String, &str)> = vec![
         (
             "a well-formed ARN naming no state machine",
@@ -363,7 +365,7 @@ async fn describe_state_machine_refuses_an_unknown_or_malformed_arn() {
         (
             "another region",
             "arn:aws:states:eu-west-1:000000000000:stateMachine:present".to_string(),
-            "StateMachineDoesNotExist",
+            "InvalidArn",
         ),
         (
             "another account",

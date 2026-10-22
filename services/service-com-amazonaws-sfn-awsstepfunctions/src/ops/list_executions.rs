@@ -191,7 +191,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `maxResults` (0..1000), `nextToken` (1..3096), `statusFilter`'s and
         // `redriveFilter`'s enum membership and every ARN length are modelled, so the
         // centralized walk has already refused anything outside them.
@@ -208,9 +207,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.state_machine_arn.as_deref(),
             input.map_run_arn.as_deref(),
         );
+        let endpoint_region = crate::state::request_region(ctx.parts());
         let state_machine_arn = match (state_machine_arn, map_run_arn) {
             (Some(arn), None) => arn,
             (None, Some(map_run)) => {
+                // The ARN is validated before anything is resolved from it, so a
+                // malformed or out-of-region Map Run ARN is `InvalidArn` rather than
+                // a map run that is absent.
+                if let Err(message) = crate::state::read_map_run_arn(map_run, &endpoint_region) {
+                    return Err(ListExecutionsErrorModeled::InvalidArn(InvalidArn {
+                        message: Some(message),
+                    })
+                    .into());
+                }
                 // Map runs are not implemented in this emulator (`DescribeMapRun`,
                 // `ListMapRuns` and `UpdateMapRun` all still answer 501) and no state
                 // this emulator executes starts one, so an ARN naming one names
@@ -227,7 +236,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(
                             "one of stateMachineArn or mapRunArn must be supplied".to_string(),
                         ),
-                        reason: Some("MISSING_REQUIRED_PARAMETER".to_string()),
+                        reason: Some(
+                            crate::state::VALIDATION_REASON_MISSING_PARAMETER.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -245,11 +256,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        if crate::state::parse_state_machine_arn(state_machine_arn).is_none() {
+        // The ARN is validated BEFORE the lookup: a malformed ARN, an ARN of another
+        // service and an ARN of another region are defects in the REQUEST, which
+        // `InvalidArn` reports, not a state machine that is absent here.
+        if let Err(message) =
+            crate::state::read_state_machine_arn(state_machine_arn, &endpoint_region)
+        {
             return Err(ListExecutionsErrorModeled::InvalidArn(InvalidArn {
-                message: Some(format!(
-                    "'{state_machine_arn}' is not a state machine ARN of this service"
-                )),
+                message: Some(message),
             })
             .into());
         }
@@ -270,7 +284,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(machine) = store.state_machines.get(state_machine_arn) else {
             return Err(ListExecutionsErrorModeled::StateMachineDoesNotExist(
                 StateMachineDoesNotExist {
-                    message: Some(format!("state machine {state_machine_arn} does not exist")),
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                        state_machine_arn,
+                    )),
                 },
             )
             .into());

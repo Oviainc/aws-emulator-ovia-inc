@@ -140,7 +140,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
@@ -148,13 +147,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The same ARN rule `TagResource` reads: `resourceArn` is "the ARN for the
-        // Step Functions state machine or activity", and anything else is the ARN
-        // this operation cannot read, which `InvalidArn` reports.
-        let Some(target) = crate::state::parse_taggable_arn(&input.resource_arn) else {
-            return Err(ListTagsForResourceErrorModeled::InvalidArn(InvalidArn {
-                message: Some(crate::state::untaggable_arn_message(&input.resource_arn)),
-            })
-            .into());
+        // Step Functions state machine or activity", and anything else — another
+        // service's ARN, another Step Functions resource type, another region's ARN —
+        // is an ARN this operation cannot read, which `InvalidArn` reports with its
+        // own HTTP 400, before any resource resolution.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let target = match crate::state::read_taggable_arn(&input.resource_arn, &endpoint_region) {
+            Ok(target) => target,
+            Err(message) => {
+                return Err(ListTagsForResourceErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(message),
+                })
+                .into())
+            }
         };
 
         let mut store = state.lock();

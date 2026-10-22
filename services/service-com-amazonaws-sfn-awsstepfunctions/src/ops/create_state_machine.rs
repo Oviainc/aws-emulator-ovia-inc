@@ -385,7 +385,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if deleting {
                 return Err(CreateStateMachineErrorModeled::StateMachineDeleting(
                     StateMachineDeleting {
-                        message: Some(format!("state machine {existing_arn} is being deleted")),
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DELETING,
+                            &existing_arn,
+                        )),
                     },
                 )
                 .into());

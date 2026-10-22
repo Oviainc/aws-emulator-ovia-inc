@@ -153,19 +153,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
 
-        if crate::state::parse_execution_arn(&input.execution_arn).is_none() {
+        // The ARN is validated BEFORE the lookup: a malformed ARN, an ARN of another
+        // service and an ARN of another region are defects in the REQUEST, which
+        // `InvalidArn` reports, not an execution that is absent here.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if let Err(message) =
+            crate::state::read_execution_arn(&input.execution_arn, &endpoint_region)
+        {
             return Err(StopExecutionErrorModeled::InvalidArn(InvalidArn {
-                message: Some(format!(
-                    "'{}' is not an execution ARN of this service",
-                    input.execution_arn
-                )),
+                message: Some(message),
             })
             .into());
         }
@@ -206,7 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(StopExecutionErrorModeled::ExecutionDoesNotExist(
                 ExecutionDoesNotExist {
-                    message: Some(format!("execution {} does not exist", input.execution_arn)),
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::EXECUTION_DOES_NOT_EXIST,
+                        &input.execution_arn,
+                    )),
                 },
             )
             .into());

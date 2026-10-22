@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/arn_validation.rs"]
+mod arn_validation;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
 #[path = "all/resource_tags.rs"]

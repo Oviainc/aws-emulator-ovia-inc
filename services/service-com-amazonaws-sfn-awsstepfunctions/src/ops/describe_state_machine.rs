@@ -210,21 +210,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
 
-        let Some(parsed) = crate::state::parse_state_machine_arn(&input.state_machine_arn) else {
-            return Err(DescribeStateMachineErrorModeled::InvalidArn(InvalidArn {
-                message: Some(format!(
-                    "'{}' is not a state machine ARN of this service",
-                    input.state_machine_arn
-                )),
-            })
-            .into());
+        // The ARN is validated BEFORE the lookup: a malformed ARN, an ARN of another
+        // service and an ARN of another region are defects in the REQUEST, which
+        // `InvalidArn` reports, not a state machine that is absent here. A map-run
+        // LABELED ARN is accepted by this operation — its output carries the `label`
+        // member — so it is resolved against the store like any other.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let parsed = match crate::state::read_state_machine_arn(
+            &input.state_machine_arn,
+            &endpoint_region,
+        ) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                return Err(DescribeStateMachineErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(message),
+                })
+                .into())
+            }
         };
 
         let mut store = state.lock();
@@ -234,9 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let not_found = || {
             DescribeStateMachineErrorModeled::StateMachineDoesNotExist(StateMachineDoesNotExist {
-                message: Some(format!(
-                    "state machine {} does not exist",
-                    input.state_machine_arn
+                message: Some(crate::state::resource_error_message(
+                    crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                    &input.state_machine_arn,
                 )),
             })
         };

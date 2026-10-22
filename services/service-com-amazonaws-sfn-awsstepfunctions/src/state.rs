@@ -36,6 +36,15 @@
 //! Nothing sleeps: the due instant is stored and [`ComAmazonawsSfnAwsstepfunctionsState::settle`]
 //! materialises whatever the clock has already made due. That is the only write a
 //! reporting operation makes.
+//!
+//! ## ARNs are validated before anything is looked up
+//!
+//! Every operation reads its ARN members through [`read_state_machine_arn`],
+//! [`read_execution_arn`], [`read_taggable_arn`] or [`read_map_run_arn`], each of
+//! which judges the ARN itself — its syntax, its service and the region the
+//! request's endpoint serves — BEFORE the store is consulted, and answers the
+//! message the modelled `InvalidArn` carries. A defect in the ARN is therefore
+//! never reported as a resource that is absent.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -67,6 +76,25 @@ pub const EXECUTION_RESOURCE: &str = "execution";
 /// answers 501), which is why an activity ARN is a resource that cannot be found
 /// rather than an ARN that cannot be read.
 pub const ACTIVITY_RESOURCE: &str = "activity";
+
+/// The resource type a Map Run ARN carries (`ListExecutions`' `mapRunArn`).
+pub const MAP_RUN_RESOURCE: &str = "mapRun";
+
+/// `ValidationExceptionReason`'s member for an API that does not accept a map-run
+/// labeled state machine ARN (`smithy_query(query="shape",
+/// shape="ValidationExceptionReason")`: `API_DOES_NOT_SUPPORT_LABELED_ARNS`,
+/// `MISSING_REQUIRED_PARAMETER`, `CANNOT_UPDATE_COMPLETED_MAP_RUN`,
+/// `INVALID_ROUTING_CONFIGURATION`).
+pub const VALIDATION_REASON_LABELED_ARN: &str = "API_DOES_NOT_SUPPORT_LABELED_ARNS";
+
+/// `ValidationExceptionReason`'s member for a request that left out a parameter the
+/// operation requires, from the same enum.
+pub const VALIDATION_REASON_MISSING_PARAMETER: &str = "MISSING_REQUIRED_PARAMETER";
+
+/// What the modelled `ValidationException` says about a map-run labeled state
+/// machine ARN, on every operation that documents refusing one. It names nothing
+/// from the request, so every such operation answers exactly this.
+pub const LABELED_ARN_MESSAGE: &str = "Labeled State Machine ARNs are not supported for this API";
 
 /// Returned when the shared engine does not carry this service's store, which can
 /// only happen on an engine this crate was not mounted on. The model declares no
@@ -1387,30 +1415,32 @@ pub enum TaggableResource {
     Activity(String),
 }
 
-/// The taggable resource `arn` names, or `None` when `arn` is not the ARN of one.
-pub fn parse_taggable_arn(arn: &str) -> Option<TaggableResource> {
-    if let Some(state_machine) = parse_state_machine_arn(arn) {
-        return Some(TaggableResource::StateMachine(state_machine));
-    }
-    let resource = states_arn_resource(arn)?;
+/// The taggable resource `arn` names, read as an ARN of this service in
+/// `endpoint_region`, or the message the modelled `InvalidArn` carries.
+pub fn read_taggable_arn(arn: &str, endpoint_region: &str) -> Result<TaggableResource, String> {
+    let resource = states_arn_resource(arn, endpoint_region)?;
     let mut parts = resource.splitn(3, ':');
-    if parts.next()? != ACTIVITY_RESOURCE {
-        return None;
+    let kind = parts.next().unwrap_or_default();
+    if kind == STATE_MACHINE_RESOURCE {
+        return Ok(TaggableResource::StateMachine(state_machine_resource(
+            arn, &mut parts,
+        )?));
     }
-    let name = parts.next().filter(|name| !name.is_empty())?;
+    if kind != ACTIVITY_RESOURCE {
+        return Err(invalid_arn_message(format!(
+            "Invalid ARN resource type: {kind}, expected {STATE_MACHINE_RESOURCE} or \
+             {ACTIVITY_RESOURCE}"
+        )));
+    }
+    let name = parts.next().unwrap_or_default();
     // An activity ARN carries no qualifier: only versions and aliases of a state
     // machine do.
-    if parts.next().is_some() {
-        return None;
+    if name.is_empty() || parts.next().is_some() {
+        return Err(invalid_arn_message(format!(
+            "Invalid ARN {ACTIVITY_RESOURCE} resource: {resource}"
+        )));
     }
-    Some(TaggableResource::Activity(name.to_string()))
-}
-
-/// What the modelled `InvalidArn` says about an ARN that is not a taggable Step
-/// Functions ARN, so every operation reading [`parse_taggable_arn`] words its
-/// refusal the same way.
-pub fn untaggable_arn_message(resource_arn: &str) -> String {
-    format!("'{resource_arn}' is not the ARN of a Step Functions state machine or activity")
+    Ok(TaggableResource::Activity(name.to_string()))
 }
 
 /// What the modelled `ResourceNotFound` says about a taggable ARN the store holds no
@@ -1418,6 +1448,32 @@ pub fn untaggable_arn_message(resource_arn: &str) -> String {
 pub fn resource_not_found_message(resource_arn: &str) -> String {
     format!("could not find the resource {resource_arn}")
 }
+
+/// The message a Step Functions resource error carries: the error's own name, in
+/// spaced Title Case, then the ARN the request named, quoted.
+///
+/// This is built from the request through ONE rule — the recorded service answers
+/// `State Machine Does Not Exist: '<arn>'` for `StateMachineDoesNotExist` and
+/// `Execution Already Exists: '<arn>'` for `ExecutionAlreadyExists` — so every
+/// operation here words a resource refusal through this, and none of them invents a
+/// sentence of its own.
+pub fn resource_error_message(error_name: &str, arn: &str) -> String {
+    format!("{error_name}: '{arn}'")
+}
+
+/// `StateMachineDoesNotExist`'s own name, as its message spells it. RECORDED text.
+pub const STATE_MACHINE_DOES_NOT_EXIST: &str = "State Machine Does Not Exist";
+
+/// `StateMachineDeleting`'s, for [`resource_error_message`]. The error's own name
+/// under the rule above, not a recorded message.
+pub const STATE_MACHINE_DELETING: &str = "State Machine is Deleting";
+
+/// `ExecutionDoesNotExist`'s, for [`resource_error_message`]. The error's own name
+/// under the rule above, not a recorded message.
+pub const EXECUTION_DOES_NOT_EXIST: &str = "Execution Does Not Exist";
+
+/// `ExecutionAlreadyExists`'s, for [`resource_error_message`]. RECORDED text.
+pub const EXECUTION_ALREADY_EXISTS: &str = "Execution Already Exists";
 
 /// Why a redrive was not performed; see
 /// [`ComAmazonawsSfnAwsstepfunctionsState::redrive_execution`]. A redrive the
@@ -1449,9 +1505,27 @@ pub enum TagWriteRejection {    /// The store holds no resource under that ARN �
 /// The parts of a state machine ARN this service reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateMachineArn {
+    /// The state machine name field, which on a map-run LABELED ARN carries the
+    /// `<name>/<label>` form — see [`StateMachineArn::label`].
     pub name: String,
     /// The `:<version>` or `:<alias>` suffix a qualified ARN carries, if any.
     pub qualifier: Option<String>,
+}
+
+impl StateMachineArn {
+    /// The map-run label a LABELED state machine ARN carries, or `None` for an ARN
+    /// that names a state machine itself.
+    ///
+    /// From `StartExecution`'s and `DeleteStateMachine`'s own documentation: "The
+    /// following qualified state machine ARN refers to a Distributed Map state with
+    /// a label `mapStateLabel` in a state machine named `myStateMachine`:
+    /// `arn:partition:states:region:account-id:stateMachine:myStateMachine/mapStateLabel`".
+    /// The label follows the name after a `/`, which the `name` rule
+    /// ([`invalid_name_reason`]) forbids inside a name, so the two forms never
+    /// collide.
+    pub fn label(&self) -> Option<&str> {
+        self.name.split_once('/').map(|(_, label)| label)
+    }
 }
 
 /// The ARN of the state machine `name` in `region`.
@@ -1515,52 +1589,139 @@ pub fn arn_region(arn: &str) -> String {
         .to_string()
 }
 
-/// The resource portion of an ARN of this service, or `None` when `arn` is not one.
+/// The message the modelled `InvalidArn` carries for `diagnosis`, the ARN component
+/// that failed validation.
 ///
-/// An ARN is six colon-delimited fields, the last of which carries the colons of the
-/// resource itself; anything that is not `arn:<partition>:states:...` with a
-/// non-empty partition is refused, which is what the modelled `InvalidArn` reports.
-fn states_arn_resource(arn: &str) -> Option<&str> {
-    let mut fields = arn.splitn(6, ':');
-    let scheme = fields.next()?;
-    let partition = fields.next()?;
-    let service = fields.next()?;
-    let _region = fields.next()?;
-    let _account = fields.next()?;
-    let resource = fields.next()?;
-    (scheme == "arn" && !partition.is_empty() && service == ARN_SERVICE).then_some(resource)
+/// Step Functions wraps every ARN diagnosis in this envelope — `Invalid Arn:
+/// '<diagnosis>'` — and the diagnosis is built from the request: `Invalid ARN
+/// prefix: <value>` for text that does not begin with `arn:`, `Expected the ARN
+/// <arn> to be within region (<region>).` for an ARN of another region. Every
+/// refusal in this module goes through here, so one envelope serves every operation.
+pub fn invalid_arn_message(diagnosis: String) -> String {
+    format!("Invalid Arn: '{diagnosis}'")
 }
 
-/// The state machine an ARN names, or `None` when `arn` is not a state machine ARN
-/// of this service.
-pub fn parse_state_machine_arn(arn: &str) -> Option<StateMachineArn> {
-    let resource = states_arn_resource(arn)?;
-    let mut parts = resource.splitn(3, ':');
-    if parts.next()? != STATE_MACHINE_RESOURCE {
-        return None;
+/// The resource portion of `arn`, which must be the ARN of a resource of THIS
+/// service in `endpoint_region`, or the message the modelled `InvalidArn` carries.
+///
+/// Step Functions validates an ARN BEFORE it looks the resource up, so a
+/// syntactically wrong ARN, an ARN of another service and an ARN of another region
+/// are each the client ARN error rather than a resource that could not be found. An
+/// ARN is six colon-delimited fields, the last of which carries the colons of the
+/// resource itself; the checks run in the order the fields are written, so the
+/// diagnosis names the FIRST component that failed.
+///
+/// The account field is deliberately not checked: no operation here is scoped by
+/// account, and the emulator serves one account.
+fn states_arn_resource<'a>(arn: &'a str, endpoint_region: &str) -> Result<&'a str, String> {
+    let Some(fields) = arn.strip_prefix("arn:") else {
+        return Err(invalid_arn_message(format!("Invalid ARN prefix: {arn}")));
+    };
+    // A field the ARN stops short of reads as empty, so the checks below judge the
+    // fields in the order they are written and the resource's own presence last.
+    let mut fields = fields.splitn(5, ':');
+    let partition = fields.next().unwrap_or_default();
+    let service = fields.next().unwrap_or_default();
+    let region = fields.next().unwrap_or_default();
+    let _account = fields.next().unwrap_or_default();
+    let resource = fields.next();
+    if partition.is_empty() {
+        return Err(invalid_arn_message(format!("Invalid ARN partition: {arn}")));
     }
-    let name = parts.next()?;
+    if service != ARN_SERVICE {
+        return Err(invalid_arn_message(format!(
+            "Invalid ARN service: {service}, expected {ARN_SERVICE}"
+        )));
+    }
+    // A regional endpoint serves only its own region's resources: an ARN naming
+    // another region is a defect in the REQUEST, not a resource that is absent here.
+    if region != endpoint_region {
+        return Err(invalid_arn_message(format!(
+            "Expected the ARN {arn} to be within region ({endpoint_region})."
+        )));
+    }
+    resource.ok_or_else(|| {
+        invalid_arn_message(format!(
+            "Invalid ARN: expected 6 colon-delimited fields in {arn}"
+        ))
+    })
+}
+
+/// The state machine `name[/label][:qualifier]` the remaining resource fields name,
+/// shared by the readers that accept a state machine ARN.
+fn state_machine_resource<'a>(
+    arn: &str,
+    parts: &mut impl Iterator<Item = &'a str>,
+) -> Result<StateMachineArn, String> {
+    let name = parts.next().unwrap_or_default();
     if name.is_empty() {
-        return None;
+        return Err(invalid_arn_message(format!(
+            "Invalid ARN {STATE_MACHINE_RESOURCE} name: {arn}"
+        )));
     }
-    Some(StateMachineArn {
+    Ok(StateMachineArn {
         name: name.to_string(),
         qualifier: parts.next().map(str::to_string),
     })
 }
 
-/// The `(stateMachineName, executionName)` an execution ARN names, or `None` when
-/// `arn` is not an execution ARN of this service.
-pub fn parse_execution_arn(arn: &str) -> Option<(String, String)> {
-    let resource = states_arn_resource(arn)?;
+/// The state machine `arn` names, read as an ARN of this service in
+/// `endpoint_region`, or the message the modelled `InvalidArn` carries.
+pub fn read_state_machine_arn(arn: &str, endpoint_region: &str) -> Result<StateMachineArn, String> {
+    let resource = states_arn_resource(arn, endpoint_region)?;
     let mut parts = resource.splitn(3, ':');
-    if parts.next()? != EXECUTION_RESOURCE {
-        return None;
+    let kind = parts.next().unwrap_or_default();
+    if kind != STATE_MACHINE_RESOURCE {
+        return Err(invalid_arn_message(format!(
+            "Invalid ARN resource type: {kind}, expected {STATE_MACHINE_RESOURCE}"
+        )));
     }
-    let state_machine = parts.next()?;
-    let execution = parts.next()?;
-    (!state_machine.is_empty() && !execution.is_empty())
-        .then(|| (state_machine.to_string(), execution.to_string()))
+    state_machine_resource(arn, &mut parts)
+}
+
+/// The `(stateMachineName, executionName)` `arn` names, read as an execution ARN of
+/// this service in `endpoint_region`, or the message the modelled `InvalidArn`
+/// carries.
+pub fn read_execution_arn(arn: &str, endpoint_region: &str) -> Result<(String, String), String> {
+    let resource = states_arn_resource(arn, endpoint_region)?;
+    let mut parts = resource.splitn(3, ':');
+    let kind = parts.next().unwrap_or_default();
+    if kind != EXECUTION_RESOURCE {
+        return Err(invalid_arn_message(format!(
+            "Invalid ARN resource type: {kind}, expected {EXECUTION_RESOURCE}"
+        )));
+    }
+    let state_machine = parts.next().unwrap_or_default();
+    let execution = parts.next().unwrap_or_default();
+    if state_machine.is_empty() || execution.is_empty() {
+        return Err(invalid_arn_message(format!(
+            "Invalid ARN {EXECUTION_RESOURCE} resource: {resource}"
+        )));
+    }
+    Ok((state_machine.to_string(), execution.to_string()))
+}
+
+/// Reads `arn` as a Map Run ARN of this service in `endpoint_region`, answering the
+/// message the modelled `InvalidArn` carries when it is not one.
+///
+/// A Map Run ARN is `mapRun:<stateMachineName>/<label>:<id>`, so only its resource
+/// type and a non-empty remainder are read here: no map run can exist in this
+/// emulator, so nothing is resolved from it.
+pub fn read_map_run_arn(arn: &str, endpoint_region: &str) -> Result<(), String> {
+    let resource = states_arn_resource(arn, endpoint_region)?;
+    let mut parts = resource.splitn(2, ':');
+    let kind = parts.next().unwrap_or_default();
+    if kind != MAP_RUN_RESOURCE {
+        return Err(invalid_arn_message(format!(
+            "Invalid ARN resource type: {kind}, expected {MAP_RUN_RESOURCE}"
+        )));
+    }
+    if parts.next().is_none_or(str::is_empty) {
+        return Err(invalid_arn_message(format!(
+            "Invalid ARN {MAP_RUN_RESOURCE} resource: {resource}"
+        )));
+    }
+    Ok(())
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; the

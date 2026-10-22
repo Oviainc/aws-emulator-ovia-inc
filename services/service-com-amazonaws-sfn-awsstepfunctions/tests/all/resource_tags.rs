@@ -395,10 +395,12 @@ async fn both_tagging_operations_read_the_same_arn_rule() {
             "ResourceNotFound",
         ),
         (
+            // An ARN of another REGION is a defect in the request, which `InvalidArn`
+            // reports with its own 400, not a resource missing from this region.
             "the same name in another region",
             format!("arn:aws:states:eu-west-1:{ACCOUNT}:stateMachine:tag-arn-rule"),
-            404,
-            "ResourceNotFound",
+            400,
+            "InvalidArn",
         ),
         (
             // Versions and aliases are not implemented, so no qualified resource

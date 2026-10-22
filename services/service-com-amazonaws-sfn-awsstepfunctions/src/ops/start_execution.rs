@@ -208,7 +208,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `stateMachineArn` (1..256), `name` (1..80), `input` (0..262144) and
         // `traceHeader`'s ASCII pattern are modelled, so the centralized walk has
         // already refused anything outside them. The character rule on `name` and the
@@ -219,13 +218,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        if crate::state::parse_state_machine_arn(&input.state_machine_arn).is_none() {
-            return Err(StartExecutionErrorModeled::InvalidArn(InvalidArn {
-                message: Some(format!(
-                    "'{}' is not a state machine ARN of this service",
-                    input.state_machine_arn
-                )),
-            })
+        // The ARN is validated BEFORE the state machine is looked up: a malformed ARN
+        // and one naming another service or another region are defects in the
+        // REQUEST, which `InvalidArn` reports, not a state machine that is absent.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let parsed =
+            match crate::state::read_state_machine_arn(&input.state_machine_arn, &endpoint_region) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    return Err(StartExecutionErrorModeled::InvalidArn(InvalidArn {
+                        message: Some(message),
+                    })
+                    .into())
+                }
+            };
+
+        // "The following qualified state machine ARN refers to a Distributed Map
+        // state with a label mapStateLabel in a state machine named myStateMachine
+        // [...] If you provide a qualified state machine ARN that refers to a
+        // Distributed Map state, the request fails with ValidationException" — whose
+        // `reason` member names the class of rejection.
+        if parsed.label().is_some() {
+            return Err(StartExecutionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::LABELED_ARN_MESSAGE.to_string()),
+                    reason: Some(crate::state::VALIDATION_REASON_LABELED_ARN.to_string()),
+                },
+            )
             .into());
         }
 
@@ -262,9 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(machine) = store.state_machines.get(&input.state_machine_arn) else {
                 return Err(StartExecutionErrorModeled::StateMachineDoesNotExist(
                     StateMachineDoesNotExist {
-                        message: Some(format!(
-                            "state machine {} does not exist",
-                            input.state_machine_arn
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                            &input.state_machine_arn,
                         )),
                     },
                 )
@@ -273,9 +292,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if machine.is_deleting() {
                 return Err(StartExecutionErrorModeled::StateMachineDeleting(
                     StateMachineDeleting {
-                        message: Some(format!(
-                            "state machine {} is being deleted",
-                            input.state_machine_arn
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::STATE_MACHINE_DELETING,
+                            &input.state_machine_arn,
                         )),
                     },
                 )
@@ -343,7 +362,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(machine) = store.state_machines.get(&machine_arn) else {
             return Err(StartExecutionErrorModeled::StateMachineDoesNotExist(
                 StateMachineDoesNotExist {
-                    message: Some(format!("state machine {machine_arn} does not exist")),
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                        &machine_arn,
+                    )),
                 },
             )
             .into());
@@ -351,7 +373,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if machine.is_deleting() {
             return Err(StartExecutionErrorModeled::StateMachineDeleting(
                 StateMachineDeleting {
-                    message: Some(format!("state machine {machine_arn} is being deleted")),
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::STATE_MACHINE_DELETING,
+                        &machine_arn,
+                    )),
                 },
             )
             .into());
@@ -375,7 +400,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !standard || existing.is_terminal() || existing.input != execution_input {
                 return Err(StartExecutionErrorModeled::ExecutionAlreadyExists(
                     ExecutionAlreadyExists {
-                        message: Some(format!("execution {arn} already exists")),
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::EXECUTION_ALREADY_EXISTS,
+                            &arn,
+                        )),
                     },
                 )
                 .into());

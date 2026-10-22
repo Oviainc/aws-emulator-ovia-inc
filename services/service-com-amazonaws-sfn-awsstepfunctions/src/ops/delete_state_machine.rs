@@ -146,39 +146,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
 
-        let Some(parsed) = crate::state::parse_state_machine_arn(&input.state_machine_arn) else {
-            return Err(DeleteStateMachineErrorModeled::InvalidArn(InvalidArn {
-                message: Some(format!(
-                    "'{}' is not a state machine ARN of this service",
-                    input.state_machine_arn
-                )),
-            })
-            .into());
-        };
+        // The ARN is validated BEFORE anything is resolved from it: a malformed ARN,
+        // an ARN of another service and an ARN of another region are defects in the
+        // REQUEST, which `InvalidArn` reports.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let parsed =
+            match crate::state::read_state_machine_arn(&input.state_machine_arn, &endpoint_region) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    return Err(DeleteStateMachineErrorModeled::InvalidArn(InvalidArn {
+                        message: Some(message),
+                    })
+                    .into())
+                }
+            };
         // "A qualified state machine ARN can either refer to a Distributed Map state
         // defined within a state machine, a version ARN, or an alias ARN", and "if
         // you provide a qualified state machine ARN that refers to a Distributed Map
-        // state, the request fails with ValidationException". A Distributed Map state
-        // is named by a label after the state machine name; a version or alias is a
-        // qualifier after it. This emulator holds none of the three — versions and
-        // aliases are not implemented and still answer 501 — so a qualified ARN names
-        // nothing it could delete, and a success would be indistinguishable from one.
-        if parsed.name.contains('/') || parsed.qualifier.is_some() {
+        // state, the request fails with ValidationException" — whose `reason` member
+        // names the class of rejection.
+        if parsed.label().is_some() {
+            return Err(DeleteStateMachineErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::LABELED_ARN_MESSAGE.to_string()),
+                    reason: Some(crate::state::VALIDATION_REASON_LABELED_ARN.to_string()),
+                },
+            )
+            .into());
+        }
+        // A version or alias qualifier names a resource this emulator cannot hold —
+        // versions and aliases are not implemented and still answer 501 — so such an
+        // ARN names nothing it could delete, and a success would be
+        // indistinguishable from one.
+        if parsed.qualifier.is_some() {
             return Err(DeleteStateMachineErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
-                        "'{}' is a qualified ARN, naming a Distributed Map state, a version or an \
-                         alias, which DeleteStateMachine does not accept",
+                        "'{}' is a qualified ARN, naming a version or an alias, which this \
+                         emulator cannot hold",
                         input.state_machine_arn
                     )),
-                    reason: Some("API_DOES_NOT_SUPPORT_LABELED_ARNS".to_string()),
+                    reason: None,
                 },
             )
             .into());
