@@ -45,9 +45,9 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The input member every resource-ARN-addressed operation of this service
-/// carries, as a violation path spells it (lowerCamel).
-const RESOURCE_ARN_MEMBER: &str = "resourceArn";
+/// The violation-path segment the boundary validator writes for a LIST element,
+/// which names no member of the request.
+const LIST_ELEMENT_SEGMENT: &str = "member";
 
 /// The `com-amazonaws-marketplacecatalog-awsmpseymour` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -116,13 +116,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // A resource ARN this service will not accept is stated the way this
-        // service states it: naming the value it rejected and the syntax it
-        // required. The boundary validator refuses a `ResourceARN` that fails the
-        // modelled `@pattern` before any handler runs, so this seam is the only
-        // place that wording can be chosen — and the one place it is chosen for
-        // EVERY operation that takes a `ResourceArn` (the tagging and
-        // resource-policy surface), rather than per operation.
+        // A member this service will not accept is stated the way this service
+        // states it: ONE bracketed fault naming the member, the value it
+        // rejected and the syntax it required — never the framework's generic
+        // aggregate, which addresses members by lowercase wire path and lists a
+        // sentence per violation where this service reports exactly one.
+        //
+        // The boundary validator refuses a member that fails its modelled
+        // `@pattern` before any handler runs, so this seam is the only place
+        // that wording can be chosen — and the one place it is chosen for EVERY
+        // operation and every member, rather than per operation. The members
+        // whose documented syntax is WIDER than the modelled pattern (`Catalog`,
+        // `Entity$Type`, `Entity$Identifier`, `EntityRequest$EntityId`,
+        // `ChangeSetName`, `ClientRequestToken`, `AssessmentIdentifier`,
+        // `NextToken`) carry `skip_validation` and are checked by their handler
+        // instead, which answers the modelled `ValidationException` and its 422;
+        // what reaches here is a member whose modelled pattern IS the syntax the
+        // service publishes — `ResourceArn` above all, the member every tagging
+        // and resource-policy operation is addressed by.
         //
         // The code stays `ValidationException`, which is both the framework's own
         // code for a constraint failure and the modelled client error a handler
@@ -133,18 +144,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
-        // The first refused member, which is the one the service names. The path
-        // is rooted at the top-level input member and descends from there.
+        // The FIRST refused member, which is the one the service names: it
+        // reports one fault however many members were malformed.
         let violation = violations.first()?;
-        if violation.path.split('.').next()? != RESOURCE_ARN_MEMBER {
-            return None;
-        }
         let ViolationKind::Pattern(pattern) = &violation.kind else {
+            // Every other kind of violation (a missing member, a length or a
+            // range) has no such published syntax to quote, so the framework's
+            // own wording stands.
             return None;
         };
+        // The path is rooted at the top-level input member and descends from
+        // there (`changeSet.1.member.entity.type`); the member a fault addresses
+        // is its last NAMED segment, since the list indices and element segments
+        // in between name no member.
+        let member = violation.path.split('.').rfind(|segment| {
+            *segment != LIST_ELEMENT_SEGMENT && segment.parse::<usize>().is_err()
+        })?;
         Some(Refused {
             code: "ValidationException".to_string(),
-            message: crate::state::invalid_resource_arn_message(
+            message: crate::state::invalid_member_message(
+                member,
                 violation.value.as_deref().unwrap_or_default(),
                 pattern,
             ),

@@ -244,12 +244,23 @@ where
 /// Both classes come from the framework's own machinery (the protocol's deserializer and
 /// `constraints::validate` over the built input), so this cannot find a different set of
 /// violations from the walk that follows it.
+///
+/// What the violations are then put through is NOT another check:
+/// [`service_common::validation::with_submitted_values`] re-reads the SAME built input to
+/// restore each violation's value echo to the bytes the caller sent, which the
+/// framework's walk stores elided (a prefix plus `... [<n> bytes]`). An AWS
+/// constraint-validation message is built from the request, so the echoed value is part
+/// of the rule a caller reads the rejected input back out of.
 fn refused_by<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Vec<Violation> {
     let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
         return Vec::new();
     };
     match <O::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
-        Ok(input) => constraints::validate(&input, O::INPUT_SCHEMA),
+        Ok(input) => service_common::validation::with_submitted_values(
+            constraints::validate(&input, O::INPUT_SCHEMA),
+            &input,
+            O::INPUT_SCHEMA,
+        ),
         // Absence is found while READING the request and a bad value while walking what
         // was read; to a caller they are one refusal, so they are one here.
         Err(SerdeError::MissingMember { member_name }) => vec![Violation {
@@ -336,6 +347,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Wording it here from the same violations keeps the two paths from disagreeing:
         // a value outside a declared bound is this service's `ValidationException`
         // either way, with the same sentence (see `refusal_message`).
+        //
+        // One thing this seam cannot do is restore an elided value echo: the framework
+        // hands over the violations alone, not the request they were collected from, and
+        // the value a violation stores was already shortened when it was built. The
+        // request that reaches here has therefore already been refused by
+        // `InModelledEnvelope` (which re-reads the input and does restore it), so this is
+        // the fallback for the one case that path declines: an error this service's own
+        // schema could not serialize.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),

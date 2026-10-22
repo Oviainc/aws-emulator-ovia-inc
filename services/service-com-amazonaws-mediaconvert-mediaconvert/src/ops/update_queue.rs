@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Modify one of your existing queues." Every member the request carries replaces the
+//! stored one on the named [`crate::state::QueueRecord`]; a member it leaves out keeps
+//! the value an earlier call persisted. The mutation is read-your-write visible: the
+//! response and the next `GetQueue` project the same stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +168,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateQueue"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateQueueErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // `{Name}` addresses the queue, as `GetQueue`'s does; the stored key is the name
+        // exactly as `CreateQueue` persisted it, so it is read as sent.
+        let name = input.name;
+        let mut state = state.lock();
+        // Settle first, so the job counts this response projects are the ones the clock
+        // had already made due at `now` rather than stale ones.
+        state.settle(now);
+
+        let Some(record) = state.queues.get_mut(&name) else {
+            return Err(UpdateQueueErrorModeled::NotFoundException(NotFoundException {
+                // The refusal names the request member the lookup read, `Name`.
+                message: Some(crate::state::not_found_message("name")),
+            })
+            .into());
+        };
+        // `Queue$Type`: "System queues are built in. You can't modify or delete system
+        // queues." A built-in queue is not "one of your existing queues", so the
+        // modification is refused the way `UpdateJobTemplate` and `UpdatePreset` refuse a
+        // built-in template or preset.
+        if record.queue_type == crate::state::QUEUE_TYPE_SYSTEM {
+            return Err(UpdateQueueErrorModeled::ForbiddenException(ForbiddenException {
+                message: Some(crate::state::system_resource_modify_message("name")),
+            })
+            .into());
+        }
+
+        // `ReservationPlanSettings` is "the new details of your pricing plan for your
+        // RESERVED queue", and `ReservationPlanSettings` itself is "required for reserved
+        // queues and not applicable to on-demand queues" — so sending one for an
+        // on-demand queue is a problem in the request, the same refusal `CreateQueue`
+        // gives. Checked before anything is written, so a refused update changes nothing.
+        if let Some(settings) = input.reservation_plan_settings.as_ref() {
+            if record.pricing_plan != crate::state::PRICING_PLAN_RESERVED {
+                return Err(UpdateQueueErrorModeled::BadRequestException(BadRequestException {
+                    // The same sentence `CreateQueue` answers for the same pairing: it
+                    // lives in `state` so the two refusals cannot drift.
+                    message: Some(crate::state::reservation_plan_not_applicable_message()),
+                })
+                .into());
+            }
+            // "When you set up a new pricing plan to replace an expired one, you enter
+            // into another 12-month commitment": the term restarts from this call.
+            record.reservation_plan = Some(crate::state::reservation_plan(settings, now));
+        }
+
+        // Each remaining member is "the new <member> ... if you are changing it": one the
+        // request carries replaces the stored value, one it omits leaves the stored value
+        // exactly as it was. The description is kept verbatim, as `CreateQueue` keeps it.
+        if let Some(status) = input.status {
+            record.status = status;
+        }
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        if let Some(concurrent_jobs) = input.concurrent_jobs {
+            record.concurrent_jobs = concurrent_jobs;
+        }
+        if let Some(maximum_concurrent_feeds) = input.maximum_concurrent_feeds {
+            record.maximum_concurrent_feeds = maximum_concurrent_feeds;
+        }
+        // `Queue$LastUpdated`: "The timestamp in epoch seconds for when you most recently
+        // updated the queue." This call is that update, so it moves; `CreatedAt` does not.
+        record.last_updated = now;
+
+        // The response is projected from the record that was just stored — the same view
+        // `GetQueue` serializes — so the update and every later read cannot disagree.
+        let record = record.clone();
+        let (submitted, progressing) = state.job_counts(&name);
+
+        Ok(UpdateQueueOutput {
+            queue: Some(record.view(&region, submitted, progressing)),
+        })
     }
 }

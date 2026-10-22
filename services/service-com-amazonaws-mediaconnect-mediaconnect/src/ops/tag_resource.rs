@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! MERGES the request's tag pairs into the tags of the resource `ResourceArn` addresses,
+//! in [`crate::state`]: a key the request names is set or overwritten, a key it does not
+//! name keeps the value it had, and ListTagsForResource afterwards reports the union.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +69,26 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error".
+fn bad_request(message: impl Into<String>) -> TagResourceError {
+    TagResourceErrorModeled::BadRequestException(BadRequestException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// The modelled 404 for a `ResourceArn` that addresses no resource this service holds:
+/// `NotFoundException`, "one or more of the resources in the request does not exist in
+/// the system". UntagResource and ListTagsForResource resolve the ARN the same way and
+/// refuse an unresolvable one the same way.
+fn not_found(resource_arn: &str) -> TagResourceError {
+    TagResourceErrorModeled::NotFoundException(NotFoundException {
+        message: format!("Resource with ARN {resource_arn} was not found."),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -167,20 +182,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect flow store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The model bounds neither a tag key nor a tag value, so the pairs reach this
+        // handler unchecked; the service's own bounds live in `crate::state`, where
+        // CreateFlow's `FlowTags` is checked against the same function. Every pair is
+        // checked before anything is written, so a refused call stores none of them.
+        for (key, value) in &input.tags {
+            if let Some(reason) = crate::state::tag_pair_rejection(key, value) {
+                return Err(bad_request(reason));
+            }
+        }
+
+        let mut store = state.lock();
+        let tags = store
+            .tags_of_mut(&input.resource_arn)
+            .ok_or_else(|| not_found(&input.resource_arn))?;
+
+        // The merged set is what the resource will carry, so it is the set the
+        // tags-per-resource bound applies to — a key the request re-states does not grow
+        // it. Checked before the first insert, so a refused call changes nothing.
+        let merged_entries = tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !tags.contains_key(*key))
+                .count();
+        if merged_entries > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(bad_request(format!(
+                "A resource keeps at most {} tags; tagging {} with these keys would give it \
+                 {merged_entries}.",
+                crate::state::MAX_TAGS_PER_RESOURCE,
+                input.resource_arn
+            )));
+        }
+
+        // "If existing tags on a resource are not specified in the request parameters,
+        // they are not changed": add or overwrite the named keys IN PLACE, leaving every
+        // other key the value it had.
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput)
     }
 }

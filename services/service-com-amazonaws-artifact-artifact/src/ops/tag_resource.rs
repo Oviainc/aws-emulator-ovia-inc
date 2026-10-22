@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds tags to the resource its `resourceArn` names, writing them onto the record
+//! [`crate::state`] holds for that resource, so `ListTagsForResource` and
+//! `GetComplianceInquiryMetadata` report back what this call persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A MUTATING operation: "Add tags to a resource." The write is ABSOLUTE PER KEY — a key
+//! the resource already carries takes the request's value and a key it does not carry is
+//! added, so repeating one request changes nothing the second time, and keys the request
+//! does not name are left alone (removing one is `UntagResource`'s job).
+//!
+//! The resource is named by its ARN, and the only resource an account owns in this service
+//! is a compliance inquiry — see
+//! [`crate::state::ComAmazonawsArtifactArtifactState::tagged_resource`]. An ARN that
+//! names no such resource is answered the way the front door answers a target it cannot
+//! authorize (HTTP 401 `UnauthorizedException`), as every resource lookup in this service
+//! does: whether the account holds the resource is not information this API discloses.
 //!
 //! ## Shape of an operation
 //!
@@ -141,20 +147,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact compliance inquiry store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(resource) = store.tagged_resource_mut(&input.resource_arn) else {
+            // An ARN none of this account's resources answers to names nothing the caller
+            // may tag, and whether such a resource exists at all is not disclosed: the
+            // front door's refusal is what the caller sees, exactly as a report lookup
+            // answers an identifier it cannot authorize.
+            return Err(crate::scaffolded::Scaffolded::unauthorized());
+        };
+
+        // Built beside the resource and only then stored, so a write refused for the
+        // per-resource tag limit leaves the resource's tag set exactly as it was.
+        let mut tags = resource.tags.clone();
+        tags.extend(input.tags);
+        if tags.len() > crate::state::TAGS_PER_RESOURCE_LIMIT {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::too_many_tags(tags.len()),
+            )
+            .into());
+        }
+        resource.tags = tags;
+        // `updatedAt` is NOT moved: it reports when the inquiry's own record was last
+        // modified, which this service moves with the processing transition the clock owes
+        // it, and no AWS documentation ties it to a write of the resource's tag set.
+
+        Ok(TagResourceOutput {})
     }
 }

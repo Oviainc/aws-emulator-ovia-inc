@@ -13,9 +13,10 @@
 //!    states (`@pattern("^[a-zA-Z0-9][.a-zA-Z0-9/-]+[a-zA-Z0-9]$")`) BEFORE any lookup:
 //!    an id outside it is a 422 `ValidationException`, and only a well-formed id reaches
 //!    the lookup that answers 404 `ResourceNotFoundException`.
-//! 2. A batch read degrades PER ENTITY: it reports both `EntityDetails` and `Errors`,
+//! 2. A batch read degrades PER ENTRY: it reports both `EntityDetails` and `Errors`,
 //!    empty maps included, with every entity the catalog holds under its id in the first
-//!    and every one it does not under its id in the second.
+//!    and every entry it cannot serve under the id that was asked for in the second —
+//!    whether that entry named a missing entity or an id that is no entity id at all.
 //! 3. A list reports what the store holds for the type and filters asked for — an empty
 //!    `EntitySummaryList` (present, not absent) when nothing matches — and refuses a
 //!    `Sort$SortBy` outside the attributes it documents with a 422.
@@ -464,25 +465,44 @@ async fn a_batch_read_reports_held_entities_and_an_error_for_the_rest() {
     }
 }
 
-/// A batch entry whose id is not in the `EntityId` form is refused rather than reported
-/// as a missing entity: the member carries the pattern in the model, so the boundary
-/// validator answers before the handler runs.
+/// A batch entry whose id is not in the `EntityId` form is reported PER ENTRY in
+/// `Errors` — under the id that was asked for, with the `ValidationException` code a
+/// single read of that id would have raised — and the call itself succeeds, so the
+/// entries beside it are still served.
 #[tokio::test]
-async fn a_batch_entry_with_a_malformed_entity_id_is_refused() {
+async fn a_batch_entry_with_a_malformed_entity_id_is_reported_per_entry() {
     let router = emulator();
-    for entity_id in ["a", "prod_abcdef", "-prod-abcdef"] {
-        let answer = batch_describe_entities(&router, &[entity_id.to_string()]).await;
-        assert!(
-            matches!(answer.status, 400 | 422),
-            "case {entity_id:?}: a malformed batch entity id must be refused as a client \
-             error, got {} with {:?}",
+    let held = created_entity(&router, "AmiProduct", "batch-partial").await;
+    for entity_id in ["a", "prod_abcdef", "-prod-abcdef", "bad entity id!"] {
+        let answer =
+            batch_describe_entities(&router, &[held.clone(), entity_id.to_string()]).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {entity_id:?}: a batch carrying a malformed id must still answer 200, \
+             got {} with {:?}",
             answer.status,
             answer.body
         );
         assert_eq!(
-            answer.error_code(),
+            answer.text(&format!("/Errors/{entity_id}/ErrorCode")),
             "ValidationException",
-            "case {entity_id:?}: must answer ValidationException, got {:?}",
+            "case {entity_id:?}: the malformed entry must be reported under its own id \
+             with the ValidationException code, got {:?}",
+            answer.body
+        );
+        assert!(
+            answer
+                .text(&format!("/Errors/{entity_id}/ErrorMessage"))
+                .contains(ENTITY_ID_PATTERN),
+            "case {entity_id:?}: the per-entry message must quote the required form, \
+             got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.keys("/EntityDetails"),
+            vec![held.clone()],
+            "case {entity_id:?}: the entity the other entry asked for must still be \
+             served, and the malformed one must not appear in EntityDetails, got {:?}",
             answer.body
         );
     }

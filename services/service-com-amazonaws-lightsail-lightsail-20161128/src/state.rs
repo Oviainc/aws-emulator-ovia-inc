@@ -33,8 +33,8 @@ use crate::ops::types::{
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
     ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, Domain, DomainEntry, Instance,
     InstanceHardware, InstanceMetadataOptions, InstanceNetworking, InstancePortInfo, InstanceState,
-    MonthlyTransfer, Operation, PrivateRegistryAccess, Region, ResourceLocation, Tag,
-    REGION_NAME_VALUES,
+    MonthlyTransfer, Operation, PrivateRegistryAccess, Region, RelationalDatabaseBundle,
+    ResourceLocation, Tag, REGION_NAME_VALUES,
 };
 
 // ---------------------------------------------------------------------------
@@ -999,6 +999,300 @@ pub fn relational_database_blueprint_ids() -> String {
     RELATIONAL_DATABASE_BLUEPRINTS
         .iter()
         .map(RelationalDatabaseBlueprintSpec::blueprint_id)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// Relational database bundles
+// ---------------------------------------------------------------------------
+
+// Like the blueprint catalog above, this is PUBLISHED data rather than
+// per-account state: the managed-database plan list, identical for every
+// account, which the reporting operation over it answers from. No call changes
+// it, so reading it leaves every later caller the answer it would have had.
+
+/// One entry of the managed-database bundle catalog: "A bundle describes the
+/// performance specifications of the database" (the modelled
+/// `RelationalDatabaseBundle` documentation) — the hardware, the included
+/// monthly data transfer and the monthly price a database created on that plan
+/// runs with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RelationalDatabaseBundleSpec {
+    /// `RelationalDatabaseBundle$bundleId` — "The ID for the database bundle".
+    ///
+    /// A database bundle id is `<size>_<major>_<minor>`, the `<size>_<version>`
+    /// form every Lightsail bundle id carries, with an `ha` token after the size
+    /// on the high-availability plans (`micro_ha_1_0`).
+    pub bundle_id: &'static str,
+    /// `RelationalDatabaseBundle$name` — "The name for the database bundle": the
+    /// label Lightsail gives the plan.
+    pub name: &'static str,
+    /// `RelationalDatabaseBundle$cpuCount` — "The number of virtual CPUs
+    /// (vCPUs) for the database bundle."
+    pub cpu_count: i32,
+    /// `RelationalDatabaseBundle$ramSizeInGb` — "The amount of RAM in GB (for
+    /// example, `2.0`) for the database bundle."
+    pub ram_size_in_gb: f32,
+    /// `RelationalDatabaseBundle$diskSizeInGb` — "The size of the disk for the
+    /// database bundle."
+    pub disk_size_in_gb: i32,
+    /// `RelationalDatabaseBundle$transferPerMonthInGb` — "The data transfer rate
+    /// per month in GB for the database bundle."
+    pub transfer_per_month_in_gb: i32,
+    /// `RelationalDatabaseBundle$price` — "The cost of the database bundle in US
+    /// currency", per month.
+    pub price_usd_per_month: f32,
+    /// `RelationalDatabaseBundle$isEncrypted` — "A Boolean value indicating
+    /// whether the database bundle is encrypted."
+    pub is_encrypted: bool,
+    /// `RelationalDatabaseBundle$isActive` — "A Boolean value indicating whether
+    /// the database bundle is active." A plan the service has retired stays in
+    /// the catalog as inactive: a database already running on it must still
+    /// resolve, and `GetRelationalDatabaseBundles` reports it only when asked to
+    /// include inactive bundles.
+    pub is_active: bool,
+}
+
+/// Every managed-database plan this service publishes: the four standard
+/// (single-database) plans cheapest first, then the four high-availability plans
+/// cheapest first.
+///
+/// SOURCE: the managed-database plan table of the Lightsail pricing page — a
+/// standard plan at $15 a month with 1 GB RAM, 1 vCPU and 40 GB of SSD storage,
+/// $30 with 2 GB / 1 vCPU / 80 GB, $60 with 4 GB / 2 vCPUs / 120 GB and $115
+/// with 8 GB / 2 vCPUs / 240 GB, with 100 GB of data transfer included on the
+/// first three plans and 200 GB on the 8 GB plan — and the high-availability
+/// column of the same table, which offers the same hardware with a standby in a
+/// second Availability Zone for twice the standard plan's price ($30, $60, $120
+/// and $230). Lightsail encrypts managed-database storage and its automatic
+/// snapshots at rest on every plan, so every entry is encrypted.
+///
+/// Lightsail has retired no database plan, so every published plan is active; a
+/// retired generation belongs here with `is_active: false`.
+///
+/// The ORDER is this slice's own (cheapest first, standard plans before
+/// high-availability ones): it is what the paged walk reports, and it is stable
+/// so two reads answer identically.
+pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
+    RelationalDatabaseBundleSpec {
+        bundle_id: "micro_1_0",
+        name: "Micro",
+        cpu_count: 1,
+        ram_size_in_gb: 1.0,
+        disk_size_in_gb: 40,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 15.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "small_1_0",
+        name: "Small",
+        cpu_count: 1,
+        ram_size_in_gb: 2.0,
+        disk_size_in_gb: 80,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 30.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "medium_1_0",
+        name: "Medium",
+        cpu_count: 2,
+        ram_size_in_gb: 4.0,
+        disk_size_in_gb: 120,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 60.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "large_1_0",
+        name: "Large",
+        cpu_count: 2,
+        ram_size_in_gb: 8.0,
+        disk_size_in_gb: 240,
+        transfer_per_month_in_gb: 200,
+        price_usd_per_month: 115.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "micro_ha_1_0",
+        name: "Micro with High Availability",
+        cpu_count: 1,
+        ram_size_in_gb: 1.0,
+        disk_size_in_gb: 40,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 30.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "small_ha_1_0",
+        name: "Small with High Availability",
+        cpu_count: 1,
+        ram_size_in_gb: 2.0,
+        disk_size_in_gb: 80,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 60.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "medium_ha_1_0",
+        name: "Medium with High Availability",
+        cpu_count: 2,
+        ram_size_in_gb: 4.0,
+        disk_size_in_gb: 120,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 120.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "large_ha_1_0",
+        name: "Large with High Availability",
+        cpu_count: 2,
+        ram_size_in_gb: 8.0,
+        disk_size_in_gb: 240,
+        transfer_per_month_in_gb: 200,
+        price_usd_per_month: 230.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+];
+
+/// How many database bundles one `GetRelationalDatabaseBundles` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more bundles remain. It is above the
+/// catalog's size, so the whole catalog is answered in one page — as AWS answers
+/// it — and the paging walk still holds for a catalog that outgrows it.
+pub const RELATIONAL_DATABASE_BUNDLE_PAGE_SIZE: usize = 20;
+
+impl RelationalDatabaseBundleSpec {
+    /// This plan as the modelled `RelationalDatabaseBundle`.
+    pub fn view(&self) -> RelationalDatabaseBundle {
+        RelationalDatabaseBundle {
+            bundle_id: Some(self.bundle_id.to_string()),
+            name: Some(self.name.to_string()),
+            price: Some(self.price_usd_per_month),
+            ram_size_in_gb: Some(self.ram_size_in_gb),
+            disk_size_in_gb: Some(self.disk_size_in_gb),
+            transfer_per_month_in_gb: Some(self.transfer_per_month_in_gb),
+            cpu_count: Some(self.cpu_count),
+            is_encrypted: Some(self.is_encrypted),
+            is_active: Some(self.is_active),
+        }
+    }
+}
+
+/// The bundles a `GetRelationalDatabaseBundles` call reports out of `specs`,
+/// before paging: every active plan, plus the inactive (retired) ones when
+/// `include_inactive` is set.
+///
+/// The order is `specs`' own. Taking the catalog as an argument is what lets the
+/// slice rule be exercised against a catalog that holds a retired plan, which the
+/// published one does not yet.
+///
+/// Unlike its bucket counterpart [`bucket_bundles_from`], this answers the SPECS
+/// rather than the modelled view: this operation is paged, and a page token names
+/// an entry by its `bundle_id`, so [`relational_database_bundle_page`] slices the
+/// specs first and calls [`RelationalDatabaseBundleSpec::view`] only on the
+/// entries one page carries.
+pub fn relational_database_bundles_from(
+    specs: &[RelationalDatabaseBundleSpec],
+    include_inactive: bool,
+) -> Vec<RelationalDatabaseBundleSpec> {
+    specs
+        .iter()
+        .filter(|spec| include_inactive || spec.is_active)
+        .copied()
+        .collect()
+}
+
+/// The database bundles a `GetRelationalDatabaseBundles` call reports:
+/// [`relational_database_bundles_from`] over this service's published catalog,
+/// [`RELATIONAL_DATABASE_BUNDLE_SPECS`].
+pub fn relational_database_bundles(include_inactive: bool) -> Vec<RelationalDatabaseBundleSpec> {
+    relational_database_bundles_from(RELATIONAL_DATABASE_BUNDLE_SPECS, include_inactive)
+}
+
+/// One page of the database bundle catalog: the bundles it carries and the token
+/// that opens the page after it.
+#[derive(Debug, Clone)]
+pub struct RelationalDatabaseBundlePage {
+    /// The page's bundles, as the modelled view.
+    pub bundles: Vec<RelationalDatabaseBundle>,
+    /// The id of the first bundle of the NEXT page, present only while bundles
+    /// remain.
+    pub next_page_token: Option<String>,
+}
+
+/// One page of the slice of `specs` that `include_inactive` selects: the slice
+/// from the entry `page_token` names onward, at most `page_size` entries, with
+/// `next_page_token` naming the first entry of the page after it.
+///
+/// `None` when `page_token` names no entry of that slice — the caller refuses it
+/// with the modelled `InvalidInputException`. A token names an ENTRY rather than
+/// an index, so a catalog that gained or lost a plan between two pages cannot
+/// make the walk skip or repeat another one. An absent — or empty — token asks
+/// for the first page.
+pub fn relational_database_bundle_page(
+    specs: &[RelationalDatabaseBundleSpec],
+    include_inactive: bool,
+    page_token: Option<&str>,
+    page_size: usize,
+) -> Option<RelationalDatabaseBundlePage> {
+    // A page carries at least one entry: a zero-length page would name its own
+    // first entry as the next token and never advance.
+    let page_size = page_size.max(1);
+    let slice = relational_database_bundles_from(specs, include_inactive);
+
+    let start = match page_token.filter(|token| !token.is_empty()) {
+        None => 0,
+        Some(token) => slice.iter().position(|spec| spec.bundle_id == token)?,
+    };
+
+    let mut bundles = Vec::new();
+    let mut next_page_token = None;
+    for spec in &slice[start..] {
+        if bundles.len() == page_size {
+            next_page_token = Some(spec.bundle_id.to_string());
+            break;
+        }
+        bundles.push(spec.view());
+    }
+
+    Some(RelationalDatabaseBundlePage {
+        bundles,
+        next_page_token,
+    })
+}
+
+/// The database bundle `bundle_id` names — active or not, since a database
+/// already running on a retired plan still has to resolve — or `None` when this
+/// service publishes no such plan.
+///
+/// This is the lookup a call that NAMES a plan resolves it through:
+/// `CreateRelationalDatabase`'s `relationalDatabaseBundleId` and
+/// `UpdateRelationalDatabase`, each still a scaffold stub with its own issue.
+pub fn relational_database_bundle_spec(bundle_id: &str) -> Option<RelationalDatabaseBundleSpec> {
+    RELATIONAL_DATABASE_BUNDLE_SPECS
+        .iter()
+        .find(|spec| spec.bundle_id == bundle_id)
+        .copied()
+}
+
+/// The bundle ids a `GetRelationalDatabaseBundles` page token may name out of
+/// `specs`, for a refusal that has to tell the caller what to send instead.
+pub fn relational_database_bundle_ids(specs: &[RelationalDatabaseBundleSpec]) -> String {
+    specs
+        .iter()
+        .map(|spec| spec.bundle_id)
         .collect::<Vec<_>>()
         .join(", ")
 }

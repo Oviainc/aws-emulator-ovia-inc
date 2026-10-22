@@ -143,9 +143,11 @@ async fn an_assessment_identifier_is_classified_before_the_store_is_read() {
     // (case, identifier, expected status, expected error code)
     //
     // 404: a well-formed identifier of either form, naming an assessment this
-    // catalog does not hold. 422: an identifier that satisfies
-    // `AssessmentIdentifier`'s own pattern — so it reaches the handler — while naming
-    // no assessment resource of this catalog at all.
+    // catalog does not hold. 422: an identifier that is not one of the two forms the
+    // service publishes — whether or not it satisfies the model's own, narrower
+    // `AssessmentIdentifier` pattern, since the handler is what judges the member
+    // (`skip_validation` on `DescribeAssessmentInput`) and it answers the modelled
+    // `ValidationException` and its 422 for every such value.
     let rows: [(&str, String, u16, &str); 14] = [
         (
             "the shortest id",
@@ -205,36 +207,32 @@ async fn an_assessment_identifier_is_classified_before_the_store_is_read() {
         (
             "an arn naming another resource type",
             "arn:aws:aws-marketplace:eu-west-1::AWSMarketplace/ChangeSet/assessment-1".to_string(),
-            // `/Assessment/` is fixed in `AssessmentIdentifier`'s own pattern, so this
-            // one the boundary refuses rather than the handler.
-            400,
+            422,
             "ValidationException",
         ),
         (
             "an arn naming a change set, not an assessment",
             "arn:aws:aws-marketplace:eu-west-1::AWSMarketplace/Assessment/cs-000000000001"
                 .to_string(),
-            // `assessment-` is what the pattern requires of the tail, so this one the
-            // boundary refuses rather than the handler.
-            400,
+            422,
             "ValidationException",
         ),
         (
             "an identifier of neither form",
             "not-a-valid-identifier".to_string(),
-            400,
+            422,
             "ValidationException",
         ),
         (
             "an id with no suffix at all",
             "assessment-".to_string(),
-            400,
+            422,
             "ValidationException",
         ),
         (
             "an id in the wrong case",
             "ASSESSMENT-1".to_string(),
-            400,
+            422,
             "ValidationException",
         ),
     ];
@@ -264,12 +262,10 @@ async fn an_assessment_identifier_is_classified_before_the_store_is_read() {
         } else {
             identifier.as_str()
         };
-        if expected_status != 400 {
-            assert!(
-                message.contains(named),
-                "case {case:?}: the refusal must name {named:?}, got {message:?}"
-            );
-        }
+        assert!(
+            message.contains(named),
+            "case {case:?}: the refusal must name {named:?}, got {message:?}"
+        );
     }
 }
 

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the named tag keys from the resource its `resourceArn` names, writing the
+//! remaining tag set back onto the record [`crate::state`] holds for that resource.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A MUTATING operation, and `@idempotent`: a key the resource does not carry is not an
+//! error — the request states the keys that must be gone afterwards, so the same request
+//! twice leaves the same tag set, and keys it does not name are left alone.
+//!
+//! An ARN that names no resource this account holds is answered HTTP 401
+//! `UnauthorizedException`, as every resource lookup in this service is — see
+//! [`crate::ops::tag_resource`].
 //!
 //! ## Shape of an operation
 //!
@@ -141,20 +142,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact compliance inquiry store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(resource) = store.tagged_resource_mut(&input.resource_arn) else {
+            // The same refusal a tag write answers: whether the account holds the resource
+            // the ARN names is not information this API discloses.
+            return Err(crate::scaffolded::Scaffolded::unauthorized());
+        };
+
+        for key in &input.tag_keys {
+            // A key the resource does not carry is already in the state the request asks
+            // for, which is what makes the operation `@idempotent`.
+            resource.tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }

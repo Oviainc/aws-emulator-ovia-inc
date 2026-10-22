@@ -25,6 +25,8 @@ mod customer_agreements;
 mod front_door_errors;
 #[path = "all/report_workflow.rs"]
 mod report_workflow;
+#[path = "all/resource_tag_writes.rs"]
+mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

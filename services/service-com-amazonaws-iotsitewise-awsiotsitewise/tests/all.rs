@@ -52,6 +52,8 @@ mod hierarchies_etags_and_refusals;
 mod property_value_history;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/single_property_aggregates.rs"]
+mod single_property_aggregates;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]
@@ -62,3 +64,4 @@ mod time_series;
 mod update_asset;
 #[path = "all/update_asset_model.rs"]
 mod update_asset_model;
+

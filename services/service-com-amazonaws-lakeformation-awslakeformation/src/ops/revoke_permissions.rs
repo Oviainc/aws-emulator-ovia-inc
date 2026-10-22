@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokePermissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokePermissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokePermissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the named permissions back out of the one grant record
+//! [`crate::state::grant_key`] identifies in
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `permission_grants`,
+//! and drops the record when nothing is left of it. A revoke of a permission the
+//! grantee does not hold — including a grant that was never made — takes nothing away
+//! and is refused with the modelled `InvalidInputException`, so a caller is never told a
+//! permission it still holds was removed.
 //!
 //! ## Shape of an operation
 //!
@@ -93,11 +92,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-lakeformation-awslakefo
 // here — hence the `RevokePermissionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.lakeformation#RevokePermissions")]
+//
+// `InternalServiceException` is widened in through `extra_errors` for the same reason as
+// in `grant_permissions`: this SERVICE models it (HTTP 500) but this operation's own
+// error list omits it, and an engine that holds no state is a server fault, not a bad
+// request and not an unwritten operation.
+#[smithy_macros::operation_error(
+    "com.amazonaws.lakeformation#RevokePermissions",
+    extra_errors = ["InternalServiceException"]
+)]
 #[derive(Debug)]
 pub enum RevokePermissionsErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
     EntityNotFoundException(EntityNotFoundException),
+    InternalServiceException(InternalServiceException),
     InvalidInputException(InvalidInputException),
 }
 
@@ -152,18 +160,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokePermissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokePermissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokePermissions"))
+        // The caller the audit record below attributes this state change to.
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RevokePermissionsErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        /// The modelled refusal for a revoke this handler will not perform.
+        fn invalid(message: String) -> RevokePermissionsError {
+            RevokePermissionsErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_deref());
+
+        // `Principal` is modelled required, but its only member is not, so a request can
+        // still reach here naming no grantee.
+        let principal = input
+            .principal
+            .data_lake_principal_identifier
+            .as_deref()
+            .unwrap_or_default();
+        if principal.is_empty() {
+            return Err(invalid(
+                "Principal.DataLakePrincipalIdentifier must name a principal".to_string(),
+            ));
+        }
+
+        crate::state::validate_resource(&input.resource).map_err(invalid)?;
+
+        let permissions = crate::state::dedup_values(&input.permissions);
+        let permissions_with_grant_option =
+            crate::state::dedup_values(input.permissions_with_grant_option.iter().flatten());
+        if permissions.is_empty() && permissions_with_grant_option.is_empty() {
+            return Err(invalid(
+                "Permissions must name at least one permission to revoke".to_string(),
+            ));
+        }
+
+        let resource = crate::state::normalize_resource(&input.resource, &catalog_id);
+        let condition = input
+            .condition
+            .as_ref()
+            .and_then(|condition| condition.expression.clone())
+            .filter(|expression| !expression.is_empty());
+        let key = crate::state::grant_key(&catalog_id, principal, &resource, condition.as_deref());
+
+        // Everything the grantee does not hold, whether because the grant does not exist
+        // at all or because it never carried these permissions: both are "there is
+        // nothing here to revoke", so both are refused the same way.
+        let mut store = state.lock();
+        let held = store.permission_grants.get(&key);
+        let missing = match held {
+            Some(grant) => {
+                let mut missing =
+                    crate::state::missing_permissions(&grant.permissions, &permissions);
+                missing.extend(crate::state::missing_permissions(
+                    &grant.permissions_with_grant_option,
+                    &permissions_with_grant_option,
+                ));
+                missing
+            }
+            None => permissions
+                .iter()
+                .chain(permissions_with_grant_option.iter())
+                .cloned()
+                .collect(),
+        };
+        if !missing.is_empty() {
+            // The message AWS answers this with, as the recorded trace shows it: fixed
+            // prose (the doubled "does not" is the real service's own wording) followed
+            // by the permissions THIS request named that the grantee does not hold, so
+            // the caller is told exactly which of its own values went unmatched. A
+            // permission named in both request lists is named once.
+            return Err(invalid(format!(
+                "No permissions revoked. Grantee does not does not have:[{}]",
+                crate::state::dedup_values(missing.iter()).join(", ")
+            )));
+        }
+
+        let Some(grant) = store.permission_grants.get_mut(&key) else {
+            // Unreachable: `missing` is every requested permission when the record is
+            // absent, which the refusal above already answered.
+            return Err(invalid(
+                "Grantee has no permissions on the requested resource".to_string(),
+            ));
+        };
+        crate::state::remove_permissions(&mut grant.permissions, &permissions);
+        crate::state::remove_permissions(
+            &mut grant.permissions_with_grant_option,
+            &permissions_with_grant_option,
+        );
+        // A record with nothing left in either set is no longer a grant: drop it, so a
+        // later `ListPermissions` reports no entry rather than an entry with no
+        // permissions.
+        let emptied = grant.permissions.is_empty() && grant.permissions_with_grant_option.is_empty();
+        if emptied {
+            store.permission_grants.remove(&key);
+        }
+
+        // The audit record for a state change: who, what, where, outcome. No secret and
+        // no credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        tracing::info!(
+            operation = "RevokePermissions",
+            akid = %akid,
+            catalog_id = %catalog_id,
+            principal = %principal,
+            outcome = if emptied { "revoked" } else { "reduced" },
+            "Lake Formation permissions revoked"
+        );
+
+        // `RevokePermissionsResponse` models no members: what changed is what
+        // `ListPermissions` reads back out of state.
+        Ok(RevokePermissionsOutput {})
     }
 }

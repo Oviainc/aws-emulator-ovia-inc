@@ -10,10 +10,14 @@
 //! * an accepted update takes the plan out of `ACTIVE` into the transient `UPDATING`
 //!   status the model declares, and the clock owes it `ACTIVE` again a span later;
 //! * while a plan is not `ACTIVE`, a control-plane call that mutates it (another
-//!   update, a delete) is refused with the modelled `ConflictException` (HTTP 409) and
+//!   update, a delete) is refused with the modelled `ConflictException` and
 //!   changes nothing;
 //! * an update addressed to an id no plan was created for is refused with
-//!   `ResourceNotFoundException` (HTTP 404).
+//!   `ResourceNotFoundException`.
+//!
+//! Both refusals travel with this service's client-error status (400 on its RPC
+//! protocols — see `wire_error_status.rs`), and the error TYPE in the body is what
+//! distinguishes them.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -318,7 +322,7 @@ async fn a_mutating_call_on_a_plan_that_is_not_active_is_refused_with_conflict_e
         let mut body = request.clone();
         body["Id"] = json!(id);
         let (status, refused) = call(&router, operation, body.clone()).await;
-        assert_eq!(status, 409, "case {case:?} on {operation}: got {refused}");
+        assert_eq!(status, 400, "case {case:?} on {operation}: got {refused}");
         assert_eq!(
             error_code(&refused),
             "ConflictException",
@@ -354,7 +358,7 @@ async fn a_mutating_call_on_a_plan_that_is_not_active_is_refused_with_conflict_e
 #[tokio::test]
 async fn an_update_of_an_id_no_plan_was_created_for_is_not_found() {
     let router = emulator();
-    // A live plan beside it, so the 404 is about the id and not about an empty store.
+    // A live plan beside it, so the refusal is about the id and not about an empty store.
     let live = create_plan(&router, "live-plan").await;
 
     // Ids of the modelled 36-character shape that no create in this test minted: the
@@ -385,7 +389,7 @@ async fn an_update_of_an_id_no_plan_was_created_for_is_not_found() {
             body["Id"] = json!(id);
             let (status, refused) = call(&router, "UpdateRescoreExecutionPlan", body).await;
             assert_eq!(
-                status, 404,
+                status, 400,
                 "case {case:?} with {member_case}: got {refused}"
             );
             assert_eq!(
