@@ -381,7 +381,199 @@ fn apply_due_transitions_to(task: &mut QuantumTask, now: SystemTime) {
 // The seeded device inventory
 // ---------------------------------------------------------------------------
 
+/// The `actionType` of the OpenQASM program action.
+pub const ACTION_OPENQASM: &str = "braket.ir.openqasm.program";
+/// The `actionType` of the (legacy) JAQCD program action.
+pub const ACTION_JAQCD: &str = "braket.ir.jaqcd.program";
+/// The `actionType` of the analog Hamiltonian-simulation program action.
+pub const ACTION_AHS: &str = "braket.ir.ahs.program";
+
+/// The schema versions a device action in this inventory accepts.
+///
+/// `version` in a Braket device-action entry is the LIST of `major.minor` program
+/// schema versions the action accepts, as the BraketSchemas package numbers them —
+/// so a client that keys off it reads `"1.0"`, not a bare major number.
+const ACTION_SCHEMA_VERSIONS: &[&str] = &["1.0"];
+
+/// `maximumQubitArrays` / `maximumClassicalArrays`: how many qubit and bit arrays one
+/// OpenQASM program may declare.
+///
+/// Both are properties of the OpenQASM device-action schema rather than of a device,
+/// so every device that accepts [`ACTION_OPENQASM`] publishes the same values.
+const MAXIMUM_QUBIT_ARRAYS: u32 = 1;
+/// See [`MAXIMUM_QUBIT_ARRAYS`].
+const MAXIMUM_CLASSICAL_ARRAYS: u32 = 1;
+/// `forbiddenArrayOperations`: the array expressions no OpenQASM program may use.
+///
+/// A property of the OpenQASM device-action schema, as [`MAXIMUM_QUBIT_ARRAYS`] is.
+const FORBIDDEN_ARRAY_OPERATIONS: &[&str] = &[
+    "concatenation",
+    "negativeIndex",
+    "range",
+    "rangeWithStep",
+    "slice",
+];
+
+/// The observables a measured result type may be taken against — the Pauli bases,
+/// the Hadamard basis, the identity, and a caller-supplied Hermitian matrix.
+const OBSERVABLES: &[&str] = &["x", "y", "z", "h", "i", "hermitian"];
+
+/// The `braket_noise_*` pragmas, one per noise channel an OpenQASM program can apply.
+///
+/// Applying a noise channel needs a device that MODELS noise (a density-matrix
+/// simulator), so these are supported exactly where [`DeviceSeed::noise`] is set and
+/// forbidden everywhere else.
+const NOISE_PRAGMAS: &[&str] = &[
+    "braket_noise_amplitude_damping",
+    "braket_noise_bit_flip",
+    "braket_noise_depolarizing",
+    "braket_noise_generalized_amplitude_damping",
+    "braket_noise_kraus",
+    "braket_noise_pauli_channel",
+    "braket_noise_phase_damping",
+    "braket_noise_phase_flip",
+    "braket_noise_two_qubit_dephasing",
+    "braket_noise_two_qubit_depolarizing",
+];
+
+/// Every result type a Braket program can ask for, with the `braket_result_type_*`
+/// pragma that requests it in an OpenQASM program (the result-type name in
+/// snake_case). A device publishes the pragma as supported exactly when it publishes
+/// the result type, so one catalog decides both.
+const RESULT_TYPE_PRAGMAS: &[(&str, &str)] = &[
+    ("Sample", "braket_result_type_sample"),
+    ("Expectation", "braket_result_type_expectation"),
+    ("Variance", "braket_result_type_variance"),
+    ("Probability", "braket_result_type_probability"),
+    ("StateVector", "braket_result_type_state_vector"),
+    ("DensityMatrix", "braket_result_type_density_matrix"),
+    ("Amplitude", "braket_result_type_amplitude"),
+    ("AdjointGradient", "braket_result_type_adjoint_gradient"),
+];
+
+/// `verbatim`: run a box of native gates exactly as written, with no recompilation.
+const VERBATIM_PRAGMA: &str = "verbatim";
+/// `braket_unitary_matrix`: apply a caller-supplied unitary, legal exactly where the
+/// device accepts the `unitary` operation.
+const UNITARY_MATRIX_PRAGMA: &str = "braket_unitary_matrix";
+
+/// One result type a device publishes in its action properties.
+struct ResultTypeSeed {
+    /// The result-type name the Braket schemas publish; each one is the left half of
+    /// a [`RESULT_TYPE_PRAGMAS`] row.
+    name: &'static str,
+    /// The observables it may be measured against; empty for the result types that
+    /// take none.
+    observables: &'static [&'static str],
+    /// Whether the device computes the value exactly from the full state rather than
+    /// sampling it, which is only possible on a shot-less run — so an exact result
+    /// type publishes `minShots`/`maxShots` of 0 and a sampled one the device's own
+    /// shot range.
+    exact: bool,
+}
+
+/// The result types a state-vector simulator computes: everything sampled, plus the
+/// exact state and gradient a full state vector makes available.
+const STATE_VECTOR_RESULT_TYPES: &[ResultTypeSeed] = &[
+    ResultTypeSeed { name: "Sample", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Expectation", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Variance", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Probability", observables: &[], exact: false },
+    ResultTypeSeed { name: "Amplitude", observables: &[], exact: true },
+    ResultTypeSeed { name: "StateVector", observables: &[], exact: true },
+    ResultTypeSeed { name: "AdjointGradient", observables: OBSERVABLES, exact: true },
+];
+
+/// The result types a density-matrix (noise) simulator computes: the density matrix
+/// stands in for the state vector, so no amplitude or state vector is published.
+const DENSITY_MATRIX_RESULT_TYPES: &[ResultTypeSeed] = &[
+    ResultTypeSeed { name: "Sample", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Expectation", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Variance", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Probability", observables: &[], exact: false },
+    ResultTypeSeed { name: "DensityMatrix", observables: &[], exact: true },
+];
+
+/// The result types a tensor-network simulator computes: it never holds the whole
+/// state, so a single amplitude is the most it can report exactly.
+const TENSOR_NETWORK_RESULT_TYPES: &[ResultTypeSeed] = &[
+    ResultTypeSeed { name: "Sample", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Expectation", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Variance", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Probability", observables: &[], exact: false },
+    ResultTypeSeed { name: "Amplitude", observables: &[], exact: true },
+];
+
+/// The result types a gate-model QPU computes: hardware only ever SAMPLES, so every
+/// row needs shots and none is exact.
+const QPU_RESULT_TYPES: &[ResultTypeSeed] = &[
+    ResultTypeSeed { name: "Sample", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Expectation", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Variance", observables: OBSERVABLES, exact: false },
+    ResultTypeSeed { name: "Probability", observables: &[], exact: false },
+];
+
+/// The gate-model operations a program submitted to this inventory may use, in the
+/// names the Braket device schemas publish them under (Amazon Braket's supported-gates
+/// documentation). Braket compiles a program to the device's own
+/// [`DeviceSeed::native_gates`], so a gate-model device accepts the whole set.
+const GATE_MODEL_OPERATIONS: &[&str] = &[
+    "barrier",
+    "ccnot",
+    "cnot",
+    "cphaseshift",
+    "cphaseshift00",
+    "cphaseshift01",
+    "cphaseshift10",
+    "cswap",
+    "cv",
+    "cy",
+    "cz",
+    "ecr",
+    "gphase",
+    "gpi",
+    "gpi2",
+    "h",
+    "i",
+    "iswap",
+    "measure",
+    "ms",
+    "phaseshift",
+    "prx",
+    "pswap",
+    "reset",
+    "rx",
+    "ry",
+    "rz",
+    "s",
+    "si",
+    "swap",
+    "t",
+    "ti",
+    "u",
+    "unitary",
+    "v",
+    "vi",
+    "x",
+    "xx",
+    "xy",
+    "y",
+    "yy",
+    "z",
+    "zz",
+];
+
+/// Where `deviceDocumentation.externalDocumentationUrl` points: the Amazon Braket
+/// developer guide's device list, anchored on the device.
+const DOCUMENTATION_BASE: &str = "https://docs.aws.amazon.com/braket/latest/developerguide";
+/// Where `deviceDocumentation.imageUrl` points.
+const DEVICE_IMAGE_BASE: &str = "https://d1.awsstatic.com/braket/devices";
+
 /// One row of the seeded inventory.
+///
+/// Every property the device's capability document publishes comes from here, so the
+/// catalog a caller reads through `GetDevice` and the rules `CreateQuantumTask` holds
+/// it to are the same data.
 struct DeviceSeed {
     arn: &'static str,
     name: &'static str,
@@ -391,6 +583,28 @@ struct DeviceSeed {
     qubit_count: u32,
     shots_range: (i64, i64),
     action_types: &'static [&'static str],
+    /// The operations a program for this device may use (`supportedOperations`);
+    /// empty for a device whose programs name no gates at all.
+    supported_operations: &'static [&'static str],
+    /// The operations the device executes without recompilation
+    /// (`paradigm.nativeGateSet`) — a subset of `supported_operations`. Empty for a
+    /// device with no native gate layer beneath the one a program is written in.
+    native_gates: &'static [&'static str],
+    /// The result types the device computes (`supportedResultTypes`), which also
+    /// decide its `braket_result_type_*` pragmas.
+    result_types: &'static [ResultTypeSeed],
+    /// Whether the device runs a `verbatim` box: real hardware can be addressed in
+    /// its native gates, a simulator has no native gate layer to bypass.
+    verbatim: bool,
+    /// Whether the device applies a noise channel a program asks for, which decides
+    /// its [`NOISE_PRAGMAS`].
+    noise: bool,
+    /// `deviceCost`: what a run costs, as a price and the unit it is charged per.
+    /// A catalog figure from Amazon Braket's pricing page: simulators are charged
+    /// per minute of simulation, QPUs per shot.
+    cost: (f64, &'static str),
+    /// `deviceDocumentation.summary`.
+    summary: &'static str,
 }
 
 /// The device inventory this emulator publishes.
@@ -411,10 +625,17 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         device_status: DEVICE_ONLINE,
         qubit_count: 34,
         shots_range: (0, 100_000),
-        action_types: &[
-            "braket.ir.openqasm.program",
-            "braket.ir.jaqcd.program",
-        ],
+        action_types: &[ACTION_OPENQASM, ACTION_JAQCD],
+        supported_operations: GATE_MODEL_OPERATIONS,
+        // A simulator applies every operation it accepts directly: it has no native
+        // gate layer under the one a program is written in, which is also why it
+        // forbids `verbatim`.
+        native_gates: &[],
+        result_types: STATE_VECTOR_RESULT_TYPES,
+        verbatim: false,
+        noise: false,
+        cost: (0.075, "minute"),
+        summary: "Amazon Braket state vector simulator",
     },
     DeviceSeed {
         arn: "arn:aws:braket:::device/quantum-simulator/amazon/dm1",
@@ -424,10 +645,14 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         device_status: DEVICE_ONLINE,
         qubit_count: 17,
         shots_range: (0, 100_000),
-        action_types: &[
-            "braket.ir.openqasm.program",
-            "braket.ir.jaqcd.program",
-        ],
+        action_types: &[ACTION_OPENQASM, ACTION_JAQCD],
+        supported_operations: GATE_MODEL_OPERATIONS,
+        native_gates: &[],
+        result_types: DENSITY_MATRIX_RESULT_TYPES,
+        verbatim: false,
+        noise: true,
+        cost: (0.075, "minute"),
+        summary: "Amazon Braket density matrix simulator",
     },
     DeviceSeed {
         arn: "arn:aws:braket:::device/quantum-simulator/amazon/tn1",
@@ -437,7 +662,14 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         device_status: DEVICE_ONLINE,
         qubit_count: 50,
         shots_range: (1, 1_000),
-        action_types: &["braket.ir.openqasm.program"],
+        action_types: &[ACTION_OPENQASM],
+        supported_operations: GATE_MODEL_OPERATIONS,
+        native_gates: &[],
+        result_types: TENSOR_NETWORK_RESULT_TYPES,
+        verbatim: false,
+        noise: false,
+        cost: (0.275, "minute"),
+        summary: "Amazon Braket tensor network simulator",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-east-1::device/qpu/ionq/Aria-1",
@@ -447,7 +679,14 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         device_status: DEVICE_ONLINE,
         qubit_count: 25,
         shots_range: (1, 1_000),
-        action_types: &["braket.ir.openqasm.program"],
+        action_types: &[ACTION_OPENQASM],
+        supported_operations: GATE_MODEL_OPERATIONS,
+        native_gates: &["gpi", "gpi2", "ms"],
+        result_types: QPU_RESULT_TYPES,
+        verbatim: true,
+        noise: false,
+        cost: (0.03, "shot"),
+        summary: "IonQ Aria trapped-ion quantum processor",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-east-1::device/qpu/ionq/Forte-1",
@@ -457,7 +696,14 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         device_status: DEVICE_OFFLINE,
         qubit_count: 36,
         shots_range: (1, 1_000),
-        action_types: &["braket.ir.openqasm.program"],
+        action_types: &[ACTION_OPENQASM],
+        supported_operations: GATE_MODEL_OPERATIONS,
+        native_gates: &["gpi", "gpi2", "ms"],
+        result_types: QPU_RESULT_TYPES,
+        verbatim: true,
+        noise: false,
+        cost: (0.08, "shot"),
+        summary: "IonQ Forte trapped-ion quantum processor",
     },
     DeviceSeed {
         arn: "arn:aws:braket:eu-north-1::device/qpu/iqm/Garnet",
@@ -467,7 +713,14 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         device_status: DEVICE_ONLINE,
         qubit_count: 20,
         shots_range: (1, 10_000),
-        action_types: &["braket.ir.openqasm.program"],
+        action_types: &[ACTION_OPENQASM],
+        supported_operations: GATE_MODEL_OPERATIONS,
+        native_gates: &["cz", "prx"],
+        result_types: QPU_RESULT_TYPES,
+        verbatim: true,
+        noise: false,
+        cost: (0.00145, "shot"),
+        summary: "IQM Garnet superconducting quantum processor",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-west-1::device/qpu/rigetti/Ankaa-3",
@@ -477,7 +730,14 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         device_status: DEVICE_ONLINE,
         qubit_count: 84,
         shots_range: (1, 10_000),
-        action_types: &["braket.ir.openqasm.program"],
+        action_types: &[ACTION_OPENQASM],
+        supported_operations: GATE_MODEL_OPERATIONS,
+        native_gates: &["cz", "iswap", "rx", "rz"],
+        result_types: QPU_RESULT_TYPES,
+        verbatim: true,
+        noise: false,
+        cost: (0.0009, "shot"),
+        summary: "Rigetti Ankaa superconducting quantum processor",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-east-1::device/qpu/quera/Aquila",
@@ -487,7 +747,17 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         device_status: DEVICE_ONLINE,
         qubit_count: 256,
         shots_range: (1, 1_000),
-        action_types: &["braket.ir.ahs.program"],
+        // An analog Hamiltonian-simulation device: a program for it is a register
+        // layout and a driving field, so it names no gates, no pragmas and no result
+        // types at all.
+        action_types: &[ACTION_AHS],
+        supported_operations: &[],
+        native_gates: &[],
+        result_types: &[],
+        verbatim: false,
+        noise: false,
+        cost: (0.01, "shot"),
+        summary: "QuEra Aquila neutral-atom analog Hamiltonian simulator",
     },
     DeviceSeed {
         arn: "arn:aws:braket:eu-west-2::device/qpu/oqc/Lucy",
@@ -497,7 +767,14 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         device_status: DEVICE_RETIRED,
         qubit_count: 8,
         shots_range: (1, 10_000),
-        action_types: &["braket.ir.openqasm.program"],
+        action_types: &[ACTION_OPENQASM],
+        supported_operations: GATE_MODEL_OPERATIONS,
+        native_gates: &["ecr", "i", "rz", "v", "x"],
+        result_types: QPU_RESULT_TYPES,
+        verbatim: true,
+        noise: false,
+        cost: (0.00035, "shot"),
+        summary: "Oxford Quantum Circuits Lucy superconducting quantum processor",
     },
     DeviceSeed {
         arn: "arn:aws:braket:us-west-1::device/qpu/rigetti/Aspen-M-3",
@@ -507,12 +784,24 @@ const DEVICE_SEEDS: &[DeviceSeed] = &[
         device_status: DEVICE_RETIRED,
         qubit_count: 79,
         shots_range: (1, 10_000),
-        action_types: &["braket.ir.openqasm.program"],
+        action_types: &[ACTION_OPENQASM],
+        supported_operations: GATE_MODEL_OPERATIONS,
+        native_gates: &["cphaseshift", "cz", "rx", "rz", "xy"],
+        result_types: QPU_RESULT_TYPES,
+        verbatim: true,
+        noise: false,
+        cost: (0.00035, "shot"),
+        summary: "Rigetti Aspen-M-3 superconducting quantum processor",
     },
 ];
 
 /// Build the seeded inventory, keyed and ordered by device ARN.
 fn seeded_devices() -> BTreeMap<String, Device> {
+    // `service.updatedAt` reports when the catalog entry a caller reads was last
+    // published. This inventory is published when the store is created, so that is the
+    // instant every row carries — and it does not move afterwards, so a capability
+    // document read twice is the same document.
+    let published_at = SystemTime::now();
     DEVICE_SEEDS
         .iter()
         .map(|seed| {
@@ -522,7 +811,7 @@ fn seeded_devices() -> BTreeMap<String, Device> {
                 provider_name: seed.provider.to_string(),
                 device_type: seed.device_type.to_string(),
                 device_status: seed.device_status.to_string(),
-                device_capabilities: capabilities_document(seed),
+                device_capabilities: capabilities_document(seed, published_at),
                 shots_range: seed.shots_range,
             };
             (device.device_arn.clone(), device)
@@ -532,28 +821,29 @@ fn seeded_devices() -> BTreeMap<String, Device> {
 
 /// The `deviceCapabilities` JSON document for one seeded device.
 ///
-/// Shaped like a Braket device capability document (a schema header, the service
-/// section with the shot range and execution windows, the accepted action types and
-/// the paradigm's qubit count) and built with `serde_json`, so what a caller parses
-/// is always well-formed JSON. The values are this inventory's own: the emulator has
-/// no hardware to report calibration data for.
-fn capabilities_document(seed: &DeviceSeed) -> String {
+/// A Braket device-capability document: the schema header; the `service` section with
+/// the execution windows, the shot range, what a run costs (`deviceCost`) and where
+/// the device is documented (`deviceDocumentation`); one `action` entry per action
+/// type the device accepts, carrying the device-schema properties a client reads to
+/// decide what it may submit (see [`action_properties`]); and the paradigm. Built with
+/// `serde_json`, so what a caller parses is always well-formed JSON, and every
+/// property is computed from the catalog row — the emulator has no hardware, so it
+/// reports no calibration data.
+fn capabilities_document(seed: &DeviceSeed, published_at: SystemTime) -> String {
     let actions: serde_json::Map<String, serde_json::Value> = seed
         .action_types
         .iter()
         .map(|action_type| {
             (
                 (*action_type).to_string(),
-                serde_json::json!({
-                    "actionType": action_type,
-                    "version": ["1"],
-                }),
+                action_properties(seed, action_type),
             )
         })
         .collect();
+    let slug = url_slug(seed.name);
     serde_json::json!({
         "braketSchemaHeader": {
-            "name": "braket.device_schema.device_capabilities",
+            "name": capabilities_schema(seed),
             "version": "1",
         },
         "service": {
@@ -567,18 +857,259 @@ fn capabilities_document(seed: &DeviceSeed) -> String {
                 "windowEndHour": "23:59:59",
             }],
             "shotsRange": [seed.shots_range.0, seed.shots_range.1],
-            "deviceDocumentation": {
-                "summary": format!("{} device {}, emulated.", seed.provider, seed.name),
+            "deviceCost": {
+                "price": seed.cost.0,
+                "unit": seed.cost.1,
             },
+            "deviceDocumentation": {
+                "imageUrl": format!("{DEVICE_IMAGE_BASE}/{slug}.png"),
+                "summary": seed.summary,
+                "externalDocumentationUrl":
+                    format!("{DOCUMENTATION_BASE}/braket-devices.html#{slug}"),
+            },
+            "updatedAt": as_iso8601(published_at),
         },
         "action": serde_json::Value::Object(actions),
-        "paradigm": {
-            "qubitCount": seed.qubit_count,
-            "nativeGateSet": ["rx", "rz", "cz"],
-        },
-        "deviceParameters": {},
+        "paradigm": paradigm_properties(seed),
+        "deviceParameters": device_parameters_schema(seed),
     })
     .to_string()
+}
+
+/// The schema a device's capability document declares itself to be an instance of.
+///
+/// A client reads this header to pick the device-schema model it deserialises the rest
+/// of the document with, so it names the concrete schema of the device's family: the
+/// gate-model simulator schema for a simulator, and the provider's own device-
+/// capability schema for a QPU, which lives in the module named after the provider
+/// segment of the device's ARN.
+fn capabilities_schema(seed: &DeviceSeed) -> String {
+    if seed.device_type == DEVICE_TYPE_SIMULATOR {
+        "braket.device_schema.simulators.gate_model_simulator_device_capabilities".to_string()
+    } else {
+        let namespace = provider_namespace(seed.arn);
+        format!("braket.device_schema.{namespace}.{namespace}_device_capabilities")
+    }
+}
+
+/// The schema the `paradigm` section declares itself to be an instance of: the
+/// gate-model simulator or QPU paradigm, or the provider's analog
+/// Hamiltonian-simulation paradigm for a device whose programs are analog.
+fn paradigm_schema(seed: &DeviceSeed) -> String {
+    if seed.action_types.contains(&ACTION_AHS) {
+        let namespace = provider_namespace(seed.arn);
+        format!("braket.device_schema.{namespace}.{namespace}_ahs_paradigm_properties")
+    } else if seed.device_type == DEVICE_TYPE_SIMULATOR {
+        "braket.device_schema.simulators.gate_model_simulator_paradigm_properties".to_string()
+    } else {
+        "braket.device_schema.gate_model_qpu_paradigm_properties".to_string()
+    }
+}
+
+/// The provider segment of a device ARN — the `<provider>` of
+/// `.../device/<kind>/<provider>/<name>`, which is also the module a provider's Braket
+/// device schemas live in.
+fn provider_namespace(arn: &str) -> &str {
+    arn.rsplit('/').nth(1).unwrap_or_default()
+}
+
+/// The JSON Schema of the `deviceParameters` a task for this device may carry.
+///
+/// `CreateQuantumTask` accepts any well-formed JSON document as a task's
+/// `deviceParameters`, so the schema published here is the draft-07 document that says
+/// exactly that, with the schema header a Braket device-parameter document carries. A
+/// client that validates its parameters before submitting them gets a usable schema
+/// rather than an empty object, and the emulator advertises no constraint it does not
+/// enforce.
+fn device_parameters_schema(seed: &DeviceSeed) -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": format!("{} device parameters", seed.name),
+        "type": "object",
+        "properties": {
+            "braketSchemaHeader": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "version": { "type": "string" },
+                },
+            },
+        },
+        "additionalProperties": true,
+    })
+}
+
+/// The `action` entry one device publishes for one action type.
+///
+/// What an entry carries is decided by the ACTION TYPE, because the properties are
+/// the action schema's: a gate-model program action ([`ACTION_OPENQASM`],
+/// [`ACTION_JAQCD`]) publishes the operations and result types a program may use, and
+/// the OpenQASM one adds the pragmas it may carry and the array limits its schema
+/// defines; the analog Hamiltonian-simulation action carries neither, because a
+/// program for it names no gates and no pragmas. Every entry carries its
+/// `actionType` and the [`ACTION_SCHEMA_VERSIONS`] it accepts.
+fn action_properties(seed: &DeviceSeed, action_type: &str) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("actionType".to_string(), serde_json::json!(action_type));
+    entry.insert(
+        "version".to_string(),
+        serde_json::json!(ACTION_SCHEMA_VERSIONS),
+    );
+    if action_type == ACTION_AHS {
+        return serde_json::Value::Object(entry);
+    }
+    entry.insert(
+        "supportedOperations".to_string(),
+        serde_json::json!(seed.supported_operations),
+    );
+    entry.insert(
+        "supportedResultTypes".to_string(),
+        supported_result_types(seed),
+    );
+    if action_type == ACTION_OPENQASM {
+        let (supported, forbidden) = pragmas(seed);
+        entry.insert("supportedPragmas".to_string(), serde_json::json!(supported));
+        entry.insert("forbiddenPragmas".to_string(), serde_json::json!(forbidden));
+        entry.insert(
+            "maximumQubitArrays".to_string(),
+            serde_json::json!(MAXIMUM_QUBIT_ARRAYS),
+        );
+        entry.insert(
+            "maximumClassicalArrays".to_string(),
+            serde_json::json!(MAXIMUM_CLASSICAL_ARRAYS),
+        );
+        entry.insert(
+            "forbiddenArrayOperations".to_string(),
+            serde_json::json!(FORBIDDEN_ARRAY_OPERATIONS),
+        );
+        // The hardware constraints a program must respect, which a client checks
+        // before it builds one. A simulator imposes none of them: it applies the
+        // program as written, to whichever qubits the program names. Hardware is
+        // addressed as physical qubits on a contiguous register it measures as a
+        // whole, and is the only thing a verbatim box or a rewiring switch means
+        // anything to.
+        let hardware = seed.device_type == DEVICE_TYPE_QPU;
+        for (property, value) in [
+            ("supportPhysicalQubits", hardware),
+            ("requiresAllQubitsMeasurement", hardware),
+            ("requiresContiguousQubitIndices", hardware),
+            ("disabledQubitRewiringSupported", hardware),
+            ("supportsUnassignedMeasurements", !hardware),
+            ("supportsPartialVerbatimBox", seed.verbatim),
+        ] {
+            entry.insert(property.to_string(), serde_json::json!(value));
+        }
+    }
+    serde_json::Value::Object(entry)
+}
+
+/// `supportedResultTypes`: one entry per result type the device computes, each with
+/// the observables it may be taken against and the shot range it needs — none for an
+/// exactly computed result type, the device's own range for a sampled one.
+fn supported_result_types(seed: &DeviceSeed) -> serde_json::Value {
+    serde_json::Value::Array(
+        seed.result_types
+            .iter()
+            .map(|result_type| {
+                let (min_shots, max_shots) = if result_type.exact {
+                    (0, 0)
+                } else {
+                    (1.max(seed.shots_range.0), seed.shots_range.1)
+                };
+                let mut entry = serde_json::Map::new();
+                entry.insert("name".to_string(), serde_json::json!(result_type.name));
+                if !result_type.observables.is_empty() {
+                    entry.insert(
+                        "observables".to_string(),
+                        serde_json::json!(result_type.observables),
+                    );
+                }
+                entry.insert("minShots".to_string(), serde_json::json!(min_shots));
+                entry.insert("maxShots".to_string(), serde_json::json!(max_shots));
+                serde_json::Value::Object(entry)
+            })
+            .collect(),
+    )
+}
+
+/// The pragmas an OpenQASM program for this device may and may not carry, as
+/// (`supportedPragmas`, `forbiddenPragmas`).
+///
+/// Every pragma the service knows about appears in exactly one of the two lists, so a
+/// client can tell "this device refuses it" from "this device has never heard of it":
+/// a `braket_result_type_*` pragma is supported exactly where the device publishes
+/// the matching result type, the [`NOISE_PRAGMAS`] exactly where it models noise,
+/// `verbatim` exactly where it has a native gate layer to address, and
+/// `braket_unitary_matrix` exactly where it accepts the `unitary` operation.
+fn pragmas(seed: &DeviceSeed) -> (Vec<&'static str>, Vec<&'static str>) {
+    let mut supported: Vec<&'static str> = Vec::new();
+    let mut forbidden: Vec<&'static str> = Vec::new();
+    let mut sort = |pragma: &'static str, allowed: bool| {
+        if allowed {
+            supported.push(pragma);
+        } else {
+            forbidden.push(pragma);
+        }
+    };
+    sort(VERBATIM_PRAGMA, seed.verbatim);
+    sort(
+        UNITARY_MATRIX_PRAGMA,
+        seed.supported_operations.contains(&"unitary"),
+    );
+    for pragma in NOISE_PRAGMAS {
+        sort(pragma, seed.noise);
+    }
+    for (result_type, pragma) in RESULT_TYPE_PRAGMAS {
+        let published = seed
+            .result_types
+            .iter()
+            .any(|seeded| seeded.name == *result_type);
+        sort(pragma, published);
+    }
+    (supported, forbidden)
+}
+
+/// `paradigm`: how the device computes — which schema's paradigm this is, the qubits
+/// it offers and, for a device with a native gate layer, the gates it executes without
+/// recompilation. A simulator and an analog device have none, so they publish none.
+fn paradigm_properties(seed: &DeviceSeed) -> serde_json::Value {
+    let mut paradigm = serde_json::Map::new();
+    paradigm.insert(
+        "braketSchemaHeader".to_string(),
+        serde_json::json!({ "name": paradigm_schema(seed), "version": "1" }),
+    );
+    paradigm.insert("qubitCount".to_string(), serde_json::json!(seed.qubit_count));
+    if !seed.native_gates.is_empty() {
+        paradigm.insert(
+            "nativeGateSet".to_string(),
+            serde_json::json!(seed.native_gates),
+        );
+    }
+    serde_json::Value::Object(paradigm)
+}
+
+/// A device name as the url slug the catalog's documentation links carry: lowercase,
+/// with every run of characters that are not letters or digits collapsed to one `-`.
+fn url_slug(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+/// An instant as the ISO-8601 `date-time` a JSON document carries.
+fn as_iso8601(at: SystemTime) -> String {
+    to_date_time(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
