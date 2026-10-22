@@ -599,8 +599,9 @@ async fn a_resource_arn_of_another_vendor_is_refused_by_the_vendor_check() {
     }
 
     // An ARN of THIS vendor is not the vendor check's business. One that satisfies
-    // `ResourceArn` reaches the handler (still a stub, so HTTP 501); one that does not
-    // keeps the framework's constraint wording, which names the member.
+    // `ResourceArn` reaches the handler, which answers on the resource it names (no
+    // application was created here, so the modelled `ResourceNotFoundException`); one
+    // that does not keeps the framework's constraint wording, which names the member.
     let application_arn =
         "arn:aws:emr-serverless:eu-west-1:000000000000:/applications/0000000000000001";
     let own_vendor_but_not_a_resource =
@@ -616,10 +617,16 @@ async fn a_resource_arn_of_another_vendor_is_refused_by_the_vendor_check() {
     )
     .await;
     assert_eq!(
-        listed.status, 501,
+        listed.status, 404,
         "case ListTagsForResource(own vendor): an admissible ARN must reach the handler, got {} \
          with {:?}",
         listed.status, listed.body
+    );
+    assert_eq!(
+        listed.error_code(),
+        "ResourceNotFoundException",
+        "case ListTagsForResource(own vendor): expected ResourceNotFoundException, got {:?}",
+        listed.body
     );
 
     for (case, value) in [

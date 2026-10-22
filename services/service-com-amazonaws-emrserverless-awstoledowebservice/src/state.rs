@@ -58,6 +58,14 @@ pub const MAX_APPLICATIONS: usize = 1_000;
 /// The same bound, for the job runs one application holds.
 pub const MAX_JOB_RUNS_PER_APPLICATION: usize = 1_000;
 
+/// The most tag pairs one resource keeps.
+///
+/// Source: `TagMap` is modelled `@length(min: 0, max: 200)` wherever it appears —
+/// `Application$tags`, `JobRun$tags`, `TagResourceRequest$tags` and
+/// `ListTagsForResourceResponse$tags` — so a resource carrying more pairs than that
+/// could not be reported at all.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// The same bound, for the interactive sessions one application holds. `StartSession`
 /// models `ServiceQuotaExceededException` ("The maximum number of resources per account
 /// has been reached"), which is what it answers past this bound.
@@ -610,6 +618,116 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
             record.settle(now);
         }
     }
+
+    /// The application the ARN `application_arn` names.
+    ///
+    /// Matched on the ARN the create STORED rather than on an id parsed out of the
+    /// request, so a well-formed ARN of another partition, region or account names no
+    /// application here even when one happens to carry the same id.
+    fn application_by_arn(&self, application_arn: &str) -> Option<&ApplicationRecord> {
+        self.applications
+            .values()
+            .find(|record| record.application.arn == application_arn)
+    }
+
+    /// The same, for a caller about to write to the record.
+    fn application_by_arn_mut(
+        &mut self,
+        application_arn: &str,
+    ) -> Option<&mut ApplicationRecord> {
+        self.applications
+            .values_mut()
+            .find(|record| record.application.arn == application_arn)
+    }
+
+    /// The tag pairs the resource `resource_arn` names carries, or the refusal this
+    /// service answers an ARN naming no such resource with.
+    ///
+    /// The tags of a resource live on the ONE record that resource is stored in
+    /// (`Application$tags`, `JobRun$tags`, `Session$tags`), so this reports exactly
+    /// what the resource's own `Get` reports. A resource that carries no tag map
+    /// carries no tags, which is an EMPTY set rather than an absent one.
+    pub fn resource_tags(
+        &self,
+        resource_arn: &str,
+    ) -> Result<HashMap<String, String>, ResourceNotFoundException> {
+        match parse_resource_arn(resource_arn) {
+            TaggedResource::Application { application_arn } => {
+                let record = self
+                    .application_by_arn(application_arn)
+                    .ok_or_else(application_not_found)?;
+                Ok(record.application.tags.clone().unwrap_or_default())
+            }
+            TaggedResource::JobRun {
+                application_arn,
+                job_run_id,
+            } => {
+                let record = self
+                    .application_by_arn(application_arn)
+                    .ok_or_else(application_not_found)?;
+                let run = record
+                    .job_runs
+                    .get(job_run_id)
+                    .ok_or_else(job_run_not_found)?;
+                Ok(run.job_run.tags.clone().unwrap_or_default())
+            }
+            TaggedResource::Session {
+                application_arn,
+                session_id,
+            } => {
+                let record = self
+                    .application_by_arn(application_arn)
+                    .ok_or_else(application_not_found)?;
+                let session = record
+                    .sessions
+                    .get(session_id)
+                    .ok_or_else(session_not_found)?;
+                Ok(session.session.tags.clone().unwrap_or_default())
+            }
+        }
+    }
+
+    /// The stored tag map of the resource `resource_arn` names, for a caller about to
+    /// add or remove pairs in it, or the same refusal for an ARN naming no resource.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Result<&mut HashMap<String, String>, ResourceNotFoundException> {
+        match parse_resource_arn(resource_arn) {
+            TaggedResource::Application { application_arn } => {
+                let record = self
+                    .application_by_arn_mut(application_arn)
+                    .ok_or_else(application_not_found)?;
+                Ok(record.application.tags.get_or_insert_default())
+            }
+            TaggedResource::JobRun {
+                application_arn,
+                job_run_id,
+            } => {
+                let record = self
+                    .application_by_arn_mut(application_arn)
+                    .ok_or_else(application_not_found)?;
+                let run = record
+                    .job_runs
+                    .get_mut(job_run_id)
+                    .ok_or_else(job_run_not_found)?;
+                Ok(run.job_run.tags.get_or_insert_default())
+            }
+            TaggedResource::Session {
+                application_arn,
+                session_id,
+            } => {
+                let record = self
+                    .application_by_arn_mut(application_arn)
+                    .ok_or_else(application_not_found)?;
+                let session = record
+                    .sessions
+                    .get_mut(session_id)
+                    .ok_or_else(session_not_found)?;
+                Ok(session.session.tags.get_or_insert_default())
+            }
+        }
+    }
 }
 
 /// The ARN of an application:
@@ -700,6 +818,53 @@ pub fn adopt_auto_stop(config: Option<AutoStopConfig>) -> Option<AutoStopConfig>
 /// every read reports it.
 pub fn adopt_tags(tags: Option<HashMap<String, String>>) -> Option<HashMap<String, String>> {
     Some(tags.unwrap_or_default())
+}
+
+/// The resource a `ResourceArn` names: the application ARN that owns it, and the child
+/// the ARN names under that application.
+///
+/// Source: `ResourceArn`'s pattern
+/// `^arn:(aws[a-zA-Z0-9-]*):emr-serverless:.+:(\d{12}):\/applications\/[0-9a-zA-Z]+(\/jobruns\/[0-9a-zA-Z]+|\/sessions\/[0-9a-zA-Z]+)?$`
+/// — an application ARN, optionally followed by one `/jobruns/<id>` or `/sessions/<id>`
+/// pair. `TagResource`, `UntagResource` and `ListTagsForResource` all bind that one
+/// shape, so they read an ARN the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource<'a> {
+    /// An application, named by the ARN it was minted with.
+    Application { application_arn: &'a str },
+    /// A job run of the application the ARN's leading part names.
+    JobRun {
+        application_arn: &'a str,
+        job_run_id: &'a str,
+    },
+    /// An interactive session of that application.
+    Session {
+        application_arn: &'a str,
+        session_id: &'a str,
+    },
+}
+
+/// Read `resource_arn` as one of the three resources the pattern admits.
+///
+/// INFALLIBLE: the modelled pattern is refused at the boundary, so an ARN that reaches
+/// a handler is one of these three forms. An `ApplicationId` is `[0-9a-zA-Z]+`, so
+/// neither segment pair can appear inside the application part of the ARN.
+pub fn parse_resource_arn(resource_arn: &str) -> TaggedResource<'_> {
+    if let Some((application_arn, job_run_id)) = resource_arn.rsplit_once("/jobruns/") {
+        return TaggedResource::JobRun {
+            application_arn,
+            job_run_id,
+        };
+    }
+    if let Some((application_arn, session_id)) = resource_arn.rsplit_once("/sessions/") {
+        return TaggedResource::Session {
+            application_arn,
+            session_id,
+        };
+    }
+    TaggedResource::Application {
+        application_arn: resource_arn,
+    }
 }
 
 /// The `architecture` to persist: the caller's, or [`DEFAULT_ARCHITECTURE`].

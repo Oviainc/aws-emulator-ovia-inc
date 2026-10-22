@@ -129,7 +129,11 @@ pub(crate) async fn delete_application(router: &MultiServiceRouter, id: &str) ->
     call(router, "DELETE", &format!("/applications/{id}"), None).await
 }
 
-async fn start_job_run(router: &MultiServiceRouter, id: &str, request: Value) -> Answer {
+pub(crate) async fn start_job_run(
+    router: &MultiServiceRouter,
+    id: &str,
+    request: Value,
+) -> Answer {
     call(
         router,
         "POST",
@@ -139,7 +143,11 @@ async fn start_job_run(router: &MultiServiceRouter, id: &str, request: Value) ->
     .await
 }
 
-async fn get_job_run(router: &MultiServiceRouter, id: &str, job_run_id: &str) -> Answer {
+pub(crate) async fn get_job_run(
+    router: &MultiServiceRouter,
+    id: &str,
+    job_run_id: &str,
+) -> Answer {
     call(
         router,
         "GET",
@@ -259,7 +267,7 @@ fn spark_submit_driver(entry_point: &str) -> Value {
 const EXECUTION_ROLE: &str = "arn:aws:iam::000000000000:role/EMRServerlessRole";
 
 /// A minimal `StartJobRun` body.
-fn minimal_job_run(token: &str) -> Value {
+pub(crate) fn minimal_job_run(token: &str) -> Value {
     json!({
         "clientToken": token,
         "executionRoleArn": EXECUTION_ROLE,
@@ -282,7 +290,7 @@ async fn created_application(router: &MultiServiceRouter, token: &str) -> String
 }
 
 /// Create an application and bring it to `STARTED`.
-async fn started_application(router: &MultiServiceRouter, token: &str) -> String {
+pub(crate) async fn started_application(router: &MultiServiceRouter, token: &str) -> String {
     let id = created_application(router, token).await;
     let started = start_application(router, &id).await;
     assert_eq!(
@@ -1845,17 +1853,6 @@ async fn the_operations_this_slice_does_not_implement_still_answer_501() {
             format!("/applications/{application_id}/dashboard"),
             None,
         ),
-        (
-            "ListTagsForResource",
-            "GET",
-            format!(
-                "/tags/{}",
-                urlencode(&format!(
-                    "arn:aws:emr-serverless:{REGION}:{ACCOUNT_ID}:/applications/{application_id}"
-                ))
-            ),
-            None,
-        ),
     ] {
         let answer = call(&router, method, &uri, body).await;
         assert_eq!(
@@ -1876,7 +1873,7 @@ fn rfc3339(epoch_seconds: f64) -> String {
 }
 
 /// Percent-encode a path segment, so an ARN can travel in one.
-fn urlencode(value: &str) -> String {
+pub(crate) fn urlencode(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
