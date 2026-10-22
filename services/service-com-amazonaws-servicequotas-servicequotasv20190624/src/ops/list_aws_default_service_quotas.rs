@@ -7,8 +7,13 @@
 //! `GetAWSDefaultServiceQuota` returns for that pair, built by the same view, so the
 //! two agree field for field — and no entry is affected by an applied increase.
 //!
-//! An unknown `ServiceCode` is `NoSuchResourceException`; a `NextToken` this service
-//! did not issue is `InvalidPaginationTokenException`.
+//! `ServiceCode` resolves against the ONE service catalog `ListServices` enumerates
+//! (the seeded catalog in [`crate::state`]): every code that catalog holds answers
+//! HTTP 200 with a `Quotas` list — empty for a service whose published defaults are
+//! not seeded, since the code itself exists — and `NoSuchResourceException` is
+//! reserved for a code the catalog does not know (one that is not an AWS service
+//! code). A `NextToken` this service did not issue is
+//! `InvalidPaginationTokenException`.
 //!
 //! ---
 //!

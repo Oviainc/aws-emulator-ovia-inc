@@ -108,9 +108,11 @@ pub const STATUS_APPROVED: &str = "APPROVED";
 /// read that is already past it.
 pub const REQUEST_DECISION_DELAY: Duration = Duration::from_millis(500);
 
-/// The page size a listing uses when the caller names no `MaxResults`: the maximum
-/// the model's `MaxResults` range declares (1..100).
-pub const DEFAULT_PAGE_SIZE: usize = 100;
+/// The largest page size a CALLER may ask for: the maximum the model's `MaxResults`
+/// range declares (1..100). It bounds `MaxResults`, NOT the unpaginated listing — a
+/// caller that names no `MaxResults` gets the whole listing in one page (see
+/// [`paginate`]).
+pub const MAX_PAGE_SIZE: usize = 100;
 
 /// The most quota increase requests this emulator stores per region.
 ///
@@ -295,7 +297,9 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     }
 
     /// The quota as `GetAWSDefaultServiceQuota` / `ListAWSDefaultServiceQuotas`
-    /// report it: the AWS default, with no applied level (nothing has been applied).
+    /// report it: the AWS default, with no applied level (nothing has been applied)
+    /// and the ACCOUNT-LESS ARN an AWS default quota carries (see
+    /// [`default_quota_arn`]).
     pub fn default_quota_view(
         &self,
         region: &str,
@@ -303,7 +307,14 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         quota_code: &str,
     ) -> Option<ServiceQuota> {
         let default = self.default_quota(service_code, quota_code)?;
-        Some(self.quota_view(region, service_code, quota_code, default))
+        let mut quota = self.quota_view(region, service_code, quota_code, default);
+        quota.quota_arn = Some(default_quota_arn(
+            region,
+            service_code,
+            quota_code,
+            default.global_quota,
+        ));
+        Some(quota)
     }
 
     /// Mint and store a quota increase request, and return the stored record —
@@ -535,13 +546,41 @@ fn epoch_timestamp(time: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
-/// The ARN of one quota: `arn:aws:servicequotas:<region>:<account>:<service>/<quota>`.
+/// The ARN of one APPLIED quota:
+/// `arn:aws:servicequotas:<region>:<account>:<service>/<quota>`.
+///
+/// An applied quota is the account's own — it is what an increase applies to — so its
+/// ARN names the account, through the canonical [`::engine::emulator_arn`] helper.
+/// `GetServiceQuota`, `ListServiceQuotas` and the quota increase requests report this
+/// form; the AWS DEFAULT of the same quota reports [`default_quota_arn`].
 ///
 /// A global quota's ARN carries no region, the way every global-service ARN does, so
 /// the same quota always reports the same ARN whichever regional endpoint is called.
 pub fn quota_arn(region: &str, service_code: &str, quota_code: &str, global_quota: bool) -> String {
     let region = if global_quota { "" } else { region };
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("{service_code}/{quota_code}"))
+}
+
+/// The ARN of one AWS DEFAULT quota:
+/// `arn:aws:servicequotas:<region>::<service>/<quota>` — the ACCOUNT segment is
+/// EMPTY.
+///
+/// An AWS default is published by the service, not owned by an account: the same
+/// default is the same value in every account, so its ARN names no account. That is
+/// the one difference from [`quota_arn`], and it is what distinguishes a default from
+/// the applied quota of the same pair rather than a formatting accident.
+///
+/// `::engine::emulator_arn` always fills the account segment with the emulator's
+/// canonical account, so the account-less form is built here; there is no account in
+/// it to disclose, and the region rule is the same as [`quota_arn`]'s.
+pub fn default_quota_arn(
+    region: &str,
+    service_code: &str,
+    quota_code: &str,
+    global_quota: bool,
+) -> String {
+    let region = if global_quota { "" } else { region };
+    format!("arn:aws:{ARN_NAMESPACE}:{region}::{service_code}/{quota_code}")
 }
 
 /// The identity a request records as its `Requester`: this emulator's single
@@ -607,7 +646,8 @@ pub struct InvalidPageToken;
 /// `listing` names the listing the token belongs to (the operation's own name), so a
 /// token issued by one listing is refused by another instead of resuming at an
 /// unrelated position. `max_results` is the caller's page size (the model bounds it
-/// to 1..100 before a handler runs) and `next_token` is an opaque position from a
+/// to 1..100 before a handler runs) — a caller that names NONE gets every item in
+/// one page — and `next_token` is an opaque position from a
 /// previous page. The token is base64 of `<listing>:<offset>` over the standard
 /// alphabet, so it matches the modelled `NextToken` pattern
 /// `^[a-zA-Z0-9/+]*={0,2}$` and tells a caller nothing it should be reading.
@@ -625,8 +665,14 @@ pub fn paginate<T>(
     if start > total {
         return Err(InvalidPageToken);
     }
-    let size = max_results.map_or(DEFAULT_PAGE_SIZE, |requested| {
-        (requested.max(1) as usize).min(DEFAULT_PAGE_SIZE)
+    // No `MaxResults` is no page size: the listing is returned whole, in one page,
+    // and only a caller that asks for a page size gets one. `MaxResults` bounds what
+    // a CALLER may ask for (1..100), not what the service returns unasked — a
+    // catalog listing of several hundred entries comes back in a single response.
+    // Nothing here grows without bound: the catalog and the defaults are seeded
+    // tables and the request store is capped by [`MAX_REQUESTS_PER_REGION`].
+    let size = max_results.map_or(total, |requested| {
+        (requested.max(1) as usize).min(MAX_PAGE_SIZE)
     });
     let items: Vec<T> = all.into_iter().skip(start).take(size).collect();
     let stopped_at = start + items.len();
@@ -657,27 +703,352 @@ fn decode_page_token(listing: &str, token: &str) -> Result<usize, InvalidPageTok
         .ok_or(InvalidPageToken)
 }
 
-/// The seeded service catalog: AWS service codes and the names Service Quotas
-/// reports for them.
+/// The service catalog `ListServices` enumerates: every `(ServiceCode,
+/// ServiceName)` pair this emulator knows, and therefore every code
+/// `ListAWSDefaultServiceQuotas` / `ListServiceQuotas` resolve.
+///
+/// Source: AWS's own Service Quotas service catalog — the pairs `aws service-quotas
+/// list-services` reports (`ServiceInfo{ServiceCode, ServiceName}`, see
+/// `smithy_query(query="shape", shape="ServiceInfo")`). Every `ServiceCode` here is
+/// an AWS service code and satisfies the modelled `ServiceCode` constraints (length
+/// 1..63, pattern `^[a-zA-Z][a-zA-Z0-9-]{1,63}$`), which `tests/all/
+/// default_quota_catalog.rs` pins over the whole table.
+///
+/// This is the catalog's ONE source: [`seed_services`] builds the `ListServices`
+/// listing from it and nothing else decides which codes exist, so the set of codes
+/// that list and the set that resolve can never drift apart.
+///
+/// The order here is only for reading; the catalog is stored in a `BTreeMap`, so
+/// `ListServices` pages it in `ServiceCode` order whatever order this table is in.
+const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
+    ("AWSCloudMap", "AWS Cloud Map"),
+    ("access-analyzer", "IAM Access Analyzer"),
+    ("acm", "AWS Certificate Manager (ACM)"),
+    ("acm-pca", "AWS Private Certificate Authority"),
+    ("airflow", "Amazon Managed Workflows for Apache Airflow"),
+    ("amplify", "AWS Amplify"),
+    ("amplifyuibuilder", "AWS Amplify UI Builder"),
+    ("aoss", "Amazon OpenSearch Serverless"),
+    ("apigateway", "Amazon API Gateway"),
+    ("appconfig", "AWS AppConfig"),
+    ("appflow", "Amazon AppFlow"),
+    ("application-autoscaling", "Application Auto Scaling"),
+    ("application-signals", "Amazon CloudWatch Application Signals"),
+    ("appmesh", "AWS App Mesh"),
+    ("apprunner", "AWS App Runner"),
+    ("appstream2", "Amazon AppStream 2.0"),
+    ("appstudio", "AWS App Studio"),
+    ("appsync", "AWS AppSync"),
+    ("athena", "Amazon Athena"),
+    ("auditmanager", "AWS Audit Manager"),
+    ("autoscaling", "Amazon EC2 Auto Scaling"),
+    ("autoscaling-plans", "AWS Auto Scaling"),
+    ("aws-marketplace", "AWS Marketplace"),
+    ("b2bi", "AWS B2B Data Interchange"),
+    ("backup", "AWS Backup"),
+    ("batch", "AWS Batch"),
+    ("bedrock", "Amazon Bedrock"),
+    ("braket", "Amazon Braket"),
+    ("cases", "Amazon Connect Cases"),
+    ("cassandra", "Amazon Keyspaces (for Apache Cassandra)"),
+    ("chime", "Amazon Chime"),
+    ("cleanrooms", "AWS Clean Rooms"),
+    ("cloud9", "AWS Cloud9"),
+    ("cloudformation", "AWS CloudFormation"),
+    ("cloudfront", "Amazon CloudFront"),
+    ("cloudhsm", "AWS CloudHSM"),
+    ("cloudsearch", "Amazon CloudSearch"),
+    ("cloudshell", "AWS CloudShell"),
+    ("cloudtrail", "AWS CloudTrail"),
+    ("cloudwatch", "Amazon CloudWatch"),
+    ("codeartifact", "AWS CodeArtifact"),
+    ("codebuild", "AWS CodeBuild"),
+    ("codecatalyst", "Amazon CodeCatalyst"),
+    ("codecommit", "AWS CodeCommit"),
+    ("codedeploy", "AWS CodeDeploy"),
+    ("codeguru-profiler", "Amazon CodeGuru Profiler"),
+    ("codeguru-reviewer", "Amazon CodeGuru Reviewer"),
+    ("codepipeline", "AWS CodePipeline"),
+    ("cognito-identity", "Amazon Cognito Federated Identities"),
+    ("cognito-idp", "Amazon Cognito User Pools"),
+    ("cognito-sync", "Amazon Cognito Sync"),
+    ("comprehend", "Amazon Comprehend"),
+    ("comprehendmedical", "Amazon Comprehend Medical"),
+    ("config", "AWS Config"),
+    ("connect", "Amazon Connect"),
+    ("connect-campaigns", "Amazon Connect Outbound Campaigns"),
+    ("controltower", "AWS Control Tower"),
+    ("databrew", "AWS Glue DataBrew"),
+    ("dataexchange", "AWS Data Exchange"),
+    ("datapipeline", "AWS Data Pipeline"),
+    ("datasync", "AWS DataSync"),
+    ("dax", "Amazon DynamoDB Accelerator (DAX)"),
+    ("deepracer", "AWS DeepRacer"),
+    ("detective", "Amazon Detective"),
+    ("devicefarm", "AWS Device Farm"),
+    ("directconnect", "AWS Direct Connect"),
+    ("discovery", "AWS Application Discovery Service"),
+    ("dlm", "Amazon Data Lifecycle Manager"),
+    ("dms", "AWS Database Migration Service"),
+    ("docdb", "Amazon DocumentDB (with MongoDB compatibility)"),
+    ("docdb-elastic", "Amazon DocumentDB Elastic Clusters"),
+    ("drs", "AWS Elastic Disaster Recovery"),
+    ("ds", "AWS Directory Service"),
+    ("dsql", "Amazon Aurora DSQL"),
+    ("dynamodb", "Amazon DynamoDB"),
+    ("ebs", "Amazon Elastic Block Store (Amazon EBS)"),
+    ("ec2", "Amazon Elastic Compute Cloud (Amazon EC2)"),
+    ("ec2-ipam", "Amazon VPC IP Address Manager"),
+    ("ec2fastlaunch", "Amazon EC2 Fast Launch"),
+    ("ecr", "Amazon Elastic Container Registry (Amazon ECR)"),
+    ("ecs", "Amazon Elastic Container Service (Amazon ECS)"),
+    ("eks", "Amazon Elastic Kubernetes Service (Amazon EKS)"),
+    ("elastic-inference", "Amazon Elastic Inference"),
+    ("elasticache", "Amazon ElastiCache"),
+    ("elasticbeanstalk", "AWS Elastic Beanstalk"),
+    ("elasticfilesystem", "Amazon Elastic File System (Amazon EFS)"),
+    ("elasticloadbalancing", "Elastic Load Balancing (ELB)"),
+    ("elasticmapreduce", "Amazon EMR"),
+    ("elastictranscoder", "Amazon Elastic Transcoder"),
+    ("emr-containers", "Amazon EMR on EKS"),
+    ("emr-serverless", "Amazon EMR Serverless"),
+    ("entityresolution", "AWS Entity Resolution"),
+    ("es", "Amazon OpenSearch Service"),
+    ("events", "Amazon EventBridge"),
+    ("evidently", "Amazon CloudWatch Evidently"),
+    ("evs", "Amazon Elastic VMware Service"),
+    ("fargate", "AWS Fargate"),
+    ("firehose", "Amazon Data Firehose"),
+    ("fms", "AWS Firewall Manager"),
+    ("forecast", "Amazon Forecast"),
+    ("frauddetector", "Amazon Fraud Detector"),
+    ("fsx", "Amazon FSx"),
+    ("gamelift", "Amazon GameLift"),
+    ("gameliftstreams", "Amazon GameLift Streams"),
+    ("glacier", "Amazon S3 Glacier"),
+    ("globalaccelerator", "AWS Global Accelerator"),
+    ("glue", "AWS Glue"),
+    ("grafana", "Amazon Managed Grafana"),
+    ("greengrass", "AWS IoT Greengrass"),
+    ("groundstation", "AWS Ground Station"),
+    ("guardduty", "Amazon GuardDuty"),
+    ("healthlake", "AWS HealthLake"),
+    ("iam", "AWS Identity and Access Management (IAM)"),
+    ("imagebuilder", "EC2 Image Builder"),
+    ("inspector", "Amazon Inspector Classic"),
+    ("inspector2", "Amazon Inspector"),
+    ("internetmonitor", "Amazon CloudWatch Internet Monitor"),
+    ("iot", "AWS IoT Core"),
+    ("iotanalytics", "AWS IoT Analytics"),
+    ("iotdeviceadvisor", "AWS IoT Core Device Advisor"),
+    ("iotevents", "AWS IoT Events"),
+    ("iotsitewise", "AWS IoT SiteWise"),
+    ("iotthingsgraph", "AWS IoT Things Graph"),
+    ("iottwinmaker", "AWS IoT TwinMaker"),
+    ("ivs", "Amazon Interactive Video Service"),
+    ("ivschat", "Amazon IVS Chat"),
+    ("kafka", "Amazon Managed Streaming for Apache Kafka (Amazon MSK)"),
+    ("kafkaconnect", "Amazon MSK Connect"),
+    ("kendra", "Amazon Kendra"),
+    ("kendra-ranking", "Amazon Kendra Intelligent Ranking"),
+    ("kinesis", "Amazon Kinesis Data Streams"),
+    ("kinesisanalytics", "Amazon Managed Service for Apache Flink"),
+    ("kinesisvideo", "Amazon Kinesis Video Streams"),
+    ("kms", "AWS Key Management Service (AWS KMS)"),
+    ("lakeformation", "AWS Lake Formation"),
+    ("lambda", "AWS Lambda"),
+    ("launchwizard", "AWS Launch Wizard"),
+    ("lex", "Amazon Lex"),
+    ("license-manager", "AWS License Manager"),
+    (
+        "license-manager-linux-subscriptions",
+        "AWS License Manager Linux Subscriptions",
+    ),
+    (
+        "license-manager-user-subscriptions",
+        "AWS License Manager User Subscriptions",
+    ),
+    ("logs", "Amazon CloudWatch Logs"),
+    ("lookoutvision", "Amazon Lookout for Vision"),
+    ("m2", "AWS Mainframe Modernization"),
+    ("machinelearning", "Amazon Machine Learning"),
+    ("macie2", "Amazon Macie"),
+    ("marketplaceagreement", "AWS Marketplace Agreement Service"),
+    ("mediaconnect", "AWS Elemental MediaConnect"),
+    ("mediaconvert", "AWS Elemental MediaConvert"),
+    ("medialive", "AWS Elemental MediaLive"),
+    ("mediapackage", "AWS Elemental MediaPackage"),
+    ("mediapackagev2", "AWS Elemental MediaPackage v2"),
+    ("mediastore", "AWS Elemental MediaStore"),
+    ("mediatailor", "AWS Elemental MediaTailor"),
+    ("medical-imaging", "AWS HealthImaging"),
+    ("memorydb", "Amazon MemoryDB"),
+    ("mgn", "AWS Application Migration Service"),
+    ("migrationhuborchestrator", "AWS Migration Hub Orchestrator"),
+    (
+        "migrationhubstrategy",
+        "AWS Migration Hub Strategy Recommendations",
+    ),
+    ("monitoring", "Amazon CloudWatch"),
+    ("mq", "Amazon MQ"),
+    ("neptune", "Amazon Neptune"),
+    ("neptune-graph", "Amazon Neptune Analytics"),
+    ("network-firewall", "AWS Network Firewall"),
+    ("networkmanager", "AWS Cloud WAN"),
+    ("networkmonitor", "Amazon CloudWatch Network Monitor"),
+    ("oam", "Amazon CloudWatch Observability Access Manager"),
+    (
+        "observabilityadmin",
+        "Amazon CloudWatch Observability Admin Service",
+    ),
+    ("omics", "AWS HealthOmics"),
+    ("opensearch", "Amazon OpenSearch Service"),
+    ("organizations", "AWS Organizations"),
+    ("outposts", "AWS Outposts"),
+    ("panorama", "AWS Panorama"),
+    ("payment-cryptography", "AWS Payment Cryptography"),
+    (
+        "pca-connector-ad",
+        "AWS Private CA Connector for Active Directory",
+    ),
+    ("pca-connector-scep", "AWS Private CA Connector for SCEP"),
+    ("pcs", "AWS Parallel Computing Service"),
+    ("personalize", "Amazon Personalize"),
+    ("pinpoint", "Amazon Pinpoint"),
+    ("polly", "Amazon Polly"),
+    ("private-networks", "AWS Private 5G"),
+    ("profile", "Amazon Connect Customer Profiles"),
+    ("proton", "AWS Proton"),
+    ("qapps", "Amazon Q Apps"),
+    ("qbusiness", "Amazon Q Business"),
+    ("qldb", "Amazon Quantum Ledger Database (Amazon QLDB)"),
+    ("quicksight", "Amazon QuickSight"),
+    ("ram", "AWS Resource Access Manager"),
+    ("rbin", "Amazon Recycle Bin"),
+    ("rds", "Amazon Relational Database Service (Amazon RDS)"),
+    ("redshift", "Amazon Redshift"),
+    ("redshift-serverless", "Amazon Redshift Serverless"),
+    ("refactor-spaces", "AWS Migration Hub Refactor Spaces"),
+    ("rekognition", "Amazon Rekognition"),
+    ("repostspace", "AWS re:Post Private"),
+    ("resource-explorer-2", "AWS Resource Explorer"),
+    ("resource-groups", "AWS Resource Groups"),
+    ("robomaker", "AWS RoboMaker"),
+    ("rolesanywhere", "AWS IAM Roles Anywhere"),
+    ("route53", "Amazon Route 53"),
+    (
+        "route53-recovery-control-config",
+        "Amazon Route 53 Application Recovery Controller",
+    ),
+    (
+        "route53-recovery-readiness",
+        "Amazon Route 53 Application Recovery Controller Readiness",
+    ),
+    ("route53domains", "Amazon Route 53 Domains"),
+    ("route53profiles", "Amazon Route 53 Profiles"),
+    ("route53resolver", "Amazon Route 53 Resolver"),
+    ("rtbfabric", "AWS RTB Fabric"),
+    ("rum", "Amazon CloudWatch RUM"),
+    ("s3", "Amazon Simple Storage Service (Amazon S3)"),
+    ("s3-outposts", "Amazon S3 on Outposts"),
+    ("sagemaker", "Amazon SageMaker AI"),
+    ("scheduler", "Amazon EventBridge Scheduler"),
+    ("schemas", "Amazon EventBridge Schemas"),
+    ("scn", "AWS Supply Chain"),
+    ("sdb", "Amazon SimpleDB"),
+    ("secretsmanager", "AWS Secrets Manager"),
+    ("security-ir", "AWS Security Incident Response"),
+    ("securityhub", "AWS Security Hub"),
+    ("serverlessrepo", "AWS Serverless Application Repository"),
+    ("servicecatalog", "AWS Service Catalog"),
+    ("servicediscovery", "AWS Cloud Map Service Discovery"),
+    ("servicequotas", "Service Quotas"),
+    ("ses", "Amazon Simple Email Service (Amazon SES)"),
+    ("shield", "AWS Shield Advanced"),
+    ("signer", "AWS Signer"),
+    ("simspaceweaver", "AWS SimSpace Weaver"),
+    ("sns", "Amazon Simple Notification Service (Amazon SNS)"),
+    ("sqs", "Amazon Simple Queue Service (Amazon SQS)"),
+    ("ssm", "AWS Systems Manager"),
+    ("ssm-contacts", "AWS Systems Manager Incident Manager Contacts"),
+    ("ssm-guiconnect", "AWS Systems Manager GUI Connect"),
+    ("ssm-incidents", "AWS Systems Manager Incident Manager"),
+    ("ssm-quicksetup", "AWS Systems Manager Quick Setup"),
+    ("ssm-sap", "AWS Systems Manager for SAP"),
+    ("sso", "AWS IAM Identity Center"),
+    ("states", "AWS Step Functions"),
+    ("storagegateway", "AWS Storage Gateway"),
+    ("sts", "AWS Security Token Service (AWS STS)"),
+    ("supportapp", "AWS Support App in Slack"),
+    ("swf", "Amazon Simple Workflow Service"),
+    ("synthetics", "Amazon CloudWatch Synthetics"),
+    ("textract", "Amazon Textract"),
+    ("timestream", "Amazon Timestream"),
+    ("transcribe", "Amazon Transcribe"),
+    ("transfer", "AWS Transfer Family"),
+    ("translate", "Amazon Translate"),
+    ("trustedadvisor", "AWS Trusted Advisor"),
+    ("verifiedpermissions", "Amazon Verified Permissions"),
+    ("vpc", "Amazon Virtual Private Cloud (Amazon VPC)"),
+    ("vpc-lattice", "Amazon VPC Lattice"),
+    ("waf", "AWS WAF Classic"),
+    ("waf-regional", "AWS WAF Classic Regional"),
+    ("wafv2", "AWS WAF"),
+    ("wellarchitected", "AWS Well-Architected Tool"),
+    ("wisdom", "Amazon Connect Wisdom"),
+    ("workdocs", "Amazon WorkDocs"),
+    ("workmail", "Amazon WorkMail"),
+    ("workspaces", "Amazon WorkSpaces"),
+    ("workspaces-web", "Amazon WorkSpaces Secure Browser"),
+    ("xray", "AWS X-Ray"),
+    // AWS's catalog reports these service codes too, but this emulator has no
+    // published display name it can cite for them (they are recent launches). The
+    // code is reported as the name rather than inventing one: `ServiceCode` — the
+    // member every other operation keys on, and the one the model constrains — stays
+    // exactly AWS's, and nothing downstream reads `ServiceName`.
+    ("account-access", "account-access"),
+    ("aco-automation", "aco-automation"),
+    ("agent-registry", "agent-registry"),
+    ("aidevops", "aidevops"),
+    ("aiops", "aiops"),
+    ("airflow-serverless", "airflow-serverless"),
+    ("aws-mcp", "aws-mcp"),
+    ("axis", "axis"),
+    ("bedrock-websearch", "bedrock-websearch"),
+    ("cloudwatchpredictions", "cloudwatchpredictions"),
+    ("eks-mcp", "eks-mcp"),
+    ("elemental-inference", "elemental-inference"),
+    ("health-agent", "health-agent"),
+    ("interconnect", "interconnect"),
+    ("networkinsights", "networkinsights"),
+    ("s3files", "s3files"),
+    ("securityagent", "securityagent"),
+];
+
+/// The seeded service catalog: [`SEED_SERVICE_CATALOG`], keyed by `ServiceCode` so
+/// `ListServices` pages it in code order and a lookup is exact.
 fn seed_services() -> BTreeMap<String, String> {
-    [
-        ("dynamodb", "Amazon DynamoDB"),
-        ("ec2", "Amazon Elastic Compute Cloud (Amazon EC2)"),
-        ("lambda", "AWS Lambda"),
-        ("s3", "Amazon Simple Storage Service (Amazon S3)"),
-        ("vpc", "Amazon Virtual Private Cloud (Amazon VPC)"),
-    ]
-    .into_iter()
-    .map(|(code, name)| (code.to_string(), name.to_string()))
-    .collect()
+    SEED_SERVICE_CATALOG
+        .iter()
+        .map(|(code, name)| ((*code).to_string(), (*name).to_string()))
+        .collect()
 }
 
-/// The seeded AWS default quotas.
+/// The seeded AWS default quotas, keyed by `(ServiceCode, QuotaCode)`.
 ///
 /// Quota codes, names, default values and adjustability come from AWS's published
 /// per-service quota pages (the same values `aws service-quotas
 /// get-aws-default-service-quota` reports). `Unit` is `None` for a countable quota,
 /// which is what Service Quotas reports for all but the measured ones.
+///
+/// Coverage is per PAIR, not per service: this table holds the published defaults
+/// this emulator can cite, and nothing is invented to fill a service out. A service
+/// code in [`SEED_SERVICE_CATALOG`] with no pair here therefore has an EMPTY default
+/// quota set, and `ListAWSDefaultServiceQuotas` answers it with HTTP 200 and an empty
+/// `Quotas` list — the code exists, so `NoSuchResourceException` (which belongs to a
+/// code that is not an AWS service code at all) would be the wrong answer. Every
+/// `ServiceCode` used here must be a catalog code; `tests/all/default_quota_catalog.rs`
+/// pins that.
 fn seed_default_quotas() -> BTreeMap<(String, String), DefaultQuota> {
     let mut quotas = BTreeMap::new();
     let mut add = |service_code: &str, quota_code: &str, quota: DefaultQuota| {
@@ -694,9 +1065,23 @@ fn seed_default_quotas() -> BTreeMap<(String, String), DefaultQuota> {
             adjustable: true,
             global_quota: false,
             adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            usage_metric: None,
+            // DynamoDB publishes table count as a CloudWatch usage metric
+            // (`AWS/Usage`, `ResourceCount`, `Resource=TableCount`), which is what
+            // Service Quotas reports as this quota's `UsageMetric`.
+            usage_metric: Some(usage_metric(
+                "DynamoDB",
+                &[
+                    ("Class", "None"),
+                    ("Resource", "TableCount"),
+                    ("Type", "Resource"),
+                ],
+            )),
             period: None,
-            description: None,
+            description: Some(
+                "The maximum number of tables that can be created in this account in the \
+                 current Region."
+                    .to_string(),
+            ),
         },
     );
     add(
