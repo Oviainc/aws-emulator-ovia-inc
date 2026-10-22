@@ -35,13 +35,25 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! ## The error envelope
+//!
+//! `override_operation` below claims every request the model's routing table resolves
+//! and runs it through [`envelope::ErrorEnvelope`], which dispatches the modelled
+//! operation unchanged and then finishes the response's error envelope: Route 53's
+//! `<ErrorResponse>` names the request it answers (`RequestId`), which is a property of
+//! the envelope rather than a member of any error shape the model declares. That
+//! module's docs carry the rule; routing stays with the generated table, which the seam
+//! reads rather than replaces.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod envelope;
+
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -51,7 +63,10 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    entry: envelope::Route53Definition<Eng>,
+    /// Finishes the error envelope of every response this service answers. Held here
+    /// because [`Service::override_operation`] hands back a borrow of it.
+    envelope: envelope::ErrorEnvelope,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +75,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: envelope::Route53Definition::new(engine),
+            envelope: envelope::ErrorEnvelope,
         }
     }
 }
@@ -87,12 +103,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the model's routing table resolves is served through the
+        // envelope seam, which runs that same table entry and then finishes the
+        // response's error envelope (see the module docs and `envelope`). A request the
+        // table does NOT resolve is left alone, so naming no modelled operation is still
+        // refused in front of the service — in the entry's own envelope, which
+        // `envelope::Route53Definition` finishes the same way.
+        self.entry
+            .routes(req)
+            .then_some(&self.envelope as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

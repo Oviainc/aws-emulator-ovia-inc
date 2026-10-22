@@ -95,7 +95,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::normalize_zone_id;
+use crate::state::{no_such_hosted_zone, normalize_zone_id, HOSTED_ZONE_NOT_EMPTY_MESSAGE};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -180,20 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = normalize_zone_id(&input.id).to_string();
         let mut store = state.lock();
         let zone = store.zones.get(&id).ok_or_else(|| {
-            DeleteHostedZoneErrorModeled::NoSuchHostedZone(NoSuchHostedZone {
-                message: Some(format!("no hosted zone exists with the ID {}", input.id)),
-            })
+            DeleteHostedZoneErrorModeled::NoSuchHostedZone(no_such_hosted_zone(&input.id))
         })?;
 
         // "You can delete a hosted zone only if it contains only the default SOA
         // and NS records."
         if zone.holds_user_records() {
             return Err(DeleteHostedZoneErrorModeled::HostedZoneNotEmpty(HostedZoneNotEmpty {
-                message: Some(format!(
-                    "the hosted zone {} contains resource records that are not the default SOA \
-                     and NS records and so cannot be deleted",
-                    input.id
-                )),
+                message: Some(HOSTED_ZONE_NOT_EMPTY_MESSAGE.to_string()),
             })
             .into());
         }
