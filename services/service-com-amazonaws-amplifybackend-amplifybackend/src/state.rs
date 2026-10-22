@@ -12,6 +12,7 @@
 //! [`BackendApp::environments`], and a hash map would order it differently on
 //! every process.
 
+use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,9 @@ pub const RESOURCE_TYPE_BACKEND_ENVIRONMENT: &str = "backend-environment";
 pub const RESOURCE_TYPE_BACKEND_AUTH: &str = "backend-auth";
 /// `NotFoundException::ResourceType` for a job id this app never minted.
 pub const RESOURCE_TYPE_BACKEND_JOB: &str = "backend-job";
+/// `NotFoundException::ResourceType` for a challenge token (app id + session id) this
+/// service does not hold: one that was never created, already deleted, or expired.
+pub const RESOURCE_TYPE_CHALLENGE_TOKEN: &str = "challenge-token";
 
 /// The modelled `NotFoundException` payload for a resource that does not exist.
 ///
@@ -92,9 +96,12 @@ pub const MAX_RETAINED_JOBS_PER_APP: usize = 1000;
 // insert, never served by growing.
 //
 // The product is therefore finite: at most MAX_APPS apps, each with at most
-// MAX_ENVIRONMENTS_PER_APP environments and MAX_RETAINED_JOBS_PER_APP jobs, each
-// environment with at most MAX_AUTH_RESOURCES_PER_ENVIRONMENT auth resources, and every
-// identifier that keys one of them at most MAX_IDENTIFIER_CHARS characters.
+// MAX_ENVIRONMENTS_PER_APP environments, MAX_RETAINED_JOBS_PER_APP jobs and
+// MAX_CHALLENGE_TOKENS_PER_APP live challenge tokens, each environment with at most
+// MAX_AUTH_RESOURCES_PER_ENVIRONMENT auth resources,
+// MAX_API_RESOURCES_PER_ENVIRONMENT API resources and
+// MAX_STORAGE_RESOURCES_PER_ENVIRONMENT storage resources, and every identifier that
+// keys one of them at most MAX_IDENTIFIER_CHARS characters.
 // ---------------------------------------------------------------------------
 
 /// Emulator resource guard, NOT an AWS quota: the most Amplify apps this emulator holds
@@ -111,10 +118,24 @@ pub const MAX_ENVIRONMENTS_PER_APP: usize = 50;
 /// environment may hold at once.
 pub const MAX_AUTH_RESOURCES_PER_ENVIRONMENT: usize = 25;
 
+/// Emulator resource guard, NOT an AWS quota: the most API resources one backend
+/// environment may hold at once. The `ResourceName` a caller supplies keys the map, so
+/// the COUNT needs a ceiling as well as the key length.
+pub const MAX_API_RESOURCES_PER_ENVIRONMENT: usize = 25;
+
+/// Emulator resource guard, NOT an AWS quota: the most storage resources one backend
+/// environment may hold at once. See [`MAX_API_RESOURCES_PER_ENVIRONMENT`].
+pub const MAX_STORAGE_RESOURCES_PER_ENVIRONMENT: usize = 25;
+
 /// Emulator resource guard, NOT an AWS quota: the longest caller-supplied identifier
 /// (`AppId`, `BackendEnvironmentName`, `ResourceName`) this emulator will key a record
 /// by, so a bounded COUNT of records cannot hold an unbounded amount of text.
 pub const MAX_IDENTIFIER_CHARS: usize = 256;
+
+/// Emulator resource guard, NOT an AWS quota: the most LIVE challenge tokens one app may
+/// hold at once. A token is reclaimed by `DeleteToken` or by its own expiry, so this is a
+/// ceiling on what is live, not a lifetime total.
+pub const MAX_CHALLENGE_TOKENS_PER_APP: usize = 100;
 
 /// `TooManyRequestsException$LimitType` for the apps bound.
 pub const LIMIT_TYPE_APPS: &str = "apps";
@@ -122,6 +143,12 @@ pub const LIMIT_TYPE_APPS: &str = "apps";
 pub const LIMIT_TYPE_ENVIRONMENTS: &str = "backend-environments-per-app";
 /// `TooManyRequestsException$LimitType` for the auth-resources-per-environment bound.
 pub const LIMIT_TYPE_AUTH_RESOURCES: &str = "auth-resources-per-backend-environment";
+/// `TooManyRequestsException$LimitType` for the api-resources-per-environment bound.
+pub const LIMIT_TYPE_API_RESOURCES: &str = "api-resources-per-backend-environment";
+/// `TooManyRequestsException$LimitType` for the storage-resources-per-environment bound.
+pub const LIMIT_TYPE_STORAGE_RESOURCES: &str = "storage-resources-per-backend-environment";
+/// `TooManyRequestsException$LimitType` for the live-challenge-tokens-per-app bound.
+pub const LIMIT_TYPE_CHALLENGE_TOKENS: &str = "challenge-tokens-per-app";
 
 /// The modelled `TooManyRequestsException` for a request that would grow a store past
 /// its cap — "An error that is returned when a limit of a specific type has been
@@ -172,11 +199,138 @@ pub fn format_time(at: SystemTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Admin UI challenge tokens
+//
+// `CreateToken` mints a one-time challenge code for signing in to an app's Amplify
+// Admin UI, `GetToken` reports the minted token back, and `DeleteToken` reclaims it.
+// A token is NOT part of a backend environment — it addresses an app directly
+// (`/backend/{AppId}/challenge`) and AmplifyBackend mints one whether or not a backend
+// was ever created for that app — so the tokens live in their own map rather than on
+// [`BackendApp`], which only exists for an app `CreateBackend` was called for.
+// ---------------------------------------------------------------------------
+
+/// How long a challenge code minted by `CreateToken` stays usable, and the value
+/// reported as `Ttl`.
+///
+/// CHOSEN, not documented: AWS publishes no lifetime for an Amplify Admin UI challenge
+/// code. The span is short, the way a one-time sign-in code's is, and long enough that a
+/// client that mints a code, opens the Admin UI and polls `GetToken` for it still finds
+/// it.
+pub const CHALLENGE_TOKEN_TTL: Duration = Duration::from_secs(300);
+
+/// How many characters of store-minted secret material a challenge code carries.
+///
+/// CHOSEN: AWS publishes no length for the code. 20 characters of the credential store's
+/// 64-symbol alphabet is ~120 bits, so a code cannot be guessed inside its lifetime.
+pub const CHALLENGE_CODE_CHARS: usize = 20;
+
+/// One live Admin UI challenge token: the code itself and when it stops being usable.
+#[derive(Debug, Clone)]
+pub struct ChallengeToken {
+    /// The app the token authenticates into.
+    pub app_id: String,
+    /// The unique id `CreateToken` handed back, which addresses the token afterwards.
+    pub session_id: String,
+    /// The one-time challenge code. Minted by the emulator's credential store (see
+    /// [`mint_challenge_token`]), never constructed here.
+    pub challenge_code: String,
+    /// When the token was minted.
+    pub created_at: SystemTime,
+    /// When the code stops being usable: [`CHALLENGE_TOKEN_TTL`] after
+    /// [`Self::created_at`].
+    pub expires_at: SystemTime,
+}
+
+impl ChallengeToken {
+    /// A token minted at `now`, expiring [`CHALLENGE_TOKEN_TTL`] later.
+    pub fn new(
+        app_id: &str,
+        session_id: String,
+        challenge_code: String,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            app_id: app_id.to_string(),
+            session_id,
+            challenge_code,
+            created_at: now,
+            expires_at: now + CHALLENGE_TOKEN_TTL,
+        }
+    }
+
+    /// Whether the code is still usable at `now`.
+    pub fn is_live(&self, now: SystemTime) -> bool {
+        now < self.expires_at
+    }
+
+    /// The `Ttl` member: this code's LIFETIME — the whole seconds between the instant it
+    /// was minted and the instant it expires — as a decimal string.
+    ///
+    /// A lifetime, not a countdown. The model does NOT fix this: it documents the member
+    /// only as "The expiry time for the one-time generated token code" and gives it no
+    /// format, no pattern and no units, so the member's NAME — `Ttl`, a time to live — is
+    /// the ground for reporting a span in seconds, and this emulator's choice is recorded
+    /// here rather than claimed from the model. The value is read from the token's own two
+    /// instants, so every report of one token carries the same value however long after
+    /// the mint it is read. What this service enforces is the EXPIRY INSTANT
+    /// ([`Self::expires_at`], applied by
+    /// [`ComAmazonawsAmplifybackendAmplifybackendState::expire_challenge_tokens`]) —
+    /// `created_at + ttl` — so a caller reading a token late is told how long the code
+    /// lives in total, not how much of that is left.
+    pub fn ttl(&self) -> String {
+        self.expires_at
+            .duration_since(self.created_at)
+            .unwrap_or(CHALLENGE_TOKEN_TTL)
+            .as_secs()
+            .to_string()
+    }
+}
+
+/// A fresh challenge code, and the store-minted random text a `SessionId` is built from.
+///
+/// The challenge code is a secret handed to a caller — it signs the holder in to the
+/// Amplify Admin UI — and nothing in a service may construct secret material itself, so
+/// it is minted by the one component that generates secrets, the emulator's credential
+/// store. It authenticates to the Admin UI and NOT to this emulator, so the credential is
+/// removed from the store again straight away: the caller gets the code, the emulator
+/// keeps no credential it would accept as SigV4, and nothing accumulates per call.
+///
+/// The second half is the credential's own ID — the store-generated, NON-secret part of a
+/// minted credential. It is what
+/// [`ComAmazonawsAmplifybackendAmplifybackendState::mint_session_id`] builds the session
+/// id from, because a session id must not be guessable: `GetToken` resolves a token by
+/// `(AppId, SessionId)`, so a predictable session id would be a predictable address for
+/// somebody else's challenge code.
+///
+/// `None` when the store minted no session-token secret, which leaves `CreateToken` to
+/// refuse rather than report a code it made up.
+pub fn mint_challenge_token(
+    store: &::emulator_server::CredentialStore,
+) -> Option<(String, String)> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let challenge_code: Option<String> = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(|secret| secret.chars().take(CHALLENGE_CODE_CHARS).collect());
+    // Reclaimed on EVERY path, before the `?` below: the code is not a credential of this
+    // emulator (see above), so a mint that yielded no secret must not leave one behind
+    // either.
+    let _ = store.delete(&minted.id);
+    Some((minted.id, challenge_code?))
+}
+
 /// Per-service state for com-amazonaws-amplifybackend-amplifybackend. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAmplifybackendAmplifybackendState {
     /// Every Amplify app a backend has been created for, keyed by `AppId`.
     pub apps: BTreeMap<String, BackendApp>,
+    /// The LIVE Admin UI challenge tokens, keyed by `AppId` and then by `SessionId`.
+    /// Separate from [`Self::apps`] because a challenge token addresses an app, not a
+    /// backend environment, and is minted whether or not the app has a backend.
+    pub challenge_tokens: BTreeMap<String, BTreeMap<String, ChallengeToken>>,
+    /// The next sequence number [`Self::mint_session_id`] hands out, so two session ids
+    /// are distinct even if the credential store repeats the random text they carry.
+    pub next_challenge_session_seq: u64,
 }
 
 impl ComAmazonawsAmplifybackendAmplifybackendState {
@@ -209,6 +363,90 @@ impl ComAmazonawsAmplifybackendAmplifybackendState {
         // for the same app restates it.
         app.app_name = app_name.to_string();
         app
+    }
+
+    /// Mint a `SessionId` for a challenge token: the store-minted random text from
+    /// [`mint_challenge_token`], lower-cased, plus this store's own sequence number.
+    ///
+    /// Both halves are needed. The random half is what makes a session id UNGUESSABLE,
+    /// which matters because `GetToken` resolves a challenge code by `(AppId, SessionId)`.
+    /// The sequence half makes uniqueness EXACT rather than probabilistic: the credential
+    /// store only avoids ids it currently holds, and `mint_challenge_token` releases the
+    /// credential as soon as it has the code, so the random text alone could repeat.
+    pub fn mint_session_id(&mut self, minted_credential_id: &str) -> String {
+        let sequence = self.next_challenge_session_seq;
+        self.next_challenge_session_seq = sequence.saturating_add(1);
+        format!(
+            "{}-{sequence:016x}",
+            minted_credential_id.to_ascii_lowercase()
+        )
+    }
+
+    /// Materialise the expiry the clock has ALREADY made due: forget every challenge
+    /// token whose [`CHALLENGE_TOKEN_TTL`] has run out, and the app entries that leaves
+    /// empty.
+    ///
+    /// Owed at each token's `expires_at` whether or not anybody called, so every handler
+    /// of a token operation runs this first and then reads only live tokens. Idempotent.
+    pub fn expire_challenge_tokens(&mut self, now: SystemTime) {
+        for sessions in self.challenge_tokens.values_mut() {
+            sessions.retain(|_, token| token.is_live(now));
+        }
+        self.challenge_tokens.retain(|_, sessions| !sessions.is_empty());
+    }
+
+    /// The live challenge token `(app_id, session_id)` addresses, or `None` when this
+    /// service holds none. Call [`Self::expire_challenge_tokens`] first so an expired
+    /// token is not reported.
+    pub fn challenge_token(&self, app_id: &str, session_id: &str) -> Option<&ChallengeToken> {
+        self.challenge_tokens
+            .get(app_id)
+            .and_then(|sessions| sessions.get(session_id))
+    }
+
+    /// Whether a token may be minted for an app the token map does not hold yet: one it
+    /// already holds always may (nothing grows), a new one only while the map is under
+    /// [`MAX_APPS`]. Call this BEFORE [`Self::store_challenge_token`].
+    pub fn has_room_for_new_challenge_token_app(&self, app_id: &str) -> bool {
+        self.challenge_tokens.contains_key(app_id) || self.challenge_tokens.len() < MAX_APPS
+    }
+
+    /// Whether one more LIVE token may be minted for `app_id`, i.e. whether the app is
+    /// under [`MAX_CHALLENGE_TOKENS_PER_APP`]. Call this BEFORE
+    /// [`Self::store_challenge_token`], on a store whose expired tokens are already
+    /// forgotten, so a caller is never refused over tokens the clock has retired.
+    pub fn has_room_for_new_challenge_token(&self, app_id: &str) -> bool {
+        self.challenge_tokens
+            .get(app_id)
+            .is_none_or(|sessions| sessions.len() < MAX_CHALLENGE_TOKENS_PER_APP)
+    }
+
+    /// Store `token` and hand the stored record back, so the response reports exactly
+    /// what a later `GetToken` will.
+    pub fn store_challenge_token(&mut self, token: ChallengeToken) -> &ChallengeToken {
+        let sessions = self.challenge_tokens.entry(token.app_id.clone()).or_default();
+        match sessions.entry(token.session_id.clone()) {
+            BTreeEntry::Vacant(slot) => slot.insert(token),
+            // A session id is a fresh UUID per mint, so this arm is not reached by
+            // `CreateToken`; it keeps the insert total rather than leaving a panic path.
+            BTreeEntry::Occupied(mut slot) => {
+                slot.insert(token);
+                slot.into_mut()
+            }
+        }
+    }
+
+    /// Forget the token `(app_id, session_id)` addresses, answering whether one was
+    /// held. `DeleteToken` is what reclaims a token before its expiry.
+    pub fn remove_challenge_token(&mut self, app_id: &str, session_id: &str) -> bool {
+        let Some(sessions) = self.challenge_tokens.get_mut(app_id) else {
+            return false;
+        };
+        let removed = sessions.remove(session_id).is_some();
+        if sessions.is_empty() {
+            self.challenge_tokens.remove(app_id);
+        }
+        removed
     }
 }
 
@@ -387,9 +625,13 @@ pub struct BackendEnvironment {
     /// Auth resources, keyed by `ResourceName`; stored verbatim so `GetBackendAuth`
     /// reports exactly what `CreateBackendAuth` was given.
     pub auth: BTreeMap<String, CreateBackendAuthResourceConfig>,
-    /// API resources, keyed by `ResourceName`.
+    /// API resources, keyed by `ResourceName`. Bounded by
+    /// [`MAX_API_RESOURCES_PER_ENVIRONMENT`]: an inserting handler asks
+    /// [`Self::has_room_for_new_api_resource`] first.
     pub api: BTreeMap<String, BackendAPIResourceConfig>,
-    /// Storage resources, keyed by `ResourceName`.
+    /// Storage resources, keyed by `ResourceName`. Bounded by
+    /// [`MAX_STORAGE_RESOURCES_PER_ENVIRONMENT`]: an inserting handler asks
+    /// [`Self::has_room_for_new_storage_resource`] first.
     pub storage: BTreeMap<String, CreateBackendStorageResourceConfig>,
     /// When the environment was created.
     pub created_at: SystemTime,
@@ -403,6 +645,25 @@ impl BackendEnvironment {
     pub fn has_room_for_new_auth_resource(&self, resource_name: &str) -> bool {
         self.auth.contains_key(resource_name)
             || self.auth.len() < MAX_AUTH_RESOURCES_PER_ENVIRONMENT
+    }
+
+    /// Whether a NEW API resource may be stored under `resource_name`; as
+    /// [`Self::has_room_for_new_auth_resource`], for [`Self::api`] and
+    /// [`MAX_API_RESOURCES_PER_ENVIRONMENT`]. Call this BEFORE inserting, and refuse an
+    /// over-cap insert with the modelled `TooManyRequestsException`
+    /// ([`LIMIT_TYPE_API_RESOURCES`]).
+    pub fn has_room_for_new_api_resource(&self, resource_name: &str) -> bool {
+        self.api.contains_key(resource_name) || self.api.len() < MAX_API_RESOURCES_PER_ENVIRONMENT
+    }
+
+    /// Whether a NEW storage resource may be stored under `resource_name`; as
+    /// [`Self::has_room_for_new_auth_resource`], for [`Self::storage`] and
+    /// [`MAX_STORAGE_RESOURCES_PER_ENVIRONMENT`]. Call this BEFORE inserting, and refuse
+    /// an over-cap insert with the modelled `TooManyRequestsException`
+    /// ([`LIMIT_TYPE_STORAGE_RESOURCES`]).
+    pub fn has_room_for_new_storage_resource(&self, resource_name: &str) -> bool {
+        self.storage.contains_key(resource_name)
+            || self.storage.len() < MAX_STORAGE_RESOURCES_PER_ENVIRONMENT
     }
 
     /// A new, empty environment created at `created_at`.
