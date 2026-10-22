@@ -261,8 +261,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both instants have to be inside the range this service computes in, so no stored
         // record carries a value a later pass cannot work with.
         for (member, instant) in [
-            ("startTime", input.start_time.as_ref()),
-            ("endTime", input.end_time.as_ref()),
+            ("StartTime", input.start_time.as_ref()),
+            ("EndTime", input.end_time.as_ref()),
         ] {
             if let Some(instant) = instant {
                 let seconds = instant.as_secs_f64();
@@ -271,8 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     || seconds > crate::state::MAX_TIMESTAMP_SECS as f64
                 {
                     return Err(validation(format!(
-                        "Value '{seconds}' at '{member}' failed to satisfy constraint: Member \
-                         must be between the epoch and {} seconds after it",
+                        "{member} must be between the epoch and {} seconds after it",
                         crate::state::MAX_TIMESTAMP_SECS
                     )));
                 }
@@ -283,9 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not a window the action could ever run in.
         if let (Some(start), Some(end)) = (input.start_time, input.end_time) {
             if end < start {
-                return Err(validation(
-                    "EndTime must be at or after StartTime for a scheduled action",
-                ));
+                return Err(validation(crate::state::START_TIME_BEFORE_END_TIME));
             }
         }
 
@@ -308,13 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.targets.contains_key(&key.target) {
             return Err(PutScheduledActionErrorModeled::ObjectNotFoundException(
                 ObjectNotFoundException {
-                    message: Some(format!(
-                        "No scalable target registered for service namespace: {}, resource ID: \
-                         {}, scalable dimension: {}",
-                        key.target.service_namespace,
-                        key.target.resource_id,
-                        key.target.scalable_dimension
-                    )),
+                    message: Some(crate::state::target_not_found_message(&key.target)),
                 },
             )
             .into());
@@ -330,11 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let schedule = match (input.schedule.clone(), stored.as_ref()) {
             (Some(schedule), _) => schedule,
             (None, Some(existing)) => existing.action.schedule.clone(),
-            (None, None) => {
-                return Err(validation(
-                    "Schedule is required when creating a scheduled action",
-                ))
-            }
+            (None, None) => return Err(validation(crate::state::SCHEDULE_MUST_BE_SET)),
         };
 
         // The ARN and the creation time are minted once per scheduled-action identity and
@@ -496,16 +483,19 @@ pub use crate::state::CRON_FIELDS as SCHEDULE_CRON_FIELDS;
 /// same sentence every operation that takes one answers it with
 /// ([`crate::state::CAPACITY_RANGE_INVERTED_MESSAGE`]).
 fn check_scalable_target_action(action: &ScalableTargetAction) -> Result<(), String> {
-    for (member, capacity) in [
-        ("scalableTargetAction.minCapacity", action.min_capacity),
-        ("scalableTargetAction.maxCapacity", action.max_capacity),
+    /// No capacity is negative, whatever the dimension. The floor a DIMENSION documents is
+    /// not applied here: the registered range is what the action is measured against when
+    /// it runs, not when it is stored (see this function's own note), so the only bound a
+    /// stored action has to satisfy is this one.
+    const FLOOR: i32 = 0;
+
+    for (bound, capacity) in [
+        (crate::state::CapacityBound::Minimum, action.min_capacity),
+        (crate::state::CapacityBound::Maximum, action.max_capacity),
     ] {
         if let Some(value) = capacity {
-            if value < 0 {
-                return Err(format!(
-                    "Value '{value}' at '{member}' failed to satisfy constraint: \
-                     Member must have value greater than or equal to 0"
-                ));
+            if value < FLOOR {
+                return Err(crate::state::capacity_below_floor_message(bound, FLOOR));
             }
         }
     }

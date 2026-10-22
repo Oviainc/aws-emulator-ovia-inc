@@ -585,7 +585,7 @@ async fn a_scheduled_action_needs_a_registered_target() {
     assert_eq!(
         error_message(&body),
         format!(
-            "No scalable target registered for service namespace: {NAMESPACE}, resource ID: \
+            "No scalable target found for service namespace: {NAMESPACE}, resource ID: \
              {RESOURCE_ID}, scalable dimension: {DIMENSION}"
         ),
         "case \"unregistered target\": expected the message to name the identity, got {body:?}"

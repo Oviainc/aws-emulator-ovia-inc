@@ -45,10 +45,9 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
-use aws_smithy_schema::serde::SerdeError;
 use aws_smithy_schema_server::constraints;
 use smithy_server_runtime::{
-    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext,
     OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
@@ -246,30 +245,15 @@ where
 /// violations from the walk that follows it.
 ///
 /// What the violations are then put through is NOT another check:
-/// [`service_common::validation::with_submitted_values`] re-reads the SAME built input to
+/// [`service_common::validation::refusing_violations`] re-reads the SAME built input to
 /// restore each violation's value echo to the bytes the caller sent, which the
 /// framework's walk stores elided (a prefix plus `... [<n> bytes]`). An AWS
 /// constraint-validation message is built from the request, so the echoed value is part
-/// of the rule a caller reads the rejected input back out of.
+/// of the rule a caller reads the rejected input back out of. The collecting step is the
+/// shared crate's: it is the same for every service that words its own pre-handler
+/// refusal, and only the ENVELOPE below is this service's.
 fn refused_by<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Vec<Violation> {
-    let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
-        return Vec::new();
-    };
-    match <O::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
-        Ok(input) => service_common::validation::with_submitted_values(
-            constraints::validate(&input, O::INPUT_SCHEMA),
-            &input,
-            O::INPUT_SCHEMA,
-        ),
-        // Absence is found while READING the request and a bad value while walking what
-        // was read; to a caller they are one refusal, so they are one here.
-        Err(SerdeError::MissingMember { member_name }) => vec![Violation {
-            path: member_name,
-            kind: ViolationKind::MissingRequiredMember,
-            value: None,
-        }],
-        Err(_) => Vec::new(),
-    }
+    service_common::validation::refusing_violations::<O>(protocol, req)
 }
 
 /// This service's answer to `violations`: HTTP 400 `ValidationException` with the prose

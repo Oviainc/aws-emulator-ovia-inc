@@ -22,12 +22,27 @@
 //! stored echo with the leaf it was elided from. A stored echo is replaced only when it
 //! IS that leaf's elision (identical, or a proper prefix plus the marker naming that
 //! leaf's byte count), so a path whose leaf is unrelated keeps the framework's own text.
+//! [`refusing_violations`] is the step before it: the violations of one request, collected
+//! from the framework's own deserializer and constraint walk and handed back with their
+//! echoes already restored, for a service that words its own pre-handler refusal.
 //!
 //! Only string-rendered leaves are collected, because they are the only ones whose echo
 //! is the caller's own bytes: the walk renders a blob as `<n> bytes`, a list as
 //! `<n> items`, a map as `<n> entries` and a document as `<document>`, each a bounded
 //! summary of the value rather than the value, and a numeric or timestamp leaf is already
 //! far shorter than any elision cap.
+//!
+//! # A clause on the collection itself
+//!
+//! `@length` on a LIST is checked on the collection member, before the walk descends into
+//! its elements, and the only rendering the walk has for a collection is the count —
+//! `<n> items`. AWS echoes the member's VALUE there too, rendering the list the way a list
+//! renders: `[<element>, <element>, …]`. So a clause whose stored echo is that summary is
+//! answered from the element leaves already collected one step deeper
+//! (`<list>.<1-based position>.member`), and only when ALL of them were collected — the
+//! count the summary states equals the number recorded — so a list whose elements are not
+//! string-rendered (a list of structures), or one the leaf caps truncated, keeps the
+//! framework's own summary rather than an echo stating fewer elements than were sent.
 //!
 //! # The bounds this module states
 //!
@@ -93,10 +108,89 @@
 
 use std::collections::{HashMap, HashSet};
 
+use aws_smithy_runtime_api::http::Request as RtRequest;
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::Schema;
-use aws_smithy_schema_server::constraints::{path, Violation, ViolationKind};
+use aws_smithy_schema_server::constraints::{self, path, Violation, ViolationKind};
 use aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
+use smithy_server_runtime::{DeserializableStruct, Operation, ServerHttpProtocol};
+
+/// Every violation that refuses `req` before `O`'s handler runs — a `@required` member
+/// absent, or a value outside a declared constraint — with each value echo restored to the
+/// bytes the caller sent ([`with_submitted_values`]).
+///
+/// Empty when the request satisfies the model, and empty for a failure that is NOT a
+/// refusal (a body the codec cannot read at all, a member of the wrong type), which the
+/// framework's own walk answers in its own envelope.
+///
+/// This is the collecting half every service that words its own pre-handler refusal needs:
+/// both classes come from the framework's own machinery (the protocol's deserializer and
+/// `constraints::validate` over the built input), so a caller cannot find a different set
+/// of violations from the walk that follows it, and the ONE place a request has to be
+/// re-read to restore an echo is here. What is then DONE with them — which envelope, which
+/// error code, which prose — is the service's own, so it stays with the service.
+#[must_use]
+pub fn refusing_violations<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Vec<Violation> {
+    violations_in::<O>(protocol, req, Echoes::AsSubmitted)
+}
+
+/// Whether a collected violation's value echo is restored to the bytes the caller sent.
+///
+/// A service whose refusal QUOTES the value needs it restored; one whose refusal reports
+/// only the class of failure (see [`crate::front_door`]) does not, and the walk that
+/// restores it is work that would never be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Echoes {
+    /// Restore each echo through [`with_submitted_values`].
+    AsSubmitted,
+    /// Leave the framework's own rendering in place.
+    AsRendered,
+}
+
+/// The ONE collecting walk this crate performs: every violation that refuses `req` before
+/// `O`'s handler runs, with `echoes` deciding whether each value echo is restored.
+///
+/// Both classes come from the framework's own machinery (the protocol's deserializer and
+/// `constraints::validate` over the built input), so no caller of this can find a different
+/// set of violations from the walk that follows it. What is then DONE with them — which
+/// members they are narrowed to, which envelope, which error code, which prose — belongs to
+/// the caller.
+pub(crate) fn violations_in<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    echoes: Echoes,
+) -> Vec<Violation> {
+    let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
+        return Vec::new();
+    };
+    let read = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer);
+    drop(deserializer);
+    match read {
+        Ok(input) => {
+            let violations = constraints::validate(&input, O::INPUT_SCHEMA);
+            match echoes {
+                Echoes::AsSubmitted => {
+                    with_submitted_values(violations, &input, O::INPUT_SCHEMA)
+                }
+                Echoes::AsRendered => violations,
+            }
+        }
+        // Absence is found while READING the request and a bad value while walking what
+        // was read; to a caller they are one refusal, so they are one here. `member_name`
+        // is already a violation path in the spelling the constraint walk uses
+        // (`aws_smithy_schema_server::missing_member` applies `path::member`, and each
+        // enclosing member prepends its own segment), so it places identically.
+        Err(SerdeError::MissingMember { member_name }) => vec![Violation {
+            path: member_name,
+            kind: ViolationKind::MissingRequiredMember,
+            value: None,
+        }],
+        Err(_) => Vec::new(),
+    }
+}
 
 /// The largest single submitted value restored into a clause (see the module docs).
 const MAX_RESTORED_ECHO: usize = 16 * 1024;
@@ -117,9 +211,10 @@ const MAX_RECORDED_BYTES: usize = MAX_RESTORED_TOTAL;
 ///
 /// `input` and `schema` must be the ones the violations were collected from — the built
 /// input and its operation's input schema — so a violation's path names a leaf of this
-/// walk. A violation this walk finds no matching leaf for (an absent `@required` member,
-/// a collection-level bound, a value the framework rendered as a summary) is returned
-/// untouched, and so is one whose value is larger than the stated bounds allow.
+/// walk, or the collection one step above one. A violation this walk finds neither for (an
+/// absent `@required` member, a value the framework rendered as a summary it cannot rebuild
+/// — a blob, a map, a document) is returned untouched, and so is one whose value is larger
+/// than the stated bounds allow.
 #[must_use]
 pub fn with_submitted_values(
     mut violations: Vec<Violation>,
@@ -140,31 +235,33 @@ pub fn with_submitted_values(
         let Some(stored) = violation.value.as_deref() else {
             continue;
         };
-        let Some(submitted) = index.candidate(violation) else {
+        // Only what the framework elided FROM this leaf, or — for a clause on a
+        // collection, which has no leaf of its own — the collection the summary it stored
+        // counts; anything else keeps the framework's own text. A stored echo that
+        // already IS the submitted value yields nothing to restore, so it spends no
+        // budget.
+        let restored = match index.candidate(violation) {
+            Some(submitted) if is_elision_of(stored, submitted) => {
+                (stored != submitted).then(|| submitted.to_string())
+            }
+            _ => index.collection_candidate(violation, stored),
+        };
+        let Some(restored) = restored else {
             continue;
         };
-        // Nothing was elided: this clause already states the submitted value, and
-        // rewriting it would spend budget to change nothing.
-        if stored == submitted {
+        // And only within the stated bounds.
+        if restored.len() > MAX_RESTORED_ECHO || restored.len() > budget {
             continue;
         }
-        // Only what the framework elided FROM this leaf, and only within the stated
-        // bounds; anything else keeps the framework's own text.
-        if !is_elision_of(stored, submitted)
-            || submitted.len() > MAX_RESTORED_ECHO
-            || submitted.len() > budget
-        {
-            continue;
-        }
-        budget -= submitted.len();
-        violation.value = Some(submitted.to_string());
+        budget -= restored.len();
+        violation.value = Some(restored);
     }
     violations
 }
 
 /// The collected leaves of one request, indexed for the lookups a violation needs.
 ///
-/// Both maps borrow the collected leaves and are built in a single pass over them.
+/// All three maps borrow the collected leaves and are built in a single pass over them.
 #[derive(Debug)]
 struct Submitted<'l> {
     /// The first leaf recorded at each dotted path: the member a clause names.
@@ -172,26 +269,32 @@ struct Submitted<'l> {
     /// For each list whose scalar elements were recorded, the first element value that
     /// repeated — what a `@uniqueItems` clause echoes, reported at the LIST's path.
     duplicate_in: HashMap<&'l str, &'l str>,
+    /// For each list whose scalar elements were recorded, those elements in walk order —
+    /// what a clause on the LIST itself echoes, reported at the list's own path.
+    elements_in: HashMap<&'l str, Vec<&'l str>>,
 }
 
 impl<'l> Submitted<'l> {
     fn of(leaves: &'l [(String, String)]) -> Self {
         // `leaves` is already bounded by `MAX_RECORDED_LEAVES` / `MAX_RECORDED_BYTES`, so
-        // both maps are too.
+        // every map is too.
         let mut by_path: HashMap<&str, &str> = HashMap::new();
         let mut seen: HashMap<&str, HashSet<&str>> = HashMap::new();
         let mut duplicate_in: HashMap<&str, &str> = HashMap::new();
+        let mut elements_in: HashMap<&str, Vec<&str>> = HashMap::new();
         for (leaf_path, value) in leaves {
             by_path.entry(leaf_path.as_str()).or_insert(value.as_str());
             if let Some(list) = list_of_element(leaf_path) {
                 if !seen.entry(list).or_default().insert(value.as_str()) {
                     duplicate_in.entry(list).or_insert(value.as_str());
                 }
+                elements_in.entry(list).or_default().push(value.as_str());
             }
         }
         Self {
             by_path,
             duplicate_in,
+            elements_in,
         }
     }
 
@@ -204,6 +307,34 @@ impl<'l> Submitted<'l> {
         }
         self.by_path.get(violation.path.as_str()).copied()
     }
+
+    /// The COLLECTION `violation`'s stored echo summarises, rendered as the value the
+    /// caller submitted, when the two describe the same collection.
+    ///
+    /// A `@length` clause on a list is reported at the LIST's path, where the walk records
+    /// no leaf of its own — the elements are recorded one step deeper — and the echo it
+    /// stored is the framework's count rendering rather than the value. The count is what
+    /// ties the two together: a summary of `<n> items` is rebuilt only from exactly `n`
+    /// recorded elements, so a partially collected list (the leaf caps) and a list whose
+    /// elements have no string rendering yield nothing and keep the framework's summary.
+    fn collection_candidate(&self, violation: &Violation, stored: &str) -> Option<String> {
+        let count = collection_count(stored)?;
+        let elements = self.elements_in.get(violation.path.as_str())?;
+        (elements.len() == count).then(|| rendered_list(elements))
+    }
+}
+
+/// How many elements the framework's rendering of a collection states, when `stored` is
+/// one: the walk renders a list as `<n> items`
+/// ([`aws_smithy_schema_server::constraints`]'s collection-length check).
+fn collection_count(stored: &str) -> Option<usize> {
+    stored.strip_suffix(" items")?.parse::<usize>().ok()
+}
+
+/// `elements` as a list renders: the elements in order, comma-separated, in brackets —
+/// the form AWS echoes a list-valued member back in.
+fn rendered_list(elements: &[&str]) -> String {
+    format!("[{}]", elements.join(", "))
 }
 
 /// The list path a leaf is a SCALAR ELEMENT of, if it is one.
@@ -715,6 +846,72 @@ mod tests {
             let actual = index.candidate(&violation);
             assert_eq!(
                 actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a clause on a LIST — whose stored echo is the framework's `<n> items`
+    /// summary — is answered with the list rendered from exactly the `n` elements
+    /// recorded under it, and with nothing when the two do not agree.
+    #[test]
+    fn a_collection_clause_is_answered_with_the_list_as_submitted() {
+        let leaves: Vec<(String, String)> = [
+            ("resourceIds.1.member", "table/a"),
+            ("resourceIds.2.member", "table/b"),
+            ("resourceIds.3.member", "table/c"),
+            ("policyNames.1.member", "only"),
+            ("serviceNamespace", "dynamodb"),
+        ]
+        .into_iter()
+        .map(|(leaf_path, value)| (leaf_path.to_string(), value.to_string()))
+        .collect();
+        let index = Submitted::of(&leaves);
+
+        // (case, the clause's path, the echo the framework stored, the restored echo)
+        let rows: [(&str, &str, &str, Option<&str>); 6] = [
+            (
+                "a list of three",
+                "resourceIds",
+                "3 items",
+                Some("[table/a, table/b, table/c]"),
+            ),
+            (
+                "a list of one, which the framework still renders in the plural",
+                "policyNames",
+                "1 items",
+                Some("[only]"),
+            ),
+            (
+                "a summary counting more elements than were recorded",
+                "resourceIds",
+                "51 items",
+                None,
+            ),
+            ("a list no element was recorded for", "tagKeys", "2 items", None),
+            (
+                "a clause on the list whose echo is not a collection summary",
+                "resourceIds",
+                "table/a",
+                None,
+            ),
+            (
+                "a scalar member, whose echo is never a collection summary",
+                "serviceNamespace",
+                "dynamodb",
+                None,
+            ),
+        ];
+        for (case, path, stored, expected) in rows {
+            let violation = Violation {
+                path: path.to_string(),
+                kind: ViolationKind::MaxLength(50),
+                value: Some(stored.to_string()),
+            };
+            let actual = index.collection_candidate(&violation, stored);
+            assert_eq!(
+                actual.as_deref(),
+                expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }

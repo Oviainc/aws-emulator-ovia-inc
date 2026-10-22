@@ -285,13 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.targets.contains_key(&key.target) {
             return Err(PutScalingPolicyErrorModeled::ObjectNotFoundException(
                 ObjectNotFoundException {
-                    message: Some(format!(
-                        "No scalable target registered for service namespace: {}, resource ID: \
-                         {}, scalable dimension: {}",
-                        key.target.service_namespace,
-                        key.target.resource_id,
-                        key.target.scalable_dimension
-                    )),
+                    message: Some(crate::state::target_not_found_message(&key.target)),
                 },
             )
             .into());
@@ -339,33 +333,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .or_else(|| stored.as_ref().and_then(|p| p.predictive_config.clone()));
 
-        let missing_member = match policy_type.as_str() {
+        let configuration_missing = match policy_type.as_str() {
             "StepScaling" => {
                 target_tracking_config = None;
                 predictive_config = None;
-                step_config
-                    .is_none()
-                    .then_some("StepScalingPolicyConfiguration")
+                step_config.is_none()
             }
             "PredictiveScaling" => {
                 step_config = None;
                 target_tracking_config = None;
-                predictive_config
-                    .is_none()
-                    .then_some("PredictiveScalingPolicyConfiguration")
+                predictive_config.is_none()
             }
             // `TargetTrackingScaling`, the only remaining modelled value.
             _ => {
                 step_config = None;
                 predictive_config = None;
-                target_tracking_config
-                    .is_none()
-                    .then_some("TargetTrackingScalingPolicyConfiguration")
+                target_tracking_config.is_none()
             }
         };
-        if let Some(member) = missing_member {
+        if configuration_missing {
+            // The service names the configuration by its POLICY TYPE rather than by the
+            // member's shape name: the type is what the caller chose, and it is the type
+            // that decides which configuration the policy owes.
             return Err(validation(format!(
-                "A {policy_type} policy requires {member}"
+                "{policy_type} policy configuration must be specified"
             )));
         }
         // The configuration the effective policy type carries has to hold together on its
@@ -389,7 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // tracking ONE metric: they would compute contradictory capacity from the same
             // signal, and the alarms of the second would duplicate the first's.
             let signature = crate::state::metric_signature(config);
-            if let Some((other, _)) = state.policies.iter().find(|(other_key, policy)| {
+            let already_tracked = state.policies.iter().any(|(other_key, policy)| {
                 other_key.target == key.target
                     && other_key.policy_name != key.policy_name
                     && policy.policy_type == "TargetTrackingScaling"
@@ -397,12 +388,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .target_tracking_config
                         .as_ref()
                         .is_some_and(|stored| crate::state::metric_signature(stored) == signature)
-            }) {
-                return Err(validation(format!(
-                    "Only one TargetTrackingScaling policy for a given metric specification is \
-                     allowed: the policy {} already tracks this metric for this scalable target",
-                    other.policy_name
-                )));
+            });
+            if already_tracked {
+                // One fixed sentence: the conflict is the SECOND policy on one metric,
+                // which is the same defect whichever of the two the caller would rather
+                // keep, so neither policy is named.
+                return Err(validation(ONE_POLICY_PER_METRIC));
             }
         }
 
@@ -599,40 +590,29 @@ fn check_tracked_metric(
     if config.customized_metric_specification.is_some()
         && !crate::state::customized_metric_supported(scalable_dimension)
     {
-        return Err(validation(format!(
-            "Value at 'targetTrackingScalingPolicyConfiguration.customizedMetricSpecification' \
-             failed to satisfy constraint: a customized metric is not supported for scalable \
-             dimension {scalable_dimension}"
-        )));
+        return Err(validation(
+            crate::state::unsupported_customized_metric_message(scalable_dimension),
+        ));
     }
     let Some(predefined) = config.predefined_metric_specification.as_ref() else {
         return Ok(());
     };
     let metric_type = predefined.predefined_metric_type.as_str();
     // A type outside the enum is already refused by `check_target_tracking_config`; one
-    // inside it with no catalog row would mint no alarm, so it is refused here rather than
-    // accepted as a policy that drives nothing.
-    let Some(dimensions) = crate::state::predefined_metric_dimensions(metric_type) else {
-        return Err(validation(format!(
-            "Value '{metric_type}' at 'targetTrackingScalingPolicyConfiguration.\
-             predefinedMetricSpecification.predefinedMetricType' failed to satisfy constraint: \
-             Member must be a metric this service scales on"
-        )));
-    };
-    if !dimensions.contains(&scalable_dimension) {
-        return Err(validation(format!(
-            "Value '{metric_type}' at 'targetTrackingScalingPolicyConfiguration.\
-             predefinedMetricSpecification.predefinedMetricType' failed to satisfy constraint: \
-             Member must be a metric published for scalable dimension {scalable_dimension}"
-        )));
+    // inside it that this dimension is not scaled on — including one with no catalog row,
+    // which is published for no dimension at all — is refused with the set the dimension
+    // DOES support, which is what a caller recovers from.
+    let supported = crate::state::predefined_metric_dimensions(metric_type).unwrap_or_default();
+    if !supported.contains(&scalable_dimension) {
+        return Err(validation(
+            crate::state::unsupported_predefined_metric_message(scalable_dimension),
+        ));
     }
     if let Some((low, high)) = crate::state::predefined_metric_target_range(metric_type) {
         if config.target_value < low || config.target_value > high {
             return Err(validation(format!(
-                "Value '{}' at 'targetTrackingScalingPolicyConfiguration.targetValue' failed to \
-                 satisfy constraint: Member must be between {low} and {high} for metric \
-                 {metric_type}",
-                config.target_value
+                "Target value must be between {low} and {high} for predefined metric type \
+                 {metric_type}"
             )));
         }
     }
@@ -798,6 +778,15 @@ fn check_predictive_config(
     }
     Ok(())
 }
+
+/// How this service states a second target-tracking policy on a metric one of the
+/// target's policies already tracks.
+///
+/// "You can have one or more target tracking scaling policies" — but not two tracking ONE
+/// metric, and the refusal is about that rule rather than about either policy, so it names
+/// neither.
+const ONE_POLICY_PER_METRIC: &str =
+    "Only one TargetTrackingScaling policy for a given metric specification is allowed.";
 
 /// This operation's modelled `ValidationException`, carrying `message`.
 fn validation(message: impl Into<String>) -> PutScalingPolicyError {

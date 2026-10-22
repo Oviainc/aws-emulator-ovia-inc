@@ -21,7 +21,9 @@
 //! * an illegal `ScheduledActionName` states the rule it breaks in prose;
 //! * a policy configuration that cannot be evaluated is refused with the model's own
 //!   sentence for the rule;
-//! * a tag operation addressed to an ARN that names no registered scalable target says so.
+//! * a tag operation addressed to an ARN that names no registered scalable target says so:
+//!   the READ reports that the resource is not there, while the two WRITES answer the
+//!   recorded permission failure (`refusal_texts` pins that sentence).
 
 use serde_json::{json, Value};
 
@@ -734,9 +736,13 @@ async fn a_policy_configuration_that_cannot_be_evaluated_states_the_documented_r
     }
 }
 
-/// The sentence a request addressed to an ARN that names no registered scalable target
-/// carries.
+/// The sentence a READ addressed to an ARN that names no registered scalable target
+/// carries. The two WRITES answer the recorded [`ACCESS_DENIED`] instead.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
+
+/// The sentence a WRITE addressed to such an ARN carries: recorded behaviour for
+/// `TagResource` on a well-formed ARN that names no registered target.
+const ACCESS_DENIED: &str = "Access Denied";
 
 #[tokio::test]
 async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found() {
@@ -818,7 +824,11 @@ async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found(
         );
         assert_service_text(case, &message);
 
-        // The two writes carry the same sentence.
+        // The two writes answer the recorded permission failure instead: a write to a
+        // target the caller holds none of is `Access Denied` (pinned, with the rest of the
+        // tagging sentences, by the `refusal_texts` suite), not a report about the
+        // resource. What is asserted here is that neither is the boundary validator's
+        // template.
         for (operation, request) in [
             (
                 "TagResource",
@@ -837,8 +847,8 @@ async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found(
             );
             let message = error_message(&body);
             assert_eq!(
-                message, TARGET_NOT_FOUND,
-                "case {case:?} on {operation}: expected {TARGET_NOT_FOUND:?}, got {message:?}"
+                message, ACCESS_DENIED,
+                "case {case:?} on {operation}: expected {ACCESS_DENIED:?}, got {message:?}"
             );
             assert_service_text(case, &message);
         }

@@ -134,16 +134,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{
-            check_tag_key, check_tag_keys_unreserved, SCALABLE_TARGET_NOT_FOUND_MESSAGE,
-        };
+        use crate::state::{check_tag_key, check_tag_keys_unreserved, ACCESS_DENIED};
 
         // `TagKeyList` carries its own `@length(0..200)`, refused at the boundary, and a
         // key the target does not carry is not an error — so there is no count to check
         // here. What is not modelled is the reserved `aws:` namespace, which is not a
         // caller's to remove either. Checked before the store is touched, so a batch
         // holding one reserved key removes none of its keys.
-        check_tag_keys_unreserved("tagKeys", input.tag_keys.iter().map(String::as_str))
+        check_tag_keys_unreserved(input.tag_keys.iter().map(String::as_str))
             .map_err(validation)?;
         // `TagKey`'s own length, the same bound `TagResource` writes under.
         for key in &input.tag_keys {
@@ -153,13 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An engine that holds no state holds no scalable target either: the same
         // refusal as an ARN that names no registered target (see `tag_resource`).
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(validation(SCALABLE_TARGET_NOT_FOUND_MESSAGE));
+            return Err(validation(ACCESS_DENIED));
         };
         let mut state = state.lock();
 
         let resolved = state.arn_index.get(&input.resource_arn).cloned();
         let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
-            return Err(validation(SCALABLE_TARGET_NOT_FOUND_MESSAGE));
+            return Err(validation(ACCESS_DENIED));
         };
 
         // "To delete a tag, specify the tag key and the Application Auto Scaling

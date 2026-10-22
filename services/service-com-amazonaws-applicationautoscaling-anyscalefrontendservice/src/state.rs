@@ -541,6 +541,54 @@ pub fn min_capacity_floor(scalable_dimension: &str) -> i32 {
         .map_or(0, |(_, floor)| *floor)
 }
 
+/// Which end of a capacity window a refusal is about, and how the service names it.
+///
+/// `ResourceCapacity` carries no `@range` in the model, so neither bound below is a
+/// modelled constraint: both are rules this service enforces, and each is stated in the
+/// service's own words rather than as a constraint clause naming the member path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityBound {
+    /// `MinCapacity`, on whichever shape carries it.
+    Minimum,
+    /// `MaxCapacity`.
+    Maximum,
+}
+
+impl CapacityBound {
+    /// How the service names this bound in a sentence.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Minimum => "Minimum",
+            Self::Maximum => "Maximum",
+        }
+    }
+}
+
+/// How this service states a capacity below the floor its dimension can be provisioned at.
+///
+/// The floor is not in the model (see [`MIN_CAPACITY_FLOORS`]), so the message is the only
+/// place a caller learns it: the service names the bound it refused and the value that
+/// bound may not go under. The INVERTED pair is a different rule, with its own sentence —
+/// [`CAPACITY_RANGE_INVERTED_MESSAGE`].
+pub fn capacity_below_floor_message(bound: CapacityBound, floor: i32) -> String {
+    format!("{} capacity cannot be less than {floor}", bound.noun())
+}
+
+/// How this service states an operation addressed at a scalable target that is not
+/// registered.
+///
+/// `ObjectNotFoundException` is "thrown if the scalable target with the specified service
+/// namespace, resource ID, and scalable dimension does not exist", and the sentence names
+/// exactly that triple, built from the request — the same phrasing
+/// `DeleteScalingPolicy` uses for the policy it cannot find.
+pub fn target_not_found_message(target: &TargetKey) -> String {
+    format!(
+        "No scalable target found for service namespace: {}, resource ID: {}, scalable \
+         dimension: {}",
+        target.service_namespace, target.resource_id, target.scalable_dimension
+    )
+}
+
 /// `len` lowercase hex characters derived from `seed`, clamped to the 64 characters a
 /// SHA-256 digest renders to so a caller asking for more gets the whole digest rather
 /// than a panic.
@@ -695,6 +743,14 @@ pub fn encode_next_token(fields: &[&str]) -> String {
     hex::encode(fields.join(&TOKEN_SEPARATOR.to_string()))
 }
 
+/// How this service states a `NextToken` it did not issue.
+///
+/// `InvalidNextTokenException`'s own documentation is "The next token supplied was
+/// invalid"; the sentence the service puts on the wire is this one, which names the member
+/// as the API spells it. The token is not echoed: a caller gets back the token it already
+/// holds, and the refusal is about the whole value rather than a part of it.
+pub const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid";
+
 /// The fields a `NextToken` carries, or `None` when the token is not one this service
 /// issued — the caller answers that with `InvalidNextTokenException`.
 pub fn decode_next_token(token: &str, field_count: usize) -> Option<Vec<String>> {
@@ -786,13 +842,16 @@ pub fn check_dimension_requires_resource_id(
     scalable_dimension: Option<&str>,
 ) -> Result<(), String> {
     match (resource_id, scalable_dimension) {
-        (None, Some(dimension)) => Err(format!(
-            "Value '{dimension}' at 'scalableDimension' failed to satisfy constraint: \
-             A resource ID must be specified when a scalable dimension is specified"
-        )),
+        (None, Some(_)) => Err(DIMENSION_WITHOUT_RESOURCE_ID.to_string()),
         _ => Ok(()),
     }
 }
+
+/// How the service states that refusal: its own fixed sentence, naming neither the
+/// member path nor the value — the rule is about which members were COMBINED, so there is
+/// no one offending value to echo.
+pub const DIMENSION_WITHOUT_RESOURCE_ID: &str =
+    "Scalable dimension cannot be provided without a resource ID.";
 
 /// `Ok` when `scalable_dimension` belongs to `service_namespace`.
 ///
@@ -1053,7 +1112,10 @@ pub fn resolve_dynamodb_capacity<Eng: Send + Sync + 'static>(
     let store = store.lock();
     let now = SystemTime::now();
     // A DynamoDB table name is unique per REGION, which is why the store is keyed by it:
-    // the target resolves against the region its own request is signed for.
+    // the target resolves against the region its own request is signed for. A table in
+    // another region is one this request's region does not hold, which is the same
+    // refusal as a table that was never created and as one being deleted — the refusal
+    // names the resource the request asked for, never the region it was looked for in.
     let table = store
         .table(region, table_name)
         .ok()
@@ -1352,6 +1414,50 @@ pub fn predefined_metric_dimensions(metric_type: &str) -> Option<&'static [&'sta
 /// one. See [`PredefinedMetric::target_range`].
 pub fn predefined_metric_target_range(metric_type: &str) -> Option<(f64, f64)> {
     predefined_metric(metric_type).and_then(|metric| metric.target_range)
+}
+
+/// Every `PredefinedMetricType` published FOR `scalable_dimension`, in the order the
+/// catalog (and the model's `MetricType` enum) declares them.
+///
+/// The inverse of [`PredefinedMetric::dimensions`], read off the one catalog so the set a
+/// refusal enumerates is the set the alarm planner can actually mint alarms from.
+pub fn supported_predefined_metrics(scalable_dimension: &str) -> Vec<&'static str> {
+    PREDEFINED_METRICS
+        .iter()
+        .filter(|metric| metric.dimensions.contains(&scalable_dimension))
+        .map(|metric| metric.metric_type)
+        .collect()
+}
+
+/// How this service states a predefined metric type that `scalable_dimension` is not
+/// scaled on.
+///
+/// The sentence ENUMERATES what the dimension does support, which is what makes the
+/// refusal recoverable: a caller reads the metric types it may choose from out of the
+/// message. Both halves are built from the request and the catalog — never from one
+/// recorded example — and a dimension the catalog publishes no metric for is told that
+/// instead of being handed an empty list.
+pub fn unsupported_predefined_metric_message(scalable_dimension: &str) -> String {
+    let supported = supported_predefined_metrics(scalable_dimension);
+    if supported.is_empty() {
+        return format!(
+            "Scalable dimension {scalable_dimension} does not support \
+             PredefinedMetricSpecification."
+        );
+    }
+    format!(
+        "Scalable dimension {scalable_dimension} only supports the following predefined metric \
+         types: {}",
+        supported.join(", ")
+    )
+}
+
+/// How this service states a customized metric on a dimension that is not scaled from one.
+/// See [`customized_metric_supported`].
+pub fn unsupported_customized_metric_message(scalable_dimension: &str) -> String {
+    format!(
+        "Scalable dimension {scalable_dimension} does not support CustomizedMetricSpecification."
+    )
 }
 
 /// Whether a target-tracking policy on `scalable_dimension` may track a CUSTOMIZED metric.
@@ -2188,6 +2294,13 @@ pub const MAX_TIMESTAMP_SECS: u64 = 253_402_300_799;
 /// past any interval a scheduled action is useful at.
 pub const MAX_RATE_SECS: u64 = 100 * 365 * 86_400;
 
+/// How this service states a missing `Schedule` on the create path: the member is required
+/// when the action is created, and an absent member has no value to echo.
+pub const SCHEDULE_MUST_BE_SET: &str = "Schedule must be set";
+
+/// How this service states a scheduling window whose boundaries are in the wrong order.
+pub const START_TIME_BEFORE_END_TIME: &str = "StartTime must be before EndTime";
+
 /// The detail a `Schedule` that is not one of the three documented forms is refused with.
 ///
 /// The three forms are the model's own ("At expressions - at(yyyy-mm-ddThh:mm:ss), Rate
@@ -2282,12 +2395,11 @@ pub fn schedule_timezone(timezone: Option<&str>) -> Result<::chrono_tz::Tz, Stri
     let Some(timezone) = timezone else {
         return Ok(::chrono_tz::UTC);
     };
-    timezone.parse::<::chrono_tz::Tz>().map_err(|_| {
-        format!(
-            "Value '{timezone}' at 'timezone' failed to satisfy constraint: Member must be the \
-             canonical name of an IANA time zone, such as Etc/GMT+9 or Pacific/Tahiti"
-        )
-    })
+    timezone
+        .parse::<::chrono_tz::Tz>()
+        // The service's own sentence, built from the request: the fixed phrase plus the
+        // name it could not resolve, which is the whole of what the caller got wrong.
+        .map_err(|_| format!("Invalid schedule timezone: {timezone}"))
 }
 
 /// Parse the six-field cron expression the service documents into a [`cron::Schedule`].
@@ -2611,37 +2723,51 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
 }
 
-/// `Ok` when no key in `keys` is in the reserved namespace, else the
-/// `ValidationException` message naming `member` and the offending key.
+/// `Ok` when no key in `keys` is in the reserved namespace, else the `ValidationException`
+/// message every write to that namespace is refused with.
 ///
-/// The keys are judged BEFORE anything is written, so a batch holding one reserved key
-/// is refused whole and no key from it lands. The lowest offending key is reported, so a
-/// request whose keys arrive in any order is refused with the same message.
+/// The keys are judged BEFORE anything is written, so a batch holding one reserved key is
+/// refused whole and no key from it lands. The refusal is one fixed sentence
+/// ([`SYSTEM_TAG_KEY_REFUSED`]) naming no key at all: every key in the namespace is refused
+/// for the same reason, so a batch is refused with the same message whatever order its keys
+/// arrive in.
 pub fn check_tag_keys_unreserved<'a>(
-    member: &str,
     keys: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), String> {
-    let reserved = keys.into_iter().filter(|key| is_reserved_tag_key(key)).min();
-    match reserved {
-        None => Ok(()),
-        Some(key) => Err(format!(
-            "Value '{key}' at '{member}' failed to satisfy constraint: \
-             Member must not begin with the reserved prefix '{RESERVED_TAG_KEY_PREFIX}'"
-        )),
+    if keys.into_iter().any(is_reserved_tag_key) {
+        return Err(SYSTEM_TAG_KEY_REFUSED.to_string());
     }
+    Ok(())
 }
 
-/// `Ok` when `member`'s entry count is within [`MAX_TAGS_PER_RESOURCE`], else the
+/// How this service states a write to the reserved tag namespace.
+///
+/// A key in it is a SYSTEM tag, and the refusal is about who the caller is rather than
+/// about the key's shape: the sentence names neither the key nor the member, because every
+/// key in that namespace is refused for the same reason.
+pub const SYSTEM_TAG_KEY_REFUSED: &str =
+    "Caller is an end user and not allowed to mutate system tags";
+
+/// `Ok` when a batch's entry count is within [`MAX_TAGS_PER_RESOURCE`], else the
 /// `ValidationException` message a request too large for ANY resource is refused with —
 /// input validation, independent of which resource the request addresses.
-pub fn check_tag_count(member: &str, count: usize) -> Result<(), String> {
+pub fn check_tag_count(count: usize) -> Result<(), String> {
     if count <= MAX_TAGS_PER_RESOURCE {
         return Ok(());
     }
-    Err(format!(
-        "Value at '{member}' failed to satisfy constraint: Member must have at most \
-         {MAX_TAGS_PER_RESOURCE} entries, and {count} were supplied"
-    ))
+    Err(tag_set_too_large_message())
+}
+
+/// How this service states a tag set over [`MAX_TAGS_PER_RESOURCE`].
+///
+/// The limit is on the RESULTANT tag set — which a single batch already exceeds on its own,
+/// whatever the resource holds — and it is this service's own bound (`TagMap` carries no
+/// `@length`), so the sentence states the number, interpolated from the one constant that
+/// holds it rather than written into the text twice.
+pub fn tag_set_too_large_message() -> String {
+    format!(
+        "The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags."
+    )
 }
 
 /// `TagKey`'s own `@length(min: 1, max: 128)`, and `TagValue`'s `@length(min: 0, max:
@@ -2683,4 +2809,14 @@ pub fn check_tag_value(member: &str, key: &str, value: &str) -> Result<(), Strin
     ))
 }
 
-
+/// The message the two MUTATING tag operations refuse a `ResourceARN` that names no
+/// registered scalable target with.
+///
+/// Recorded behaviour: `TagResource` on a well-formed ARN that names no registered target
+/// is `ValidationException` with `Access Denied` — the write is answered as a PERMISSION
+/// failure, which is also the only thing the service can say without disclosing whether
+/// that target exists for somebody else. The ARN is not echoed, and the sentence is the
+/// same for every ARN that resolves to nothing. The READ answers the modelled
+/// `ResourceNotFoundException` with [`SCALABLE_TARGET_NOT_FOUND_MESSAGE`] instead: it
+/// reports on the resource, so it says the resource is not there.
+pub const ACCESS_DENIED: &str = "Access Denied";

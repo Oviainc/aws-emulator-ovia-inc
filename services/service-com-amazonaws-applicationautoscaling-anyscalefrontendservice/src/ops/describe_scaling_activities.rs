@@ -316,7 +316,7 @@ fn validation(message: impl Into<String>) -> DescribeScalingActivitiesError {
 /// This operation's modelled `InvalidNextTokenException`.
 fn invalid_next_token() -> DescribeScalingActivitiesError {
     DescribeScalingActivitiesErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-        message: Some("The next token supplied was invalid.".to_string()),
+        message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
     })
     .into()
 }

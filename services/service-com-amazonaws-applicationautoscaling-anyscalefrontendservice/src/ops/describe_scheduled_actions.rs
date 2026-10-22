@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         DescribeScheduledActionsErrorModeled::InvalidNextTokenException(
                             InvalidNextTokenException {
-                                message: Some("The next token supplied was invalid.".to_string()),
+                                message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
                             },
                         )
                         .into(),

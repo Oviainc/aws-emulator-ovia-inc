@@ -152,19 +152,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             check_tag_count, check_tag_key, check_tag_keys_unreserved, check_tag_value,
-            MAX_TAGS_PER_RESOURCE, SCALABLE_TARGET_NOT_FOUND_MESSAGE,
+            ACCESS_DENIED, MAX_TAGS_PER_RESOURCE,
         };
 
         // Input validation first, so a request no resource could accept is refused the
         // same way whichever `ResourceARN` it names. `TagMap` carries no `@length`, so
         // the per-resource maximum is this operation's to enforce.
-        check_tag_count("tags", input.tags.len()).map_err(validation)?;
+        check_tag_count(input.tags.len()).map_err(validation)?;
         // "You cannot have more than one tag on an Application Auto Scaling scalable
         // target with the same tag key" is already true of a map; what is not modelled
         // is the reserved `aws:` namespace, which a caller may not write. Checked before
         // the store is touched, so a batch holding one reserved key lands no key at all.
-        check_tag_keys_unreserved("tags", input.tags.keys().map(String::as_str))
-            .map_err(validation)?;
+        check_tag_keys_unreserved(input.tags.keys().map(String::as_str)).map_err(validation)?;
         // `TagKey`'s and `TagValue`'s own lengths, for the same batch: the boundary
         // validator does not reach a MAP's keys, so an over-long key arrives here. The
         // lowest-ordered refusal is the one reported, so the same batch is always
@@ -186,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // addressed to it resolves to nothing — the same refusal as an ARN that names no
         // registered target, rather than a server error this operation does not model.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(validation(SCALABLE_TARGET_NOT_FOUND_MESSAGE));
+            return Err(validation(ACCESS_DENIED));
         };
         let mut state = state.lock();
 
@@ -194,10 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // you want to apply tags to", and the only ARNs that identify one are those
         // `RegisterScalableTarget` minted and `DeregisterScalableTarget` has not
         // withdrawn. The recorded behaviour for a well-formed ARN naming no registered
-        // target is a 400 `ValidationException`, not the 404 `ResourceNotFoundException`.
+        // target is a 400 `ValidationException` carrying `Access Denied`: a WRITE to a
+        // target the caller holds none of is answered as a permission failure, not as a
+        // report that the resource is absent (which is what the READ answers, see
+        // `list_tags_for_resource`).
         let resolved = state.arn_index.get(&input.resource_arn).cloned();
         let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
-            return Err(validation(SCALABLE_TARGET_NOT_FOUND_MESSAGE));
+            return Err(validation(ACCESS_DENIED));
         };
 
         // The merge is computed before anything is stored: "To add a tag, specify a new

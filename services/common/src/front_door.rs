@@ -39,13 +39,12 @@
 //! own suite. Nothing new should inline the rule again — call this module.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
-use aws_smithy_schema::serde::SerdeError;
 use aws_smithy_schema::Schema;
-use aws_smithy_schema_server::constraints::{self, path, ViolationKind};
+use aws_smithy_schema_server::constraints::path;
 use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
-    BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refused,
-    ServerHttpProtocol, Service, Violation,
+    BoxFuture, ErasedOperation, Operation, OperationContext, Refused, ServerHttpProtocol, Service,
+    Violation,
 };
 
 /// The error code a front door names for a request body that breaks a modelled
@@ -142,32 +141,11 @@ pub fn body_violations<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> Vec<Violation> {
-    let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
-        return Vec::new();
-    };
-    let read = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer);
-    drop(deserializer);
-    let input = match read {
-        Ok(input) => input,
-        Err(SerdeError::MissingMember { member_name }) => {
-            // `member_name` is already a violation path in the spelling the
-            // constraint walk uses (`aws_smithy_schema_server::missing_member` applies
-            // `path::member`, and each enclosing member prepends its own segment), so
-            // it places the same way a walked violation does.
-            let absent = Violation {
-                path: member_name,
-                kind: ViolationKind::MissingRequiredMember,
-                value: None,
-            };
-            return if binds_to_body(O::INPUT_SCHEMA, &absent.path) {
-                vec![absent]
-            } else {
-                Vec::new()
-            };
-        }
-        Err(_) => return Vec::new(),
-    };
-    constraints::validate(&input, O::INPUT_SCHEMA)
+    // The collecting walk is the shared one (`crate::validation`), so a front door cannot
+    // find a different violation set from the framework's own; the echo is left as the
+    // framework rendered it, because a front door's answer quotes no value. The narrowing
+    // below is this module's own rule.
+    crate::validation::violations_in::<O>(protocol, req, crate::validation::Echoes::AsRendered)
         .into_iter()
         .filter(|violation| binds_to_body(O::INPUT_SCHEMA, &violation.path))
         .collect()

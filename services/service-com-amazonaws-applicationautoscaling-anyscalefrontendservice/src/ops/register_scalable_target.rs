@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             check_dimension_namespace, check_enum, check_resource_id_form, scalable_target_arn,
-            service_linked_role_arn, ScalableTargetRecord, TargetKey,
+            service_linked_role_arn, CapacityBound, ScalableTargetRecord, TargetKey,
         };
 
         let Some(self_state) = crate::state::service_state(&*self.engine) else {
@@ -276,34 +276,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(validation)?;
 
-        for (member, capacity) in [
-            ("minCapacity", input.min_capacity),
-            ("maxCapacity", input.max_capacity),
-        ] {
-            if let Some(value) = capacity {
-                if value < 0 {
-                    return Err(validation(format!(
-                        "Value '{value}' at '{member}' failed to satisfy constraint: \
-                         Member must have value greater than or equal to 0"
-                    )));
-                }
-            }
-        }
-
-        // A capacity window also has to be one the owning service can provision: a
-        // dimension whose unit has a documented floor cannot be scaled below it.
+        // A capacity window has to be one the owning service can provision: a dimension
+        // whose unit has a documented floor cannot be scaled below it, and no dimension
+        // can be scaled below zero. Neither bound is modelled (`ResourceCapacity` carries
+        // no `@range`), so both are stated in the service's own words.
         let floor = crate::state::min_capacity_floor(&input.scalable_dimension);
-        for (member, capacity) in [
-            ("minCapacity", input.min_capacity),
-            ("maxCapacity", input.max_capacity),
+        for (bound, capacity) in [
+            (CapacityBound::Minimum, input.min_capacity),
+            (CapacityBound::Maximum, input.max_capacity),
         ] {
             if let Some(value) = capacity {
                 if value < floor {
-                    return Err(validation(format!(
-                        "Value '{value}' at '{member}' failed to satisfy constraint: \
-                         Member must have value greater than or equal to {floor} for scalable \
-                         dimension {}",
-                        input.scalable_dimension
+                    return Err(validation(crate::state::capacity_below_floor_message(
+                        bound, floor,
                     )));
                 }
             }

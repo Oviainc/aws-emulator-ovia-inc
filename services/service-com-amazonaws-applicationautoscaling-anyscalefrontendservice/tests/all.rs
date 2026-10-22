@@ -21,6 +21,8 @@ mod emulator;
 mod predictive_scaling_forecast;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
+#[path = "all/refusal_texts.rs"]
+mod refusal_texts;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/scalable_target_lifecycle.rs"]

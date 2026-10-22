@@ -207,11 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(removed) = state.targets.remove(&key) else {
                 return Err(DeregisterScalableTargetErrorModeled::ObjectNotFoundException(
                     ObjectNotFoundException {
-                        message: Some(format!(
-                            "No scalable target registered for service namespace: {}, resource \
-                             ID: {}, scalable dimension: {}",
-                            key.service_namespace, key.resource_id, key.scalable_dimension
-                        )),
+                        message: Some(crate::state::target_not_found_message(&key)),
                     },
                 )
                 .into());
