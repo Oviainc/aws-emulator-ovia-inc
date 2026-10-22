@@ -36,12 +36,25 @@ struct Emulator {
 }
 
 impl Emulator {
+    /// A fresh emulator: its store holds the inventory the service computed for
+    /// this account (`RecommendedActionsStore::default`).
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(bcm::EmulatedService::new(Arc::clone(&engine)));
         Self { engine, router }
+    }
+
+    /// The same emulator with that inventory cleared, so a case can seed exactly
+    /// the records it reasons about and nothing else.
+    fn empty() -> Self {
+        let emulator = Self::new();
+        assert!(
+            emulator.clear(),
+            "case \"empty emulator\": clearing the boot inventory must leave the store empty"
+        );
+        emulator
     }
 
     /// Install recommended actions through the state seam.
@@ -72,14 +85,21 @@ impl Emulator {
         guard.recommended_actions.is_empty()
     }
 
-    /// `ListRecommendedActions` with `body` as the request payload.
-    async fn list(&self, body: &Value) -> (u16, Value) {
+    /// `ListRecommendedActions` with `body` as the request payload, reporting the
+    /// response's status, announced media type and payload. `request_content_type`
+    /// is what the CLIENT sent.
+    async fn dispatch(
+        &self,
+        body: &Value,
+        request_content_type: &str,
+        target: &str,
+    ) -> (u16, String, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
             .header("host", "bcm-recommended-actions.us-east-1.amazonaws.com")
-            .header("content-type", "application/x-amz-json-1.0")
-            .header("x-amz-target", TARGET)
+            .header("content-type", request_content_type)
+            .header("x-amz-target", target)
             .header("authorization", AUTHORIZATION)
             .body(bytes::Bytes::from(
                 serde_json::to_vec(body).expect("serialize the request body"),
@@ -87,6 +107,12 @@ impl Emulator {
             .expect("build the request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let payload = if response.body().is_empty() {
             Value::Null
         } else {
@@ -97,6 +123,16 @@ impl Emulator {
                 )
             })
         };
+        (status, content_type, payload)
+    }
+
+    /// `ListRecommendedActions` with `body` as the request payload, as an
+    /// awsJson1_0 client (the media type the model's protocol trait declares) sends
+    /// it.
+    async fn list(&self, body: &Value) -> (u16, Value) {
+        let (status, _, payload) = self
+            .dispatch(body, "application/x-amz-json-1.0", TARGET)
+            .await;
         (status, payload)
     }
 }
@@ -200,7 +236,7 @@ fn error_code(case: &str, body: &Value) -> String {
 
 #[tokio::test]
 async fn an_empty_store_lists_no_actions() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
 
     let (status, body) = emulator.list(&json!({})).await;
 
@@ -217,7 +253,7 @@ async fn an_empty_store_lists_no_actions() {
 
 #[tokio::test]
 async fn an_unfiltered_listing_returns_every_stored_record_and_member() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
     emulator.seed(fixture());
 
     let (status, body) = emulator.list(&json!({})).await;
@@ -257,7 +293,7 @@ async fn an_unfiltered_listing_returns_every_stored_record_and_member() {
 
 #[tokio::test]
 async fn a_filter_selects_exactly_the_records_its_predicate_keeps() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
     emulator.seed(fixture());
 
     // key, matchOption, values -> the ids the predicate keeps. Each row is written
@@ -364,7 +400,7 @@ async fn not_equals_is_the_complement_of_equals_for_every_published_enum_member(
     // shape="Feature,Severity,ActionType")`), reached through the enums the state
     // module declares — so every published member is exercised, including the ones
     // no fixture of this issue cited.
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
 
     // One record per ActionType member, each carrying a feature and severity that
     // cycle through their own catalogs.
@@ -474,7 +510,7 @@ async fn not_equals_is_the_complement_of_equals_for_every_published_enum_member(
 
 #[tokio::test]
 async fn paging_reports_every_matching_record_exactly_once() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
     emulator.seed(fixture());
 
     // Every page size from one record to one past the whole set, plus the published
@@ -567,7 +603,7 @@ async fn paging_reports_every_matching_record_exactly_once() {
 
 #[tokio::test]
 async fn max_results_outside_the_published_range_is_refused() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
     emulator.seed(fixture());
 
     // The model's MaxResults range is 1..1000: each bound is accepted, each value
@@ -594,7 +630,7 @@ async fn max_results_outside_the_published_range_is_refused() {
 
 #[tokio::test]
 async fn a_next_token_this_service_did_not_mint_is_refused() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
     emulator.seed(fixture());
 
     // A token minted for a DIFFERENT query: same page size, different filter.
@@ -654,7 +690,7 @@ async fn a_next_token_this_service_did_not_mint_is_refused() {
 
 #[tokio::test]
 async fn a_token_resumes_the_same_query_it_was_issued_for() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
     emulator.seed(fixture());
 
     let query = json!({
@@ -706,74 +742,121 @@ async fn a_token_resumes_the_same_query_it_was_issued_for() {
 }
 
 #[tokio::test]
-async fn a_filter_value_outside_the_enum_its_key_names_is_refused() {
-    let emulator = Emulator::new();
+async fn every_refused_member_is_stated_with_a_reason_and_a_field_list() {
+    let emulator = Emulator::empty();
     emulator.seed(fixture());
 
-    // Each row carries a value that is not a member of the enum the key names —
-    // including near-misses in case, spelling and pluralisation. `ActionFilter$key`
-    // and `$matchOption` target enum shapes, so the framework's own constraint
-    // validator refuses those two before the handler runs and answers the same 400
-    // `ValidationException` without the modelled `reason`/`fieldList` members; the
-    // last element of each row says whether the modelled members are expected.
-    let cases: Vec<(&str, Value, bool)> = vec![
+    // Each row is a refused input and the member path(s) the refusal must name.
+    // The class spans every way one request member can be refused — a value outside
+    // the enum its filter key names (near-misses in case, spelling and
+    // pluralisation), an unmodelled `key` or `matchOption`, a `values` list shorter
+    // than its modelled minimum, a `maxResults` outside its modelled range, and an
+    // absent required member — found at the constraint boundary or in the handler
+    // alike. Paths are the dotted, 1-based spelling the service's validator uses
+    // (`filter.actions.1.member.key`).
+    let cases: Vec<(&str, Value, Vec<&str>)> = vec![
         (
             "FEATURE with a lowercase member",
-            json!([{"key": "FEATURE", "matchOption": "EQUALS", "values": ["budgets"]}]),
-            true,
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": ["budgets"]}
+            ]}}),
+            vec!["filter.actions.1.member.values.1.member"],
         ),
         (
             "FEATURE with a value from another enum",
-            json!([{"key": "FEATURE", "matchOption": "EQUALS", "values": ["CRITICAL"]}]),
-            true,
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": ["CRITICAL"]}
+            ]}}),
+            vec!["filter.actions.1.member.values.1.member"],
         ),
         (
             "SEVERITY with an unmodelled level",
-            json!([{"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["SEVERE"]}]),
-            true,
+            json!({"filter": {"actions": [
+                {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["SEVERE"]}
+            ]}}),
+            vec!["filter.actions.1.member.values.1.member"],
         ),
         (
             "TYPE with a pluralised member",
-            json!([{"key": "TYPE", "matchOption": "EQUALS", "values": ["CREATE_BUDGETS"]}]),
-            true,
+            json!({"filter": {"actions": [
+                {"key": "TYPE", "matchOption": "EQUALS", "values": ["CREATE_BUDGETS"]}
+            ]}}),
+            vec!["filter.actions.1.member.values.1.member"],
         ),
         (
             "one bad value beside a good one",
-            json!([{"key": "TYPE", "matchOption": "EQUALS", "values": ["CREATE_BUDGET", "CREATE_BUDGETS"]}]),
-            true,
+            json!({"filter": {"actions": [
+                {"key": "TYPE", "matchOption": "EQUALS", "values": ["CREATE_BUDGET", "CREATE_BUDGETS"]}
+            ]}}),
+            vec!["filter.actions.1.member.values.2.member"],
         ),
         (
             "an unmodelled filter key",
-            json!([{"key": "ACCOUNT_ID", "matchOption": "EQUALS", "values": ["000000000000"]}]),
-            false,
+            json!({"filter": {"actions": [
+                {"key": "ACCOUNT_ID", "matchOption": "EQUALS", "values": ["000000000000"]}
+            ]}}),
+            vec!["filter.actions.1.member.key"],
         ),
         (
             "an unmodelled match option",
-            json!([{"key": "FEATURE", "matchOption": "CONTAINS", "values": ["BUDGETS"]}]),
-            false,
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "CONTAINS", "values": ["BUDGETS"]}
+            ]}}),
+            vec!["filter.actions.1.member.matchOption"],
         ),
-        // `FilterValues` is modelled `length: {min: 1}`, so an empty list is refused
-        // too — whether by the framework's constraint validation or by the handler's
-        // backstop, hence `false` for the modelled members.
+        // Two offending members in one request: AWS reports EVERY validation error,
+        // so both must be named.
+        (
+            "an unmodelled key and match option together",
+            json!({"filter": {"actions": [
+                {"key": "ACCOUNT_ID", "matchOption": "CONTAINS", "values": ["000000000000"]}
+            ]}}),
+            vec![
+                "filter.actions.1.member.key",
+                "filter.actions.1.member.matchOption",
+            ],
+        ),
+        // `FilterValues` is modelled `length: {min: 1}`.
         (
             "an empty values list",
-            json!([{"key": "FEATURE", "matchOption": "EQUALS", "values": []}]),
-            false,
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": []}
+            ]}}),
+            vec!["filter.actions.1.member.values"],
         ),
         (
             "an empty values list beside a well-formed filter",
-            json!([
+            json!({"filter": {"actions": [
                 {"key": "FEATURE", "matchOption": "EQUALS", "values": ["BUDGETS"]},
                 {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": []}
-            ]),
-            false,
+            ]}}),
+            vec!["filter.actions.2.member.values"],
+        ),
+        // `ActionFilter$key` is modelled required: an absent member is refused as
+        // the same shape, naming the member that is missing.
+        (
+            "an absent required filter member",
+            json!({"filter": {"actions": [
+                {"matchOption": "EQUALS", "values": ["BUDGETS"]}
+            ]}}),
+            vec!["filter.actions.1.member.key"],
+        ),
+        // Not a filter member at all: the same refusal shape covers every member of
+        // the input, so `maxResults` outside its modelled range is stated alike.
+        (
+            "maxResults below the modelled range",
+            json!({"maxResults": 0}),
+            vec!["maxResults"],
+        ),
+        (
+            "maxResults past the modelled range",
+            json!({"maxResults": 1001}),
+            vec!["maxResults"],
         ),
     ];
 
-    for (case, filters, modelled_members) in cases {
-        let (status, body) = emulator
-            .list(&json!({"filter": {"actions": filters}}))
-            .await;
+    for (case, request, expected_paths) in cases {
+        let (status, body) = emulator.list(&request).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} with {body}"
@@ -785,45 +868,277 @@ async fn a_filter_value_outside_the_enum_its_key_names_is_refused() {
         );
         assert!(
             body.get("recommendedActions").is_none(),
-            "case {case:?}: a refused filter must not return a listing, got {body}"
+            "case {case:?}: a refused request must not return a listing, got {body}"
         );
-        if !modelled_members {
-            continue;
-        }
-        // `ValidationException` models `reason` as required, with
-        // `ValidationExceptionReason` as its enum (`smithy_query(query="shape",
-        // shape="ValidationExceptionReason")`), and `fieldList` naming the member
-        // at fault — a client reads both.
-        let reason = body.get("reason").and_then(Value::as_str);
-        assert!(
-            matches!(
-                reason,
-                Some("unknownOperation" | "cannotParse" | "fieldValidationFailed" | "other")
-            ),
-            "case {case:?}: expected a ValidationExceptionReason member, got {reason:?} in {body}"
+        // `ValidationException` models `reason` as REQUIRED, from
+        // `ValidationExceptionReason` (`smithy_query(query="shape",
+        // shape="ValidationExceptionReason")`); a member-level refusal is
+        // `fieldValidationFailed`.
+        assert_eq!(
+            body.get("reason").and_then(Value::as_str),
+            Some("fieldValidationFailed"),
+            "case {case:?}: expected reason fieldValidationFailed, got {body}"
         );
-        let field_names: Vec<&str> = body
+        // One `fieldList` entry per offending member: the name is the member's path,
+        // the message states the constraint it failed.
+        let fields = body
             .get("fieldList")
             .and_then(Value::as_array)
-            .map(|fields| {
-                fields
-                    .iter()
-                    .filter_map(|field| field.get("name").and_then(Value::as_str))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .unwrap_or_else(|| panic!("case {case:?}: expected a fieldList array, got {body}"));
+        let names: Vec<&str> = fields
+            .iter()
+            .filter_map(|field| field.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            names, expected_paths,
+            "case {case:?}: expected fieldList to name {expected_paths:?}, got {names:?} in {body}"
+        );
+        for field in fields {
+            let message = field.get("message").and_then(Value::as_str).unwrap_or("");
+            assert!(
+                message.contains("failed to satisfy constraint"),
+                "case {case:?}: expected a fieldList message stating the constraint, got {field}"
+            );
+        }
+        // The message is the envelope AWS states, counting the errors it reports and
+        // carrying each clause.
+        let message = body.get("message").and_then(Value::as_str).unwrap_or("");
+        let count = expected_paths.len();
+        let expected_prefix = if count == 1 {
+            "1 validation error detected: ".to_string()
+        } else {
+            format!("{count} validation errors detected: ")
+        };
         assert!(
-            field_names
-                .iter()
-                .any(|name| name.starts_with("filter.actions[0]")),
-            "case {case:?}: expected fieldList to name the offending filter member, got {field_names:?} in {body}"
+            message.starts_with(&expected_prefix),
+            "case {case:?}: expected a message starting {expected_prefix:?}, got {message:?}"
+        );
+        for path in &expected_paths {
+            assert!(
+                message.contains(path),
+                "case {case:?}: expected the message to name {path:?}, got {message:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_names_at_most_the_capped_number_of_members() {
+    let emulator = Emulator::empty();
+
+    // A refusal states every offending member, but a bounded number of them: each
+    // violation is rendered twice into the body (a clause and a `fieldList` entry),
+    // so a request-chosen list length must not grow the response without bound. The
+    // ceiling is the boundary validator's own (`MAX_VIOLATIONS` = 100 in
+    // vendor/smithy-schema-server/src/constraints.rs), so both refusal paths bound
+    // alike.
+    const MAX_VIOLATIONS: usize = 100;
+    for count in [1_usize, 2, 99, 100, 101, 500] {
+        let values: Vec<String> = (0..count).map(|i| format!("NOT_A_MEMBER_{i}")).collect();
+        let (status, body) = emulator
+            .list(&json!({"filter": {"actions": [
+                {"key": "TYPE", "matchOption": "EQUALS", "values": values}
+            ]}}))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {count} bad values: expected HTTP 400, got {status} with {body}"
+        );
+        let fields = body
+            .get("fieldList")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {count} bad values: expected a fieldList, got {body}"));
+        assert_eq!(
+            fields.len(),
+            count.min(MAX_VIOLATIONS),
+            "case {count} bad values: expected at most {MAX_VIOLATIONS} named members, got {}",
+            fields.len()
         );
     }
 }
 
 #[tokio::test]
-async fn listing_never_changes_what_a_later_caller_sees() {
+async fn every_response_announces_the_services_media_type() {
     let emulator = Emulator::new();
+
+    // What this service's own responses announce does not depend on what the client
+    // sent or on whether the call succeeded: one media type for a success and for a
+    // failure its handler raises. A refusal of the REQUEST is answered by the input
+    // validator in front of the service, which announces the media type the model's
+    // protocol trait declares — the last column is the media type each row expects.
+    let json_1_0 = "application/x-amz-json-1.0";
+    let json_1_1 = "application/x-amz-json-1.1";
+    let cases: Vec<(&str, &str, &str, Value, u16, &str)> = vec![
+        (
+            "success, awsJson1_0 request",
+            json_1_0,
+            TARGET,
+            json!({}),
+            200,
+            json_1_1,
+        ),
+        (
+            "success, awsJson1_1 request",
+            json_1_1,
+            TARGET,
+            json!({}),
+            200,
+            json_1_1,
+        ),
+        (
+            "success, no request media type",
+            "",
+            TARGET,
+            json!({}),
+            200,
+            json_1_1,
+        ),
+        (
+            "filtered success",
+            json_1_0,
+            TARGET,
+            json!({"filter": {"actions": [
+                {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["CRITICAL"]}
+            ]}}),
+            200,
+            json_1_1,
+        ),
+        (
+            "a modelled failure the handler raises",
+            json_1_0,
+            TARGET,
+            json!({"nextToken": "not-a-token-this-service-minted"}),
+            400,
+            json_1_1,
+        ),
+        (
+            "a refused member value",
+            json_1_0,
+            TARGET,
+            json!({"filter": {"actions": [
+                {"key": "NOT_A_REAL_FILTER_KEY", "matchOption": "EQUALS", "values": ["BUDGETS"]}
+            ]}}),
+            400,
+            json_1_0,
+        ),
+        (
+            "a refused member value, awsJson1_1 request",
+            json_1_1,
+            TARGET,
+            json!({"filter": {"actions": [
+                {"key": "FEATURE", "matchOption": "NOT_A_REAL_MATCH_OPTION", "values": ["BUDGETS"]}
+            ]}}),
+            400,
+            json_1_0,
+        ),
+        (
+            "an unroutable target",
+            json_1_0,
+            "AWSBillingAndCostManagementRecommendedActions.NoSuchOperation",
+            json!({}),
+            501,
+            json_1_0,
+        ),
+    ];
+
+    for (case, request_content_type, target, body, expected_status, expected_media_type) in cases {
+        let (status, content_type, payload) = emulator
+            .dispatch(&body, request_content_type, target)
+            .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with {payload}"
+        );
+        assert_eq!(
+            content_type, expected_media_type,
+            "case {case:?}: expected media type {expected_media_type:?}, got {content_type:?} with {payload}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_boot_inventory_is_reported_and_is_filterable() {
+    // The service models no create operation — AWS computes the recommendations —
+    // so a caller that never seeded anything must still read the inventory this
+    // account has, and an exclusion filter over it must return its complement
+    // rather than nothing.
+    let emulator = Emulator::new();
+
+    let (status, body) = emulator.list(&json!({})).await;
+    assert_eq!(status, 200, "boot inventory: expected 200, got {status} with {body}");
+    let boot = actions_of("boot inventory", &body).clone();
+    assert!(
+        !boot.is_empty(),
+        "boot inventory: expected the computed recommendations, got {body}"
+    );
+
+    // Every record is a well-formed `RecommendedAction` for this account: the
+    // modelled members, each carrying a member of its own enum.
+    let account_id = engine::emulator_account_id();
+    for entry in &boot {
+        let case = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("boot inventory: a record carries no id: {entry}"));
+        assert_eq!(
+            entry.get("accountId").and_then(Value::as_str),
+            Some(account_id),
+            "case {case:?}: expected the emulator's account id, got {entry}"
+        );
+        for member in ["type", "severity", "feature", "lastUpdatedTimeStamp"] {
+            assert!(
+                entry.get(member).and_then(Value::as_str).is_some_and(|v| !v.is_empty()),
+                "case {case:?}: expected a {member}, got {entry}"
+            );
+        }
+    }
+
+    // Severity enum members from `smithy_query(query="shape", shape="Severity")`.
+    for severity in ["INFO", "WARNING", "CRITICAL"] {
+        let request = |match_option: &str| {
+            json!({"filter": {"actions": [
+                {"key": "SEVERITY", "matchOption": match_option, "values": [severity]}
+            ]}})
+        };
+        let (status, kept) = emulator.list(&request("EQUALS")).await;
+        assert_eq!(status, 200, "case {severity:?} EQUALS: expected 200, got {kept}");
+        let (status, excluded) = emulator.list(&request("NOT_EQUALS")).await;
+        assert_eq!(status, 200, "case {severity:?} NOT_EQUALS: expected 200, got {excluded}");
+
+        let kept = ids_of(severity, &kept);
+        let excluded = ids_of(severity, &excluded);
+        let mut union = kept.clone();
+        union.extend(excluded.iter().cloned());
+        union.sort();
+        let mut all: Vec<String> = boot
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        all.sort();
+        assert_eq!(
+            union, all,
+            "case {severity:?}: EQUALS and NOT_EQUALS must partition the inventory, got {kept:?} and {excluded:?}"
+        );
+        assert!(
+            kept.iter().all(|id| !excluded.contains(id)),
+            "case {severity:?}: a record cannot be both kept and excluded, got {kept:?} and {excluded:?}"
+        );
+    }
+
+    // Reading the inventory does not consume it.
+    let (status, again) = emulator.list(&json!({})).await;
+    assert_eq!(status, 200, "re-read: expected 200, got {status} with {again}");
+    assert_eq!(
+        actions_of("re-read", &again),
+        &boot,
+        "re-read: reporting the inventory must not change it, got {again}"
+    );
+}
+
+#[tokio::test]
+async fn listing_never_changes_what_a_later_caller_sees() {
+    let emulator = Emulator::empty();
     emulator.seed(fixture());
     let before = emulator.stored_count();
 
@@ -859,7 +1174,7 @@ async fn listing_never_changes_what_a_later_caller_sees() {
 
 #[tokio::test]
 async fn clearing_the_store_empties_the_listing() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
     emulator.seed(fixture());
 
     let (status, before) = emulator.list(&json!({})).await;
@@ -890,7 +1205,7 @@ async fn clearing_the_store_empties_the_listing() {
 
 #[tokio::test]
 async fn re_seeding_an_existing_id_updates_it_in_place() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
     emulator.seed(fixture());
 
     let mut updated = action(

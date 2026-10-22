@@ -5,9 +5,10 @@
 //! The service holds exactly one kind of record: a *recommended action* that AWS
 //! Billing and Cost Management computed for an account. Its model binds a single
 //! operation, `ListRecommendedActions`, which only reports — there is no public
-//! create, update or delete — so the store starts EMPTY and is filled through the
-//! seeding seam below ([`RecommendedActionsStore::seed`]), which stands in for the
-//! real service's own recommendation generator.
+//! create, update or delete — so the store STARTS with the inventory this account
+//! has ([`computed_recommendations`], the stand-in for the real service's own
+//! recommendation generator) and is re-filled through the seeding seam below
+//! ([`RecommendedActionsStore::seed`]).
 //!
 //! Records are held in INSERTION ORDER: `ListRecommendedActions` is `@paginated`,
 //! and a stable order is what makes its `nextToken` resume exactly where the
@@ -138,6 +139,13 @@ wire_enum! {
     }
 }
 
+/// The wire members of an enum, as the value set a refusal states them — used both
+/// by [`FilterName::value_members`] and by the handler's own refusals, so one
+/// mapping serves every value set this service names.
+pub fn member_strings<E: std::fmt::Display>(all: &[E]) -> Vec<String> {
+    all.iter().map(std::string::ToString::to_string).collect()
+}
+
 impl FilterName {
     /// Whether `value` is a member of the enum this filter key names.
     ///
@@ -159,6 +167,17 @@ impl FilterName {
             Self::Feature => "Feature",
             Self::Severity => "Severity",
             Self::Type => "ActionType",
+        }
+    }
+
+    /// Every member of the enum this filter key's values are drawn from, in model
+    /// order — the value set a `ValidationException` states when a value falls
+    /// outside it.
+    pub fn value_members(self) -> Vec<String> {
+        match self {
+            Self::Feature => member_strings(Feature::ALL),
+            Self::Severity => member_strings(Severity::ALL),
+            Self::Type => member_strings(ActionType::ALL),
         }
     }
 }
@@ -190,10 +209,101 @@ pub struct StoredAction {
     pub last_updated_timestamp: String,
 }
 
+/// The instant a record was last recomputed, as `RecommendedAction$lastUpdatedTimeStamp`
+/// carries it: the member is modelled as a plain `String`, and AWS renders these
+/// instants ISO-8601 in UTC.
+fn iso8601(at: std::time::SystemTime) -> String {
+    ::aws_smithy_types::DateTime::from(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+}
+
+/// One record of the inventory the service computed for this account, built from
+/// the action it recommends.
+fn computed(
+    id: &str,
+    action_type: ActionType,
+    severity: Severity,
+    feature: Feature,
+    next_step: &str,
+    computed_at: &str,
+) -> StoredAction {
+    StoredAction {
+        id: id.to_string(),
+        action_type,
+        account_id: ::engine::emulator_account_id().to_string(),
+        severity,
+        feature,
+        context: BTreeMap::from([(
+            "feature".to_string(),
+            feature.as_str().to_string(),
+        )]),
+        next_steps: vec![next_step.to_string()],
+        last_updated_timestamp: computed_at.to_string(),
+    }
+}
+
+/// The recommended actions this emulator holds when it starts.
+///
+/// `ListRecommendedActions` only REPORTS, and the service models no create
+/// operation because AWS itself computes the recommendations — so an inventory
+/// filled ONLY through [`RecommendedActionsStore::seed`] reports nothing at all to
+/// a caller that never seeded it, and an exclusion-style query (`NOT_EQUALS`) over
+/// it can never return the complement it exists to return. The store therefore
+/// starts with the set this account has, the way the real service's generator
+/// produces one; `seed` and `clear` stay the seam that installs another.
+///
+/// Every record names a modelled `ActionType`, `Severity` and `Feature`, and the
+/// account the emulator presents ([`engine::emulator_account_id`]). The three
+/// severities differ, so a filter on any one of them keeps some records and excludes
+/// others. The inventory is fixed rather than derived from traffic: this emulator
+/// observes no billing usage to derive one from.
+fn computed_recommendations() -> Vec<StoredAction> {
+    let computed_at = iso8601(std::time::SystemTime::now());
+    vec![
+        computed(
+            "ra-savings-opportunities",
+            ActionType::ReviewSavingsOpportunityRecommendations,
+            Severity::Info,
+            Feature::CostOptimizationHub,
+            "Review the savings opportunities in Cost Optimization Hub.",
+            &computed_at,
+        ),
+        computed(
+            "ra-expiring-reserved-instances",
+            ActionType::ReviewExpiringRi,
+            Severity::Warning,
+            Feature::Reservations,
+            "Review the Reserved Instances that expire soon.",
+            &computed_at,
+        ),
+        computed(
+            "ra-expiring-savings-plans",
+            ActionType::ReviewExpiringSp,
+            Severity::Critical,
+            Feature::SavingsPlans,
+            "Review the Savings Plans that expire soon.",
+            &computed_at,
+        ),
+    ]
+}
+
 /// The recommended actions this emulator holds, in insertion order.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RecommendedActionsStore {
     actions: Vec<StoredAction>,
+}
+
+impl Default for RecommendedActionsStore {
+    /// The inventory the service computed for this account — see
+    /// [`computed_recommendations`]. Part of the store's INITIAL value rather than
+    /// something a reader installs on first use, so `ListRecommendedActions` stays
+    /// a pure read: two callers see the same records whichever of them called first.
+    fn default() -> Self {
+        Self {
+            actions: computed_recommendations(),
+        }
+    }
 }
 
 impl RecommendedActionsStore {

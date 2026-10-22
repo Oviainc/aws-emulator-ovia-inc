@@ -11,9 +11,11 @@
 //! * **Reporting only.** The model binds this single operation and its doc says it
 //!   "returns a list of recommended actions"; it never writes, so two identical
 //!   calls answer identically and a later caller sees exactly what an earlier one
-//!   saw. The records come from the store, which is filled through
-//!   [`crate::state::RecommendedActionsStore::seed`] — the service has no create
-//!   operation because AWS itself computes the recommendations.
+//!   saw. The records come from the store, which already holds the inventory this
+//!   account has when the emulator starts
+//!   ([`crate::state::RecommendedActionsStore::default`]) and which a caller can
+//!   re-fill through [`crate::state::RecommendedActionsStore::seed`] — the service
+//!   has no create operation because AWS itself computes the recommendations.
 //! * **Every account the caller can see.** `RecommendedAction$accountId` is "the
 //!   account that the recommended action is for", and `FilterName` has no account
 //!   key — the real API reports the actions of the calling (management) account AND
@@ -35,6 +37,11 @@
 //!   value that is not a member of the enum its `key` names is refused with
 //!   `ValidationException`, and so is an empty `values` list, whose modelled
 //!   minimum length is 1.
+//! * **How a refusal is stated.** Every refusal of this operation's input is one
+//!   `ValidationException` (400) carrying the modelled `reason` and one `fieldList`
+//!   entry per offending member, built from [`Violation`]s by
+//!   [`field_validation_failed`] — the same rendering whether the offending member
+//!   was found at the constraint boundary (see `crate::service`) or here.
 //! * **Pagination.** Records are reported in store (insertion) order, so a page
 //!   boundary is stable. `nextToken` is opaque: a 128-bit fingerprint of the
 //!   effective query (the filter plus `maxResults`) followed by the offset to
@@ -109,8 +116,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{FilterName, MatchOption, StoredAction};
+use crate::state::{member_strings, FilterName, MatchOption, StoredAction};
+use aws_smithy_schema_server::constraints;
 use sha2::Digest;
+use smithy_server_runtime::{Violation, ViolationKind};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -165,19 +174,105 @@ const TOKEN_OFFSET_LEN: usize = 8;
 /// Total length of a `nextToken` this service mints.
 const TOKEN_LEN: usize = TOKEN_FINGERPRINT_LEN + TOKEN_OFFSET_LEN;
 
-/// A 400 `ValidationException` with the modelled `reason` and, when a member is to
-/// blame, the `fieldList` entry naming it.
-fn validation(
+/// A 400 `ValidationException` stating `violations` the way this service's input
+/// validator states them.
+///
+/// ONE rendering for every member this operation refuses, wherever the refusal is
+/// found: the message is the `N validation error(s) detected: …` envelope built
+/// from the violations, `reason` is the modelled
+/// `ValidationExceptionReason$fieldValidationFailed`, and `fieldList` carries one
+/// entry per violation — `name` the dotted member path, `message` that violation's
+/// own clause. Both of those members are modelled (`reason` is REQUIRED), so a
+/// client can branch on the reason and report which member was rejected and why.
+pub fn field_validation_failed(violations: &[Violation]) -> ListRecommendedActionsErrorModeled {
+    // BOUNDED, like the boundary validator's own walk: every violation is rendered
+    // TWICE into the body (a clause in the message and a `fieldList` entry) and each
+    // clause interpolates the rejected value and the bound it failed, so an unbounded
+    // count turns a small request into an arbitrarily large refusal. The cap is the
+    // framework's (`MAX_VIOLATIONS`), and like the framework the envelope keeps
+    // counting what was RECORDED, so the two refusal paths read alike.
+    let violations = &violations[..violations.len().min(MAX_VIOLATIONS)];
+    ListRecommendedActionsErrorModeled::ValidationException(ValidationException {
+        message: constraints::envelope(violations)
+            .unwrap_or_else(|| "The input fails to satisfy the service's constraints.".to_string()),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(
+            violations
+                .iter()
+                .map(|violation| ValidationExceptionField {
+                    name: violation.path.clone(),
+                    message: violation.message(),
+                })
+                .collect(),
+        ),
+    })
+}
+
+/// A 400 `ValidationException` for a value the service could not read at all —
+/// `ValidationExceptionReason$cannotParse` — naming the member it could not read.
+fn cannot_parse(
     message: impl Into<String>,
-    reason: &str,
-    field: Option<(String, String)>,
+    field: (String, String),
 ) -> ListRecommendedActionsError {
     ListRecommendedActionsErrorModeled::ValidationException(ValidationException {
         message: message.into(),
-        reason: reason.to_string(),
-        field_list: field.map(|(name, message)| vec![ValidationExceptionField { name, message }]),
+        reason: REASON_CANNOT_PARSE.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: field.0,
+            message: field.1,
+        }]),
     })
     .into()
+}
+
+/// The dotted path of a member of the `index`-th `ActionFilter` in the request,
+/// spelled through the framework's own path rule ([`constraints::path`]) so a path
+/// this handler builds reads exactly like one the boundary validator builds:
+/// `filter.actions.1.member.key`.
+fn filter_member_path(index: usize, member: &str) -> String {
+    constraints::path::join(&[
+        constraints::path::member("filter"),
+        constraints::path::member("actions"),
+        constraints::path::element(index + 1),
+        constraints::path::member(member),
+    ])
+}
+
+/// The dotted path of one element of that filter's `values` list:
+/// `filter.actions.1.member.values.2.member`.
+fn filter_value_path(index: usize, value_index: usize) -> String {
+    constraints::path::join(&[
+        filter_member_path(index, "values"),
+        constraints::path::element(value_index + 1),
+    ])
+}
+
+/// One violation of an enumerated value set, stated the way the boundary validator
+/// states one.
+fn enum_violation(path: String, value: &str, allowed: Vec<String>) -> Violation {
+    Violation {
+        path,
+        kind: ViolationKind::EnumValue(allowed),
+        value: Some(echoed(value)),
+    }
+}
+
+/// A caller-supplied value, capped before a refusal echoes it: a message must not
+/// amplify an arbitrarily long request value into the response. Both the cap
+/// (`MAX_ECHOED_VALUE` = 256) and the elision text are the boundary validator's own
+/// (`vendor/smithy-schema-server/src/constraints.rs`), so a long value refused here
+/// reads exactly as the same value refused there. The ORIGINAL value is what
+/// `accepts_value` checks; this is rendering only.
+fn echoed(value: &str) -> String {
+    const MAX_ECHOED_VALUE: usize = 256;
+    if value.len() <= MAX_ECHOED_VALUE {
+        return value.to_string();
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
 }
 
 /// A 500 `InternalServerException`: the service could not reach its own store.
@@ -188,13 +283,22 @@ fn internal_server_error(message: impl Into<String>) -> ListRecommendedActionsEr
     .into()
 }
 
-/// The wire members of an enum, for a refusal message.
-fn member_list<E: std::fmt::Display>(all: &[E]) -> String {
-    all.iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+
+/// `FilterValues` is modelled `length: {min: 1}` (`smithy_query(query="shape",
+/// shape="ActionFilter,FilterValues")`).
+const FILTER_VALUES_MIN_LEN: i64 = 1;
+
+/// Ceiling on the violations ONE refusal accumulates, matching the boundary
+/// validator's own (`MAX_VIOLATIONS` in
+/// `vendor/smithy-schema-server/src/constraints.rs`).
+///
+/// Every violation is rendered TWICE into the refusal body — a clause in the message
+/// and a `fieldList` entry — and each clause carries the rejected value and the value
+/// set it failed, so the COUNT is what turns a request-chosen list length into an
+/// arbitrarily large response. The walk below STOPS at the cap (a caller cannot act on
+/// thousands of clauses) and, like the framework, the envelope keeps counting what was
+/// recorded.
+const MAX_VIOLATIONS: usize = 100;
 
 /// One validated `ActionFilter`: the field it reads, whether it keeps or excludes a
 /// match, and the values it compares against.
@@ -239,12 +343,16 @@ impl CompiledFilter {
 /// Validate the request's filters, refusing a key, match option or value the model
 /// does not declare.
 ///
-/// `ActionFilter$key` and `$matchOption` target enum shapes, so the framework's
-/// constraint validation refuses an unmodelled member of either before this
-/// handler runs; the checks here are the backstop that turns such a value into this
-/// service's own `ValidationException` rather than a panic or a silent default.
-/// `ActionFilter$values` is a list of plain strings, so the enum its `key` names is
-/// enforced ONLY here.
+/// EVERY offending member is reported in one refusal, the way the boundary
+/// validator reports one: a violation per member, rendered by
+/// [`field_validation_failed`].
+///
+/// `ActionFilter$key` and `$matchOption` target enum shapes, so an unmodelled
+/// member of either is normally refused before this handler runs (by the
+/// constraint boundary, whose violations this service answers in the same modelled
+/// shape); the checks here are the backstop that turns such a value into the same
+/// refusal rather than a silent default. `ActionFilter$values` is a list of plain
+/// strings, so the enum its `key` names is enforced ONLY here.
 fn compile_filters(
     filter: Option<&RequestFilter>,
 ) -> Result<Vec<CompiledFilter>, ListRecommendedActionsError> {
@@ -252,74 +360,68 @@ fn compile_filters(
         return Ok(Vec::new());
     };
 
+    let mut violations: Vec<Violation> = Vec::new();
     let mut compiled = Vec::with_capacity(actions.len());
     for (index, action_filter) in actions.iter().enumerate() {
-        let key = FilterName::from_wire(&action_filter.key).ok_or_else(|| {
-            validation(
-                format!(
-                    "'{}' is not a valid filter key; expected one of {}",
-                    action_filter.key,
-                    member_list(FilterName::ALL)
-                ),
-                REASON_FIELD_VALIDATION_FAILED,
-                Some((
-                    format!("filter.actions[{index}].key"),
-                    format!("expected one of {}", member_list(FilterName::ALL)),
-                )),
-            )
-        })?;
-        let match_option = MatchOption::from_wire(&action_filter.match_option).ok_or_else(|| {
-            validation(
-                format!(
-                    "'{}' is not a valid match option; expected one of {}",
-                    action_filter.match_option,
-                    member_list(MatchOption::ALL)
-                ),
-                REASON_FIELD_VALIDATION_FAILED,
-                Some((
-                    format!("filter.actions[{index}].matchOption"),
-                    format!("expected one of {}", member_list(MatchOption::ALL)),
-                )),
-            )
-        })?;
-        // `ActionFilter$values` is `FilterValues`, whose modelled length is `min: 1`
-        // (`smithy_query(query="shape", shape="ActionFilter,FilterValues")`), so an
-        // empty list is refused rather than evaluated: `any()` over no value is
-        // `false`, which would silently turn an `EQUALS` filter into "matches
-        // nothing" and a `NOT_EQUALS` filter into a no-op. Same backstop role as the
-        // `maxResults` range check below.
-        if action_filter.values.is_empty() {
-            return Err(validation(
-                "filter.actions[].values must carry at least one value",
-                REASON_FIELD_VALIDATION_FAILED,
-                Some((
-                    format!("filter.actions[{index}].values"),
-                    "expected at least one value".to_string(),
-                )),
+        // Bounded refusal: stop accumulating (and stop walking) at the cap the
+        // boundary validator uses. See [`MAX_VIOLATIONS`].
+        if violations.len() >= MAX_VIOLATIONS {
+            break;
+        }
+        let key = FilterName::from_wire(&action_filter.key);
+        if key.is_none() {
+            violations.push(enum_violation(
+                filter_member_path(index, "key"),
+                &action_filter.key,
+                member_strings(FilterName::ALL),
             ));
         }
-        for (value_index, value) in action_filter.values.iter().enumerate() {
-            if !key.accepts_value(value) {
-                return Err(validation(
-                    format!(
-                        "'{}' is not a member of {}, which filter key {} filters on",
+        let match_option = MatchOption::from_wire(&action_filter.match_option);
+        if match_option.is_none() {
+            violations.push(enum_violation(
+                filter_member_path(index, "matchOption"),
+                &action_filter.match_option,
+                member_strings(MatchOption::ALL),
+            ));
+        }
+        // An empty `values` list is refused rather than evaluated: `any()` over no
+        // value is `false`, which would silently turn an `EQUALS` filter into
+        // "matches nothing" and a `NOT_EQUALS` filter into a no-op.
+        if (action_filter.values.len() as i64) < FILTER_VALUES_MIN_LEN {
+            violations.push(Violation {
+                path: filter_member_path(index, "values"),
+                kind: ViolationKind::MinLength(FILTER_VALUES_MIN_LEN),
+                value: Some(format!("{} items", action_filter.values.len())),
+            });
+        }
+        // The values of a filter are members of the enum its KEY names (a `FEATURE`
+        // filter compares `Feature` members, and so on), which the model cannot
+        // express — `FilterValues` is a list of plain strings — so this is the only
+        // place that value set is enforced.
+        if let Some(key) = key {
+            for (value_index, value) in action_filter.values.iter().enumerate() {
+                if violations.len() >= MAX_VIOLATIONS {
+                    break;
+                }
+                if !key.accepts_value(value) {
+                    violations.push(enum_violation(
+                        filter_value_path(index, value_index),
                         value,
-                        key.value_enum_name(),
-                        key.as_str()
-                    ),
-                    REASON_FIELD_VALIDATION_FAILED,
-                    Some((
-                        format!("filter.actions[{index}].values[{value_index}]"),
-                        format!("expected a member of {}", key.value_enum_name()),
-                    )),
-                ));
+                        key.value_members(),
+                    ));
+                }
             }
         }
-        compiled.push(CompiledFilter {
-            key,
-            match_option,
-            values: action_filter.values.clone(),
-        });
+        if let (Some(key), Some(match_option)) = (key, match_option) {
+            compiled.push(CompiledFilter {
+                key,
+                match_option,
+                values: action_filter.values.clone(),
+            });
+        }
+    }
+    if !violations.is_empty() {
+        return Err(field_validation_failed(&violations).into());
     }
     Ok(compiled)
 }
@@ -348,13 +450,12 @@ fn mint_token(fingerprint: &str, offset: usize) -> String {
 /// this service minted for this query.
 fn parse_token(token: &str, fingerprint: &str) -> Result<usize, ListRecommendedActionsError> {
     let malformed = || {
-        validation(
+        cannot_parse(
             "The nextToken is not valid. Pass back the nextToken returned by the previous call, unchanged.",
-            REASON_CANNOT_PARSE,
-            Some((
+            (
                 "nextToken".to_string(),
                 "not a pagination token issued by this service".to_string(),
-            )),
+            ),
         )
     };
     // A minted token is lower-case hex throughout, so anything else — including an
@@ -365,13 +466,12 @@ fn parse_token(token: &str, fingerprint: &str) -> Result<usize, ListRecommendedA
     }
     let (token_fingerprint, offset) = token.split_at(TOKEN_FINGERPRINT_LEN);
     if token_fingerprint != fingerprint {
-        return Err(validation(
+        return Err(cannot_parse(
             "The nextToken was issued for a different request. Repeat the original filter and maxResults when paginating.",
-            REASON_FIELD_VALIDATION_FAILED,
-            Some((
+            (
                 "nextToken".to_string(),
                 "issued for a different filter or maxResults".to_string(),
-            )),
+            ),
         ));
     }
     usize::from_str_radix(offset, 16).map_err(|_| malformed())
@@ -442,31 +542,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `maxResults` absent means "no page limit": report every matching record.
         // AWS documents no default page size for this operation, and the model's
-        // `MaxResults` range (1..1000) is refused by the framework's constraint
-        // validation before this handler runs; the same bound is enforced here as a
-        // backstop, because a page size of 0 would otherwise report an empty page while
-        // still owing a `nextToken` — a listing that never terminates. The range check
-        // and the conversion share ONE refusal, so neither can fall through to a
-        // silently unbounded page.
+        // `MaxResults` range (1..1000) is refused at the constraint boundary before
+        // this handler runs; the same bound is enforced here as a backstop, because a
+        // page size of 0 would otherwise report an empty page while still owing a
+        // `nextToken` — a listing that never terminates. The range check and the
+        // conversion share ONE refusal, so neither can fall through to a silently
+        // unbounded page, and it is stated as the same violation the boundary states.
         let page_size = match input.max_results {
             Some(max_results) => usize::try_from(max_results)
                 .ok()
                 .filter(|_| (MAX_RESULTS_RANGE.0..=MAX_RESULTS_RANGE.1).contains(&max_results))
                 .ok_or_else(|| {
-                    validation(
-                        format!(
-                            "maxResults must be between {} and {}, got {max_results}",
-                            MAX_RESULTS_RANGE.0, MAX_RESULTS_RANGE.1
-                        ),
-                        REASON_FIELD_VALIDATION_FAILED,
-                        Some((
-                            "maxResults".to_string(),
-                            format!(
-                                "expected a value between {} and {}",
-                                MAX_RESULTS_RANGE.0, MAX_RESULTS_RANGE.1
-                            ),
-                        )),
-                    )
+                    let kind = if max_results < MAX_RESULTS_RANGE.0 {
+                        ViolationKind::MinValue(MAX_RESULTS_RANGE.0.to_string())
+                    } else {
+                        ViolationKind::MaxValue(MAX_RESULTS_RANGE.1.to_string())
+                    };
+                    let violation = Violation {
+                        path: constraints::path::member("maxResults"),
+                        kind,
+                        value: Some(max_results.to_string()),
+                    };
+                    ListRecommendedActionsError::from(field_validation_failed(&[violation]))
                 })?,
             None => usize::MAX,
         };
