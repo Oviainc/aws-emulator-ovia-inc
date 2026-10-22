@@ -67,8 +67,8 @@ const PROFILE_MEMBERS: &[&str] = &[
 /// A router with just this service mounted on a fresh engine.
 ///
 /// `pub(crate)` because the wire harness below is shared with this crate's other
-/// suites (`tests/all/get_group_id.rs`, `tests/all/list_groups.rs`) rather than copied
-/// into each of them.
+/// suites (`tests/all/get_group_id.rs`, `tests/all/is_member_in_groups.rs`,
+/// `tests/all/list_groups.rs`) rather than copied into each of them.
 pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -277,7 +277,12 @@ fn user_name(case: &str, index: usize) -> String {
 }
 
 /// Create a user and return its `UserId`.
-async fn create_user(router: &MultiServiceRouter, store: &str, user_name: &str, case: &str) -> String {
+pub(crate) async fn create_user(
+    router: &MultiServiceRouter,
+    store: &str,
+    user_name: &str,
+    case: &str,
+) -> String {
     let created = ok(
         router,
         "CreateUser",
@@ -289,7 +294,7 @@ async fn create_user(router: &MultiServiceRouter, store: &str, user_name: &str, 
 }
 
 /// Create a group and return its `GroupId`.
-async fn create_group(
+pub(crate) async fn create_group(
     router: &MultiServiceRouter,
     store: &str,
     display_name: &str,
