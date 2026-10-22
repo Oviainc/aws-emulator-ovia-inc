@@ -3,7 +3,9 @@
 //! @op ListTagsForResource
 //! Reports the tags stored on the environment the ARN names — the ones
 //! `CreateEnvironment` was given plus every later `TagResource`/`UntagResource`. An
-//! ARN this service holds no environment for is a `ResourceNotFoundException`.
+//! ARN this service holds no environment for is a `ResourceNotFoundException` — the
+//! tagging surface's own, answered with HTTP 400 and carrying the request's
+//! `resourceArn` (see `crate::scaffolded`).
 //!
 //! ## Shape of an operation
 //!
@@ -148,9 +150,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let environment = state
             .environment_by_arn(&input.resource_arn)
             .ok_or_else(|| {
-                ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                    crate::state::environment_not_found(&input.resource_arn),
-                )
+                // The tagging surface's own not-found refusal: HTTP 400, the fixed
+                // resource-agnostic message, and the request's `resourceArn` echoed.
+                // NOT `crate::state::environment_not_found`, which is the
+                // environmentId-addressed lookup error (404, `resourceId` /
+                // `resourceType`).
+                crate::scaffolded::Scaffolded::tagging_resource_not_found(&input.resource_arn)
             })?;
 
         Ok(ListTagsForResourceOutput {

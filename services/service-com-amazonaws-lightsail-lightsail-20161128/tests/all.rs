@@ -19,5 +19,7 @@ mod domain_zone;
 mod instance_lifecycle;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
+#[path = "all/relational_database_blueprints.rs"]
+mod relational_database_blueprints;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
