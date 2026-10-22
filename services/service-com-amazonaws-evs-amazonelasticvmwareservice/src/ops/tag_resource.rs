@@ -4,7 +4,8 @@
 //! Merges the request's tags into the stored environment the ARN names: tags already
 //! on the resource that the request does not mention are left alone. A resource with
 //! more than 200 tags is refused; an ARN this service holds no environment for is a
-//! `ResourceNotFoundException`.
+//! `ResourceNotFoundException` — the tagging surface's own, answered with HTTP 400 and
+//! carrying the request's `resourceArn` (see `crate::scaffolded`).
 //!
 //! ## Shape of an operation
 //!
@@ -170,9 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let environment = state
             .environment_by_arn_mut(&input.resource_arn)
             .ok_or_else(|| {
-                TagResourceErrorModeled::ResourceNotFoundException(
-                    crate::state::environment_not_found(&input.resource_arn),
-                )
+                // The tagging surface's own not-found refusal: HTTP 400, the fixed
+                // resource-agnostic message, and the request's `resourceArn` echoed.
+                // NOT `crate::state::environment_not_found`, which is the
+                // environmentId-addressed lookup error (404, `resourceId` /
+                // `resourceType`).
+                crate::scaffolded::Scaffolded::tagging_resource_not_found(&input.resource_arn)
             })?;
 
         // "If existing tags on a resource are not specified in the request parameters,

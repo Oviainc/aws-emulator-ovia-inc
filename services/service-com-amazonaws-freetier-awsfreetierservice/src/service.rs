@@ -34,11 +34,29 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — the codec this service's own responses are serialized
+//!   in. The default returns `None`, keeping the model-derived protocol; this
+//!   service overrides it (see "The media type this service announces" below).
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The media type this service announces
+//!
+//! The model declares the `awsJson1_0` protocol trait, but every recorded response
+//! this SERVICE produces — a success and a modelled failure its handler raises
+//! alike — announces `application/x-amz-json-1.1`, and the media type a client
+//! reads is what it keys content negotiation and protocol assertion off.
+//! `override_protocol` below therefore serves the awsJson `1.1` codec: the JSON
+//! framing is byte-identical to `1.0`, so a request sent with either media type
+//! still reads, and only the announced media type changes.
+//!
+//! A refusal of the REQUEST is not a response the service produced — the framework
+//! answers it in front of the service — so the routing, transport and refusal
+//! envelopes keep the media type the model's protocol trait declares, which is the
+//! one seam `override_protocol` deliberately does not reach.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -52,6 +70,12 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The codec this service answers in (awsJson `1.1`; see the module docs).
+    /// Built once here because [`Service::override_protocol`] hands back a borrow
+    /// of it.
+    protocol: aws_smithy_schema_server::rpc::HttpRpcServerProtocol<
+        aws_smithy_schema_server::json::JsonCodec,
+    >,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +85,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: aws_smithy_schema_server::rpc::AwsJson11(),
         }
     }
 }
@@ -107,6 +132,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // leaving both alone.
         let _ = refusal;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every response this SERVICE produces — a success and a modelled failure
+        // its handler raises — is serialized by the protocol returned here, so this
+        // is the one place the media type it announces is decided. See the module
+        // docs: every recorded response of this service carries the awsJson `1.1`
+        // media type, which is what a client keys its parsing off.
+        Some(&self.protocol)
     }
 
     fn override_routing_error(

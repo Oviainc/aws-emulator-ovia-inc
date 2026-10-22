@@ -6,6 +6,12 @@
 //! `accountPlanType` and reports what was stored, so a following
 //! `GetAccountPlanState` reports the same plan.
 //!
+//! This is the service's ONLY plan-writing operation, so it is also what
+//! establishes the record for an account that holds no account-plan data yet
+//! ([`crate::state::ComAmazonawsFreetierAwsfreetierserviceState::plan_mut`]);
+//! `GetAccountPlanState`, which only reports, answers such an account with the
+//! modelled `ResourceNotFoundException` instead.
+//!
 //! The scaffold's guidance follows.
 //!
 //! ## Shape of an operation
@@ -175,6 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let account_id = crate::state::caller_account_id();
         let mut store = state.lock();
+        // The plan this call writes, established on the free plan when the
+        // account holds none: moving an account onto a plan is the mutation the
+        // caller asked for, and this is the one operation allowed to make it.
         let plan = store.plan_mut(account_id);
         // The plan the clock already moved is what this call starts from.
         plan.settle(crate::state::now());

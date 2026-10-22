@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCanary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCanary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCanary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a canary record in this service's store and answers with the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +145,16 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use crate::state::{
+    default_run_timeout_in_seconds, engine_arn, source_location_arn, CanaryState,
+    StoredArtifactConfig, StoredCanary, StoredCode, StoredDependency, StoredRunConfig,
+    StoredSchedule, StoredVpcConfig, CREATE_IN_PROGRESS_REASON_CODE,
+    DEFAULT_PROVISIONED_RESOURCE_CLEANUP, DEFAULT_RETENTION_PERIOD_IN_DAYS,
+    DEFAULT_SCHEDULE_DURATION_IN_SECONDS, MAX_CANARIES, PROVISIONING_SETTLE, STORE_UNAVAILABLE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -165,11 +167,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-synthetics-synthetics.j
 // here — hence the `CreateCanaryError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.synthetics#CreateCanary")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.synthetics#CreateCanary",
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateCanaryErrorModeled {
     InternalServerException(InternalServerException),
     RequestEntityTooLargeException(RequestEntityTooLargeException),
+    // Widened in with `extra_errors`: the service models this shape (HTTP 402) and it is
+    // what a caller past a canary quota is answered with, but `CreateCanary`'s own
+    // `errors` list in the model omits it.
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
 }
 
@@ -224,18 +233,253 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCanary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCanaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCanary"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_error)?;
+        let now = SystemTime::now();
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        // Rules the model documents in prose but cannot express as a constraint, so they
+        // are refused here rather than at the boundary.
+        validate_code(&input.code)?;
+        validate_run_config(input.run_config.as_ref())?;
+        if input.resources_to_replicate_tags.is_some()
+            && input.tags.as_ref().is_none_or(|tags| tags.is_empty())
+        {
+            // `CreateCanaryRequest$ResourcesToReplicateTags`: "If you specify this
+            // parameter and don't specify any tags in the Tags parameter, the canary
+            // creation fails."
+            return Err(validation(
+                "ResourcesToReplicateTags requires at least one tag in Tags",
+            ));
+        }
+        if input.add_replica_locations.is_some() {
+            // Cross-region replicas would have to report a per-region replication state
+            // this emulator cannot produce, so the request is refused instead of being
+            // accepted and silently dropped.
+            return Err(validation(
+                "AddReplicaLocations is not supported: this emulator does not replicate \
+                 canaries across Regions",
+            ));
+        }
+
+        let id = crate::state::new_uuid();
+        let schedule_expression = input.schedule.expression.clone();
+        let stored = StoredCanary {
+            code: StoredCode {
+                // `Handler` carries `@default: ""`, so an omitted handler arrives as the
+                // empty string; report it absent rather than as an empty entry point.
+                handler: input
+                    .code
+                    .handler
+                    .filter(|handler| !handler.is_empty()),
+                blueprint_types: input.code.blueprint_types.unwrap_or_default(),
+                dependencies: input
+                    .code
+                    .dependencies
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|dep| StoredDependency {
+                        r#type: dep.r#type,
+                        reference: dep.reference,
+                    })
+                    .collect(),
+                source_location_arn: source_location_arn(&region, &input.name, &id),
+                s3_bucket: input.code.s3_bucket,
+                s3_key: input.code.s3_key,
+                s3_version: input.code.s3_version,
+            },
+            execution_role_arn: input.execution_role_arn,
+            schedule: StoredSchedule {
+                duration_in_seconds: input
+                    .schedule
+                    .duration_in_seconds
+                    .unwrap_or(DEFAULT_SCHEDULE_DURATION_IN_SECONDS),
+                max_retries: input
+                    .schedule
+                    .retry_config
+                    .map(|retry| retry.max_retries),
+                expression: schedule_expression.clone(),
+            },
+            // Every canary has a run configuration: the documented
+            // `TimeoutInSeconds` default is a property of the member, so it applies when
+            // the whole structure is omitted as much as when only the member is.
+            run_config: StoredRunConfig {
+                timeout_in_seconds: input
+                    .run_config
+                    .as_ref()
+                    .and_then(|rc| rc.timeout_in_seconds)
+                    .unwrap_or_else(|| default_run_timeout_in_seconds(&schedule_expression)),
+                memory_in_mb: input.run_config.as_ref().and_then(|rc| rc.memory_in_mb),
+                active_tracing: input.run_config.as_ref().and_then(|rc| rc.active_tracing),
+                ephemeral_storage: input
+                    .run_config
+                    .as_ref()
+                    .and_then(|rc| rc.ephemeral_storage),
+                environment_variables: input
+                    .run_config
+                    .and_then(|rc| rc.environment_variables)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            },
+            success_retention_period_in_days: input
+                .success_retention_period_in_days
+                .unwrap_or(DEFAULT_RETENTION_PERIOD_IN_DAYS),
+            failure_retention_period_in_days: input
+                .failure_retention_period_in_days
+                .unwrap_or(DEFAULT_RETENTION_PERIOD_IN_DAYS),
+            artifact_s3_location: input.artifact_s3_location,
+            artifact_config: input.artifact_config.map(|cfg| StoredArtifactConfig {
+                encryption_mode: cfg
+                    .s3_encryption
+                    .as_ref()
+                    .and_then(|enc| enc.encryption_mode.clone()),
+                kms_key_arn: cfg
+                    .s3_encryption
+                    .as_ref()
+                    .and_then(|enc| enc.kms_key_arn.clone()),
+            }),
+            runtime_version: input.runtime_version,
+            vpc_config: input.vpc_config.map(|vpc| StoredVpcConfig {
+                subnet_ids: vpc.subnet_ids.unwrap_or_default(),
+                security_group_ids: vpc.security_group_ids.unwrap_or_default(),
+                ipv6_allowed_for_dual_stack: vpc.ipv6_allowed_for_dual_stack,
+            }),
+            engine_arn: engine_arn(&region, &input.name, &id),
+            provisioned_resource_cleanup: input
+                .provisioned_resource_cleanup
+                .unwrap_or_else(|| DEFAULT_PROVISIONED_RESOURCE_CLEANUP.to_string()),
+            kms_key_arn: input.kms_key_arn,
+            // The canary is reported as still being provisioned; the move to READY is
+            // owed by the clock, not by another call.
+            state: CanaryState::Creating,
+            state_reason: None,
+            state_reason_code: Some(CREATE_IN_PROGRESS_REASON_CODE.to_string()),
+            ready_due: Some(now + PROVISIONING_SETTLE),
+            created: now,
+            last_modified: now,
+            last_started: None,
+            last_stopped: None,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+            browser_types: input
+                .browser_configs
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|cfg| cfg.browser_type)
+                .collect(),
+            runs: Vec::new(),
+            id,
+            name: input.name,
+            region,
+        };
+
+        // Claim the name and read the response back out of the stored record, under one
+        // lock, so a duplicate can never overwrite a canary and the response can never
+        // describe anything other than what was persisted.
+        let mut guard = state.lock();
+        if guard.canaries.contains_key(&stored.name) {
+            return Err(validation(format!(
+                "Canary with name {} already exists",
+                stored.name
+            )));
+        }
+        // Checked under the same lock as the insert, so a concurrent pair of creates
+        // cannot both pass it: the store never grows past the quota.
+        if guard.canaries.len() >= MAX_CANARIES {
+            return Err(CreateCanaryErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Maximum number of canaries reached: {MAX_CANARIES} canaries per Region"
+                    )),
+                },
+            )
+            .into());
+        }
+        let name = stored.name.clone();
+        let canary = guard
+            .canaries
+            .entry(name)
+            .or_insert(stored)
+            .to_canary();
+        Ok(CreateCanaryOutput {
+            canary: Some(canary),
+        })
     }
+}
+
+/// The modelled 400 this service refuses a bad request with.
+fn validation(message: impl Into<String>) -> CreateCanaryError {
+    CreateCanaryErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled 500 for a store that cannot be reached. Never a fresh engine: a private
+/// store would accept the write and drop it when the request returns.
+fn internal_error() -> CreateCanaryError {
+    CreateCanaryErrorModeled::InternalServerException(InternalServerException {
+        message: Some(STORE_UNAVAILABLE.to_string()),
+    })
+    .into()
+}
+
+/// The two prose rules `CanaryCodeInput` states about where a canary's code comes from.
+fn validate_code(code: &CanaryCodeInput) -> Result<(), CreateCanaryError> {
+    let blueprints = code
+        .blueprint_types
+        .as_ref()
+        .is_some_and(|types| !types.is_empty());
+    let handler = code.handler.as_deref().is_some_and(|h| !h.is_empty());
+    // `CanaryCodeInput$Handler`: "This field is required when you don't specify
+    // BlueprintTypes and is not allowed when you specify BlueprintTypes."
+    if blueprints && handler {
+        return Err(validation(
+            "Code.Handler is not allowed when Code.BlueprintTypes is specified",
+        ));
+    }
+    if !blueprints && !handler {
+        return Err(validation(
+            "Code.Handler is required when Code.BlueprintTypes is not specified",
+        ));
+    }
+
+    // `CanaryCodeInput`: the script is either in Amazon S3 ("the bucket name, key, and
+    // version are also included") or passed in directly ("the script code is contained
+    // in the value of Zipfile") — one of the two, never both.
+    let zip = code.zip_file.as_ref().is_some_and(|zip| !zip.is_empty());
+    let bucket = code.s3_bucket.is_some();
+    let key = code.s3_key.is_some();
+    if zip && (bucket || key) {
+        return Err(validation(
+            "Code.ZipFile cannot be combined with Code.S3Bucket or Code.S3Key",
+        ));
+    }
+    // That prose is written for a script-based canary. A blueprint canary is created
+    // "by providing only a JSON configuration file instead of writing custom scripts"
+    // (`CanaryCodeInput$BlueprintTypes`), and nothing the model says requires a script
+    // source for it, so the requirement is not imposed on that form.
+    if !(blueprints || zip || bucket && key) {
+        return Err(validation(
+            "Code must specify either ZipFile, or both S3Bucket and S3Key",
+        ));
+    }
+    Ok(())
+}
+
+/// `CanaryRunConfigInput$MemoryInMB`: "This value must be a multiple of 64." A range
+/// constraint cannot express that, so it is refused here.
+fn validate_run_config(run_config: Option<&CanaryRunConfigInput>) -> Result<(), CreateCanaryError> {
+    let Some(memory) = run_config.and_then(|rc| rc.memory_in_mb) else {
+        return Ok(());
+    };
+    if memory % 64 != 0 {
+        return Err(validation(format!(
+            "RunConfig.MemoryInMB must be a multiple of 64, got {memory}"
+        )));
+    }
+    Ok(())
 }

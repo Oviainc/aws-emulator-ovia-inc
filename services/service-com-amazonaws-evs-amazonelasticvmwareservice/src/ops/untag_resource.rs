@@ -3,7 +3,9 @@
 //! @op UntagResource
 //! Removes the named tag keys from the stored environment the ARN names. `@idempotent`:
 //! a key the resource does not carry is not an error. An ARN this service holds no
-//! environment for is a `ResourceNotFoundException`.
+//! environment for is a `ResourceNotFoundException` — the tagging surface's own,
+//! answered with HTTP 400 and carrying the request's `resourceArn` (see
+//! `crate::scaffolded`).
 //!
 //! ## Shape of an operation
 //!
@@ -150,9 +152,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let environment = state
             .environment_by_arn_mut(&input.resource_arn)
             .ok_or_else(|| {
-                UntagResourceErrorModeled::ResourceNotFoundException(
-                    crate::state::environment_not_found(&input.resource_arn),
-                )
+                // The tagging surface's own not-found refusal: HTTP 400, the fixed
+                // resource-agnostic message, and the request's `resourceArn` echoed.
+                // NOT `crate::state::environment_not_found`, which is the
+                // environmentId-addressed lookup error (404, `resourceId` /
+                // `resourceType`).
+                crate::scaffolded::Scaffolded::tagging_resource_not_found(&input.resource_arn)
             })?;
 
         let mut removed = false;

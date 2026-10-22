@@ -15,6 +15,24 @@
 //! when its `Action`/`Resource` patterns INTERSECT the caller's. That is what the
 //! [`intersect`] module adds.
 //!
+//! The evaluation's cost is CAPPED before any matching runs — statements per document
+//! ([`MAX_POLICY_STATEMENTS`]), patterns per document ([`MAX_POLICY_PATTERNS`]),
+//! characters ([`MAX_PATTERN_CHARACTERS`]) and wildcards ([`MAX_PATTERN_WILDCARDS`]) per
+//! pattern, the product of the probed actions, the probed resources and the statements
+//! ([`MAX_EVALUATION_WORK`]), and the worst-case CHARACTER work of the comparisons
+//! themselves ([`MAX_MATCH_CHARACTER_WORK`]) — and a request past a cap is refused with
+//! the modelled `ValidationException` rather than walked. Every pattern is compiled
+//! exactly once, each (probe, pattern) comparison is made exactly once, and the bounded
+//! evaluation runs on the BLOCKING pool, so it occupies no async worker and the
+//! `spawn_blocking(..).await` is a real await point a timeout, a cancellation or a
+//! shutdown can land on.
+//!
+//! A statement gated by a `Condition` only MIGHT apply, since this check is given no
+//! request context to evaluate the condition against: a conditional `Allow` is counted
+//! as granting and a conditional `Deny` does not suppress one, which keeps the answer on
+//! the side the operation's own doc describes — "If the result is FAIL, the specified
+//! policy might allow some or all of the permissions in the access object."
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -216,9 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // This operation is `@readonly` and owns no resource: it answers from the policy
         // document the request carries, so it neither reads nor writes this service's
-        // store and leaves nothing behind for a later caller to see. The engine and the
-        // request metadata stay bound, as every handler in this crate has them.
-        let _ = (ctx, &self.engine);
+        // store and leaves nothing behind for a later caller to see. The engine stays
+        // bound, as every handler in this crate has it; `ctx` attributes the call in the
+        // access record this service writes for every operation.
+        let _ = &self.engine;
         // The request path is recorded, with the sizes that drive the work but NOT the
         // policy document itself (`policyDocument` is `@sensitive`).
         ::tracing::debug!(
@@ -233,6 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // has already refused anything else; refusing it again is what keeps the handler
         // from guessing a grammar.
         let flavor = policy::Flavor::from_policy_type(&input.policy_type).ok_or_else(|| {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
             refuse_field(
                 "policyType",
                 format!(
@@ -248,12 +268,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // document's own size and shape in `policy::parse`, the length of every pattern
         // in `intersect::evaluable`, and finally one matching budget over their product.
         if input.access.is_empty() {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
             return Err(refuse_field(
                 "access",
                 "access must name at least one access object".to_string(),
             ));
         }
         if input.access.len() > MAX_ACCESS_ENTRIES {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
             return Err(refuse_field(
                 "access",
                 format!(
@@ -264,8 +286,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let document = policy::parse(&input.policy_document, "policyDocument", flavor)
-            .map_err(refuse_document)?;
-        intersect::evaluable(&document).map_err(refuse_matching)?;
+            .map_err(|error| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                );
+                refuse_document(error)
+            })?;
+        intersect::evaluable(&document).map_err(|error| {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
+            refuse_matching(error)
+        })?;
 
         // One matching budget for the whole request, charged before any table is sized,
         // so what a single request can ask the matchers for is bounded however its
@@ -283,6 +315,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let named_actions = access.actions.as_deref().unwrap_or(&[]);
             let named_resources = access.resources.as_slice();
             if named_actions.is_empty() && named_resources.is_empty() {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                );
                 return Err(refuse_field(
                     "access",
                     format!("access[{position}] must specify actions, resources, or both"),
@@ -359,6 +396,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "the policy check is decided"
         );
 
+        // ONE record for the call, whichever result it answers: the outcome is the same
+        // "the check ran" either way, and the result itself is in the response.
+        crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::CheckEvaluated);
         if reasons.is_empty() {
             Ok(CheckAccessNotGrantedOutput {
                 result: Some(RESULT_PASS.to_string()),
