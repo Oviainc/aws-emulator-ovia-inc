@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListManagedResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListManagedResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListManagedResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the managed resources the store holds, one page at a time, each summary
+//! carrying the shifts in progress for that resource and the weights they move.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +76,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{encode_page_token, page_request};
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +150,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListManagedResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListManagedResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListManagedResources"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListManagedResourcesError::from(
+                ListManagedResourcesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the ARC zonal shift store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // The paging rule is this service's, not this operation's, so both list
+        // operations read their token and page size through the same helper.
+        let page = page_request(input.next_token.as_deref(), input.max_results).map_err(
+            |refused| {
+                ListManagedResourcesError::from(
+                    ListManagedResourcesErrorModeled::ValidationException(ValidationException {
+                        message: refused.message,
+                        reason: refused.reason.to_string(),
+                    }),
+                )
+            },
+        )?;
+
+        let mut store = state.lock();
+        // Reporting only: materialises the expiry the clock already made due, so a
+        // summary never reports a shift that stopped being applied before this call.
+        store.expire_due_shifts(SystemTime::now());
+
+        // `managed_resources` is a BTreeMap, so `keys()` ascends: the cursor
+        // comparison below and the token issued from the last key returned are both
+        // well defined, and a walk neither skips nor repeats a resource.
+        let mut remaining = store
+            .managed_resources
+            .values()
+            .filter(|resource| {
+                page.after
+                    .as_deref()
+                    .is_none_or(|after| resource.arn.as_str() > after)
+            })
+            .peekable();
+
+        let mut items = Vec::new();
+        let mut last_key = None;
+        for resource in remaining.by_ref().take(page.page_size) {
+            items.push(ManagedResourceSummary {
+                arn: Some(resource.arn.clone()),
+                name: Some(resource.name.clone()),
+                availability_zones: resource.availability_zones.clone(),
+                autoshifts: Some(resource.autoshifts.clone()),
+                zonal_autoshift_status: Some(resource.zonal_autoshift_status.as_wire().to_string()),
+                practice_run_status: Some(resource.practice_run_status().as_wire().to_string()),
+                applied_weights: Some(store.applied_weights(&resource.arn)),
+                zonal_shifts: Some(store.zonal_shifts_in_resource(&resource.arn)),
+            });
+            last_key = Some(resource.arn.clone());
+        }
+
+        // A token is issued only when a further resource is actually waiting.
+        let next_token = remaining
+            .peek()
+            .and(last_key.as_deref())
+            .map(encode_page_token);
+
+        Ok(ListManagedResourcesOutput { items, next_token })
     }
 }

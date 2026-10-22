@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutImageScanningConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutImageScanningConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutImageScanningConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the image scanning configuration of one repository in this emulator's
+//! registry: the setting the request carries replaces whatever the repository held, is
+//! persisted on the [`crate::state::Repo`] record, and is what `DescribeRepositories`
+//! (and every other operation that reports that repository) reads back afterwards. The
+//! response reports the stored setting, never the request body.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +122,29 @@ impl From<PutImageScanningConfigurationErrorModeled> for PutImageScanningConfigu
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+///
+/// Only two of the shared failures are reachable here: a repository this registry does
+/// not hold, and a request naming another registry. This operation looks no image up,
+/// so [`crate::state::Fault::ImageNotFound`] is not raised on its path; it is folded
+/// into the same `InvalidParameterException` as any other unusable parameter rather
+/// than onto an error this operation does not model.
+fn fault_error(fault: crate::state::Fault) -> PutImageScanningConfigurationErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            PutImageScanningConfigurationErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        crate::state::Fault::InvalidParameter(_) | crate::state::Fault::ImageNotFound(_) => {
+            PutImageScanningConfigurationErrorModeled::InvalidParameterException(
+                InvalidParameterException { message },
+            )
+        }
+    }
+}
+
 /// The `PutImageScanningConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +181,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutImageScanningConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutImageScanningConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutImageScanningConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutImageScanningConfigurationErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // Nothing about this update depends on request metadata: the setting is stored
+        // on a repository that already carries the region of its own creation.
+        let _ = ctx;
+
+        // `registryId` names the registry holding the repository; this emulator serves
+        // exactly one registry — its own account's.
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let mut store = state.lock();
+        let repo = store
+            .repository_mut(&input.repository_name)
+            .map_err(fault_error)?;
+
+        // The whole setting is replaced, not merged: `imageScanningConfiguration` is a
+        // required member, so every call states the repository's new setting in full.
+        repo.image_scanning_config = Some(input.image_scanning_configuration);
+
+        Ok(PutImageScanningConfigurationOutput {
+            registry_id: Some(repo.registry_id.clone()),
+            repository_name: Some(repo.name.clone()),
+            image_scanning_configuration: repo.image_scanning_config.clone(),
+        })
     }
 }

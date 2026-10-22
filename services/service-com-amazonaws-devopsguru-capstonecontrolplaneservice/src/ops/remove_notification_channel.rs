@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveNotificationChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveNotificationChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveNotificationChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the stored notification channel with the given id; an id that names no
+//! stored channel — including one already removed — is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +142,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveNotificationChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveNotificationChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveNotificationChannel"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RemoveNotificationChannelError::Modeled(
+                RemoveNotificationChannelErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru notification channel store is unavailable"
+                            .to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        let mut guard = state.lock();
+
+        // Deleting is not idempotent here: the channel is gone after the first call, so
+        // the second call names a channel that does not exist.
+        if guard.notification_channels.remove(&input.id).is_none() {
+            return Err(
+                RemoveNotificationChannelErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("no notification channel with id {} exists", input.id),
+                        resource_id: input.id.clone(),
+                        resource_type: crate::state::NOTIFICATION_CHANNEL_RESOURCE_TYPE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(RemoveNotificationChannelOutput::default())
     }
 }

@@ -143,7 +143,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartJobRunErrorModeled::InternalServerException(InternalServerException {
@@ -151,17 +151,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let started_by = crate::state::request_principal(ctx);
+        let started_by = crate::state::request_principal();
         let started_on = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
         let Some(job) = store.jobs.get(&input.name).cloned() else {
             return Err(StartJobRunErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "One or more resources can't be found. The job {} was not found.",
-                        input.name
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

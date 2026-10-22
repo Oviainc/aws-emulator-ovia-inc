@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResourceCollection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResourceCollection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResourceCollection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Maintains the analysis coverage in [`crate::state::ResourceCoverage`]: `ADD` unions
+//! the submitted CloudFormation stack names and tag key/value pairs into it, `REMOVE`
+//! subtracts them. Coverage is a SET, so repeating a request changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +111,29 @@ impl From<UpdateResourceCollectionErrorModeled> for UpdateResourceCollectionErro
     }
 }
 
+/// A `ValidationException` (HTTP 400) refusing an `ADD` that would take the store past
+/// one of `crate::state`'s coverage caps.
+///
+/// `UpdateResourceCollection` declares no `ServiceQuotaExceededException`, so its
+/// modelled client-input error is the refusal channel; the message is built from the
+/// member and the bound the request exceeded.
+fn over_cap(
+    member: &str,
+    cap: usize,
+    requested: usize,
+    noun: &str,
+) -> UpdateResourceCollectionError {
+    UpdateResourceCollectionErrorModeled::ValidationException(ValidationException {
+        message: format!("the request would cover {requested} {noun}, past the maximum of {cap}"),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!("coverage is limited to {cap} {noun}"),
+        }]),
+    })
+    .into()
+}
+
 /// The `UpdateResourceCollection` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +170,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResourceCollection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResourceCollectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResourceCollection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateResourceCollectionError::Modeled(
+                UpdateResourceCollectionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru resource collection store is unavailable"
+                            .to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // `UpdateResourceCollectionAction` has exactly two values and the boundary
+        // validator refuses anything else, so the third arm is a refusal rather than
+        // the 501 a non-exhaustive match would otherwise need.
+        let adding = match input.action.as_str() {
+            "ADD" => true,
+            "REMOVE" => false,
+            other => {
+                let allowed = UPDATE_RESOURCE_COLLECTION_ACTION_VALUES.join(" | ");
+                return Err(UpdateResourceCollectionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!("Action must be one of {allowed}, got '{other}'"),
+                        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: "Action".to_string(),
+                            message: format!("must be one of {allowed}"),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let submitted_stacks: Vec<&String> = input
+            .resource_collection
+            .cloud_formation
+            .iter()
+            .flat_map(|filter| filter.stack_names.iter().flatten())
+            .collect();
+        let submitted_tags: Vec<&UpdateTagCollectionFilter> =
+            input.resource_collection.tags.iter().flatten().collect();
+
+        let mut guard = state.lock();
+
+        // STORE BOUNDS. Coverage is reclaimed only by an explicit REMOVE, so an ADD is
+        // refused when it would take the store past one of the caps in
+        // `crate::state`. Checked here, BEFORE any write, so a refused request leaves
+        // the coverage exactly as it was rather than half-applied.
+        if adding {
+            let coverage = &guard.resource_collection;
+
+            let new_stacks: std::collections::BTreeSet<&str> = submitted_stacks
+                .iter()
+                .map(|name| name.as_str())
+                .filter(|name| !coverage.cloudformation_stack_names.contains(*name))
+                .collect();
+            let prospective_stacks = coverage.cloudformation_stack_names.len() + new_stacks.len();
+            if prospective_stacks > crate::state::MAX_COVERED_STACK_NAMES {
+                return Err(over_cap(
+                    "ResourceCollection.CloudFormation.StackNames",
+                    crate::state::MAX_COVERED_STACK_NAMES,
+                    prospective_stacks,
+                    "CloudFormation stacks",
+                ));
+            }
+
+            let new_keys: std::collections::BTreeSet<&str> = submitted_tags
+                .iter()
+                .map(|tag| tag.app_boundary_key.as_str())
+                .filter(|key| !coverage.tag_collections.contains_key(*key))
+                .collect();
+            let prospective_keys = coverage.tag_collections.len() + new_keys.len();
+            if prospective_keys > crate::state::MAX_COVERED_TAG_KEYS {
+                return Err(over_cap(
+                    "ResourceCollection.Tags",
+                    crate::state::MAX_COVERED_TAG_KEYS,
+                    prospective_keys,
+                    "app boundary keys",
+                ));
+            }
+
+            let mut prospective_values: std::collections::BTreeMap<
+                &str,
+                std::collections::BTreeSet<&str>,
+            > = std::collections::BTreeMap::new();
+            for tag in &submitted_tags {
+                let values = prospective_values
+                    .entry(tag.app_boundary_key.as_str())
+                    .or_insert_with(|| {
+                        coverage
+                            .tag_collections
+                            .get(tag.app_boundary_key.as_str())
+                            .map(|stored| stored.iter().map(String::as_str).collect())
+                            .unwrap_or_default()
+                    });
+                values.extend(tag.tag_values.iter().map(String::as_str));
+            }
+            if let Some((key, values)) = prospective_values
+                .iter()
+                .find(|(_, values)| values.len() > crate::state::MAX_TAG_VALUES_PER_KEY)
+            {
+                return Err(over_cap(
+                    "ResourceCollection.Tags[].TagValues",
+                    crate::state::MAX_TAG_VALUES_PER_KEY,
+                    values.len(),
+                    &format!("tag values for app boundary key '{key}'"),
+                ));
+            }
+        }
+
+        let coverage = &mut guard.resource_collection;
+
+        // CloudFormation coverage: a set of stack names.
+        for stack_name in submitted_stacks {
+            if adding {
+                coverage
+                    .cloudformation_stack_names
+                    .insert(stack_name.clone());
+            } else {
+                coverage.cloudformation_stack_names.remove(stack_name);
+            }
+        }
+
+        // Tag coverage: per app-boundary key, a set of tag values.
+        for tag in submitted_tags {
+            if adding {
+                coverage
+                    .tag_collections
+                    .entry(tag.app_boundary_key.clone())
+                    .or_default()
+                    .extend(tag.tag_values.iter().cloned());
+            } else if let Some(values) = coverage.tag_collections.get_mut(&tag.app_boundary_key) {
+                for value in &tag.tag_values {
+                    values.remove(value);
+                }
+            }
+        }
+
+        // An app-boundary key is covered exactly while one of its tag values is, so a
+        // key left with no values is not reported as an empty tag collection.
+        coverage.tag_collections.retain(|_, values| !values.is_empty());
+
+        Ok(UpdateResourceCollectionOutput::default())
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReplicationConfigurationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReplicationConfigurationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReplicationConfigurationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the supplied members into the STORED template, leaving the ones the
+//! request omitted unchanged, and answers 200 with the merged record. An id the
+//! store does not hold is a 404 `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -220,18 +215,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReplicationConfigurationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReplicationConfigurationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReplicationConfigurationTemplate"))
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateReplicationConfigurationTemplateErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the service store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        if !store.initialized {
+            return Err(
+                UpdateReplicationConfigurationTemplateErrorModeled::UninitializedAccountException(
+                    UninitializedAccountException {
+                        message: Some(
+                            "Elastic Disaster Recovery has not been initialized for this account; \
+                             call InitializeService first"
+                                .to_string(),
+                        ),
+                        code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = input.replication_configuration_template_id;
+        let Some(record) = store.replication_configuration_templates.get_mut(&id) else {
+            return Err(
+                UpdateReplicationConfigurationTemplateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Replication configuration template {id} does not exist"
+                        )),
+                        code: None,
+                        resource_id: Some(id.clone()),
+                        resource_type: Some("ReplicationConfigurationTemplate".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A supplied member replaces the stored one; an omitted member is left alone.
+        // `arn` is an input member the model carries but the service assigns, so it is
+        // not merged: the stored ARN stays the one derived from this template's id.
+        if let Some(value) = input.staging_area_subnet_id {
+            record.staging_area_subnet_id = value;
+        }
+        if let Some(value) = input.associate_default_security_group {
+            record.associate_default_security_group = Some(value);
+        }
+        if let Some(value) = input.replication_servers_security_groups_i_ds {
+            record.replication_servers_security_groups_ids = value;
+        }
+        if let Some(value) = input.replication_server_instance_type {
+            record.replication_server_instance_type = Some(value);
+        }
+        if let Some(value) = input.use_dedicated_replication_server {
+            record.use_dedicated_replication_server = Some(value);
+        }
+        if let Some(value) = input.default_large_staging_disk_type {
+            record.default_large_staging_disk_type = Some(value);
+        }
+        if let Some(value) = input.ebs_encryption {
+            record.ebs_encryption = value;
+        }
+        if let Some(value) = input.ebs_encryption_key_arn {
+            record.ebs_encryption_key_arn = Some(value);
+        }
+        // `bandwidthThrottling` carries `@default(0)`, so the wire cannot distinguish
+        // "omitted" from "0" and the deserialized input is always a value this member
+        // must take.
+        record.bandwidth_throttling = input.bandwidth_throttling;
+        if let Some(value) = input.data_plane_routing {
+            record.data_plane_routing = Some(value);
+        }
+        if let Some(value) = input.create_public_ip {
+            record.create_public_ip = Some(value);
+        }
+        if let Some(value) = input.staging_area_tags {
+            record.staging_area_tags = value;
+        }
+        if let Some(value) = input.pit_policy {
+            record.pit_policy = value;
+        }
+        if let Some(value) = input.auto_replicate_new_disks {
+            record.auto_replicate_new_disks = Some(value);
+        }
+        if let Some(value) = input.internet_protocol {
+            record.internet_protocol = Some(value);
+        }
+
+        // The response is the record as it now stands in the store, so a 200 reports
+        // exactly what a following Describe will report.
+        Ok(record.to_update_wire())
     }
 }

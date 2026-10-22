@@ -194,25 +194,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.jobs.get(&input.name) else {
             return Err(DescribeJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "One or more resources can't be found. The job {} was not found.",
-                        input.name
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
         };
 
         Ok(DescribeJobOutput {
-            create_date: Some(crate::state::wire_date(record.create_date)),
-            created_by: Some(record.created_by.clone()),
+            create_date: Some(crate::state::wire_date(record.audit.create_date)),
+            created_by: Some(record.audit.created_by.clone()),
             dataset_name: record.dataset_name.clone(),
             encryption_key_arn: record.encryption_key_arn.clone(),
             encryption_mode: record.encryption_mode.clone(),
             name: record.name.clone(),
             r#type: Some(record.job_type.clone()),
-            last_modified_by: Some(record.last_modified_by.clone()),
-            last_modified_date: Some(crate::state::wire_date(record.last_modified_date)),
+            // Absent until a mutating operation has modified this job, for the reason
+            // `crate::state::Audit` gives.
+            last_modified_by: record.audit.wire_last_modified_by(),
+            last_modified_date: record.audit.wire_last_modified_date(),
             log_subscription: record.log_subscription.clone(),
             max_capacity: record.max_capacity,
             max_retries: record.max_retries,

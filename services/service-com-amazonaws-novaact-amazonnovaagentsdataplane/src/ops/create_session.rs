@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stores a new session under its workflow run and answers 201 with the session id it
+//! generated — a freshly generated lowercase UUID, the form the model's `UuidString` is
+//! constrained to.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Both parents are resolved first: an unknown definition name or run id answers
+//! `ResourceNotFoundException` (404), and a run that is not running conflicts with the
+//! request (409). The operation is `@idempotent`, so a `clientToken` already seen replays
+//! the session it created rather than adding a duplicate one.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +161,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSession"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSessionErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let not_found = |missing: crate::state::MissingResource| -> Self::Error {
+            CreateSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: missing.message,
+                resource_id: missing.resource_id,
+                resource_type: missing.resource_type,
+            })
+            .into()
+        };
+
+        let mut state = state.lock();
+        state.complete_due_deletions(now);
+
+        // The parent path is all this create carries beyond its token, so it is the
+        // whole fingerprint: the same token under another run is a different call.
+        let fingerprint = crate::state::fingerprint(&[
+            input.workflow_definition_name.clone(),
+            input.workflow_run_id.clone(),
+        ]);
+
+        let replay = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.idempotent_create(Self::NAME, token).cloned());
+        if let Some(record) = replay {
+            if record.fingerprint != fingerprint {
+                return Err(CreateSessionErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "clientToken was already used to create session {} with different parameters",
+                        record.resource_id
+                    ),
+                    resource_id: record.resource_id,
+                    resource_type: "session".to_string(),
+                })
+                .into());
+            }
+            let replayed = state
+                .definition(&input.workflow_definition_name)
+                .and_then(|definition| definition.run(&input.workflow_run_id))
+                .and_then(|run| run.session(&record.resource_id))
+                .map(|session| session.session_id.clone());
+            if let Ok(session_id) = replayed {
+                return Ok(CreateSessionOutput { session_id });
+            }
+            // The session that token created is gone with its parents: create a new one.
+        }
+
+        let run_status = state
+            .definition(&input.workflow_definition_name)
+            .and_then(|definition| definition.run(&input.workflow_run_id))
+            .map(|run| run.status)
+            .map_err(not_found)?;
+        if run_status != crate::state::WorkflowRunStatus::Running {
+            return Err(CreateSessionErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "workflow run {} is {} and cannot accept a new session",
+                    input.workflow_run_id,
+                    run_status.as_wire()
+                ),
+                resource_id: input.workflow_run_id.clone(),
+                resource_type: "workflow-run".to_string(),
+            })
+            .into());
+        }
+
+        // The session store is bounded, per run and store-wide.
+        state
+            .check_session_quota(&input.workflow_definition_name, &input.workflow_run_id)
+            .map_err(|quota| -> Self::Error {
+                CreateSessionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: quota.message(&input.workflow_run_id),
+                        resource_id: input.workflow_run_id.clone(),
+                        resource_type: quota.resource_type().to_string(),
+                        service_code: crate::state::SERVICE_CODE.to_string(),
+                        quota_code: quota.code().to_string(),
+                    },
+                )
+                .into()
+            })?;
+
+        let insertion_seq = state.next_insertion_seq();
+        let session_id = state.mint_uuid();
+        let session = crate::state::Session {
+            session_id: session_id.clone(),
+            created_at: now,
+            acts: ::std::collections::BTreeMap::new(),
+            insertion_seq,
+        };
+        state
+            .insert_session(
+                &input.workflow_definition_name,
+                &input.workflow_run_id,
+                session,
+            )
+            .map_err(not_found)?;
+        if let Some(token) = input.client_token.as_deref() {
+            state.record_idempotent_create(Self::NAME, token, fingerprint, session_id.clone());
+        }
+
+        Ok(CreateSessionOutput { session_id })
     }
 }

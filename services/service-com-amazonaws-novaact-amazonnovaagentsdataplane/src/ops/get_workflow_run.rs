@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkflowRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkflowRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads a stored workflow run back. Its ARN, id, status, start time, model id and log
+//! group all come from the record `CreateWorkflowRun` stored under the parent definition,
+//! and `endedAt` is reported only once the run reached a terminal status.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkflowRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Parentage is resolved before the run: an unknown definition name and an unknown run
+//! id both answer `ResourceNotFoundException` (404), each naming what was missing. Like
+//! every read here it first materialises a deletion the clock has already made due, which
+//! was owed at that instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +167,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkflowRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkflowRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkflowRun"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWorkflowRunErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let not_found = |missing: crate::state::MissingResource| -> Self::Error {
+            GetWorkflowRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: missing.message,
+                resource_id: missing.resource_id,
+                resource_type: missing.resource_type,
+            })
+            .into()
+        };
+
+        let mut state = state.lock();
+        state.complete_due_deletions(now);
+
+        let run = state
+            .definition(&input.workflow_definition_name)
+            .and_then(|definition| definition.run(&input.workflow_run_id))
+            .map_err(not_found)?;
+
+        Ok(GetWorkflowRunOutput {
+            workflow_run_arn: run.arn.clone(),
+            workflow_run_id: run.run_id.clone(),
+            status: run.status.as_wire().to_string(),
+            started_at: ::aws_smithy_types::DateTime::from(run.started_at),
+            ended_at: run
+                .ended_at
+                .filter(|_| run.status.is_terminal())
+                .map(::aws_smithy_types::DateTime::from),
+            model_id: run.model_id.clone(),
+            log_group_name: run.log_group_name.clone(),
+        })
     }
 }

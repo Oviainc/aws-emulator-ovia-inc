@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints the lowercase v4 UUID `AddNotificationChannel` returns as the channel id.
+uuid = { version = "1", features = ["v4"] }
+# Binds an opaque pagination token to the collection it walks (see src/state.rs).
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

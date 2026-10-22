@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceCollection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceCollection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceCollection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the coverage [`crate::ops::update_resource_collection`] persisted, narrowed to
+//! the requested `ResourceCollectionType`. A pure read: it never writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +162,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceCollection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceCollectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceCollection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourceCollectionError::Modeled(
+                GetResourceCollectionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru resource collection store is unavailable"
+                            .to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // A token names an offset into ONE collection type's coverage, so it is
+        // scoped to the type being read: a token from another type does not resolve.
+        let collection_type = input.resource_collection_type.clone();
+        let scope = format!("GetResourceCollection/{collection_type}");
+        let invalid_next_token = || -> GetResourceCollectionError {
+            GetResourceCollectionErrorModeled::ValidationException(ValidationException {
+                message: "NextToken does not name a page of this resource collection"
+                    .to_string(),
+                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "NextToken".to_string(),
+                    message: "must be a token returned by an earlier GetResourceCollection for the same ResourceCollectionType"
+                        .to_string(),
+                }]),
+            })
+            .into()
+        };
+        let token = input.next_token.as_deref();
+
+        let guard = state.lock();
+        let coverage = &guard.resource_collection;
+
+        let (resource_collection, next_token) = match collection_type.as_str() {
+            "AWS_CLOUD_FORMATION" => {
+                let stack_names: Vec<String> =
+                    coverage.cloudformation_stack_names.iter().cloned().collect();
+                let (page, next) = crate::state::page(&stack_names, &scope, token)
+                    .ok_or_else(invalid_next_token)?;
+                (
+                    ResourceCollectionFilter {
+                        cloud_formation: Some(CloudFormationCollectionFilter {
+                            stack_names: Some(page),
+                        }),
+                        tags: None,
+                    },
+                    next,
+                )
+            }
+            "AWS_TAGS" => {
+                let tags: Vec<TagCollectionFilter> = coverage
+                    .tag_collections
+                    .iter()
+                    .map(|(app_boundary_key, tag_values)| TagCollectionFilter {
+                        app_boundary_key: app_boundary_key.clone(),
+                        tag_values: tag_values.iter().cloned().collect(),
+                    })
+                    .collect();
+                let (page, next) =
+                    crate::state::page(&tags, &scope, token).ok_or_else(invalid_next_token)?;
+                (
+                    ResourceCollectionFilter {
+                        cloud_formation: None,
+                        tags: Some(page),
+                    },
+                    next,
+                )
+            }
+            "AWS_SERVICE" => {
+                // `ResourceCollectionFilter` models only `CloudFormation` and `Tags`:
+                // service coverage is derived by DevOps Guru's own analysis and is not
+                // part of the client-declared collection, so there is nothing to
+                // report for this type. The token is still checked, so a cursor from
+                // another type is refused here too.
+                let nothing: Vec<TagCollectionFilter> = Vec::new();
+                let (_, next) =
+                    crate::state::page(&nothing, &scope, token).ok_or_else(invalid_next_token)?;
+                (
+                    ResourceCollectionFilter {
+                        cloud_formation: None,
+                        tags: None,
+                    },
+                    next,
+                )
+            }
+            other => {
+                let allowed = RESOURCE_COLLECTION_TYPE_VALUES.join(" | ");
+                return Err(GetResourceCollectionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "ResourceCollectionType must be one of {allowed}, got '{other}'"
+                        ),
+                        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: "ResourceCollectionType".to_string(),
+                            message: format!("must be one of {allowed}"),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        };
+
+        Ok(GetResourceCollectionOutput {
+            resource_collection: Some(resource_collection),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListZonalShifts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListZonalShifts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListZonalShifts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the zonal shifts the store holds — active and completed — filtered by the
+//! `status` and `resourceIdentifier` query parameters and returned one page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +83,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{as_date_time, encode_page_token, page_request};
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -162,18 +157,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListZonalShifts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListZonalShiftsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListZonalShifts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListZonalShiftsError::from(ListZonalShiftsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the ARC zonal shift store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // The paging rule is this service's, not this operation's, so both list
+        // operations read their token and page size through the same helper.
+        let page = page_request(input.next_token.as_deref(), input.max_results).map_err(|refused| {
+            ListZonalShiftsError::from(ListZonalShiftsErrorModeled::ValidationException(
+                ValidationException {
+                    message: refused.message,
+                    reason: refused.reason.to_string(),
+                },
+            ))
+        })?;
+
+        let mut store = state.lock();
+        // Reporting only: materialises the expiry the clock already made due, so the
+        // status this call filters and reports on is the status the clock implies.
+        store.expire_due_shifts(SystemTime::now());
+
+        // `zonal_shifts` is a BTreeMap keyed by `zonalShiftId`, so `values()` ascends
+        // by id: the cursor comparison and the token issued from the last item
+        // returned are both well defined, and a walk neither skips nor repeats a
+        // shift.
+        let matching: Vec<ZonalShiftSummary> = store
+            .zonal_shifts
+            .values()
+            .filter(|shift| {
+                shift.zonal_shift_id.as_str() > page.after.as_deref().unwrap_or("")
+            })
+            .filter(|shift| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| status == shift.status.as_wire())
+            })
+            .filter(|shift| {
+                input
+                    .resource_identifier
+                    .as_deref()
+                    .is_none_or(|resource| resource == shift.resource_identifier)
+            })
+            .map(|shift| ZonalShiftSummary {
+                zonal_shift_id: shift.zonal_shift_id.clone(),
+                resource_identifier: shift.resource_identifier.clone(),
+                away_from: shift.away_from.clone(),
+                expiry_time: as_date_time(shift.expiry_time),
+                start_time: as_date_time(shift.start_time),
+                status: shift.status.as_wire().to_string(),
+                comment: shift.comment.clone(),
+                shift_type: Some(shift.shift_type.as_wire().to_string()),
+                practice_run_outcome: shift.practice_run_outcome.clone(),
+            })
+            .collect();
+
+        let mut remaining = matching.into_iter();
+        let items: Vec<ZonalShiftSummary> = remaining.by_ref().take(page.page_size).collect();
+        // A token is issued only when a further shift is actually waiting, and names
+        // the last shift this page returned.
+        let next_token = remaining
+            .next()
+            .and(items.last())
+            .map(|last| encode_page_token(&last.zonal_shift_id));
+
+        Ok(ListZonalShiftsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

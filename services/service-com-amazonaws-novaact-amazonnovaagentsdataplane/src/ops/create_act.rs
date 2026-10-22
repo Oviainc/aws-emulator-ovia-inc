@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stores a new act — one AI task, with the tool specifications it may invoke — under its
+//! session, and answers 201 with the generated act id and the act's initial stored
+//! status. The id is a freshly generated lowercase UUID, as the model's `UuidString` is
+//! constrained to, and the task and tool specs are kept so later reads see them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! All three parents are resolved first: an unknown definition name, run id or session id
+//! answers `ResourceNotFoundException` (404), and a run that is not running conflicts
+//! (409). A `clientToken` already seen replays the act it created.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +171,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateActErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAct"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateActErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let not_found = |missing: crate::state::MissingResource| -> Self::Error {
+            CreateActErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: missing.message,
+                resource_id: missing.resource_id,
+                resource_type: missing.resource_type,
+            })
+            .into()
+        };
+
+        let mut state = state.lock();
+        state.complete_due_deletions(now);
+
+        let fingerprint = crate::state::fingerprint(&[
+            input.workflow_definition_name.clone(),
+            input.workflow_run_id.clone(),
+            input.session_id.clone(),
+            input.task.clone(),
+            crate::state::structural_field(&input.tool_specs),
+        ]);
+
+        let replay = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.idempotent_create(Self::NAME, token).cloned());
+        if let Some(record) = replay {
+            if record.fingerprint != fingerprint {
+                return Err(CreateActErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "clientToken was already used to create act {} with different parameters",
+                        record.resource_id
+                    ),
+                    resource_id: record.resource_id,
+                    resource_type: "act".to_string(),
+                })
+                .into());
+            }
+            let replayed = state
+                .definition(&input.workflow_definition_name)
+                .and_then(|definition| definition.run(&input.workflow_run_id))
+                .and_then(|run| run.session(&input.session_id))
+                .map(|session| session.acts.get(&record.resource_id));
+            if let Ok(Some(act)) = replayed {
+                return Ok(CreateActOutput {
+                    act_id: act.act_id.clone(),
+                    status: act.status.as_wire().to_string(),
+                });
+            }
+            // The act that token created is gone with its parents: create a new one.
+        }
+
+        // One walk down the chain: the run's status for the state check below, and the
+        // session resolved in the same pass so an act is never created under a missing one.
+        let run_status = {
+            let run = state
+                .definition(&input.workflow_definition_name)
+                .and_then(|definition| definition.run(&input.workflow_run_id))
+                .map_err(not_found)?;
+            run.session(&input.session_id).map_err(not_found)?;
+            run.status
+        };
+        if run_status != crate::state::WorkflowRunStatus::Running {
+            return Err(CreateActErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "workflow run {} is {} and cannot accept a new act",
+                    input.workflow_run_id,
+                    run_status.as_wire()
+                ),
+                resource_id: input.workflow_run_id.clone(),
+                resource_type: "workflow-run".to_string(),
+            })
+            .into());
+        }
+
+        // The act store is bounded, per session and store-wide.
+        state
+            .check_act_quota(
+                &input.workflow_definition_name,
+                &input.workflow_run_id,
+                &input.session_id,
+            )
+            .map_err(|quota| -> Self::Error {
+                CreateActErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: quota.message(&input.session_id),
+                        resource_id: input.session_id.clone(),
+                        resource_type: quota.resource_type().to_string(),
+                        service_code: crate::state::SERVICE_CODE.to_string(),
+                        quota_code: quota.code().to_string(),
+                    },
+                )
+                .into()
+            })?;
+
+        let insertion_seq = state.next_insertion_seq();
+        let act_id = state.mint_uuid();
+        let act = crate::state::Act {
+            act_id: act_id.clone(),
+            task: input.task.clone(),
+            tool_specs: input.tool_specs.clone().unwrap_or_default(),
+            // The model documents this member as the act's INITIAL status, and an act
+            // AWS has just accepted is running.
+            status: crate::state::ActStatus::Running,
+            error: None,
+            created_at: now,
+            insertion_seq,
+        };
+        let status = act.status.as_wire().to_string();
+        state
+            .insert_act(
+                &input.workflow_definition_name,
+                &input.workflow_run_id,
+                &input.session_id,
+                act,
+            )
+            .map_err(not_found)?;
+        if let Some(token) = input.client_token.as_deref() {
+            state.record_idempotent_create(Self::NAME, token, fingerprint, act_id.clone());
+        }
+
+        Ok(CreateActOutput { act_id, status })
     }
 }

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkflowDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkflowDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads a stored workflow definition back: its name, ARN, creation time, description,
+//! export configuration and status all come from the record `CreateWorkflowDefinition`
+//! inserted, so this is the operation that proves a create persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkflowDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A name this account holds no definition for answers `ResourceNotFoundException` (404).
+//! Reporting is all it does, with one exception the clock owes: a definition whose
+//! `DELETING` span has elapsed is removed before the lookup, so the removal a previous
+//! `DeleteWorkflowDefinition` made due is materialised here rather than observed late.
+//! That is work owed at the same instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +158,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkflowDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkflowDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkflowDefinition"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWorkflowDefinitionErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.complete_due_deletions(now);
+
+        let definition = state
+            .definition(&input.workflow_definition_name)
+            .map_err(|missing| {
+                GetWorkflowDefinitionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: missing.message,
+                        resource_id: missing.resource_id,
+                        resource_type: missing.resource_type,
+                    },
+                )
+            })?;
+
+        Ok(GetWorkflowDefinitionOutput {
+            name: definition.name.clone(),
+            arn: definition.arn.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(definition.created_at),
+            description: definition.description.clone(),
+            export_config: definition.export_config.clone(),
+            status: definition.status.as_wire().to_string(),
+        })
     }
 }

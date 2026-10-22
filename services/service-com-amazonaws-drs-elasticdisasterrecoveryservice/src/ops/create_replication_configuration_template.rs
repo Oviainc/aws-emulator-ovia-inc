@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReplicationConfigurationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReplicationConfigurationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReplicationConfigurationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `replicationConfigurationTemplateID` and its ARN, stores every member the
+//! request supplied under that id, and answers 201 with the STORED record — so a
+//! following Describe/Update reads back exactly what was created.
 //!
 //! ## Shape of an operation
 //!
@@ -219,18 +214,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReplicationConfigurationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReplicationConfigurationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReplicationConfigurationTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateReplicationConfigurationTemplateErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the service store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        if !store.initialized {
+            return Err(
+                CreateReplicationConfigurationTemplateErrorModeled::UninitializedAccountException(
+                    UninitializedAccountException {
+                        message: Some(
+                            "Elastic Disaster Recovery has not been initialized for this account; \
+                             call InitializeService first"
+                                .to_string(),
+                        ),
+                        code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The emulator's own bound on this store: without it a caller that can reach
+        // the port could loop this call until the host is out of memory. The refusal
+        // is the modelled `ServiceQuotaExceededException` (402), so a client sees a
+        // DRS error rather than a dead emulator.
+        if store.replication_configuration_templates.len()
+            >= crate::state::REPLICATION_CONFIGURATION_TEMPLATE_QUOTA
+        {
+            return Err(
+                CreateReplicationConfigurationTemplateErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Cannot create more than {} replication configuration templates",
+                            crate::state::REPLICATION_CONFIGURATION_TEMPLATE_QUOTA
+                        )),
+                        code: None,
+                        resource_id: None,
+                        resource_type: Some("ReplicationConfigurationTemplate".to_string()),
+                        service_code: Some(crate::state::SERVICE_CODE.to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The id is minted first because the ARN is derived from it, and the ARN
+        // carries the region the caller signed for.
+        let id = store.next_id("rct");
+        let region = crate::state::request_region(ctx.parts());
+        let record = crate::state::ReplicationConfigurationTemplateRecord {
+            arn: crate::state::replication_configuration_template_arn(&region, &id),
+            id: id.clone(),
+            staging_area_subnet_id: input.staging_area_subnet_id,
+            associate_default_security_group: input.associate_default_security_group,
+            replication_servers_security_groups_ids: input
+                .replication_servers_security_groups_i_ds,
+            replication_server_instance_type: input.replication_server_instance_type,
+            use_dedicated_replication_server: input.use_dedicated_replication_server,
+            default_large_staging_disk_type: input.default_large_staging_disk_type,
+            ebs_encryption: input.ebs_encryption,
+            ebs_encryption_key_arn: input.ebs_encryption_key_arn,
+            bandwidth_throttling: input.bandwidth_throttling,
+            data_plane_routing: input.data_plane_routing,
+            create_public_ip: input.create_public_ip,
+            staging_area_tags: input.staging_area_tags,
+            tags: input.tags,
+            pit_policy: input.pit_policy,
+            auto_replicate_new_disks: input.auto_replicate_new_disks,
+            internet_protocol: input.internet_protocol,
+        };
+
+        // Insert, then report the record as it now stands IN the store, so a 201 can
+        // only describe what was persisted — never the request echoed past a failed
+        // write. The id was just minted, so the entry is always vacant; `or_insert`
+        // is how one step both writes the record and hands back the stored one.
+        let stored = store
+            .replication_configuration_templates
+            .entry(id)
+            .or_insert(record)
+            .to_wire();
+
+        Ok(stored)
     }
 }

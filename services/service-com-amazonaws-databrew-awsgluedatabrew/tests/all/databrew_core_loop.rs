@@ -5,116 +5,20 @@
 //! Every case drives the real wire path — `MultiServiceRouter::dispatch` with a
 //! restJson1 request, exactly as the router serves one — so what is asserted is the
 //! HTTP status, the error code and the JSON body a client sees, not an internal call.
+//! The emulator and the request helpers live in `databrew_harness`, shared with this
+//! crate's other suites.
 //!
 //! The tables below span the classes the implementation generalises over (every
 //! `Source` an `Input` can imply, the documented name character set, every page size)
 //! rather than one recorded request.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
+use serde_json::json;
 
-/// A SigV4 credential scope naming `databrew`: it is what routes a request to this
-/// service, and its access-key id is the caller the service reports in
-/// `CreatedBy`/`LastModifiedBy`/`StartedBy`.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/us-east-1/databrew/aws4_request, \
-     SignedHeaders=host, Signature=0123456789abcdef";
-
-/// The ARN prefix every DataBrew resource of this account/region carries.
-const ARN_PREFIX: &str = "arn:aws:databrew:us-east-1:000000000000:";
-
-/// One request's answer: the status, the restJson1 error code (`x-amzn-errortype`)
-/// and the decoded body.
-struct Reply {
-    status: u16,
-    error_type: Option<String>,
-    body: Value,
-}
-
-impl Reply {
-    /// A top-level string member, or `""` when it is absent.
-    fn text(&self, member: &str) -> String {
-        self.body
-            .get(member)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    }
-}
-
-/// The emulator under test: this one service mounted on one shared engine.
-struct Emulator {
-    router: MultiServiceRouter,
-}
-
-impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // The signature itself is not what these cases are about; the credential
-        // scope above still routes the request and names the caller.
-        router.set_request_authentication(false);
-        router.register_service(
-            service_com_amazonaws_databrew_awsgluedatabrew::EmulatedService::new(engine),
-        );
-        Self { router }
-    }
-
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
-        let payload = body
-            .map(|body| serde_json::to_vec(&body).expect("the test body serializes"))
-            .unwrap_or_default();
-        let request = ::http::Request::builder()
-            .method(method)
-            .uri(format!("https://databrew.us-east-1.amazonaws.com{uri}"))
-            .header("authorization", AUTHORIZATION)
-            .header("content-type", "application/json")
-            .body(::bytes::Bytes::from(payload))
-            .expect("a well-formed request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error_type = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
-        let body = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        Reply {
-            status,
-            error_type,
-            body,
-        }
-    }
-}
-
-/// A resource name as it appears in a URI path label. DataBrew names may contain a
-/// space, which a URI cannot carry raw.
-fn label(name: &str) -> String {
-    name.replace(' ', "%20")
-}
-
-/// The `Input` of a plain S3-backed dataset.
-fn s3_input(key: &str) -> Value {
-    json!({"S3InputDefinition": {"Bucket": "brew-bucket", "Key": key}})
-}
-
-async fn create_dataset(emulator: &Emulator, name: &str, input: Value) -> Reply {
-    emulator
-        .call(
-            "POST",
-            "/datasets",
-            Some(json!({"Name": name, "Input": input, "Format": "CSV"})),
-        )
-        .await
-}
+use crate::databrew_harness::{
+    create_dataset, label, s3_input, Emulator, ARN_PREFIX, CALLER_PRINCIPAL,
+};
 
 /// `Source` is the input definition the dataset carries, for every value the model
 /// declares (`smithy_query(query="shape", shape="Source")`: `S3`, `DATA-CATALOG`,
@@ -181,8 +85,9 @@ async fn describe_dataset_reports_the_source_its_input_definition_implies() {
             "case {name:?}: expected a server-generated CreateDate, got {:?}",
             described.body["CreateDate"]
         );
-        assert!(
-            described.text("CreatedBy").contains("AKIDEXAMPLE"),
+        assert_eq!(
+            described.text("CreatedBy"),
+            CALLER_PRINCIPAL,
             "case {name:?}: expected CreatedBy to name the calling principal, got {:?}",
             described.body["CreatedBy"]
         );
@@ -302,6 +207,14 @@ async fn creating_a_dataset_twice_conflicts_and_keeps_the_first_record() {
         Some("ConflictException"),
         "expected ConflictException, got {:?}",
         again.error_type
+    );
+    // The message names the resource kind and the name the request carried, so a
+    // client is told WHICH create conflicted.
+    assert_eq!(
+        again.text("Message"),
+        "Dataset demo-ds already exists.",
+        "expected the conflict message to name the dataset, got {:?}",
+        again.body
     );
 
     let described = emulator.call("GET", "/datasets/demo-ds", None).await;
@@ -498,8 +411,9 @@ async fn the_dataset_recipe_job_and_job_run_loop_is_served_from_state() {
             described_job.body[member]
         );
     }
-    assert!(
-        described_job.text("CreatedBy").contains("AKIDEXAMPLE"),
+    assert_eq!(
+        described_job.text("CreatedBy"),
+        CALLER_PRINCIPAL,
         "expected CreatedBy to name the calling principal, got {:?}",
         described_job.body["CreatedBy"]
     );
@@ -583,8 +497,9 @@ async fn the_dataset_recipe_job_and_job_run_loop_is_served_from_state() {
         "expected a server-generated StartedOn, got {:?}",
         described.body["StartedOn"]
     );
-    assert!(
-        described.text("StartedBy").contains("AKIDEXAMPLE"),
+    assert_eq!(
+        described.text("StartedBy"),
+        CALLER_PRINCIPAL,
         "expected StartedBy to name the calling principal, got {:?}",
         described.body["StartedBy"]
     );

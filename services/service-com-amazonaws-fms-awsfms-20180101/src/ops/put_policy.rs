@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates a Firewall Manager policy and persists it in
+//! [`crate::state::ComAmazonawsFmsAwsfms20180101State::policies`].
+//!
+//! * CREATE (`Policy.PolicyId` absent) — the service mints the `PolicyId` and the
+//!   first `PolicyUpdateToken`, builds the policy ARN, and stores the whole
+//!   modelled `Policy` plus the request's `TagList`.
+//! * UPDATE (`Policy.PolicyId` present) — the request's `PolicyUpdateToken` must
+//!   equal the stored one (the model: "the `PolicyUpdateToken` in the request
+//!   must match the `PolicyUpdateToken` of the current policy version"), and a
+//!   successful update rotates it. An unknown id is `ResourceNotFoundException`;
+//!   a stale or absent token is `InvalidOperationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -146,6 +149,20 @@ impl From<PutPolicyErrorModeled> for PutPolicyError {
     }
 }
 
+/// The number of policies this service stores before it refuses to create
+/// another. An EMULATOR-CHOSEN bound, not an AWS-documented quota number:
+/// Firewall Manager's published policy quota is adjustable, so the exact value
+/// is ours. What is modelled is the BEHAVIOUR — the service bounds how many
+/// policy objects can be created and answers `LimitExceededException` once the
+/// bound is reached, the condition that error's own documentation names ("the
+/// maximum number of policy objects that you can create") — so neither the store
+/// nor the `ListPolicies` page drawn from it can grow without limit.
+///
+/// Deliberately LARGER than `ListPolicies`' page bound, so a full store spans
+/// several pages: a store that could never exceed one page would make the page
+/// bound untestable (and unobservable to a client).
+const MAX_POLICIES: usize = 250;
+
 /// The `PutPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -182,18 +199,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutPolicyErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+
+        // Everything the caller sent is stored verbatim; the only member filled
+        // in here is the `PolicyStatus` default.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutPolicy"))
+        // The two SERVICE-OWNED members are TAKEN OUT of the stored copy:
+        // `PolicyRecord`'s `policy_id` and `update_token` are the single source
+        // of truth for them, and `PolicyRecord::policy()` overlays both onto the
+        // stored document for every reader (this response and `GetPolicy`).
+        // Keeping the caller's copies would leave a second, stale `PolicyId` and
+        // `PolicyUpdateToken` in the store once a later update rotates the token.
+        let mut policy = input.policy.clone();
+        let requested_id = policy.policy_id.take();
+        let requested_token = policy.policy_update_token.take();
+        if policy.policy_status.is_none() {
+            policy.policy_status = Some(crate::state::POLICY_STATUS_ACTIVE.to_string());
+        }
+
+        let mut store = state.lock();
+
+        let record = match requested_id {
+            // UPDATE: the id names an existing policy version, and the token must
+            // match that version.
+            Some(policy_id) => {
+                let Some(existing) = store.policies.get(&policy_id) else {
+                    return Err(PutPolicyErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("no policy with the id {policy_id}")),
+                        },
+                    )
+                    .into());
+                };
+                if requested_token.as_deref() != Some(existing.update_token.as_str()) {
+                    return Err(PutPolicyErrorModeled::InvalidOperationException(
+                        InvalidOperationException {
+                            message: Some(
+                                "the PolicyUpdateToken in the request does not match the \
+                                 PolicyUpdateToken of the current policy version"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::PolicyRecord {
+                    policy_id,
+                    policy_arn: existing.policy_arn.clone(),
+                    // A successful update makes the caller's token stale, so the
+                    // next update has to read the current one back first.
+                    update_token: crate::state::mint_identifier(),
+                    policy,
+                    // `TagList` is optional, and an absent optional member is
+                    // "unchanged", not "empty": an update that sends no TagList
+                    // keeps the tags the resource already carries, so a caller
+                    // editing the policy document cannot drop a tag it never
+                    // mentioned. A TagList that IS sent replaces the set.
+                    tags: input.tag_list.clone().unwrap_or_else(|| existing.tags.clone()),
+                    created_at: existing.created_at,
+                    updated_at: now,
+                }
+            }
+            // CREATE: mint the identifiers and the ARN.
+            None => {
+                if store.policies.len() >= MAX_POLICIES {
+                    return Err(PutPolicyErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "the maximum of {MAX_POLICIES} Firewall Manager policy objects \
+                                 has already been created"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                let policy_id = crate::state::mint_identifier();
+                let region = crate::state::request_region(ctx.parts());
+                crate::state::PolicyRecord {
+                    policy_arn: crate::state::policy_arn(&region, &policy_id),
+                    policy_id,
+                    update_token: crate::state::mint_identifier(),
+                    policy,
+                    // A new resource carries only the tags the create sent.
+                    tags: input.tag_list.clone().unwrap_or_default(),
+                    created_at: now,
+                    updated_at: now,
+                }
+            }
+        };
+
+        store
+            .tags_by_arn
+            .insert(record.policy_arn.clone(), record.tags.clone());
+        let output = PutPolicyOutput {
+            policy: Some(record.policy()),
+            policy_arn: Some(record.policy_arn.clone()),
+        };
+        store.policies.insert(record.policy_id.clone(), record);
+        Ok(output)
     }
 }
