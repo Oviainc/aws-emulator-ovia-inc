@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the resource-based policy attached to a registry. The policy is the
+//! resource this operation deletes: a registry that holds none has nothing to delete,
+//! and once the policy is gone `GetResourcePolicy` reports that it does not exist.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        // This operation names its resource by `RegistryName` alone, so it needs
+        // nothing from the request metadata `ctx` carries.
+        let _ = ctx;
+
+        // A resource policy belongs to ONE registry, so a request that names no
+        // registry names no resource to delete. Same refusal as `PutResourcePolicy`
+        // and `GetResourcePolicy`.
+        let registry_name = input.registry_name.ok_or_else(|| {
+            DeleteResourcePolicyError::from(DeleteResourcePolicyErrorModeled::BadRequestException(
+                crate::state::registry_name_required(),
+            ))
+        })?;
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteResourcePolicyError::from(
+                DeleteResourcePolicyErrorModeled::InternalServerErrorException(
+                    crate::state::internal_error(),
+                ),
+            )
+        })?;
+        let mut state = store.lock();
+
+        // The policy hangs off the registry, so there has to be a registry to take it
+        // from.
+        let registry = state.registries.get_mut(&registry_name).ok_or_else(|| {
+            DeleteResourcePolicyError::from(DeleteResourcePolicyErrorModeled::NotFoundException(
+                crate::state::registry_not_found(&registry_name),
+            ))
+        })?;
+
+        // `take` is the whole mutation: the policy leaves the store, so every later
+        // `GetResourcePolicy` of this registry reports that it does not exist and a
+        // later `PutResourcePolicy` creates a fresh one at a new revision. A registry
+        // that holds no policy names no resource to delete, which is the same 404
+        // `GetResourcePolicy` answers for it — the model declares `NotFoundException`
+        // here for exactly that case, and a 204 would tell a caller a policy had been
+        // removed when none ever existed.
+        if registry.policy.take().is_none() {
+            return Err(DeleteResourcePolicyErrorModeled::NotFoundException(
+                crate::state::policy_not_found(&registry_name),
+            )
+            .into());
+        }
+
+        // Modelled 204 with an empty body: the status is the only thing a caller gets.
+        Ok(DeleteResourcePolicyOutput)
     }
 }
