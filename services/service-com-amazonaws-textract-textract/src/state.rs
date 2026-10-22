@@ -38,8 +38,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Block, BoundingBox, Document, DocumentLocation, DocumentMetadata, ExpenseCurrency,
-    ExpenseDetection, ExpenseDocument, ExpenseField, ExpenseType, Geometry,
+    AdapterOverview, Block, BoundingBox, Document, DocumentLocation, DocumentMetadata,
+    ExpenseCurrency, ExpenseDetection, ExpenseDocument, ExpenseField, ExpenseType, Geometry,
     InvalidParameterException, LineItemFields, LineItemGroup, NotificationChannel, OutputConfig,
     Point, Relationship, ResourceNotFoundException, Warning, AUTO_UPDATE_VALUES,
     FEATURE_TYPE_VALUES,
@@ -59,7 +59,7 @@ pub const ANALYZE_DOCUMENT_MODEL_VERSION: &str = "1.0";
 /// `Get*` immediately after `Start*` still observes `IN_PROGRESS`.
 pub const JOB_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 
-/// The page size `Get*` uses when the caller passes no `MaxResults`.
+/// The page size a paginated read uses when the caller passes no `MaxResults`.
 pub const DEFAULT_MAX_RESULTS: usize = 1000;
 
 /// The largest inline document this service accepts.
@@ -1898,47 +1898,146 @@ pub fn expense_documents(key: &str, content: &DocumentContent) -> Vec<ExpenseDoc
 // Pagination
 // ---------------------------------------------------------------------------
 
-/// An opaque cursor into a job's block list.
+/// An opaque cursor into ONE listing: a job's block list, or a filtered adapter listing.
 ///
-/// Stateless and self-verifying on purpose: `Get*` is a reporting call, so it must not
-/// write state to hand out a cursor. The token binds its offset to the job with a
-/// digest, so a token minted for one job cannot be replayed against another.
-pub fn encode_page_token(job_id: &str, offset: usize) -> String {
-    let digest = hex::encode(Sha256::digest(format!("{job_id}|{offset}").as_bytes()));
+/// Stateless and self-verifying on purpose: a paginated read is a reporting call, so it
+/// must not write state to hand out a cursor. The token binds its offset to `scope` — the
+/// listing it was cut from — with a digest, so a token minted for one listing cannot be
+/// replayed against another.
+pub fn encode_page_token(scope: &str, offset: usize) -> String {
+    let digest = hex::encode(Sha256::digest(format!("{scope}|{offset}").as_bytes()));
     let prefix = PAGE_TOKEN_LEN - PAGE_TOKEN_OFFSET_DIGITS;
     format!("{}{offset:08x}", &digest[..prefix])
 }
 
-/// The offset a token names, or `None` when it was not minted for this job.
+/// The offset a token names, or `None` when it was not minted for this `scope`.
 ///
 /// TOTAL over any `&str`: `NextToken` is caller-controlled, so the token is rejected
 /// unless it is ASCII of exactly the issued length, and every read of it uses a
 /// non-panicking accessor.
-pub fn decode_page_token(job_id: &str, token: &str) -> Option<usize> {
+pub fn decode_page_token(scope: &str, token: &str) -> Option<usize> {
     if !token.is_ascii() || token.len() != PAGE_TOKEN_LEN {
         return None;
     }
     let digits = token.get(PAGE_TOKEN_LEN - PAGE_TOKEN_OFFSET_DIGITS..)?;
     let offset = usize::from_str_radix(digits, 16).ok()?;
-    (encode_page_token(job_id, offset) == token).then_some(offset)
+    (encode_page_token(scope, offset) == token).then_some(offset)
 }
 
-/// One page of `blocks`, plus the token for the next page (`None` on the last one).
+/// One page of `items`, plus the token for the next page (`None` on the last one).
+///
+/// The ONE page-cutting rule every paginated operation of this service uses, so their
+/// `MaxResults`/`NextToken` semantics cannot drift apart: `scope` names the listing the
+/// page is cut from (see [`encode_page_token`]), `offset` is where this page starts, and
+/// an offset past the end answers an empty page rather than failing.
 ///
 /// `None` when `max_results` is present but not a usable page size, which the caller
 /// refuses with `InvalidParameterException` rather than quietly substituting a default.
+pub fn page_of<T: Clone>(
+    scope: &str,
+    items: &[T],
+    max_results: Option<i32>,
+    offset: usize,
+) -> Option<(Vec<T>, Option<String>)> {
+    let limit = match max_results {
+        None => DEFAULT_MAX_RESULTS,
+        Some(requested) => usize::try_from(requested).ok().filter(|m| *m > 0)?,
+    };
+    let end = offset.saturating_add(limit).min(items.len());
+    let page = items.get(offset..end).unwrap_or_default().to_vec();
+    let next = (end < items.len()).then(|| encode_page_token(scope, end));
+    Some((page, next))
+}
+
+/// One page of a job's `blocks`: [`page_of`] over the job's own cursor scope.
 pub fn page_of_blocks(
     job_id: &str,
     blocks: &[Block],
     max_results: Option<i32>,
     offset: usize,
 ) -> Option<(Vec<Block>, Option<String>)> {
-    let limit = match max_results {
-        None => DEFAULT_MAX_RESULTS,
-        Some(requested) => usize::try_from(requested).ok().filter(|m| *m > 0)?,
-    };
-    let end = offset.saturating_add(limit).min(blocks.len());
-    let page = blocks.get(offset..end).unwrap_or_default().to_vec();
-    let next = (end < blocks.len()).then(|| encode_page_token(job_id, end));
-    Some((page, next))
+    page_of(job_id, blocks, max_results, offset)
+}
+
+// ---------------------------------------------------------------------------
+// Adapter listing
+// ---------------------------------------------------------------------------
+
+/// A wire `CreationTime` bound as whole nanoseconds since the Unix epoch.
+fn datetime_nanos(value: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(value.secs()) * 1_000_000_000 + i128::from(value.subsec_nanos())
+}
+
+/// A stored instant on the SAME scale as [`datetime_nanos`], so a filter bound and a
+/// stored `CreationTime` are compared exactly rather than through a lossy float.
+fn system_time_nanos(value: SystemTime) -> i128 {
+    match value.duration_since(UNIX_EPOCH) {
+        Ok(since) => i128::try_from(since.as_nanos()).unwrap_or(i128::MAX),
+        Err(earlier) => -i128::try_from(earlier.duration().as_nanos()).unwrap_or(i128::MAX),
+    }
+}
+
+/// The cursor scope a listing's pages are bound to: the filtration criteria the listing
+/// was computed under.
+///
+/// A `NextToken` is an offset into ONE list, so a cursor cut under one creation-time
+/// window names nothing in another: changing the window invalidates the cursor instead of
+/// silently indexing a different list.
+pub fn adapter_page_scope(
+    after_creation_time: Option<&::aws_smithy_types::DateTime>,
+    before_creation_time: Option<&::aws_smithy_types::DateTime>,
+) -> String {
+    fn bound(value: Option<&::aws_smithy_types::DateTime>) -> String {
+        value.map_or_else(|| "-".to_string(), |value| datetime_nanos(value).to_string())
+    }
+    format!(
+        "ListAdapters|{}|{}",
+        bound(after_creation_time),
+        bound(before_creation_time)
+    )
+}
+
+/// Every stored adapter the filtration criteria admit, as `ListAdapters` reports it, in
+/// the ONE total order the listing's pages are cut from.
+///
+/// AWS, on `ListAdaptersRequest$AfterCreationTime`/`$BeforeCreationTime`: they specify
+/// the "lower bound" and the "upper bound" for the operation, so an adapter is listed
+/// exactly when its stored `CreationTime` lies within the bounds the request gave (each
+/// bound inclusive, and an absent one unbounded on that side). AWS documents no order for
+/// the listing and an offset cursor is only coherent over a stable one, so adapters are
+/// reported oldest first, with the `AdapterId` breaking ties between adapters created in
+/// the same instant.
+///
+/// Derived from the stored adapter records alone — the same records `GetAdapter` reports —
+/// so the listing can never disagree with a read of one adapter.
+pub fn listed_adapters(
+    store: &ComAmazonawsTextractTextractState,
+    after_creation_time: Option<&::aws_smithy_types::DateTime>,
+    before_creation_time: Option<&::aws_smithy_types::DateTime>,
+) -> Vec<AdapterOverview> {
+    let after = after_creation_time.map(datetime_nanos);
+    let before = before_creation_time.map(datetime_nanos);
+    let mut selected: Vec<&AdapterRecord> = store
+        .adapters
+        .values()
+        .filter(|adapter| {
+            let created = system_time_nanos(adapter.created_at);
+            after.is_none_or(|bound| created >= bound)
+                && before.is_none_or(|bound| created <= bound)
+        })
+        .collect();
+    selected.sort_by(|left, right| {
+        system_time_nanos(left.created_at)
+            .cmp(&system_time_nanos(right.created_at))
+            .then_with(|| left.adapter_id.cmp(&right.adapter_id))
+    });
+    selected
+        .into_iter()
+        .map(|adapter| AdapterOverview {
+            adapter_id: Some(adapter.adapter_id.clone()),
+            adapter_name: Some(adapter.adapter_name.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(adapter.created_at)),
+            feature_types: Some(adapter.feature_types.clone()),
+        })
+        .collect()
 }

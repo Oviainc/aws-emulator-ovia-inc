@@ -379,16 +379,10 @@ fn aggregate(
     percentiles: &[(&str, f64)],
     requested_unit: Option<&str>,
 ) -> Datapoint {
-    let sample_count: f64 = data.iter().map(|datum| datum.sample_count).sum();
-    let sum: f64 = data.iter().map(|datum| datum.sum).sum();
-    let minimum = data
-        .iter()
-        .map(|datum| datum.minimum)
-        .fold(f64::INFINITY, f64::min);
-    let maximum = data
-        .iter()
-        .map(|datum| datum.maximum)
-        .fold(f64::NEG_INFINITY, f64::max);
+    let folded = crate::state::BasicStatistics::of(data.iter().copied());
+    let (sample_count, sum) = (folded.sample_count, folded.sum);
+    let minimum = folded.minimum;
+    let maximum = folded.maximum;
 
     let mut extended_statistics = std::collections::HashMap::new();
     for (name, percentile) in percentiles {
@@ -402,8 +396,8 @@ fn aggregate(
         sample_count: statistics.contains(&"SampleCount").then_some(sample_count),
         average: statistics
             .contains(&"Average")
-            .then(|| sum / sample_count)
-            .filter(|average: &f64| average.is_finite()),
+            .then(|| folded.average())
+            .flatten(),
         sum: statistics.contains(&"Sum").then_some(sum),
         minimum: statistics
             .contains(&"Minimum")

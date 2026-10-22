@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TerminateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TerminateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TerminateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +137,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TerminateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TerminateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TerminateSession"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TerminateSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the EMR Serverless application store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A session lives inside one application, so both ids have to name something:
+        // the application first, then the session within it.
+        let record = store
+            .settled_mut(&input.application_id, now)
+            .ok_or_else(|| {
+                TerminateSessionErrorModeled::ResourceNotFoundException(
+                    crate::state::application_not_found(),
+                )
+            })?;
+
+        let output = {
+            let session = record.sessions.get_mut(&input.session_id).ok_or_else(|| {
+                TerminateSessionErrorModeled::ResourceNotFoundException(
+                    crate::state::session_not_found(),
+                )
+            })?;
+
+            // `@idempotent`: a session that is ALREADY terminating has exactly the
+            // termination this call asks for in flight, so the retry reports the same ids
+            // and writes NOTHING — the termination is neither restarted nor its due
+            // instant pushed out.
+            if session.session.state == crate::state::SESSION_TERMINATING_STATE {
+                return Ok(TerminateSessionOutput {
+                    application_id: session.session.application_id.clone(),
+                    session_id: session.session.session_id.clone(),
+                });
+            }
+
+            // A session that has reached a `SessionState` it never leaves (`TERMINATED`,
+            // `FAILED`) has no live session left for this call to end, and its terminal
+            // state must not be overwritten, so it is refused with the only 400 the
+            // operation models. Recorded evidence for the refusal rather than an
+            // idempotent success: the corpus unit
+            // `emr-serverless.terminate-already-terminated-session-rejected`.
+            if !crate::state::is_terminable_session_state(&session.session.state) {
+                return Err(TerminateSessionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::SESSION_NOT_TERMINABLE_MESSAGE.to_string(),
+                    },
+                )
+                .into());
+            }
+
+            // "After you terminate a session, it enters the TERMINATING state and then
+            // the TERMINATED state": the caller observes `TERMINATING` straight away and
+            // the clock owes it `TERMINATED` once the transition span has passed. The
+            // terminate REPLACES whatever change the clock still owed the session (the
+            // start it had not come up from, or the termination its idle timeout owed
+            // it), so a session cannot come up after being asked to end.
+            session.session.state = crate::state::SESSION_TERMINATING_STATE.to_string();
+            session.session.state_details =
+                crate::state::SESSION_TERMINATING_STATE_DETAILS.to_string();
+            session.session.updated_at = crate::state::now_timestamp(now);
+            session.pending = Some(crate::state::PendingState {
+                due: crate::state::due_at(now, crate::state::LIFECYCLE_TRANSITION),
+                state: crate::state::SESSION_TERMINATED_STATE.to_string(),
+                state_details: Some(crate::state::SESSION_TERMINATED_STATE_DETAILS.to_string()),
+            });
+
+            // The output reports the stored ids, which is what makes it a report of the
+            // record rather than an echo of the request.
+            TerminateSessionOutput {
+                application_id: session.session.application_id.clone(),
+                session_id: session.session.session_id.clone(),
+            }
+        };
+
+        // An ACCEPTED terminate is activity on the application: the idle span its
+        // `autoStopConfiguration` bounds starts again here, and starts again once more
+        // when the termination falls due (`ApplicationRecord::settle`). A refused call
+        // writes nothing, so it must not push the automatic stop out either.
+        record.mark_activity(now);
+
+        Ok(output)
     }
 }

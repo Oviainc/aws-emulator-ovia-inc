@@ -300,8 +300,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = state.policies.get(&key).cloned();
 
         // `PolicyType` "is required if you are creating a scaling policy"; re-putting an
-        // existing policy without one keeps the type it was created with.
+        // existing policy without one keeps the type it was created with — and a Put that
+        // names an EXISTING policy with a DIFFERENT type is refused: a policy's type is
+        // what its configuration, its alarms and its whole evaluation are, so changing it
+        // under the same name is not an update of that policy but a different policy
+        // wearing its name.
         let policy_type = match (input.policy_type.clone(), stored.as_ref()) {
+            (Some(policy_type), Some(existing)) if policy_type != existing.policy_type => {
+                return Err(validation(format!(
+                    "You can't change the policy type of an existing scaling policy: the policy \
+                     {} already exists with the policy type {}. Delete the policy and create a \
+                     new one with the policy type you want",
+                    key.policy_name, existing.policy_type
+                )))
+            }
             (Some(policy_type), _) => policy_type,
             (None, Some(existing)) => existing.policy_type.clone(),
             (None, None) => {
@@ -312,8 +324,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Merge each configuration the request carries over the stored one, then keep
-        // only the configuration that belongs to the effective policy type: a policy
-        // carries exactly one, so switching a policy's type drops the old one.
+        // only the configuration that belongs to the policy's type: a policy carries
+        // exactly one, so a configuration of any other type is not part of it.
         let mut step_config = input
             .step_scaling_policy_configuration
             .clone()
@@ -363,6 +375,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(config) = step_config.as_ref() {
             check_step_config(config)?;
+        }
+        if let Some(config) = predictive_config.as_ref() {
+            check_predictive_config(config)?;
         }
         // And it has to hold together for THIS scalable dimension: the metric it names has
         // to be one this dimension is scaled on, with a target value inside the window
@@ -626,11 +641,19 @@ fn check_tracked_metric(
 
 /// Refuse a step-scaling configuration whose steps cannot be evaluated.
 ///
-/// Both rules are the model's own, and the refusal is the model's own sentence for each:
+/// Every rule is the model's own, and the refusal is the model's own sentence for each:
 /// "At least one step adjustment is required if you are adding a new step scaling policy
 /// configuration", and of a step adjustment's bounds, "the upper and lower bound can't be
 /// null in the same step adjustment" with "at most one step adjustment can have a null lower
-/// bound" and the same for the upper bound.
+/// bound" and the same for the upper bound — and "the ranges of your step adjustments can't
+/// overlap or have a gap".
+///
+/// A step adjustment's range is an interval of the difference between the metric and the
+/// alarm threshold, "the lower bound is inclusive […] the upper bound is exclusive", with a
+/// null bound meaning unbounded in that direction. A metric breach picks the adjustment
+/// whose range it falls in, so the ranges have to partition the differences the policy is
+/// evaluated over: two that share a point name two adjustments for one breach, and two that
+/// leave a gap name none for a breach inside it.
 fn check_step_config(
     config: &StepScalingPolicyConfiguration,
 ) -> Result<(), PutScalingPolicyError> {
@@ -679,6 +702,99 @@ fn check_step_config(
         return Err(validation(
             "At most one step adjustment can have a null upper bound",
         ));
+    }
+    check_step_ranges(adjustments)?;
+    Ok(())
+}
+
+/// Refuse step adjustments whose ranges do not partition the metric differences the policy
+/// is evaluated over.
+///
+/// Each range is read as `[lower, upper)` over the metric-to-threshold difference, with a
+/// null bound unbounded in that direction and a bound that is not a finite number treated
+/// as unbounded too (nothing can be compared against it). Sorting the ranges by their lower
+/// bound makes the rule local: consecutive ranges are neither overlapping nor gapped exactly
+/// when each one STARTS where the previous one ends. A range whose lower bound is not below
+/// its upper bound is empty, so it selects no difference at all and is refused on its own
+/// terms.
+fn check_step_ranges(adjustments: &[StepAdjustment]) -> Result<(), PutScalingPolicyError> {
+    let finite = |bound: Option<f64>| bound.filter(|value| value.is_finite());
+    let mut ranges: Vec<(f64, f64)> = adjustments
+        .iter()
+        .map(|adjustment| {
+            (
+                finite(adjustment.metric_interval_lower_bound).unwrap_or(f64::NEG_INFINITY),
+                finite(adjustment.metric_interval_upper_bound).unwrap_or(f64::INFINITY),
+            )
+        })
+        .collect();
+    for (lower, upper) in &ranges {
+        if lower >= upper {
+            return Err(validation(format!(
+                "A step adjustment's lower bound must be less than its upper bound, and \
+                 [{lower}, {upper}) holds no metric value"
+            )));
+        }
+    }
+    ranges.sort_by(|left, right| left.0.total_cmp(&right.0));
+    for pair in ranges.windows(2) {
+        let ((lower, upper), (next_lower, next_upper)) = (pair[0], pair[1]);
+        // Compared by `total_cmp` rather than by `==`/`<`, so the two unbounded ends are
+        // ordered against a finite bound without a float-equality comparison.
+        match next_lower.total_cmp(&upper) {
+            ::std::cmp::Ordering::Less => {
+                return Err(validation(format!(
+                    "The ranges of your step adjustments can't overlap, and [{lower}, {upper}) \
+                     overlaps [{next_lower}, {next_upper})"
+                )))
+            }
+            ::std::cmp::Ordering::Greater => {
+                return Err(validation(format!(
+                    "The ranges of your step adjustments can't have a gap, and [{lower}, \
+                     {upper}) leaves one before [{next_lower}, {next_upper})"
+                )))
+            }
+            ::std::cmp::Ordering::Equal => {}
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a predictive scaling configuration that does not describe exactly one load to
+/// forecast.
+///
+/// The model states the count in prose: "This is an array, but we currently only support a
+/// single metric specification. That is, you can specify a target value and a single metric
+/// pair, or a target value and one scaling metric and one load metric"
+/// ([`crate::state::MAX_PREDICTIVE_METRIC_SPECIFICATIONS`]). A configuration carrying none
+/// has no load to forecast, and one carrying more is not a configuration this service
+/// supports — and the count is what bounds the work a forecast of the policy does, so it is
+/// held at ADMISSION rather than at the read.
+fn check_predictive_config(
+    config: &PredictiveScalingPolicyConfiguration,
+) -> Result<(), PutScalingPolicyError> {
+    let supported = crate::state::MAX_PREDICTIVE_METRIC_SPECIFICATIONS;
+    let count = config.metric_specifications.len();
+    if count == 0 || count > supported {
+        return Err(validation(format!(
+            "We currently only support a single metric specification, so a predictive scaling \
+             policy configuration takes {supported} of them; got {count}"
+        )));
+    }
+    // Both members are closed enums, and both are READ later — the mode by the policy's
+    // evaluation and the breach behaviour by `GetPredictiveScalingForecast` — so a value
+    // outside the enum is refused here rather than resolving to one of them at the read.
+    if let Some(mode) = config.mode.as_deref() {
+        crate::state::check_enum("mode", mode, PREDICTIVE_SCALING_MODE_VALUES)
+            .map_err(validation)?;
+    }
+    if let Some(behavior) = config.max_capacity_breach_behavior.as_deref() {
+        crate::state::check_enum(
+            "maxCapacityBreachBehavior",
+            behavior,
+            PREDICTIVE_SCALING_MAX_CAPACITY_BREACH_BEHAVIOR_VALUES,
+        )
+        .map_err(validation)?;
     }
     Ok(())
 }

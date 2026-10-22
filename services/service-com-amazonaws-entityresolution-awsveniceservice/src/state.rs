@@ -348,6 +348,40 @@ pub struct IdMappingWorkflow {
     pub tags: Option<HashMap<String, String>>,
 }
 
+/// One resource-based policy as this service persists it.
+///
+/// `PutPolicy`, `AddPolicyStatement` and `DeletePolicyStatement` all answer the same
+/// two members beside the resource ARN — the policy document and the revision token —
+/// and `GetPolicy` reads exactly those back, so one record serves the whole policy
+/// surface and a reader cannot disagree with the writer.
+#[derive(Debug, Clone)]
+pub struct ResourcePolicy {
+    /// `policy`: the resource-based policy document, byte for byte as the writer
+    /// supplied it. A `PolicyDocument` is an opaque string on the wire
+    /// (`smithy_query(query="shape",shape="PolicyDocument")`), so nothing here
+    /// rewrites or reformats it.
+    pub policy: String,
+    /// `token`: "a unique identifier for the current revision of the policy"
+    /// (`smithy_query(query="doc",shape="PutPolicyOutput",member="token")`), minted
+    /// fresh by the write that produced this revision (see [`new_policy_token`]) and
+    /// then stable for as long as that revision stands — so a reader reports the same
+    /// token the write answered, and a write carrying an earlier revision's token is
+    /// recognisable as stale.
+    pub token: String,
+    /// The `createdAt` of the resource this policy was attached to.
+    ///
+    /// A resource-based policy belongs to a RESOURCE, so deleting the resource takes
+    /// its policy with it. The policy map is keyed by the resource's ARN, and an ARN is
+    /// a function of the resource's name, so a resource that is deleted and then
+    /// created again under the same name would otherwise inherit the deleted one's
+    /// policy. Stamping the entry with the incarnation it belongs to is what keeps a
+    /// re-created resource policy-less: an entry whose stamp is not the current
+    /// resource's `createdAt` names a resource that no longer exists, so no reader
+    /// serves it (see
+    /// [`ComAmazonawsEntityresolutionAwsveniceserviceState::resource_policy`]).
+    pub resource_created_at: ::aws_smithy_types::DateTime,
+}
+
 /// Per-service state for com-amazonaws-entityresolution-awsveniceservice. A handler reaches it through [`service_state`].
 ///
 /// Every map is a `BTreeMap`, not a `HashMap`, because the list operations are
@@ -376,6 +410,21 @@ pub struct ComAmazonawsEntityresolutionAwsveniceserviceState {
     /// create/get/list/delete operations and their own URI prefixes, so the same name
     /// can name one of each.
     pub id_mapping_workflows: BTreeMap<String, IdMappingWorkflow>,
+    /// The resource-based policy attached to each resource that has one, keyed by the
+    /// resource's own ARN — the `VeniceGlobalArn` every policy operation takes as its
+    /// `@httpLabel`, which is what makes one map serve all four resource types
+    /// (`schemamapping`, `matchingworkflow`, `idmappingworkflow`, `idnamespace`).
+    ///
+    /// A resource with no policy has NO entry here, which is what distinguishes "the
+    /// resource exists but carries no policy" from the policy a write attached to it.
+    ///
+    /// BOUNDED by the live resources, not by how many requests have run: a policy is
+    /// not a resource of its own and dies with the resource it is attached to, so a
+    /// write drops the entries whose resource is gone before it adds its own (see
+    /// [`ComAmazonawsEntityresolutionAwsveniceserviceState::prune_orphaned_policies`]).
+    /// That leaves at most one entry per live resource, and every resource collection
+    /// here carries its own quota.
+    pub policies: BTreeMap<String, ResourcePolicy>,
 }
 
 /// `Default` is what the engine builds the store with on first touch, so it is where
@@ -390,6 +439,7 @@ impl Default for ComAmazonawsEntityresolutionAwsveniceserviceState {
             matching_jobs: BTreeMap::new(),
             provider_services: provider_service_catalog(),
             id_mapping_workflows: BTreeMap::new(),
+            policies: BTreeMap::new(),
         }
     }
 }
@@ -929,6 +979,47 @@ pub mod messages {
     pub fn delete_schema_mapping_not_found(schema_name: &str) -> String {
         format!("SchemaMapping {schema_name} does not exist")
     }
+
+    /// The `ResourceNotFoundException$message` (HTTP 404) every policy operation
+    /// answers when the `arn` @httpLabel names no resource this account holds — a
+    /// resource-based policy belongs to a resource, so there is nothing to read or
+    /// write a policy on.
+    ///
+    /// Not recorded. A TEMPLATE over the request, like
+    /// [`delete_matching_workflow_not_found`]: the ARN the caller asked for is
+    /// substituted into it, so the refusal names the resource that was not found. The
+    /// template is the rule — any ARN goes through it unchanged.
+    pub fn policy_resource_not_found(arn: &str) -> String {
+        format!("Resource {arn} does not exist")
+    }
+
+    /// `GetPolicy`'s `ResourceNotFoundException$message` (HTTP 404) when the resource
+    /// exists but carries no resource-based policy: there is no policy revision to
+    /// report. Not recorded; this reader's own constant, in the same constant,
+    /// no-name form as the recorded [`GET_SCHEMA_MAPPING_NOT_FOUND`] and spelled with
+    /// the resource the operation reads.
+    pub const GET_POLICY_NOT_FOUND: &str = "Policy does not exist";
+
+    /// `PutPolicy`'s `ConflictException$message` (HTTP 400) when the request carries a
+    /// `token` that is not the current revision of the resource's policy — the
+    /// optimistic-concurrency refusal the member's own doc implies ("a unique
+    /// identifier for the CURRENT revision of the policy").
+    ///
+    /// Not recorded. Built from the request: it names the token the caller sent, which
+    /// is what tells them their copy of the policy is out of date and must be re-read.
+    pub fn stale_policy_token(token: &str) -> String {
+        format!("The policy token {token} is not the current revision of this resource's policy")
+    }
+
+    /// `PutPolicy`'s `ValidationException$message` (HTTP 400) when `policy` is not a
+    /// JSON document.
+    ///
+    /// A `PolicyDocument` is modelled only as a bounded string, so the boundary
+    /// validator cannot refuse a document that is not JSON at all; a resource-based
+    /// policy IS a JSON policy document, and the service parses it. Not recorded; the
+    /// message names the member and the constraint it failed, which is what a caller
+    /// needs to fix the request.
+    pub const POLICY_NOT_JSON: &str = "policy must be a JSON policy document";
 }
 
 /// How many schema mappings this emulator lets exist at once, past which
@@ -1037,6 +1128,64 @@ pub fn id_namespace_key<'a>(name_or_arn: &'a str, region: &str) -> Option<&'a st
     (name_or_arn == minted).then_some(name)
 }
 
+/// The four resource types a `VeniceGlobalArn` can name, i.e. the resources that can
+/// carry a resource-based policy.
+///
+/// The modelled `VeniceGlobalArn` pattern admits exactly these and nothing else
+/// (`arn:(aws|aws-us-gov|aws-cn):entityresolution:<region>:<account>:(schemamapping|matchingworkflow|idmappingworkflow|idnamespace)/<name>`,
+/// `smithy_query(query="shape",shape="VeniceGlobalArn")`), so a value that reaches a
+/// handler always carries one of them. Each is the same segment the matching create
+/// mints its ARN with — [`ID_NAMESPACE_RESOURCE_PREFIX`] is
+/// [`ID_NAMESPACE_RESOURCE_TYPE`] plus `/`.
+pub const SCHEMA_MAPPING_RESOURCE_TYPE: &str = "schemamapping";
+/// See [`SCHEMA_MAPPING_RESOURCE_TYPE`].
+pub const MATCHING_WORKFLOW_RESOURCE_TYPE: &str = "matchingworkflow";
+/// See [`SCHEMA_MAPPING_RESOURCE_TYPE`].
+pub const ID_MAPPING_WORKFLOW_RESOURCE_TYPE: &str = "idmappingworkflow";
+/// See [`SCHEMA_MAPPING_RESOURCE_TYPE`].
+pub const ID_NAMESPACE_RESOURCE_TYPE: &str = "idnamespace";
+
+/// The `(resourceType, name)` a `VeniceGlobalArn` names, or `None` when the value
+/// cannot name a resource served for a request signed for `region`.
+///
+/// An ARN names a resource here only when it is EXACTLY the ARN this service mints for
+/// that resource while serving this request, so one differing in its partition,
+/// service, account or region segment names NOTHING rather than resolving to the local
+/// record of the same name — the same scoping rule [`id_namespace_key`] applies to the
+/// one ARN-or-name label in this API.
+pub fn venice_global_arn_resource<'a>(arn: &'a str, region: &str) -> Option<(&'a str, &'a str)> {
+    let (_, resource) = arn.rsplit_once(':')?;
+    let minted = ::emulator_server::emulator_arn("entityresolution", region, resource);
+    if arn != minted {
+        return None;
+    }
+    resource.split_once('/')
+}
+
+/// The region segment of an ARN — `arn:<partition>:<service>:<region>:<account>:<…>`,
+/// so the fourth `:`-separated field.
+///
+/// A stored ARN carries the region it was minted in, which is how an entry keyed by an
+/// ARN can be resolved without a request to take the region from (see
+/// [`ComAmazonawsEntityresolutionAwsveniceserviceState::prune_orphaned_policies`]).
+fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3)
+}
+
+/// A freshly minted policy revision token: a hyphenated v4 UUID, which is exactly what
+/// the modelled `PolicyToken` requires (`length 36..36`, pattern
+/// `^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`,
+/// `smithy_query(query="shape",shape="PolicyToken")`).
+///
+/// The entropy is the same audited generator [`new_job_id`] borrows —
+/// `emulator_telemetry`'s `BatchId::random()`, `uuid::Uuid::new_v4().as_hyphenated()`
+/// verbatim — so nothing new enters the workspace lockfile for it, and only the
+/// generator is borrowed: the newtype's telemetry meaning is dropped here. A revision
+/// token is an identifier, never a credential.
+pub fn new_policy_token() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
+
 /// The `ResolutionType` for which matching workflows have no incremental processing.
 ///
 /// One of the values `ResolutionType` admits
@@ -1070,6 +1219,89 @@ pub fn incremental_run_conflict(
 }
 
 impl ComAmazonawsEntityresolutionAwsveniceserviceState {
+    /// The instant the resource `arn` names was created, or `None` when it names no
+    /// resource this store holds for a request served in `region`.
+    ///
+    /// A resource-based policy belongs TO a resource, so every policy operation is
+    /// about one of the four resources a `VeniceGlobalArn` can name (see
+    /// [`venice_global_arn_resource`]) and each type is looked up in its own
+    /// collection. An ARN scoped to another partition, region or account names nothing
+    /// here. The `createdAt` is returned rather than a bare `bool` because it is also
+    /// the incarnation stamp a policy entry carries
+    /// ([`ResourcePolicy::resource_created_at`]), so existence and incarnation are
+    /// read in ONE lookup and cannot disagree.
+    pub fn policy_resource_created_at(
+        &self,
+        arn: &str,
+        region: &str,
+    ) -> Option<::aws_smithy_types::DateTime> {
+        match venice_global_arn_resource(arn, region)? {
+            (SCHEMA_MAPPING_RESOURCE_TYPE, name) => {
+                self.schema_mappings.get(name).map(|record| record.created_at)
+            }
+            (MATCHING_WORKFLOW_RESOURCE_TYPE, name) => {
+                self.matching_workflows.get(name).map(|record| record.created_at)
+            }
+            (ID_MAPPING_WORKFLOW_RESOURCE_TYPE, name) => {
+                self.id_mapping_workflows.get(name).map(|record| record.created_at)
+            }
+            (ID_NAMESPACE_RESOURCE_TYPE, name) => {
+                self.id_namespaces.get(name).map(|record| record.created_at)
+            }
+            _ => None,
+        }
+    }
+
+    /// The resource-based policy currently attached to the resource `arn` names, or
+    /// `None` when that resource does not exist or carries no policy.
+    ///
+    /// An entry stamped with another incarnation of the resource is not served: see
+    /// [`ResourcePolicy::resource_created_at`].
+    pub fn resource_policy(&self, arn: &str, region: &str) -> Option<&ResourcePolicy> {
+        let created_at = self.policy_resource_created_at(arn, region)?;
+        self.policies
+            .get(arn)
+            .filter(|policy| policy.resource_created_at == created_at)
+    }
+
+    /// Drop every policy entry whose resource no longer exists, and answer how many
+    /// were dropped.
+    ///
+    /// A resource-based policy is NOT a resource of its own: it has no create API, no
+    /// ARN and no quota, and AWS deletes it with the resource it is attached to. The
+    /// delete of each of the four resource types is its own operation (and its own
+    /// file), so this store collects the orphan when the policy path next runs: every
+    /// write prunes first, which keeps the collection bounded by the LIVE resources —
+    /// at most one entry per resource, and each resource collection has its own quota
+    /// ([`MAX_SCHEMA_MAPPINGS`], [`MAX_MATCHING_WORKFLOWS`], [`MAX_ID_NAMESPACES`],
+    /// [`MAX_ID_MAPPING_WORKFLOWS`]) — however many resources a caller creates,
+    /// policies and deletes.
+    ///
+    /// An entry is an orphan when the resource its ARN names is gone, and also when
+    /// that resource is a LATER incarnation of the name (its `createdAt` differs),
+    /// which is the same condition [`resource_policy`] refuses to serve
+    /// ([`ResourcePolicy::resource_created_at`]). The ARN carries the region it was
+    /// minted in, so each entry is resolved against ITS OWN region: pruning while
+    /// serving one region never drops another region's live policy.
+    ///
+    /// [`resource_policy`]: Self::resource_policy
+    pub fn prune_orphaned_policies(&mut self) -> usize {
+        let orphaned: Vec<String> = self
+            .policies
+            .iter()
+            .filter(|(arn, policy)| {
+                arn_region(arn)
+                    .and_then(|region| self.policy_resource_created_at(arn, region))
+                    .is_none_or(|created_at| created_at != policy.resource_created_at)
+            })
+            .map(|(arn, _)| arn.clone())
+            .collect();
+        for arn in &orphaned {
+            self.policies.remove(arn);
+        }
+        orphaned.len()
+    }
+
     /// Is `schema_name` referenced by the `inputSourceConfig` of any stored matching
     /// workflow?
     ///

@@ -246,10 +246,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Terminating: Environment is in the shut-down process." The move to
         // `Terminated` is what the clock then owes.
-        environment.begin_termination();
-        Ok(crate::state::environment_description!(
+        let request_id = crate::state::new_request_id();
+        environment.begin_termination(&request_id);
+        let output = crate::state::environment_description!(
             TerminateEnvironmentOutput,
             &*environment
-        ))
+        );
+        let subject = environment.event_subject();
+        // The shut-down has STARTED here; the event for its completion is
+        // recorded when the clock makes that completion due.
+        store.record_event(
+            &request_id,
+            crate::state::SEVERITY_INFO,
+            "terminateEnvironment is starting.",
+            subject,
+        );
+        Ok(output)
     }
 }

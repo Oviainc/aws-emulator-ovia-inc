@@ -94,6 +94,17 @@ pub const MAX_FILES_PER_TREE: usize = 1_000;
 /// which is what one repository can cost.
 pub const MAX_COMMITS_RETAINED: usize = 256;
 
+/// How many branches one repository holds before `CreateBranch` refuses the write.
+///
+/// The emulator's OWN bound, not an AWS limit: a branch is a caller-named
+/// reference kept for the life of the repository, and
+/// [`Repository::prune_history`] never drops a branch tip, so an unbounded number
+/// of branches would pin an unbounded number of commits and defeat
+/// [`MAX_COMMITS_RETAINED`]. It is therefore deliberately well BELOW that bound,
+/// which is what lets pruning always reach it. Every record it holds is released
+/// by `DeleteRepository`.
+pub const MAX_BRANCHES_PER_REPOSITORY: usize = 64;
+
 /// The largest total content size of one folder, in bytes. CodeCommit documents
 /// this limit on `FolderContentSizeLimitExceededException`: a commit cannot be
 /// created when a change "results in a folder whose contents exceed the limit of
@@ -170,8 +181,9 @@ pub fn is_reaction_removal(value: &str) -> bool {
 ///
 /// Bounded on every axis a caller drives: at most [`REPOSITORY_QUOTA`]
 /// repositories, each holding at most [`MAX_FILES_PER_TREE`] files per tree,
-/// [`MAX_COMMITS_RETAINED`] commits and [`MAX_COMMENTS_PER_REPOSITORY`] comments,
-/// with blobs released as soon as no retained commit references them.
+/// [`MAX_COMMITS_RETAINED`] commits, [`MAX_BRANCHES_PER_REPOSITORY`] branches and
+/// [`MAX_COMMENTS_PER_REPOSITORY`] comments, with blobs released as soon as no
+/// retained commit references them.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodecommitCodecommit20150413State {
     /// Live repositories, keyed by `repositoryName` (unique per account).
@@ -707,6 +719,44 @@ const OBJECT_ID_BYTES: usize = 20;
 /// Is this a syntactically valid git object id (40 hex characters)?
 pub fn is_object_id(candidate: &str) -> bool {
     candidate.len() == 2 * OBJECT_ID_BYTES && candidate.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Can `refs/heads/<name>` be a git reference? CodeCommit is a git host, so a
+/// branch name is a reference name: the rules below are git's own
+/// (`git check-ref-format`), which is what makes a name a repository can hold
+/// tellable from one it cannot.
+///
+/// The model constrains only the length of `BranchName`
+/// (`smithy_query(query="operation",operation="CreateBranch")` reports
+/// `len 1..256`), so every other malformed name arrives at a handler and is
+/// refused there with `InvalidBranchNameException`.
+pub fn is_valid_branch_name(name: &str) -> bool {
+    // git refuses a bare "@" as a reference name, a name that ends in "/" or
+    // ".", the sequences "..", "//" and "@{", and every ASCII control
+    // character as well as space ~ ^ : ? * [ and backslash.
+    if name.is_empty() || name == "@" {
+        return false;
+    }
+    if name.ends_with('/') || name.ends_with('.') {
+        return false;
+    }
+    if name.contains("..") || name.contains("//") || name.contains("@{") {
+        return false;
+    }
+    if name.bytes().any(|byte| {
+        byte.is_ascii_control()
+            || matches!(
+                byte,
+                b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\'
+            )
+    }) {
+        return false;
+    }
+    // No slash-separated component may be empty, start with "." or end in
+    // ".lock" — the leading "/" case is the first component being empty.
+    name.split('/').all(|component| {
+        !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+    })
 }
 
 /// The total content size of the folder a path lives in, over the sizes a tree

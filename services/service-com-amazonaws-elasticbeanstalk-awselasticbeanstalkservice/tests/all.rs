@@ -23,6 +23,8 @@ mod describe_application_versions;
 mod dns_availability;
 #[path = "all/environment_operations.rs"]
 mod environment_operations;
+#[path = "all/events.rs"]
+mod events;
 // Not a suite of its own: the name the suites below import the shared harness
 // by. Declared here because every file under `tests/all/` must be.
 #[path = "all/harness.rs"]

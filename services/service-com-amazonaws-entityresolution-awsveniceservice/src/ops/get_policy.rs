@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads back the resource-based policy a write PERSISTED in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::policies`] for
+//! the resource the `arn` @httpLabel names, with the revision `token` of the standing
+//! revision — so this reader answers exactly what `PutPolicy` wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@readonly`: a read writes nothing, and two consecutive reads answer identically.
+//! An `arn` that names no resource this account holds, and a resource that carries no
+//! policy, are both refused with the modelled `ResourceNotFoundException` (HTTP 404):
+//! there is no policy revision to report in either case.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +154,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetPolicyErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // A pure read: nothing about the store changes, and two consecutive calls
+        // answer identically.
+        let store = state.lock();
+
+        // The resource and the policy are two distinct "not found"s, so they are
+        // reported with their own messages: the ARN may name no resource at all, or
+        // name one that simply carries no policy.
+        if store
+            .policy_resource_created_at(&input.arn, &region)
+            .is_none()
+        {
+            return Err(GetPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::messages::policy_resource_not_found(&input.arn)),
+                },
+            )
+            .into());
+        }
+        let stored = store
+            .resource_policy(&input.arn, &region)
+            .ok_or_else(|| {
+                GetPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::messages::GET_POLICY_NOT_FOUND.to_string()),
+                })
+            })?;
+
+        Ok(GetPolicyOutput {
+            arn: input.arn,
+            token: stored.token.clone(),
+            policy: Some(stored.policy.clone()),
+        })
     }
 }

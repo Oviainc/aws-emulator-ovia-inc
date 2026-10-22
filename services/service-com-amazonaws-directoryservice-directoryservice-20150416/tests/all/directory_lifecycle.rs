@@ -54,8 +54,9 @@ pub(crate) const TAG_QUOTA: usize = 50;
 pub(crate) const PAST_ONE_SPAN: Duration = Duration::from_millis(900);
 
 /// The Region the calls below are signed for, and the one a minted ARN therefore
-/// carries. `tests/all/event_topics.rs` reuses the harness below with another Region,
-/// which is why [`call_in_region`] takes it as a parameter.
+/// carries. `tests/all/event_topics.rs` and
+/// `tests/all/directory_networking_and_settings.rs` reuse the harness below with other
+/// Regions, which is why [`call_in_region`] takes it as a parameter.
 pub(crate) const REGION: &str = "us-east-1";
 
 /// A router with just this service mounted on a fresh engine.
@@ -64,6 +65,12 @@ pub(crate) const REGION: &str = "us-east-1";
 /// it as `crate::directory_lifecycle::<item>` rather than standing up a second copy.
 pub(crate) fn service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    emulator_on(engine)
+}
+
+/// A router with just this service mounted on `engine`, so a test that needs to read
+/// or seed the store directly can hold the same engine the handlers serve from.
+pub(crate) fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // The tests exercise the service, not SigV4: requests carry a credential scope so
     // the router can name the target service, but no real signature.
@@ -79,7 +86,8 @@ pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Val
 }
 
 /// One `awsJson1_1` call whose sigv4 credential scope names `region`, returning the
-/// HTTP status and the parsed response body.
+/// HTTP status and the parsed response body. The credential scope is the only place a
+/// request carries the Region an operation such as `RemoveRegion` acts on.
 pub(crate) async fn call_in_region(
     router: &MultiServiceRouter,
     operation: &str,
