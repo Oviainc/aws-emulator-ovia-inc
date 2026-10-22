@@ -15,5 +15,7 @@
 mod dax_cluster_lifecycle;
 #[path = "all/dax_parameter_groups.rs"]
 mod dax_parameter_groups;
+#[path = "all/dax_rejection_paths.rs"]
+mod dax_rejection_paths;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -170,13 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .contains(&max_results)
             {
                 return Err(DescribeClustersErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(format!(
-                            "MaxResults must be between {} and {}, got {max_results}",
-                            crate::state::MIN_MAX_RESULTS,
-                            crate::state::MAX_MAX_RESULTS
-                        )),
-                    },
+                    crate::state::invalid_max_results(),
                 )
                 .into());
             }
@@ -189,13 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(from) => Some(from),
                 None => {
                     return Err(DescribeClustersErrorModeled::InvalidParameterValueException(
-                        InvalidParameterValueException {
-                            message: Some(
-                                "NextToken is not a continuation token from a prior \
-                                 DescribeClusters response"
-                                    .to_string(),
-                            ),
-                        },
+                        crate::state::invalid_next_token(Self::NAME),
                     )
                     .into())
                 }
@@ -215,9 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let name = name.to_lowercase();
                 if !store.clusters.contains_key(&name) {
                     return Err(DescribeClustersErrorModeled::ClusterNotFoundFault(
-                        ClusterNotFoundFault {
-                            message: Some(format!("Cluster {name} does not exist")),
-                        },
+                        crate::state::cluster_not_found(),
                     )
                     .into());
                 }

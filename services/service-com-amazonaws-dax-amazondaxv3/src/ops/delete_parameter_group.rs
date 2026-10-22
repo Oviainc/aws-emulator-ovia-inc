@@ -161,9 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.parameter_groups.get(&input.parameter_group_name) else {
             return Err(
                 DeleteParameterGroupErrorModeled::ParameterGroupNotFoundFault(
-                    ParameterGroupNotFoundFault {
-                        message: Some(crate::state::parameter_group_not_found_message()),
-                    },
+                    crate::state::parameter_group_not_found(),
                 )
                 .into(),
             );
@@ -201,6 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.parameter_groups.remove(&input.parameter_group_name);
+        store.record_event(
+            &input.parameter_group_name,
+            crate::state::SOURCE_TYPE_PARAMETER_GROUP,
+            crate::state::EVENT_PARAMETER_GROUP_DELETED,
+            now,
+        );
 
         Ok(DeleteParameterGroupOutput {
             deletion_message: Some(format!(

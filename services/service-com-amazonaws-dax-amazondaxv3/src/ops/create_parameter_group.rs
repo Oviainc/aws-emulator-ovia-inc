@@ -206,7 +206,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             default_group: false,
         };
         let view = record.view();
-        store.parameter_groups.insert(input.parameter_group_name, record);
+        store
+            .parameter_groups
+            .insert(input.parameter_group_name.clone(), record);
+        store.record_event(
+            &input.parameter_group_name,
+            crate::state::SOURCE_TYPE_PARAMETER_GROUP,
+            crate::state::EVENT_PARAMETER_GROUP_CREATED,
+            ::std::time::SystemTime::now(),
+        );
 
         Ok(CreateParameterGroupOutput {
             parameter_group: Some(view),

@@ -156,24 +156,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due(now);
 
         let Some(cluster) = store.clusters.get_mut(&cluster_name) else {
-            return Err(
-                DeleteClusterErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault {
-                    message: Some(format!("Cluster {cluster_name} does not exist")),
-                })
-                .into(),
-            );
+            return Err(DeleteClusterErrorModeled::ClusterNotFoundFault(
+                crate::state::cluster_not_found(),
+            )
+            .into());
         };
         if cluster.status != crate::state::CLUSTER_AVAILABLE {
-            return Err(
-                DeleteClusterErrorModeled::InvalidClusterStateFault(InvalidClusterStateFault {
-                    message: Some(format!(
-                        "Cluster {cluster_name} is {}, not {}",
-                        cluster.status,
-                        crate::state::CLUSTER_AVAILABLE
-                    )),
-                })
-                .into(),
-            );
+            return Err(DeleteClusterErrorModeled::InvalidClusterStateFault(
+                crate::state::invalid_cluster_state(),
+            )
+            .into());
         }
 
         cluster.status = crate::state::CLUSTER_DELETING.to_string();
@@ -181,9 +173,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             node.node_status = crate::state::NODE_DELETING.to_string();
         }
         cluster.settles_at = Some(now + crate::state::STATUS_SETTLE_DELAY);
+        let view = cluster.view();
+        store.record_event(
+            &cluster_name,
+            crate::state::SOURCE_TYPE_CLUSTER,
+            crate::state::EVENT_CLUSTER_DELETING,
+            now,
+        );
 
         Ok(DeleteClusterOutput {
-            cluster: Some(cluster.view()),
+            cluster: Some(view),
         })
     }
 }

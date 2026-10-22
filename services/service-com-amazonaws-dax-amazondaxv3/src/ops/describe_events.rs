@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the events this service RECORDED for its own resources — a cluster created,
+//! settled, modified, grown or deleted, a subnet group created — oldest first, filtered
+//! to the window the request asks for and to one `SourceName`/`SourceType` when it names
+//! them, and paged through `MaxResults`/`NextToken`.
+//!
+//! A window reaching further back than the events DAX retains ("you can retrieve up to
+//! 14 days' worth of events", `crate::state::MAX_EVENT_DURATION`) is refused with the
+//! modelled `InvalidParameterCombinationException`, whether the request reached back
+//! through `Duration` or through `StartTime`. A request that names neither reads the
+//! last 24 hours ("By default, only the events occurring within the last 24 hours are
+//! returned").
+//!
+//! Reporting only: it materialises the status moves and the event expiry the CLOCK had
+//! already made due, and records nothing of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +166,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEvents"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let now = ::std::time::SystemTime::now();
+
+        // "The value for MaxResults must be between 20 and 100" (`MaxResults`).
+        if let Some(max_results) = input.max_results {
+            if !(crate::state::MIN_MAX_RESULTS..=crate::state::MAX_MAX_RESULTS)
+                .contains(&max_results)
+            {
+                return Err(DescribeEventsErrorModeled::InvalidParameterValueException(
+                    crate::state::invalid_max_results(),
+                )
+                .into());
+            }
+        }
+
+        // `SourceType` is an enum; a value outside it names no event source.
+        if let Some(source_type) = input.source_type.as_deref() {
+            if !crate::state::SOURCE_TYPES.contains(&source_type) {
+                return Err(DescribeEventsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value for SourceType. Must be one of {}",
+                            crate::state::SOURCE_TYPES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The number of minutes' worth of events to retrieve" (`Duration`): a negative
+        // count of minutes names no window at all.
+        let duration = input
+            .duration
+            .unwrap_or(crate::state::DEFAULT_EVENT_DURATION);
+        if duration < 0 {
+            return Err(DescribeEventsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "Invalid value for duration. Must be between 0 and {}",
+                        crate::state::MAX_EVENT_DURATION
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let end = match input.end_time {
+            Some(stamp) => match crate::state::from_date_time(stamp) {
+                Some(at) => at,
+                None => return Err(invalid_timestamp("EndTime")),
+            },
+            None => now,
+        };
+        // `StartTime` names the beginning of the interval outright; otherwise it is
+        // `Duration` minutes before the end of it.
+        let start = match input.start_time {
+            Some(stamp) => match crate::state::from_date_time(stamp) {
+                Some(at) => at,
+                None => return Err(invalid_timestamp("StartTime")),
+            },
+            None => end
+                .checked_sub(::std::time::Duration::from_secs(
+                    u64::try_from(duration).unwrap_or(0) * 60,
+                ))
+                .unwrap_or(::std::time::UNIX_EPOCH),
+        };
+        if start > end {
+            return Err(
+                DescribeEventsErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some("StartTime must not be later than EndTime".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The window may not reach further back than the events DAX keeps, however the
+        // request reached back there.
+        if now
+            .checked_sub(crate::state::EVENT_RETENTION)
+            .is_some_and(|retained_from| start < retained_from)
+        {
+            return Err(
+                DescribeEventsErrorModeled::InvalidParameterCombinationException(
+                    crate::state::events_beyond_retention(),
+                )
+                .into(),
+            );
+        }
+
+        // A continuation token this service did not issue is refused, rather than
+        // answering an arbitrary page with a 200.
+        let start_from = match input.next_token.as_deref() {
+            Some(token) => {
+                match crate::state::decode_token(token).and_then(|value| value.parse::<u64>().ok())
+                {
+                    Some(seq) => Some(seq),
+                    None => {
+                        return Err(DescribeEventsErrorModeled::InvalidParameterValueException(
+                            crate::state::invalid_next_token(Self::NAME),
+                        )
+                        .into())
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let mut store = state.lock();
+        // Both of these are moves the clock already owed: the status transitions due by
+        // now (each of which records its own event) and the events that have aged out.
+        store.settle_due(now);
+        store.expire_events(now);
+
+        let matching: Vec<&crate::state::EventRecord> = store
+            .events
+            .iter()
+            .filter(|event| event.date >= start && event.date <= end)
+            .filter(|event| {
+                input
+                    .source_type
+                    .as_deref()
+                    .is_none_or(|wanted| event.source_type == wanted)
+            })
+            .filter(|event| {
+                input
+                    .source_name
+                    .as_deref()
+                    .is_none_or(|wanted| event.source_name == wanted)
+            })
+            .filter(|event| start_from.is_none_or(|from| event.seq >= from))
+            .collect();
+
+        let size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::MAX_MAX_RESULTS)
+                .clamp(1, crate::state::MAX_MAX_RESULTS),
+        )
+        .unwrap_or(1);
+        let next_token = matching
+            .get(size)
+            .map(|event| ::aws_smithy_types::base64::encode(event.seq.to_string()));
+        let events = matching.iter().take(size).map(|event| event.view()).collect();
+
+        Ok(DescribeEventsOutput {
+            next_token,
+            events: Some(events),
+        })
     }
+}
+
+/// The refusal of a `StartTime`/`EndTime` this service cannot read as an instant.
+fn invalid_timestamp(member: &str) -> DescribeEventsError {
+    DescribeEventsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(format!("Invalid value for {member}. Must be a timestamp")),
+    })
+    .into()
 }
