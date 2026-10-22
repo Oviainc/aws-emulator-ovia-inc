@@ -12,6 +12,10 @@
 //! `RateBasedRule`/`RuleSummary`, `RuleGroup`, `SizeConstraintSet`,
 //! `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet`/`XssMatchSetSummary`
 //! projections) are shared by those handlers rather than duplicated per operation.
+//!
+//! The `ByteMatchSet` records and bounds live at the END of this file, under "AWS WAF
+//! Classic ByteMatchSet records", so this one store carries them beside every other
+//! resource kind.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -23,6 +27,10 @@ use crate::ops::types::{
     WafAction, WebACL, XssMatchSet,
     XssMatchSetSummary, XssMatchTuple,
 };
+
+// The shapes the ByteMatchSet records at the end of this file project onto. A `use` of
+// their own, so the shared list above stays exactly as the other resource kinds leave it.
+use crate::ops::types::{ByteMatchSet, ByteMatchTuple, FieldToMatch};
 
 /// `ChangeTokenStatus` wire values, from the model's `CHANGE_TOKEN_STATUS_VALUES`
 /// (`INSYNC`, `PENDING`, `PROVISIONED`).
@@ -923,6 +931,10 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// before submitting a create, update, or delete request, the second
     /// `GetChangeToken` request returns the same value as the first."
     pub outstanding_change_token: Option<String>,
+    /// Every stored `ByteMatchSet`, keyed by its `ByteMatchSetId`. A `BTreeMap` for the
+    /// same reason as `ip_sets`: one stable order for `ListByteMatchSets` to walk. The
+    /// records themselves are at the end of this file.
+    pub byte_match_sets: BTreeMap<String, ByteMatchSetEntry>,
     /// Monotonic counter behind every minted id and change token.
     next_seq: u64,
 }
@@ -1038,4 +1050,158 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsWafregionalAwswafRegional20161128State>)
+}
+
+// ---------------------------------------------------------------------------
+// AWS WAF Classic ByteMatchSet records
+//
+// `CreateByteMatchSet`, `UpdateByteMatchSet` and `GetByteMatchSet` read and write the
+// `byte_match_sets` map of the one state struct above through the records and bounds
+// below.
+// ---------------------------------------------------------------------------
+
+/// The most `ByteMatchSet`s this emulator stores for the account before
+/// `CreateByteMatchSet` answers its modelled `WAFLimitsExceededException`.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes for an
+/// account (100 conditions of each condition type); with [`MAX_BYTE_MATCH_TUPLES`]
+/// bounding each one's contents, it keeps the ByteMatchSet state a caller can grow
+/// bounded.
+pub const MAX_BYTE_MATCH_SETS: usize = 100;
+
+/// The most `ByteMatchTuple`s one `ByteMatchSet` may hold.
+///
+/// The model states no quota for this and no AWS sentence is cited for it, so the bound
+/// is CHOSEN: far above the number of filters any one condition carries, and low enough
+/// that the tuple state a caller can accumulate over many `UpdateByteMatchSet` requests
+/// stays bounded.
+pub const MAX_BYTE_MATCH_TUPLES: usize = 1_000;
+
+/// The most `ByteMatchSetUpdate`s one `UpdateByteMatchSet` request may carry.
+///
+/// `ByteMatchSetUpdates` is modelled `len 1..`, bounded only from below, and no AWS
+/// sentence is cited for a maximum, so this per-request batch cap is CHOSEN: it is the
+/// same bound the sibling `UpdateIPSet` applies to its own updates
+/// ([`MAX_UPDATES_PER_REQUEST`]), it is far above the number of filters one condition
+/// carries, and with [`MAX_BYTE_MATCH_TUPLES`] it bounds the work one request can do
+/// while holding this service's state.
+pub const MAX_BYTE_MATCH_UPDATES_PER_REQUEST: usize = 1_000;
+
+/// The most bytes a `ByteMatchTuple`'s `TargetString` may carry.
+///
+/// Source: `ByteMatchTuple`'s own `TargetString` documentation — "The maximum length of
+/// the value is 50 bytes."
+pub const MAX_TARGET_STRING_BYTES: usize = 50;
+
+/// One stored `ByteMatchTuple`, and its own identity.
+///
+/// `ByteMatchSetUpdate` documents the identity: "If you specify `DELETE` for the value of
+/// `Action`, the `ByteMatchTuple` values must exactly match the values in the
+/// `ByteMatchTuple` that you want to delete from the `ByteMatchSet`" — so two tuples are
+/// the same tuple exactly when all four of their members are equal, which is what the
+/// derived `Eq`/`Ord` here mean. The tuple is stored DECOMPOSED (rather than as the
+/// modelled shape with a separate key type, as `XssMatchSetEntry` does) because that
+/// whole-tuple identity covers every member, including the `TargetString` blob's bytes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ByteMatchTupleEntry {
+    /// `FieldToMatch.Type` as it goes on the wire: a `MatchFieldType` value.
+    pub field_type: String,
+    /// `FieldToMatch.Data` — the header or query-argument name, for the types that name
+    /// one (see [`match_field_takes_data`]).
+    pub field_data: Option<String>,
+    /// The bytes AWS WAF would search for. A blob, so it is stored as bytes rather than
+    /// as the base64 the wire carries.
+    pub target_string: Vec<u8>,
+    /// A `TextTransformation` value.
+    pub text_transformation: String,
+    /// A `PositionalConstraint` value.
+    pub positional_constraint: String,
+}
+
+impl ByteMatchTupleEntry {
+    /// The record a modelled `ByteMatchTuple` from an `UpdateByteMatchSet` request
+    /// denotes.
+    pub fn from_modelled(tuple: &ByteMatchTuple) -> Self {
+        Self {
+            field_type: tuple.field_to_match.r#type.clone(),
+            field_data: tuple.field_to_match.data.clone(),
+            target_string: tuple.target_string.clone(),
+            text_transformation: tuple.text_transformation.clone(),
+            positional_constraint: tuple.positional_constraint.clone(),
+        }
+    }
+
+    /// This record projected back onto the modelled `ByteMatchTuple` shape.
+    pub fn to_modelled(&self) -> ByteMatchTuple {
+        ByteMatchTuple {
+            field_to_match: FieldToMatch {
+                r#type: self.field_type.clone(),
+                data: self.field_data.clone(),
+            },
+            target_string: self.target_string.clone(),
+            text_transformation: self.text_transformation.clone(),
+            positional_constraint: self.positional_constraint.clone(),
+        }
+    }
+}
+
+/// One stored `ByteMatchSet`.
+#[derive(Debug, Clone)]
+pub struct ByteMatchSetEntry {
+    pub byte_match_set_id: String,
+    pub name: String,
+    /// The tuples in insertion order, deduplicated by whole-tuple equality.
+    pub tuples: Vec<ByteMatchTupleEntry>,
+    /// Membership index over `tuples`, kept in step with it by
+    /// [`ByteMatchSetEntry::insert_tuple`] and [`ByteMatchSetEntry::remove_tuple`], so
+    /// deduplicating one update costs a lookup rather than a scan of the whole set.
+    keys: BTreeSet<ByteMatchTupleEntry>,
+}
+
+impl ByteMatchSetEntry {
+    /// A new `ByteMatchSet` record, which holds no tuples: `CreateByteMatchSet`
+    /// documents that it answers "A ByteMatchSet that contains no ByteMatchTuple
+    /// objects", and the tuples arrive through `UpdateByteMatchSet`.
+    pub fn new(byte_match_set_id: String, name: String) -> Self {
+        Self {
+            byte_match_set_id,
+            name,
+            tuples: Vec::new(),
+            keys: BTreeSet::new(),
+        }
+    }
+
+    /// This record projected onto the modelled `ByteMatchSet` shape the Get and Create
+    /// responses carry: the stored record's own fields, never request input.
+    pub fn to_modelled(&self) -> ByteMatchSet {
+        ByteMatchSet {
+            byte_match_set_id: self.byte_match_set_id.clone(),
+            name: Some(self.name.clone()),
+            byte_match_tuples: self
+                .tuples
+                .iter()
+                .map(ByteMatchTupleEntry::to_modelled)
+                .collect(),
+        }
+    }
+
+    /// Add a tuple, unless an equal one is already stored. Answers whether the set
+    /// changed.
+    pub fn insert_tuple(&mut self, tuple: ByteMatchTupleEntry) -> bool {
+        if !self.keys.insert(tuple.clone()) {
+            return false;
+        }
+        self.tuples.push(tuple);
+        true
+    }
+
+    /// Remove the tuple equal to `tuple`, if the set holds one. Answers whether the set
+    /// changed.
+    pub fn remove_tuple(&mut self, tuple: &ByteMatchTupleEntry) -> bool {
+        if !self.keys.remove(tuple) {
+            return false;
+        }
+        self.tuples.retain(|stored| stored != tuple);
+        true
+    }
 }
