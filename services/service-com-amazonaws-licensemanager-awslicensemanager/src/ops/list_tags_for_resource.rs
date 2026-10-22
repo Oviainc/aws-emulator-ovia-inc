@@ -152,11 +152,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
-        if store.configuration(&input.resource_arn).is_none() {
+        // The tagging operations are modelled against a generic `ResourceArn`, so
+        // this reports the tags of ANY resource this service stores — a license
+        // configuration or a license.
+        if !store.is_taggable(&input.resource_arn) {
             return Err(ListTagsForResourceErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(format!(
-                        "no license configuration exists with the ARN '{}'",
+                        "no resource exists with the ARN '{}'",
                         input.resource_arn
                     )),
                 },

@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/license_configuration_lifecycle.rs"]
 mod license_configuration_lifecycle;
+#[path = "all/license_lifecycle.rs"]
+mod license_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

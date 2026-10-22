@@ -7,6 +7,11 @@
 //! of the lifecycle — create, get, list, update, delete — reads and writes the one
 //! record, and a later read reports what an earlier call persisted.
 //!
+//! A **license** — the granted, entitlement-carrying resource `CreateLicense` mints
+//! and `GetLicense` reports — is stored the same way, once, keyed by its ARN, beside
+//! the `ClientToken` the request that minted it carried, so a repeat of that request
+//! reports the same license instead of minting a second one.
+//!
 //! Tags live in their own ARN-keyed map rather than on the record: `TagResource`,
 //! `UntagResource` and `ListTagsForResource` are modelled against a generic
 //! `ResourceArn`, so the map is the single place the tags of any taggable resource
@@ -22,7 +27,9 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    ConsumedLicenseSummary, LicenseConfiguration, ManagedResourceSummary, ProductInformation, Tag,
+    ConsumedLicenseSummary, ConsumptionConfiguration, DatetimeRange, Entitlement, Issuer,
+    IssuerDetails, License, LicenseConfiguration, ManagedResourceSummary, Metadata,
+    ProductInformation, Tag, ENTITLEMENT_UNIT_VALUES, RENEW_TYPE_VALUES,
 };
 
 /// The ARN service namespace for this service: the model's `arnNamespace` and sigv4
@@ -41,6 +48,13 @@ pub const CONFIGURATION_ID_PREFIX: &str = "lic-";
 /// Number of hex characters after [`CONFIGURATION_ID_PREFIX`] in a configuration id.
 pub const CONFIGURATION_ID_HEX_LEN: usize = 32;
 
+/// The resource portion a license ARN carries before its id, so a generated ARN
+/// reads `arn:aws:license-manager:<home region>:<account>:license:l-<32 hex>`.
+pub const LICENSE_ARN_RESOURCE_PREFIX: &str = "license:";
+
+/// The prefix of a license id.
+pub const LICENSE_ID_PREFIX: &str = "l-";
+
 /// The region used when a request carries no SigV4 credential scope to read one
 /// from; the emulator's documented default region.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -52,6 +66,19 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// One of the modelled `LicenseConfigurationStatus` values
 /// (`smithy_query(query="shape",shape="LicenseConfigurationStatus")`).
 pub const STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The status a license carries from the moment `CreateLicense` mints it: AWS hands
+/// back a license that can be checked out at once, so it is created in this terminal
+/// status and owes the clock no transition. One of the modelled `LicenseStatus`
+/// values (`smithy_query(query="shape",shape="LicenseStatus")`); the non-terminal
+/// `PENDING_AVAILABLE` belongs to a license a grant workflow is still activating,
+/// which nothing in this slice produces.
+pub const LICENSE_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The version `CreateLicense` gives a license it mints. License versions are
+/// numbered from 1 and only `CreateLicenseVersion` moves one on
+/// (`smithy_query(query="operation",operation="CreateLicenseVersion")`).
+pub const FIRST_LICENSE_VERSION: &str = "1";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -69,18 +96,25 @@ pub const STATUS_AVAILABLE: &str = "AVAILABLE";
 /// in [`ComAmazonawsLicensemanagerAwslicensemanagerState::insert_configuration`].
 pub const MAX_LICENSE_CONFIGURATIONS: usize = 500;
 
+/// The most licenses this emulator will hold, enforced in
+/// [`ComAmazonawsLicensemanagerAwslicensemanagerState::insert_license`]. A create
+/// past it stores nothing; `CreateLicense` models no resource-limit error, so its
+/// handler renders the refusal as the modelled `ServerInternalException`.
+pub const MAX_LICENSES: usize = 500;
+
 /// The most tags one resource may carry. Emulator resource guard, matching the
 /// 50-tags-per-resource ceiling AWS applies to tagged resources generally; enforced
 /// in [`ComAmazonawsLicensemanagerAwslicensemanagerState::merge_tags`].
 pub const MAX_TAGS: usize = 50;
 
 /// The most entries this emulator stores for any other caller-sized list on a
-/// configuration — `LicenseRules`, `ProductInformationList`, a product
-/// information's filter list and that filter's own value list.
+/// configuration or a license — `LicenseRules`, `ProductInformationList`, a product
+/// information's filter list, that filter's own value list, a license's
+/// `Entitlements` and its `LicenseMetadata`.
 pub const MAX_COLLECTION_ENTRIES: usize = 50;
 
-/// The longest caller-supplied text this emulator stores in a configuration or a
-/// tag.
+/// The longest caller-supplied text this emulator stores in a configuration, a
+/// license or a tag.
 pub const MAX_TEXT_LEN: usize = 2048;
 
 /// One stored license configuration: every member `GetLicenseConfiguration`
@@ -159,6 +193,66 @@ impl StoredLicenseConfiguration {
     }
 }
 
+/// One stored license: every member `GetLicense` reports, plus the identity and the
+/// `ClientToken` of the request that minted it.
+///
+/// `Tags` are NOT held here — a license is tagged through the same ARN-keyed map
+/// every other taggable resource of this service uses.
+#[derive(Debug, Clone, Default)]
+pub struct StoredLicense {
+    /// `l-<32 hex>`: the ARN's last segment and this license's id.
+    pub id: String,
+    /// This record's store key.
+    pub arn: String,
+    pub license_name: String,
+    pub product_name: String,
+    pub product_sku: String,
+    /// The issuer, as the `IssuerDetails` a read reports: the `Issuer` the create
+    /// carried, with no `KeyFingerprint` — this emulator holds no KMS key material
+    /// and signs no license, so there is no fingerprint to report.
+    pub issuer: IssuerDetails,
+    pub home_region: String,
+    /// One of the modelled `LicenseStatus` values.
+    pub status: String,
+    pub validity: DatetimeRange,
+    pub beneficiary: String,
+    pub entitlements: Vec<Entitlement>,
+    pub consumption_configuration: ConsumptionConfiguration,
+    /// Absent when the create carried none, so a read reports what the caller set
+    /// and nothing more.
+    pub license_metadata: Option<Vec<Metadata>>,
+    /// The ISO8601-UTC instant this record was minted at.
+    pub create_time: String,
+    /// The license version this record is, as a decimal counted from
+    /// [`FIRST_LICENSE_VERSION`].
+    pub version: String,
+    /// The `ClientToken` of the request that minted this license, so a repeat of
+    /// that request is answered from this record instead of minting another.
+    pub client_token: String,
+}
+
+impl StoredLicense {
+    /// This record as the modelled `License` structure `GetLicense` reports.
+    pub fn wire(&self) -> License {
+        License {
+            license_arn: Some(self.arn.clone()),
+            license_name: Some(self.license_name.clone()),
+            product_name: Some(self.product_name.clone()),
+            product_sku: Some(self.product_sku.clone()),
+            issuer: Some(self.issuer.clone()),
+            home_region: Some(self.home_region.clone()),
+            status: Some(self.status.clone()),
+            validity: Some(self.validity.clone()),
+            beneficiary: Some(self.beneficiary.clone()),
+            entitlements: Some(self.entitlements.clone()),
+            consumption_configuration: Some(self.consumption_configuration.clone()),
+            license_metadata: self.license_metadata.clone(),
+            create_time: Some(self.create_time.clone()),
+            version: Some(self.version.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-licensemanager-awslicensemanager. A handler
 /// reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -168,9 +262,18 @@ pub struct ComAmazonawsLicensemanagerAwslicensemanagerState {
     /// page token can name the ARN the next page starts at — no token table, and no
     /// page that skips or repeats a configuration created between two calls.
     pub license_configurations: BTreeMap<String, StoredLicenseConfiguration>,
+    /// Every license, keyed by its ARN, for the same reason: one record per license,
+    /// walked in one stable total order.
+    pub licenses: BTreeMap<String, StoredLicense>,
+    /// The ARN each accepted `CreateLicense` `ClientToken` minted, so the repeat of
+    /// a request is idempotent. Written only by
+    /// [`Self::insert_license`] and dropped with its license by
+    /// [`Self::remove_license`], so it holds at most one entry per stored license
+    /// and is bounded by [`MAX_LICENSES`].
+    pub license_client_tokens: BTreeMap<String, String>,
     /// Tags, keyed by resource ARN then tag key. Shared by `TagResource`,
     /// `UntagResource` and `ListTagsForResource`, and seeded from the `Tags` passed
-    /// to `CreateLicenseConfiguration`.
+    /// to `CreateLicenseConfiguration` or `CreateLicense`.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
     /// Mixed into each generated id so two creates in the same nanosecond differ.
     id_counter: u64,
@@ -220,6 +323,62 @@ impl ComAmazonawsLicensemanagerAwslicensemanagerState {
         Some(configuration)
     }
 
+    /// The license `arn` names, for a reporting operation.
+    pub fn license(&self, arn: &str) -> Option<&StoredLicense> {
+        self.licenses.get(arn)
+    }
+
+    /// The license the request carrying `client_token` minted, or `None` when no
+    /// accepted `CreateLicense` has carried it. This is what makes the repeat of a
+    /// create idempotent: the second call reports this record and mints nothing.
+    pub fn license_for_client_token(&self, client_token: &str) -> Option<&StoredLicense> {
+        let arn = self.license_client_tokens.get(client_token)?;
+        self.licenses.get(arn)
+    }
+
+    /// Store a newly minted license, with the `ClientToken` it was minted under,
+    /// refusing it — and changing nothing — when the store already holds
+    /// [`MAX_LICENSES`] or already holds a license under this ARN.
+    ///
+    /// The bound is enforced HERE, at the growth site, so no handler can grow the
+    /// store past it by forgetting a pre-check, and an ARN collision can never
+    /// silently replace a stored license. `false` means nothing was stored.
+    #[must_use]
+    pub fn insert_license(&mut self, license: StoredLicense) -> bool {
+        if self.licenses.len() >= MAX_LICENSES || self.licenses.contains_key(&license.arn) {
+            return false;
+        }
+        // The token map is written only here, so it can never name an ARN the store
+        // does not hold. `ClientToken` is `^\S+$`, so the empty string is not one.
+        if !license.client_token.is_empty() {
+            self.license_client_tokens
+                .insert(license.client_token.clone(), license.arn.clone());
+        }
+        self.licenses.insert(license.arn.clone(), license);
+        true
+    }
+
+    /// Remove the license `arn` names, with its tags and the client token it was
+    /// minted under. `None` when nothing matched.
+    pub fn remove_license(&mut self, arn: &str) -> Option<StoredLicense> {
+        let license = self.licenses.remove(arn)?;
+        self.tags.remove(arn);
+        self.license_client_tokens.retain(|_, minted| minted != arn);
+        Some(license)
+    }
+
+    /// Whether `arn` names a resource this service stores, and can therefore tag: a
+    /// license configuration or a license. Both are ARN-keyed and capped, so the
+    /// number of KEYS in the tag map is bounded by
+    /// [`MAX_LICENSE_CONFIGURATIONS`] + [`MAX_LICENSES`].
+    ///
+    /// `TagResource`, `UntagResource` and `ListTagsForResource` are modelled against
+    /// a generic `ResourceArn`, so each of them asks THIS question rather than
+    /// naming one resource kind.
+    pub fn is_taggable(&self, arn: &str) -> bool {
+        self.license_configurations.contains_key(arn) || self.licenses.contains_key(arn)
+    }
+
     /// The tags stored for `arn`, as the modelled `TagList`. Empty when none were
     /// ever set.
     pub fn tags_of(&self, arn: &str) -> Vec<Tag> {
@@ -260,11 +419,12 @@ impl ComAmazonawsLicensemanagerAwslicensemanagerState {
     /// map past one by forgetting a pre-check, and `Err` always means nothing was
     /// written (the caller renders it as its own modelled refusal):
     ///
-    /// * `arn` must name a configuration the store holds, so the number of KEYS in
-    ///   the outer map can never exceed the number of stored configurations, and is
-    ///   therefore bounded by [`MAX_LICENSE_CONFIGURATIONS`]. A tag map entry is
-    ///   also dropped with its configuration by [`Self::remove_configuration`], so
-    ///   the map cannot outlive what it describes.
+    /// * `arn` must name a resource the store holds, so the number of KEYS in the
+    ///   outer map can never exceed the number of stored configurations and
+    ///   licenses, and is therefore bounded by [`MAX_LICENSE_CONFIGURATIONS`] +
+    ///   [`MAX_LICENSES`]. A tag map entry is also dropped with its resource by
+    ///   [`Self::remove_configuration`] or [`Self::remove_license`], so the map
+    ///   cannot outlive what it describes.
     /// * that ARN is length-bounded like every other stored string, so no single
     ///   key can be arbitrarily large.
     /// * the merge may not leave `arn` carrying more than [`MAX_TAGS`] distinct
@@ -273,10 +433,8 @@ impl ComAmazonawsLicensemanagerAwslicensemanagerState {
         if let Some(why) = text_rejection("ResourceArn", Some(arn)) {
             return Err(why);
         }
-        if !self.license_configurations.contains_key(arn) {
-            return Err(format!(
-                "no license configuration exists with the ARN '{arn}'"
-            ));
+        if !self.is_taggable(arn) {
+            return Err(format!("no resource exists with the ARN '{arn}'"));
         }
         let after = self.tag_count_after_merge(arn, tags);
         if after > MAX_TAGS {
@@ -308,34 +466,224 @@ impl ComAmazonawsLicensemanagerAwslicensemanagerState {
 
     /// A `lic-<32 hex>` id no stored configuration is using.
     pub fn fresh_configuration_id(&mut self) -> String {
-        let taken = |candidate: &str| {
-            self.license_configurations
-                .keys()
-                .any(|arn| arn.ends_with(candidate))
-        };
-        for _ in 0..1024 {
-            self.id_counter = self.id_counter.wrapping_add(1);
-            let candidate = configuration_id_from_seed(
-                now_nanos() ^ self.id_counter.rotate_left(17),
-                self.id_counter,
-            );
-            if !taken(&candidate) {
-                return candidate;
-            }
+        let configurations = &self.license_configurations;
+        fresh_id(
+            &mut self.id_counter,
+            CONFIGURATION_ID_PREFIX,
+            configurations.len(),
+            |candidate| configurations.keys().any(|arn| arn.ends_with(candidate)),
+        )
+    }
+
+    /// An `l-<32 hex>` id no stored license is using.
+    pub fn fresh_license_id(&mut self) -> String {
+        let licenses = &self.licenses;
+        fresh_id(
+            &mut self.id_counter,
+            LICENSE_ID_PREFIX,
+            licenses.len(),
+            |candidate| licenses.keys().any(|arn| arn.ends_with(candidate)),
+        )
+    }
+}
+
+/// One `<prefix><32 hex>` id that `taken` does not already claim.
+///
+/// Shared by every id this service mints, so each kind differs only in its prefix
+/// and in the records it must not collide with. `stored` is how many records that
+/// kind already holds, which bounds the fallback walk below.
+fn fresh_id(
+    counter: &mut u64,
+    prefix: &str,
+    stored: usize,
+    taken: impl Fn(&str) -> bool,
+) -> String {
+    for _ in 0..1024 {
+        *counter = counter.wrapping_add(1);
+        let candidate = id_from_seed(prefix, now_nanos() ^ counter.rotate_left(17), *counter);
+        if !taken(&candidate) {
+            return candidate;
         }
-        // Bounded fallback, so a pathological clock can never spin here: the
-        // zero-padded hex counters are also `lic-[0-9a-f]{32}`, and there are always
-        // more of them than there are stored configurations.
-        (0u64..=self.license_configurations.len() as u64)
-            .map(|n| format!("{CONFIGURATION_ID_PREFIX}{n:032x}"))
-            .find(|candidate| !taken(candidate))
-            .unwrap_or_else(|| {
+    }
+    // Bounded fallback, so a pathological clock can never spin here: the
+    // zero-padded hex counters are also `<prefix>[0-9a-f]{32}`, and there are always
+    // more of them than there are stored records.
+    (0u64..=stored as u64)
+        .map(|n| format!("{prefix}{n:032x}"))
+        .find(|candidate| !taken(candidate))
+        .unwrap_or_else(|| format!("{prefix}{stored:032x}"))
+}
+
+/// The members a license-minting request persists, borrowed for validation.
+///
+/// `CreateLicense` and `CreateLicenseVersion` carry the same license body, so the
+/// rule that decides whether that body is storable lives once, here. Pass `None` for
+/// a member the request does not carry.
+#[derive(Debug)]
+pub struct LicenseInput<'a> {
+    pub license_name: &'a str,
+    pub product_name: &'a str,
+    pub product_sku: Option<&'a str>,
+    pub issuer: &'a Issuer,
+    pub home_region: &'a str,
+    pub validity: &'a DatetimeRange,
+    pub beneficiary: Option<&'a str>,
+    pub entitlements: &'a [Entitlement],
+    pub consumption_configuration: &'a ConsumptionConfiguration,
+    pub license_metadata: Option<&'a [Metadata]>,
+    pub tags: Option<&'a [Tag]>,
+}
+
+/// Why the license body `input` carries is unacceptable, or `None` when every member
+/// of it fits the store.
+pub fn license_input_rejection(input: &LicenseInput<'_>) -> Option<String> {
+    text_rejection("LicenseName", Some(input.license_name))
+        .or_else(|| text_rejection("ProductName", Some(input.product_name)))
+        .or_else(|| text_rejection("ProductSKU", input.product_sku))
+        .or_else(|| text_rejection("Issuer.Name", Some(&input.issuer.name)))
+        .or_else(|| text_rejection("Issuer.SignKey", input.issuer.sign_key.as_deref()))
+        .or_else(|| text_rejection("Beneficiary", input.beneficiary))
+        .or_else(|| region_rejection("HomeRegion", input.home_region))
+        .or_else(|| validity_rejection(input.validity))
+        .or_else(|| {
+            list_rejection(
+                "Entitlements",
+                input.entitlements.len(),
+                MAX_COLLECTION_ENTRIES,
+            )
+        })
+        .or_else(|| input.entitlements.iter().find_map(entitlement_rejection))
+        .or_else(|| consumption_configuration_rejection(input.consumption_configuration))
+        .or_else(|| {
+            list_rejection(
+                "LicenseMetadata",
+                input.license_metadata.map_or(0, <[Metadata]>::len),
+                MAX_COLLECTION_ENTRIES,
+            )
+        })
+        .or_else(|| {
+            input
+                .license_metadata
+                .unwrap_or_default()
+                .iter()
+                .find_map(|entry| {
+                    text_rejection("a LicenseMetadata entry's Name", entry.name.as_deref()).or_else(
+                        || text_rejection("a LicenseMetadata entry's Value", entry.value.as_deref()),
+                    )
+                })
+        })
+        .or_else(|| input.tags.and_then(tag_list_rejection))
+}
+
+/// Why a caller-supplied Region is unacceptable, or `None` when it is a Region
+/// token.
+///
+/// The value lands inside a generated ARN, so anything that is not an AWS Region
+/// token is refused rather than stored: an ARN can never carry arbitrary caller
+/// text. The value itself is not echoed back, because the model bounds it at no
+/// length.
+fn region_rejection(member: &str, region: &str) -> Option<String> {
+    (!is_region_token(region)).then(|| {
+        format!(
+            "{member} must be an AWS Region name: up to 64 alphanumeric-or-hyphen characters"
+        )
+    })
+}
+
+/// Why one `Entitlement` entry is unacceptable, or `None` when it fits the store.
+fn entitlement_rejection(entitlement: &Entitlement) -> Option<String> {
+    text_rejection("an Entitlements entry's Name", Some(&entitlement.name))
+        .or_else(|| {
+            text_rejection(
+                "an Entitlements entry's Value",
+                entitlement.value.as_deref(),
+            )
+        })
+        .or_else(|| {
+            // The catalog is the modelled `EntitlementUnit` enum; this is the
+            // handler-side guard, so nothing outside it can reach the store whatever
+            // the centralized constraint walk does.
+            (!ENTITLEMENT_UNIT_VALUES.contains(&entitlement.unit.as_str())).then(|| {
                 format!(
-                    "{CONFIGURATION_ID_PREFIX}{:032x}",
-                    self.license_configurations.len()
+                    "an Entitlements entry's Unit must be one of [{}], got '{}'",
+                    ENTITLEMENT_UNIT_VALUES.join(", "),
+                    entitlement.unit
                 )
             })
-    }
+        })
+        // `MaxCount` is the "maximum entitlement count", so it has no meaning below
+        // zero; the model gives it the unconstrained `Long`.
+        .or_else(|| negative_rejection("an Entitlements entry's MaxCount", entitlement.max_count))
+}
+
+/// Why a `ConsumptionConfiguration` is unacceptable, or `None` when it fits.
+fn consumption_configuration_rejection(
+    configuration: &ConsumptionConfiguration,
+) -> Option<String> {
+    configuration
+        .renew_type
+        .as_deref()
+        .filter(|renew_type| !RENEW_TYPE_VALUES.contains(renew_type))
+        .map(|renew_type| {
+            format!(
+                "ConsumptionConfiguration.RenewType must be one of [{}], got '{renew_type}'",
+                RENEW_TYPE_VALUES.join(", ")
+            )
+        })
+        .or_else(|| {
+            configuration
+                .provisional_configuration
+                .as_ref()
+                .and_then(|provisional| {
+                    minutes_rejection(
+                        "ConsumptionConfiguration.ProvisionalConfiguration.MaxTimeToLiveInMinutes",
+                        provisional.max_time_to_live_in_minutes,
+                    )
+                })
+        })
+        .or_else(|| {
+            configuration
+                .borrow_configuration
+                .as_ref()
+                .and_then(|borrow| {
+                    minutes_rejection(
+                        "ConsumptionConfiguration.BorrowConfiguration.MaxTimeToLiveInMinutes",
+                        borrow.max_time_to_live_in_minutes,
+                    )
+                })
+        })
+}
+
+/// Why a time-to-live in minutes is unacceptable, or `None` when it is not
+/// negative: a maximum time to live is a duration, so it has no meaning below zero.
+fn minutes_rejection(member: &str, minutes: i32) -> Option<String> {
+    (minutes < 0).then(|| format!("{member} must not be negative, got {minutes}"))
+}
+
+/// Why a `Validity` range is unacceptable, or `None` when it fits the store.
+///
+/// A range runs forwards: `End`, when the request carries one, may not precede
+/// `Begin`. The ordering is decided on the PARSED instants, so a zone offset is
+/// honoured rather than compared as text; a bound the ISO8601 parser does not accept
+/// is left alone, because the member's modelled pattern is what admits it.
+fn validity_rejection(validity: &DatetimeRange) -> Option<String> {
+    text_rejection("Validity.Begin", Some(&validity.begin))
+        .or_else(|| text_rejection("Validity.End", validity.end.as_deref()))
+        .or_else(|| {
+            let begin = parse_instant(&validity.begin)?;
+            let end = parse_instant(validity.end.as_deref()?)?;
+            (end < begin).then(|| {
+                "Validity.End must not be earlier than Validity.Begin".to_string()
+            })
+        })
+}
+
+/// `text` as seconds since the Unix epoch, or `None` when it is not an ISO8601
+/// instant this emulator can order.
+fn parse_instant(text: &str) -> Option<f64> {
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .map(|instant| instant.as_secs_f64())
 }
 
 /// Why a caller-supplied string is unacceptable, or `None` when it fits the store.
@@ -510,6 +858,38 @@ pub fn configuration_arn(region: &str, id: &str) -> String {
     )
 }
 
+/// The ARN of the license `id` in `region`, which for a license is its home Region:
+/// a license is a resource OF the Region the create named as its home.
+pub fn license_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{LICENSE_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// Now, as the ISO8601-UTC instant `License.CreateTime` carries.
+///
+/// `Format::DateTime` renders RFC 3339 in UTC, `YYYY-MM-DDThh:mm:ss[.fff]Z`, which
+/// is what the member's modelled pattern admits.
+pub fn now_iso8601() -> String {
+    ::aws_smithy_types::DateTime::from(SystemTime::now())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        // That format renders every instant this type can hold; the epoch is the
+        // bounded fallback, so no handler has to carry a formatting failure.
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Whether `region` is an AWS Region token: the only text this service lets into a
+/// generated ARN's Region segment.
+pub fn is_region_token(region: &str) -> bool {
+    !region.is_empty()
+        && region.len() <= 64
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// The region this request was signed for, from its SigV4 credential scope; the
 /// emulator's default region when it carries none.
 ///
@@ -519,13 +899,7 @@ pub fn configuration_arn(region: &str, id: &str) -> String {
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
-        .filter(|region| {
-            !region.is_empty()
-                && region.len() <= 64
-                && region
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+        .filter(|region| is_region_token(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
@@ -536,12 +910,12 @@ fn now_nanos() -> u64 {
         .map_or(0, |d| d.as_nanos() as u64)
 }
 
-/// One `lic-<32 hex>` id from `seed`.
-fn configuration_id_from_seed(seed: u64, salt: u64) -> String {
+/// One `<prefix><32 hex>` id from `seed`.
+fn id_from_seed(prefix: &str, seed: u64, salt: u64) -> String {
     let mut state = seed;
     let high = splitmix64(&mut state) ^ salt.rotate_right(29);
     let low = splitmix64(&mut state);
-    format!("{CONFIGURATION_ID_PREFIX}{high:016x}{low:016x}")
+    format!("{prefix}{high:016x}{low:016x}")
 }
 
 /// SplitMix64: the id generator's mixing step, so consecutive seeds do not produce

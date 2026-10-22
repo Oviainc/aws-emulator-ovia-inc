@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLicense
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLicense`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLicense::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one license and PERSISTS it in [`crate::state`], keyed by the ARN it
+//! returns, so a later `GetLicense` reports exactly what this call stored, and a
+//! repeat of the same `ClientToken` reports the license the first call minted
+//! instead of minting a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +169,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLicense` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLicenseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLicense"))
+        // Every member this handler stores is `@required` or modelled-optional and
+        // the centralized walk has already refused a request that breaks a modelled
+        // constraint. The rejection below is this handler's own guard — the model
+        // publishes no length for any string or list in a license body, so those
+        // bounds, the entitlement-unit catalog and the Region shape of `HomeRegion`
+        // live with the store that holds them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        if let Some(why) = crate::state::license_input_rejection(&crate::state::LicenseInput {
+            license_name: &input.license_name,
+            product_name: &input.product_name,
+            product_sku: Some(&input.product_sku),
+            issuer: &input.issuer,
+            home_region: &input.home_region,
+            validity: &input.validity,
+            beneficiary: Some(&input.beneficiary),
+            entitlements: &input.entitlements,
+            consumption_configuration: &input.consumption_configuration,
+            license_metadata: input.license_metadata.as_deref(),
+            tags: input.tags.as_deref(),
+        }) {
+            return Err(invalid_parameter(why));
+        }
+
+        let mut store = state.lock();
+
+        // `ClientToken` is the caller's idempotency key, so the repeat of an
+        // accepted create reports the license that create minted and mints nothing:
+        // one token, one license.
+        if let Some(minted) = store.license_for_client_token(&input.client_token) {
+            return Ok(CreateLicenseOutput {
+                license_arn: Some(minted.arn.clone()),
+                status: Some(minted.status.clone()),
+                version: Some(minted.version.clone()),
+            });
+        }
+
+        let id = store.fresh_license_id();
+        // A license belongs to the Region the request named as its home, so that is
+        // the Region segment of its ARN; `HomeRegion` was checked to be a Region
+        // token above, so no caller text beyond one can reach the ARN.
+        let arn = crate::state::license_arn(&input.home_region, &id);
+        let license = crate::state::StoredLicense {
+            id,
+            arn: arn.clone(),
+            license_name: input.license_name,
+            product_name: input.product_name,
+            product_sku: input.product_sku,
+            issuer: IssuerDetails {
+                name: Some(input.issuer.name),
+                sign_key: input.issuer.sign_key,
+                // This emulator holds no KMS key material and signs no license, so
+                // there is no issuer key fingerprint to report.
+                key_fingerprint: None,
+            },
+            home_region: input.home_region,
+            // AWS hands back a license that can be checked out at once, so it is
+            // minted in the terminal `AVAILABLE` status and owes the clock no
+            // transition.
+            status: crate::state::LICENSE_STATUS_AVAILABLE.to_string(),
+            validity: input.validity,
+            beneficiary: input.beneficiary,
+            entitlements: input.entitlements,
+            consumption_configuration: input.consumption_configuration,
+            license_metadata: input.license_metadata,
+            create_time: crate::state::now_iso8601(),
+            version: crate::state::FIRST_LICENSE_VERSION.to_string(),
+            client_token: input.client_token,
+        };
+        let status = license.status.clone();
+        let version = license.version.clone();
+        // The store is finite, and `insert_license` is what enforces that: a create
+        // that would take it past its cap stores nothing. `CreateLicense` models no
+        // resource-limit error, so a store this emulator cannot grow is reported on
+        // the modelled server channel rather than blamed on the request.
+        if !store.insert_license(license) {
+            return Err(store_full());
+        }
+
+        // Tags supplied at create time go into the same ARN-keyed map the tagging
+        // operations use, so `ListTagsForResource` reports them. The list was
+        // already bounded above and the license is now stored, so the only way this
+        // can be refused is a bound; the half-made license goes with it.
+        if let Some(tags) = input.tags {
+            if let Err(why) = store.merge_tags(&arn, &tags) {
+                store.remove_license(&arn);
+                return Err(invalid_parameter(why));
+            }
+        }
+
+        crate::state::record_mutation(Self::NAME, &arn, ctx.parts());
+        Ok(CreateLicenseOutput {
+            license_arn: Some(arn),
+            status: Some(status),
+            version: Some(version),
+        })
     }
+}
+
+/// The modelled server error for a store this handler cannot reach.
+fn store_unavailable() -> CreateLicenseError {
+    CreateLicenseErrorModeled::ServerInternalException(ServerInternalException {
+        message: Some("the license store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for a store this emulator will not grow any further.
+fn store_full() -> CreateLicenseError {
+    CreateLicenseErrorModeled::ServerInternalException(ServerInternalException {
+        message: Some(format!(
+            "this emulator already holds the maximum of {} licenses",
+            crate::state::MAX_LICENSES
+        )),
+    })
+    .into()
+}
+
+/// The modelled 400 this service answers for a parameter value it will not accept.
+fn invalid_parameter(message: impl Into<String>) -> CreateLicenseError {
+    CreateLicenseErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message.into()),
+    })
+    .into()
 }

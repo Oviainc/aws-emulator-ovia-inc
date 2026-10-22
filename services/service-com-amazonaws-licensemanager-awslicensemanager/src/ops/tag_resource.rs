@@ -165,17 +165,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        // Tags are keyed by resource ARN, so the resource has to exist first.
-        if store.configuration(&input.resource_arn).is_none() {
+        // Tags are keyed by resource ARN, so the resource has to exist first — any
+        // resource this service stores, since the operation is modelled against a
+        // generic `ResourceArn`.
+        if !store.is_taggable(&input.resource_arn) {
             return Err(invalid_parameter(format!(
-                "no license configuration exists with the ARN '{}'",
+                "no resource exists with the ARN '{}'",
                 input.resource_arn
             )));
         }
 
         // The store is finite, and `merge_tags` is what enforces that: a merge whose
-        // ARN names no stored configuration, or that would take the resource past
-        // the tag cap, changes nothing.
+        // ARN names no stored resource, or that would take the resource past the tag
+        // cap, changes nothing.
         if let Err(why) = store.merge_tags(&input.resource_arn, &input.tags) {
             return Err(invalid_parameter(why));
         }
