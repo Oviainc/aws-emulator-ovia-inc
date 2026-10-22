@@ -21,9 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Digests the `clientToken` idempotency record fingerprints a create request with.
+# Digests the `clientToken` idempotency record fingerprints a create request with, and
+# seals the opaque `nextToken` pagination cursors in `src/state.rs`.
 sha2 = { workspace = true }
-# Renders those digests as the hex string the idempotency record stores.
+# Renders those digests as the hex strings the idempotency record and the pagination
+# cursors are encoded as.
 hex = { workspace = true }
 
 [build-dependencies]

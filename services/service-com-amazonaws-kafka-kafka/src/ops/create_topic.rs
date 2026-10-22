@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTopic
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTopic`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates one topic on a stored cluster and registers it, so every later reader
+//! of that cluster's topics sees it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTopic::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The cluster is resolved first, exactly as in `DeleteTopic` / `DescribeTopic`:
+//!
+//! * a `ClusterArn` that is not shaped like an MSK cluster ARN is a
+//!   `BadRequestException`;
+//! * a well-formed one this endpoint's region holds no cluster for is also a
+//!   `BadRequestException` -- this operation models NO `NotFoundException`, so the
+//!   modelled 400 is what reports a cluster the request names and the service does
+//!   not hold;
+//! * a `TopicName` Apache Kafka itself would refuse (see
+//!   [`crate::state::topic_name_error`]) is a `BadRequestException`;
+//! * a `ReplicationFactor` above the cluster's broker count is a
+//!   `BadRequestException`: Kafka cannot place more replicas of a partition than
+//!   it has brokers to place them on;
+//! * a name the cluster already holds a topic for is a `TopicExistsException`,
+//!   leaving the existing topic untouched;
+//! * a cluster already at [`crate::state::MAX_TOPICS_PER_CLUSTER`] topics answers
+//!   `TooManyRequestsException`, which is what bounds the registry.
+//!
+//! A created topic starts in `CREATING` and the clock owes it its `ACTIVE`
+//! transition ([`crate::state::TOPIC_ACTIVATION_DELAY`]), so a caller that reads
+//! it straight back sees `CREATING` and one that waits sees `ACTIVE`.
+//!
+//! `Configs` is stored verbatim (the model types it as the Base64 string the
+//! caller supplied) and handed back by `DescribeTopic` unchanged; this emulator
+//! does not interpret topic-level Kafka configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +193,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTopic` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTopicErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTopic"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTopicErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Request-only checks first, so the registry mutex below is held for the
+        // state-dependent work alone.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                CreateTopicErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+        if let Some(reason) = crate::state::topic_name_error(&input.topic_name) {
+            return Err(
+                CreateTopicErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("TopicName".to_string()),
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+
+        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
+            // `CreateTopic` models no `NotFoundException`, so the cluster it
+            // cannot resolve is reported through the modelled 400.
+            return Err(
+                CreateTopicErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "No cluster exists in {region} with the ARN {}",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // Apache Kafka cannot place more replicas of a partition than the cluster
+        // has brokers to place them on, so the replication factor is bounded by
+        // THIS cluster's broker count rather than by any fixed number.
+        if input.replication_factor > cluster.number_of_broker_nodes {
+            return Err(
+                CreateTopicErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ReplicationFactor".to_string()),
+                    message: Some(format!(
+                        "Replication factor: {} larger than available brokers: {}.",
+                        input.replication_factor, cluster.number_of_broker_nodes
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        let topic = crate::state::Topic::created(
+            cluster,
+            input.topic_name,
+            input.partition_count,
+            input.replication_factor,
+            input.configs,
+            now,
+        );
+        let output = CreateTopicOutput {
+            topic_arn: Some(topic.arn.clone()),
+            topic_name: Some(topic.name.clone()),
+            status: Some(topic.state.clone()),
+        };
+        let topic_name = topic.name.clone();
+        // The registry enforces its own ceiling and its own uniqueness on the one
+        // insertion path, so a refused create registers nothing. It is also what
+        // materialises a removal the clock already owed this name, so a name whose
+        // topic every reader reports gone is free here too.
+        if let Err(rejected) = state.register_topic(topic, now) {
+            return Err(match rejected {
+                crate::state::TopicRejected::DuplicateName => {
+                    CreateTopicErrorModeled::TopicExistsException(TopicExistsException {
+                        invalid_parameter: Some("TopicName".to_string()),
+                        message: Some(format!(
+                            "The cluster {} already has a topic named '{topic_name}'.",
+                            input.cluster_arn
+                        )),
+                    })
+                    .into()
+                }
+                crate::state::TopicRejected::ClusterCeiling => {
+                    CreateTopicErrorModeled::TooManyRequestsException(TooManyRequestsException {
+                        invalid_parameter: None,
+                        message: Some(format!(
+                            "The cluster {} holds its maximum of {} topics.",
+                            input.cluster_arn,
+                            crate::state::MAX_TOPICS_PER_CLUSTER
+                        )),
+                    })
+                    .into()
+                }
+            });
+        }
+        Ok(output)
     }
 }

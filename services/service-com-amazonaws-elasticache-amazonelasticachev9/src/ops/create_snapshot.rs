@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateSnapshot::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -174,18 +170,227 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSnapshot"))
+        // This operation MUTATES: it mints a snapshot of a stored cluster, and
+        // puts that cluster in `snapshotting` until the clock owes it
+        // `available` again.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `SnapshotName` "is stored as a lowercase string", so the identity a
+        // later Describe resolves is the lowercased one.
+        let snapshot_name = input.snapshot_name.to_ascii_lowercase();
+        if !crate::state::is_valid_snapshot_name(&snapshot_name) {
+            return Err(CreateSnapshotErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "Invalid value {} for SnapshotName: a name must contain from 1 to 255 \
+                         alphanumeric characters or hyphens.",
+                        input.snapshot_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A snapshot is taken of ONE source: "The identifier of an existing
+        // cluster. The snapshot is created from this cluster" or "The
+        // identifier of an existing replication group". Naming both, or
+        // neither, names no source to copy.
+        let cache_cluster_id = match (
+            input.cache_cluster_id.as_deref(),
+            input.replication_group_id.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    CreateSnapshotErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                "CacheClusterId and ReplicationGroupId cannot both be specified: a \
+                                 snapshot is taken of one source."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            (None, None) => {
+                return Err(
+                    CreateSnapshotErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                "Either CacheClusterId or ReplicationGroupId must be specified: a \
+                                 snapshot is taken of an existing cluster or replication group."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            // A replication group can only be snapshotted if it exists, and
+            // none can: every replication-group operation in this service is
+            // still a scaffolded 501, so there is nothing to copy.
+            (None, Some(group)) => {
+                return Err(CreateSnapshotErrorModeled::ReplicationGroupNotFoundFault(
+                    ReplicationGroupNotFoundFault {
+                        message: Some(format!("Replication group {group} not found.")),
+                    },
+                )
+                .into())
+            }
+            (Some(id), None) => id.to_ascii_lowercase(),
+        };
+
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(CreateSnapshotErrorModeled::TagQuotaPerResourceExceeded(
+                    TagQuotaPerResourceExceeded {
+                        message: Some(format!(
+                            "{count} tags were supplied; the maximum number of tags permitted on a \
+                             resource is {}.",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::TagRefusal::MissingKey) => {
+                return Err(CreateSnapshotErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "Invalid value for Tags: a tag's Key may not be null.".to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        if store.snapshots.contains_key(&snapshot_name) {
+            return Err(CreateSnapshotErrorModeled::SnapshotAlreadyExistsFault(
+                SnapshotAlreadyExistsFault {
+                    message: Some(format!("Snapshot {snapshot_name} already exists.")),
+                },
+            )
+            .into());
+        }
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record, which is what `SnapshotQuotaExceededFault`
+        // refuses.
+        if store.snapshots.len() >= crate::state::SNAPSHOT_QUOTA {
+            return Err(CreateSnapshotErrorModeled::SnapshotQuotaExceededFault(
+                SnapshotQuotaExceededFault {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} snapshots.",
+                        crate::state::SNAPSHOT_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(cluster) = store.settled_cluster_mut(&cache_cluster_id, now) else {
+            return Err(CreateSnapshotErrorModeled::CacheClusterNotFoundFault(
+                CacheClusterNotFoundFault {
+                    message: Some(format!(
+                        "Cache cluster {} not found.",
+                        input.cache_cluster_id.unwrap_or_default()
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `SnapshotFeatureNotSupportedFault` is what ElastiCache refuses
+        // "creating a snapshot of a cluster that is running Memcached rather
+        // than Valkey or Redis OSS" and "creating a snapshot of a Valkey or
+        // Redis OSS cluster running on a cache.t1.micro cache node" with. This
+        // operation "is valid for Valkey or Redis OSS only".
+        if cluster.engine == "memcached" {
+            return Err(CreateSnapshotErrorModeled::SnapshotFeatureNotSupportedFault(
+                SnapshotFeatureNotSupportedFault {
+                    message: Some(format!(
+                        "Cache cluster {cache_cluster_id} runs {}, and snapshots are supported for \
+                         valkey and redis only.",
+                        cluster.engine
+                    )),
+                },
+            )
+            .into());
+        }
+        if cluster
+            .cache_node_type
+            .as_deref()
+            .is_some_and(|node_type| {
+                node_type.eq_ignore_ascii_case(crate::state::UNSNAPSHOTTABLE_NODE_TYPE)
+            })
+        {
+            return Err(CreateSnapshotErrorModeled::SnapshotFeatureNotSupportedFault(
+                SnapshotFeatureNotSupportedFault {
+                    message: Some(format!(
+                        "Cache cluster {cache_cluster_id} runs on {}, which does not support \
+                         snapshots.",
+                        crate::state::UNSNAPSHOTTABLE_NODE_TYPE
+                    )),
+                },
+            )
+            .into());
+        }
+        // A cluster can only be copied while it is settled: one still
+        // `creating`, `modifying`, `deleting` or already `snapshotting` from an
+        // earlier call is refused with the modelled state fault.
+        if cluster.status != crate::state::STATUS_AVAILABLE {
+            return Err(CreateSnapshotErrorModeled::InvalidCacheClusterStateFault(
+                InvalidCacheClusterStateFault {
+                    message: Some(format!(
+                        "Cache cluster {cache_cluster_id} is in {} state, not available.",
+                        cluster.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The snapshot copies the cluster as it stands at this instant, and the
+        // cluster answers `snapshotting` until the clock owes it `available`.
+        let record = crate::state::SnapshotRecord::from_cluster(
+            cluster,
+            crate::state::NewSnapshot {
+                snapshot_name,
+                source: crate::state::SNAPSHOT_SOURCE_MANUAL.to_string(),
+                kms_key_id: input.kms_key_id,
+                // Resolved below: the VPC is the source cluster's subnet
+                // group's, which is another record of this store.
+                vpc_id: None,
+                tags,
+                now,
+            },
+        );
+        cluster.begin_transition(crate::state::STATUS_SNAPSHOTTING, now);
+        let subnet_group_name = cluster.cache_subnet_group_name.clone();
+
+        let mut record = record;
+        record.vpc_id = subnet_group_name.and_then(|name| {
+            store
+                .cache_subnet_groups
+                .get(&name.to_ascii_lowercase())
+                .map(|group| group.vpc_id.clone())
+        });
+
+        // A created snapshot is NOT ready: it answers `creating`, and the clock
+        // owes it `available` once the transition span has passed. The response
+        // is read back out of the store, so it reports the persisted record.
+        Ok(CreateSnapshotOutput {
+            snapshot: Some(store.insert_snapshot(record).to_modeled(true)),
+        })
     }
 }

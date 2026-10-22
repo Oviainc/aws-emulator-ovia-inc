@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AccountAggregationSource, AggregatorFilters, ComplianceContributorCount, ComplianceSummary,
     ConfigRule, ConfigSnapshotDeliveryProperties, ConfigurationAggregator, ConfigurationRecorder,
-    ConfigurationRecorderStatus, DeliveryChannel, EvaluationModeConfiguration,
+    ConfigurationRecorderStatus, ConfigurationRecorderSummary, DeliveryChannel,
+    EvaluationModeConfiguration,
     ExclusionByResourceTypes, OrganizationAggregationSource, PendingAggregationRequest,
     RecordingGroup, RecordingMode, RecordingStrategy, Scope, Source, Tag,
 };
@@ -75,6 +76,27 @@ pub const RECORDING_FREQUENCY_CONTINUOUS: &str = "CONTINUOUS";
 /// the `PAID` scope; `INTERNAL` belongs to the service-linked recorders
 /// `PutServiceLinkedConfigurationRecorder` creates.
 pub const RECORDING_SCOPE_PAID: &str = "PAID";
+/// See [`RECORDING_SCOPE_PAID`].
+pub const RECORDING_SCOPE_INTERNAL: &str = "INTERNAL";
+
+/// Every published `RecordingScope` value
+/// (`com.amazonaws.configservice#RecordingScope`, whose values are `INTERNAL` and
+/// `PAID`). A `recordingScope` filter value outside this list names no scope a
+/// recorder can record in.
+pub const RECORDING_SCOPES: [&str; 2] = [RECORDING_SCOPE_INTERNAL, RECORDING_SCOPE_PAID];
+
+/// The only `ConfigurationRecorderFilterName` the model declares
+/// (`com.amazonaws.configservice#ConfigurationRecorderFilterName`, whose single value
+/// is `recordingScope`; `ConfigurationRecorderFilter$filterName`: "Currently, only
+/// recordingScope is supported").
+pub const CONFIGURATION_RECORDER_FILTER_RECORDING_SCOPE: &str = "recordingScope";
+
+/// How many recorder summaries one `ListConfigurationRecorders` page carries when the
+/// request asks for no fewer: the maximum of that operation's own `MaxResults` member
+/// (range 0..20). A request that carries no `MaxResults`, or carries the member's own
+/// default of 0, is served a page of this size — a page of zero would never report a
+/// recorder the store holds.
+pub const LIST_CONFIGURATION_RECORDERS_PAGE_SIZE: usize = 20;
 
 /// The `RuleEvaluationVisibility` of a rule whose `Evaluation`s the caller can read
 /// back (`ConfigRule$RuleEvaluationVisibility`: "You can get Evaluations for the
@@ -160,6 +182,13 @@ pub struct RecorderEntry {
     pub recording_mode: Option<RecordingMode>,
     pub recording_scope: Option<String>,
     pub service_principal: Option<String>,
+    /// The third-party cloud service provider whose resources a service-linked
+    /// recorder records (`ConfigurationRecorderSummary$provider`: "For service-linked
+    /// configuration recorders that record resources from a third-party cloud service
+    /// provider, indicates the cloud service provider"), so it stays unset for every
+    /// recorder this account creates itself. Only
+    /// `PutThirdPartyServiceLinkedConfigurationRecorder` sets it.
+    pub provider: Option<String>,
     /// Tags are taken at creation and not updated afterwards
     /// (`PutConfigurationRecorder`: "Tags are added at creation and cannot be
     /// updated").
@@ -179,6 +208,22 @@ impl RecorderEntry {
             service_principal: self.service_principal.clone(),
             connector_arn: None,
             scope_configuration: None,
+        }
+    }
+
+    /// The modelled `ConfigurationRecorderSummary`, read back out of state: the
+    /// recorder's identity and the scope it records in, without its configuration.
+    ///
+    /// `recordingScope` is required in the summary while state keeps it optional, so a
+    /// recorder stored without one summarises with the scope
+    /// [`materialised_recording_scope`] gives it.
+    pub fn to_summary(&self) -> ConfigurationRecorderSummary {
+        ConfigurationRecorderSummary {
+            arn: self.arn.clone(),
+            name: self.name.clone(),
+            service_principal: self.service_principal.clone(),
+            recording_scope: materialised_recording_scope(self.recording_scope.clone()),
+            provider: self.provider.clone(),
         }
     }
 }

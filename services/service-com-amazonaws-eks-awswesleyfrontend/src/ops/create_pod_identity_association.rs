@@ -2,10 +2,10 @@
 
 //! @op CreatePodIdentityAssociation
 //! IMPLEMENTED. Writes the [`crate::state::PodIdentityAssociationRecord`] that
-//! `DescribePodIdentityAssociation`, `UpdatePodIdentityAssociation` and
-//! `DeletePodIdentityAssociation` read: the `associationId`, `associationArn`,
-//! `externalId`, `createdAt` and `modifiedAt` it answers with are minted once here
-//! and stored, never recomputed on a read.
+//! `DescribePodIdentityAssociation`, `UpdatePodIdentityAssociation`,
+//! `DeletePodIdentityAssociation` and `ListPodIdentityAssociations` read: the
+//! `associationId`, `associationArn`, `externalId`, `createdAt` and `modifiedAt`
+//! it answers with are minted once here and stored, never recomputed on a read.
 //!
 //! Every identifier the request carries is checked for its documented FORM before
 //! any resource is resolved — the cluster name, the IAM role ARNs and the

@@ -296,8 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            cluster_state, ClusterRecord, ClusterStatusRecord, InstancesRecord, StepRecord,
-            DEFAULT_STEP_CONCURRENCY_LEVEL, MAX_STEPS_PER_JOB_FLOW, MAX_STEP_CONCURRENCY_LEVEL,
+            cluster_state, ClusterRecord, ClusterStatusRecord, InstanceFleetRecord,
+            InstancesRecord, StepRecord, DEFAULT_STEP_CONCURRENCY_LEVEL,
+            MAX_INSTANCE_FLEETS_PER_CLUSTER, MAX_STEPS_PER_JOB_FLOW, MAX_STEP_CONCURRENCY_LEVEL,
             TRANSITION_SPAN,
         };
 
@@ -322,6 +323,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(
                 "Instances may carry InstanceGroups or InstanceFleets, but not both",
             ));
+        }
+
+        // One cluster carries a bounded number of instance fleets, whether they arrive
+        // with the cluster or through `AddInstanceFleet`, so neither entry point can
+        // grow one cluster's fleet list without limit.
+        let requested_fleet_count = input
+            .instances
+            .instance_fleets
+            .as_ref()
+            .map_or(0, Vec::len);
+        if requested_fleet_count > MAX_INSTANCE_FLEETS_PER_CLUSTER {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Instances carries {requested_fleet_count} instance fleets; a cluster carries \
+                 at most {MAX_INSTANCE_FLEETS_PER_CLUSTER}"
+            )));
         }
 
         // "A maximum of 256 steps are allowed in each job flow." (RunJobFlow doc.)
@@ -366,6 +382,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.mint_cluster_id();
         let arn = crate::state::cluster_arn(&region, &id);
         let instances = InstancesRecord::from_config(&input.instances);
+
+        // One InstanceFleetRecord per fleet the request configured, in request order,
+        // each under the id EMR mints for it — the same records `AddInstanceFleet`
+        // appends to later.
+        let mut requested_fleets = Vec::new();
+        for config in input.instances.instance_fleets.clone().unwrap_or_default() {
+            let fleet_id = store.mint_instance_fleet_id();
+            requested_fleets.push(InstanceFleetRecord::from_config(fleet_id, config, now));
+        }
 
         // One Step record per submitted StepConfig, in submission order.
         let mut steps = Vec::with_capacity(step_configs.len());
@@ -430,6 +455,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 terminated_due_at: None,
             },
             steps,
+            // The fleets the request named, which `AddInstanceFleet` appends to.
+            fleets: requested_fleets,
+            // A new cluster carries no Spark Connect session: `StartSession` is what
+            // starts one.
+            sessions: Vec::new(),
         };
         store.clusters.insert(id.clone(), record);
         drop(store);

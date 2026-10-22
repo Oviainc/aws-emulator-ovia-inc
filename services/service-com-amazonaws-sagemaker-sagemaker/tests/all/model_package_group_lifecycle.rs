@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end wire tests for SageMaker's model-package-group registry:
-//! `CreateModelPackageGroup` and the `DescribeModelPackageGroup` that reads it back.
+//! `CreateModelPackageGroup`, the `DescribeModelPackageGroup` that reads it back and the
+//! `DeleteModelPackageGroup` that removes it.
 //!
 //! Every case goes over the wire (`POST /` with `X-Amz-Target: SageMaker.<Op>`,
 //! `awsJson1_1`) through the same `MultiServiceRouter` the production router uses, so
@@ -10,7 +11,10 @@
 //! The tests assert RULES over a TABLE of inputs rather than one recorded call: the ARN
 //! form for every name shape and region, the create/describe round trip for every
 //! optional member, `ArnOrName` addressing for the reader, the refusal of a name already
-//! in use, the refusal of a name no group is stored under, and the stability of a read.
+//! in use, the refusal of a name no group is stored under, the stability of a read, and
+//! — for the delete — that it removes exactly the group it names, refuses a group that
+//! still holds registered model package versions, and refuses a name no group is stored
+//! under.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,6 +115,32 @@ fn error_code(body: &Value) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+/// The `message` an error body carries.
+fn message(body: &Value) -> String {
+    body.get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The two forms a caller may address a resource by when the input member is modelled
+/// `ArnOrName`.
+#[derive(Debug, Clone, Copy)]
+enum Address {
+    Name,
+    Arn,
+}
+
+impl Address {
+    /// The identifier to send for the group called `name` whose ARN is `arn`.
+    fn identifier(self, name: &str, arn: &str) -> String {
+        match self {
+            Self::Name => name.to_string(),
+            Self::Arn => arn.to_string(),
+        }
+    }
 }
 
 fn str_field(body: &Value, member: &str) -> String {
@@ -501,4 +531,320 @@ async fn repeated_describes_answer_the_same_group() {
              did, got {second:?}"
         );
     }
+}
+
+/// RULE: a delete removes exactly the resource its identifier resolves to — afterwards the
+/// reader refuses that resource, every other stored resource of the kind still reads back
+/// unchanged, and the freed name can be taken again.
+#[tokio::test]
+async fn deleting_a_group_removes_only_that_group_and_frees_its_name() {
+    // Rows differ along the name's shape and along the two `ArnOrName` addressing forms
+    // the delete's `ModelPackageGroupName` admits.
+    for address in [Address::Name, Address::Arn] {
+        for name in NAMES {
+            let emulator = Emulator::new();
+            let case = format!("address={address:?} name={name}");
+
+            // A second group, so the delete is shown to remove only the one it names.
+            let sibling = emulator
+                .ok(
+                    "CreateModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": "sibling", "ModelPackageGroupDescription": "kept" }),
+                )
+                .await;
+            let created = emulator
+                .ok(
+                    "CreateModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": name, "ModelPackageGroupDescription": "first" }),
+                )
+                .await;
+            let arn = str_field(&created, "ModelPackageGroupArn");
+
+            let (status, deleted) = emulator
+                .call(
+                    "DeleteModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": address.identifier(name, &arn) }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case}: expected HTTP 200 from DeleteModelPackageGroup, got {status} \
+                 with {deleted}"
+            );
+
+            // The group is gone: the reader refuses it rather than replaying a record.
+            let (describe_status, described) = emulator
+                .call(
+                    "DescribeModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": name }),
+                )
+                .await;
+            assert_eq!(
+                describe_status, 400,
+                "case {case}: DescribeModelPackageGroup after the delete must be refused, got \
+                 {describe_status} with {described}"
+            );
+            assert_eq!(
+                error_code(&described),
+                "ValidationException",
+                "case {case}: error code of the read-after-delete, got {described:?}"
+            );
+
+            // The group the delete did not name is untouched.
+            let sibling_after = emulator
+                .ok(
+                    "DescribeModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": "sibling" }),
+                )
+                .await;
+            assert_eq!(
+                str_field(&sibling_after, "ModelPackageGroupArn"),
+                str_field(&sibling, "ModelPackageGroupArn"),
+                "case {case}: the sibling group must survive the delete, got {sibling_after:?}"
+            );
+            assert_eq!(
+                sibling_after
+                    .get("ModelPackageGroupDescription")
+                    .and_then(Value::as_str),
+                Some("kept"),
+                "case {case}: the sibling group's members must be unchanged, got \
+                 {sibling_after:?}"
+            );
+
+            // The name is free again, and what reads back is the NEW record, not the
+            // deleted one.
+            let recreated = emulator
+                .ok(
+                    "CreateModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": name, "ModelPackageGroupDescription": "second" }),
+                )
+                .await;
+            assert_eq!(
+                str_field(&recreated, "ModelPackageGroupArn"),
+                arn,
+                "case {case}: re-creating the freed name mints the same ARN, got {recreated:?}"
+            );
+            let after = emulator
+                .ok(
+                    "DescribeModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": name }),
+                )
+                .await;
+            assert_eq!(
+                after
+                    .get("ModelPackageGroupDescription")
+                    .and_then(Value::as_str),
+                Some("second"),
+                "case {case}: the re-created group must be the new record, got {after:?}"
+            );
+        }
+    }
+}
+
+/// RULE: deleting a container while it still holds members is refused (HTTP 400
+/// `ValidationException`) and removes nothing, whatever the identifier form and however
+/// many members it holds.
+#[tokio::test]
+async fn deleting_a_group_that_still_holds_model_package_versions_is_refused() {
+    // Rows differ along the number of versions registered into the group (one, a few,
+    // several) and along the two `ArnOrName` addressing forms.
+    for address in [Address::Name, Address::Arn] {
+        for versions in [1_usize, 2, 5] {
+            let emulator = Emulator::new();
+            let case = format!("address={address:?} versions={versions}");
+            let created = emulator
+                .ok(
+                    "CreateModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": "versioned" }),
+                )
+                .await;
+            let arn = str_field(&created, "ModelPackageGroupArn");
+            for _ in 0..versions {
+                emulator
+                    .ok(
+                        "CreateModelPackage",
+                        &json!({ "ModelPackageGroupName": "versioned" }),
+                    )
+                    .await;
+            }
+            let before = emulator
+                .ok(
+                    "DescribeModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": "versioned" }),
+                )
+                .await;
+
+            let (status, refused) = emulator
+                .call(
+                    "DeleteModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": address.identifier("versioned", &arn) }),
+                )
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case}: expected HTTP 400 for a group that still holds versions, got \
+                 {status} with {refused}"
+            );
+            assert_eq!(
+                error_code(&refused),
+                "ValidationException",
+                "case {case}: error code, got {refused:?}"
+            );
+            assert!(
+                message(&refused).contains(&arn),
+                "case {case}: the refusal must name the group, got {:?}",
+                message(&refused)
+            );
+
+            let after = emulator
+                .ok(
+                    "DescribeModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": "versioned" }),
+                )
+                .await;
+            assert_eq!(
+                after, before,
+                "case {case}: a refused delete must leave the group stored and unchanged, got \
+                 {after:?}"
+            );
+            // Every version is still registered: its own reader still answers for it.
+            for version in 1..=versions {
+                let package = emulator
+                    .ok(
+                        "DescribeModelPackage",
+                        &json!({ "ModelPackageName": format!("versioned/{version}") }),
+                    )
+                    .await;
+                assert_eq!(
+                    package.get("ModelPackageVersion").and_then(Value::as_i64),
+                    Some(version as i64),
+                    "case {case}: version {version} must still be registered, got {package:?}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: what blocks a container's deletion is the members it HOLDS, not resources whose
+/// name merely coincides with its own — an unversioned model package belongs to no model
+/// package group, so one named like the group leaves the group deletable and survives it.
+#[tokio::test]
+async fn an_unversioned_package_sharing_the_groups_name_does_not_block_the_delete() {
+    for name in NAMES {
+        let emulator = Emulator::new();
+        emulator
+            .ok(
+                "CreateModelPackageGroup",
+                &json!({ "ModelPackageGroupName": name }),
+            )
+            .await;
+        // `CreateModelPackage` with `ModelPackageName` registers an UNVERSIONED package,
+        // which records no model package group.
+        emulator
+            .ok("CreateModelPackage", &json!({ "ModelPackageName": name }))
+            .await;
+
+        let (status, deleted) = emulator
+            .call(
+                "DeleteModelPackageGroup",
+                &json!({ "ModelPackageGroupName": name }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case name={name}: an unversioned package of the same name must not block the \
+             group's deletion, got {status} with {deleted}"
+        );
+
+        let package = emulator
+            .ok("DescribeModelPackage", &json!({ "ModelPackageName": name }))
+            .await;
+        assert_eq!(
+            str_field(&package, "ModelPackageName"),
+            name,
+            "case name={name}: the unversioned package must survive the group's deletion, got \
+             {package:?}"
+        );
+    }
+}
+
+/// RULE: a delete given a name no resource is stored under is refused (HTTP 400
+/// `ValidationException`) rather than answering an empty 200, so a repeat of a delete that
+/// already succeeded is refused too.
+#[tokio::test]
+async fn deleting_a_group_no_record_is_stored_under_is_refused() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateModelPackageGroup",
+            &json!({ "ModelPackageGroupName": "present-group" }),
+        )
+        .await;
+    emulator
+        .ok(
+            "CreateModelPackageGroup",
+            &json!({ "ModelPackageGroupName": "gone-group" }),
+        )
+        .await;
+    let (status, body) = emulator
+        .call(
+            "DeleteModelPackageGroup",
+            &json!({ "ModelPackageGroupName": "gone-group" }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"first delete of gone-group\": expected HTTP 200, got {status} with {body}"
+    );
+
+    // Rows differ along what "absent" can look like: never created, a near-miss of a name
+    // that does exist, a differently cased name, an ARN for a group never created, and a
+    // group whose delete already succeeded.
+    let absent = [
+        ("never created", "missing-group".to_string()),
+        ("near-miss of a stored name", "present-group-2".to_string()),
+        ("differently cased", "Present-Group".to_string()),
+        (
+            "ARN of a group never created",
+            format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:model-package-group/missing-group"),
+        ),
+        ("already deleted", "gone-group".to_string()),
+    ];
+    for (case, identifier) in absent {
+        let (status, refused) = emulator
+            .call(
+                "DeleteModelPackageGroup",
+                &json!({ "ModelPackageGroupName": identifier }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?} ({identifier}): expected HTTP 400 for an absent group, got {status} \
+             with {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case:?} ({identifier}): error code, got {refused:?}"
+        );
+        let resolved = identifier.rsplit('/').next().unwrap_or(&identifier);
+        assert!(
+            message(&refused).contains(resolved),
+            "case {case:?} ({identifier}): the refusal must name the group asked for, got {:?}",
+            message(&refused)
+        );
+    }
+
+    // The group nobody deleted is still there.
+    let present = emulator
+        .ok(
+            "DescribeModelPackageGroup",
+            &json!({ "ModelPackageGroupName": "present-group" }),
+        )
+        .await;
+    assert_eq!(
+        str_field(&present, "ModelPackageGroupName"),
+        "present-group",
+        "case \"present-group after the refusals\": got {present:?}"
+    );
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the job templates this service stores, newest first, after applying the
+//! `createdBefore` / `createdAfter` query filters and the `@paginated` page of
+//! `maxResults` + `nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +70,57 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The opaque `nextToken` for the template the next page starts at: that template's
+/// place in the newest-first order (the pair the order is built from). A client must not
+/// read it; the service only has to be able to resume from it.
+///
+/// The components are joined by `:`, which neither a decimal millisecond (it may carry a
+/// leading `-`) nor a sequence can contain, so the split below is unambiguous whatever
+/// the stored instant is.
+fn encode_cursor(record: &crate::state::JobTemplateRecord) -> String {
+    format!("{}:{}", record.created_at_millis, record.sequence)
+}
+
+/// The place in the newest-first order a `nextToken` names.
+///
+/// `None` — refused as an invalid request — when the token is not one of this
+/// operation's cursors.
+fn decode_cursor(token: &str) -> Option<(i64, u64)> {
+    let mut parts = token.split(':');
+    let (Some(created_at_millis), Some(sequence), None) = (parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    Some((created_at_millis.parse().ok()?, sequence.parse().ok()?))
+}
+
+/// Whether one stored template satisfies every filter the request carried. A filter the
+/// request omitted constrains nothing.
+///
+/// `createdBefore` / `createdAfter` bound `createdAt` strictly, the same way
+/// `ListJobRuns` bounds a job run's, so the two together name an open interval and
+/// neither ever returns the template created exactly at a bound.
+fn matches_filters(
+    record: &crate::state::JobTemplateRecord,
+    input: &ListJobTemplatesInput,
+) -> bool {
+    if input
+        .created_before
+        .as_ref()
+        .is_some_and(|bound| record.created_at_millis >= crate::state::millis_of(bound))
+    {
+        return false;
+    }
+    if input
+        .created_after
+        .as_ref()
+        .is_some_and(|bound| record.created_at_millis <= crate::state::millis_of(bound))
+    {
+        return false;
+    }
+    true
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +191,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobTemplates"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListJobTemplatesError::Modeled(
+                ListJobTemplatesErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the job template store is unavailable".to_string()),
+                }),
+            )
+        })?;
+        let _ = ctx;
+        let mut state = store.lock();
+        state.settle();
+
+        // `maxResults` is the page size. The model declares no range for it, but a page
+        // of fewer than one item is not a page, so it is refused rather than silently
+        // read as "no limit".
+        let page_size = match input.max_results {
+            Some(limit) if limit < 1 => {
+                return Err(ListJobTemplatesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "maxResults must be at least 1, but {limit} was requested"
+                        )),
+                    },
+                )
+                .into());
+            }
+            Some(limit) => Some(usize::try_from(limit).unwrap_or(usize::MAX)),
+            None => None,
+        };
+
+        // Newest first. The creation sequence breaks a tie between two templates created
+        // in the same millisecond, so the order is total and a page boundary never
+        // depends on hash order.
+        let mut matching: Vec<&crate::state::JobTemplateRecord> = state
+            .job_templates
+            .values()
+            .filter(|record| matches_filters(record, &input))
+            .collect();
+        matching.sort_by(|left, right| {
+            (right.created_at_millis, right.sequence).cmp(&(left.created_at_millis, left.sequence))
+        });
+
+        // `nextToken` is the POSITION in the newest-first order the next page starts at,
+        // not the identity of a row, so resuming reports everything ordered after the
+        // cursor with no repeats and no gaps.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = decode_cursor(token) else {
+                    return Err(ListJobTemplatesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("nextToken is not a valid pagination token".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                matching
+                    .iter()
+                    .position(|record| (record.created_at_millis, record.sequence) <= cursor)
+                    .unwrap_or(matching.len())
+            }
+        };
+
+        let end = page_size.map_or(matching.len(), |size| {
+            start.saturating_add(size).min(matching.len())
+        });
+        let templates: Vec<JobTemplate> = matching[start..end]
+            .iter()
+            .map(|record| record.to_job_template())
+            .collect();
+        // A `nextToken` only when templates remain after this page.
+        let next_token = matching.get(end).map(|record| encode_cursor(record));
+
+        Ok(ListJobTemplatesOutput {
+            templates: Some(templates),
+            next_token,
+        })
     }
 }

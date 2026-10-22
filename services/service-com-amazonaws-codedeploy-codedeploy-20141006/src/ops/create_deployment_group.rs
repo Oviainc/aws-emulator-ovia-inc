@@ -393,9 +393,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
 
+            // Only now that the application the request NAMES has been resolved is
+            // the request's own configuration validated, the same precedence
+            // `CreateDeployment` applies: an automatic rollback that is enabled but
+            // names no triggering event can never fire, which is one of the cases
+            // `InvalidAutoRollbackConfigException` describes; an all-empty disabled
+            // one carries no information at all, so it is normalised away rather
+            // than stored and echoed back on every read.
+            if input
+                .auto_rollback_configuration
+                .as_ref()
+                .is_some_and(crate::state::auto_rollback_is_enabled_without_events)
+            {
+                return Err(
+                    CreateDeploymentGroupErrorModeled::InvalidAutoRollbackConfigException(
+                        InvalidAutoRollbackConfigException {
+                            message: Some(
+                                "The automatic rollback configuration is enabled but lists no \
+                                 triggering event type"
+                                    .to_string(),
+                            ),
+                        },
+                    ),
+                );
+            }
+            let auto_rollback_configuration = crate::state::normalized_auto_rollback_configuration(
+                input.auto_rollback_configuration,
+            );
+            // The selector lists are BOUNDED before they are stored. Resolving a
+            // deployment's targets matches every filter its group holds against
+            // the tags of every registered on-premises instance, so an unbounded
+            // selector list stored here would be unbounded work on each later
+            // `CreateDeployment`.
+            check_selector_counts(
+                input.ec2_tag_filters.as_deref().map(<[_]>::len),
+                input
+                    .ec2_tag_set
+                    .as_ref()
+                    .and_then(|set| set.ec2_tag_set_list.as_ref()),
+                || {
+                    CreateDeploymentGroupErrorModeled::InvalidEC2TagException(
+                        InvalidEC2TagException {
+                            message: Some(too_many_filters_message("ec2TagFilters")),
+                        },
+                    )
+                },
+            )?;
+            check_selector_counts(
+                input
+                    .on_premises_instance_tag_filters
+                    .as_deref()
+                    .map(<[_]>::len),
+                input
+                    .on_premises_tag_set
+                    .as_ref()
+                    .and_then(|set| set.on_premises_tag_set_list.as_ref()),
+                || {
+                    CreateDeploymentGroupErrorModeled::InvalidTagException(InvalidTagException {
+                        message: Some(too_many_filters_message("onPremisesInstanceTagFilters")),
+                    })
+                },
+            )?;
+
             let deployment_group_id =
                 crate::state::mint_uuid_from(&mut state.next_id, "deployment-group");
-
             let compute_platform = application.compute_platform.clone();
             let deployment_config_name = named_config.unwrap_or_else(|| {
                 crate::state::default_deployment_config_for(&compute_platform).to_string()
@@ -414,7 +475,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 auto_scaling_groups: input.auto_scaling_groups.unwrap_or_default(),
                 trigger_configurations: input.trigger_configurations.unwrap_or_default(),
                 alarm_configuration: input.alarm_configuration,
-                auto_rollback_configuration: input.auto_rollback_configuration,
+                auto_rollback_configuration,
                 outdated_instances_strategy: input.outdated_instances_strategy,
                 deployment_style: input.deployment_style,
                 blue_green_deployment_configuration: input.blue_green_deployment_configuration,
@@ -443,4 +504,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deployment_group_id: Some(outcome?),
         })
     }
+}
+
+/// Refuse a deployment group whose instance selectors carry more than CodeDeploy
+/// accepts: more filters in one list than
+/// [`crate::state::MAX_TAG_FILTERS_PER_LIST`], or more tag groups in a tag set
+/// than [`crate::state::MAX_TAG_SET_GROUPS`].
+///
+/// `flat_filters` is the length of the group's flat filter list and
+/// `tag_set_groups` the groups of its tag set — the EC2 pair or the on-premises
+/// pair, which differ only in the filter type and in the error a too-long list
+/// answers, hence `too_many_filters`.
+fn check_selector_counts<Filter>(
+    flat_filters: Option<usize>,
+    tag_set_groups: Option<&Vec<Vec<Filter>>>,
+    too_many_filters: impl Fn() -> CreateDeploymentGroupErrorModeled,
+) -> Result<(), CreateDeploymentGroupErrorModeled> {
+    if flat_filters.is_some_and(|len| len > crate::state::MAX_TAG_FILTERS_PER_LIST) {
+        return Err(too_many_filters());
+    }
+    let Some(groups) = tag_set_groups else {
+        return Ok(());
+    };
+    if groups.len() > crate::state::MAX_TAG_SET_GROUPS {
+        return Err(
+            CreateDeploymentGroupErrorModeled::TagSetListLimitExceededException(
+                TagSetListLimitExceededException {
+                    message: Some(format!(
+                        "The number of tag groups included in the tag set list exceeded the \
+                         maximum allowed limit of {}",
+                        crate::state::MAX_TAG_SET_GROUPS
+                    )),
+                },
+            ),
+        );
+    }
+    if groups
+        .iter()
+        .any(|group| group.len() > crate::state::MAX_TAG_FILTERS_PER_LIST)
+    {
+        return Err(too_many_filters());
+    }
+    Ok(())
+}
+
+/// The refusal message for a selector list longer than the service accepts: it
+/// names the member and the limit, which is what a caller has to fix.
+fn too_many_filters_message(member: &str) -> String {
+    format!(
+        "The number of tag filters in {member} exceeded the maximum allowed limit of {}",
+        crate::state::MAX_TAG_FILTERS_PER_LIST
+    )
 }

@@ -855,7 +855,7 @@ async fn date_filters_select_findings_inside_the_window_they_name() {
     let harness = Harness::with_findings(vec![old, recent]).await;
 
     // (case, Filters, expected ids)
-    let cases: [(&str, Value, Vec<&str>); 5] = [
+    let cases: [(&str, Value, Vec<&str>); 6] = [
         (
             "Start and End bracket the old finding",
             json!({ "CreatedAt": [{ "Start": "2019-01-01T00:00:00Z", "End": "2021-01-01T00:00:00Z" }] }),
@@ -875,6 +875,11 @@ async fn date_filters_select_findings_inside_the_window_they_name() {
             "DateRange OLDER_THAN one day keeps only the old finding",
             json!({ "UpdatedAt": [{ "DateRange": { "Value": 1, "Unit": "DAYS", "Comparison": "OLDER_THAN" } }] }),
             vec!["date-old"],
+        ),
+        (
+            "DateRange WITHIN one day keeps only the recent finding",
+            json!({ "UpdatedAt": [{ "DateRange": { "Value": 1, "Unit": "DAYS", "Comparison": "WITHIN" } }] }),
+            vec!["date-recent"],
         ),
         (
             "two windows on one field are joined by OR",

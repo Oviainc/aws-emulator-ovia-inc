@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeSnapshots::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -171,18 +167,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSnapshots"))
+        // This is a reporting operation: it reads the stored snapshots. The one
+        // write it makes is materialising the status change the clock already
+        // owed each record — owed at this instant whether or not anybody called
+        // — through `settle_all`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // This operation's own `MaxRecords` bounds: "Default: 50. Constraints:
+        // minimum 20; maximum 50."
+        let page_size = match crate::state::snapshot_page_size(input.max_records) {
+            Ok(size) => size,
+            Err(message) => {
+                return Err(DescribeSnapshotsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+        // A `Marker` only ever travels back unchanged, so one this service did
+        // not mint is a bad parameter value rather than an empty page.
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(DescribeSnapshotsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(format!("Invalid value {marker} for Marker.")),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+        // `SnapshotSource` selects by how a snapshot came about: "If set to
+        // system, the output shows snapshots that were automatically created by
+        // ElastiCache. If set to user the output shows snapshots that were
+        // manually created. If omitted, the output shows both" — and the filter
+        // is matched against the stored source, which `Snapshot$SnapshotSource`
+        // reports under its own spellings (`automated` / `manual`).
+        let source_filter = match input.snapshot_source.as_deref() {
+            None => None,
+            Some(crate::state::SNAPSHOT_SOURCE_FILTER_SYSTEM) => {
+                Some(crate::state::SNAPSHOT_SOURCE_AUTOMATED)
+            }
+            Some(crate::state::SNAPSHOT_SOURCE_FILTER_USER) => {
+                Some(crate::state::SNAPSHOT_SOURCE_MANUAL)
+            }
+            Some(other) => {
+                return Err(DescribeSnapshotsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {other} for SnapshotSource: must be {} or {}.",
+                            crate::state::SNAPSHOT_SOURCE_FILTER_SYSTEM,
+                            crate::state::SNAPSHOT_SOURCE_FILTER_USER
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+        // `ShowNodeGroupConfig`: "A Boolean value which if true, the node group
+        // (shard) configuration is included in the snapshot description", so it
+        // is reported only when it was asked for.
+        let include_node_group_config = input.show_node_group_config.unwrap_or(false);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // A named cluster has to be one this service knows about: either a
+        // stored cluster, or the source of a stored snapshot, because a snapshot
+        // outlives the cluster it was taken from. Anything else names no
+        // cluster, which is what the modelled `CacheClusterNotFoundFault`
+        // refuses.
+        let cluster_filter = match input.cache_cluster_id.as_deref() {
+            Some(id) => {
+                let key = id.to_ascii_lowercase();
+                let known = store.cache_clusters.contains_key(&key)
+                    || store
+                        .snapshots
+                        .values()
+                        .any(|snapshot| snapshot.cache_cluster_id.as_deref() == Some(key.as_str()));
+                if !known {
+                    return Err(DescribeSnapshotsErrorModeled::CacheClusterNotFoundFault(
+                        CacheClusterNotFoundFault {
+                            message: Some(format!("Cache cluster {id} not found.")),
+                        },
+                    )
+                    .into());
+                }
+                Some(key)
+            }
+            None => None,
+        };
+        // `SnapshotName`: "If this parameter is specified, only this snapshot
+        // are described" — and a name the store does not hold is the modelled
+        // not-found rather than an empty page. The stored name is the lowercased
+        // one, so the lookup lowercases too.
+        let name_filter = match input.snapshot_name.as_deref() {
+            Some(name) => {
+                let key = name.to_ascii_lowercase();
+                if !store.snapshots.contains_key(&key) {
+                    return Err(DescribeSnapshotsErrorModeled::SnapshotNotFoundFault(
+                        SnapshotNotFoundFault {
+                            message: Some(format!("Snapshot {name} not found.")),
+                        },
+                    )
+                    .into());
+                }
+                Some(key)
+            }
+            None => None,
+        };
+        // `ReplicationGroupId` selects "only snapshots associated with that
+        // specific replication group". No stored snapshot has one — every
+        // replication-group operation is a scaffolded 501, so no group can be
+        // snapshotted — and this operation models no not-found for a group, so
+        // the id filters the stored value rather than refusing the request, and
+        // it keeps working when that slice lands.
+        let group_filter = input.replication_group_id.as_deref();
+
+        let mut page: Vec<Snapshot> = Vec::new();
+        let mut marker = None;
+        // The marker names the key the next page resumes at, so the walk starts
+        // there rather than rescanning the records before it.
+        let start = resume_from.unwrap_or_default();
+        for (key, snapshot) in store
+            .snapshots
+            .range(start..)
+            .filter(|(key, _)| name_filter.as_ref().is_none_or(|name| *key == name))
+            .filter(|(_, snapshot)| {
+                cluster_filter
+                    .as_ref()
+                    .is_none_or(|id| snapshot.cache_cluster_id.as_deref() == Some(id.as_str()))
+            })
+            .filter(|(_, snapshot)| {
+                group_filter.is_none_or(|id| snapshot.replication_group_id.as_deref() == Some(id))
+            })
+            .filter(|(_, snapshot)| source_filter.is_none_or(|source| snapshot.source == source))
+        {
+            if page.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from — the key of the first
+                // record this page did not return.
+                marker = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(snapshot.to_modeled(include_node_group_config));
+        }
+
+        Ok(DescribeSnapshotsOutput {
+            marker,
+            snapshots: Some(page),
+        })
     }
 }

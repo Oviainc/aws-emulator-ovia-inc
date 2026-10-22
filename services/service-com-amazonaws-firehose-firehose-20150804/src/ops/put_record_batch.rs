@@ -226,6 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err(crate::state::StreamRefusal::NotActive(status)) => {
                     return Err(stream_not_active(&input.delivery_stream_name, status))
                 }
+                Err(crate::state::StreamRefusal::SourceNotCloudWatchLogs) => {
+                    return Err(not_from_cloudwatch_logs(&input.delivery_stream_name))
+                }
             };
 
         // "If the record is successfully added to your Firehose stream, it receives a
@@ -281,6 +284,26 @@ fn stream_not_active(name: &str, status: &str) -> PutRecordBatchError {
         message: Some(format!(
             "Firehose stream {name} is in status {status}; it accepts data only in status ACTIVE"
         )),
+    })
+    .into()
+}
+
+/// The stream takes data from CloudWatch Logs only, and this put is an API call.
+///
+/// "Only requests from CloudWatch Logs are supported when CloudWatch Logs decompression is
+/// enabled" (`InvalidSourceException`), which this operation models as a client error with
+/// HTTP 400. The gate is a property of the stream's processing configuration
+/// (`crate::state::DeliveryStream::takes_cloudwatch_logs_only`) and not of any payload, so
+/// it refuses the WHOLE batch rather than reporting per record: there is no record the
+/// stream would have taken.
+///
+/// `Code` is left unset: the model documents no rule for this exception's `Code` member
+/// (unlike `InvalidKMSResourceException`, whose `Code` relays the KMS exception type), and
+/// nothing in the request determines one.
+fn not_from_cloudwatch_logs(name: &str) -> PutRecordBatchError {
+    PutRecordBatchErrorModeled::InvalidSourceException(InvalidSourceException {
+        code: None,
+        message: Some(crate::service::invalid_source_message(name)),
     })
     .into()
 }

@@ -165,16 +165,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // `deploymentId` is @required but carries no modelled length, so an empty one
-        // reaches the handler and is what `DeploymentIdRequiredException` is for — the
-        // same reading `GetDeployment` uses, so the two agree about one id. The model
-        // states no FORMAT for a deployment id either, so an id of any other shape is
-        // simply one this account does not have.
+        // `deploymentId` is @required but carries no modelled length or pattern, so
+        // both an empty one and a malformed one reach the handler — the same reading
+        // `GetDeployment` uses, so the two agree about one id: an absent or empty id
+        // is what `DeploymentIdRequiredException` is for, an id that is not shaped
+        // like one the service mints is what `InvalidDeploymentIdException` is for,
+        // and only a well-formed id is then discriminated on existence.
         let deployment_id = input.deployment_id;
         if deployment_id.trim().is_empty() {
             return Err(StopDeploymentErrorModeled::DeploymentIdRequiredException(
                 DeploymentIdRequiredException {
                     message: Some("The deployment ID was not specified".to_string()),
+                },
+            )
+            .into());
+        }
+        if !crate::state::deployment_id_is_well_formed(&deployment_id) {
+            return Err(StopDeploymentErrorModeled::InvalidDeploymentIdException(
+                InvalidDeploymentIdException {
+                    message: Some(crate::state::malformed_deployment_id_message(
+                        &deployment_id,
+                    )),
                 },
             )
             .into());
@@ -221,6 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let compute_platform = deployment.compute_platform.clone();
             let deployment_style = deployment.deployment_style.clone();
             let auto_rollback_configuration = deployment.auto_rollback_configuration.clone();
+            // A rollback goes to the SAME deployment group, so it resolves the
+            // same deployment targets as the deployment it rolls back, and its
+            // terminal status follows from them the same way.
+            let target_count = deployment.target_count;
 
             // The id of the rollback deployment, minted only when the caller asked
             // for a rollback AND this deployment group has a revision to go back
@@ -313,6 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     starts_at_ms: crate::state::deployment_start_due(stopped_at_ms),
                     completes_at_ms: crate::state::deployment_completion_due(stopped_at_ms)
                         + termination_wait_millis,
+                    target_count,
                     terminates_original_instances,
                     termination_wait_millis,
                     instance_termination_wait_time_started: false,

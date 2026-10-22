@@ -457,6 +457,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .or_else(|| object.content_language.clone()),
             expires,
             website_redirect_location: object.website_redirect_location.clone(),
+            // "The number of tags, if any, on the object" (`GetObjectOutput$TagCount`) —
+            // the count of the tag set the object holds, whether the write that stored it
+            // carried the set in `x-amz-tagging` or a later `PutObjectTagging` associated
+            // one with it. "If any": an object with no tags reports no count at all
+            // rather than a zero.
+            tag_count: object.tag_count(),
             // "Version ID of the object" (`GetObjectOutput$VersionId`), reported for a
             // version the store minted an id for — a write into a bucket whose versioning
             // status is `Enabled`. A `null` version carries no id of its own, so none is
@@ -468,12 +474,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // delete records none, so no read can be of one), `Expiration` and
             // `Restore`/`ArchiveStatus` need a lifecycle configuration and an archive
             // tier, the checksum members need a checksum `PutObject` did not compute, the
-            // encryption members are refused at write time, `TagCount` needs object tags
-            // no operation here records, `PartsCount` needs a multipart upload,
-            // `ContentRange` belongs to a ranged read, `MissingMeta` counts unreadable
-            // metadata headers (there are none), `ReplicationStatus` needs a replication
-            // configuration and `RequestCharged` a Requester Pays charge this emulator
-            // does not model.
+            // encryption members are refused at write time, `PartsCount` needs a
+            // multipart upload, `ContentRange` belongs to a ranged read, `MissingMeta`
+            // counts unreadable metadata headers (there are none), `ReplicationStatus`
+            // needs a replication configuration and `RequestCharged` a Requester Pays
+            // charge this emulator does not model.
             ..GetObjectOutput::default()
         })
     }

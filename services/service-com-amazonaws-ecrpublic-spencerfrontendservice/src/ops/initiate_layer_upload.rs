@@ -275,6 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 repository_name: input.repository_name.clone(),
                 part_size,
                 started_at: ::std::time::SystemTime::now(),
+                // A freshly opened upload has received no layer part yet, so the next
+                // part `UploadLayerPart` accepts is the one beginning at byte 0.
+                received: Vec::new(),
             },
         );
         drop(store);

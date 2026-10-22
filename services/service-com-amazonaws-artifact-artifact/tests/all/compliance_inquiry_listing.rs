@@ -17,9 +17,10 @@
 //! * `@paginated(items: complianceInquiries)`: a page is cut at `maxResults`, a `nextToken`
 //!   arrives exactly when inquiries remain, and it resumes where the previous page ended —
 //!   so walking the pages at ANY admissible page size enumerates the whole set once;
-//! * `nextToken` carries an `InquiryId`, so a token this service never issued is refused
-//!   with the modelled `ValidationException`, while a well-shaped one naming no stored
-//!   inquiry still resumes at the first id at or after it.
+//! * `nextToken` carries an OPAQUE cursor rather than an `InquiryId`, so a token this
+//!   service never issued — a bare inquiry id included — is refused with the modelled
+//!   `ValidationException`, while a cursor naming no stored inquiry still resumes at the
+//!   first id at or after it.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_artifact_artifact::state::inquiries_page_token;
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -648,7 +650,7 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
     let router = emulator();
     create_every_case(&router).await;
 
-    // The token is the inquiry id the next page resumes at, so every row here is a value
+    // A `nextToken` is an OPAQUE cursor this operation cut, so every row here is a value
     // that is not one: a made-up string, a token of another operation, and an id whose
     // suffix is the wrong length or carries characters the pattern excludes.
     for token in [
@@ -681,31 +683,77 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
         "the suite needs several inquiries to resume between, got {all:?}"
     );
 
-    // A token the service DID issue, and a well-shaped id naming no stored inquiry, both
-    // resume at the first id at or after the token — so a set that changed between pages
-    // is still served. The expected tail is computed from the whole set, which is the
-    // rule rather than one recorded page.
-    let issued: Vec<String> = all.clone();
-    let mut tokens: Vec<String> = issued.clone();
-    tokens.push("compliance-inquiry-0000000000000000".to_string());
-    tokens.push("compliance-inquiry-zzzzzzzzzzzzzzzz".to_string());
-    tokens.push("compliance-inquiry-ZZZZZZZZZZZZZZZZ".to_string());
-    for token in tokens {
-        let expected: Vec<String> = issued
-            .iter()
-            .filter(|id| id.as_str() >= token.as_str())
-            .cloned()
-            .collect();
+    // The case this operation used to serve: a BARE inquiry id, even one the store holds,
+    // is a resource identifier rather than a cursor, so it was never issued as a token.
+    for id in &all {
+        let refused = list(&router, &format!("?nextToken={id}")).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {id:?}: a bare inquiry id is not a token this operation issued, got {} \
+             with {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ValidationException",
+            "case {id:?}: expected ValidationException, got {:?}",
+            refused.body
+        );
+    }
+
+    // The token this operation DOES issue carries none of the store's identifiers in the
+    // clear, and stays inside `NextTokenAttribute`'s `@length(1..2048)`.
+    let issued = list(&router, "?maxResults=1")
+        .await
+        .next_token()
+        .expect("a store of several inquiries must page");
+    assert!(
+        !issued.is_empty() && issued.len() <= 2048,
+        "case \"the issued token\": NextTokenAttribute is @length(1..2048), got {} bytes",
+        issued.len()
+    );
+    for id in &all {
+        assert!(
+            &issued != id && !issued.contains(id.as_str()),
+            "case \"the issued token\": a pagination token must not be or carry the \
+             identifier {id:?}, got {issued:?}"
+        );
+    }
+
+    // And the token taken from an ACTUAL page resumes the listing at the inquiry after
+    // that page, so the cursor rows below cannot pass on a symmetric encode/decode defect.
+    let resumed = list(&router, &format!("?nextToken={issued}")).await;
+    assert_eq!(
+        resumed.status, 200,
+        "case \"the issued token\": a token this operation cut must be served, got {} with {:?}",
+        resumed.status, resumed.body
+    );
+    assert_eq!(
+        resumed.ids(),
+        all[1..].to_vec(),
+        "case \"the issued token\": expected the inquiries after the first page, got {:?}",
+        resumed.body
+    );
+
+    // A cursor this operation cut resumes the listing at the POSITION it carries, so the
+    // page after a cursor is exactly the tail of the reported order behind it. Every
+    // position is covered — including one past the last inquiry, which serves an empty
+    // page rather than refusing. The expected tail is computed from the whole set, which
+    // is the rule rather than one recorded page.
+    for position in 0..=all.len() {
+        let expected: Vec<String> = all[position..].to_vec();
+        let token = inquiries_page_token(position);
         let answer = list(&router, &format!("?nextToken={token}")).await;
         assert_eq!(
             answer.status, 200,
-            "case {token:?}: a well-shaped token must be served, got {} with {:?}",
+            "case position={position}: a cursor this operation cut must be served, got {} \
+             with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.ids(),
             expected,
-            "case {token:?}: expected the inquiries at or after the token, got {:?}",
+            "case position={position}: expected the inquiries after the cursor, got {:?}",
             answer.body
         );
     }

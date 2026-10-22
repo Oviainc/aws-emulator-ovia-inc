@@ -99,8 +99,23 @@ async fn application(emulator: &Emulator, name: &str) -> String {
     name.to_string()
 }
 
+/// The tag a deployment group of this suite selects its targets by, and the
+/// instance [`seeded_group`] registers carrying it.
+///
+/// A deployment ends `Succeeded` only if its group resolved a target, so every
+/// group here is given one selector and one registered instance that satisfies
+/// it; which status a group's targets imply is covered in
+/// `codedeploy_deployment_outcome`.
+const TARGET_TAG_KEY: &str = "Fleet";
+/// See [`TARGET_TAG_KEY`].
+const TARGET_TAG_VALUE: &str = "deployable";
+
 /// Create an application and a deployment group on it, answering the group name.
 /// `style` and `blue_green` are added to the group only when they are not null.
+///
+/// The group selects on-premises instances by [`TARGET_TAG_KEY`], and one
+/// instance carrying that tag is registered for it, so its deployments have a
+/// target to reach.
 async fn seeded_group(
     emulator: &Emulator,
     application_name: &str,
@@ -113,6 +128,9 @@ async fn seeded_group(
         "applicationName": application_name,
         "deploymentGroupName": group,
         "serviceRoleArn": "arn:aws:iam::000000000000:role/CodeDeployRole",
+        "onPremisesInstanceTagFilters": [
+            {"Key": TARGET_TAG_KEY, "Value": TARGET_TAG_VALUE, "Type": "KEY_AND_VALUE"},
+        ],
     });
     if !style.is_null() {
         request["deploymentStyle"] = style;
@@ -121,6 +139,26 @@ async fn seeded_group(
         request["blueGreenDeploymentConfiguration"] = blue_green;
     }
     emulator.ok("CreateDeploymentGroup", request).await;
+
+    let instance = format!("{application_name}-host");
+    emulator
+        .ok(
+            "RegisterOnPremisesInstance",
+            json!({
+                "instanceName": instance,
+                "iamUserArn": format!("arn:aws:iam::{ACCOUNT}:user/{instance}"),
+            }),
+        )
+        .await;
+    emulator
+        .ok(
+            "AddTagsToOnPremisesInstances",
+            json!({
+                "instanceNames": [instance],
+                "tags": [{"Key": TARGET_TAG_KEY, "Value": TARGET_TAG_VALUE}],
+            }),
+        )
+        .await;
     group
 }
 
@@ -1266,7 +1304,10 @@ async fn skipping_the_termination_wait_is_refused_where_it_does_not_apply() {
     }
 
     // Rows differ along the form of an id no deployment was ever created with.
-    for id in ["d-ABCDEFGHI", "d-000000000", "not-a-deployment-id"] {
+    // An id of the minted `d-XXXXXXXXX` form is answered on existence; one of
+    // another form is not an id at all, and is refused on FORMAT (the gate is
+    // covered in `codedeploy_deployment_outcome`).
+    for id in ["d-ABCDEFGHI", "d-000000000"] {
         let code = emulator
             .refused(
                 id,
@@ -1279,6 +1320,18 @@ async fn skipping_the_termination_wait_is_refused_where_it_does_not_apply() {
             "case {id:?}: expected DeploymentDoesNotExistException, got {code}"
         );
     }
+    let malformed = "not-a-deployment-id";
+    let code = emulator
+        .refused(
+            malformed,
+            "SkipWaitTimeForInstanceTermination",
+            json!({"deploymentId": malformed}),
+        )
+        .await;
+    assert_eq!(
+        code, "InvalidDeploymentIdException",
+        "case {malformed:?}: expected InvalidDeploymentIdException, got {code}"
+    );
 
     // An in-place deployment has no original environment to terminate. The call
     // is made straight after the deployment is created, while it is still

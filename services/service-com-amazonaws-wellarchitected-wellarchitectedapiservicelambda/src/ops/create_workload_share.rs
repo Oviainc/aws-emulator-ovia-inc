@@ -288,8 +288,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let share_id = store.mint_share_id();
+        // Creating the share is what raises the invitation the recipient has to answer
+        // ("Shared access to a workload is not removed until the workload invitation is
+        // deleted"), so the invitation exists from here. It is a resource of its own,
+        // named by its own `ShareInvitationId` rather than by this share's `ShareId`, and
+        // it is what `ListShareInvitations` reports to the principal offered the share.
+        let share_invitation_id = store.mint_share_invitation_id();
         let record = crate::state::WorkloadShareRecord {
             share_id: share_id.clone(),
+            share_invitation_id,
             workload_id: input.workload_id.clone(),
             shared_by,
             shared_with: input.shared_with,

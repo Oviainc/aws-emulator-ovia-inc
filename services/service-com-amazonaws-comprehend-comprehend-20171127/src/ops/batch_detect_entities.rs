@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDetectEntities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDetectEntities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! SCAFFOLDED, NOT IMPLEMENTED: the named-entity recognition itself. The batch
+//! PRECONDITIONS this operation documents ARE enforced here, each with the modelled
+//! error AWS answers it with: a `TextList` longer than [`MAX_BATCH_DOCUMENTS`] is
+//! refused wholesale with `BatchSizeLimitExceededException`, and a document larger
+//! than [`MAX_DOCUMENT_BYTES`] with `TextSizeLimitExceededException` — neither ever
+//! answers 501 again.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDetectEntities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request that satisfies every precondition still answers HTTP 501
+//! `NotImplemented`, because recognising entities means running a trained
+//! named-entity recognition model and this emulator has no in-process engine for
+//! one: no maintained offline crate does it, and an invented `ResultList` — entities
+//! matched out of the request, or an empty `Entities` list claiming the document
+//! holds none — would be output nothing computed. The marker line above therefore
+//! STAYS: entity recognition is still unwritten, so this operation belongs in the
+//! stub census (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`) until an
+//! engine for it exists. `DetectEntities`, the single-document sibling, is a stub
+//! for the same reason and carries its own issue.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +98,22 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The most documents one `BatchDetectEntities` request may carry.
+///
+/// From the modelled member documentation of `BatchDetectEntitiesRequest$TextList`:
+/// "The list can contain a maximum of 25 documents" — the same limit the
+/// `BatchSizeLimitExceededException` this operation declares names ("The number of
+/// documents in the request exceeds the limit of 25").
+pub const MAX_BATCH_DOCUMENTS: usize = 25;
+
+/// The largest single document in the batch, in UTF-8 bytes.
+///
+/// From the same member documentation: "The maximum size of each document is 5 KB."
+/// A document past it is refused with the `TextSizeLimitExceededException` this
+/// operation declares ("The size of the input text exceeds the limit. Use a smaller
+/// document.").
+pub const MAX_DOCUMENT_BYTES: usize = 5 * 1024;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +186,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDetectEntities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDetectEntitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDetectEntities"))
+        // Batch inference holds no state: the answer is a function of the submitted
+        // documents alone.
+        let _ = (ctx, &self.engine);
+
+        // The batch quota is checked BEFORE any document is looked at, and refuses
+        // the whole request: AWS returns no partial `ResultList`/`ErrorList` for an
+        // oversized batch, because the batch was never accepted.
+        if input.text_list.len() > MAX_BATCH_DOCUMENTS {
+            return Err(
+                BatchDetectEntitiesErrorModeled::BatchSizeLimitExceededException(
+                    BatchSizeLimitExceededException {
+                        message: Some(format!(
+                            "TextList contains {} documents, which exceeds the limit of \
+                             {MAX_BATCH_DOCUMENTS}. Please use a smaller number of items in \
+                             a single batch.",
+                            input.text_list.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The documented per-document ceiling. The model's `@length` floor of 1 on
+        // the list is enforced at the boundary; this byte ceiling is stated in prose
+        // only, so it is enforced here, naming the document that broke it.
+        if let Some((index, text)) = input
+            .text_list
+            .iter()
+            .enumerate()
+            .find(|(_, text)| text.len() > MAX_DOCUMENT_BYTES)
+        {
+            return Err(
+                BatchDetectEntitiesErrorModeled::TextSizeLimitExceededException(
+                    TextSizeLimitExceededException {
+                        message: Some(format!(
+                            "The document at index {index} is {} bytes, which exceeds the \
+                             {MAX_DOCUMENT_BYTES} byte limit for one document in a batch. Use \
+                             a smaller document.",
+                            text.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every precondition holds, and what remains is the inference itself: see
+        // this module's header for why that is the one thing still answered with the
+        // 501 rather than with an invented `ResultList`.
+        Err(crate::scaffolded::Scaffolded::not_implemented(
+            "BatchDetectEntities",
+        ))
     }
 }
