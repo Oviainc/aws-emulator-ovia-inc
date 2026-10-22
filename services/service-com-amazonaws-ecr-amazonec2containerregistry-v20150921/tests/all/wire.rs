@@ -32,11 +32,7 @@ const TARGET_PREFIX: &str = "AmazonEC2ContainerRegistry_V20150921";
 
 /// One emulator: a router carrying only this service, over one shared engine.
 pub fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    emulator_with_engine().0
 }
 
 /// The same emulator as [`emulator`], plus the engine its handlers read and write — for

@@ -179,6 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description.clone(),
             tags: crate::state::tags_from_input(input.tags.as_ref()),
             schemas: std::collections::BTreeMap::new(),
+            // A new registry carries no resource-based policy until
+            // `PutResourcePolicy` attaches one.
+            policy: None,
         };
         state
             .registries

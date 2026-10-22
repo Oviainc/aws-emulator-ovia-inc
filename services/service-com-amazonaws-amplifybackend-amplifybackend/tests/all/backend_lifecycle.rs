@@ -1094,12 +1094,6 @@ async fn operations_outside_this_slice_still_answer_501() {
             Some(json!({ "targetEnvironmentName": "copy" })),
         ),
         (
-            "ListBackendJobs",
-            "POST",
-            "/backend/dstub/job/staging",
-            Some(json!({})),
-        ),
-        (
             "RemoveAllBackends",
             "POST",
             "/backend/dstub/remove",

@@ -23,6 +23,8 @@ mod channel_policy_lifecycle;
 mod channel_reset;
 #[path = "all/control_plane_validation.rs"]
 mod control_plane_validation;
+#[path = "all/error_bodies.rs"]
+mod error_bodies;
 #[path = "all/origin_endpoint_policy.rs"]
 mod origin_endpoint_policy;
 #[path = "all/origin_endpoint_reset.rs"]

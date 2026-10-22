@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ValidatePullThroughCacheRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ValidatePullThroughCacheRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ValidatePullThroughCacheRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -53,6 +44,16 @@
 //! authentication. This will retrieve the contents of the Amazon Web Services Secrets
 //! Manager secret, verify the syntax, and then validate that authentication to the upstream
 //! registry is successful.
+//!
+//! The last of those three steps cannot run here: this emulator opens no outbound
+//! connection, so no request to an upstream registry is ever made and nothing can report
+//! that one succeeded. A rule that EXISTS therefore always ends in this operation's own
+//! modelled failure state — `isValid: false` with a `failure` reason naming the check
+//! that did not pass — which is deliberate, not an oversight: `isValid: true` is
+//! documented as "Amazon ECR was able to reach the upstream registry and authentication
+//! was successful", and claiming it for a round trip that never happened would be a
+//! fabricated success. A prefix no rule answers to is a different answer altogether:
+//! `PullThroughCacheRuleNotFoundException`.
 //!
 //! ## Input
 //!
@@ -136,6 +137,13 @@ impl From<ValidatePullThroughCacheRuleErrorModeled> for ValidatePullThroughCache
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> ValidatePullThroughCacheRuleErrorModeled {
+    ValidatePullThroughCacheRuleErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(fault.message().to_string()),
+    })
+}
+
 /// The `ValidatePullThroughCacheRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -172,18 +180,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ValidatePullThroughCacheRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ValidatePullThroughCacheRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ValidatePullThroughCacheRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ValidatePullThroughCacheRuleErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let store = state.lock();
+        // Validation is about an EXISTING rule, so a prefix no rule answers to is refused
+        // with `PullThroughCacheRuleNotFoundException` — never reported as `isValid:
+        // false`, which is the answer for a rule that exists and does not validate. That
+        // distinction is the whole point of this operation.
+        let Some(rule) = store
+            .pull_through_cache_rules
+            .get(&input.ecr_repository_prefix)
+        else {
+            return Err(
+                ValidatePullThroughCacheRuleErrorModeled::PullThroughCacheRuleNotFoundException(
+                    PullThroughCacheRuleNotFoundException {
+                        message: Some(crate::state::pull_through_cache_rule_not_found_message(
+                            &input.ecr_repository_prefix,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `isValid` is documented as "Amazon ECR was able to reach the upstream registry
+        // and authentication was successful", so it is only ever true of a round trip that
+        // really happened. This emulator opens no outbound connection, so no upstream
+        // request can run here and nothing can report that one succeeded: validation ends
+        // in this operation's own modelled failure state (`isValid: false`) with the
+        // `failure` reason saying which check failed.
+        let needs_credential = crate::state::upstream_needs_credential(
+            rule.upstream_registry.as_deref(),
+            rule.upstream_registry_url.as_deref().unwrap_or_default(),
+        );
+        let has_credential = rule.credential_arn.is_some() || rule.custom_role_arn.is_some();
+        let failure = if needs_credential && !has_credential {
+            // A real configuration defect, decided entirely from the stored rule: the
+            // upstream authenticates its callers and the rule carries no credential for
+            // it, so authentication cannot even be attempted.
+            format!(
+                "the upstream registry '{}' requires authentication and the pull through \
+                 cache rule for '{}' stores neither a credentialArn nor a customRoleArn",
+                rule.upstream_registry
+                    .as_deref()
+                    .unwrap_or_else(|| rule.upstream_registry_url.as_deref().unwrap_or("unknown")),
+                input.ecr_repository_prefix
+            )
+        } else {
+            format!(
+                "the stored configuration of the pull through cache rule for '{}' is \
+                 complete, but authentication to the upstream registry could not be \
+                 verified: this emulator makes no outbound connection to '{}'",
+                input.ecr_repository_prefix,
+                rule.upstream_registry_url.as_deref().unwrap_or("the upstream registry")
+            )
+        };
+
+        Ok(ValidatePullThroughCacheRuleOutput {
+            ecr_repository_prefix: rule.ecr_repository_prefix.clone(),
+            registry_id: rule.registry_id.clone(),
+            upstream_registry_url: rule.upstream_registry_url.clone(),
+            credential_arn: rule.credential_arn.clone(),
+            custom_role_arn: rule.custom_role_arn.clone(),
+            upstream_repository_prefix: rule.upstream_repository_prefix.clone(),
+            is_valid: false,
+            failure: Some(failure),
+        })
     }
 }

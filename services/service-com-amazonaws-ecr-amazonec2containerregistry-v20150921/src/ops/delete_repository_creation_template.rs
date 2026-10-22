@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRepositoryCreationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRepositoryCreationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRepositoryCreationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +139,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRepositoryCreationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRepositoryCreationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRepositoryCreationTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRepositoryCreationTemplateErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        // The delete answers with the template it removed, so it has to come out of the
+        // store the create and the update write: a prefix no template answers to — never
+        // created, or already deleted — is refused with `TemplateNotFoundException`, which
+        // is what makes a re-delete distinguishable from the first one. The prefix is
+        // resolved the way every other template operation resolves it, so the trailing
+        // slash ECR assumes does not hide a stored template.
+        let prefix = crate::state::normalize_prefix(&input.prefix);
+        let mut store = state.lock();
+        let Some(removed) = store.creation_templates.remove(&prefix) else {
+            return Err(
+                DeleteRepositoryCreationTemplateErrorModeled::TemplateNotFoundException(
+                    TemplateNotFoundException {
+                        message: Some(crate::state::template_not_found_message(&input.prefix)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DeleteRepositoryCreationTemplateOutput {
+            registry_id: Some(crate::state::registry_id().to_string()),
+            repository_creation_template: Some(removed.to_template()),
+        })
     }
 }

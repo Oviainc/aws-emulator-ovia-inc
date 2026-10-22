@@ -35,12 +35,15 @@ fn harness() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// [`harness`] when the test needs only the router.
-fn router() -> MultiServiceRouter {
+///
+/// `pub(crate)` with the wire helpers below: the sibling `volume_lifecycle` suite
+/// drives the same router over the same wire rather than rebuilding a harness.
+pub(crate) fn router() -> MultiServiceRouter {
     harness().0
 }
 
 /// One awsJson1_0 call. Returns the HTTP status and the parsed JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -71,7 +74,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// `call`, asserting a 200.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let (status, payload) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -81,7 +84,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value 
 }
 
 /// The awsJson error code: the `__type` discriminator in the error envelope.
-fn error_code(payload: &Value) -> String {
+pub(crate) fn error_code(payload: &Value) -> String {
     payload
         .get("__type")
         .and_then(Value::as_str)
@@ -102,7 +105,7 @@ fn is_modelled_instance_id(id: &str) -> bool {
 }
 
 /// `CreateWorkspaceInstance`, returning the minted id.
-async fn create(router: &MultiServiceRouter, body: Value) -> String {
+pub(crate) async fn create(router: &MultiServiceRouter, body: Value) -> String {
     let payload = ok(router, "CreateWorkspaceInstance", body).await;
     payload
         .get("WorkspaceInstanceId")
@@ -112,7 +115,7 @@ async fn create(router: &MultiServiceRouter, body: Value) -> String {
 }
 
 /// A minimal valid create body (`ManagedInstance` is the only required member).
-fn minimal_create() -> Value {
+pub(crate) fn minimal_create() -> Value {
     json!({ "ManagedInstance": {} })
 }
 

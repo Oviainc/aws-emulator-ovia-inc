@@ -264,15 +264,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One channel group per name per account and region: a repeat create conflicts
-        // rather than replacing the group that is already there.
+        // rather than replacing the group that is already there. MediaPackage states the
+        // collision without naming the resource it collided with — see
+        // `crate::state::resource_already_exists`.
         if store.channel_groups.contains_key(&input.channel_group_name) {
-            return Err(CreateChannelGroupErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Channel group {} already exists",
-                    input.channel_group_name
-                )),
-                conflict_exception_type: Some("RESOURCE_ALREADY_EXISTS".to_string()),
-            })
+            return Err(CreateChannelGroupErrorModeled::ConflictException(
+                crate::state::resource_already_exists(),
+            )
             .into());
         }
 

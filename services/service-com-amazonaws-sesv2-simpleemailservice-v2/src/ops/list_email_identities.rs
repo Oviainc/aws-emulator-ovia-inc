@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEmailIdentities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEmailIdentities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEmailIdentities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted email identities, honouring `Filter`, `PageSize` and the
+//! opaque `NextToken` this operation hands back. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +77,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::EmailIdentityRecord;
+
+/// The largest `PageSize` this operation accepts: "The value you specify has to be
+/// at least 0, and can be no more than 1000."
+const MAX_PAGE_SIZE: i32 = 1000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +152,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEmailIdentities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEmailIdentitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEmailIdentities"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the
+            // scaffold's 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListEmailIdentities without the shared emulator state",
+            ));
+        };
+
+        // "The value you specify has to be at least 0, and can be no more than
+        // 1000." What a page size of 0 means is not documented; it is read here as
+        // "no truncation" — a CHOSEN reading, which keeps a caller that sends 0
+        // from being stuck on an empty page forever.
+        let page_size = match input.page_size {
+            None => None,
+            Some(size) if (0..=MAX_PAGE_SIZE).contains(&size) => {
+                usize::try_from(size).ok().filter(|size| *size > 0)
+            }
+            Some(size) => {
+                return Err(bad_request(format!(
+                    "PageSize {size} is outside the supported range of 0 to {MAX_PAGE_SIZE}."
+                )))
+            }
+        };
+
+        let filters = page_filters(input.filter)?;
+
+        // The token is this operation's own: it names the last identity the previous
+        // page returned, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                bad_request("NextToken is not a token returned by ListEmailIdentities.")
+            })?),
+        };
+
+        let mut store = state.lock();
+        // A listing reports verification statuses, and a transition the clock
+        // already owed is part of what it reports.
+        store.settle(::std::time::SystemTime::now());
+
+        // `identities` is ordered by storage key, so a page is a window over the
+        // matching records and the resume point is a position in that order — which
+        // keeps the token valid even if the identity it names has since been
+        // deleted.
+        let matching: Vec<(&String, &EmailIdentityRecord)> = store
+            .identities
+            .iter()
+            .filter(|(_, record)| matches_filters(record, &filters))
+            .collect();
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => matching.partition_point(|(key, _)| key.as_str() <= last),
+        };
+        let remaining = &matching[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+
+        let email_identities: Vec<IdentityInfo> = page
+            .iter()
+            .map(|(_, record)| IdentityInfo {
+                identity_type: Some(record.identity_kind.as_str().to_string()),
+                identity_name: Some(record.name.clone()),
+                sending_enabled: record.verified_for_sending,
+                verification_status: Some(record.verification_status.as_str().to_string()),
+            })
+            .collect();
+        // A token only when records remain behind this page.
+        let next_token = (page.len() < remaining.len())
+            .then(|| page.last().map(|(key, _)| crate::state::encode_page_token(key)))
+            .flatten();
+
+        Ok(ListEmailIdentitiesOutput {
+            email_identities: Some(email_identities),
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this service's input error.
+fn bad_request(message: impl Into<String>) -> ListEmailIdentitiesError {
+    ListEmailIdentitiesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Validate the request's `Filter` map into (key, value) pairs, ordered by key so a
+/// refusal reads the same for the same request.
+fn page_filters(
+    filter: Option<std::collections::HashMap<String, String>>,
+) -> Result<Vec<(String, String)>, ListEmailIdentitiesError> {
+    let filter = filter.unwrap_or_default();
+    let mut pairs: Vec<(String, String)> = filter.into_iter().collect();
+    pairs.sort();
+    for (key, value) in &pairs {
+        // The filter keys and the value sets come from the generated enum consts,
+        // so they follow the model rather than a copy of it.
+        if !IDENTITY_FILTER_KEY_VALUES.contains(&key.as_str()) {
+            return Err(bad_request(format!(
+                "Filter key {key} is not one of {}.",
+                IDENTITY_FILTER_KEY_VALUES.join(", ")
+            )));
+        }
+        // An equality filter can only match a value of the member's own enum, so a
+        // value outside it is a request this operation cannot answer.
+        let allowed: &[&str] = match key.as_str() {
+            // `IdentityType`, whose `MANAGED_DOMAIN` value is accepted as a filter
+            // even though no identity here carries it.
+            "IDENTITY_TYPE" => IDENTITY_TYPE_VALUES,
+            "VERIFICATION_STATUS" => VERIFICATION_STATUS_VALUES,
+            // A substring filter takes any non-empty string, which the model's
+            // `IdentityFilterValue` length constraint already enforces.
+            _ => continue,
+        };
+        if !allowed.contains(&value.as_str()) {
+            return Err(bad_request(format!(
+                "Filter value {value} for {key} is not one of {}.",
+                allowed.join(", ")
+            )));
+        }
+    }
+    Ok(pairs)
+}
+
+/// Whether `record` satisfies every filter the request carried.
+fn matches_filters(record: &EmailIdentityRecord, filters: &[(String, String)]) -> bool {
+    filters.iter().all(|(key, value)| match key.as_str() {
+        "IDENTITY_NAME_CONTAINS" => record.name.contains(value.as_str()),
+        "IDENTITY_TYPE" => record.identity_kind.as_str() == value,
+        "VERIFICATION_STATUS" => record.verification_status.as_str() == value,
+        // `page_filters` has already refused every other key.
+        _ => false,
+    })
 }

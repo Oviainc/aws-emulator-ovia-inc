@@ -159,30 +159,34 @@ fn is_kms_alias(candidate: &str) -> bool {
     })
 }
 
+/// The six colon-delimited fields of an ARN —
+/// `arn:<partition>:<service>:<region>:<account>:<resource>` — or `None` when
+/// `candidate` is not in that form at all.
+///
+/// One definition of "split an ARN" for this module: the callers differ only in
+/// which fields they then require.
+fn arn_fields(candidate: &str) -> Option<[&str; 6]> {
+    let mut split = candidate.splitn(6, ':');
+    let fields = [
+        split.next()?,
+        split.next()?,
+        split.next()?,
+        split.next()?,
+        split.next()?,
+        split.next()?,
+    ];
+    (fields[0] == "arn").then_some(fields)
+}
+
 /// Whether `candidate` is the full ARN of a KMS key or alias
 /// (`arn:<partition>:kms:<region>:<account>:key/<key id>` or `…:alias/<name>`),
 /// the third form `PutEncryptionConfig$KeyId` documents.
 fn is_kms_arn(candidate: &str) -> bool {
-    let mut fields = candidate.splitn(6, ':');
-    let (
-        Some("arn"),
-        Some(partition),
-        Some("kms"),
-        Some(region),
-        Some(account),
-        Some(resource),
-    ) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    )
-    else {
+    let Some([_, partition, service, region, account, resource]) = arn_fields(candidate) else {
         return false;
     };
-    !partition.is_empty()
+    service == "kms"
+        && !partition.is_empty()
         && !region.is_empty()
         && account.len() == ACCOUNT_ID_DIGITS
         && account.bytes().all(|byte| byte.is_ascii_digit())
@@ -1798,10 +1802,11 @@ impl ComAmazonawsXrayAwsxrayState {
     /// The tags held by the resource `resource_arn` names, or `None` when it
     /// names no resource this store holds.
     ///
-    /// X-Ray tags attach to a group or a sampling rule; sampling rules are not
-    /// implemented in this emulator yet (`CreateSamplingRule` is still a
-    /// scaffold), so a group's ARN is the only one that resolves today, and this
-    /// lookup is the single place their branch goes when they land.
+    /// X-Ray tags attach to a group or a sampling rule; a group's ARN is the
+    /// only one that resolves here, so a sampling rule's tags — which
+    /// `CreateSamplingRule` validates and stores on the rule — are NOT reachable
+    /// through the tagging operations yet, and this lookup is the single place
+    /// their branch goes when they are.
     ///
     /// No region argument: a group ARN carries the region it was minted in and a
     /// suffix unique to the group, so it names at most one record in the whole

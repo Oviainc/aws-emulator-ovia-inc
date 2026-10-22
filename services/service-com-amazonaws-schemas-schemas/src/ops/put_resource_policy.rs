@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a resource-based policy to a registry and answers from the stored value.
+//!
+//! ## Revisions, and the `RevisionId` precondition
+//!
+//! The stored policy carries a revision id, minted fresh on every successful write
+//! (`crate::state::ComAmazonawsSchemasSchemasState::mint_policy_revision_id`), so the
+//! id a caller holds names exactly the policy it read. A request that carries
+//! `RevisionId` is therefore a CONDITIONAL write: it succeeds only while the stored
+//! policy is still at that revision, and is refused with `PreconditionFailedException`
+//! (HTTP 412) otherwise — including when the registry holds no policy at all, which is
+//! no revision. A request without `RevisionId` states no precondition and overwrites.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +152,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        // This operation names its resource by `RegistryName` alone and reports the
+        // policy document, so it needs nothing from the request metadata `ctx` carries.
+        let _ = ctx;
+
+        // The request's three members, taken apart here so the policy DOCUMENT can be
+        // moved into the store rather than copied into it.
+        let PutResourcePolicyInput {
+            policy,
+            registry_name,
+            revision_id,
+        } = input;
+
+        // A resource policy belongs to ONE registry, so a request that names no
+        // registry names no resource to write. Refused as a client error rather than
+        // applied to some default resource the service does not model.
+        let registry_name = registry_name.ok_or_else(|| {
+            PutResourcePolicyError::from(PutResourcePolicyErrorModeled::BadRequestException(
+                crate::state::registry_name_required(),
+            ))
+        })?;
+
+        // The store retains one policy per registry for the life of the process, so
+        // how large one may be is capped. Checked BEFORE the document is parsed, so an
+        // oversized document is refused without being walked. See
+        // `crate::state::MAX_POLICY_BYTES`.
+        if policy.len() > crate::state::MAX_POLICY_BYTES {
+            return Err(PutResourcePolicyErrorModeled::BadRequestException(
+                crate::state::policy_too_large(policy.len()),
+            )
+            .into());
+        }
+
+        // `Policy` is modelled `@mediaType("application/json")` and a resource-based
+        // policy document is a JSON object; anything else is not a policy this service
+        // could ever report back.
+        match ::serde_json::from_str::<::serde_json::Value>(&policy) {
+            Ok(::serde_json::Value::Object(_)) => {}
+            Ok(other) => {
+                let kind = match other {
+                    ::serde_json::Value::Null => "null",
+                    ::serde_json::Value::Bool(_) => "a boolean",
+                    ::serde_json::Value::Number(_) => "a number",
+                    ::serde_json::Value::String(_) => "a string",
+                    ::serde_json::Value::Array(_) => "an array",
+                    ::serde_json::Value::Object(_) => "an object",
+                };
+                return Err(PutResourcePolicyErrorModeled::BadRequestException(
+                    crate::state::policy_not_json(&format!("the value sent is {kind}")),
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(PutResourcePolicyErrorModeled::BadRequestException(
+                    crate::state::policy_not_json(&format!(
+                        "the value sent is not well-formed JSON ({error})"
+                    )),
+                )
+                .into());
+            }
+        }
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutResourcePolicyError::from(
+                PutResourcePolicyErrorModeled::InternalServerErrorException(
+                    crate::state::internal_error(),
+                ),
+            )
+        })?;
+        let mut state = store.lock();
+
+        // A policy attaches to a registry, so there has to be one to attach it to.
+        let current_revision = state
+            .registries
+            .get(&registry_name)
+            .ok_or_else(|| {
+                PutResourcePolicyError::from(PutResourcePolicyErrorModeled::NotFoundException(
+                    crate::state::registry_not_found(&registry_name),
+                ))
+            })?
+            .policy
+            .as_ref()
+            .map(|policy| policy.revision_id.clone());
+
+        // `RevisionId` is a precondition on the write: it holds only while the stored
+        // policy is still at that revision. A registry with no policy is at no
+        // revision, so no revision a caller can name matches it.
+        if let Some(requested) = revision_id.as_deref() {
+            if current_revision.as_deref() != Some(requested) {
+                return Err(PutResourcePolicyErrorModeled::PreconditionFailedException(
+                    crate::state::stale_policy_revision(requested),
+                )
+                .into());
+            }
+        }
+
+        let minted_revision = state.mint_policy_revision_id();
+        let registry = state
+            .registries
+            .get_mut(&registry_name)
+            .expect("the registry read above is still present under the same lock");
+        registry.policy = Some(crate::state::ResourcePolicy {
+            // Stored verbatim: `GetResourcePolicy` must report the document the
+            // caller sent, not a re-rendering of it.
+            document: policy,
+            revision_id: minted_revision,
+        });
+
+        // Answer from the STORED policy, so this response can only ever describe what
+        // `GetResourcePolicy` will report.
+        let stored = registry
+            .policy
+            .as_ref()
+            .expect("the policy written above is present");
+        Ok(PutResourcePolicyOutput {
+            policy: Some(stored.document.clone()),
+            revision_id: Some(stored.revision_id.clone()),
+        })
     }
 }

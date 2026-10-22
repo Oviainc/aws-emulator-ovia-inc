@@ -3,9 +3,11 @@
 //! Engine state for the com-amazonaws-ecr-amazonec2containerregistry-v20150921 service.
 //!
 //! One registry (this emulator's account) holding repositories by name, each holding
-//! its images by digest plus a tag index, plus the registry-wide settings a caller can
-//! configure (today: its replication rules). Everything an operation answers with is
-//! derived from here; nothing is re-synthesised from a request.
+//! its images by digest plus a tag index, beside the registry-wide settings a caller can
+//! configure (its replication rules, its signing configuration) and the registry-level
+//! resources ECR keys by prefix or principal (pull through cache rules, repository
+//! creation templates and pull time update exclusions). Everything an operation answers
+//! with is derived from here; nothing is re-synthesised from a request.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,9 +17,10 @@ use crate::ops::types::{
     EncryptionConfiguration, EncryptionConfigurationForRepositoryCreationTemplate, ImageDetail,
     ImageIdentifier, ImageScanningConfiguration, ImageTagMutabilityExclusionFilter,
     LifecyclePolicyPreviewResult, LifecyclePolicyPreviewSummary, LifecyclePolicyRuleAction,
-    ReplicationConfiguration, ReplicationRule, Repository, RepositoryCreationTemplate,
-    RepositoryScanningConfiguration, SigningConfiguration, Tag, TransitioningImageTotalCount,
-    IMAGE_ACTION_TYPE_VALUES, LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES, TAG_STATUS_VALUES,
+    PullThroughCacheRule, ReplicationConfiguration, ReplicationRule, Repository,
+    RepositoryCreationTemplate, RepositoryScanningConfiguration, SigningConfiguration, Tag,
+    TransitioningImageTotalCount, IMAGE_ACTION_TYPE_VALUES,
+    LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES, TAG_STATUS_VALUES,
 };
 
 /// `CreateRepository`'s documented default: "If this parameter is omitted, the default
@@ -315,6 +318,28 @@ impl ImageRecord {
             image_status: Some(ACTIVE_IMAGE_STATUS.to_string()),
             ..ImageDetail::default()
         }
+    }
+
+    /// The identifier that addresses this image for a request that named `tag`.
+    ///
+    /// The digest is this image's own — the stored one, never the one a request guessed
+    /// — and the tag is reported only when it really points at this image.
+    pub fn identifier(&self, tag: Option<&str>) -> ImageIdentifier {
+        ImageIdentifier {
+            image_digest: Some(self.digest.clone()),
+            image_tag: tag
+                .filter(|tag| self.tags.contains(*tag))
+                .map(ToString::to_string),
+        }
+    }
+
+    /// The manifest as a JSON document, for the members a registry reads out of it
+    /// (an OCI artifact's `subject`, `artifactType` and `annotations`).
+    ///
+    /// `None` when the stored manifest is not JSON at all, which is what a caller who
+    /// pushed something else gets: no member can be read out of it.
+    pub fn manifest_document(&self) -> Option<serde_json::Value> {
+        serde_json::from_str(&self.manifest).ok()
     }
 
     /// The `(digest, tag)` pairs this image is addressable by: one per tag, or a single
@@ -892,6 +917,49 @@ impl Repo {
         self.tag_index.get(tag)
     }
 
+    /// The stored image an [`ImageIdentifier`] names, or the failure it resolves to.
+    ///
+    /// An identifier carries a digest, a tag, or both; it names an image only when this
+    /// repository holds one that answers to every part of it. Shared by every operation
+    /// that takes an `imageId`, so they all refuse the same identifier the same way.
+    pub fn resolve_image(&self, id: &ImageIdentifier) -> Result<&ImageRecord, Fault> {
+        match (id.image_digest.as_deref(), id.image_tag.as_deref()) {
+            (Some(digest), tag) => {
+                let stored = self.images.get(digest).ok_or_else(|| {
+                    Fault::ImageNotFound(format!(
+                        "The image with digest '{digest}' does not exist within the repository \
+                         with name '{}'",
+                        self.name
+                    ))
+                })?;
+                if let Some(tag) = tag {
+                    if !stored.tags.contains(tag) {
+                        return Err(Fault::ImageNotFound(format!(
+                            "The image with digest '{digest}' and tag '{tag}' does not exist \
+                             within the repository with name '{}'",
+                            self.name
+                        )));
+                    }
+                }
+                Ok(stored)
+            }
+            (None, Some(tag)) => {
+                let missing = || {
+                    Fault::ImageNotFound(format!(
+                        "The image with tag '{tag}' does not exist within the repository with \
+                         name '{}'",
+                        self.name
+                    ))
+                };
+                let digest = self.digest_of_tag(tag).ok_or_else(missing)?;
+                self.images.get(digest).ok_or_else(missing)
+            }
+            (None, None) => Err(Fault::InvalidParameter(
+                "an image identifier must carry an imageDigest, an imageTag, or both".to_string(),
+            )),
+        }
+    }
+
     /// Every blob this repository holds, by digest.
     ///
     /// A manifest cannot be pushed before every blob it references is in the
@@ -1047,6 +1115,12 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// Repositories by name. A `BTreeMap` so every listing — and therefore every
     /// pagination token — has one deterministic order.
     pub repositories: BTreeMap<String, Repo>,
+    /// This registry's pull through cache rules, by `ecrRepositoryPrefix` — the key AWS
+    /// addresses a rule by. `CreatePullThroughCacheRule` is the only operation that adds
+    /// one (still a 501 stub, filed separately); `UpdatePullThroughCacheRule`,
+    /// `ValidatePullThroughCacheRule` and `DeletePullThroughCacheRule` resolve a prefix
+    /// here rather than each keeping their own copy.
+    pub pull_through_cache_rules: BTreeMap<String, PullThroughCacheRule>,
     /// The account settings a `PutAccountSetting` has changed, by setting name. A name
     /// absent from here is still readable — it reports its spec's
     /// [`AccountSettingSpec::default_value`] — so a read never has to invent a value
@@ -1149,6 +1223,70 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     pub fn replication_configuration(&self) -> ReplicationConfiguration {
         ReplicationConfiguration {
             rules: self.replication_rules.clone(),
+        }
+    }
+}
+
+/// The wording ECR uses when no pull through cache rule answers to a prefix. The first
+/// sentence is `PullThroughCacheRuleNotFoundException`'s own documentation.
+pub fn pull_through_cache_rule_not_found_message(prefix: &str) -> String {
+    format!(
+        "The pull through cache rule was not found. Specify a valid pull through cache \
+         rule and try again. No rule with ecrRepositoryPrefix '{prefix}' exists in the \
+         registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when no repository creation template answers to a prefix. The
+/// first sentence is `TemplateNotFoundException`'s own documentation.
+pub fn template_not_found_message(prefix: &str) -> String {
+    format!(
+        "The specified repository creation template can't be found. Verify the registry \
+         ID and prefix and try again. No template with prefix '{prefix}' exists in the \
+         registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The upstream registries ECR documents as serving anonymously, each with the host it
+/// is reached at: Amazon ECR Public and Kubernetes, from the ECR user guide's
+/// supported-upstream table. One table, so the `UpstreamRegistry` value and the host it
+/// corresponds to cannot drift apart.
+pub const ANONYMOUS_UPSTREAM_REGISTRIES: [(&str, &str); 2] = [
+    ("ecr-public", "public.ecr.aws"),
+    ("k8s", "registry.k8s.io"),
+];
+
+/// Whether an upstream registry a pull through cache rule points at authenticates its
+/// callers, and therefore needs a credential stored on the rule.
+///
+/// Every upstream registry ECR supports except the two in
+/// [`ANONYMOUS_UPSTREAM_REGISTRIES`] — the rest of the model's `UpstreamRegistry` enum,
+/// listed in `UPSTREAM_REGISTRY_VALUES` — requires credentials. A rule that names no
+/// upstream registry is judged by the host it points at instead.
+pub fn upstream_needs_credential(upstream_registry: Option<&str>, upstream_url: &str) -> bool {
+    match upstream_registry {
+        Some(registry) => !ANONYMOUS_UPSTREAM_REGISTRIES
+            .iter()
+            .any(|(anonymous, _)| *anonymous == registry),
+        None => {
+            // A registry URL's authority: what is left after an optional scheme, before
+            // the path, without the userinfo or the port, compared case-insensitively —
+            // a host is not case-sensitive, and `public.ecr.aws:443` is the same host as
+            // `public.ecr.aws`.
+            let host = upstream_url
+                .split_once("://")
+                .map_or(upstream_url, |(_, rest)| rest)
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            let host = host.rsplit_once('@').map_or(host, |(_, after)| after);
+            let host = host.split_once(':').map_or(host, |(before, _)| before);
+            let host = host.to_ascii_lowercase();
+            !ANONYMOUS_UPSTREAM_REGISTRIES
+                .iter()
+                .any(|(_, anonymous_host)| *anonymous_host == host)
         }
     }
 }

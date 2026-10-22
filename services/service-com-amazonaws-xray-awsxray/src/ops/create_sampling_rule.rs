@@ -14,6 +14,11 @@
 //! `RuleLimitExceededException` instead, which is the one refusal that reports a
 //! limit rather than the request.
 //!
+//! The tags a create carries are refused by the same rules `TagResource` and
+//! `CreateGroup` apply (`crate::state::validate_tag`, and
+//! `crate::state::MAX_TAGS_PER_RESOURCE` on the deduplicated set), so a rule
+//! cannot end up holding tags no tagging call could have applied to it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -171,12 +176,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_epoch_seconds();
-        let tags = input
-            .tags
-            .unwrap_or_default()
+
+        // The same tag restrictions `TagResource` and `CreateGroup` enforce,
+        // from the one place they are written down
+        // (`crate::state::validate_tag`): tags arrive the same way whichever
+        // operation carries them, so they are refused the same way — otherwise
+        // a rule could hold tags no tagging call could have applied to it.
+        // `CreateSamplingRule` models no `TooManyTagsException`, so the
+        // per-resource cap is reported through a 400 it does model.
+        let submitted = input.tags.unwrap_or_default();
+        for tag in &submitted {
+            if let Err(rejection) = crate::state::validate_tag(&tag.key, &tag.value) {
+                return Err(invalid(rejection.message()));
+            }
+        }
+        // Deduplicated by tag key, so a key the request repeats ends at its last
+        // value rather than being stored twice — which is also what the cap
+        // counts.
+        let deduplicated: ::std::collections::BTreeMap<String, String> = submitted
             .into_iter()
             .map(|tag| (tag.key, tag.value))
             .collect();
+        if deduplicated.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(invalid(format!(
+                "{} tags were supplied, past the maximum of {} per resource",
+                deduplicated.len(),
+                crate::state::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+        let tags: Vec<(String, String)> = deduplicated.into_iter().collect();
 
         // One lock, so the name check and the insert cannot interleave with
         // another call for the same name.
@@ -193,12 +221,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             ),
-            Err(rejection) => Err(CreateSamplingRuleErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(rejection.message().to_string()),
-                },
-            )
-            .into()),
+            Err(rejection) => Err(invalid(rejection.message().to_string())),
         }
     }
+}
+
+/// Refuse the request with the operation's modelled `InvalidRequestException`
+/// (HTTP 400): "The request is missing required parameters or has invalid
+/// parameters."
+fn invalid(message: impl Into<String>) -> CreateSamplingRuleError {
+    CreateSamplingRuleErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

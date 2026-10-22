@@ -793,9 +793,10 @@ async fn a_declared_constraint_violation_is_reported_in_this_services_own_form()
         (
             "a channel group name outside its @pattern",
             emulator.create_group("has a space", json!({})).await,
-            "Validation error encountered at request.channelGroupName: Member must satisfy \
-             regular expression pattern: ^[a-zA-Z0-9_-]+$. Check the value you specified in \
-             your request and then try again",
+            "Validation error encountered at request.channelGroupName: Member must \
+             contain only supported characters. Supported characters are A-Z, a-z, 0-9, \
+             _ (underscore), and - (hyphen). Check the value you specified in your \
+             request and then try again",
         ),
         (
             "a channel group name past its @length maximum",
