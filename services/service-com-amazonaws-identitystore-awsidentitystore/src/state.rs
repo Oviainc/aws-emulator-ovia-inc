@@ -35,7 +35,7 @@ pub const MAX_IDENTITY_STORES: usize = 16;
 /// would cause the number of users or groups in the identity store to exceed the
 /// maximum allowed", which is exactly this bound. AWS's own figure is far larger than
 /// anything an in-memory emulator should hold, so the number is CHOSEN; capacity is
-/// released by `DeleteUser` once that operation is implemented.
+/// released by `DeleteUser` (see [`IdentityStoreData::remove_user`]).
 pub const MAX_USERS_PER_STORE: usize = 500;
 
 /// The number of groups one identity store will hold. Chosen for the same reason, and
@@ -572,6 +572,41 @@ impl IdentityStoreData {
             }
         }
         Some(membership)
+    }
+
+    /// Remove the user `user_id` names, with the `UserName` claim it held and every
+    /// membership that names it as a member. `None` when this store holds no such
+    /// user, so the caller can report it as not found rather than answer a success
+    /// that removed nothing.
+    ///
+    /// The memberships go with the user because `CreateGroupMembership` requires BOTH
+    /// ends to exist in the identity store, so a membership naming a user the store no
+    /// longer holds is a state no sequence of creates could produce — and the member
+    /// indexes would keep the deleted id alive in `ListGroupMemberships`.
+    pub fn remove_user(&mut self, user_id: &str) -> Option<User> {
+        let user = self.users.remove(user_id)?;
+        // The index IS the store's uniqueness claim on the name, so dropping the
+        // holder frees the name for a later create. Guarded on the holder's id in case
+        // the entry has since been re-pointed at another user.
+        let claimed_name = user
+            .user_name
+            .clone()
+            .filter(|user_name| {
+                self.user_name_index
+                    .get(user_name)
+                    .is_some_and(|holder| holder == user_id)
+            });
+        if let Some(user_name) = claimed_name {
+            self.user_name_index.remove(&user_name);
+        }
+        let membership_ids = self
+            .memberships_by_member
+            .remove(user_id)
+            .unwrap_or_default();
+        for membership_id in &membership_ids {
+            self.remove_membership(membership_id);
+        }
+        Some(user)
     }
 
     /// This store's users in a deterministic order: when each was created, ties broken

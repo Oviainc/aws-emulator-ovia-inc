@@ -39,11 +39,57 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The front door
+//!
+//! This service is not reached directly: the AWS gateway in front of it judges the
+//! request envelope BEFORE the service runs, and a request it will not forward is
+//! refused with its own HTTP 403 `ForbiddenException` (`"Forbidden"`,
+//! [`crate::scaffolded::FrontDoorRefusal::forbidden`]) — a shape the model does not
+//! declare, carrying nothing of the request.
+//!
+//! What the gateway refuses here is an OVERSIZED `@sensitive` payload: a value past the
+//! maximum length its modelled shape declares. Such a payload is dropped at the gateway
+//! instead of being described back to the caller, so the answer is the opaque 403 rather
+//! than the modelled 400 `ValidationException` the walk would otherwise state — which
+//! for a `@sensitive` member could only name the member and the bound anyway (see
+//! `constraint_clause` below). Every OTHER constraint violation, including one on the
+//! same member for being too SHORT or for naming no supported value, stays the modelled
+//! `ValidationException`.
+//!
+//! WHY THAT PREDICATE, and what is NOT claimed by it: what AWS recorded is one fact —
+//! a secret past `SecretString`'s modelled maximum is answered 403 `ForbiddenException`
+//! while an in-limit one reaches the service. AWS's own gateway rule behind that 403 is
+//! not observable from here: a byte threshold on the whole body cannot be derived from
+//! the recording either, because the in-limit request that DOES reach the service and
+//! the over-limit one that does not differ by a single character, so no body size
+//! separates them, and a threshold low enough to separate them would refuse requests the
+//! model declares valid (a 15000-character secret, a full 50-entry tag map). So the
+//! refusal is keyed to the one thing this emulator can observe and the model can state:
+//! the modelled maximum of the payload the request would hand over, on the member whose
+//! value may not be echoed. `@sensitive` is a STAND-IN for the unknown gateway rule — it
+//! marks the payload a gateway treats as opaque — and the bound is read off the model,
+//! never written here, so an oversized NON-sensitive member stays the modelled 400 until
+//! a recording says otherwise.
+//!
+//! [`EmulatedService::front_door_refuses`] is that check, reached through
+//! [`Service::override_operation`] because the refusal PRECEDES the modelled walk:
+//! constraint validation runs before a handler, so no handler can answer ahead of it.
+//! The request's auth schemes are unaffected — the router reads them off the MODELLED
+//! operation the routing key names — so a front-door refusal is still only reached by a
+//! request whose signature verified.
 
+use aws_smithy_schema::serde::SerializableStruct;
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::constraints::validate;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, Refusal, Refused, Service,
+    Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+use crate::ops::types;
+use crate::scaffolded::FrontDoorRefusal;
 
 /// The error code this service answers an input-constraint violation with: the
 /// modelled `ValidationException`, which every operation of this service declares
@@ -65,6 +111,56 @@ const SENSITIVE_MEMBERS: &[&str] = &["secretString"];
 fn names_a_sensitive_member(path: &str) -> bool {
     let member = path.split('.').next_back().unwrap_or(path);
     SENSITIVE_MEMBERS.contains(&member)
+}
+
+/// Whether `violation` is the one the front door answers for: a `@sensitive` payload
+/// past the MAXIMUM length its modelled shape declares.
+///
+/// The bound itself is never spelled here — it is read off the violation the model's own
+/// validator reported — so this holds for every `@sensitive` length-bounded member of
+/// this model, and moves with the model if a bound changes. A violation on the same
+/// member for being too SHORT is not this refusal: it is the modelled
+/// `ValidationException`, which states the member and the bound without echoing the
+/// value. See the module docs for why the predicate is keyed this way and what it does
+/// not claim.
+fn is_oversized_sensitive_payload(violation: &Violation) -> bool {
+    matches!(violation.kind, ViolationKind::MaxLength(_))
+        && names_a_sensitive_member(&violation.path)
+}
+
+/// One refusal the front door answers with, as a pre-dispatch operation.
+///
+/// WHY this is a seam and not a line in a handler: the refusal happens BEFORE the
+/// modelled walk — the gateway judges the request envelope ahead of the service — and
+/// the walk refuses a modelled constraint violation before any handler runs, so the
+/// answer is not reachable from inside `handle`. [`Service::override_operation`] is the
+/// one hook that sees the whole request ahead of that walk.
+struct FrontDoorAnswer(FrontDoorRefusal);
+
+impl ErasedOperation for FrontDoorAnswer {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        _req: &'r aws_smithy_runtime_api::http::Request,
+        _ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // Rendered through this service's own protocol, so the refusal carries the
+            // same envelope (and the same `x-amzn-errortype` header) as every other
+            // error it answers. The status and the error code come from the refusal
+            // itself: the shape is not in the model, so there is no modelled error to
+            // read them off.
+            svc.definition()
+                .protocol()
+                .serialize_error(
+                    &self.0,
+                    &crate::scaffolded::FRONT_DOOR_SCHEMA,
+                    self.0.code,
+                    self.0.status,
+                )
+                .unwrap_or_else(|e| svc.definition().framework_error_response(e))
+        })
+    }
 }
 
 /// Render one constraint violation the way this service states it.
@@ -173,6 +269,8 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Answers a request the front door will not forward: HTTP 403 `ForbiddenException`.
+    forbidden: FrontDoorAnswer,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -182,8 +280,73 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            forbidden: FrontDoorAnswer(FrontDoorRefusal::forbidden()),
         }
     }
+
+    /// Whether the front door refuses this request outright — see the module docs.
+    ///
+    /// The input is read through the PROTOCOL's own binding against the operation's own
+    /// model-derived input schema, so the value judged is the value dispatch would hand
+    /// the handler (URI labels percent-decoded, body members parsed), and the bound
+    /// checked is the model's, through the same validator the walk runs.
+    /// Deserialization does not enforce constraints, which is what lets the gateway
+    /// judge a value the modelled constraint would otherwise have refused.
+    ///
+    /// One arm per operation whose input carries a member the gateway judges — today
+    /// `PutDeploymentParameter`, the only operation of this model carrying a
+    /// `@sensitive` member. Every other operation's request has nothing for the front
+    /// door to judge, so the modelled walk answers it.
+    fn front_door_refuses(&self, req: &aws_smithy_runtime_api::http::Request) -> bool {
+        let protocol = self.definition().protocol();
+        let Ok(key) = protocol.routing_key(req) else {
+            return false;
+        };
+        if key
+            != <crate::ops::put_deployment_parameter::PutDeploymentParameter<Eng> as Operation>::NAME
+        {
+            return false;
+        }
+        oversized_sensitive_payload::<types::PutDeploymentParameterInput>(
+            protocol,
+            req,
+            types::PUT_DEPLOYMENT_PARAMETER_INPUT_SCHEMA,
+        )
+    }
+}
+
+/// Whether the request carries a `@sensitive` payload past its modelled maximum length,
+/// read through `protocol` against `schema`.
+///
+/// Generic over the input shape so a second operation carrying a `@sensitive` member
+/// needs one call here rather than a second copy of the judgement. A request the protocol
+/// cannot bind at all is NOT judged: the framework's own refusal answers it, and the
+/// gateway's answer to a malformed envelope is not this one.
+///
+/// COST, knowingly paid: this binds and validates the request once here and dispatch
+/// binds and validates it again, so a request carrying a large payload is parsed twice.
+/// The framework offers no seam for handing the already-bound input on to dispatch (the
+/// pre-dispatch hook answers with an operation, not with an input), and the alternative —
+/// answering from inside the handler — cannot work at all, because the modelled walk
+/// refuses the request before any handler runs. The work is bounded by the same payload
+/// the request already carries.
+fn oversized_sensitive_payload<I>(
+    protocol: &dyn smithy_server_runtime::ServerHttpProtocol,
+    req: &aws_smithy_runtime_api::http::Request,
+    schema: &'static Schema,
+) -> bool
+where
+    I: DeserializableStruct + SerializableStruct,
+{
+    let Ok(mut deserializer) = protocol.deserialize_input(req, schema) else {
+        return false;
+    };
+    let Ok(input) = I::deserialize(&mut *deserializer) else {
+        return false;
+    };
+    validate(&input, schema)
+        .iter()
+        .any(is_oversized_sensitive_payload)
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -225,8 +388,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // This service is reached through a gateway that answers before it (see the
+        // module docs): a request carrying a `@sensitive` payload past its modelled
+        // maximum is refused there and never reaches the modelled walk at all. That
+        // answer is pre-dispatch, which is what this hook is.
+        self.front_door_refuses(req)
+            .then_some(&self.forbidden as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

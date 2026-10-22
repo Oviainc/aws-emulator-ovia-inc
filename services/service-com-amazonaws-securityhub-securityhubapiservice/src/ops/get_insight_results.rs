@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInsightResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInsightResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Evaluates the insight `CreateInsight` persisted: the findings of the caller's hub that
+//! match the insight's stored `AwsSecurityFindingFilters`, counted per distinct value of
+//! its stored `GroupByAttribute`. This operation only READS: it never writes to the store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInsightResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A finding contributes 1 to each DISTINCT value it carries for the grouping attribute
+//! (a list-valued attribute such as `Type`, or a finding with several `Resources`, can
+//! carry more than one), and nothing at all when it carries no value for it —
+//! `InsightResultValue$GroupByAttributeValue` is a `NonEmptyString`, so there is no
+//! group for "absent".
+//!
+//! Filtering is `GetFindings`' own predicate over the same filters, so an insight and the
+//! equivalent `GetFindings` call cannot disagree about which findings match; a filter or a
+//! grouping attribute this slice cannot evaluate answers 501 naming it, rather than
+//! counting findings it did not filter.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +137,39 @@ impl<Eng> GetInsightResults<Eng> {
     }
 }
 
+/// The values one finding contributes to the grouping, or `None` when the attribute is
+/// not one this slice can read a value for.
+///
+/// The string-valued finding attributes come straight from `GetFindings`' accessor, so
+/// grouping and filtering agree on what a finding's `SeverityLabel` (or `Type`, or
+/// `WorkflowStatus`) is. The arms below add the attributes of the finding's `Resources`,
+/// whose names are the `AwsSecurityFindingFilters` members that bind to a `Resource`
+/// member of the same name.
+fn group_values<'a>(finding: &'a AwsSecurityFinding, attribute: &str) -> Option<Vec<&'a str>> {
+    if let Some(values) = crate::ops::get_findings::string_attribute(finding, attribute) {
+        return Some(values);
+    }
+    let per_resource = |pick: fn(&'a Resource) -> Option<&'a str>| {
+        Some(finding.resources.iter().filter_map(pick).collect::<Vec<_>>())
+    };
+    match attribute {
+        "ResourceId" => per_resource(|resource| Some(resource.id.as_str())),
+        "ResourceType" => per_resource(|resource| Some(resource.r#type.as_str())),
+        "ResourcePartition" => per_resource(|resource| resource.partition.as_deref()),
+        "ResourceRegion" => per_resource(|resource| resource.region.as_deref()),
+        _ => None,
+    }
+}
+
+/// Can an insight grouped by `attribute` be evaluated at all?
+///
+/// Asked of [`group_values`] itself with a `Default` finding — a probe that carries no
+/// values but still makes the accessor answer `Some` for a name it knows and `None` for
+/// one it does not — so the answer cannot depend on what the hub happens to hold.
+fn is_groupable_attribute(attribute: &str) -> bool {
+    group_values(&AwsSecurityFinding::default(), attribute).is_some()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for GetInsightResults<Eng>
 {
@@ -149,18 +187,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInsightResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInsightResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInsightResults"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetInsightResultsError::Modeled(GetInsightResultsErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        let store = state.lock();
+        if !store.hubs.contains_key(&(account_id.clone(), region.clone())) {
+            return Err(GetInsightResultsErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let insight_arn = input.insight_arn;
+        let key = crate::state::InsightKey {
+            account_id: account_id.clone(),
+            region: region.clone(),
+            insight_arn: insight_arn.clone(),
+        };
+        let Some(insight) = store.insights.get(&key) else {
+            return Err(GetInsightResultsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No insight with ARN {insight_arn} exists for account {account_id} in Region {region}"
+                    )),
+                    code: Some("ResourceNotFoundException".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // What this slice can evaluate is settled before a single finding is read, so a
+        // hub with no findings answers an insight exactly as a full one does.
+        if !is_groupable_attribute(&insight.group_by_attribute) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "GetInsightResults GroupByAttribute {}",
+                insight.group_by_attribute
+            )));
+        }
+        if let Some(member) = crate::ops::get_findings::unsupported_filter_member(&insight.filters) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "GetInsightResults filter {member}"
+            )));
+        }
+
+        let now_nanos = crate::state::now_nanos();
+        // Ordered by group value, so the counting order is the insight's, not the
+        // store's iteration order.
+        let mut counts: ::std::collections::BTreeMap<&str, i32> =
+            ::std::collections::BTreeMap::new();
+        for (finding_key, stored) in &store.findings {
+            if finding_key.account_id != account_id || finding_key.region != region {
+                continue;
+            }
+            match crate::ops::get_findings::finding_matches(
+                &stored.finding,
+                &insight.filters,
+                now_nanos,
+            ) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(message) => {
+                    return Err(GetInsightResultsErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(message),
+                            code: Some("InvalidInputException".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            }
+            let values = group_values(&stored.finding, &insight.group_by_attribute)
+                .unwrap_or_default()
+                .into_iter()
+                // `GroupByAttributeValue` is a `NonEmptyString` with pattern `\S`, so a
+                // blank value names no group.
+                .filter(|value| !value.trim().is_empty())
+                // One finding counts ONCE per distinct value: two `Resources` of the
+                // same `Type` are one finding of that type, not two.
+                .collect::<::std::collections::BTreeSet<&str>>();
+            for value in values {
+                let count = counts.entry(value).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+
+        // The groups a caller acts on first: the biggest count first, ties broken by the
+        // group value, so the same stored state always renders the same list.
+        let mut result_values: Vec<InsightResultValue> = counts
+            .into_iter()
+            .map(|(value, count)| InsightResultValue {
+                group_by_attribute_value: value.to_string(),
+                count,
+            })
+            .collect();
+        result_values.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.group_by_attribute_value.cmp(&right.group_by_attribute_value))
+        });
+
+        Ok(GetInsightResultsOutput {
+            insight_results: InsightResults {
+                insight_arn,
+                group_by_attribute: insight.group_by_attribute.clone(),
+                result_values,
+            },
+        })
     }
 }

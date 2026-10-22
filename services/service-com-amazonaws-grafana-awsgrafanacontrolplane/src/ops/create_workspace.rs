@@ -332,6 +332,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A licence is associated by `AssociateLicense`, never at create.
             license_type: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // Service accounts are minted by `CreateWorkspaceServiceAccount`,
+            // never at create: a new workspace holds none.
+            service_accounts: Vec::new(),
+            service_account_id_seq: 0,
             created: now,
             modified: now,
         };

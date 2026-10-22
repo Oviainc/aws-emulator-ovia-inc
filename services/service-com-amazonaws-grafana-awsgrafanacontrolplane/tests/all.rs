@@ -17,6 +17,9 @@ mod list_versions;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/service_accounts.rs"]
+mod service_accounts;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

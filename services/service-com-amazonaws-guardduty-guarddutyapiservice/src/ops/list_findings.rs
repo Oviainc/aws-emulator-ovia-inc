@@ -163,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListFindingsErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    message: Some("the GuardDuty state store is unavailable".to_string()),
-                    r#type: None,
-                },
+                crate::state::state_unavailable(),
             )
             .into());
         };
@@ -175,9 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure report: nothing below writes to the store.
         let state = state.lock();
         let Some(detector) = state.detector_in(&region, &input.detector_id) else {
-            return Err(bad_request(format!(
-                "The request is rejected because the specified detector ID does not exist: {}.",
-                input.detector_id
+            // Classified from the REQUEST: a value that cannot be a detector id is a
+            // parameter failure, a well-formed one this account does not hold an
+            // ownership failure.
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
             )));
         };
 
@@ -203,9 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
             FINDING_IDS_MAX,
         )
-        .map_err(|token| {
-            bad_request(format!(
-                "The request is rejected because nextToken is not a token this service issued: {token}."
+        .map_err(|_| {
+            bad_request(crate::state::invalid_parameter_message(
+                crate::state::NEXT_TOKEN_MEMBER,
             ))
         })?;
 
@@ -220,13 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// can never carry more than 50 ids whatever `maxResults` asks for.
 const FINDING_IDS_MAX: usize = 50;
 
-/// Refuse the request with this operation's modeled 400.
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
 fn bad_request(message: impl Into<String>) -> ListFindingsError {
-    ListFindingsErrorModeled::BadRequestException(BadRequestException {
-        message: Some(message.into()),
-        r#type: None,
-    })
-    .into()
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }
 
 /// Refuse a finding attribute path this emulator does not model, naming the member

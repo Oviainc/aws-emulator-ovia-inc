@@ -31,6 +31,51 @@ pub const ARN_NAMESPACE: &str = "aws-marketplace";
 /// from; `engine::emulator_arn`'s own documented default.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The catalogs this service serves.
+///
+/// MODELLED, not chosen: `PutDeploymentParameterRequest$catalog` documents "The catalog
+/// related to the request. Fixed value: `AWSMarketplace`"
+/// (`smithy_query(query="doc",shape="PutDeploymentParameterRequest",member="catalog")`).
+/// So the `Catalog` shape's `length 1..64` / `^[a-zA-Z_-]+$` is the SYNTAX a catalog name
+/// takes, and this list is the set of catalogs that EXIST: a syntactically valid value
+/// outside it names no catalog at all, and the request that carries it is refused as
+/// invalid input rather than looked up.
+///
+/// A list rather than a single constant because the member's constraint is an
+/// allowed-value set that AWS can extend; everything below reads the set, so adding an
+/// entry here is the whole change.
+pub const SUPPORTED_CATALOGS: &[&str] = &["AWSMarketplace"];
+
+/// Whether `candidate` names a catalog this service serves ([`SUPPORTED_CATALOGS`]).
+///
+/// Compared exactly: `Catalog` carries no `@pattern` casing freedom and AWS's own
+/// catalog names are case-sensitive, so a value differing only in case names no catalog.
+pub fn is_supported_catalog(candidate: &str) -> bool {
+    SUPPORTED_CATALOGS.contains(&candidate)
+}
+
+/// The modelled `ValidationException` (HTTP 400) for a `catalog` that names no catalog
+/// this service serves.
+///
+/// The status and the code are what the model fixes; the sentence names the member and
+/// lists the values that ARE supported, read off [`SUPPORTED_CATALOGS`] — so it cannot
+/// drift from what the service accepts. `fieldName` names the member the way the
+/// validation report's own paths spell it (lowerCamel, as the request carries it).
+pub fn unsupported_catalog() -> ValidationException {
+    let supported = SUPPORTED_CATALOGS
+        .iter()
+        .map(|catalog| format!("\"{catalog}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ValidationException {
+        message: format!(
+            "Catalog: The provided Catalog is invalid. Provide a valid Catalog. \
+             Supported values are [{supported}]."
+        ),
+        field_name: "catalog".to_string(),
+    }
+}
+
 /// The resource portion prefix of a deployment-parameter ARN.
 ///
 /// The ARN's resource segment is the minted `dp-…` id ALONE. It deliberately

@@ -89,12 +89,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // operations bind (the `/endpoints/…` space), which is what `claims_request`
         // matches against the generated `ROUTE_PATH_SEGMENTS` when a service declares no
         // RPC protocol.
+        //
+        // That path space is the ONE in the family that is not disjoint: the HTTP2
+        // endpoint runtime signs as `sagemaker` too, publishes the SAME
+        // `runtime.sagemaker` endpointPrefix, and binds its one operation under the
+        // same `/endpoints/{EndpointName}/` prefix, so the first segment leaves the two
+        // of them claiming each other's traffic. The segment their modelled URIs differ
+        // at is the third, and `service_common::addresses_runtime_bidirectional_stream`
+        // states that split once for both sides: this service claims the `/endpoints/…`
+        // space EXCEPT the one bidirectional-stream invocation that sibling binds.
+        // Stated as a complement rather than as "my own three operations" on purpose —
+        // a request under `/endpoints/…` that matches no modelled invocation at all is
+        // then still claimed by exactly one service, this one, which answers it in its
+        // own protocol envelope, instead of by none, which the router would answer
+        // `404 UnknownService`.
         service_common::claims_request(
             parts,
             self.entry.identity().signing_name(),
             crate::ROUTE_PATH_SEGMENTS,
             None,
-        )
+        ) && !service_common::addresses_runtime_bidirectional_stream(parts.uri.path())
     }
 
     fn override_operation(

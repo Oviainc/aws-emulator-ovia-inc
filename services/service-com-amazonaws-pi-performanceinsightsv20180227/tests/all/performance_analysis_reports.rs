@@ -862,39 +862,50 @@ async fn delete_removes_the_report_from_get_and_from_list() {
     }
 }
 
-/// RULE: a request that breaks a modelled constraint — an absent required
-/// member, a value outside a `length`, `range`, `pattern` or enum value set —
-/// and a window whose end does not follow its start are refused as
-/// `InvalidArgumentException` (HTTP 400), and nothing is persisted.
+/// RULE: a bad request is refused with HTTP 400 by the stage that found it — a
+/// violation of a modelled constraint (an absent required member, a value
+/// outside a `length`, `range`, `pattern` or enum value set) by the validation
+/// stage as `ValidationException`, and a rule only the handler can check (a
+/// window whose end does not follow its start, a cursor this service never
+/// issued) as the modelled `InvalidArgumentException` — and nothing is persisted
+/// either way.
 #[tokio::test]
-async fn bad_arguments_are_refused_as_invalid_argument_exception() {
+async fn bad_arguments_are_refused_by_the_stage_that_finds_them() {
     let emulator = emulator();
 
-    let cases: Vec<(&str, &str, Value)> = vec![
+    // `expected_code` is the stage: `ValidationException` for a modelled
+    // constraint the validation stage refuses before any handler runs,
+    // `InvalidArgumentException` for the handler's own refusals.
+    let cases: Vec<(&str, &str, Value, &str)> = vec![
         (
             "Create without ServiceType",
             "CreatePerformanceAnalysisReport",
             json!({"Identifier": "db-ABCDEFG1234567", "StartTime": T0}),
+            "ValidationException",
         ),
         (
             "Create without Identifier",
             "CreatePerformanceAnalysisReport",
             json!({"ServiceType": "RDS", "StartTime": T0}),
+            "ValidationException",
         ),
         (
             "Create without StartTime",
             "CreatePerformanceAnalysisReport",
             json!({"ServiceType": "RDS", "Identifier": "db-ABCDEFG1234567"}),
+            "ValidationException",
         ),
         (
             "Create with a ServiceType outside the enum value set",
             "CreatePerformanceAnalysisReport",
             json!({"ServiceType": "AURORA", "Identifier": "db-ABCDEFG1234567", "StartTime": T0}),
+            "ValidationException",
         ),
         (
             "Create with an Identifier outside the pattern",
             "CreatePerformanceAnalysisReport",
             json!({"ServiceType": "RDS", "Identifier": "db_ABCDEFG!", "StartTime": T0}),
+            "ValidationException",
         ),
         (
             "Create with EndTime equal to StartTime",
@@ -905,6 +916,7 @@ async fn bad_arguments_are_refused_as_invalid_argument_exception() {
                 "StartTime": T0,
                 "EndTime": T0,
             }),
+            "InvalidArgumentException",
         ),
         (
             "Create with EndTime before StartTime",
@@ -915,6 +927,7 @@ async fn bad_arguments_are_refused_as_invalid_argument_exception() {
                 "StartTime": T0,
                 "EndTime": T0 - 1.0,
             }),
+            "InvalidArgumentException",
         ),
         (
             "Get with an AnalysisReportId outside the pattern",
@@ -924,6 +937,7 @@ async fn bad_arguments_are_refused_as_invalid_argument_exception() {
                 "Identifier": "db-ABCDEFG1234567",
                 "AnalysisReportId": "report-NOTHEX0000000000",
             }),
+            "ValidationException",
         ),
         (
             "Get with a TextFormat outside the enum value set",
@@ -934,6 +948,7 @@ async fn bad_arguments_are_refused_as_invalid_argument_exception() {
                 "AnalysisReportId": UNMINTED_REPORT_ID,
                 "TextFormat": "HTML",
             }),
+            "ValidationException",
         ),
         (
             "List with MaxResults above the modelled range",
@@ -943,6 +958,7 @@ async fn bad_arguments_are_refused_as_invalid_argument_exception() {
                 "Identifier": "db-ABCDEFG1234567",
                 "MaxResults": 26,
             }),
+            "ValidationException",
         ),
         (
             "List with MaxResults below the modelled range",
@@ -952,6 +968,7 @@ async fn bad_arguments_are_refused_as_invalid_argument_exception() {
                 "Identifier": "db-ABCDEFG1234567",
                 "MaxResults": -1,
             }),
+            "ValidationException",
         ),
         (
             "List with a NextToken this service never issued",
@@ -961,6 +978,7 @@ async fn bad_arguments_are_refused_as_invalid_argument_exception() {
                 "Identifier": "db-ABCDEFG1234567",
                 "NextToken": "not-a-cursor",
             }),
+            "InvalidArgumentException",
         ),
         (
             "List with a NextToken outside the modelled pattern",
@@ -970,10 +988,11 @@ async fn bad_arguments_are_refused_as_invalid_argument_exception() {
                 "Identifier": "db-ABCDEFG1234567",
                 "NextToken": "has spaces",
             }),
+            "ValidationException",
         ),
     ];
 
-    for (label, operation, input) in cases {
+    for (label, operation, input, expected_code) in cases {
         let answer = call(&emulator, operation, input).await;
         assert_eq!(
             answer.status, 400,
@@ -982,8 +1001,8 @@ async fn bad_arguments_are_refused_as_invalid_argument_exception() {
         );
         assert_eq!(
             answer.error_code(),
-            "InvalidArgumentException",
-            "case {label}: expected InvalidArgumentException, got {:?}",
+            expected_code,
+            "case {label}: expected {expected_code}, got {:?}",
             answer.body
         );
         assert!(

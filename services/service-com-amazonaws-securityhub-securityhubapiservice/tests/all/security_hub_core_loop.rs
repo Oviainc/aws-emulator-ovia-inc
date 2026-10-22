@@ -82,7 +82,7 @@ impl Harness {
         self.call("GET", &path, None).await
     }
 
-    async fn disable(&self) -> (u16, Value) {
+    pub(crate) async fn disable(&self) -> (u16, Value) {
         self.call("DELETE", "/accounts", None).await
     }
 

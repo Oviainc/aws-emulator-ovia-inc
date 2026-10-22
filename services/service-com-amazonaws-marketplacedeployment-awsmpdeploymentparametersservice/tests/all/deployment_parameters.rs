@@ -35,10 +35,10 @@ use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-// The percent-encoder and the error-code accessor are shared by every suite of this
+// The percent-encoder and the body accessors are shared by every suite of this
 // test binary; ONE copy lives in `tests/all/support.rs` and is re-exported here, so
 // the sibling suites that import them from this module keep working.
-pub(crate) use crate::support::{error_code, pct};
+pub(crate) use crate::support::{error_code, field_name, message, pct};
 
 /// The region every request below signs for; every minted ARN must carry it.
 pub(crate) const REGION: &str = "us-west-2";
@@ -47,6 +47,14 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// This service's ARN namespace and sigv4 signing name, from the model's
 /// `aws.api#service$arnNamespace` / `aws.auth#sigv4$name`.
 pub(crate) const SIGNING_NAME: &str = "aws-marketplace";
+/// The one catalog this service serves, which every request below names.
+///
+/// `PutDeploymentParameterRequest$catalog` is documented as a fixed value
+/// (`smithy_query(query="doc",shape="PutDeploymentParameterRequest",member="catalog")`),
+/// and the service reads the set it belongs to from
+/// `state::SUPPORTED_CATALOGS` — which this constant is asserted against in the
+/// `catalog_allowed_values` suite, so the two cannot drift.
+pub(crate) const CATALOG: &str = "AWSMarketplace";
 /// The longest `DeploymentParameterName` the model admits (`length 1..400`).
 pub(crate) const PARAMETER_NAME_MAX_LEN: usize = 400;
 /// The longest `SecretString` the model admits (`length 1..15000`).
@@ -266,11 +274,14 @@ struct Lifecycle {
 
 /// The lifecycle table. The rows differ along everything the rule generalises
 /// over: the form of each identity segment (the characters its own modelled
-/// pattern admits — `Catalog` is `^[a-zA-Z_-]+$`, `ResourceId`
-/// `^[A-Za-z0-9_/-]+$`, `DeploymentParameterName` `^[a-zA-Z0-9/_+=.@-]+$`), the
-/// length of the secret at both modelled bounds, the number of tags the create
-/// carries (none, one, a few, and one short of the cap) and whether the create
-/// names an `expirationDate`.
+/// pattern admits — `ResourceId` is `^[A-Za-z0-9_/-]+$`,
+/// `DeploymentParameterName` `^[a-zA-Z0-9/_+=.@-]+$`), the length of the secret at
+/// both modelled bounds, the number of tags the create carries (none, one, a few,
+/// and one short of the cap) and whether the create names an `expirationDate`.
+///
+/// Every row carries the SAME catalog: `catalog` is an allowed-value member (the
+/// model documents it as a fixed value, `crate::catalog_allowed_values` pins the
+/// rule), so a row varying it would be testing that rule and not this one.
 fn lifecycle_table() -> Vec<Lifecycle> {
     // One short of the cap, so the single tag the TagResource step adds lands the
     // record exactly ON the modelled `TagsMap length max 50`.
@@ -280,7 +291,7 @@ fn lifecycle_table() -> Vec<Lifecycle> {
     vec![
         Lifecycle {
             case: "plain identity, one tag",
-            catalog: "AWSMarketplace".to_string(),
+            catalog: CATALOG.to_string(),
             product_id: "prod-abc123".to_string(),
             agreement_id: "agmt-abc123".to_string(),
             parameter: "DbPassword".to_string(),
@@ -289,8 +300,8 @@ fn lifecycle_table() -> Vec<Lifecycle> {
             expiration_date: None,
         },
         Lifecycle {
-            case: "catalog with _ and -, nested product id, punctuated name, no tags",
-            catalog: "AWS_Marketplace-Test".to_string(),
+            case: "nested product id, punctuated name, no tags",
+            catalog: CATALOG.to_string(),
             product_id: "prod/nested/id-7".to_string(),
             agreement_id: "agmt_1/2-3".to_string(),
             parameter: "api.key+v1=1@host/path_1-2".to_string(),
@@ -300,7 +311,7 @@ fn lifecycle_table() -> Vec<Lifecycle> {
         },
         Lifecycle {
             case: "secret at the modelled maximum, several punctuated tags",
-            catalog: "PrivateMarketplace".to_string(),
+            catalog: CATALOG.to_string(),
             product_id: "prod_01/beta-2".to_string(),
             agreement_id: "A".to_string(),
             parameter: "p".to_string(),
@@ -315,7 +326,7 @@ fn lifecycle_table() -> Vec<Lifecycle> {
         },
         Lifecycle {
             case: "name at the modelled maximum, one tag short of the cap",
-            catalog: "Catalog".to_string(),
+            catalog: CATALOG.to_string(),
             product_id: "0".to_string(),
             agreement_id: "9".to_string(),
             parameter: "n".repeat(PARAMETER_NAME_MAX_LEN),
@@ -325,7 +336,7 @@ fn lifecycle_table() -> Vec<Lifecycle> {
         },
         Lifecycle {
             case: "single-character identity",
-            catalog: "a".to_string(),
+            catalog: CATALOG.to_string(),
             product_id: "b".to_string(),
             agreement_id: "c".to_string(),
             parameter: "d".to_string(),
@@ -659,8 +670,10 @@ async fn a_put_outside_the_modelled_constraints_is_refused() {
     // report map-key constraints, so those two are refused by the handler's own
     // tag check, which runs after the target is resolved.
     provision(&engine, "AWSMarketplace", "a1", &["prod-1"]);
-    // The one legal row at the end of this test writes against this target.
-    provision(&engine, "c", "a", &["p"]);
+    // The one legal row at the end of this test writes against this target: the
+    // shortest product, agreement, name and secret the model admits, under the one
+    // catalog it serves.
+    provision(&engine, "AWSMarketplace", "a", &["p"]);
 
     let too_many: serde_json::Map<String, Value> = (0..=MAX_TAGS_PER_RESOURCE)
         .map(|i| (format!("key-{i:02}"), json!("v")))
@@ -669,7 +682,10 @@ async fn a_put_outside_the_modelled_constraints_is_refused() {
     // Each row breaks exactly one modelled constraint of `PutDeploymentParameter`'s
     // input: `Catalog` (`^[a-zA-Z_-]+$`, len 1..64), `ResourceId`
     // (`^[A-Za-z0-9_/-]+$`, len 1..64), `DeploymentParameterName` (len 1..400),
-    // `SecretString` (len 1..15000), `TagsMap` (len ..50), or `@required`.
+    // `SecretString`'s MINIMUM (len 1..15000), `TagsMap` (len ..50), or
+    // `@required`. `SecretString`'s MAXIMUM is deliberately absent: an oversized
+    // `@sensitive` payload is refused one layer earlier, by the front door, with
+    // HTTP 403 `ForbiddenException` — the `front_door_forbidden` suite pins it.
     let over_long_catalog = "c".repeat(65);
     let over_long_product = "p".repeat(65);
 
@@ -762,15 +778,6 @@ async fn a_put_outside_the_modelled_constraints_is_refused() {
             json!({ "agreementId": "a1", "deploymentParameter": { "name": "N", "secretString": "" } }),
         ),
         (
-            "secretString one character past its maximum",
-            "AWSMarketplace",
-            "prod-1",
-            json!({
-                "agreementId": "a1",
-                "deploymentParameter": { "name": "N", "secretString": "s".repeat(SECRET_MAX_LEN + 1) },
-            }),
-        ),
-        (
             "one tag past the modelled cap",
             "AWSMarketplace",
             "prod-1",
@@ -826,10 +833,10 @@ async fn a_put_outside_the_modelled_constraints_is_refused() {
     }
 
     // A legal boundary row the refusals must not have swallowed: the shortest
-    // catalog, product, agreement, name and secret the model admits.
+    // product, agreement, name and secret the model admits.
     let (status, created) = put(
         &router,
-        "c",
+        "AWSMarketplace",
         "p",
         &json!({ "agreementId": "a", "deploymentParameter": { "name": "n", "secretString": "s" } }),
     )
@@ -950,7 +957,6 @@ async fn a_client_token_identifies_exactly_one_write() {
         &["prod-token", "prod-other"],
     );
     provision(&engine, "AWSMarketplace", "agmt-other", &["prod-token"]);
-    provision(&engine, "OtherMarketplace", "agmt-token", &["prod-token"]);
     // 36 characters of `^[a-zA-Z0-9/_+=.:@-]+$`, inside `ClientToken`'s len 32..64.
     let token = "0123456789abcdef0123456789abcdef0123";
 
@@ -1005,16 +1011,6 @@ async fn a_client_token_identifies_exactly_one_write() {
             "another product",
             "AWSMarketplace",
             "prod-other",
-            json!({
-                "agreementId": "agmt-token",
-                "deploymentParameter": { "name": "Tokened", "secretString": "s" },
-                "clientToken": token,
-            }),
-        ),
-        (
-            "another catalog",
-            "OtherMarketplace",
-            "prod-token",
             json!({
                 "agreementId": "agmt-token",
                 "deploymentParameter": { "name": "Tokened", "secretString": "s" },

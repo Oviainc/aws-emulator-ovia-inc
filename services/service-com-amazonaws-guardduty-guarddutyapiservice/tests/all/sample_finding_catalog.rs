@@ -11,9 +11,10 @@
 //! call:
 //!
 //! 1. A `findingTypes` entry that is not a GuardDuty finding type is refused with the
-//!    modelled `BadRequestException` — HTTP 400, `x-amzn-errortype: BadRequestException`,
-//!    the error CLASS `InvalidInputException` in the body's `type` member — and the
-//!    refused request writes nothing.
+//!    modelled `BadRequestException` envelope — HTTP 400,
+//!    `x-amzn-errortype: BadRequestException` — carrying the error CLASS
+//!    `InvalidInputException` in the body's `__type` discriminator and in its `type`
+//!    member — and the refused request writes nothing.
 //! 2. A generated sample finding's `severity` is the value GuardDuty publishes for its
 //!    finding TYPE, which spans the four documented severity levels.
 //! 3. A generated sample finding reports `service.additionalInfo` as a JSON DOCUMENT
@@ -21,7 +22,9 @@
 
 use serde_json::{json, Value};
 
-use super::detector_lifecycle::{all_finding_ids, call, enabled_detector, error_code, new_router};
+use super::detector_lifecycle::{
+    all_finding_ids, call, enabled_detector, error_code, error_shape, new_router,
+};
 
 /// A well-formed `DetectorId` (32 lowercase hex characters) that no create minted.
 const ABSENT_DETECTOR_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -125,9 +128,14 @@ async fn a_finding_type_outside_the_catalogue_is_refused() {
             "case {label:?} ({finding_type:?}): expected 400, got {status} {body:?}"
         );
         assert_eq!(
-            error_code(&body),
+            error_shape(&body),
             "BadRequestException",
             "case {label:?} ({finding_type:?}): expected the modelled error shape, got {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidInputException",
+            "case {label:?} ({finding_type:?}): expected the invalid-input error class in __type, got {body:?}"
         );
         assert_eq!(
             body["type"],

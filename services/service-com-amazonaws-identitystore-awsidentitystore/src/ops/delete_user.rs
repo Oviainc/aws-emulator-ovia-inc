@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the user the request names from the identity store, with the `UserName`
+//! claim it held and every group membership that named it as a member, so a later
+//! `DescribeUser` reports it as not found and `ListGroupMemberships` no longer carries
+//! it. A request that carries a `Revision` deletes CONDITIONALLY on it being the
+//! user's current revision.
 //!
 //! ## Shape of an operation
 //!
@@ -96,12 +93,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `DeleteUserError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#DeleteUser")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#DeleteUser",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteUserErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -153,20 +157,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUser"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteUserErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let mut state = state.lock();
+        let not_found = || {
+            DeleteUserErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                crate::state::ResourceKind::User,
+                &input.user_id,
+            ))
+        };
+
+        // `store_mut` looks the store up and NEVER brings one into being: a delete that
+        // finds nothing to delete must not leave an identity store behind as a side
+        // effect.
+        let store = state
+            .store_mut(&input.identity_store_id)
+            .ok_or_else(not_found)?;
+        // Both the bare id and the resource's ARN name the same user.
+        let user_key = crate::state::resource_key(&input.user_id);
+        // `Revision` is the caller's EXPECTED current revision: "the user is deleted
+        // only if it matches the current revision of the user in the identity store.
+        // If the value doesn't match, the operation fails with a ConflictException. If
+        // you don't provide this value, the user is deleted regardless of its current
+        // revision." The member is a decimal string (`^[0-9]+$`), so it is compared as
+        // the number it denotes — `01` and `1` name one revision — and a value too
+        // large to be any revision simply never matches. Only a conditional delete
+        // needs to read the record first; an unconditional one is the removal itself.
+        if let Some(expected) = input.revision.as_deref() {
+            let user = store.users.get(&user_key).ok_or_else(not_found)?;
+            if expected.parse::<u64>().ok() != Some(user.revision) {
+                return Err(DeleteUserErrorModeled::ConflictException(
+                    crate::state::concurrent_modification(format!(
+                        "user {} is at revision {}, not the expected revision {expected}",
+                        user.user_id, user.revision
+                    )),
+                )
+                .into());
+            }
+        }
+
+        // Removes the user, the `UserName` uniqueness claim it held and the memberships
+        // naming it as a member (`IdentityStoreData::remove_user`). Its `None` is the
+        // one not-found signal: a user this store does not hold cannot be deleted, and
+        // the operation models `ResourceNotFoundException` for exactly that rather than
+        // a success that removed nothing.
+        store.remove_user(&user_key).ok_or_else(not_found)?;
+        Ok(DeleteUserOutput {})
     }
 }

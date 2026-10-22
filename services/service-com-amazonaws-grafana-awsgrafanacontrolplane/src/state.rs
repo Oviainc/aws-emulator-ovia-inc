@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AuthenticationDescription, AuthenticationSummary, AwsSsoAuthentication,
     NetworkAccessConfiguration, ResourceNotFoundException, SamlAuthentication, SamlConfiguration,
-    ValidationException, ValidationExceptionField, VpcConfiguration, WorkspaceDescription,
-    WorkspaceSummary,
+    ServiceAccountSummary, ValidationException, ValidationExceptionField, VpcConfiguration,
+    WorkspaceDescription, WorkspaceSummary,
 };
 
 /// The Grafana versions this emulator supports, OLDEST FIRST.
@@ -72,6 +72,26 @@ pub const SAML_NOT_CONFIGURED: &str = "NOT_CONFIGURED";
 /// The `resourceType` a `ResourceNotFoundException` reports for a workspace id
 /// that names no workspace.
 pub const WORKSPACE_RESOURCE_TYPE: &str = "Workspace";
+
+/// The `resourceType` an error reports for a service account of a workspace.
+pub const SERVICE_ACCOUNT_RESOURCE_TYPE: &str = "ServiceAccount";
+
+/// The lowest Grafana major version a workspace must run for it to hold service
+/// accounts.
+///
+/// `CreateWorkspaceServiceAccount` documents the rule: "You can only create
+/// service accounts for workspaces that are compatible with Grafana version 9
+/// and above."
+pub const SERVICE_ACCOUNT_MIN_GRAFANA_MAJOR: u64 = 9;
+
+/// How many service accounts one workspace holds before a create is refused with
+/// the modelled `ServiceQuotaExceededException`.
+///
+/// Like [`WORKSPACE_QUOTA`], this is the emulator's OWN bound on the store rather
+/// than a claim about any account's Service Quotas value: it keeps the state from
+/// growing without end, and sits far above any workflow an emulator serves. Every
+/// record it bounds is released with its workspace, which owns it.
+pub const SERVICE_ACCOUNT_QUOTA: usize = 100;
 
 /// The largest page `ListWorkspaces` serves, and the page size it uses when the
 /// request names no `maxResults`: `ListWorkspacesRequest$maxResults` is modelled
@@ -172,6 +192,14 @@ pub struct Workspace {
     /// Set by `AssociateLicense`; unset until then.
     pub license_type: Option<String>,
     pub tags: BTreeMap<String, String>,
+    /// Every service account of this workspace, in the order
+    /// `CreateWorkspaceServiceAccount` minted them — the stable total order
+    /// `ListWorkspaceServiceAccounts` pages through. They live on the workspace
+    /// record because they belong to it: `DeleteWorkspace` dropping the
+    /// workspace releases them with it.
+    pub service_accounts: Vec<ServiceAccount>,
+    /// The counter this workspace's service-account ids are minted from.
+    pub service_account_id_seq: u64,
     pub created: SystemTime,
     pub modified: SystemTime,
 }
@@ -192,6 +220,47 @@ impl Workspace {
         }
         self.status = pending.status.clone();
         self.pending = None;
+    }
+
+    /// Whether this workspace may hold service accounts at all.
+    ///
+    /// `CreateWorkspaceServiceAccount` documents that only workspaces
+    /// "compatible with Grafana version 9 and above" can have them, so the major
+    /// component of the version decides it. The comparison goes through
+    /// [`version_order`], the one place this crate reads a Grafana version as
+    /// numbers: a component that is not a number contributes 0, so a version
+    /// this emulator cannot classify is below the floor rather than clearing it.
+    pub fn supports_service_accounts(&self) -> bool {
+        version_order(&self.grafana_version)
+            .first()
+            .is_some_and(|major| *major >= SERVICE_ACCOUNT_MIN_GRAFANA_MAJOR)
+    }
+
+    /// This workspace's service account named `name`, if it holds one.
+    ///
+    /// `CreateWorkspaceServiceAccountRequest$name` documents that "the name must
+    /// be unique within the workspace", so this is what a create consults
+    /// before minting another.
+    pub fn service_account_named(&self, name: &str) -> Option<&ServiceAccount> {
+        self.service_accounts
+            .iter()
+            .find(|account| account.name == name)
+    }
+
+    /// Mint an id no service account of this workspace holds.
+    ///
+    /// Grafana identifies a service account by a positive integer, rendered as a
+    /// string on the wire (`ServiceAccountSummary$id` is a plain `String`), so
+    /// the id is the decimal counter value. The loop skips an id already taken,
+    /// which is what makes the wrap safe.
+    pub fn mint_service_account_id(&mut self) -> String {
+        loop {
+            self.service_account_id_seq = self.service_account_id_seq.wrapping_add(1);
+            let id = self.service_account_id_seq.to_string();
+            if !self.service_accounts.iter().any(|account| account.id == id) {
+                return id;
+            }
+        }
     }
 
     /// True when `provider` is one of this workspace's stored authentication
@@ -325,6 +394,42 @@ impl Workspace {
     }
 }
 
+/// One Grafana service account of a workspace, as this emulator persists it.
+///
+/// A service account is the identity `CreateWorkspaceServiceAccountToken` mints
+/// tokens for; `ListWorkspaceServiceAccounts` reports it as a
+/// [`ServiceAccountSummary`].
+#[derive(Debug, Clone)]
+pub struct ServiceAccount {
+    /// The id minted by [`Workspace::mint_service_account_id`].
+    pub id: String,
+    /// The name the create named, unique within the workspace.
+    pub name: String,
+    /// One of `Role`'s values: `ADMIN`, `EDITOR` or `VIEWER`.
+    pub grafana_role: String,
+    /// Service accounts "can be disabled and enabled in the Amazon Managed
+    /// Grafana console", which this emulator does not model, so an account is
+    /// enabled from the moment it is created.
+    pub disabled: bool,
+    pub created: SystemTime,
+}
+
+impl ServiceAccount {
+    /// The `ServiceAccountSummary` projection `ListWorkspaceServiceAccounts`
+    /// returns.
+    ///
+    /// `isDisabled` is modelled as a `String` ("Returns true if the service
+    /// account is disabled"), so the boolean is rendered as `true` / `false`.
+    pub fn to_summary(&self) -> ServiceAccountSummary {
+        ServiceAccountSummary {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            is_disabled: self.disabled.to_string(),
+            grafana_role: self.grafana_role.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-grafana-awsgrafanacontrolplane. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsGrafanaAwsgrafanacontrolplaneState {
@@ -426,6 +531,22 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The `ConflictException` payload for a service-account name a workspace
+/// already holds: the existing account is the resource in the way.
+pub fn service_account_name_taken(
+    workspace_id: &str,
+    name: &str,
+    existing_id: &str,
+) -> crate::ops::types::ConflictException {
+    crate::ops::types::ConflictException {
+        message: format!(
+            "workspace {workspace_id} already holds a service account named {name}"
+        ),
+        resource_id: existing_id.to_string(),
+        resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_string(),
+    }
 }
 
 /// The `ResourceNotFoundException` payload for a workspace id that names no

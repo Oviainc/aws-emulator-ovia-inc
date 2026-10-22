@@ -18,6 +18,20 @@
 //! space — the root path for the awsJson1_1 control plane, whose operations all arrive as
 //! `POST /`. This suite pins that: the claim table (who claims what) and the answers the
 //! AgenticRFT job runtime's four operations give through the whole router.
+//!
+//! The two endpoint runtimes are the one pair whose path spaces are NOT disjoint: both
+//! bind `/endpoints/{EndpointName}/…` and both publish the endpointPrefix
+//! `runtime.sagemaker`, so the first path segment cannot separate them either. The
+//! segment their modelled URIs differ at does — `smithy_query(query="digest")` on the two
+//! models gives HTTP2 only `…/invocations-bidirectional-stream`, against
+//! `…/invocations`, `…/async-invocations` and `…/invocations-response-stream` — and
+//! `service_common::addresses_runtime_bidirectional_stream` states that split once for
+//! both sides, so every path in the space they share has exactly one claimant too. The
+//! claim table below has a row for each side of it.
+//!
+//! The last test is the metrics data plane the SageMaker Metrics checks exercise, driven
+//! with the whole family mounted: what `BatchPutMetrics` stores is what `BatchGetMetrics`
+//! aggregates, so a routing fix that reached the wrong member could not produce it.
 
 use std::sync::Arc;
 
@@ -176,7 +190,8 @@ fn claimants(
 /// RULE: a request signed under the shared `sagemaker` signing name is claimed by the one
 /// family member whose modelled wire surface it addresses — the control plane for a root
 /// `POST` whose `X-Amz-Target` names IT, each REST data-plane service for its own URI
-/// path space.
+/// path space, and, where two members publish the same path space, the one whose own
+/// model binds the deeper segment the request addresses.
 #[test]
 fn each_service_sharing_the_sagemaker_signing_name_claims_only_its_own_path_space() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -194,9 +209,9 @@ fn each_service_sharing_the_sagemaker_signing_name_claims_only_its_own_path_spac
     }
 
     // Rows differ along the wire surface they address: one row per family member's own
-    // surface (the control plane's RPC form, each REST member's paths), the root path
-    // without an `X-Amz-Target` and with one naming another service, and a path no
-    // member binds.
+    // surface (the control plane's RPC form, each REST member's paths), both sides of the
+    // `/endpoints/…` space the two endpoint runtimes share, the root path without an
+    // `X-Amz-Target` and with one naming another service, and a path no member binds.
     let rows = [
         Row {
             case: "control plane, awsJson1_1 root path targeted at it",
@@ -231,17 +246,49 @@ fn each_service_sharing_the_sagemaker_signing_name_claims_only_its_own_path_spac
             claimants: vec![JOB_RUNTIME],
         },
         Row {
-            case: "endpoint runtime invocations (a collision this change does not resolve)",
+            case: "endpoint runtime invocations",
             method: "POST",
             path: "/endpoints/my-endpoint/invocations",
             target: None,
-            // The two endpoint runtimes publish the SAME `/endpoints/…` space (AWS
-            // separates them by port, not by path), so both still claim it and the
-            // router still answers their traffic `500 AmbiguousService`. That pair's own
-            // collision PRE-DATES this change and is NOT resolved here — it is pinned as
-            // a known-unresolved claim, not as correct behaviour. What matters for this
-            // suite is that neither of them claims any other member's paths.
-            claimants: vec![ENDPOINT_RUNTIME, ENDPOINT_RUNTIME_HTTP2],
+            // The two endpoint runtimes publish the SAME `/endpoints/…` space and the
+            // same endpointPrefix, so the first path segment cannot separate them; the
+            // third can, because that is where their modelled URIs differ. This one is
+            // the SageMaker Runtime endpoint's.
+            claimants: vec![ENDPOINT_RUNTIME],
+        },
+        Row {
+            case: "endpoint runtime async invocations",
+            method: "POST",
+            path: "/endpoints/my-endpoint/async-invocations",
+            target: None,
+            claimants: vec![ENDPOINT_RUNTIME],
+        },
+        Row {
+            case: "endpoint runtime response stream",
+            method: "POST",
+            path: "/endpoints/my-endpoint/invocations-response-stream",
+            target: None,
+            claimants: vec![ENDPOINT_RUNTIME],
+        },
+        Row {
+            case: "the HTTP2 endpoint runtime's bidirectional stream",
+            method: "POST",
+            path: "/endpoints/my-endpoint/invocations-bidirectional-stream",
+            target: None,
+            // The one invocation the HTTP2 model binds, and the only one of the shared
+            // space it claims.
+            claimants: vec![ENDPOINT_RUNTIME_HTTP2],
+        },
+        Row {
+            case: "an invocation neither endpoint-runtime model binds",
+            method: "POST",
+            path: "/endpoints/my-endpoint/no-such-invocation",
+            target: None,
+            // Stated as a complement on the SageMaker Runtime side, so a path inside the
+            // shared space that names no modelled invocation still has exactly one
+            // claimant — which answers in its own protocol envelope — instead of none,
+            // which the router would answer `404 UnknownService`.
+            claimants: vec![ENDPOINT_RUNTIME],
         },
         Row {
             case: "a2i human loops",
@@ -268,6 +315,13 @@ fn each_service_sharing_the_sagemaker_signing_name_claims_only_its_own_path_spac
             case: "metrics ingestion",
             method: "PUT",
             path: "/BatchPutMetrics",
+            target: None,
+            claimants: vec![METRICS],
+        },
+        Row {
+            case: "metrics retrieval",
+            method: "POST",
+            path: "/BatchGetMetrics",
             target: None,
             claimants: vec![METRICS],
         },
@@ -375,8 +429,20 @@ async fn dispatch(
     headers: &[(&str, &str)],
     body: &str,
 ) -> Answer {
+    dispatch_with_method(router, "POST", path, headers, body).await
+}
+
+/// [`dispatch`] for a row whose method the model fixes to something other than `POST` —
+/// `BatchPutMetrics` is a `PUT`.
+async fn dispatch_with_method(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Answer {
     let mut builder = http::Request::builder()
-        .method("POST")
+        .method(method)
         .uri(format!("https://emulator.local{path}"))
         .header("host", "emulator.local")
         .header("content-type", "application/json")
@@ -522,6 +588,103 @@ async fn the_job_runtime_answers_its_own_modelled_rejections_through_the_whole_r
             answer.message().contains(&fragment),
             "case {case:?}: expected the Message to state {fragment:?}, got {:?}",
             answer.message()
+        );
+    }
+}
+
+/// RULE: with the whole family mounted, the metrics endpoint's own data plane works end
+/// to end — what `BatchPutMetrics` stores is what `BatchGetMetrics` aggregates — so the
+/// claim resolution above reaches SageMaker Metrics and nothing else does.
+///
+/// The aggregates are computed from the three stored points, not echoed: the three
+/// timestamps share one `OneMinute` bucket, so each `MetricStatistic` the model declares
+/// is a different function of the same series, and the x value is that bucket's start.
+#[tokio::test]
+async fn the_metrics_endpoint_round_trips_its_own_data_plane_through_the_whole_router() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = build_router(&engine);
+
+    let trial_component = "routing-roundtrip-tc";
+    let resource_arn = format!(
+        "arn:aws:sagemaker:us-east-1:000000000000:experiment-trial-component/{trial_component}"
+    );
+    let put_body = serde_json::json!({
+        "TrialComponentName": trial_component,
+        "MetricData": [
+            {"MetricName": "loss", "Timestamp": 1_700_000_000, "Step": 0, "Value": 1.0},
+            {"MetricName": "loss", "Timestamp": 1_700_000_001, "Step": 1, "Value": 0.5},
+            {"MetricName": "loss", "Timestamp": 1_700_000_002, "Step": 2, "Value": 0.25},
+        ],
+    })
+    .to_string();
+
+    let answer = dispatch_with_method(&router, "PUT", "/BatchPutMetrics", &[], &put_body).await;
+    assert_eq!(
+        (answer.status, answer.error_code().as_str()),
+        (200, ""),
+        "case \"BatchPutMetrics\": expected HTTP 200 from SageMaker Metrics, got {} {:?} / {}",
+        answer.status,
+        answer.error_type,
+        answer.body
+    );
+    assert!(
+        !answer.body.contains("Errors"),
+        "case \"BatchPutMetrics\": a wholly accepted batch reports no Errors, got {}",
+        answer.body
+    );
+
+    // `floor(1_700_000_000 / 60) * 60`: the start of the minute all three points fall in.
+    const MINUTE_BUCKET: i64 = 1_699_999_980;
+    // Five of the six `MetricStatistic` members, each a different function of the same
+    // three values (`smithy_query(query="shape", shape="MetricStatistic")`).
+    let expected: [(&str, f64); 5] = [
+        ("Last", 0.25),
+        ("Min", 0.25),
+        ("Max", 1.0),
+        ("Count", 3.0),
+        ("Avg", (1.0 + 0.5 + 0.25) / 3.0),
+    ];
+
+    for (stat, want) in expected {
+        let get_body = serde_json::json!({"MetricQueries": [{
+            "MetricName": "loss",
+            "ResourceArn": resource_arn,
+            "MetricStat": stat,
+            "Period": "OneMinute",
+            "XAxisType": "Timestamp",
+        }]})
+        .to_string();
+        let answer = dispatch(&router, "/BatchGetMetrics", &[], &get_body).await;
+        assert_eq!(
+            (answer.status, answer.error_code().as_str()),
+            (200, ""),
+            "case {stat:?}: expected HTTP 200 from SageMaker Metrics, got {} {:?} / {}",
+            answer.status,
+            answer.error_type,
+            answer.body
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&answer.body).unwrap_or(serde_json::Value::Null);
+        let result = &parsed["MetricQueryResults"][0];
+        assert_eq!(
+            result["Status"].as_str(),
+            Some("Complete"),
+            "case {stat:?}: expected a Complete query result, got {result}"
+        );
+        let values = result["MetricValues"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let actual = values.first().and_then(serde_json::Value::as_f64);
+        assert!(
+            values.len() == 1 && actual.is_some_and(|value| (value - want).abs() < 1e-9),
+            "case {stat:?}: expected MetricValues [{want}] for the points written, got {result}"
+        );
+        assert_eq!(
+            result["XAxisValues"],
+            serde_json::json!([MINUTE_BUCKET]),
+            "case {stat:?}: expected the one minute bucket [{MINUTE_BUCKET}] the three points \
+             share, got {result}"
         );
     }
 }
