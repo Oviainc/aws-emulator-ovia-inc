@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource-based policy attached to a private CA, read off the CA record
+//! this service persists. Nothing here attaches or removes a policy: `PutPolicy` and
+//! `DeletePolicy` own that.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPolicy"))
+        let _ = ctx;
+        let resource_arn = input.resource_arn;
+        // `Arn`'s modelled pattern admits any `acm-pca` ARN, and a resource-based policy
+        // of this service lives on a private CA, so an ARN that names anything else
+        // refers to no resource whose policy can be read.
+        if crate::state::parse_certificate_authority_arn(&resource_arn).is_none() {
+            return Err(invalid_arn(crate::state::INVALID_ARN_MESSAGE.to_string()));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPolicyErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // Reporting only: `certificate_authority_mut` materialises the CREATING ->
+        // PENDING_CERTIFICATE change the clock already owed, which came due at the same
+        // instant whether or not anybody read the policy. Reading a policy neither
+        // attaches nor removes one, so a later caller sees exactly what this one saw.
+        let policy = state
+            .certificate_authority_mut(&resource_arn, ::std::time::SystemTime::now())
+            .and_then(|record| record.resource_policy.clone());
+
+        // "If either the private CA resource or the policy cannot be found, this action
+        // returns a ResourceNotFoundException" (this operation's docs): a CA that does
+        // not exist and a CA with no policy attached are the SAME refusal, about the
+        // policy this operation was asked for.
+        let Some(policy) = policy else {
+            return Err(not_found(
+                crate::state::POLICY_NOT_FOUND_MESSAGE.to_string(),
+            ));
+        };
+
+        Ok(GetPolicyOutput {
+            policy: Some(policy),
+        })
     }
+}
+
+/// "The requested Amazon Resource Name (ARN) does not refer to an existing resource."
+fn invalid_arn(message: String) -> GetPolicyError {
+    GetPolicyErrorModeled::InvalidArnException(InvalidArnException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy
+/// cannot be found."
+fn not_found(message: String) -> GetPolicyError {
+    GetPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
 }

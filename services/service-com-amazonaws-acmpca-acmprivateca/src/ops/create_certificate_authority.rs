@@ -290,6 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ca_certificate_chain_pem: None,
             restorable_until: None,
             tags: input.tags.unwrap_or_default(),
+            // A new CA carries no resource-based policy until one is attached to it.
+            resource_policy: None,
             next_serial: 1,
             certificates: ::std::collections::HashMap::new(),
             permissions: ::std::vec::Vec::new(),

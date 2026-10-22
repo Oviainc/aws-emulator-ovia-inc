@@ -80,6 +80,15 @@ pub const ISSUANCE_INVALID_STATE_MESSAGE: &str =
 /// the CA matches: one sentence about the certificate, naming no ARN of its own.
 pub const CERTIFICATE_NOT_FOUND_MESSAGE: &str = "Could not find specified certificate.";
 
+/// What Amazon Web Services Private CA answers when the resource-based policy a request
+/// asks for is not there.
+///
+/// `GetPolicy`'s docs make the two absences one refusal — "If either the private CA
+/// resource or the policy cannot be found, this action returns a
+/// ResourceNotFoundException" — so the sentence is about the POLICY, the thing the
+/// operation was asked for, and names no resource of the request's own.
+pub const POLICY_NOT_FOUND_MESSAGE: &str = "Could not find policy for specified resource.";
+
 /// `SigningAlgorithm`'s members in the order the model DECLARES them, which is the order
 /// Amazon Web Services Private CA lists the usable algorithms in when it refuses a
 /// key/signing-algorithm pairing.
@@ -280,6 +289,10 @@ pub struct CertificateAuthorityRecord {
     pub restorable_until: Option<SystemTime>,
     /// Tags attached to the CA.
     pub tags: Vec<Tag>,
+    /// The resource-based policy attached to the CA, when one is (`PutPolicy` attaches
+    /// it, `GetPolicy` reads it, `DeletePolicy` removes it). It lives ON the CA, so it
+    /// goes away with the CA rather than outliving it in a map of its own.
+    pub resource_policy: Option<String>,
     /// Counter the next issued serial is minted from.
     pub next_serial: u64,
     /// Certificates issued by this CA, keyed by certificate ARN.

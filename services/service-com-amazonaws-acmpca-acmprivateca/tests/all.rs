@@ -15,6 +15,8 @@
 mod permissions;
 #[path = "all/private_ca_lifecycle.rs"]
 mod private_ca_lifecycle;
+#[path = "all/resource_policy_read.rs"]
+mod resource_policy_read;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_listing.rs"]
