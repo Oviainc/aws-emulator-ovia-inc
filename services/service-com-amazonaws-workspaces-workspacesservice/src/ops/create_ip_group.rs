@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIpGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIpGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIpGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -93,7 +83,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `CreateIpGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#CreateIpGroup")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#CreateIpGroup",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateIpGroupErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -101,6 +98,7 @@ pub enum CreateIpGroupErrorModeled {
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
     ResourceCreationFailedException(ResourceCreationFailedException),
     ResourceLimitExceededException(ResourceLimitExceededException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -154,18 +152,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIpGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIpGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIpGroup"))
+        let _ = ctx;
+
+        // `Tags`: "Each WorkSpaces resource can have a maximum of 50 tags."
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(invalid_parameters(format!(
+                "Tags holds {} tags; a WorkSpaces resource can have a maximum of {} tags.",
+                tags.len(),
+                crate::state::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+
+        // Every caller-sized member is bounded BEFORE anything is persisted: the
+        // model constrains none of their lengths, so an unbounded value would be
+        // retained for the life of the process. Each bound is a documented
+        // constant in `crate::state`.
+        text_within_bound("GroupName", &input.group_name)?;
+        if let Some(group_desc) = input.group_desc.as_deref() {
+            text_within_bound("GroupDesc", group_desc)?;
+        }
+
+        // `IpRuleItem$ipRule`: "The IP address range, in CIDR notation." A value
+        // that is not an IP address range is refused rather than persisted as a
+        // rule that could never match a client address.
+        let user_rules = input.user_rules.unwrap_or_default();
+        if user_rules.len() > crate::state::MAX_RULES_PER_IP_GROUP {
+            return Err(invalid_parameters(format!(
+                "UserRules holds {} rules; an IP access control group can hold at most {}.",
+                user_rules.len(),
+                crate::state::MAX_RULES_PER_IP_GROUP
+            )));
+        }
+        for rule in &user_rules {
+            if let Some(ip_rule) = rule.ip_rule.as_deref() {
+                if !crate::state::is_ip_range(ip_rule) {
+                    return Err(invalid_parameters(format!(
+                        "UserRules holds ipRule '{ip_rule}', which is not an IP address range in CIDR notation."
+                    )));
+                }
+            }
+            if let Some(rule_desc) = rule.rule_desc.as_deref() {
+                text_within_bound("UserRules ruleDesc", rule_desc)?;
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateIpGroupErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        // One lock covers reading the name index and writing the group, so of any
+        // number of creates racing on one name exactly one wins and the rest are
+        // told the name is taken.
+        let created = state
+            .lock()
+            .create_ip_group(&input.group_name, input.group_desc, user_rules, tags);
+
+        match created {
+            Ok(record) => Ok(CreateIpGroupOutput {
+                group_id: Some(record.group_id),
+            }),
+            Err(crate::state::IpGroupCreateError::NameTaken(group_id)) => Err(
+                CreateIpGroupErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "The IP access control group {group_id} is already named {}.",
+                            input.group_name
+                        )),
+                    },
+                )
+                .into(),
+            ),
+            Err(crate::state::IpGroupCreateError::LimitExceeded) => Err(
+                CreateIpGroupErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        message: Some(format!(
+                            "Your resource limits have been exceeded: at most {} IP access control groups can exist.",
+                            crate::state::MAX_STORED_IP_GROUPS
+                        )),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
+}
+
+/// A refusal of an input value this operation's own rules reject, as the modelled
+/// `InvalidParameterValuesException` ("One or more parameter values are not valid").
+fn invalid_parameters(message: String) -> CreateIpGroupError {
+    CreateIpGroupErrorModeled::InvalidParameterValuesException(InvalidParameterValuesException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse `member` when its value is longer than this emulator stores.
+///
+/// The model gives these members no length trait, so request validation passes
+/// any size; see [`crate::state::MAX_IP_GROUP_TEXT_CHARS`] for the bound and why
+/// it exists.
+fn text_within_bound(member: &str, value: &str) -> Result<(), CreateIpGroupError> {
+    let length = value.chars().count();
+    if length > crate::state::MAX_IP_GROUP_TEXT_CHARS {
+        return Err(invalid_parameters(format!(
+            "{member} is {length} characters long; at most {} are accepted.",
+            crate::state::MAX_IP_GROUP_TEXT_CHARS
+        )));
+    }
+    Ok(())
 }
