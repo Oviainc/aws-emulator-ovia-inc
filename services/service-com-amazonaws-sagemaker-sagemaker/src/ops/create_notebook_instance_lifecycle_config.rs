@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNotebookInstanceLifecycleConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNotebookInstanceLifecycleConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNotebookInstanceLifecycleConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the configuration's `OnCreate`/`OnStart` hooks verbatim in
+//! `crate::state`, mints its ARN and refuses a name already in use. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNotebookInstanceLifecycleConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNotebookInstanceLifecycleConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNotebookInstanceLifecycleConfig"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::NOTEBOOK_LIFECYCLE_CONFIG_ARN_KIND,
+            &input.notebook_instance_lifecycle_config_name,
+        );
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller varying the configuration name cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.notebook_instance_lifecycle_configs_below_quota() {
+            return Err(
+                CreateNotebookInstanceLifecycleConfigErrorModeled::ResourceLimitExceeded(
+                    ResourceLimitExceeded {
+                        message: Some(format!(
+                            "The account-level service limit for notebook instance lifecycle \
+                             configurations is {}, with current utilization of {} and a request \
+                             delta of 1.",
+                            crate::state::NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_QUOTA,
+                            store.notebook_instance_lifecycle_configs.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A create never overwrites: the name is the resource's identity, so a second
+        // create under a live name is refused rather than silently replacing its scripts.
+        if store
+            .notebook_instance_lifecycle_configs
+            .contains_key(&input.notebook_instance_lifecycle_config_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot create already existing notebook instance lifecycle configuration \
+                 \"{arn}\"."
+            )));
+        }
+
+        // The configuration is usable the moment it is created — it carries no status and
+        // no transient state — so `CreationTime` and `LastModifiedTime` start out equal
+        // and the latter only moves when an update rewrites its scripts.
+        let created_at = ::std::time::SystemTime::now();
+        store.notebook_instance_lifecycle_configs.insert(
+            input.notebook_instance_lifecycle_config_name.clone(),
+            crate::state::NotebookInstanceLifecycleConfig {
+                name: input.notebook_instance_lifecycle_config_name.clone(),
+                arn: arn.clone(),
+                on_create: input.on_create,
+                on_start: input.on_start,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: created_at,
+                last_modified_time: created_at,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateNotebookInstanceLifecycleConfigOutput {
+            notebook_instance_lifecycle_config_arn: Some(arn),
+        })
     }
 }

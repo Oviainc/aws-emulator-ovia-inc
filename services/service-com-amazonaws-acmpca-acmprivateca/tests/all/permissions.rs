@@ -16,6 +16,16 @@ use crate::private_ca_lifecycle::{
     root_ca_request, string, wait_for_the_clock, Emulator, ACCOUNT, REGION,
 };
 
+/// `seconds` rounded DOWN to the millisecond the wire's `Timestamp` encoding carries.
+fn floor_to_millisecond(seconds: f64) -> f64 {
+    (seconds * 1_000.0).floor() / 1_000.0
+}
+
+/// `seconds` rounded UP to the millisecond the wire's `Timestamp` encoding carries.
+fn ceil_to_millisecond(seconds: f64) -> f64 {
+    (seconds * 1_000.0).ceil() / 1_000.0
+}
+
 /// Every `ActionType` member the model declares, from
 /// `smithy_query(query="shape",shape="ActionType")`: `IssueCertificate`,
 /// `GetCertificate`, `ListPermissions`. A grant names one to three of them
@@ -130,10 +140,17 @@ async fn a_granted_permission_is_listed_back_as_it_was_granted() {
         ),
     ];
 
-    let before = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("the clock is after the epoch")
-        .as_secs_f64();
+    // `awsJson1_1` serialises a `Timestamp` as epoch seconds with MILLISECOND precision,
+    // so the `CreatedAt` reported back is the grant's instant truncated to the
+    // millisecond and can sit just below a nanosecond-precision bound. Widen each bound
+    // to the millisecond the wire carries, so the window brackets the reported value
+    // rather than the clock's full resolution.
+    let before = floor_to_millisecond(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs_f64(),
+    );
 
     for (case, principal, source_account, actions) in rows {
         let answer = emulator
@@ -163,10 +180,12 @@ async fn a_granted_permission_is_listed_back_as_it_was_granted() {
         "case \"granted\": expected one permission per grant, got {permissions:?}"
     );
 
-    let after = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("the clock is after the epoch")
-        .as_secs_f64();
+    let after = ceil_to_millisecond(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs_f64(),
+    );
 
     for (case, principal, source_account, actions) in rows {
         // A request that names no source account is the calling account's grant, and the

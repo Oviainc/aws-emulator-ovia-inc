@@ -640,6 +640,48 @@ pub struct ModelPackageGroup {
     pub creation_time: SystemTime,
 }
 
+/// The most notebook instance lifecycle configurations this service's store holds, after
+/// which a create is refused with the modelled `ResourceLimitExceeded`. See
+/// [`MODEL_QUOTA`] for why the bound is the emulator's own rather than an account's.
+pub const NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_QUOTA: usize = 1_000;
+
+/// The `<kind>` component [`resource_arn`] takes for a notebook instance lifecycle
+/// configuration, as the AWS ARN reference spells SageMaker's resource type for it.
+/// Named once so the create and the describe mint and expect the same ARN.
+pub const NOTEBOOK_LIFECYCLE_CONFIG_ARN_KIND: &str = "notebook-instance-lifecycle-config";
+
+/// A notebook instance lifecycle configuration created by
+/// `CreateNotebookInstanceLifecycleConfig`, as `DescribeNotebookInstanceLifecycleConfig`
+/// replays it.
+///
+/// `OnCreate` and `OnStart` are modelled as lists of at most one hook each; they are
+/// stored exactly as the create request carried them, because the scripts they hold are
+/// opaque base64 the service only ever hands back.
+#[derive(Debug, Clone)]
+pub struct NotebookInstanceLifecycleConfig {
+    pub name: String,
+    pub arn: String,
+    pub on_create: Option<Vec<crate::ops::types::NotebookInstanceLifecycleHook>>,
+    pub on_start: Option<Vec<crate::ops::types::NotebookInstanceLifecycleHook>>,
+    /// What the create carried, so a later `ListTags`/`AddTags` reports it; no
+    /// implemented operation surfaces it yet (`DescribeNotebookInstanceLifecycleConfig`
+    /// models no `Tags` member).
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another notebook instance lifecycle configuration fits, i.e. the store is
+    /// below [`NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_QUOTA`].
+    ///
+    /// Kept with the rest of this resource's slice rather than in the first `impl` block,
+    /// as the lineage-action slice at the end of this module is.
+    pub fn notebook_instance_lifecycle_configs_below_quota(&self) -> bool {
+        self.notebook_instance_lifecycle_configs.len() < NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_QUOTA
+    }
+}
+
 /// A model package created by `CreateModelPackage`, as `DescribeModelPackage` replays it.
 ///
 /// One record covers both documented kinds: an UNVERSIONED package (the request named
@@ -793,6 +835,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Keyed by `MlflowAppArn` — the app's ARN is its identity, since the model
     /// documents that an MLflow app's NAME is not part of its ARN.
     pub mlflow_apps: BTreeMap<String, MlflowApp>,
+    /// Keyed by `NotebookInstanceLifecycleConfigName`.
+    pub notebook_instance_lifecycle_configs: BTreeMap<String, NotebookInstanceLifecycleConfig>,
     /// Keyed by `AppImageConfigName`, which AWS documents as unique to the account.
     pub app_image_configs: BTreeMap<String, AppImageConfig>,
     /// Keyed by `CodeRepositoryName`.

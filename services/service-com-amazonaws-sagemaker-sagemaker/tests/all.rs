@@ -37,6 +37,8 @@ mod model_card_governance;
 mod model_package_group_lifecycle;
 #[path = "all/model_package_registry.rs"]
 mod model_package_registry;
+#[path = "all/notebook_lifecycle_config.rs"]
+mod notebook_lifecycle_config;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/studio_app_lifecycle.rs"]
