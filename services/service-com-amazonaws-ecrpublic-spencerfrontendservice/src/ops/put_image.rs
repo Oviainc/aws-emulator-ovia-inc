@@ -210,6 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_else(|| media_type_of(manifest_json.as_ref()));
         let artifact_media_type = media_type_of(manifest_json.as_ref().and_then(|m| m.get("config")));
 
+        // What this manifest references, read from the document already parsed above so
+        // one push parses one manifest exactly once. A document that is not JSON
+        // references nothing this service can size.
+        let references = manifest_json
+            .as_ref()
+            .map(crate::state::manifest_content_of)
+            .unwrap_or(crate::state::ManifestContent::Opaque);
+
         let image_tag = input.image_tag.as_deref().filter(|tag| !tag.is_empty());
         let pushed_at = ::std::time::SystemTime::now();
 
@@ -337,15 +345,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The manifest is stored exactly as it was pushed, together with what it
+        // references, read once here so that sizing an image never re-parses a document.
         let stored = repository
             .images
             .entry(digest.clone())
             .or_insert_with(|| crate::state::StoredImage {
                 digest: digest.clone(),
                 manifest: input.image_manifest.clone(),
+                references,
+                size_in_bytes: None,
                 manifest_media_type: manifest_media_type.clone(),
                 artifact_media_type,
-                size_in_bytes: input.image_manifest.len() as i64,
                 pushed_at,
                 tags: ::std::collections::BTreeSet::new(),
             });
@@ -362,6 +373,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             image_manifest: Some(stored.manifest.clone()),
             image_manifest_media_type: stored.manifest_media_type.clone(),
         };
+
+        // An image the repository did not hold changes what a manifest list stored
+        // beside it is the max over, so the sizes this repository reports are
+        // recomputed now that the image set has changed.
+        repository.refresh_image_sizes();
         drop(store);
 
         Ok(PutImageOutput { image: Some(image) })
