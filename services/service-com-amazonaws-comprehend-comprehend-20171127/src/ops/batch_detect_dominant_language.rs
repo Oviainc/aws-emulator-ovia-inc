@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDetectDominantLanguage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDetectDominantLanguage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDetectDominantLanguage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Each document in `TextList` is identified by the same in-process
+//! `whatlang` engine `DetectDominantLanguage` uses — through that operation's
+//! `detect_languages`, so a batch answer and a single-document answer for the same
+//! text are the same answer — and is reported at its own zero-based input position.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +80,34 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use super::detect_dominant_language::detect_languages;
+
+/// The most documents one call may carry.
+///
+/// From the modelled member documentation of
+/// `BatchDetectDominantLanguageRequest$TextList` ("The list can contain a maximum of
+/// 25 documents.") and from `BatchSizeLimitExceededException` itself ("The number of
+/// documents in the request exceeds the limit of 25."). A longer list is refused with
+/// that modelled error; the model's `@length` floor of 1 is enforced at the boundary.
+const MAX_BATCH_DOCUMENTS: usize = 25;
+
+/// The largest single document in the batch, in UTF-8 bytes.
+///
+/// From the same member documentation: "The maximum size of each document is 5 KB."
+/// The ceiling is PER DOCUMENT, so an oversized document is reported as that
+/// document's `BatchItemError` rather than failing the whole call: the modelled
+/// `ErrorList` holds "one object for each document that contained an error", and its
+/// companion sentence — "If all of the documents contain an error, the ResultList is
+/// empty" — only describes a reachable response if a document's own failure leaves
+/// the call itself successful.
+const MAX_DOCUMENT_BYTES: usize = 5 * 1024;
+
+/// The `BatchItemError$ErrorCode` a document past [`MAX_DOCUMENT_BYTES`] carries: the
+/// screaming-snake-case spelling of the operation's own
+/// `TextSizeLimitExceededException`, which is the error that same document would get
+/// if it were submitted on its own.
+const TEXT_SIZE_LIMIT_ERROR_CODE: &str = "TEXT_SIZE_LIMIT_EXCEEDED";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +179,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDetectDominantLanguage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDetectDominantLanguageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDetectDominantLanguage"))
+        // Synchronous inference holds no state: the answer is a function of
+        // `TextList` alone, so repeating a call returns the same scores.
+        let _ = (ctx, &self.engine);
+
+        // The batch ceiling is documented in prose, not modelled, so it is enforced
+        // here — before any document is read, since the whole call is refused.
+        if input.text_list.len() > MAX_BATCH_DOCUMENTS {
+            return Err(
+                BatchDetectDominantLanguageErrorModeled::BatchSizeLimitExceededException(
+                    BatchSizeLimitExceededException {
+                        message: Some(format!(
+                            "The number of documents in the request ({}) exceeds the limit \
+                             of {MAX_BATCH_DOCUMENTS}. Try your request again with fewer \
+                             documents.",
+                            input.text_list.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Both lists are built in input order, so each is "sorted in ascending order
+        // by the Index field" and every entry's `Index` is its document's own
+        // zero-based position — the only mapping a caller has back to its input.
+        let mut result_list = Vec::new();
+        let mut error_list = Vec::new();
+        for (position, text) in input.text_list.iter().enumerate() {
+            let index = i32::try_from(position).ok();
+            if text.len() > MAX_DOCUMENT_BYTES {
+                error_list.push(BatchItemError {
+                    index,
+                    error_code: Some(TEXT_SIZE_LIMIT_ERROR_CODE.to_string()),
+                    error_message: Some(format!(
+                        "Document at index {position} is {} bytes, which exceeds the \
+                         {MAX_DOCUMENT_BYTES} byte limit for one document. Use a smaller \
+                         document.",
+                        text.len()
+                    )),
+                });
+                continue;
+            }
+            result_list.push(BatchDetectDominantLanguageItemResult {
+                index,
+                languages: Some(detect_languages(text)),
+            });
+        }
+
+        Ok(BatchDetectDominantLanguageOutput {
+            result_list,
+            error_list,
+        })
     }
 }
