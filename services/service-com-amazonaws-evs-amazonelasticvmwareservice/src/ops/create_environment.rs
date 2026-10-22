@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints an environment and persists it in [`crate::state`]: a new `environmentId`,
+//! its ARN, `environmentState` `CREATING` (the clock owes it `CREATED`), and the ten
+//! VLAN subnets materialised from `initialVlans`. Every other operation of this
+//! service reads what this one stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The request-level rules it enforces beyond the modelled constraints, each from the
+//! documentation quoted under "Modeled contract" below:
+//!
+//! 1. `SELF_DEPLOYED` does not support `licenseInfo`, `hosts`, `vcfHostnames`,
+//!    `siteId` or `connectivityInfo`.
+//! 2. `dedicatedHostId` and `placementGroupId` cannot be used together.
+//! 3. A VLAN subnet CIDR block is between /24 and /28, and no two of an
+//!    environment's VLAN subnets may overlap.
+//! 4. `hcxNetworkAclId` is required when `isHcxPublic` is true.
+//! 5. An environment name is unique within the account and Region.
+//!
+//! The store itself is bounded by [`crate::state::MAX_ENVIRONMENTS`]: this is the only
+//! operation that grows it, and it refuses with the service's
+//! `ServiceQuotaExceededException` once the cap is reached and no finished (`DELETED`)
+//! record can be reclaimed.
 //!
 //! ## Shape of an operation
 //!
@@ -174,10 +185,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `CreateEnvironmentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#CreateEnvironment")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#CreateEnvironment",
+    extra_errors = ["InternalServerException", "ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateEnvironmentErrorModeled {
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
+    /// Widened in from the service's own error set (`TagResource` lists it): the
+    /// refusal when this emulator's store is full, which is a quota condition and not
+    /// a defect in the request.
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -231,18 +252,375 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEnvironmentErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+
+        validate_vcf_mode(&input)?;
+        let requested_hosts = input.hosts.unwrap_or_default();
+        validate_hosts(&requested_hosts)?;
+        let vlan_plan = plan_vlans(&input.initial_vlans)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        if let Some(name) = input.environment_name.as_deref() {
+            if state.name_is_taken(&region, name) {
+                return Err(CreateEnvironmentErrorModeled::ValidationException(
+                    crate::state::request_validation_error(format!(
+                        "An environment named {name} already exists in {region}."
+                    )),
+                )
+                .into());
+            }
+        }
+
+        // Bound the store before anything is minted: a generated emulator holds its
+        // resources for the life of the process, so the create path is the one that
+        // must refuse rather than grow without limit.
+        if !state.reserve_environment_slot() {
+            return Err(CreateEnvironmentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "This emulator holds at most {} environments; delete one before \
+                         creating another.",
+                        crate::state::MAX_ENVIRONMENTS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let created_at_ms = crate::state::now_ms();
+        let environment_id = state.mint_environment_id();
+        let vlans = vlan_plan
+            .into_iter()
+            .enumerate()
+            .map(|(index, planned)| crate::state::StoredVlan {
+                // The 802.1Q tag the traffic type is carried on: unique within the
+                // environment, assigned in the order the `InitialVlans` members are
+                // modelled, and clear of the reserved default VLAN 1.
+                vlan_id: FIRST_VLAN_ID + index as i32,
+                cidr: planned.cidr.to_string(),
+                function_name: planned.function_name.to_string(),
+                subnet_id: state.mint_subnet_id(),
+                vlan_state: crate::state::STATE_CREATING.to_string(),
+                is_public: planned.is_public,
+                network_acl_id: planned.network_acl_id.map(str::to_string),
+                created_at_ms,
+                modified_at_ms: created_at_ms,
+                eip_associations: Vec::new(),
+            })
+            .collect();
+
+        let environment = crate::state::StoredEnvironment {
+            environment_arn: crate::state::environment_arn(&region, &environment_id),
+            environment_id: environment_id.clone(),
+            region,
+            environment_name: input.environment_name,
+            // Creation has started but is not finished: the clock owes this
+            // environment, and its VLAN subnets, the move to CREATED.
+            state: crate::state::STATE_CREATING.to_string(),
+            state_details: None,
+            created_at_ms,
+            modified_at_ms: created_at_ms,
+            vpc_id: input.vpc_id,
+            service_access_subnet_id: input.service_access_subnet_id,
+            vcf_version: input.vcf_version,
+            terms_accepted: input.terms_accepted,
+            kms_key_id: input.kms_key_id,
+            site_id: input.site_id,
+            license_info: input.license_info.unwrap_or_default(),
+            connectivity_info: input.connectivity_info,
+            vcf_hostnames: input.vcf_hostnames,
+            service_access_security_groups: input.service_access_security_groups,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            vlans,
+            requested_hosts,
+            checks: Vec::new(),
+            pending: Some(crate::state::PendingTransition::starting_now(
+                crate::state::STATE_CREATED,
+                crate::state::STATE_CREATED,
+            )),
+        };
+
+        let transition_due_at = environment.pending.as_ref().map(|pending| pending.due_at);
+        let created = match state.environments.entry(environment_id) {
+            std::collections::btree_map::Entry::Vacant(slot) => slot.insert(environment).to_wire(),
+            // Unreachable: ids are minted from a strictly increasing seed. Answering
+            // honestly beats reporting some other environment as the created one.
+            std::collections::btree_map::Entry::Occupied(taken) => {
+                return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "The environment id {} is already in use.",
+                            taken.key()
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+        if let Some(due_at) = transition_due_at {
+            state.note_transition_due(due_at);
+        }
+        Ok(CreateEnvironmentOutput {
+            environment: Some(created),
+        })
     }
 }
+
+/// The first 802.1Q VLAN tag this service assigns. VLAN 1 is the reserved default
+/// VLAN of an 802.1Q trunk, so an environment's own VLANs start clear of it.
+const FIRST_VLAN_ID: i32 = 100;
+
+/// The `VcfVersion` value that means the customer installs VCF itself.
+const SELF_DEPLOYED: &str = "SELF_DEPLOYED";
+
+/// The largest VLAN subnet prefix length: "Amazon EVS VLAN subnets have a minimum
+/// CIDR block size of /28 and a maximum size of /24" (`InitialVlans` doc).
+const MAX_VLAN_PREFIX_LEN: u8 = 28;
+/// The smallest VLAN subnet prefix length. See [`MAX_VLAN_PREFIX_LEN`].
+const MIN_VLAN_PREFIX_LEN: u8 = 24;
+
+/// One VLAN subnet `CreateEnvironment` is about to materialise.
+struct PlannedVlan<'a> {
+    /// The `functionName` the VLAN carries — the `InitialVlans` member's own name,
+    /// which is the form the `Vlan` doc gives (a `functionName` of `hcx`).
+    function_name: &'static str,
+    /// The path of the `InitialVlans` member this VLAN came from, so a refusal names
+    /// the member the caller sent.
+    member: &'static str,
+    /// The CIDR block the request supplied for it.
+    cidr: &'a str,
+    /// Whether Amazon EVS provisions this VLAN as public.
+    is_public: bool,
+    /// The network ACL the VLAN uses, when the request named one.
+    network_acl_id: Option<&'a str>,
+}
+
+/// One IPv4 CIDR block, reduced to the inclusive address range it covers.
+///
+/// Over 32 bits the two rules this operation needs are a mask and a range comparison,
+/// so they are computed here on `std::net::Ipv4Addr` rather than pulled in: a new
+/// dependency would be the only part of this change to touch the workspace's shared
+/// `Cargo.lock`, which every other concurrent change touches as well.
+#[derive(Debug, Clone, Copy)]
+struct Ipv4Cidr {
+    /// The first address of the block (the network address).
+    first: u32,
+    /// The last address of the block (the broadcast address).
+    last: u32,
+    /// The block's prefix length, in bits.
+    prefix_len: u8,
+}
+
+impl Ipv4Cidr {
+    /// Parse `a.b.c.d/<prefix length>`; `None` for anything that is not an IPv4 CIDR
+    /// block.
+    fn parse(cidr: &str) -> Option<Self> {
+        let (address, prefix_len) = cidr.split_once('/')?;
+        let address: ::std::net::Ipv4Addr = address.parse().ok()?;
+        let prefix_len: u8 = prefix_len.parse().ok()?;
+        if prefix_len > 32 {
+            return None;
+        }
+        // The host bits below the prefix are what the block spans: clearing them gives
+        // its first address, setting them its last.
+        let host_bits = 32 - u32::from(prefix_len);
+        let mask = if host_bits == 32 { 0 } else { u32::MAX << host_bits };
+        let first = u32::from(address) & mask;
+        Some(Self {
+            first,
+            last: first | !mask,
+            prefix_len,
+        })
+    }
+
+    /// Whether the two blocks share any address.
+    fn overlaps(&self, other: &Self) -> bool {
+        self.first <= other.last && other.first <= self.last
+    }
+}
+
+/// Refuse a request that uses a parameter the chosen VCF mode does not support:
+/// "When you specify SELF_DEPLOYED for vcfVersion ... The licenseInfo, hosts,
+/// vcfHostnames, siteId, and connectivityInfo parameters are not supported in this
+/// mode."
+fn validate_vcf_mode(input: &CreateEnvironmentInput) -> Result<(), CreateEnvironmentError> {
+    if input.vcf_version != SELF_DEPLOYED {
+        return Ok(());
+    }
+    let unsupported = [
+        ("licenseInfo", input.license_info.is_some()),
+        ("hosts", input.hosts.is_some()),
+        ("vcfHostnames", input.vcf_hostnames.is_some()),
+        ("siteId", input.site_id.is_some()),
+        ("connectivityInfo", input.connectivity_info.is_some()),
+    ];
+    for (member, supplied) in unsupported {
+        if supplied {
+            return Err(CreateEnvironmentErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    member,
+                    &format!("is not supported when vcfVersion is {SELF_DEPLOYED}"),
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a host that names both placement mechanisms: "You cannot use the
+/// dedicatedHostId and placementGroupId parameters together in the same
+/// CreateEnvironment action. This results in a ValidationException response."
+fn validate_hosts(hosts: &[HostInfoForCreate]) -> Result<(), CreateEnvironmentError> {
+    for host in hosts {
+        if host.dedicated_host_id.is_some() && host.placement_group_id.is_some() {
+            return Err(CreateEnvironmentErrorModeled::ValidationException(
+                crate::state::request_validation_error(
+                    "dedicatedHostId and placementGroupId cannot be used together in the same \
+                     CreateEnvironment action.",
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// The ten VLAN subnets to materialise, in the order `InitialVlans` models its
+/// members, after checking every rule that governs them.
+fn plan_vlans(initial: &InitialVlans) -> Result<Vec<PlannedVlan<'_>>, CreateEnvironmentError> {
+    // "Required when isHcxPublic is set to true" (`hcxNetworkAclId` doc).
+    if initial.is_hcx_public && initial.hcx_network_acl_id.is_none() {
+        return Err(CreateEnvironmentErrorModeled::ValidationException(
+            crate::state::field_validation_error(
+                "initialVlans.hcxNetworkAclId",
+                "is required when isHcxPublic is true",
+            ),
+        )
+        .into());
+    }
+
+    let planned = vec![
+        PlannedVlan {
+            function_name: "vmkManagement",
+            member: "initialVlans.vmkManagement",
+            cidr: &initial.vmk_management.cidr,
+            is_public: false,
+            network_acl_id: None,
+        },
+        PlannedVlan {
+            function_name: "vmManagement",
+            member: "initialVlans.vmManagement",
+            cidr: &initial.vm_management.cidr,
+            is_public: false,
+            network_acl_id: None,
+        },
+        PlannedVlan {
+            function_name: "vMotion",
+            member: "initialVlans.vMotion",
+            cidr: &initial.v_motion.cidr,
+            is_public: false,
+            network_acl_id: None,
+        },
+        PlannedVlan {
+            function_name: "vSan",
+            member: "initialVlans.vSan",
+            cidr: &initial.v_san.cidr,
+            is_public: false,
+            network_acl_id: None,
+        },
+        PlannedVlan {
+            function_name: "vTep",
+            member: "initialVlans.vTep",
+            cidr: &initial.v_tep.cidr,
+            is_public: false,
+            network_acl_id: None,
+        },
+        PlannedVlan {
+            function_name: "edgeVTep",
+            member: "initialVlans.edgeVTep",
+            cidr: &initial.edge_v_tep.cidr,
+            is_public: false,
+            network_acl_id: None,
+        },
+        PlannedVlan {
+            function_name: "nsxUplink",
+            member: "initialVlans.nsxUplink",
+            cidr: &initial.nsx_uplink.cidr,
+            is_public: false,
+            network_acl_id: None,
+        },
+        // Only the HCX VLAN can be public, and only it carries a network ACL id.
+        PlannedVlan {
+            function_name: "hcx",
+            member: "initialVlans.hcx",
+            cidr: &initial.hcx.cidr,
+            is_public: initial.is_hcx_public,
+            network_acl_id: initial.hcx_network_acl_id.as_deref(),
+        },
+        PlannedVlan {
+            function_name: "expansionVlan1",
+            member: "initialVlans.expansionVlan1",
+            cidr: &initial.expansion_vlan1.cidr,
+            is_public: false,
+            network_acl_id: None,
+        },
+        PlannedVlan {
+            function_name: "expansionVlan2",
+            member: "initialVlans.expansionVlan2",
+            cidr: &initial.expansion_vlan2.cidr,
+            is_public: false,
+            network_acl_id: None,
+        },
+    ];
+
+    let mut networks: Vec<(&'static str, Ipv4Cidr)> = Vec::with_capacity(planned.len());
+    for vlan in &planned {
+        let member = vlan.member;
+        // The modelled `Cidr` pattern already refused anything that is not a
+        // dotted-quad with a prefix length, so a parse failure here is a value that
+        // pattern admits and no IPv4 subnet can be.
+        let network = Ipv4Cidr::parse(vlan.cidr).ok_or_else(|| {
+            CreateEnvironmentErrorModeled::ValidationException(
+                crate::state::field_validation_error(member, "is not a valid IPv4 CIDR block"),
+            )
+        })?;
+        let prefix_len = network.prefix_len;
+        if !(MIN_VLAN_PREFIX_LEN..=MAX_VLAN_PREFIX_LEN).contains(&prefix_len) {
+            return Err(CreateEnvironmentErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    member,
+                    &format!(
+                        "must have a prefix length between /{MIN_VLAN_PREFIX_LEN} and \
+                         /{MAX_VLAN_PREFIX_LEN}, but was /{prefix_len}"
+                    ),
+                ),
+            )
+            .into());
+        }
+        // "Amazon EVS VLAN subnet CIDR blocks must not overlap with other subnets"
+        // (`InitialVlans` doc).
+        if let Some((other, _)) = networks.iter().find(|(_, other)| other.overlaps(&network)) {
+            return Err(CreateEnvironmentErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    member,
+                    &format!("overlaps the CIDR block of {other}"),
+                ),
+            )
+            .into());
+        }
+        networks.push((member, network));
+    }
+
+    Ok(planned)
+}
+
+// The `InitialVlans` member a VLAN's `functionName` came from is carried on
+// `PlannedVlan::member`, so no reverse lookup from the wire name is needed.

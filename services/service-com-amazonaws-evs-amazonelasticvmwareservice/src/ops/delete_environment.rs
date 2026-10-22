@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the stored environment into `DELETING` and records the `DELETED` the clock
+//! then owes it, stamping `modifiedAt`. `@idempotent`: deleting an environment that
+//! is already going away reports the record as it stands and starts nothing new. An
+//! id this service holds no environment for is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -94,11 +89,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `DeleteEnvironmentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#DeleteEnvironment")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#DeleteEnvironment",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteEnvironmentErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,18 +153,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEnvironment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteEnvironmentErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        // Regional resource: an environment can only be deleted at the endpoint of the
+        // Region it was created in.
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .ok_or_else(|| {
+                DeleteEnvironmentErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+
+        // `@idempotent`: an environment that is already DELETING or DELETED is
+        // reported as it stands, so a repeated call neither restarts the transition
+        // nor moves `modifiedAt`.
+        let already_going_away = environment.state == crate::state::STATE_DELETING
+            || environment.state == crate::state::STATE_DELETED;
+        if !already_going_away {
+            environment.state = crate::state::STATE_DELETING.to_string();
+            environment.modified_at_ms = crate::state::now_ms();
+            for vlan in &mut environment.vlans {
+                // "Environment deletion also deletes the associated Amazon EVS VLAN
+                // subnets": they go away with the environment.
+                vlan.vlan_state = crate::state::STATE_DELETING.to_string();
+                vlan.modified_at_ms = environment.modified_at_ms;
+            }
+            environment.pending = Some(crate::state::PendingTransition::starting_now(
+                crate::state::STATE_DELETED,
+                crate::state::STATE_DELETED,
+            ));
+        }
+
+        let transition_due_at = environment.pending.as_ref().map(|pending| pending.due_at);
+        let deleted = environment.to_wire();
+        if let Some(due_at) = transition_due_at {
+            state.note_transition_due(due_at);
+        }
+
+        Ok(DeleteEnvironmentOutput {
+            environment: Some(deleted),
+        })
     }
 }

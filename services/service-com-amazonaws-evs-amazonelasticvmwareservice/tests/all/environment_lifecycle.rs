@@ -1,0 +1,1133 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The Amazon EVS environment lifecycle, end to end over awsJson1_0.
+//!
+//! Every test drives the service the way a client does — `POST /` with
+//! `X-Amz-Target: AmazonElasticVMwareService.<Operation>` through the same
+//! [`MultiServiceRouter`] the production router mounts — so what it asserts is the
+//! wire behaviour, not an internal call.
+//!
+//! The rules under test, and where each comes from:
+//!
+//! * `CreateEnvironment` mints and PERSISTS an environment, and every other
+//!   operation answers from that stored record.
+//! * A VLAN subnet CIDR block is between /24 and /28 and may not overlap another of
+//!   the same environment (`InitialVlans` doc).
+//! * `SELF_DEPLOYED` supports none of `licenseInfo`, `hosts`, `vcfHostnames`,
+//!   `siteId`, `connectivityInfo` (`CreateEnvironment` doc).
+//! * `dedicatedHostId` and `placementGroupId` cannot be used together in one
+//!   `HostInfoForCreate` (its own doc).
+//! * `hcxNetworkAclId` is required when `isHcxPublic` is true (its own doc).
+//! * An environment name is unique within the account and Region (`environmentName` doc).
+//! * `maxResults` is a real page bound and `nextToken` resumes exactly where the page
+//!   stopped; a token this service did not issue, or one issued more than 24 hours
+//!   ago, is refused (`nextToken` doc).
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The Region the test client signs for, so the ARNs under test carry it.
+const REGION: &str = "us-west-2";
+
+/// The account every emulated ARN carries.
+const ACCOUNT: &str = "000000000000";
+
+/// Long enough for the lifecycle transition this service owes a new or deleted
+/// environment to come due (its span is under a second by construction).
+const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
+
+/// The emulator a test drives: one shared engine, this service mounted on it.
+fn emulator() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // The tests exercise behaviour, not signing: the credentials below are unsigned.
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_evs_amazonelasticvmwareservice::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// Call one operation and return its HTTP status and JSON body.
+async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+    call_in_region(router, REGION, operation, body).await
+}
+
+/// Call one operation as a client signing for `region`.
+async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let request = ::http::Request::builder()
+        .method("POST")
+        .uri("https://evs.us-west-2.amazonaws.com/")
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "x-amz-target",
+            format!("AmazonElasticVMwareService.{operation}"),
+        )
+        // The SigV4 credential scope is what routes the request to `evs` and what
+        // names the Region the service builds ARNs in.
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{region}/evs/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=0"
+            ),
+        )
+        .body(::bytes::Bytes::from(
+            serde_json::to_vec(body).expect("the request body serializes"),
+        ))
+        .expect("the request builds");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    (status, payload)
+}
+
+/// Ten non-overlapping VLAN subnet CIDR blocks of the given prefix length, one per
+/// `InitialVlans` member, each in its own `10.0.<n>.0` block.
+fn vlans_with_prefix(prefix_len: u8) -> Value {
+    let cidr = |index: u8| json!({ "cidr": format!("10.0.{}.0/{prefix_len}", index * 2) });
+    json!({
+        "vmkManagement": cidr(0),
+        "vmManagement": cidr(1),
+        "vMotion": cidr(2),
+        "vSan": cidr(3),
+        "vTep": cidr(4),
+        "edgeVTep": cidr(5),
+        "nsxUplink": cidr(6),
+        "hcx": cidr(7),
+        "expansionVlan1": cidr(8),
+        "expansionVlan2": cidr(9),
+    })
+}
+
+/// The ten VLAN subnets a valid create uses, at the smallest allowed size.
+fn vlans() -> Value {
+    vlans_with_prefix(28)
+}
+
+/// A `CreateEnvironment` request that satisfies every rule, optionally named.
+fn create_request(name: Option<&str>) -> Value {
+    let mut body = json!({
+        "vpcId": "vpc-0123456789abcdef0",
+        "serviceAccessSubnetId": "subnet-0123456789abcdef0",
+        "vcfVersion": "VCF-5.2.1",
+        "termsAccepted": true,
+        "initialVlans": vlans(),
+    });
+    if let Some(name) = name {
+        body["environmentName"] = json!(name);
+    }
+    body
+}
+
+/// Four hosts, as `hosts` requires (len 4..4), with `extra` merged into the first.
+fn four_hosts(extra: Value) -> Value {
+    let mut first = json!({
+        "hostName": "esx-1",
+        "keyName": "evs-key",
+        "instanceType": "i4i.metal",
+    });
+    for (key, value) in extra.as_object().expect("the extra members are an object") {
+        first[key] = value.clone();
+    }
+    json!([
+        first,
+        { "hostName": "esx-2", "keyName": "evs-key", "instanceType": "i4i.metal" },
+        { "hostName": "esx-3", "keyName": "evs-key", "instanceType": "i4i.metal" },
+        { "hostName": "esx-4", "keyName": "evs-key", "instanceType": "i4i.metal" },
+    ])
+}
+
+/// Whether `id` satisfies the modelled `^(env-[a-zA-Z0-9]{10})$`.
+fn is_environment_id(id: &str) -> bool {
+    match id.strip_prefix("env-") {
+        Some(rest) => rest.len() == 10 && rest.bytes().all(|b| b.is_ascii_alphanumeric()),
+        None => false,
+    }
+}
+
+/// Whether `id` satisfies the modelled `^subnet-[a-f0-9]{8}([a-f0-9]{9})?$`.
+fn is_subnet_id(id: &str) -> bool {
+    match id.strip_prefix("subnet-") {
+        Some(rest) => {
+            (rest.len() == 8 || rest.len() == 17)
+                && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
+    }
+}
+
+/// The `__type` an error body carries, for an assertion message.
+fn error_type(body: &Value) -> String {
+    body["__type"].as_str().unwrap_or("<none>").to_string()
+}
+
+/// Create an environment and return its id, failing the test if it is refused.
+async fn create(router: &MultiServiceRouter, name: Option<&str>) -> String {
+    let (status, body) = call(router, "CreateEnvironment", &create_request(name)).await;
+    assert_eq!(
+        status, 200,
+        "create {name:?}: expected 200, got {status} {body}"
+    );
+    body["environment"]["environmentId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("create {name:?}: no environmentId in {body}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn an_environment_round_trips_through_create_get_list_vlans_and_delete() {
+    let router = emulator();
+
+    let (status, created) = call(
+        &router,
+        "CreateEnvironment",
+        &create_request(Some("demo-env")),
+    )
+    .await;
+    assert_eq!(status, 200, "create: expected 200, got {status} {created}");
+    let environment = created["environment"].clone();
+    let id = environment["environmentId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("create: no environmentId in {created}"))
+        .to_string();
+
+    assert!(
+        is_environment_id(&id),
+        "create: environmentId {id:?} must match ^(env-[a-zA-Z0-9]{{10}})$"
+    );
+    assert_eq!(
+        environment["environmentArn"],
+        json!(format!("arn:aws:evs:{REGION}:{ACCOUNT}:environment/{id}")),
+        "create: expected the environment ARN of {id}, got {}",
+        environment["environmentArn"]
+    );
+    assert_eq!(
+        environment["environmentState"],
+        json!("CREATING"),
+        "create: a just-created environment is still CREATING, got {}",
+        environment["environmentState"]
+    );
+    for (member, expected) in [
+        ("environmentName", json!("demo-env")),
+        ("vpcId", json!("vpc-0123456789abcdef0")),
+        ("serviceAccessSubnetId", json!("subnet-0123456789abcdef0")),
+        ("vcfVersion", json!("VCF-5.2.1")),
+        ("termsAccepted", json!(true)),
+        ("environmentStatus", json!("UNKNOWN")),
+    ] {
+        assert_eq!(
+            environment[member], expected,
+            "create: {member}: expected {expected}, got {}",
+            environment[member]
+        );
+    }
+
+    // The read-back: GetEnvironment must report the record create stored.
+    let (status, got) = call(&router, "GetEnvironment", &json!({ "environmentId": id })).await;
+    assert_eq!(status, 200, "get: expected 200, got {status} {got}");
+    for member in [
+        "environmentId",
+        "environmentArn",
+        "environmentName",
+        "vpcId",
+        "serviceAccessSubnetId",
+        "vcfVersion",
+        "termsAccepted",
+        "createdAt",
+    ] {
+        assert_eq!(
+            got["environment"][member], environment[member],
+            "get: {member}: expected the stored {}, got {}",
+            environment[member], got["environment"][member]
+        );
+    }
+
+    // The transition the clock owes a new environment: it is CREATED once due, and
+    // its VLAN subnets with it.
+    std::thread::sleep(PAST_THE_TRANSITION);
+    let (status, settled) = call(&router, "GetEnvironment", &json!({ "environmentId": id })).await;
+    assert_eq!(status, 200, "get settled: expected 200, got {status} {settled}");
+    assert_eq!(
+        settled["environment"]["environmentState"],
+        json!("CREATED"),
+        "get settled: the owed transition must have been applied, got {}",
+        settled["environment"]["environmentState"]
+    );
+    assert_eq!(
+        settled["environment"]["environmentStatus"],
+        json!("PASSED"),
+        "get settled: a CREATED environment with no failing check is PASSED, got {}",
+        settled["environment"]["environmentStatus"]
+    );
+    let created_at = settled["environment"]["createdAt"]
+        .as_f64()
+        .expect("createdAt is a timestamp");
+    let modified_at = settled["environment"]["modifiedAt"]
+        .as_f64()
+        .expect("modifiedAt is a timestamp");
+    assert!(
+        modified_at > created_at,
+        "get settled: modifiedAt {modified_at} must advance past createdAt {created_at}"
+    );
+
+    // The VLAN subnets derived from the initialVlans supplied at create time.
+    let (status, listed) = call(
+        &router,
+        "ListEnvironmentVlans",
+        &json!({ "environmentId": id }),
+    )
+    .await;
+    assert_eq!(status, 200, "list vlans: expected 200, got {status} {listed}");
+    let vlans = listed["environmentVlans"]
+        .as_array()
+        .unwrap_or_else(|| panic!("list vlans: no environmentVlans in {listed}"));
+    assert_eq!(
+        vlans.len(),
+        10,
+        "list vlans: InitialVlans declares ten VLAN subnets, got {}",
+        vlans.len()
+    );
+    let expected_cidrs = vlans_with_prefix(28);
+    let mut seen_subnets = BTreeSet::new();
+    let mut seen_tags = BTreeSet::new();
+    for vlan in vlans {
+        let function = vlan["functionName"]
+            .as_str()
+            .unwrap_or_else(|| panic!("list vlans: no functionName in {vlan}"));
+        assert_eq!(
+            vlan["cidr"], expected_cidrs[function]["cidr"],
+            "list vlans: {function}: expected the CIDR block the request supplied ({}), got {}",
+            expected_cidrs[function]["cidr"], vlan["cidr"]
+        );
+        let subnet = vlan["subnetId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("list vlans: {function}: no subnetId in {vlan}"));
+        assert!(
+            is_subnet_id(subnet),
+            "list vlans: {function}: subnetId {subnet:?} must match \
+             ^subnet-[a-f0-9]{{8}}([a-f0-9]{{9}})?$"
+        );
+        assert!(
+            seen_subnets.insert(subnet.to_string()),
+            "list vlans: {function}: subnetId {subnet} is used by another VLAN"
+        );
+        let tag = vlan["vlanId"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("list vlans: {function}: no vlanId in {vlan}"));
+        assert!(
+            seen_tags.insert(tag),
+            "list vlans: {function}: vlanId {tag} is used by another VLAN"
+        );
+        assert_eq!(
+            vlan["vlanState"],
+            json!("CREATED"),
+            "list vlans: {function}: the owed VLAN transition must have been applied, got {}",
+            vlan["vlanState"]
+        );
+        assert_eq!(
+            vlan["isPublic"],
+            json!(false),
+            "list vlans: {function}: only the HCX VLAN can be public, got {}",
+            vlan["isPublic"]
+        );
+    }
+    let functions: BTreeSet<&str> = vlans
+        .iter()
+        .filter_map(|vlan| vlan["functionName"].as_str())
+        .collect();
+    let expected_functions: BTreeSet<&str> = [
+        "vmkManagement",
+        "vmManagement",
+        "vMotion",
+        "vSan",
+        "vTep",
+        "edgeVTep",
+        "nsxUplink",
+        "hcx",
+        "expansionVlan1",
+        "expansionVlan2",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        functions, expected_functions,
+        "list vlans: expected one VLAN per InitialVlans member, got {functions:?}"
+    );
+
+    // The environment is enumerable.
+    let (status, all) = call(&router, "ListEnvironments", &json!({})).await;
+    assert_eq!(status, 200, "list: expected 200, got {status} {all}");
+    let ids: Vec<&str> = all["environmentSummaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("list: no environmentSummaries in {all}"))
+        .iter()
+        .filter_map(|summary| summary["environmentId"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![id.as_str()],
+        "list: expected exactly the created environment, got {ids:?}"
+    );
+
+    // Deleting it moves it to DELETING and stamps modifiedAt.
+    let (status, deleted) = call(
+        &router,
+        "DeleteEnvironment",
+        &json!({ "environmentId": id, "clientToken": "delete-1" }),
+    )
+    .await;
+    assert_eq!(status, 200, "delete: expected 200, got {status} {deleted}");
+    assert_eq!(
+        deleted["environment"]["environmentState"],
+        json!("DELETING"),
+        "delete: expected DELETING, got {}",
+        deleted["environment"]["environmentState"]
+    );
+    let deleting_modified_at = deleted["environment"]["modifiedAt"]
+        .as_f64()
+        .expect("modifiedAt is a timestamp");
+    assert!(
+        deleting_modified_at >= modified_at,
+        "delete: modifiedAt {deleting_modified_at} must not go backwards from {modified_at}"
+    );
+
+    // @idempotent: deleting it again reports the same record and restarts nothing.
+    let (status, again) = call(
+        &router,
+        "DeleteEnvironment",
+        &json!({ "environmentId": id, "clientToken": "delete-2" }),
+    )
+    .await;
+    assert_eq!(status, 200, "delete again: expected 200, got {status} {again}");
+    assert_eq!(
+        again["environment"]["modifiedAt"].as_f64(),
+        Some(deleting_modified_at),
+        "delete again: a repeated delete must not move modifiedAt, got {}",
+        again["environment"]["modifiedAt"]
+    );
+
+    // Once the deletion is due, the environment reports DELETED and drops out of a
+    // list filtered to the active states.
+    std::thread::sleep(PAST_THE_TRANSITION);
+    let (status, purged) = call(&router, "GetEnvironment", &json!({ "environmentId": id })).await;
+    assert_eq!(status, 200, "get deleted: expected 200, got {status} {purged}");
+    assert_eq!(
+        purged["environment"]["environmentState"],
+        json!("DELETED"),
+        "get deleted: expected DELETED, got {}",
+        purged["environment"]["environmentState"]
+    );
+
+    for (filter, expected) in [
+        (json!(["CREATED", "CREATING"]), Vec::<&str>::new()),
+        (json!(["DELETED"]), vec![id.as_str()]),
+    ] {
+        let (status, filtered) =
+            call(&router, "ListEnvironments", &json!({ "state": filter })).await;
+        assert_eq!(
+            status, 200,
+            "list {filter}: expected 200, got {status} {filtered}"
+        );
+        let got: Vec<&str> = filtered["environmentSummaries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("list {filter}: no environmentSummaries in {filtered}"))
+            .iter()
+            .filter_map(|summary| summary["environmentId"].as_str())
+            .collect();
+        assert_eq!(
+            got, expected,
+            "list {filter}: expected {expected:?}, got {got:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_environment_enforces_the_documented_request_rules() {
+    // Each row: the case, the request, and the HTTP status the rule gives it. Rows
+    // that pass create a nameless environment, so no row collides with another.
+    let license = json!([{
+        "solutionKey": "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE",
+        "vsanKey": "FFFFF-GGGGG-HHHHH-IIIII-JJJJJ",
+    }]);
+    let hostnames = json!({
+        "vCenter": "vcenter", "nsx": "nsx", "nsxManager1": "nsxm1", "nsxManager2": "nsxm2",
+        "nsxManager3": "nsxm3", "nsxEdge1": "nsxe1", "nsxEdge2": "nsxe2",
+        "sddcManager": "sddc", "cloudBuilder": "builder",
+    });
+    let connectivity = json!({ "privateRouteServerPeerings": ["rsp-1", "rsp-2"] });
+
+    let mut overlapping = vlans();
+    // vmManagement's /24 swallows vMotion's /28 — the same addresses twice.
+    overlapping["vmManagement"] = json!({ "cidr": "10.0.4.0/24" });
+
+    let mut public_hcx = vlans();
+    public_hcx["isHcxPublic"] = json!(true);
+    let mut public_hcx_with_acl = public_hcx.clone();
+    public_hcx_with_acl["hcxNetworkAclId"] = json!("acl-0123456789abcdef0");
+
+    let rows: Vec<(&str, Value, u16)> = vec![
+        (
+            "SELF_DEPLOYED supports none of the five install parameters: siteId",
+            json!({ "vcfVersion": "SELF_DEPLOYED", "siteId": "site-1" }),
+            400,
+        ),
+        (
+            "SELF_DEPLOYED supports none of the five install parameters: licenseInfo",
+            json!({ "vcfVersion": "SELF_DEPLOYED", "licenseInfo": license }),
+            400,
+        ),
+        (
+            "SELF_DEPLOYED supports none of the five install parameters: hosts",
+            json!({ "vcfVersion": "SELF_DEPLOYED", "hosts": four_hosts(json!({})) }),
+            400,
+        ),
+        (
+            "SELF_DEPLOYED supports none of the five install parameters: vcfHostnames",
+            json!({ "vcfVersion": "SELF_DEPLOYED", "vcfHostnames": hostnames }),
+            400,
+        ),
+        (
+            "SELF_DEPLOYED supports none of the five install parameters: connectivityInfo",
+            json!({ "vcfVersion": "SELF_DEPLOYED", "connectivityInfo": connectivity }),
+            400,
+        ),
+        (
+            "SELF_DEPLOYED with none of them is accepted",
+            json!({ "vcfVersion": "SELF_DEPLOYED" }),
+            200,
+        ),
+        (
+            "an installed version accepts the same parameters SELF_DEPLOYED refuses",
+            json!({
+                "vcfVersion": "VCF-5.2.2",
+                "siteId": "site-1",
+                "licenseInfo": license,
+                "vcfHostnames": hostnames,
+                "connectivityInfo": connectivity,
+            }),
+            200,
+        ),
+        (
+            "a /28 VLAN subnet is the smallest allowed",
+            json!({ "initialVlans": vlans_with_prefix(28) }),
+            200,
+        ),
+        (
+            "a /25 VLAN subnet is inside the allowed range",
+            json!({ "initialVlans": vlans_with_prefix(25) }),
+            200,
+        ),
+        (
+            "a /24 VLAN subnet is the largest allowed",
+            json!({ "initialVlans": vlans_with_prefix(24) }),
+            200,
+        ),
+        (
+            "a /29 VLAN subnet is smaller than the minimum",
+            json!({ "initialVlans": vlans_with_prefix(29) }),
+            400,
+        ),
+        (
+            "a /23 VLAN subnet is larger than the maximum",
+            json!({ "initialVlans": vlans_with_prefix(23) }),
+            400,
+        ),
+        (
+            "two VLAN subnets may not overlap",
+            json!({ "initialVlans": overlapping }),
+            400,
+        ),
+        (
+            "a public HCX VLAN requires a network ACL id",
+            json!({ "initialVlans": public_hcx }),
+            400,
+        ),
+        (
+            "a public HCX VLAN with a network ACL id is accepted",
+            json!({ "initialVlans": public_hcx_with_acl }),
+            200,
+        ),
+        (
+            "a host cannot name both a dedicated host and a placement group",
+            json!({
+                "hosts": four_hosts(json!({
+                    "dedicatedHostId": "h-0123456789abcdef0",
+                    "placementGroupId": "pg-0123456789abcdef0",
+                })),
+            }),
+            400,
+        ),
+        (
+            "a host may name a placement group alone",
+            json!({ "hosts": four_hosts(json!({ "placementGroupId": "pg-0123456789abcdef0" })) }),
+            200,
+        ),
+        (
+            "a host may name a dedicated host alone",
+            json!({ "hosts": four_hosts(json!({ "dedicatedHostId": "h-0123456789abcdef0" })) }),
+            200,
+        ),
+    ];
+
+    for (case, overrides, expected_status) in rows {
+        let router = emulator();
+        let mut request = create_request(None);
+        for (member, value) in overrides.as_object().expect("the overrides are an object") {
+            request[member] = value.clone();
+        }
+
+        let (status, body) = call(&router, "CreateEnvironment", &request).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} ({}) {body}",
+            error_type(&body)
+        );
+        if expected_status == 400 {
+            assert!(
+                error_type(&body).contains("ValidationException"),
+                "case {case:?}: expected a ValidationException, got {}",
+                error_type(&body)
+            );
+        } else {
+            let id = body["environment"]["environmentId"].as_str().unwrap_or("");
+            assert!(
+                is_environment_id(id),
+                "case {case:?}: expected a minted environmentId, got {id:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_environment_name_is_unique_within_the_account_and_region() {
+    let router = emulator();
+    let first = create(&router, Some("shared-name")).await;
+
+    let (status, body) = call(
+        &router,
+        "CreateEnvironment",
+        &create_request(Some("shared-name")),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a second environment named shared-name must be refused, got {status} {body}"
+    );
+    assert!(
+        error_type(&body).contains("ValidationException"),
+        "duplicate name: expected a ValidationException, got {}",
+        error_type(&body)
+    );
+
+    // A different name is accepted, and is a different environment.
+    let second = create(&router, Some("another-name")).await;
+    assert_ne!(
+        first, second,
+        "two creates must mint two environments, both came back as {first}"
+    );
+
+    // The scope of the rule is one Region: the same name in another Region is a
+    // different environment, and each ARN names the Region its caller addressed.
+    // Each row is a Region token shape — three segments, and the four-segment form
+    // the gov/iso partitions use.
+    for other_region in ["eu-central-1", "us-gov-west-1"] {
+        let (status, body) = call_in_region(
+            &router,
+            other_region,
+            "CreateEnvironment",
+            &create_request(Some("shared-name")),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {other_region}: the name is free in another Region, got {status} {body}"
+        );
+        let id = body["environment"]["environmentId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {other_region}: no environmentId in {body}"));
+        assert_ne!(
+            id, first,
+            "case {other_region}: expected a new environment, got the {first} of {REGION}"
+        );
+        assert_eq!(
+            body["environment"]["environmentArn"],
+            json!(format!(
+                "arn:aws:evs:{other_region}:{ACCOUNT}:environment/{id}"
+            )),
+            "case {other_region}: the ARN must name the Region the caller addressed, got {}",
+            body["environment"]["environmentArn"]
+        );
+
+        // ...and the rule still bites inside that Region.
+        let (status, body) = call_in_region(
+            &router,
+            other_region,
+            "CreateEnvironment",
+            &create_request(Some("shared-name")),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {other_region}: a second environment of that name must be refused, \
+             got {status} {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_environment_is_only_visible_at_the_region_it_was_created_in() {
+    // An Amazon EVS environment is a regional resource: it lives at the endpoint of
+    // the Region it was created in, which is the Region its own ARN names.
+    let router = emulator();
+    let home = create(&router, Some("home-region-env")).await;
+
+    // Each row: an operation that resolves an environment by id, and the request for
+    // it. From any other Region every one of them is a miss.
+    let rows: Vec<(&str, Value)> = vec![
+        ("GetEnvironment", json!({ "environmentId": home })),
+        ("ListEnvironmentVlans", json!({ "environmentId": home })),
+        ("DeleteEnvironment", json!({ "environmentId": home })),
+    ];
+    for (operation, request) in rows {
+        let (status, body) = call_in_region(&router, "eu-central-1", operation, &request).await;
+        assert_eq!(
+            status, 404,
+            "case {operation:?} from another Region: expected HTTP 404, got {status} {body}"
+        );
+        assert!(
+            error_type(&body).contains("ResourceNotFoundException"),
+            "case {operation:?} from another Region: expected a ResourceNotFoundException, got {}",
+            error_type(&body)
+        );
+    }
+
+    // ListEnvironments reports "the environments in your account in the specified
+    // Region" — so the other Region's list is empty and the home Region's is not.
+    for (region, expected) in [("eu-central-1", Vec::new()), (REGION, vec![home.as_str()])] {
+        let (status, body) = call_in_region(&router, region, "ListEnvironments", &json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case list in {region}: expected 200, got {status} {body}"
+        );
+        let got: Vec<&str> = body["environmentSummaries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case list in {region}: no summaries in {body}"))
+            .iter()
+            .filter_map(|summary| summary["environmentId"].as_str())
+            .collect();
+        assert_eq!(
+            got, expected,
+            "case list in {region}: expected {expected:?}, got {got:?}"
+        );
+    }
+
+    // And it is still fully usable at its own Region.
+    let (status, body) = call(&router, "GetEnvironment", &json!({ "environmentId": home })).await;
+    assert_eq!(
+        status, 200,
+        "the environment at its own Region: expected 200, got {status} {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_client_token_has_no_effect_on_which_environment_is_created() {
+    // "This parameter is not used in Amazon EVS currently. If you supply input for
+    // this parameter, it will have no effect." (`clientToken` doc.) Two creates that
+    // repeat one token are therefore two environments.
+    let router = emulator();
+    let mut request = create_request(None);
+    request["clientToken"] = json!("tok-1");
+
+    let (first_status, first) = call(&router, "CreateEnvironment", &request).await;
+    let (second_status, second) = call(&router, "CreateEnvironment", &request).await;
+    assert_eq!(
+        (first_status, second_status),
+        (200, 200),
+        "both creates must be accepted, got {first_status} {first} and {second_status} {second}"
+    );
+    assert_ne!(
+        first["environment"]["environmentId"], second["environment"]["environmentId"],
+        "a repeated clientToken must not be deduplicated, both creates returned {}",
+        first["environment"]["environmentId"]
+    );
+}
+
+#[tokio::test]
+async fn unknown_resources_are_reported_as_not_found() {
+    let router = emulator();
+    // One real environment, so a miss is a miss on the lookup and not an empty store.
+    let id = create(&router, Some("present")).await;
+    let absent = "env-0000000000";
+    let absent_arn = format!("arn:aws:evs:{REGION}:{ACCOUNT}:environment/{absent}");
+
+    let rows: Vec<(&str, Value)> = vec![
+        ("GetEnvironment", json!({ "environmentId": absent })),
+        ("DeleteEnvironment", json!({ "environmentId": absent })),
+        ("ListEnvironmentVlans", json!({ "environmentId": absent })),
+        (
+            "ListTagsForResource",
+            json!({ "resourceArn": absent_arn.clone() }),
+        ),
+        (
+            "TagResource",
+            json!({ "resourceArn": absent_arn.clone(), "tags": { "k": "v" } }),
+        ),
+        (
+            "UntagResource",
+            json!({ "resourceArn": absent_arn.clone(), "tagKeys": ["k"] }),
+        ),
+    ];
+
+    for (operation, request) in rows {
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(
+            status, 404,
+            "case {operation:?} on an absent resource: expected HTTP 404, got {status} {body}"
+        );
+        assert!(
+            error_type(&body).contains("ResourceNotFoundException"),
+            "case {operation:?}: expected a ResourceNotFoundException, got {}",
+            error_type(&body)
+        );
+    }
+
+    // An id that is not an environment id at all is refused before any lookup.
+    let (status, body) = call(
+        &router,
+        "GetEnvironment",
+        &json!({ "environmentId": "not-an-env-id" }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a malformed environmentId must be refused, got {status} {body}"
+    );
+
+    // And the environment that does exist is still reachable.
+    let (status, body) = call(&router, "GetEnvironment", &json!({ "environmentId": id })).await;
+    assert_eq!(status, 200, "the present environment: got {status} {body}");
+}
+
+#[tokio::test]
+async fn list_environments_pages_with_max_results_and_a_resumable_token() {
+    let router = emulator();
+    let mut created = BTreeSet::new();
+    for index in 0..5 {
+        created.insert(create(&router, Some(&format!("env-number-{index}"))).await);
+    }
+
+    // Every page size spans the collection exactly once, with no duplicates and no
+    // gaps, however many pages it takes.
+    for page_size in [1, 2, 3, 5, 100] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut next_token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut request = json!({ "maxResults": page_size });
+            if let Some(token) = &next_token {
+                request["nextToken"] = json!(token);
+            }
+            let (status, body) = call(&router, "ListEnvironments", &request).await;
+            assert_eq!(
+                status, 200,
+                "case page size {page_size}: expected 200, got {status} {body}"
+            );
+            let page = body["environmentSummaries"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case page size {page_size}: no summaries in {body}"));
+            assert!(
+                page.len() <= page_size as usize,
+                "case page size {page_size}: a page may not exceed the bound, got {}",
+                page.len()
+            );
+            seen.extend(
+                page.iter()
+                    .filter_map(|summary| summary["environmentId"].as_str())
+                    .map(str::to_string),
+            );
+            pages += 1;
+            assert!(
+                pages <= 10,
+                "case page size {page_size}: pagination did not terminate after {pages} pages"
+            );
+            match body["nextToken"].as_str() {
+                Some(token) => next_token = Some(token.to_string()),
+                None => break,
+            }
+        }
+        let unique: BTreeSet<String> = seen.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "case page size {page_size}: pages must not repeat an environment, got {seen:?}"
+        );
+        assert_eq!(
+            unique, created,
+            "case page size {page_size}: expected every environment exactly once, got {unique:?}"
+        );
+    }
+
+    // A token this service did not issue, and one it issued more than 24 hours ago,
+    // are both refused rather than silently restarting the scan.
+    let stale = ::hex::encode("0:env-0000000000");
+    for (case, token) in [("malformed", "not-a-token".to_string()), ("expired", stale)] {
+        let (status, body) = call(
+            &router,
+            "ListEnvironments",
+            &json!({ "nextToken": token.clone() }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case} token {token:?}: expected HTTP 400, got {status} {body}"
+        );
+        assert!(
+            error_type(&body).contains("ValidationException"),
+            "case {case} token: expected a ValidationException, got {}",
+            error_type(&body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_environment_vlans_pages_with_max_results_and_a_resumable_token() {
+    let router = emulator();
+    let id = create(&router, Some("paged-vlans")).await;
+
+    for page_size in [1, 3, 4, 10, 100] {
+        let mut seen: Vec<i64> = Vec::new();
+        let mut next_token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut request = json!({ "environmentId": id, "maxResults": page_size });
+            if let Some(token) = &next_token {
+                request["nextToken"] = json!(token);
+            }
+            let (status, body) = call(&router, "ListEnvironmentVlans", &request).await;
+            assert_eq!(
+                status, 200,
+                "case page size {page_size}: expected 200, got {status} {body}"
+            );
+            let page = body["environmentVlans"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case page size {page_size}: no VLANs in {body}"));
+            assert!(
+                page.len() <= page_size as usize,
+                "case page size {page_size}: a page may not exceed the bound, got {}",
+                page.len()
+            );
+            seen.extend(page.iter().filter_map(|vlan| vlan["vlanId"].as_i64()));
+            pages += 1;
+            assert!(
+                pages <= 12,
+                "case page size {page_size}: pagination did not terminate after {pages} pages"
+            );
+            match body["nextToken"].as_str() {
+                Some(token) => next_token = Some(token.to_string()),
+                None => break,
+            }
+        }
+        let unique: BTreeSet<i64> = seen.iter().copied().collect();
+        assert_eq!(
+            (unique.len(), seen.len()),
+            (10, 10),
+            "case page size {page_size}: expected the ten VLAN subnets exactly once, got {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tags_are_stored_on_the_environment_and_read_back_by_arn() {
+    let router = emulator();
+    let (status, created) = call(
+        &router,
+        "CreateEnvironment",
+        &{
+            let mut request = create_request(Some("tagged-env"));
+            request["tags"] = json!({ "team": "platform", "stage": "dev" });
+            request
+        },
+    )
+    .await;
+    assert_eq!(status, 200, "create: expected 200, got {status} {created}");
+    let arn = created["environment"]["environmentArn"]
+        .as_str()
+        .expect("the created environment has an ARN")
+        .to_string();
+
+    // Each step: what the tag set must be after it.
+    let steps: Vec<(&str, &str, Value, Value)> = vec![
+        (
+            "the tags CreateEnvironment was given",
+            "ListTagsForResource",
+            json!({ "resourceArn": arn }),
+            json!({ "team": "platform", "stage": "dev" }),
+        ),
+        (
+            "TagResource adds a key and overwrites one",
+            "TagResource",
+            json!({ "resourceArn": arn, "tags": { "stage": "prod", "owner": "evs" } }),
+            json!({ "team": "platform", "stage": "prod", "owner": "evs" }),
+        ),
+        (
+            "UntagResource removes only the named keys",
+            "UntagResource",
+            json!({ "resourceArn": arn, "tagKeys": ["team", "absent"] }),
+            json!({ "stage": "prod", "owner": "evs" }),
+        ),
+        (
+            "UntagResource is idempotent",
+            "UntagResource",
+            json!({ "resourceArn": arn, "tagKeys": ["team"] }),
+            json!({ "stage": "prod", "owner": "evs" }),
+        ),
+    ];
+
+    for (case, operation, request, expected) in steps {
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from {operation}, got {status} {body}"
+        );
+        let (status, listed) = call(
+            &router,
+            "ListTagsForResource",
+            &json!({ "resourceArn": arn }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from ListTagsForResource, got {status} {listed}"
+        );
+        assert_eq!(
+            listed["tags"], expected,
+            "case {case:?}: expected the tags {expected}, got {}",
+            listed["tags"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_store_is_bounded_and_reclaims_only_finished_environments() {
+    use service_com_amazonaws_evs_amazonelasticvmwareservice::state::MAX_ENVIRONMENTS;
+
+    let router = emulator();
+    let first = create(&router, None).await;
+    for index in 1..MAX_ENVIRONMENTS {
+        let (status, body) = call(&router, "CreateEnvironment", &create_request(None)).await;
+        assert_eq!(
+            status, 200,
+            "create {index} of {MAX_ENVIRONMENTS}: expected 200, got {status} {body}"
+        );
+    }
+
+    // At the cap, a create is refused with a quota error rather than growing the store.
+    let (status, body) = call(&router, "CreateEnvironment", &create_request(None)).await;
+    assert_eq!(
+        status, 402,
+        "create past the cap of {MAX_ENVIRONMENTS}: expected HTTP 402, got {status} {body}"
+    );
+    assert!(
+        error_type(&body).contains("ServiceQuotaExceededException"),
+        "create past the cap: expected a ServiceQuotaExceededException, got {}",
+        error_type(&body)
+    );
+
+    // A live record is never evicted to make room — not even one that is on its way
+    // out, until its deletion has actually come due.
+    let (status, body) = call(
+        &router,
+        "DeleteEnvironment",
+        &json!({ "environmentId": first }),
+    )
+    .await;
+    assert_eq!(status, 200, "delete: expected 200, got {status} {body}");
+    let (status, body) = call(&router, "CreateEnvironment", &create_request(None)).await;
+    assert_eq!(
+        status, 402,
+        "create while the only deletion is still DELETING: expected HTTP 402, got {status} {body}"
+    );
+
+    // Once it is DELETED, its room is reclaimed and the next create is admitted; the
+    // purged environment is then reported as absent.
+    std::thread::sleep(PAST_THE_TRANSITION);
+    let (status, body) = call(&router, "CreateEnvironment", &create_request(None)).await;
+    assert_eq!(
+        status, 200,
+        "create after a deletion came due: expected 200, got {status} {body}"
+    );
+    let (status, body) = call(
+        &router,
+        "GetEnvironment",
+        &json!({ "environmentId": first }),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "get a purged environment: expected HTTP 404, got {status} {body}"
+    );
+}
+
+#[tokio::test]
+async fn every_create_mints_a_distinct_environment_id_and_subnet_ids() {
+    let router = emulator();
+    let mut environment_ids = BTreeSet::new();
+    let mut subnet_ids = BTreeSet::new();
+
+    for index in 0..25 {
+        let id = create(&router, Some(&format!("unique-{index}"))).await;
+        assert!(
+            is_environment_id(&id),
+            "create {index}: environmentId {id:?} must match ^(env-[a-zA-Z0-9]{{10}})$"
+        );
+        assert!(
+            environment_ids.insert(id.clone()),
+            "create {index}: environmentId {id} was already minted"
+        );
+
+        let (status, body) = call(
+            &router,
+            "ListEnvironmentVlans",
+            &json!({ "environmentId": id }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "create {index}: expected 200 from ListEnvironmentVlans, got {status} {body}"
+        );
+        for vlan in body["environmentVlans"]
+            .as_array()
+            .unwrap_or_else(|| panic!("create {index}: no VLANs in {body}"))
+        {
+            let subnet = vlan["subnetId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("create {index}: no subnetId in {vlan}"))
+                .to_string();
+            assert!(
+                subnet_ids.insert(subnet.clone()),
+                "create {index}: subnetId {subnet} was already minted"
+            );
+        }
+    }
+    assert_eq!(
+        subnet_ids.len(),
+        250,
+        "25 environments of ten VLAN subnets each need 250 distinct subnet ids, got {}",
+        subnet_ids.len()
+    );
+}

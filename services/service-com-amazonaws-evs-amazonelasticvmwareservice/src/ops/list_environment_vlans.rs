@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnvironmentVlans
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnvironmentVlans`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnvironmentVlans::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the VLAN subnets `CreateEnvironment` materialised from the
+//! environment's `initialVlans`, in VLAN-id order, with `maxResults` as a real page
+//! bound and a resumable `nextToken`. An id this service holds no environment for is
+//! a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -95,11 +90,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `ListEnvironmentVlansError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#ListEnvironmentVlans")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#ListEnvironmentVlans",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListEnvironmentVlansErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -153,18 +154,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnvironmentVlans` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnvironmentVlansErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnvironmentVlans"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEnvironmentVlansErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // The cursor is the VLAN id the next page starts at.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let cursor = crate::state::decode_page_token(token).map_err(|error| {
+                    ListEnvironmentVlansErrorModeled::ValidationException(
+                        crate::state::invalid_next_token(error),
+                    )
+                })?;
+                Some(cursor.parse::<i32>().map_err(|_| {
+                    ListEnvironmentVlansErrorModeled::ValidationException(
+                        crate::state::invalid_next_token(crate::state::PageTokenError::Malformed),
+                    )
+                })?)
+            }
+        };
+        // Clamped locally, so the page bound holds whatever reaches the handler and not
+        // only because the boundary validator enforced the modelled 1..100 range.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE) as usize;
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the VLAN state changes the clock already
+        // owed, which were due whether or not anybody listed them.
+        state.materialise_due_transitions();
+
+        // Regional resource: the VLANs of an environment are only listable at the
+        // endpoint of the Region that environment was created in.
+        let environment = state
+            .environment_in_region(&region, &input.environment_id)
+            .ok_or_else(|| {
+                ListEnvironmentVlansErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+
+        let mut matching = environment
+            .vlans
+            .iter()
+            .filter(|vlan| start_at.is_none_or(|cursor| vlan.vlan_id >= cursor));
+        let environment_vlans: Vec<Vlan> = matching
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::StoredVlan::to_wire)
+            .collect();
+        // The next page starts at the first VLAN this one did not report.
+        let next_token = matching
+            .next()
+            .map(|vlan| crate::state::encode_page_token(&vlan.vlan_id.to_string()));
+
+        Ok(ListEnvironmentVlansOutput {
+            next_token,
+            environment_vlans: Some(environment_vlans),
+        })
     }
 }

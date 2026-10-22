@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnvironments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnvironments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnvironments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the environments [`crate::state`] holds, in `environmentId` order, with
+//! `maxResults` as a real page bound and a `nextToken` that resumes exactly where the
+//! previous page stopped. `state` filters the page to the listed
+//! `environmentState`s.
 //!
 //! ## Shape of an operation
 //!
@@ -93,10 +88,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `ListEnvironmentsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#ListEnvironments")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#ListEnvironments",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListEnvironmentsErrorModeled {
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,18 +151,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnvironments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnvironmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnvironments"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEnvironmentsErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+
+        let start_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).map_err(|error| {
+                ListEnvironmentsErrorModeled::ValidationException(
+                    crate::state::invalid_next_token(error),
+                )
+            })?),
+        };
+        // "If you specify MaxResults in the request, the response includes information
+        // up to the limit specified"; absent, the page is bounded by the top of the
+        // modelled range. Clamped here as well, so the bound holds locally and not only
+        // because the boundary validator enforced the modelled 1..100 range.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE) as usize;
+        let wanted_states = input.state.unwrap_or_default();
+        // "Lists the Amazon EVS environments in your Amazon Web Services account in the
+        // specified Amazon Web Services Region": an environment is a regional resource,
+        // so only the ones created at this endpoint's Region are listed.
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the state changes the clock already owed,
+        // so the filter and the page report the states that are due at this instant.
+        state.materialise_due_transitions();
+
+        let mut matching = state
+            .environments
+            .range::<str, _>((
+                match start_after.as_deref() {
+                    Some(cursor) => std::ops::Bound::Included(cursor),
+                    None => std::ops::Bound::Unbounded,
+                },
+                std::ops::Bound::Unbounded,
+            ))
+            .filter(|(_, environment)| {
+                environment.region == region
+                    && (wanted_states.is_empty() || wanted_states.contains(&environment.state))
+            });
+
+        let environment_summaries: Vec<EnvironmentSummary> = matching
+            .by_ref()
+            .take(page_size)
+            .map(|(_, environment)| environment.to_summary())
+            .collect();
+        // The next page starts at the first environment this one did not report.
+        let next_token = matching
+            .next()
+            .map(|(id, _)| crate::state::encode_page_token(id));
+
+        Ok(ListEnvironmentsOutput {
+            next_token,
+            environment_summaries: Some(environment_summaries),
+        })
     }
 }

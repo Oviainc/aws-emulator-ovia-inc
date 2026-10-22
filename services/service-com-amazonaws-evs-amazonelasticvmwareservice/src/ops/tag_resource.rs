@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the request's tags into the stored environment the ARN names: tags already
+//! on the resource that the request does not mention are left alone. A resource with
+//! more than 200 tags is refused; an ARN this service holds no environment for is a
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -98,13 +93,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#TagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#TagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     TagPolicyException(TagPolicyException),
     TooManyTagsException(TooManyTagsException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,20 +157,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "The Amazon EVS environment store is unavailable.".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        let environment = state
+            .environment_by_arn_mut(&input.resource_arn)
+            .ok_or_else(|| {
+                TagResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.resource_arn),
+                )
+            })?;
+
+        // "If existing tags on a resource are not specified in the request parameters,
+        // they aren't changed": the request is merged into the stored tags, and a key
+        // the request repeats takes the request's value.
+        let mut merged = environment.tags.clone();
+        merged.extend(input.tags);
+        // A resource carries at most 200 tags — the bound the model puts on the tag
+        // map, and the one `TooManyTagsException` reports ("has more than 200 tags").
+        // That error is deprecated "See ServiceQuotaExceededException instead", so the
+        // refusal is the quota error.
+        if merged.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "A resource cannot carry more than {MAX_TAGS_PER_RESOURCE} tags; this \
+                         request would leave it with {}.",
+                        merged.len()
+                    ),
+                },
+            )
+            .into());
+        }
+        environment.tags = merged;
+        environment.modified_at_ms = crate::state::now_ms();
+
+        Ok(TagResourceOutput {})
     }
 }
+
+/// The most tags one Amazon EVS resource carries: the bound the modelled tag maps
+/// declare (len 1..200) and the one `TooManyTagsException` reports.
+const MAX_TAGS_PER_RESOURCE: usize = 200;
