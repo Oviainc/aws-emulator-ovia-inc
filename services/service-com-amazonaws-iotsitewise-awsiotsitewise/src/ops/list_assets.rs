@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation enumerates the stored assets from the shared engine
+//! store (`crate::state`); this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +159,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssetsError::Modeled(ListAssetsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // `filter` defaults to ALL, and "the assetModelId parameter is required if you
+        // filter by ALL".
+        let filter = input.filter.as_deref().unwrap_or("ALL");
+        if filter == "ALL" && input.asset_model_id.is_none() {
+            return Err(ListAssetsError::Modeled(
+                ListAssetsErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: "assetModelId is required when filtering by ALL.".to_string(),
+                }),
+            ));
+        }
+
+        let store = state.lock();
+
+        // The label is either the raw UUID or the `externalId:<externalId>` alias form.
+        let asset_model_id = match input.asset_model_id.as_deref() {
+            Some(label) => Some(store.resolve_asset_model_id(label).ok_or_else(|| {
+                ListAssetsError::Modeled(ListAssetsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("The asset model {label} could not be found."),
+                    },
+                ))
+            })?),
+            None => None,
+        };
+
+        let mut matching: Vec<&crate::state::AssetRecord> = store
+            .assets
+            .values()
+            .filter(|asset| {
+                asset_model_id
+                    .as_deref()
+                    .is_none_or(|id| asset.asset_model_id == id)
+            })
+            // TOP_LEVEL keeps only the assets that are nobody's child; ALL keeps every
+            // asset of the named model.
+            //
+            // NOTE for a later reader: `asset_hierarchy_children`, the store this reads,
+            // is written only by the association operations (`AssociateAssets`,
+            // `BatchAssociateProjectAssets`), which are still 501 scaffolds. Until one
+            // of them lands no asset is anybody's child, so TOP_LEVEL and ALL select
+            // the same set. The derivation is the modelled rule; the data it reads is
+            // what is still missing.
+            .filter(|asset| filter != "TOP_LEVEL" || !is_child(&store, &asset.id))
+            .collect();
+        // A stable order is what makes `nextToken` resumable: oldest first, ties broken
+        // by id so two assets created in the same instant still order deterministically.
+        matching.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first asset of
+        // the next page, hex-encoded so the token matches the modelled `^[A-Za-z0-9+/=]+$`.
+        // A token whose resume point is not in this enumeration is refused rather than
+        // answered with an empty page, which would report absence as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                matching
+                    .iter()
+                    .position(|asset| asset.id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one AWS documents for this operation.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(matching.len());
+
+        let next_token = matching
+            .get(end)
+            .map(|asset| ::hex::encode(asset.id.as_bytes()));
+        let asset_summaries = matching[start..end]
+            .iter()
+            .map(|asset| asset.summary(now))
+            .collect();
+
+        Ok(ListAssetsOutput {
+            asset_summaries,
+            next_token,
+        })
     }
+}
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// Whether `asset_id` appears as a child in any stored asset's hierarchies.
+fn is_child(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    asset_id: &str,
+) -> bool {
+    store
+        .asset_hierarchy_children
+        .values()
+        .any(|children| children.iter().any(|child| child == asset_id))
+}
+
+/// Decode a `nextToken` back into the asset id it resumes from.
+fn decode_token(token: &str) -> Result<String, ListAssetsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListAssetsError {
+    ListAssetsError::Modeled(ListAssetsErrorModeled::InvalidRequestException(
+        InvalidRequestException {
+            message: "The nextToken is not a token this operation issued.".to_string(),
+        },
+    ))
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAssetPropertyValue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAssetPropertyValue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAssetPropertyValue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the latest stored value of an asset property
+//! from the shared engine store (`crate::state`); this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +154,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAssetPropertyValue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAssetPropertyValueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAssetPropertyValue"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAssetPropertyValueError::Modeled(
+                GetAssetPropertyValueErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        let store = state.lock();
+
+        // A property is named either by its asset and property ids or by its alias;
+        // exactly one of the two forms identifies it.
+        let (asset_id, property_id) = match (
+            input.asset_id.as_deref(),
+            input.property_id.as_deref(),
+            input.property_alias.as_deref(),
+        ) {
+            (Some(asset_label), Some(property_id), None) => {
+                // Resolved through the shared resolver every other handler uses, so
+                // one asset is named one way across the service. (This member is
+                // modelled as `ID`, not `CustomID`, so only the raw UUID form can
+                // reach here today.)
+                let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
+                    not_found(format!("The asset {asset_label} could not be found."))
+                })?;
+                let has_property = store.assets.get(&asset_id).is_some_and(|asset| {
+                    asset
+                        .properties
+                        .iter()
+                        .any(|property| property.id == property_id)
+                });
+                if !has_property {
+                    return Err(not_found(format!(
+                        "The asset {asset_label} has no property {property_id}."
+                    )));
+                }
+                (asset_id, property_id.to_string())
+            }
+            (None, None, Some(alias)) => {
+                store.property_alias_index.get(alias).cloned().ok_or_else(|| {
+                    not_found(format!("The property alias {alias} could not be found."))
+                })?
+            }
+            _ => {
+                return Err(GetAssetPropertyValueError::Modeled(
+                    GetAssetPropertyValueErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: "Specify either assetId and propertyId, or propertyAlias."
+                                .to_string(),
+                        },
+                    ),
+                ))
+            }
+        };
+
+        // The latest value is the last element of the ascending series; a property
+        // nothing has been written to simply has no `propertyValue`.
+        Ok(GetAssetPropertyValueOutput {
+            property_value: store
+                .latest_property_value(&asset_id, &property_id)
+                .cloned(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> GetAssetPropertyValueError {
+    GetAssetPropertyValueError::Modeled(
+        GetAssetPropertyValueErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message,
+        }),
+    )
 }

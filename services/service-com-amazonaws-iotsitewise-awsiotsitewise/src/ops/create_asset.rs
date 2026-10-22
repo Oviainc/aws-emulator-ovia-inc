@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAsset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAsset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAsset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation mints an asset from a stored asset model in the shared
+//! engine store (`crate::state`); this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +184,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAsset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAsset"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssetError::Modeled(CreateAssetErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> created-id mapping, so a retry with the same token mints a second
+        // asset rather than replaying the first answer. Deliberately left to the
+        // idempotency issue rather than half-done here; nothing is fabricated for it.
+        let mut store = state.lock();
+
+        // The store is bounded: a create is the only thing that adds an asset and
+        // nothing evicts one, so past the cap this is a quota refusal.
+        if store.assets.len() >= crate::state::MAX_ASSETS {
+            return Err(CreateAssetError::Modeled(
+                CreateAssetErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} assets.",
+                        crate::state::MAX_ASSETS
+                    ),
+                }),
+            ));
+        }
+
+        // An asset cannot exist without the model whose definitions it inherits; the
+        // label is either the raw UUID or the `externalId:<externalId>` alias form.
+        // Resolved and fetched as ONE fallible lookup, so a label that names no
+        // stored model is a modelled refusal and never an unwind.
+        let model = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .and_then(|id| store.asset_models.get(&id))
+            .ok_or_else(|| {
+                CreateAssetError::Modeled(CreateAssetErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "The asset model {} could not be found.",
+                            input.asset_model_id
+                        ),
+                    },
+                ))
+            })?;
+        let asset_model_id = model.id.clone();
+
+        // Only an ASSET_MODEL can be instantiated: a COMPONENT_MODEL is includable in
+        // other models and an INTERFACE is applied to them, and the model's own docs
+        // say assets cannot be created directly from either.
+        if model.model_type != "ASSET_MODEL" {
+            let model_type = model.model_type.clone();
+            return Err(CreateAssetError::Modeled(
+                CreateAssetErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: format!(
+                        "Assets cannot be created from an asset model of type {model_type}."
+                    ),
+                }),
+            ));
+        }
+
+        // Each asset property is materialised from a model property definition and
+        // inherits its id, so property writes and reads resolve against the asset. A
+        // stored model property without an id would make an unaddressable asset
+        // property, so it is skipped rather than materialised with an empty id.
+        let properties: Vec<AssetProperty> = model
+            .properties
+            .iter()
+            .filter_map(|property| {
+                let id = property.id.clone().filter(|id| !id.is_empty())?;
+                Some(AssetProperty {
+                    id,
+                    external_id: property.external_id.clone(),
+                    name: property.name.clone(),
+                    alias: None,
+                    notification: None,
+                    data_type: property.data_type.clone(),
+                    data_type_spec: property.data_type_spec.clone(),
+                    unit: property.unit.clone(),
+                    path: None,
+                })
+            })
+            .collect();
+        // An asset starts with one (empty) hierarchy per model hierarchy definition.
+        let hierarchies: Vec<AssetHierarchy> = model
+            .hierarchies
+            .iter()
+            .map(|hierarchy| AssetHierarchy {
+                id: hierarchy.id.clone(),
+                external_id: hierarchy.external_id.clone(),
+                name: hierarchy.name.clone(),
+            })
+            .collect();
+
+        // A caller-supplied id must be globally unique; an absent one is minted.
+        let asset_id = match input.asset_id.clone() {
+            Some(id) => {
+                if store.assets.contains_key(&id) {
+                    return Err(already_exists(&region, &id));
+                }
+                id
+            }
+            None => loop {
+                let candidate = crate::state::new_id();
+                if !store.assets.contains_key(&candidate) {
+                    break candidate;
+                }
+            },
+        };
+
+        // `assetExternalId` must be unique within the account.
+        if let Some(external) = input.asset_external_id.as_deref() {
+            if let Some(existing) = store.asset_external_ids.get(external).cloned() {
+                return Err(already_exists(&region, &existing));
+            }
+        }
+
+        let record = crate::state::AssetRecord {
+            id: asset_id.clone(),
+            external_id: input.asset_external_id.clone(),
+            arn: crate::state::asset_arn(&region, &asset_id),
+            name: input.asset_name.clone(),
+            asset_model_id,
+            description: input.asset_description.clone(),
+            properties,
+            hierarchies,
+            creation_date: now,
+            last_update_date: now,
+            // The CREATING -> ACTIVE transition the clock owes. Stored, never slept on.
+            active_at: now + crate::state::ACTIVATION_DELAY,
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreateAssetOutput {
+            asset_id: record.id.clone(),
+            asset_arn: record.arn.clone(),
+            asset_status: record.status(now),
+        };
+
+        if let Some(external) = record.external_id.clone() {
+            store.asset_external_ids.insert(external, record.id.clone());
+        }
+        store.assets.insert(record.id.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// HTTP 409 `ResourceAlreadyExistsException` naming the colliding asset.
+fn already_exists(region: &str, asset_id: &str) -> CreateAssetError {
+    CreateAssetError::Modeled(CreateAssetErrorModeled::ResourceAlreadyExistsException(
+        ResourceAlreadyExistsException {
+            message: format!("The asset {asset_id} already exists."),
+            resource_id: asset_id.to_string(),
+            resource_arn: crate::state::asset_arn(region, asset_id),
+        },
+    ))
 }

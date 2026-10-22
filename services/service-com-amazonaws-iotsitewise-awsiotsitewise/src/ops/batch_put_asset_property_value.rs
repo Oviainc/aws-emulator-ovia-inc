@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchPutAssetPropertyValue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchPutAssetPropertyValue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchPutAssetPropertyValue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation appends property values to the per-(asset, property)
+//! time series in the shared engine store (`crate::state`); this is the ONLY file to
+//! touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +171,239 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchPutAssetPropertyValue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchPutAssetPropertyValueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchPutAssetPropertyValueError::Modeled(
+                BatchPutAssetPropertyValueErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        // "The list of asset property value entries for the batch put request. You can
+        // specify up to 10 entries per request." The model carries no `@length` for it,
+        // so the bound is enforced here; with the per-entry cap below it also bounds
+        // the work one request can do under the shared state lock.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchPutAssetPropertyValue"))
+        // It is a bound on the INPUT SHAPE, so it is a request-validation failure —
+        // `InvalidRequestException` (400), the same status the runtime's own
+        // constraint check answers with for a modelled `@length` — not the quota
+        // error a per-entry overflow reports.
+        if input.entries.len() > MAX_ENTRIES {
+            return Err(BatchPutAssetPropertyValueError::Modeled(
+                BatchPutAssetPropertyValueErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: format!(
+                            "A request carries at most {MAX_ENTRIES} entries, but this one \
+                             carries {}.",
+                            input.entries.len()
+                        ),
+                    },
+                ),
+            ));
+        }
+
+        let mut store = state.lock();
+        let mut error_entries = Vec::new();
+
+        for entry in &input.entries {
+            // "You can specify up to 10 propertyValues array elements."
+            if entry.property_values.len() > MAX_VALUES_PER_ENTRY {
+                error_entries.push(error_entry(
+                    entry,
+                    "LimitExceededException",
+                    format!(
+                        "An entry carries at most {MAX_VALUES_PER_ENTRY} propertyValues, but \
+                         this one carries {}.",
+                        entry.property_values.len()
+                    ),
+                ));
+                continue;
+            }
+
+            // Resolve the entry to the one stored property it names — by asset and
+            // property id, or by the alias that stands for them — and read that
+            // property's data type from the SAME lookup, so a pair that names no
+            // stored property can never fall through to an unchecked write.
+            let (asset_id, property_id, data_type) = match resolve_entry(&store, entry) {
+                Ok(resolved) => resolved,
+                Err((code, message)) => {
+                    error_entries.push(error_entry(entry, code, message));
+                    continue;
+                }
+            };
+
+            // A property accepts only values of its own data type, and a `Variant`
+            // carries a value "of a single type only".
+            if let Some((code, message)) = entry
+                .property_values
+                .iter()
+                .find_map(|value| reject_value(&data_type, value))
+            {
+                error_entries.push(error_entry(entry, code, message));
+                continue;
+            }
+
+            for value in &entry.property_values {
+                store.record_property_value(&asset_id, &property_id, value.clone());
+            }
+        }
+
+        Ok(BatchPutAssetPropertyValueOutput { error_entries })
+    }
+}
+
+/// How many entries one request carries, from the model doc on
+/// `BatchPutAssetPropertyValueRequest$entries`: "You can specify up to 10 entries
+/// per request."
+const MAX_ENTRIES: usize = 10;
+
+/// How many values one entry carries, from the model doc on
+/// `PutAssetPropertyValueEntry$propertyValues`: "You can specify up to 10
+/// `propertyValues` array elements."
+const MAX_VALUES_PER_ENTRY: usize = 10;
+
+/// Resolve one entry to `(assetId, propertyId, dataType)`, failing with the
+/// `BatchPutAssetPropertyValueErrorCode` the entry should report.
+///
+/// The asset label goes through [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::resolve_asset_id`],
+/// the same resolver `DescribeAsset`/`DeleteAsset`/`ListAssets` use, so one asset
+/// is named one way everywhere. (This entry's `assetId` is modelled as `ID`, not
+/// `CustomID`, so the runtime's pattern check means only the raw UUID form can
+/// actually reach here — routing it through the shared resolver keeps the handlers
+/// from disagreeing if the model ever widens it.)
+///
+/// The property record is fetched ONCE here, whichever form named it, so both the
+/// existence check and the data type come from the same stored property.
+fn resolve_entry(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    entry: &PutAssetPropertyValueEntry,
+) -> Result<(String, String, String), (&'static str, String)> {
+    let (asset_id, property_id) = match (
+        entry.asset_id.as_deref(),
+        entry.property_id.as_deref(),
+        entry.property_alias.as_deref(),
+    ) {
+        (Some(asset_label), Some(property_id), None) => {
+            let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
+                (
+                    "ResourceNotFoundException",
+                    format!("The asset {asset_label} could not be found."),
+                )
+            })?;
+            (asset_id, property_id.to_string())
+        }
+        (None, None, Some(alias)) => store
+            .property_alias_index
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    "ResourceNotFoundException",
+                    format!("The property alias {alias} could not be found."),
+                )
+            })?,
+        _ => {
+            return Err((
+                "InvalidRequestException",
+                "Each entry must specify either assetId and propertyId, or propertyAlias."
+                    .to_string(),
+            ))
+        }
+    };
+
+    let asset = store.assets.get(&asset_id).ok_or_else(|| {
+        (
+            "ResourceNotFoundException",
+            format!("The asset {asset_id} could not be found."),
+        )
+    })?;
+    let property = asset
+        .properties
+        .iter()
+        .find(|property| property.id == property_id)
+        .ok_or_else(|| {
+            (
+                "ResourceNotFoundException",
+                format!("The asset {asset_id} has no property {property_id}."),
+            )
+        })?;
+    let data_type = property.data_type.clone();
+    Ok((asset_id, property_id, data_type))
+}
+
+/// The reason to refuse `value`, or `None` when it is acceptable.
+///
+/// A `Variant` holds "an asset property value (of a single type only)", and the one
+/// member it sets must be the one the property's `PropertyDataType` names. A
+/// `nullValue` is the modelled way to report an absent reading, so it is accepted
+/// whatever the data type is.
+fn reject_value(
+    data_type: &str,
+    value: &AssetPropertyValue,
+) -> Option<(&'static str, String)> {
+    let set: Vec<&'static str> = [
+        value.value.string_value.is_some().then_some("stringValue"),
+        value.value.integer_value.is_some().then_some("integerValue"),
+        value.value.double_value.is_some().then_some("doubleValue"),
+        value.value.boolean_value.is_some().then_some("booleanValue"),
+        value.value.null_value.is_some().then_some("nullValue"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if set.len() != 1 {
+        return Some((
+            "InvalidRequestException",
+            format!(
+                "A property value must set exactly one member of Variant, but sets {}.",
+                set.len()
+            ),
+        ));
+    }
+    let expected = match data_type {
+        "STRING" => "stringValue",
+        "INTEGER" => "integerValue",
+        "DOUBLE" => "doubleValue",
+        "BOOLEAN" => "booleanValue",
+        // STRUCT and the time-series-only types (VIDEO, ANNOTATION, JSON) name no
+        // single Variant member, so there is nothing to check against.
+        _ => return None,
+    };
+    if set[0] == expected || set[0] == "nullValue" {
+        None
+    } else {
+        Some((
+            "InvalidRequestException",
+            format!(
+                "The property has data type {data_type}, so its value must be a {expected}, not a {}.",
+                set[0]
+            ),
+        ))
+    }
+}
+
+/// The error entry for `entry`, carrying the timestamps the entry asked to write
+/// (capped at [`MAX_VALUES_PER_ENTRY`], so a refused oversize entry cannot
+/// amplify the response).
+fn error_entry(
+    entry: &PutAssetPropertyValueEntry,
+    error_code: &str,
+    error_message: String,
+) -> BatchPutAssetPropertyErrorEntry {
+    BatchPutAssetPropertyErrorEntry {
+        entry_id: entry.entry_id.clone(),
+        errors: vec![BatchPutAssetPropertyError {
+            error_code: error_code.to_string(),
+            error_message,
+            timestamps: entry
+                .property_values
+                .iter()
+                .take(MAX_VALUES_PER_ENTRY)
+                .map(|value| value.timestamp.clone())
+                .collect(),
+        }],
     }
 }

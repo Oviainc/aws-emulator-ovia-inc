@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAssetModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAssetModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAssetModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the stored asset model from the shared engine
+//! store (`crate::state`); this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +194,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAssetModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAssetModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAssetModel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAssetModelError::Modeled(
+                DescribeAssetModelErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let store = state.lock();
+        // The label is either the raw UUID or the `externalId:<externalId>` alias form.
+        let id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| not_found(&input.asset_model_id))?;
+        let record = store
+            .asset_models
+            .get(&id)
+            .ok_or_else(|| not_found(&input.asset_model_id))?;
+
+        // `excludeProperties` asks for the model without its property definitions, so
+        // it blanks a composite model's own properties as well as the top-level list:
+        // a caller that asked not to be sent property definitions must not receive
+        // them by the composite-model route.
+        let composite_models = (!record.composite_models.is_empty()).then(|| {
+            record
+                .composite_models
+                .iter()
+                .map(|composite| AssetModelCompositeModel {
+                    properties: if input.exclude_properties {
+                        None
+                    } else {
+                        composite.properties.clone()
+                    },
+                    ..composite.clone()
+                })
+                .collect()
+        });
+        // The summaries are the SAME stored composite models, viewed by id/name/type
+        // and their path from the model root (one segment: the composite model itself,
+        // since a top-level composite model has no parent). Derived here rather than
+        // withheld, so the two views of one stored list cannot disagree.
+        let composite_model_summaries = (!record.composite_models.is_empty()).then(|| {
+            record
+                .composite_models
+                .iter()
+                .map(|composite| AssetModelCompositeModelSummary {
+                    id: composite.id.clone().unwrap_or_default(),
+                    external_id: composite.external_id.clone(),
+                    name: composite.name.clone(),
+                    r#type: composite.r#type.clone(),
+                    description: composite.description.clone(),
+                    path: Some(vec![AssetModelCompositeModelPathSegment {
+                        id: composite.id.clone(),
+                        name: Some(composite.name.clone()),
+                    }]),
+                })
+                .collect()
+        });
+
+        Ok(DescribeAssetModelOutput {
+            asset_model_id: record.id.clone(),
+            asset_model_external_id: record.external_id.clone(),
+            asset_model_arn: record.arn.clone(),
+            asset_model_name: record.name.clone(),
+            asset_model_type: Some(record.model_type.clone()),
+            asset_model_description: record.description.clone().unwrap_or_default(),
+            // `excludeProperties` asks for the model without its property definitions.
+            asset_model_properties: if input.exclude_properties {
+                Vec::new()
+            } else {
+                record.properties.clone()
+            },
+            asset_model_hierarchies: record.hierarchies.clone(),
+            asset_model_composite_models: composite_models,
+            asset_model_composite_model_summaries: composite_model_summaries,
+            asset_model_creation_date: crate::state::to_date_time(record.creation_date),
+            asset_model_last_update_date: crate::state::to_date_time(record.last_update_date),
+            asset_model_status: record.status(now),
+            asset_model_version: Some(record.version.to_string()),
+            interface_details: None,
+            e_tag: None,
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the label that resolved to nothing.
+fn not_found(label: &str) -> DescribeAssetModelError {
+    DescribeAssetModelError::Modeled(DescribeAssetModelErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: format!("The asset model {label} could not be found."),
+        },
+    ))
 }

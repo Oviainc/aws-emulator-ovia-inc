@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssetModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssetModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssetModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation mints and stores an asset model in the shared engine
+//! store (`crate::state`); this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -217,18 +210,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssetModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssetModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssetModel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssetModelError::Modeled(CreateAssetModelErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `assetModelType` is optional and defaults to ASSET_MODEL.
+        let model_type = input
+            .asset_model_type
+            .clone()
+            .unwrap_or_else(|| "ASSET_MODEL".to_string());
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> created-id mapping, so a retry with the same token mints a second
+        // asset model rather than replaying the first answer. Deliberately left to the
+        // idempotency issue rather than half-done here; nothing is fabricated for it.
+        let mut store = state.lock();
+
+        // The store is bounded: a create is the only thing that adds an asset model
+        // and nothing evicts one, so past the cap this is a quota refusal.
+        if store.asset_models.len() >= crate::state::MAX_ASSET_MODELS {
+            return Err(CreateAssetModelError::Modeled(
+                CreateAssetModelErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} asset models.",
+                        crate::state::MAX_ASSET_MODELS
+                    ),
+                }),
+            ));
+        }
+
+        // A caller-supplied id must be globally unique; an absent one is minted.
+        let asset_model_id = match input.asset_model_id.clone() {
+            Some(id) => {
+                if store.asset_models.contains_key(&id) {
+                    return Err(already_exists(&region, &id));
+                }
+                id
+            }
+            None => loop {
+                let candidate = crate::state::new_id();
+                if !store.asset_models.contains_key(&candidate) {
+                    break candidate;
+                }
+            },
+        };
+
+        // `assetModelExternalId` must be unique within the account.
+        if let Some(external) = input.asset_model_external_id.as_deref() {
+            if let Some(existing) = store.asset_model_external_ids.get(external).cloned() {
+                return Err(already_exists(&region, &existing));
+            }
+        }
+
+        let properties =
+            convert_property_definitions(input.asset_model_properties.as_deref().unwrap_or(&[]))?;
+
+        // Each hierarchy names the asset model whose assets may be children of this
+        // one's; that model has to exist.
+        let mut hierarchies = Vec::new();
+        for definition in input.asset_model_hierarchies.as_deref().unwrap_or(&[]) {
+            let child = store
+                .resolve_asset_model_id(&definition.child_asset_model_id)
+                .ok_or_else(|| {
+                    CreateAssetModelError::Modeled(
+                        CreateAssetModelErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: format!(
+                                    "The child asset model {} could not be found.",
+                                    definition.child_asset_model_id
+                                ),
+                            },
+                        ),
+                    )
+                })?;
+            hierarchies.push(AssetModelHierarchy {
+                id: Some(definition.id.clone().unwrap_or_else(crate::state::new_id)),
+                external_id: definition.external_id.clone(),
+                name: definition.name.clone(),
+                child_asset_model_id: child,
+            });
+        }
+
+        let mut composite_models = Vec::new();
+        for definition in input.asset_model_composite_models.as_deref().unwrap_or(&[]) {
+            // A definition that carried no `properties` stays absent rather than
+            // becoming an empty list, so `DescribeAssetModel` reports it as it arrived.
+            let properties = match definition.properties.as_deref() {
+                Some(definitions) => Some(convert_property_definitions(definitions)?),
+                None => None,
+            };
+            composite_models.push(AssetModelCompositeModel {
+                id: Some(definition.id.clone().unwrap_or_else(crate::state::new_id)),
+                external_id: definition.external_id.clone(),
+                name: definition.name.clone(),
+                description: definition.description.clone(),
+                r#type: definition.r#type.clone(),
+                properties,
+            });
+        }
+
+        let record = crate::state::AssetModelRecord {
+            id: asset_model_id.clone(),
+            external_id: input.asset_model_external_id.clone(),
+            arn: crate::state::asset_model_arn(&region, &asset_model_id),
+            name: input.asset_model_name.clone(),
+            description: input.asset_model_description.clone(),
+            model_type,
+            properties,
+            hierarchies,
+            composite_models,
+            creation_date: now,
+            last_update_date: now,
+            // The CREATING -> ACTIVE transition the clock owes. Stored, never slept on.
+            active_at: now + crate::state::ACTIVATION_DELAY,
+            version: 1,
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreateAssetModelOutput {
+            asset_model_id: record.id.clone(),
+            asset_model_arn: record.arn.clone(),
+            asset_model_status: record.status(now),
+        };
+
+        if let Some(external) = record.external_id.clone() {
+            store
+                .asset_model_external_ids
+                .insert(external, record.id.clone());
+        }
+        store.asset_models.insert(record.id.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// HTTP 409 `ResourceAlreadyExistsException` naming the colliding asset model.
+fn already_exists(region: &str, asset_model_id: &str) -> CreateAssetModelError {
+    CreateAssetModelError::Modeled(CreateAssetModelErrorModeled::ResourceAlreadyExistsException(
+        ResourceAlreadyExistsException {
+            message: format!("The asset model {asset_model_id} already exists."),
+            resource_id: asset_model_id.to_string(),
+            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+        },
+    ))
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateAssetModelError {
+    CreateAssetModelError::Modeled(CreateAssetModelErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
+}
+
+/// Turn `AssetModelPropertyDefinition`s into the stored `AssetModelProperty`s,
+/// minting an id for every definition that did not supply one.
+///
+/// Two rules the shapes' own documentation states are enforced here: a property
+/// definition carries exactly ONE property type ("You can only specify one type in
+/// a property definition"), and a `STRUCT` property also carries `dataTypeSpec`
+/// ("This parameter is required on properties that have the STRUCT data type").
+fn convert_property_definitions(
+    definitions: &[AssetModelPropertyDefinition],
+) -> Result<Vec<AssetModelProperty>, CreateAssetModelError> {
+    let mut properties = Vec::with_capacity(definitions.len());
+    for definition in definitions {
+        let kinds = [
+            definition.r#type.attribute.is_some(),
+            definition.r#type.measurement.is_some(),
+            definition.r#type.transform.is_some(),
+            definition.r#type.metric.is_some(),
+        ]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+        if kinds != 1 {
+            return Err(invalid_request(format!(
+                "The property definition {} must specify exactly one property type \
+                 (attribute, measurement, transform or metric), but specifies {kinds}.",
+                definition.name
+            )));
+        }
+        if definition.data_type == "STRUCT" && definition.data_type_spec.is_none() {
+            return Err(invalid_request(format!(
+                "The property definition {} has the STRUCT data type, so dataTypeSpec is required.",
+                definition.name
+            )));
+        }
+        properties.push(AssetModelProperty {
+            id: Some(definition.id.clone().unwrap_or_else(crate::state::new_id)),
+            external_id: definition.external_id.clone(),
+            name: definition.name.clone(),
+            data_type: definition.data_type.clone(),
+            data_type_spec: definition.data_type_spec.clone(),
+            unit: definition.unit.clone(),
+            r#type: definition.r#type.clone(),
+            path: None,
+        });
+    }
+    Ok(properties)
 }
