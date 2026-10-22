@@ -148,7 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let removed = store.apps.remove(&input.app_id).ok_or_else(|| {
             DeleteAppErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("App {} not found", input.app_id)),
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
             })
         })?;
 

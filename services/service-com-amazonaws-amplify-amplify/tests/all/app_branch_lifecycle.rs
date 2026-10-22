@@ -34,31 +34,42 @@ const ACCOUNT_ID: &str = "000000000000";
 const REGION: &str = "us-east-1";
 
 /// One response, reduced to what a client branches on.
+///
+/// `pub(crate)` so a sibling suite in this test target (`tests/all/*.rs`) can drive the
+/// same wire path through this harness instead of cloning it.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_code: Option<String>,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The `app` / `branch` member of a success body.
-    fn member(&self, name: &str) -> Value {
+    pub(crate) fn member(&self, name: &str) -> Value {
         self.body
             .get(name)
             .cloned()
             .unwrap_or_else(|| panic!("response has no `{name}` member: {:?}", self.body))
     }
+
+    /// The `message` member of an error body, when it carries one.
+    pub(crate) fn message(&self) -> Option<String> {
+        self.body
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
 }
 
 /// The emulator under test: ONE shared engine with the Amplify service mounted on
 /// it, reached the way the production router reaches it.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -66,7 +77,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(value).expect("a request body serializes")
         });
@@ -98,39 +109,48 @@ impl Emulator {
         }
     }
 
-    async fn create_app(&self, request: &Value) -> Reply {
+    pub(crate) async fn create_app(&self, request: &Value) -> Reply {
         self.call("POST", "/apps", Some(request)).await
     }
 
-    async fn get_app(&self, app_id: &str) -> Reply {
+    pub(crate) async fn get_app(&self, app_id: &str) -> Reply {
         self.call("GET", &format!("/apps/{app_id}"), None).await
     }
 
-    async fn delete_app(&self, app_id: &str) -> Reply {
+    pub(crate) async fn delete_app(&self, app_id: &str) -> Reply {
         self.call("DELETE", &format!("/apps/{app_id}"), None).await
     }
 
-    async fn list_apps(&self, query: &str) -> Reply {
+    pub(crate) async fn list_apps(&self, query: &str) -> Reply {
         self.call("GET", &format!("/apps{query}"), None).await
     }
 
-    async fn create_branch(&self, app_id: &str, request: &Value) -> Reply {
+    pub(crate) async fn create_branch(&self, app_id: &str, request: &Value) -> Reply {
         self.call("POST", &format!("/apps/{app_id}/branches"), Some(request))
             .await
     }
 
-    async fn get_branch(&self, app_id: &str, branch_name: &str) -> Reply {
+    pub(crate) async fn get_branch(&self, app_id: &str, branch_name: &str) -> Reply {
         self.call("GET", &format!("/apps/{app_id}/branches/{branch_name}"), None)
             .await
     }
 
-    async fn list_branches(&self, app_id: &str, query: &str) -> Reply {
+    pub(crate) async fn delete_branch(&self, app_id: &str, branch_name: &str) -> Reply {
+        self.call(
+            "DELETE",
+            &format!("/apps/{app_id}/branches/{branch_name}"),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_branches(&self, app_id: &str, query: &str) -> Reply {
         self.call("GET", &format!("/apps/{app_id}/branches{query}"), None)
             .await
     }
 
     /// Create an app and return its minted `appId`.
-    async fn app_id_of_new_app(&self, name: &str) -> String {
+    pub(crate) async fn app_id_of_new_app(&self, name: &str) -> String {
         let reply = self.create_app(&json!({ "name": name })).await;
         assert_eq!(reply.status, 200, "CreateApp {name}: {:?}", reply);
         string_member(&reply.member("app"), "appId")
@@ -147,7 +167,7 @@ fn is_modelled_app_id(candidate: &str) -> bool {
         && rest.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
 }
 
-fn string_member(record: &Value, member: &str) -> String {
+pub(crate) fn string_member(record: &Value, member: &str) -> String {
     record
         .get(member)
         .and_then(Value::as_str)
@@ -162,7 +182,7 @@ fn bool_member(record: &Value, member: &str) -> bool {
         .unwrap_or_else(|| panic!("member `{member}` is not a boolean in {record:?}"))
 }
 
-fn list_member<'a>(record: &'a Value, member: &str) -> &'a Vec<Value> {
+pub(crate) fn list_member<'a>(record: &'a Value, member: &str) -> &'a Vec<Value> {
     record
         .get(member)
         .and_then(Value::as_array)

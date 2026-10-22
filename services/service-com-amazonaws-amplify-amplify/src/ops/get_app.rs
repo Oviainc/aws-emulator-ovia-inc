@@ -148,7 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|stored| stored.app.clone())
             .ok_or_else(|| {
                 GetAppErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!("App {} not found", input.app_id)),
+                    message: Some(crate::state::not_found_message(
+                        crate::state::APP_ENTITY,
+                        &input.app_id,
+                    )),
                 })
             })?;
 

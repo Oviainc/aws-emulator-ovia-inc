@@ -143,18 +143,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A pure read. The branch is looked up INSIDE its app, so a branch name that
-        // exists on another app is not found here.
+        // exists on another app is not found here. The 404 names the entity that is
+        // actually absent: the app when the app itself is unknown, otherwise the branch.
         let store = state.lock();
-        let branch = store
-            .apps
-            .get(&input.app_id)
-            .and_then(|app| app.branches.get(&input.branch_name))
+        let app = store.apps.get(&input.app_id).ok_or_else(|| {
+            GetBranchErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        })?;
+        let branch = app
+            .branches
+            .get(&input.branch_name)
             .cloned()
             .ok_or_else(|| {
                 GetBranchErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Branch {} not found on app {}",
-                        input.branch_name, input.app_id
+                    message: Some(crate::state::not_found_message(
+                        crate::state::BRANCH_ENTITY,
+                        &input.branch_name,
                     )),
                 })
             })?;

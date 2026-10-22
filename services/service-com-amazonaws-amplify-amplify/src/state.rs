@@ -175,6 +175,25 @@ pub fn page<T>(
     (records, None)
 }
 
+/// The `message` an Amplify `NotFoundException` carries for a resource the request
+/// addressed and this store does not hold.
+///
+/// The text is built FROM THE REQUEST and is a complete sentence: the kind of entity,
+/// the identifier the request used for it, and `not found` closed by the
+/// sentence-terminating period. Every 404 in this crate is formatted through this one
+/// function, so `GetApp`, `DeleteApp`, `GetBranch`, `DeleteBranch`, `CreateBranch` and
+/// `ListBranches` cannot drift from one another — and an identifier is NEVER inspected
+/// here, so the message is the same construction whatever the request named.
+pub fn not_found_message(entity: &str, identifier: &str) -> String {
+    format!("{entity} {identifier} not found.")
+}
+
+/// The entity name [`not_found_message`] uses for an app addressed by `appId`.
+pub const APP_ENTITY: &str = "App";
+
+/// The entity name [`not_found_message`] uses for a branch addressed by `branchName`.
+pub const BRANCH_ENTITY: &str = "Branch";
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

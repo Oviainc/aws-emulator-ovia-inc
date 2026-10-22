@@ -203,7 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than an app created on the way.
         let app = store.apps.get_mut(&input.app_id).ok_or_else(|| {
             CreateBranchErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("App {} not found", input.app_id)),
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
             })
         })?;
 
