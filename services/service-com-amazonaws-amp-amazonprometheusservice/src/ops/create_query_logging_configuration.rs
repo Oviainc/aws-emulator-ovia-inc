@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQueryLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQueryLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists the workspace's one query logging configuration and answers
+//! from the PERSISTED record. The configuration starts in `CREATING` and the clock
+//! owes its move to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]); `clientToken` makes
+//! the call idempotent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQueryLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +150,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQueryLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQueryLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQueryLoggingConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateQueryLoggingConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the workspace store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // `workspaceId` names the configuration's parent resource ("Creates a query
+        // logging configuration for the specified workspace"), and
+        // `ResourceNotFoundException` is the modelled refusal for a request that
+        // "references a resources that doesn't exist".
+        if !store.workspaces.contains_key(&input.workspace_id) {
+            return Err(
+                CreateQueryLoggingConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Workspace not found: {}", input.workspace_id),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if let Some(existing) = store.query_logging.get(&input.workspace_id) {
+            // `clientToken` carries `@idempotencyToken`: replaying the very call that
+            // created this configuration is that same call, so it answers from the
+            // stored record instead of creating or refusing anything — however many
+            // updates have happened since.
+            if input.client_token.is_some() && existing.create_token == input.client_token {
+                return Ok(CreateQueryLoggingConfigurationOutput {
+                    status: crate::state::query_logging_status(existing),
+                });
+            }
+
+            // A workspace holds at most ONE query logging configuration — which is why
+            // `DescribeQueryLoggingConfiguration` finds one by `workspaceId` alone and
+            // `UpdateQueryLoggingConfiguration` exists to change it. Creating a second
+            // one is not a request this service can satisfy, and the only refusal it
+            // models for it is `ValidationException` (400): this operation declares no
+            // `ConflictException`.
+            return Err(
+                CreateQueryLoggingConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "a query logging configuration already exists for workspace {}; \
+                             use UpdateQueryLoggingConfiguration to change it",
+                            input.workspace_id,
+                        ),
+                        // No single field is at fault — the request conflicts with the
+                        // workspace's state — so the reason is the modelled `OTHER`.
+                        reason: "OTHER".to_string(),
+                        field_list: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let configuration = crate::state::QueryLoggingConfiguration {
+            workspace_id: input.workspace_id.clone(),
+            // The configuration is being created; the clock owes its move to `ACTIVE`
+            // at `transition_due`.
+            status_code: crate::state::QUERY_LOGGING_STATUS_CREATING.to_string(),
+            // "If there is a failure, the reason for the failure" — nothing failed.
+            status_reason: None,
+            destinations: crate::state::stored_query_logging_destinations(&input.destinations),
+            created_at: now,
+            modified_at: now,
+            transition_due: Some(now + crate::state::TRANSITION_DELAY),
+            create_token: input.client_token.clone(),
+            client_token: input.client_token,
+        };
+
+        let response = CreateQueryLoggingConfigurationOutput {
+            status: crate::state::query_logging_status(&configuration),
+        };
+        store.query_logging.insert(input.workspace_id, configuration);
+        Ok(response)
     }
 }
