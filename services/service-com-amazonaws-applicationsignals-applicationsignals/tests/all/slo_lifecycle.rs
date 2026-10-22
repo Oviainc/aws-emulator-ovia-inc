@@ -22,10 +22,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=0000";
 
 /// The region in [`AUTHORIZATION`], which every minted ARN must name.
-const REGION: &str = "eu-west-2";
+pub(crate) const REGION: &str = "eu-west-2";
 
 /// The canonical emulator account id every ARN carries (`engine::emulator_account_id`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A router with just this service mounted on a fresh engine.
 ///
@@ -65,7 +65,7 @@ pub(crate) async fn call(router: &MultiServiceRouter, method: &str, uri: &str, b
 }
 
 /// A period-based `SliConfig` on an Application Signals service operation.
-fn sli_config(service_name: &str, operation: &str, threshold: f64) -> Value {
+pub(crate) fn sli_config(service_name: &str, operation: &str, threshold: f64) -> Value {
     json!({
         "SliMetricConfig": {
             "KeyAttributes": { "Type": "Service", "Name": service_name, "Environment": "prod" },
@@ -1192,7 +1192,8 @@ async fn delete_removes_the_record_and_a_missing_id_is_not_found() {
     );
 
     // Every id that names no stored SLO is a 404 — the deleted ones and one that never
-    // existed, by name and by ARN.
+    // existed, by name and by ARN. Whichever form the id took, the failure identifies the
+    // SLO by its ARN; `tests/all/error_identity.rs` asserts that rule over more inputs.
     let missing = [
         ("gone-by-name".to_string(), name_path_segment("gone-by-name")),
         (by_arn, arn_path_segment("gone-by-arn")),
@@ -1203,6 +1204,11 @@ async fn delete_removes_the_record_and_a_missing_id_is_not_found() {
         ),
     ];
     for (id, encoded) in &missing {
+        let arn = if id.starts_with("arn:") {
+            id.clone()
+        } else {
+            format!("arn:aws:application-signals:{REGION}:{ACCOUNT}:slo/{id}")
+        };
         for (method, body) in [
             ("GET", None),
             ("PATCH", Some(json!({ "Description": "x" }))),
@@ -1215,8 +1221,8 @@ async fn delete_removes_the_record_and_a_missing_id_is_not_found() {
             );
             assert_eq!(
                 error["ResourceId"].as_str(),
-                Some(id.as_str()),
-                "case {id:?}: expected the failure to name the requested id, got {error}"
+                Some(arn.as_str()),
+                "case {id:?}: expected the failure to identify the SLO by its ARN {arn:?}, got {error}"
             );
         }
     }
@@ -1240,7 +1246,7 @@ pub(crate) fn name_path_segment(name: &str) -> String {
 /// path segment cannot carry `/` (it would split the segment), and `:` is written `%3A`
 /// beside it for symmetry. The unescaped form is what the test asserts the service RETURNS;
 /// this is only how it is spelled in a request line.
-fn arn_path_segment(name: &str) -> String {
+pub(crate) fn arn_path_segment(name: &str) -> String {
     format!(
         "arn%3Aaws%3Aapplication-signals%3A{REGION}%3A{ACCOUNT}%3Aslo%2F{}",
         name_path_segment(name)

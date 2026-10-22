@@ -41,9 +41,70 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with: the modelled
+/// `ValidationException` (`smithy_query(shape="ValidationException")`: `@error client`,
+/// `@httpError 400`), which is also the code the framework would have chosen — restated
+/// here because `override_refusal` replaces the code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// Render one constraint violation the way this service states it: the member path and the
+/// requirement it violated, and NOTHING of the value that was rejected.
+///
+/// `None` for a violation class this service has no wording for, which lets
+/// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
+/// rather than invent a sentence ([`ViolationKind`] is `#[non_exhaustive]`).
+fn constraint_clause(violation: &Violation) -> Option<String> {
+    let requirement = match &violation.kind {
+        // An absent member is stated as the null it was, by the one builder that words it.
+        ViolationKind::MissingRequiredMember => {
+            return Some(crate::state::absent_member_clause(&violation.path))
+        }
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        // The requirement reported is the expression itself, without the `^` / `$` the
+        // model spells it with: the constraint stated is the expression a value must
+        // satisfy, not the anchoring the model uses to make the match total.
+        ViolationKind::Pattern(pattern) => format!(
+            "Member must satisfy regular expression pattern: {}",
+            crate::state::unanchored(pattern)
+        ),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return None,
+    };
+    Some(crate::state::constraint_clause(&violation.path, &requirement))
+}
+
+/// The `ValidationException` message for a refusal: the AWS envelope
+/// (`N validation error(s) detected: `) over one clause per violation, joined by `; `.
+///
+/// `None` declines the whole refusal — see [`constraint_clause`].
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(constraint_clause)
+        .collect::<Option<Vec<_>>>()?;
+    if clauses.is_empty() {
+        return None;
+    }
+    Some(crate::state::validation_envelope(&clauses))
+}
 
 /// The `com-amazonaws-applicationsignals-applicationsignals` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +159,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Application Signals states a constraint violation WITHOUT the value that
+        // violated it, and states a `@pattern` requirement as the expression the model
+        // declares minus its anchors. The code stays the modelled `ValidationException`
+        // (HTTP 400), which is what the framework would have answered — only the wording
+        // changes.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
