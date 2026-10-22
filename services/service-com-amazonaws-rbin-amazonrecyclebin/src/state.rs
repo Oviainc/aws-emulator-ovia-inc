@@ -8,7 +8,7 @@
 //! key order, and its `NextToken` is the last identifier it returned, so a page
 //! boundary stays stable while rules are added or removed.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
@@ -40,6 +40,35 @@ pub const MAX_PAGE_SIZE: usize = 1000;
 /// cap. It also keeps the store from growing for the process's whole lifetime on
 /// nothing but repeated `CreateRule` calls.
 pub const MAX_RULES: usize = 1000;
+
+/// The number of tags one retention rule may carry, after which assigning more is
+/// refused with the modelled `ServiceQuotaExceededException` ("The request would
+/// cause a service quota for the number of tags per resource to be exceeded").
+///
+/// AWS General Reference, "Tag naming limits and requirements": "Maximum number of
+/// tags per resource — 50". Recycle Bin publishes no higher figure of its own, and the
+/// model's `TagList` bound of 200 limits one REQUEST, not the rule's total.
+///
+/// BOTH operations that can put a rule over it are held to it — `CreateRule`, which
+/// models `ServiceQuotaExceededException` too, and `TagResource` — so no sequence of
+/// calls can leave a rule carrying more tags than the quota allows.
+pub const MAX_TAGS_PER_RULE: usize = 50;
+
+/// Assign `tags` to the tag list `held`, keyed by tag key.
+///
+/// A key already present takes the new value IN PLACE, and a key that is not present is
+/// appended, so a rule holds at most one tag per key and the order it reports them in
+/// is assignment order. A request naming the same key twice therefore ends with the
+/// last value it gave for that key. Shared by `CreateRule` and `TagResource`, which
+/// assign a rule's tags the same way.
+pub fn upsert_tags(held: &mut Vec<Tag>, tags: Vec<Tag>) {
+    for tag in tags {
+        match held.iter_mut().find(|present| present.key == tag.key) {
+            Some(present) => present.value = tag.value,
+            None => held.push(tag),
+        }
+    }
+}
 
 /// Seconds in one day. `UnlockDelayUnit` models exactly one unit — "The unit of
 /// time in which to measure the unlock delay. Currently, the unlock delay can be
@@ -109,6 +138,26 @@ impl Rule {
         }
     }
 
+    /// Assign `tags` to the rule, as [`upsert_tags`] defines assigning.
+    pub fn apply_tags(&mut self, tags: Vec<Tag>) {
+        upsert_tags(&mut self.tags, tags);
+    }
+
+    /// How many tags the rule would carry once `tags` were assigned — the size of the
+    /// union of the keys it holds and the keys `tags` names, since assignment replaces
+    /// a key's value rather than adding a second tag for it.
+    pub fn tag_count_after(&self, tags: &[Tag]) -> usize {
+        let mut keys: BTreeSet<&str> = self.tags.iter().map(|tag| tag.key.as_str()).collect();
+        keys.extend(tags.iter().map(|tag| tag.key.as_str()));
+        keys.len()
+    }
+
+    /// Unassign every tag whose key appears in `keys`. A key the rule does not carry is
+    /// ignored, so unassigning is idempotent.
+    pub fn remove_tags(&mut self, keys: &[String]) {
+        self.tags.retain(|tag| !keys.contains(&tag.key));
+    }
+
     /// Materialise the lock transition the CLOCK has already made due: a
     /// `pending_unlock` rule whose unlock delay has expired is `unlocked`, and it
     /// no longer reports a lock end time ("Only returned for retention rules that
@@ -124,6 +173,7 @@ impl Rule {
             self.lock_end_time = None;
         }
     }
+
     /// Whether every tag in `filter` appears among the rule's resource tags. An
     /// empty filter selects every rule.
     pub fn has_resource_tags(&self, filter: &[ResourceTag]) -> bool {
@@ -222,6 +272,13 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
     pub fn rule_by_arn(&self, rule_arn: &str) -> Option<&Rule> {
         let identifier = self.arn_index.get(rule_arn)?;
         self.rules.get(identifier)
+    }
+
+    /// The rule an ARN addresses, for modification — the write-side twin of
+    /// [`Self::rule_by_arn`], used by the ARN-addressed tag operations.
+    pub fn rule_by_arn_mut(&mut self, rule_arn: &str) -> Option<&mut Rule> {
+        let identifier = self.arn_index.get(rule_arn)?.clone();
+        self.rules.get_mut(&identifier)
     }
 
     /// The rules to walk for a page, starting after `after` when a `NextToken`
