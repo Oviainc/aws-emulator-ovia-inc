@@ -1,0 +1,780 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The `DBInstance` envelope every DB instance operation answers with.
+//!
+//! One rule is under test: an operation that answers with a `DBInstance` projects
+//! EVERY modelled member the service holds state for — from the stored record or from
+//! the default the record was created with — and the three envelopes that carry a
+//! DBInstance (`CreateDBInstance`, `DescribeDBInstances`, `DeleteDBInstance`) project
+//! the same record, so none of them can report less than another.
+//!
+//! The tables below span what the rule generalises over rather than one recorded
+//! instance: the engine families whose default parameter group, option group and
+//! license model differ; the four ways an `EngineVersion` resolves against the
+//! engine-version catalogue (absent, exact, a major version, a version inside a major
+//! version the catalogue publishes) plus the values it refuses; both branches of the
+//! `StorageThroughput` and `DbInstancePort` rules; and, for every member that has a
+//! documented default, the supplied value as well as the default.
+//!
+//! Every call goes over the wire through the same `MultiServiceRouter` the production
+//! router uses, and every assertion reads the XML the emulator answered with.
+
+use std::thread::sleep;
+use std::time::Duration;
+
+use service_com_amazonaws_rds_amazonrdsv19::state::STATUS_TRANSITION_DELAY;
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::db_instances::{call, emulator, expect_error, expect_ok, optional_text, subtrees, text};
+
+/// How long a test waits before expecting the `creating` → `available` transition this
+/// service owes to have settled: the span itself plus slack for a loaded test machine.
+fn wait_for_settle() {
+    sleep(STATUS_TRANSITION_DELAY + Duration::from_millis(200));
+}
+
+/// The one `<DBInstance>` subtree of a response.
+fn the_instance(case: &str, xml: &str) -> String {
+    let found = subtrees(xml, "DBInstance");
+    assert_eq!(
+        found.len(),
+        1,
+        "case {case:?}: expected exactly one DBInstance, got {} in {xml}",
+        found.len()
+    );
+    found.into_iter().next().expect("checked just above")
+}
+
+/// `CreateDBInstance` with its three required members plus `extra`, as the
+/// `<DBInstance>` the create envelope carries.
+async fn create_instance(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    engine: &str,
+    extra: &[(&str, &str)],
+) -> String {
+    let mut params: Vec<(&str, String)> = vec![
+        ("DBInstanceIdentifier", identifier.to_string()),
+        ("Engine", engine.to_string()),
+        ("DBInstanceClass", "db.t3.medium".to_string()),
+    ];
+    params.extend(
+        extra
+            .iter()
+            .map(|(name, value)| (*name, (*value).to_string())),
+    );
+    let body = expect_ok(case, call(router, "CreateDBInstance", &params).await);
+    the_instance(case, &body)
+}
+
+/// `DescribeDBInstances` for one identifier, as the one `<DBInstance>` it reports.
+async fn describe_instance(router: &MultiServiceRouter, case: &str, identifier: &str) -> String {
+    let body = expect_ok(
+        case,
+        call(
+            router,
+            "DescribeDBInstances",
+            &[("DBInstanceIdentifier", identifier.to_string())],
+        )
+        .await,
+    );
+    the_instance(case, &body)
+}
+
+/// `DeleteDBInstance` without a final snapshot, as the `<DBInstance>` it answers with.
+async fn delete_instance(router: &MultiServiceRouter, case: &str, identifier: &str) -> String {
+    let body = expect_ok(
+        case,
+        call(
+            router,
+            "DeleteDBInstance",
+            &[
+                ("DBInstanceIdentifier", identifier.to_string()),
+                ("SkipFinalSnapshot", "true".to_string()),
+            ],
+        )
+        .await,
+    );
+    the_instance(case, &body)
+}
+
+/// Assert one scalar member of an envelope.
+fn assert_member(case: &str, envelope: &str, instance: &str, member: &str, expected: &str) {
+    let actual = optional_text(instance, member);
+    assert_eq!(
+        actual.as_deref(),
+        Some(expected),
+        "case {case:?}: the {envelope} envelope must report {member} as {expected:?}, \
+         got {actual:?}"
+    );
+}
+
+/// Assert that an envelope carries exactly one `<element>` — the check an EMPTY list or
+/// an empty structure needs, which carries no text of its own.
+fn assert_element_present(case: &str, envelope: &str, instance: &str, element: &str) {
+    let found = subtrees(instance, element);
+    assert_eq!(
+        found.len(),
+        1,
+        "case {case:?}: the {envelope} envelope must report exactly one {element} \
+         element, got {found:?}"
+    );
+}
+
+/// The year of an ISO-8601 timestamp the emulator reported.
+fn year_of(case: &str, member: &str, value: &str) -> i32 {
+    value
+        .get(..4)
+        .and_then(|year| year.parse().ok())
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: {member} must be an ISO-8601 timestamp, got {value:?}")
+        })
+}
+
+/// One row of the engine table: an engine, the `EngineVersion` the request names (if
+/// any), and what the service must report having provisioned for it.
+struct EngineCase {
+    case: &'static str,
+    identifier: &'static str,
+    engine: &'static str,
+    /// `EngineVersion` as the request names it, or `None` when it names none.
+    requested_version: Option<&'static str>,
+    /// The catalogue version the service provisioned.
+    engine_version: &'static str,
+    /// `default.` + that version's DB parameter group family.
+    db_parameter_group: &'static str,
+    /// `default:<engine>-<major engine version>`, the version's dots as hyphens.
+    option_group: &'static str,
+    /// The license model of the engine, from the value list
+    /// `CreateDBInstanceMessage$LicenseModel` publishes.
+    license_model: &'static str,
+    /// The engine's default port.
+    port: &'static str,
+}
+
+/// The engines this table spans: one per documented license-model row, one per
+/// parameter-group-family shape (`mysql8.4`, `postgres16`, `sqlserver-ee-16.0`,
+/// `oracle-se2-19`, `db2-se-11.5`), and the four ways an `EngineVersion` resolves.
+const ENGINE_CASES: &[EngineCase] = &[
+    EngineCase {
+        case: "mysql, no version named",
+        identifier: "emu-env-mysql-default",
+        engine: "mysql",
+        requested_version: None,
+        engine_version: "8.4.4",
+        db_parameter_group: "default.mysql8.4",
+        option_group: "default:mysql-8-4",
+        license_model: "general-public-license",
+        port: "3306",
+    },
+    EngineCase {
+        case: "mysql, a version inside a published major version",
+        identifier: "emu-env-mysql-8-0-99",
+        engine: "mysql",
+        requested_version: Some("8.0.99"),
+        engine_version: "8.0.40",
+        db_parameter_group: "default.mysql8.0",
+        option_group: "default:mysql-8-0",
+        license_model: "general-public-license",
+        port: "3306",
+    },
+    EngineCase {
+        case: "postgres, a major version named",
+        identifier: "emu-env-postgres-16",
+        engine: "postgres",
+        requested_version: Some("16"),
+        engine_version: "16.4",
+        db_parameter_group: "default.postgres16",
+        option_group: "default:postgres-16",
+        license_model: "postgresql-license",
+        port: "5432",
+    },
+    EngineCase {
+        case: "mariadb, an exact version named",
+        identifier: "emu-env-mariadb-11-4-4",
+        engine: "mariadb",
+        requested_version: Some("11.4.4"),
+        engine_version: "11.4.4",
+        db_parameter_group: "default.mariadb11.4",
+        option_group: "default:mariadb-11-4",
+        license_model: "general-public-license",
+        port: "3306",
+    },
+    EngineCase {
+        case: "sqlserver-ee, a major version whose form carries two digits",
+        identifier: "emu-env-sqlserver-ee-16",
+        engine: "sqlserver-ee",
+        requested_version: Some("16.00"),
+        engine_version: "16.00.4165.4.v1",
+        db_parameter_group: "default.sqlserver-ee-16.0",
+        option_group: "default:sqlserver-ee-16-00",
+        license_model: "license-included",
+        port: "1433",
+    },
+    EngineCase {
+        case: "oracle-se2, no version named",
+        identifier: "emu-env-oracle-se2",
+        engine: "oracle-se2",
+        requested_version: None,
+        engine_version: "19.0.0.0.ru-2024-10.rur-2024-10.r1",
+        db_parameter_group: "default.oracle-se2-19",
+        option_group: "default:oracle-se2-19",
+        license_model: "license-included",
+        port: "1521",
+    },
+    EngineCase {
+        case: "db2-se, no version named",
+        identifier: "emu-env-db2-se",
+        engine: "db2-se",
+        requested_version: None,
+        engine_version: "12.1.0.0",
+        db_parameter_group: "default.db2-se-12.1",
+        option_group: "default:db2-se-12-1",
+        license_model: "bring-your-own-license",
+        port: "50000",
+    },
+    EngineCase {
+        case: "aurora-postgresql, no version named",
+        identifier: "emu-env-aurora-postgresql",
+        engine: "aurora-postgresql",
+        requested_version: None,
+        engine_version: "16.6",
+        db_parameter_group: "default.aurora-postgresql16",
+        option_group: "default:aurora-postgresql-16",
+        license_model: "postgresql-license",
+        port: "5432",
+    },
+];
+
+/// Every member the projection reports for an instance whatever the request named: a
+/// scalar the record always holds, or a list that is EMPTY when the instance has no
+/// such association. `DBSubnetGroup` is NOT among them — only an instance whose
+/// request named a subnet group has one.
+const ALWAYS_PROJECTED: &[&str] = &[
+    "DBInstanceIdentifier",
+    "DBInstanceClass",
+    "Engine",
+    "DBInstanceStatus",
+    "Endpoint",
+    "InstanceCreateTime",
+    "PreferredBackupWindow",
+    "BackupRetentionPeriod",
+    "DBSecurityGroups",
+    "VpcSecurityGroups",
+    "DBParameterGroups",
+    "OptionGroupMemberships",
+    "AvailabilityZone",
+    "PreferredMaintenanceWindow",
+    "PendingModifiedValues",
+    "UpgradeRolloutOrder",
+    "MultiAZ",
+    "EngineVersion",
+    "AutoMinorVersionUpgrade",
+    "ReadReplicaDBInstanceIdentifiers",
+    "LicenseModel",
+    "StorageThroughput",
+    "PubliclyAccessible",
+    "StorageType",
+    "DbInstancePort",
+    "StorageEncrypted",
+    "DbiResourceId",
+    "CACertificateIdentifier",
+    "CertificateDetails",
+    "DomainMemberships",
+    "CopyTagsToSnapshot",
+    "MonitoringInterval",
+    "DBInstanceArn",
+    "IAMDatabaseAuthenticationEnabled",
+    "DatabaseInsightsMode",
+    "PerformanceInsightsEnabled",
+    "DeletionProtection",
+    "AssociatedRoles",
+    "TagList",
+    "CustomerOwnedIpEnabled",
+    "NetworkType",
+    "ActivityStreamStatus",
+    "BackupTarget",
+    "DedicatedLogVolume",
+    "IsStorageConfigUpgradeAvailable",
+    "EngineLifecycleSupport",
+];
+
+/// The defaults every instance in [`ENGINE_CASES`] is created with, since none of their
+/// requests names any of these members. Each value is the one its member documents, or
+/// the only member of the enum that describes an instance nothing configured.
+const DEFAULTS: &[(&str, &str)] = &[
+    ("CACertificateIdentifier", "rds-ca-rsa2048-g1"),
+    ("PreferredBackupWindow", "07:00-07:30"),
+    ("PreferredMaintenanceWindow", "mon:08:00-mon:08:30"),
+    ("MonitoringInterval", "0"),
+    ("PerformanceInsightsEnabled", "false"),
+    ("IAMDatabaseAuthenticationEnabled", "false"),
+    ("DatabaseInsightsMode", "standard"),
+    ("DedicatedLogVolume", "false"),
+    ("CustomerOwnedIpEnabled", "false"),
+    ("NetworkType", "IPV4"),
+    ("BackupTarget", "region"),
+    (
+        "EngineLifecycleSupport",
+        "open-source-rds-extended-support",
+    ),
+    ("ActivityStreamStatus", "stopped"),
+    ("UpgradeRolloutOrder", "second"),
+    ("IsStorageConfigUpgradeAvailable", "false"),
+    // `StorageType` "Default: io1, if the Iops parameter is specified. Otherwise,
+    // gp3", and `StorageThroughput` is the gp3 baseline.
+    ("StorageType", "gp3"),
+    ("StorageThroughput", "125"),
+    // An instance that belongs to no DB cluster has no cluster-member port.
+    ("DbInstancePort", "0"),
+];
+
+#[tokio::test]
+async fn every_db_instance_envelope_projects_the_whole_stored_record() {
+    let router = emulator();
+
+    for row in ENGINE_CASES {
+        let extra: Vec<(&str, &str)> = row
+            .requested_version
+            .map(|version| vec![("EngineVersion", version)])
+            .unwrap_or_default();
+        let created = create_instance(&router, row.case, row.identifier, row.engine, &extra).await;
+        wait_for_settle();
+        let described = describe_instance(&router, row.case, row.identifier).await;
+        // The same record through the third envelope, which answers with the instance
+        // it removed.
+        let deleted = delete_instance(&router, row.case, row.identifier).await;
+
+        for (envelope, instance) in [
+            ("create", &created),
+            ("describe", &described),
+            ("delete", &deleted),
+        ] {
+            for member in ALWAYS_PROJECTED {
+                assert_element_present(row.case, envelope, instance, member);
+            }
+            // A DB subnet group is reported only for an instance whose request named
+            // one, which none of these did.
+            assert!(
+                subtrees(instance, "DBSubnetGroup").is_empty(),
+                "case {:?}: the {envelope} envelope must report no DBSubnetGroup for an \
+                 instance created without one, got {instance}",
+                row.case
+            );
+
+            assert_member(row.case, envelope, instance, "Engine", row.engine);
+            assert_member(
+                row.case,
+                envelope,
+                instance,
+                "EngineVersion",
+                row.engine_version,
+            );
+            assert_member(
+                row.case,
+                envelope,
+                instance,
+                "DBParameterGroupName",
+                row.db_parameter_group,
+            );
+            assert_member(
+                row.case,
+                envelope,
+                instance,
+                "ParameterApplyStatus",
+                "in-sync",
+            );
+            assert_member(
+                row.case,
+                envelope,
+                instance,
+                "OptionGroupName",
+                row.option_group,
+            );
+            assert_member(row.case, envelope, instance, "LicenseModel", row.license_model);
+            assert_member(row.case, envelope, instance, "Port", row.port);
+            for (member, expected) in DEFAULTS {
+                assert_member(row.case, envelope, instance, member, expected);
+            }
+
+            // The server certificate is the one the CA identifier names, and it expires
+            // a year after the instance was created.
+            assert_member(
+                row.case,
+                envelope,
+                instance,
+                "CAIdentifier",
+                "rds-ca-rsa2048-g1",
+            );
+            let created_at = text(instance, "InstanceCreateTime");
+            let valid_till = text(instance, "ValidTill");
+            assert!(
+                valid_till > created_at,
+                "case {:?}: the {envelope} envelope must report a ValidTill after the \
+                 instance was created, got {valid_till:?} and {created_at:?}",
+                row.case
+            );
+            assert_eq!(
+                year_of(row.case, "ValidTill", &valid_till),
+                year_of(row.case, "InstanceCreateTime", &created_at) + 1,
+                "case {:?}: the {envelope} envelope must report a ValidTill one year \
+                 after InstanceCreateTime, got {valid_till:?} and {created_at:?}",
+                row.case
+            );
+
+            // The lists an instance with no such association carries: present and
+            // empty, which is what says it has none.
+            for member in [
+                "DBSecurityGroups",
+                "VpcSecurityGroups",
+                "AssociatedRoles",
+                "DomainMemberships",
+                "ReadReplicaDBInstanceIdentifiers",
+                "TagList",
+            ] {
+                let element = subtrees(instance, member);
+                let reported = element.first().map(String::as_str).unwrap_or_default();
+                assert!(
+                    reported.ends_with("/>") || reported == format!("<{member}></{member}>"),
+                    "case {:?}: the {envelope} envelope must report {member} as an empty \
+                     list, got {reported:?}",
+                    row.case
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_supplied_member_is_reported_from_the_store_rather_than_defaulted() {
+    let router = emulator();
+    let identifier = "emu-env-supplied";
+    // The other branch of every default the table above takes, plus the members whose
+    // values are lists.
+    let supplied: &[(&str, &str)] = &[
+        ("EngineVersion", "8.0.37"),
+        ("DBParameterGroupName", "custom-mysql80"),
+        ("OptionGroupName", "custom-option-group"),
+        ("CACertificateIdentifier", "rds-ca-ecc384-g1"),
+        ("PreferredBackupWindow", "02:00-02:30"),
+        ("PreferredMaintenanceWindow", "wed:03:00-wed:03:30"),
+        ("MonitoringInterval", "60"),
+        ("EnablePerformanceInsights", "true"),
+        ("EnableIAMDatabaseAuthentication", "true"),
+        ("DatabaseInsightsMode", "advanced"),
+        ("DedicatedLogVolume", "true"),
+        ("EnableCustomerOwnedIp", "true"),
+        ("NetworkType", "DUAL"),
+        ("BackupTarget", "outposts"),
+        (
+            "EngineLifecycleSupport",
+            "open-source-rds-extended-support-disabled",
+        ),
+        ("LicenseModel", "general-public-license"),
+        // A non-gp3 storage type provisions no separate throughput.
+        ("StorageType", "gp2"),
+        ("DBSubnetGroupName", "emu-subnets"),
+        ("DBSecurityGroups.DBSecurityGroupName.1", "legacy-one"),
+        ("DBSecurityGroups.DBSecurityGroupName.2", "legacy-two"),
+        ("VpcSecurityGroupIds.VpcSecurityGroupId.1", "sg-00000001"),
+        ("VpcSecurityGroupIds.VpcSecurityGroupId.2", "sg-00000002"),
+        ("Domain", "d-9067d45678"),
+        ("Tags.Tag.1.Key", "team"),
+        ("Tags.Tag.1.Value", "platform"),
+    ];
+    let case = "every member supplied";
+    let created = create_instance(&router, case, identifier, "mysql", supplied).await;
+    wait_for_settle();
+    let described = describe_instance(&router, case, identifier).await;
+
+    for (envelope, instance) in [("create", &created), ("describe", &described)] {
+        for (member, expected) in [
+            ("EngineVersion", "8.0.37"),
+            ("DBParameterGroupName", "custom-mysql80"),
+            ("OptionGroupName", "custom-option-group"),
+            ("CACertificateIdentifier", "rds-ca-ecc384-g1"),
+            ("CAIdentifier", "rds-ca-ecc384-g1"),
+            ("PreferredBackupWindow", "02:00-02:30"),
+            ("PreferredMaintenanceWindow", "wed:03:00-wed:03:30"),
+            ("MonitoringInterval", "60"),
+            ("PerformanceInsightsEnabled", "true"),
+            ("IAMDatabaseAuthenticationEnabled", "true"),
+            ("DatabaseInsightsMode", "advanced"),
+            ("DedicatedLogVolume", "true"),
+            ("CustomerOwnedIpEnabled", "true"),
+            ("NetworkType", "DUAL"),
+            ("BackupTarget", "outposts"),
+            (
+                "EngineLifecycleSupport",
+                "open-source-rds-extended-support-disabled",
+            ),
+            ("StorageType", "gp2"),
+            ("StorageThroughput", "0"),
+            ("DBSubnetGroupName", "emu-subnets"),
+            ("SubnetGroupStatus", "Complete"),
+            ("Domain", "d-9067d45678"),
+        ] {
+            assert_member(case, envelope, instance, member, expected);
+        }
+        // The membership lists carry one entry per supplied name, each with the status
+        // of a membership that is in effect.
+        let security_groups = subtrees(instance, "DBSecurityGroup");
+        assert_eq!(
+            security_groups.len(),
+            2,
+            "case {case:?}: the {envelope} envelope must report one DBSecurityGroup \
+             membership per supplied name, got {security_groups:?}"
+        );
+        for (membership, expected) in security_groups.iter().zip(["legacy-one", "legacy-two"]) {
+            assert_member(case, envelope, membership, "DBSecurityGroupName", expected);
+            assert_member(case, envelope, membership, "Status", "active");
+        }
+        let vpc_groups = subtrees(instance, "VpcSecurityGroupMembership");
+        assert_eq!(
+            vpc_groups.len(),
+            2,
+            "case {case:?}: the {envelope} envelope must report one \
+             VpcSecurityGroupMembership per supplied id, got {vpc_groups:?}"
+        );
+        for (membership, expected) in vpc_groups.iter().zip(["sg-00000001", "sg-00000002"]) {
+            assert_member(case, envelope, membership, "VpcSecurityGroupId", expected);
+            assert_member(case, envelope, membership, "Status", "active");
+        }
+        let domains = subtrees(instance, "DomainMembership");
+        assert_eq!(
+            domains.len(),
+            1,
+            "case {case:?}: the {envelope} envelope must report the domain the instance \
+             joined, got {domains:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_instance_in_a_db_cluster_reports_its_own_port() {
+    let router = emulator();
+    let case = "a cluster member";
+    let identifier = "emu-env-cluster-member";
+    let created = create_instance(
+        &router,
+        case,
+        identifier,
+        "aurora-mysql",
+        &[("DBClusterIdentifier", "emu-cluster"), ("Port", "13306")],
+    )
+    .await;
+    wait_for_settle();
+    let described = describe_instance(&router, case, identifier).await;
+    for (envelope, instance) in [("create", &created), ("describe", &described)] {
+        // "The port that the DB instance listens on. If the DB instance is part of a DB
+        // cluster, this can be a different port than the DB cluster port."
+        assert_member(case, envelope, instance, "DbInstancePort", "13306");
+        assert_member(case, envelope, instance, "Port", "13306");
+        assert_member(case, envelope, instance, "DBClusterIdentifier", "emu-cluster");
+    }
+}
+
+/// One row of the engine-version resolution table: what a request names, and the
+/// version the service provisions for it.
+struct VersionCase {
+    case: &'static str,
+    identifier: &'static str,
+    engine: &'static str,
+    requested: Option<&'static str>,
+    /// The version the service must report, or `None` when the request must be refused.
+    provisioned: Option<&'static str>,
+}
+
+/// Every branch of the resolution: no value, an exact version (default or not), a major
+/// version, a version inside a published major version, a major version the catalogue
+/// publishes no AVAILABLE version for (`mysql` 5.7 is deprecated), a version no major
+/// version prefixes, and an engine the catalogue publishes no version for at all.
+const VERSION_CASES: &[VersionCase] = &[
+    VersionCase {
+        case: "no version named",
+        identifier: "emu-ver-mysql-none",
+        engine: "mysql",
+        requested: None,
+        provisioned: Some("8.4.4"),
+    },
+    VersionCase {
+        case: "a major version named",
+        identifier: "emu-ver-mysql-80",
+        engine: "mysql",
+        requested: Some("8.0"),
+        provisioned: Some("8.0.40"),
+    },
+    VersionCase {
+        case: "an exact version that is not the default of its major version",
+        identifier: "emu-ver-mysql-8037",
+        engine: "mysql",
+        requested: Some("8.0.37"),
+        provisioned: Some("8.0.37"),
+    },
+    VersionCase {
+        case: "a version inside a published major version",
+        identifier: "emu-ver-mysql-8099",
+        engine: "mysql",
+        requested: Some("8.0.99"),
+        provisioned: Some("8.0.40"),
+    },
+    VersionCase {
+        case: "a version named in another case",
+        identifier: "emu-ver-mysql-case",
+        engine: "mysql",
+        requested: Some("8.4.3"),
+        provisioned: Some("8.4.3"),
+    },
+    VersionCase {
+        case: "a major version whose only version is deprecated",
+        identifier: "emu-ver-mysql-57",
+        engine: "mysql",
+        requested: Some("5.7"),
+        provisioned: None,
+    },
+    VersionCase {
+        case: "a deprecated version named exactly",
+        identifier: "emu-ver-mysql-5744",
+        engine: "mysql",
+        requested: Some("5.7.44"),
+        provisioned: None,
+    },
+    VersionCase {
+        case: "a version of no major version the engine has",
+        identifier: "emu-ver-mysql-999",
+        engine: "mysql",
+        requested: Some("9.9.9"),
+        provisioned: None,
+    },
+    VersionCase {
+        case: "a major version of postgres",
+        identifier: "emu-ver-postgres-17",
+        engine: "postgres",
+        requested: Some("17"),
+        provisioned: Some("17.2"),
+    },
+    VersionCase {
+        case: "a postgres version inside a published major version",
+        identifier: "emu-ver-postgres-1699",
+        engine: "postgres",
+        requested: Some("16.99"),
+        provisioned: Some("16.4"),
+    },
+    VersionCase {
+        case: "an aurora major version",
+        identifier: "emu-ver-aurora-mysql",
+        engine: "aurora-mysql",
+        requested: Some("8.0"),
+        provisioned: Some("8.0.mysql_aurora.3.08.0"),
+    },
+    VersionCase {
+        case: "an engine the catalogue publishes no version for",
+        identifier: "emu-ver-custom-oracle",
+        engine: "custom-oracle-ee",
+        requested: Some("19.my_cev1"),
+        provisioned: Some("19.my_cev1"),
+    },
+];
+
+#[tokio::test]
+async fn the_engine_version_is_resolved_through_the_catalogue() {
+    let router = emulator();
+
+    for row in VERSION_CASES {
+        let mut params: Vec<(&str, String)> = vec![
+            ("DBInstanceIdentifier", row.identifier.to_string()),
+            ("Engine", row.engine.to_string()),
+            ("DBInstanceClass", "db.t3.medium".to_string()),
+        ];
+        if let Some(requested) = row.requested {
+            params.push(("EngineVersion", requested.to_string()));
+        }
+        let response = call(&router, "CreateDBInstance", &params).await;
+        match row.provisioned {
+            Some(expected) => {
+                let created = the_instance(row.case, &expect_ok(row.case, response));
+                assert_member(row.case, "create", &created, "EngineVersion", expected);
+                wait_for_settle();
+                let described = describe_instance(&router, row.case, row.identifier).await;
+                assert_member(row.case, "describe", &described, "EngineVersion", expected);
+            }
+            None => {
+                // No modelled error covers a version the service cannot provision, so
+                // it is refused with a 400 naming the member and the value.
+                let body = expect_error(row.case, response, 400, "ValidationException");
+                let message = text(&body, "Message");
+                assert!(
+                    message.contains("EngineVersion")
+                        && message.contains(row.requested.unwrap_or_default()),
+                    "case {:?}: the refusal must name EngineVersion and the value, \
+                     got {message:?}",
+                    row.case
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn modifying_an_instance_resolves_the_new_engine_version_too() {
+    let router = emulator();
+    let case = "modify to a version inside a published major version";
+    let identifier = "emu-env-modified";
+    create_instance(&router, case, identifier, "postgres", &[("EngineVersion", "15.8")]).await;
+    wait_for_settle();
+
+    let rows: &[(&str, &str, &str)] = &[
+        ("an exact version", "17.2", "17.2"),
+        ("a major version", "16", "16.4"),
+        ("a version inside a published major version", "15.99", "15.8"),
+    ];
+    for (row_case, requested, expected) in rows {
+        let modified = expect_ok(
+            row_case,
+            call(
+                &router,
+                "ModifyDBInstance",
+                &[
+                    ("DBInstanceIdentifier", identifier.to_string()),
+                    ("ApplyImmediately", "true".to_string()),
+                    ("EngineVersion", (*requested).to_string()),
+                ],
+            )
+            .await,
+        );
+        let modified = the_instance(row_case, &modified);
+        assert_member(row_case, "modify", &modified, "EngineVersion", expected);
+        wait_for_settle();
+        let described = describe_instance(&router, row_case, identifier).await;
+        assert_member(row_case, "describe", &described, "EngineVersion", expected);
+    }
+
+    // And a version it cannot provision is refused, leaving the stored one in place.
+    let body = expect_error(
+        "modify to an unprovisionable version",
+        call(
+            &router,
+            "ModifyDBInstance",
+            &[
+                ("DBInstanceIdentifier", identifier.to_string()),
+                ("EngineVersion", "42.0".to_string()),
+            ],
+        )
+        .await,
+        400,
+        "ValidationException",
+    );
+    assert!(
+        text(&body, "Message").contains("EngineVersion"),
+        "the refusal must name EngineVersion, got {body}"
+    );
+    let described = describe_instance(&router, "after the refusal", identifier).await;
+    assert_member(
+        "after the refusal",
+        "describe",
+        &described,
+        "EngineVersion",
+        "15.8",
+    );
+}

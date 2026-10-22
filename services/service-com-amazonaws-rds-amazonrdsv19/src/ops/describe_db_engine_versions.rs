@@ -1559,6 +1559,87 @@ pub(crate) fn engine_facts(engine: &str) -> Option<&'static EngineFacts> {
     ENGINES.iter().find(|facts| facts.engine == engine)
 }
 
+/// The catalogue version this service would PROVISION for `engine` when a create or
+/// modify request names `requested`, or `Err` with the message to refuse the request
+/// with.
+///
+/// `DBInstance$EngineVersion` is "the version of the database engine" an instance RUNS,
+/// not the string a request carried: a request names a version to provision and the
+/// service answers with the version it provisioned, which is one of the versions it
+/// publishes as available. The resolution, against [`CATALOG`]:
+///
+/// * no value — the engine's own default version, which is what RDS provisions when a
+///   request names none;
+/// * a value naming an available version of that engine (case-insensitively) — that
+///   version;
+/// * any other value — read as the major version it starts with, longest prefix first,
+///   and resolved to that major version's default available version: this is what
+///   serves a request naming only a major version (`8.0`, `16`), and a value inside a
+///   major version this service does not publish resolves to the version it does;
+/// * a value no available major version prefixes — `Err`.
+///
+/// `Ok(None)` means the catalogue publishes no AVAILABLE version for `engine` at all
+/// (a `custom-*` engine, whose versions a customer creates, or a value that is not an
+/// engine): there is nothing to resolve against, so the caller keeps what the request
+/// named rather than moving it to another engine's version.
+pub(crate) fn resolve_version(
+    engine: &str,
+    requested: Option<&str>,
+) -> Result<Option<&'static CatalogVersion>, String> {
+    let available: Vec<&'static CatalogVersion> = CATALOG
+        .iter()
+        .filter(|entry| {
+            entry.engine.eq_ignore_ascii_case(engine) && entry.status == STATUS_AVAILABLE
+        })
+        .collect();
+    if available.is_empty() {
+        return Ok(None);
+    }
+    let Some(requested) = requested else {
+        return Ok(Some(default_version_of(&available)));
+    };
+    if let Some(exact) = available
+        .iter()
+        .find(|entry| entry.engine_version.eq_ignore_ascii_case(requested))
+    {
+        return Ok(Some(exact));
+    }
+    let mut prefix = Some(requested);
+    while let Some(candidate) = prefix {
+        let within: Vec<&'static CatalogVersion> = available
+            .iter()
+            .copied()
+            .filter(|entry| entry.major_engine_version.eq_ignore_ascii_case(candidate))
+            .collect();
+        if !within.is_empty() {
+            return Ok(Some(default_version_of(&within)));
+        }
+        prefix = candidate.rsplit_once('.').map(|(head, _)| head);
+    }
+    Err(format!(
+        "invalid value '{requested}' for EngineVersion: cannot find version \
+         '{requested}' for {engine}"
+    ))
+}
+
+/// The version `entries` resolves to: the engine's own default, else the default of the
+/// major version, else the last of them — [`CATALOG`] lists an engine's rows in
+/// ascending version order, so that is its latest.
+fn default_version_of(entries: &[&'static CatalogVersion]) -> &'static CatalogVersion {
+    entries
+        .iter()
+        .copied()
+        .find(|entry| entry.default_level.is_engine_default())
+        .or_else(|| {
+            entries
+                .iter()
+                .copied()
+                .find(|entry| entry.default_level.is_major_default())
+        })
+        .or_else(|| entries.iter().copied().next_back())
+        .expect("entries is never empty: the caller checks")
+}
+
 /// Every catalogue entry with its index and its engine's facts.
 ///
 /// A row naming an engine absent from [`ENGINES`] could not be projected onto the wire
