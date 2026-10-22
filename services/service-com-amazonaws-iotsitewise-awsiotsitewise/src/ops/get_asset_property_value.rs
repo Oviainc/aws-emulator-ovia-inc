@@ -167,9 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
 
-        // A property is named either by its asset and property ids or by its alias;
-        // exactly one of the two forms identifies it.
-        let (asset_id, property_id) = match (
+        // A stream is named either by the asset and property ids of the property it
+        // is associated with, or by its alias; exactly one of the two forms
+        // identifies it.
+        let stream = match (
             input.asset_id.as_deref(),
             input.property_id.as_deref(),
             input.property_alias.as_deref(),
@@ -196,13 +197,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "The asset {asset_label} has no property {property_id}."
                     )));
                 }
-                (asset_id, property_id.to_string())
+                crate::state::SeriesKey::Property(asset_id, property_id.to_string())
             }
-            (None, None, Some(alias)) => {
-                store.property_alias_index.get(alias).cloned().ok_or_else(|| {
-                    not_found(format!("The property alias {alias} could not be found."))
-                })?
-            }
+            // An alias names ONE data stream, whether an asset property is
+            // associated with it or not: the shared resolver reaches the property's
+            // stream, or the disassociated one standing under that alias.
+            (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
+                not_found(format!("The property alias {alias} could not be found."))
+            })?,
             _ => {
                 return Err(GetAssetPropertyValueError::Modeled(
                     GetAssetPropertyValueErrorModeled::InvalidRequestException(
@@ -215,12 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The latest value is the last element of the ascending series; a property
+        // The latest value is the last element of the ascending series; a stream
         // nothing has been written to simply has no `propertyValue`.
         Ok(GetAssetPropertyValueOutput {
-            property_value: store
-                .latest_property_value(&asset_id, &property_id)
-                .cloned(),
+            property_value: store.series(&stream).last().cloned(),
         })
     }
 }

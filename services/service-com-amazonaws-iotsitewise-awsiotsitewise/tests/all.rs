@@ -62,6 +62,8 @@ mod state_roundtrip;
 mod support;
 #[path = "all/time_series.rs"]
 mod time_series;
+#[path = "all/time_series_disassociation.rs"]
+mod time_series_disassociation;
 #[path = "all/update_asset.rs"]
 mod update_asset;
 #[path = "all/update_asset_model.rs"]

@@ -302,7 +302,7 @@ fn resolve_entry(
 ) -> Result<Option<AssetPropertyValue>, (&'static str, String)> {
     // "To identify an asset property, you must specify one of the following: the
     // assetId and propertyId of an asset property; a propertyAlias."
-    let (asset_id, property_id) = match (
+    let stream = match (
         entry.asset_id.as_deref(),
         entry.property_id.as_deref(),
         entry.property_alias.as_deref(),
@@ -326,18 +326,17 @@ fn resolve_entry(
                     format!("The asset {asset_label} has no property {property_id}."),
                 ));
             }
-            (asset_id, property_id.to_string())
+            crate::state::SeriesKey::Property(asset_id, property_id.to_string())
         }
-        (None, None, Some(alias)) => store
-            .property_alias_index
-            .get(alias)
-            .cloned()
-            .ok_or_else(|| {
-                (
-                    ERROR_NOT_FOUND,
-                    format!("The property alias {alias} could not be found."),
-                )
-            })?,
+        // An alias names ONE data stream, whether an asset property is associated
+        // with it or not: the shared resolver reaches the property's stream, or the
+        // disassociated one standing under that alias.
+        (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
+            (
+                ERROR_NOT_FOUND,
+                format!("The property alias {alias} could not be found."),
+            )
+        })?,
         _ => {
             return Err((
                 ERROR_INVALID_REQUEST,
@@ -348,7 +347,7 @@ fn resolve_entry(
     };
 
     // The latest value is the last element of the ascending series.
-    Ok(store.latest_property_value(&asset_id, &property_id).cloned())
+    Ok(store.series(&stream).last().cloned())
 }
 
 /// `BatchGetAssetPropertyValueErrorCode` value for an entry naming no stored

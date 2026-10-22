@@ -5,6 +5,11 @@
 //! notification state and unit in the shared engine store (`crate::state`), and
 //! moves the alias index with it; this is the ONLY file to touch for it.
 //!
+//! Binding an alias is also what ASSOCIATES the data stream that alias names with
+//! this property, so an alias a disassociated time series stands under brings that
+//! stream (and its samples) back to the property — and only where the two carry the
+//! same data type, which is the modelled refusal below.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -230,6 +235,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
         let property_id = asset.properties[at].id.clone();
+        let property_data_type = asset.properties[at].data_type.clone();
+        let property_data_type_spec = asset.properties[at].data_type_spec.clone();
         let asset_model_id = asset.asset_model_id.clone();
 
         // An alias names ONE data stream, so it cannot stand for two properties at
@@ -259,6 +266,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 resource_id: bound_asset,
                                 resource_arn: arn,
                             },
+                        ),
+                    ));
+                }
+            }
+
+            // Binding an alias a disassociated time series stands under ASSOCIATES
+            // that stream with this property, and a stream is associated with an
+            // asset property only where the two carry the same data type: IoT
+            // SiteWise's own ingest refuses a TQV whose variant is not the
+            // property's `PropertyDataType`, so a stream of another type is not data
+            // this property can hold. Refused here, before anything is written, so
+            // the stream and its samples stay exactly where they are.
+            if let Some((stream_type, stream_spec)) = store.disassociated_stream_type(alias) {
+                if stream_type != property_data_type
+                    || stream_spec != property_data_type_spec.as_deref()
+                {
+                    let message = format!(
+                        "The time series {alias} has data type {stream_type}, but property \
+                         {property_id} of asset {asset_id} has data type {property_data_type}."
+                    );
+                    return Err(UpdateAssetPropertyError::Modeled(
+                        UpdateAssetPropertyErrorModeled::InvalidRequestException(
+                            InvalidRequestException { message },
                         ),
                     ));
                 }

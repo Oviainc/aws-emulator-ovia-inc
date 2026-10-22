@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
 
-            let (asset_id, property_id, query) = match resolved {
+            let (stream, query) = match resolved {
                 Ok(resolved) => resolved,
                 Err((code, message)) => {
                     error_entries.push(BatchGetAssetPropertyAggregatesErrorEntry {
@@ -256,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
-            let aggregated = crate::state::aggregated_values(&store, &asset_id, &property_id, &query);
+            let aggregated = crate::state::aggregated_values(&store, &stream, &query);
             // The first entry of a resumed page starts where the previous one
             // stopped; every later entry starts at its first data point.
             let from = if at == cursor.entry {
@@ -382,10 +382,11 @@ fn invalid_request(message: String) -> BatchGetAssetPropertyAggregatesError {
 fn resolve_entry<'a>(
     store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
     entry: &'a BatchGetAssetPropertyAggregatesEntry,
-) -> Result<(String, String, crate::state::AggregateQuery<'a>), (&'static str, String)> {
-    // A property is named either by its asset and property ids or by its alias;
-    // exactly one of the two forms identifies it.
-    let (asset_id, property_id) = match (
+) -> Result<(crate::state::SeriesKey, crate::state::AggregateQuery<'a>), (&'static str, String)>
+{
+    // A stream is named either by the asset and property ids of the property it is
+    // associated with or by its alias; exactly one of the two forms identifies it.
+    let stream = match (
         entry.asset_id.as_deref(),
         entry.property_id.as_deref(),
         entry.property_alias.as_deref(),
@@ -411,18 +412,17 @@ fn resolve_entry<'a>(
                     format!("The asset {asset_label} has no property {property_id}."),
                 ));
             }
-            (asset_id, property_id.to_string())
+            crate::state::SeriesKey::Property(asset_id, property_id.to_string())
         }
-        (None, None, Some(alias)) => store
-            .property_alias_index
-            .get(alias)
-            .cloned()
-            .ok_or_else(|| {
-                (
-                    "ResourceNotFoundException",
-                    format!("The property alias {alias} could not be found."),
-                )
-            })?,
+        // An alias names ONE data stream, whether an asset property is associated
+        // with it or not: the shared resolver reaches the property's stream, or the
+        // disassociated one standing under that alias.
+        (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
+            (
+                "ResourceNotFoundException",
+                format!("The property alias {alias} could not be found."),
+            )
+        })?,
         _ => {
             return Err((
                 "InvalidRequestException",
@@ -523,7 +523,7 @@ fn resolve_entry<'a>(
         )
     })?;
 
-    Ok((asset_id, property_id, query))
+    Ok((stream, query))
 }
 
 /// `a, b, c` — the accepted values a refusal names, so the message states the rule

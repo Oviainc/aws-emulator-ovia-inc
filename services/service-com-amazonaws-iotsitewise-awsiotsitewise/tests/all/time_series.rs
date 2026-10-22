@@ -35,7 +35,7 @@ use crate::asset_lifecycle::{
 /// `TimeSeriesSummary$dataTypeSpec` doc ("required for time series that have the
 /// STRUCT data type. … Use AWS/ALARM_STATE for alarm state").
 ///
-fn time_series_property_catalog() -> Vec<PropertyRow> {
+pub(crate) fn time_series_property_catalog() -> Vec<PropertyRow> {
     vec![
         PropertyRow {
             name: "Temperature",
@@ -85,13 +85,13 @@ fn time_series_property_catalog() -> Vec<PropertyRow> {
 /// One row of [`time_series_property_catalog`]: an asset-model property definition
 /// and what the time series of the asset property it materialises must report.
 #[derive(Debug)]
-struct PropertyRow {
-    name: &'static str,
-    data_type: &'static str,
-    data_type_spec: Option<&'static str>,
-    external_id: Option<&'static str>,
+pub(crate) struct PropertyRow {
+    pub(crate) name: &'static str,
+    pub(crate) data_type: &'static str,
+    pub(crate) data_type_spec: Option<&'static str>,
+    pub(crate) external_id: Option<&'static str>,
     /// The `PropertyType` the definition carries.
-    kind: Value,
+    pub(crate) kind: Value,
 }
 
 /// The catalog ([`time_series_property_catalog`]) as `CreateAssetModel` property
@@ -118,7 +118,7 @@ fn property_definitions() -> Value {
 /// A model with [`time_series_property_catalog`] and one asset of it, created with an
 /// `assetExternalId` so the `externalId:` lookup form has something to resolve.
 /// Returns `(router, engine, assetId, DescribeAsset body)`.
-async fn asset_fixture() -> (
+pub(crate) async fn asset_fixture() -> (
     MultiServiceRouter,
     std::sync::Arc<engine::InMemoryEngine>,
     String,
@@ -154,12 +154,15 @@ async fn asset_fixture() -> (
 /// derivation (the separator included — it must stay inside the modelled `ARN`
 /// pattern's character class) fails these assertions instead of agreeing with
 /// itself.
-fn time_series_id_of(asset_id: &str, property_id: &str) -> String {
+pub(crate) fn time_series_id_of(asset_id: &str, property_id: &str) -> String {
     format!("{asset_id}.{property_id}")
 }
 
 /// `GET /timeseries/describe?<query>`.
-async fn describe_time_series(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
+pub(crate) async fn describe_time_series(
+    router: &MultiServiceRouter,
+    query: &str,
+) -> (u16, Value) {
     call(router, "GET", &format!("/timeseries/describe?{query}"), None).await
 }
 

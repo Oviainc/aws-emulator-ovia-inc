@@ -236,11 +236,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
 
-            // Resolve the entry to the one stored property it names — by asset and
-            // property id, or by the alias that stands for them — and read that
-            // property's data type from the SAME lookup, so a pair that names no
-            // stored property can never fall through to an unchecked write.
-            let (asset_id, property_id, data_type) = match resolve_entry(&store, entry) {
+            // Resolve the entry to the one stored data stream it names — by the
+            // asset and property id of the property it is associated with, or by
+            // its alias — and read that stream's data type from the SAME lookup, so
+            // an identifier that names no stored stream can never fall through to
+            // an unchecked write.
+            let (stream, data_type) = match resolve_entry(&store, entry) {
                 Ok(resolved) => resolved,
                 Err((code, message)) => {
                     error_entries.push(error_entry(entry, code, message));
@@ -279,7 +280,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             for value in accepted {
-                store.record_property_value(&asset_id, &property_id, value.clone());
+                // The stream resolved under this same held lock, so the write
+                // cannot miss it; asserted rather than ignored, so a future caller
+                // cannot drop a write while this operation answers 200 for it.
+                let written = store.record_stream_value(&stream, value.clone());
+                debug_assert!(written, "the resolved stream must still accept a write");
             }
         }
 
@@ -391,8 +396,8 @@ fn group_errors(
 fn resolve_entry(
     store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
     entry: &PutAssetPropertyValueEntry,
-) -> Result<(String, String, String), (&'static str, String)> {
-    let (asset_id, property_id) = match (
+) -> Result<(crate::state::SeriesKey, String), (&'static str, String)> {
+    let stream = match (
         entry.asset_id.as_deref(),
         entry.property_id.as_deref(),
         entry.property_alias.as_deref(),
@@ -404,18 +409,17 @@ fn resolve_entry(
                     crate::state::not_found_message(crate::state::RESOURCE_ASSET, asset_label),
                 )
             })?;
-            (asset_id, property_id.to_string())
+            crate::state::SeriesKey::Property(asset_id, property_id.to_string())
         }
-        (None, None, Some(alias)) => store
-            .property_alias_index
-            .get(alias)
-            .cloned()
-            .ok_or_else(|| {
-                (
-                    "ResourceNotFoundException",
-                    format!("The property alias {alias} could not be found."),
-                )
-            })?,
+        // An alias names ONE data stream, whether an asset property is associated
+        // with it or not, so ingest addressed by the alias of a disassociated stream
+        // lands in that stream rather than being refused as absent.
+        (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
+            (
+                "ResourceNotFoundException",
+                format!("The property alias {alias} could not be found."),
+            )
+        })?,
         _ => {
             return Err((
                 "InvalidRequestException",
@@ -425,16 +429,34 @@ fn resolve_entry(
         }
     };
 
-    let asset = store.assets.get(&asset_id).ok_or_else(|| {
+    // The stream's data type: the asset property's, for an associated stream, and
+    // the one the disassociated record kept, for a stream no property owns.
+    let (asset_id, property_id) = match &stream {
+        crate::state::SeriesKey::Property(asset_id, property_id) => (asset_id, property_id),
+        crate::state::SeriesKey::Disassociated(alias) => {
+            let data_type = store
+                .disassociated_time_series
+                .get(alias)
+                .map(|series| series.data_type.clone())
+                .ok_or_else(|| {
+                    (
+                        "ResourceNotFoundException",
+                        format!("The property alias {alias} could not be found."),
+                    )
+                })?;
+            return Ok((stream, data_type));
+        }
+    };
+    let asset = store.assets.get(asset_id).ok_or_else(|| {
         (
             "ResourceNotFoundException",
-            crate::state::not_found_message(crate::state::RESOURCE_ASSET, &asset_id),
+            crate::state::not_found_message(crate::state::RESOURCE_ASSET, asset_id),
         )
     })?;
     let property = asset
         .properties
         .iter()
-        .find(|property| property.id == property_id)
+        .find(|property| &property.id == property_id)
         .ok_or_else(|| {
             (
                 "ResourceNotFoundException",
@@ -442,7 +464,7 @@ fn resolve_entry(
             )
         })?;
     let data_type = property.data_type.clone();
-    Ok((asset_id, property_id, data_type))
+    Ok((stream, data_type))
 }
 
 /// The reason to refuse `value`, or `None` when it is acceptable.

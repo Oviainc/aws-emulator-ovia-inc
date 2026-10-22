@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTimeSeries
-//! IMPLEMENTED: this operation reports the time series (data stream) of the stored asset
-//! property the request identifies, from the shared engine store (`crate::state`); this is
-//! the ONLY file to touch for it.
+//! IMPLEMENTED: this operation reports the time series (data stream) the request
+//! identifies, from the shared engine store (`crate::state`); this is the ONLY file to
+//! touch for it.
 //!
 //! Every asset property materialised by `CreateAsset` IS a data stream in IoT SiteWise's
 //! time-series store, so this read needs no second copy of one: the series' identity
 //! ([`crate::state::time_series_id`]), data type, alias and dates are all derived from the
-//! stored asset and its property, which is why reading one writes nothing.
+//! stored asset and its property, which is why reading one writes nothing. A series
+//! `DisassociateTimeSeriesFromAssetProperty` detached owns no property any more, so that
+//! one is read from the record that call left standing
+//! ([`crate::state::DisassociatedTimeSeriesRecord`]) and reports no `assetId`/`propertyId`.
 //!
 //! ## Shape of an operation
 //!
@@ -205,22 +208,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the time series. ... specify one of the following: The alias of the time
         // series. The assetId and propertyId that identifies the asset property." — so
         // EXACTLY one of the two identifying forms names the series, and either half of
-        // the pair on its own names nothing.
-        let (asset_label, property_label) = match (
+        // the pair on its own names nothing. The first clause is the DISASSOCIATED
+        // series — one no asset property owns, which only its alias names.
+        let identified = match (
             input.asset_id.as_deref(),
             input.property_id.as_deref(),
             input.alias.as_deref(),
         ) {
             (Some(asset_label), Some(property_label), None) => {
-                (asset_label.to_string(), property_label.to_string())
+                Identified::Property(asset_label.to_string(), property_label.to_string())
             }
             (None, None, Some(alias)) => {
                 // An alias stands for the asset property it is bound to, resolved
                 // through the same index `GetAssetPropertyValue` and
-                // `BatchPutAssetPropertyValue` resolve aliases with.
-                store.property_alias_index.get(alias).cloned().ok_or_else(|| {
-                    not_found(format!("The time series {alias} could not be found."))
-                })?
+                // `BatchPutAssetPropertyValue` resolve aliases with — and, for an
+                // alias no property carries, for the stream itself, which
+                // `DisassociateTimeSeriesFromAssetProperty` leaves standing.
+                match store.property_alias_index.get(alias) {
+                    Some((asset_id, property_id)) => {
+                        Identified::Property(asset_id.clone(), property_id.clone())
+                    }
+                    None => Identified::Disassociated(
+                        store
+                            .disassociated_time_series
+                            .get(alias)
+                            .cloned()
+                            .ok_or_else(|| {
+                                not_found(format!("The time series {alias} could not be found."))
+                            })?,
+                    ),
+                }
             }
             _ => {
                 return Err(invalid_request(
@@ -239,6 +256,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "The workspace {workspace} could not be found."
             )));
         }
+
+        // A series no asset property owns reports what the store kept of it: no
+        // `assetId`/`propertyId` pair names it, and its alias, identity, data type and
+        // creation date are the ones it carried while it was associated.
+        let (asset_label, property_label) = match identified {
+            Identified::Disassociated(series) => {
+                return Ok(DescribeTimeSeriesOutput {
+                    asset_id: None,
+                    property_id: None,
+                    alias: Some(series.alias),
+                    data_type: series.data_type,
+                    data_type_spec: series.data_type_spec,
+                    time_series_creation_date: crate::state::to_date_time(series.creation_date),
+                    time_series_last_update_date: crate::state::to_date_time(
+                        series.last_update_date,
+                    ),
+                    time_series_arn: crate::state::time_series_arn(&region, &series.time_series_id),
+                    time_series_id: series.time_series_id,
+                    workspace_name: None,
+                })
+            }
+            Identified::Property(asset_label, property_label) => (asset_label, property_label),
+        };
 
         // Both ids are modelled `CustomID`, so either can arrive as the raw UUID or as
         // `externalId:<externalId>`; both forms name the one stored property.
@@ -289,4 +329,13 @@ fn invalid_request(message: String) -> DescribeTimeSeriesError {
     DescribeTimeSeriesError::Modeled(DescribeTimeSeriesErrorModeled::InvalidRequestException(
         InvalidRequestException { message },
     ))
+}
+
+/// Which stored time series a well-formed request named.
+enum Identified {
+    /// The series of the asset property a `(assetId, propertyId)` pair of `CustomID`
+    /// labels names — an `ASSOCIATED` series.
+    Property(String, String),
+    /// A series no asset property owns, named by its alias alone.
+    Disassociated(crate::state::DisassociatedTimeSeriesRecord),
 }
