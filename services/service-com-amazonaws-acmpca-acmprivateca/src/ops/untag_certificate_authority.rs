@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagCertificateAuthority
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagCertificateAuthority`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagCertificateAuthority::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +66,18 @@
 //!   invalid argument is contained in the message field.
 //! * `ResourceNotFoundException` (HTTP 400) — A resource such as a private CA, S3 bucket,
 //!   certificate, audit report, or policy cannot be found.
+//!
+//! ## What this handler does
+//!
+//! "If you do not specify the value portion of the tag when calling this action, the tag
+//! will be removed regardless of value. If you specify a value, the tag is removed only
+//! if it is associated with the specified value." A key the CA does not carry removes
+//! nothing, which is not a failure: the request leaves the CA with the tag set it asked
+//! for either way.
+//!
+//! `InvalidStateException` answers a CA that has been deleted and not restored, for the
+//! reason `tag_certificate_authority` records: its tag set is not writable while it waits
+//! to be restored or permanently deleted.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -169,18 +172,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagCertificateAuthority` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagCertificateAuthorityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagCertificateAuthority"))
+        let _ = ctx;
+        let arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(UntagCertificateAuthorityErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The rules every tag set this service reads is held to, refused before the CA
+        // is touched so a bad request writes nothing.
+        if let Some(reason) = crate::state::invalid_tag_reason(&input.tags) {
+            return Err(UntagCertificateAuthorityErrorModeled::InvalidTagException(
+                InvalidTagException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(not_found(
+                "the private CA store is unavailable, so no certificate authority can be read",
+            ));
+        };
+        let mut state = state.lock();
+
+        // `certificate_authority_mut` also materialises the CREATING ->
+        // PENDING_CERTIFICATE change the clock already owed: this call writes to the CA
+        // anyway, and that transition came due at the same instant either way.
+        let Some(record) = state.certificate_authority_mut(&arn, ::std::time::SystemTime::now())
+        else {
+            return Err(not_found(format!(
+                "the certificate authority {arn} was not found"
+            )));
+        };
+
+        // A deleted CA is waiting to be restored or permanently deleted: its tag set is
+        // not writable in that status, which is what the modelled `InvalidStateException`
+        // answers.
+        if record.is_deleted() {
+            return Err(UntagCertificateAuthorityErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(crate::state::DELETED_INVALID_STATE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        crate::state::remove_tags(&mut record.tags, &input.tags);
+        Ok(UntagCertificateAuthorityOutput)
     }
+}
+
+/// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy
+/// cannot be found."
+///
+/// This operation models no server-fault error, so a store that cannot be reached is
+/// reported the way a CA that was never created is: the named CA cannot be read.
+fn not_found(message: impl Into<String>) -> UntagCertificateAuthorityError {
+    UntagCertificateAuthorityErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.into()),
+    })
+    .into()
 }
