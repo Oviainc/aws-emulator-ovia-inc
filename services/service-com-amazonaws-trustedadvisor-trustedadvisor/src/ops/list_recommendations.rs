@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the stored recommendations from [`crate::state`], one
+//! `RecommendationSummary` per [`crate::state::RecommendationEntry`] the
+//! request's filters keep, in recommendation-ARN order and cut into a page by
+//! the shared cursor helper.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `resourcesAggregates` is COUNTED from the recommendation's own resources on
+//! every read ([`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::aggregates_for`]),
+//! so it always agrees with `ListRecommendationResources`.
+//!
+//! `language` is accepted and does not change the text: the store holds one
+//! (English) copy of each name and description.
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +100,42 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// A modelled `date-time` as milliseconds since the Unix epoch, so a filter
+/// bound and a stored `lastUpdatedAt` are compared on one scale. `to_millis` is
+/// the exact conversion — going through seconds as an `f64` could move an
+/// inclusive bound by a millisecond.
+fn millis_of(value: &::aws_smithy_types::DateTime) -> i64 {
+    value.to_millis().unwrap_or(i64::MAX)
+}
+
+/// The stored recommendation, as the modelled `RecommendationSummary`.
+///
+/// `pillarSpecificAggregates` and `statusReason` are left absent: the store
+/// holds no cost-savings aggregate and no status-determination discrepancy, and
+/// both members are optional.
+fn recommendation_summary(
+    entry: &crate::state::RecommendationEntry,
+    resources_aggregates: RecommendationResourcesAggregates,
+) -> RecommendationSummary {
+    RecommendationSummary {
+        id: entry.id.clone(),
+        r#type: entry.r#type.clone(),
+        check_arn: entry.check_arn.clone(),
+        status: entry.status.clone(),
+        lifecycle_stage: entry.lifecycle_stage.clone(),
+        pillars: entry.pillars.clone(),
+        source: entry.source.clone(),
+        aws_services: Some(entry.aws_services.clone()),
+        name: entry.name.clone(),
+        resources_aggregates,
+        pillar_specific_aggregates: None,
+        created_at: Some(crate::state::date_time(entry.created_at_millis)),
+        last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
+        arn: entry.arn.clone(),
+        status_reason: None,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +207,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecommendations"))
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRecommendationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Trusted Advisor store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // `afterLastUpdatedAt` / `beforeLastUpdatedAt` are inclusive bounds on
+        // the stored `lastUpdatedAt`; every other filter is an equality (or
+        // membership) test. An absent filter keeps every recommendation.
+        let after = input.after_last_updated_at.as_ref().map(millis_of);
+        let before = input.before_last_updated_at.as_ref().map(millis_of);
+
+        let matching: Vec<(String, RecommendationSummary)> = state
+            .recommendations
+            .iter()
+            .filter(|(_, entry)| {
+                input.r#type.as_ref().is_none_or(|kind| &entry.r#type == kind)
+                    && input.status.as_ref().is_none_or(|status| &entry.status == status)
+                    && input
+                        .pillar
+                        .as_ref()
+                        .is_none_or(|pillar| entry.pillars.iter().any(|stored| stored == pillar))
+                    && input.aws_service.as_ref().is_none_or(|service| {
+                        entry.aws_services.iter().any(|stored| stored == service)
+                    })
+                    && input.source.as_ref().is_none_or(|source| &entry.source == source)
+                    && input
+                        .check_identifier
+                        .as_ref()
+                        .is_none_or(|check| entry.check_arn.as_ref() == Some(check))
+                    && after.is_none_or(|bound| entry.last_updated_at_millis >= bound)
+                    && before.is_none_or(|bound| entry.last_updated_at_millis <= bound)
+            })
+            .map(|(arn, entry)| {
+                (
+                    arn.clone(),
+                    recommendation_summary(entry, state.aggregates_for(arn)),
+                )
+            })
+            .collect();
+
+        // The cursor's scope carries this read's filters, so a token issued
+        // under one filter set cannot resume a differently filtered sequence.
+        let after_scope = after.map(|millis| millis.to_string());
+        let before_scope = before.map(|millis| millis.to_string());
+        let page = crate::state::paginate(
+            &crate::state::list_scope(
+                "recommendations",
+                &[
+                    ("type", input.r#type.as_deref()),
+                    ("status", input.status.as_deref()),
+                    ("pillar", input.pillar.as_deref()),
+                    ("awsService", input.aws_service.as_deref()),
+                    ("source", input.source.as_deref()),
+                    ("checkIdentifier", input.check_identifier.as_deref()),
+                    ("afterLastUpdatedAt", after_scope.as_deref()),
+                    ("beforeLastUpdatedAt", before_scope.as_deref()),
+                ],
+            ),
+            matching,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListRecommendationsErrorModeled::ValidationException(ValidationException {
+                message: "nextToken is not a pagination token this service issued for this list"
+                    .to_string(),
+            })
+        })?;
+
+        Ok(ListRecommendationsOutput {
+            next_token: page.next_token,
+            recommendation_summaries: page.items,
+        })
     }
 }

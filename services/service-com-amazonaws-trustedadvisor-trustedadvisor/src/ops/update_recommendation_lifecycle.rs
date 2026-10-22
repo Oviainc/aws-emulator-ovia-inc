@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRecommendationLifecycle
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRecommendationLifecycle`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! MUTATES the stored recommendation: the model's own doc says "Update the
+//! lifecyle of a Recommendation. This API only supports prioritized
+//! recommendations", so this handler writes `lifecycleStage`, `updateReason`
+//! and `updateReasonCode` onto the stored
+//! [`crate::state::RecommendationEntry`], stamps `lastUpdatedAt` from the clock,
+//! and sets `resolvedAt` when (and only when) the new stage is `resolved`. A
+//! following `GetRecommendation` / `ListRecommendations` reports the new values.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRecommendationLifecycle::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Refusals: a well-formed ARN naming nothing in the store is a
+//! `ResourceNotFoundException` (404); a recommendation whose `type` is not
+//! `priority` is a `ConflictException` (409), because that sentence makes the
+//! operation inapplicable to it. `lifecycleStage` outside
+//! `UpdateRecommendationLifecycleStage`, an `updateReason` shorter than 10
+//! characters, and an identifier outside the ARN pattern are all refused by the
+//! framework as a `ValidationException` (400) before `handle` runs.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +88,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The one `UpdateRecommendationLifecycleStage` value that resolves a
+/// recommendation (see `UPDATE_RECOMMENDATION_LIFECYCLE_STAGE_VALUES` in
+/// `ops::types::shared_types`).
+const LIFECYCLE_STAGE_RESOLVED: &str = "resolved";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -180,18 +191,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRecommendationLifecycle` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRecommendationLifecycleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRecommendationLifecycle"))
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateRecommendationLifecycleErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the Trusted Advisor store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        let Some(entry) = state
+            .recommendations
+            .get_mut(&input.recommendation_identifier)
+        else {
+            return Err(
+                UpdateRecommendationLifecycleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "no recommendation with the identifier {}",
+                            input.recommendation_identifier
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if entry.r#type != crate::state::RECOMMENDATION_TYPE_PRIORITY {
+            return Err(UpdateRecommendationLifecycleErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "the lifecycle of the {} recommendation {} cannot be updated: this \
+                         operation only supports prioritized recommendations",
+                        entry.r#type, entry.arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotent` PUT semantics: the request REPLACES the lifecycle of the
+        // recommendation, so an omitted `updateReason`/`updateReasonCode` clears
+        // the stored one rather than leaving the previous update's wording
+        // attached to the new stage.
+        let updated_at = crate::state::now_millis();
+        entry.lifecycle_stage = Some(input.lifecycle_stage.clone());
+        entry.update_reason = input.update_reason.clone();
+        entry.update_reason_code = input.update_reason_code.clone();
+        entry.last_updated_at_millis = updated_at;
+        // `resolvedAt` is "When the Recommendation was resolved": set it on the
+        // update that resolves the recommendation, and clear it on one that moves
+        // the recommendation back out of `resolved`.
+        entry.resolved_at_millis = (input.lifecycle_stage == LIFECYCLE_STAGE_RESOLVED)
+            .then_some(updated_at);
+
+        Ok(UpdateRecommendationLifecycleOutput)
     }
 }

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecommendation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecommendation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Resolves the `recommendationIdentifier` ARN in [`crate::state`] and reports
+//! the stored [`crate::state::RecommendationEntry`] as the full
+//! `Recommendation`, with `resourcesAggregates` counted from that
+//! recommendation's own resources.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecommendation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A well-formed ARN that names nothing in the store is a
+//! `ResourceNotFoundException` (404); an identifier outside the modelled
+//! `length`/`pattern` never reaches this handler — the framework refuses it as a
+//! `ValidationException` (400) before `handle` runs.
+//!
+//! `language` is accepted and does not change the text: the store holds one
+//! (English) copy of each name and description.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +82,43 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The stored recommendation, as the modelled `Recommendation`.
+///
+/// `createdBy`, `updatedOnBehalfOf` and `updatedOnBehalfOfJobTitle` identify the
+/// Trusted Advisor Priority person who acted on the recommendation; the store
+/// holds no such actor, so those optional members stay absent rather than
+/// carrying an invented name. `pillarSpecificAggregates` and `statusReason` are
+/// absent for the same reason.
+fn recommendation(
+    entry: &crate::state::RecommendationEntry,
+    resources_aggregates: RecommendationResourcesAggregates,
+) -> Recommendation {
+    Recommendation {
+        id: entry.id.clone(),
+        r#type: entry.r#type.clone(),
+        check_arn: entry.check_arn.clone(),
+        status: entry.status.clone(),
+        lifecycle_stage: entry.lifecycle_stage.clone(),
+        pillars: entry.pillars.clone(),
+        source: entry.source.clone(),
+        aws_services: Some(entry.aws_services.clone()),
+        name: entry.name.clone(),
+        resources_aggregates,
+        pillar_specific_aggregates: None,
+        created_at: Some(crate::state::date_time(entry.created_at_millis)),
+        last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
+        arn: entry.arn.clone(),
+        status_reason: None,
+        description: entry.description.clone(),
+        created_by: None,
+        updated_on_behalf_of: None,
+        updated_on_behalf_of_job_title: None,
+        update_reason: entry.update_reason.clone(),
+        update_reason_code: entry.update_reason_code.clone(),
+        resolved_at: entry.resolved_at_millis.map(crate::state::date_time),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +192,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecommendation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecommendationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecommendation"))
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRecommendationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Trusted Advisor store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        let Some(entry) = state.recommendations.get(&input.recommendation_identifier) else {
+            return Err(GetRecommendationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no recommendation with the identifier {}",
+                        input.recommendation_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let aggregates = state.aggregates_for(&input.recommendation_identifier);
+        Ok(GetRecommendationOutput {
+            recommendation: Some(recommendation(entry, aggregates)),
+        })
     }
 }

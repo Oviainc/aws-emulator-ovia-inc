@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateRecommendationResourceExclusion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateRecommendationResourceExclusion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! MUTATES the stored recommendation resources: each accepted entry writes the
+//! `exclusionStatus` the entry's `isExcluded` asks for onto the stored
+//! [`crate::state::ResourceEntry`] and stamps its `lastUpdatedAt` from the
+//! clock, so a following `ListRecommendationResources` reports the new status
+//! and the recommendation's `resourcesAggregates.excludedCount` counts it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateRecommendationResourceExclusion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Per the model's doc, this operation "supports up to 25 unique recommendation
+//! resource ARNs per request" (the modelled `length 1..25` + `uniqueItems`, both
+//! enforced by the framework) and "currently doesn't support prioritized
+//! recommendation resources". A refusal of one entry is reported as an entry of
+//! `batchUpdateRecommendationResourceExclusionErrors` rather than as a
+//! top-level error, so the remaining entries still apply: an ARN naming no
+//! stored resource and an ARN whose recommendation is `priority` each come back
+//! as one error entry, named by the modelled error shape the same refusal would
+//! use on a single-resource operation.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +87,21 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// One refused entry of the batch: the ARN it names, the modelled error shape a
+/// single-resource operation would refuse it with, and why. Reported per entry
+/// so the other entries of the same request still apply.
+fn entry_error(
+    arn: &str,
+    error_code: &str,
+    error_message: String,
+) -> UpdateRecommendationResourceExclusionError {
+    UpdateRecommendationResourceExclusionError {
+        arn: Some(arn.to_string()),
+        error_code: Some(error_code.to_string()),
+        error_message: Some(error_message),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +175,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateRecommendationResourceExclusion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateRecommendationResourceExclusionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateRecommendationResourceExclusion"))
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchUpdateRecommendationResourceExclusionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the Trusted Advisor store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        // The store itself, so the resource this entry writes and the
+        // recommendation that owns it are reached as two DISJOINT fields: the
+        // entry is looked up exactly once, mutably, and there is no second
+        // lookup that could miss.
+        let store = &mut *state;
+        let updated_at = crate::state::now_millis();
+
+        let mut errors: Vec<UpdateRecommendationResourceExclusionError> = Vec::new();
+        for exclusion in &input.recommendation_resource_exclusions {
+            let Some(resource) = store.recommendation_resources.get_mut(&exclusion.arn) else {
+                errors.push(entry_error(
+                    &exclusion.arn,
+                    "ResourceNotFoundException",
+                    format!(
+                        "no recommendation resource with the identifier {}",
+                        exclusion.arn
+                    ),
+                ));
+                continue;
+            };
+
+            // The type of the recommendation that owns this resource. A resource
+            // whose recommendation is not stored belongs to nothing this
+            // operation can update, so it is refused like an unknown ARN.
+            let owning_type = store
+                .recommendations
+                .get(&resource.recommendation_arn)
+                .map(|recommendation| recommendation.r#type.as_str());
+            match owning_type {
+                None => {
+                    errors.push(entry_error(
+                        &exclusion.arn,
+                        "ResourceNotFoundException",
+                        format!(
+                            "the recommendation that owns {} is not stored",
+                            exclusion.arn
+                        ),
+                    ));
+                    continue;
+                }
+                Some(kind) if kind == crate::state::RECOMMENDATION_TYPE_PRIORITY => {
+                    errors.push(entry_error(
+                        &exclusion.arn,
+                        "ConflictException",
+                        format!(
+                            "the exclusion status of {} cannot be updated: this operation does \
+                             not support prioritized recommendation resources",
+                            exclusion.arn
+                        ),
+                    ));
+                    continue;
+                }
+                Some(_) => {}
+            }
+
+            resource.exclusion_status = if exclusion.is_excluded {
+                crate::state::EXCLUSION_EXCLUDED.to_string()
+            } else {
+                crate::state::EXCLUSION_INCLUDED.to_string()
+            };
+            resource.last_updated_at_millis = updated_at;
+        }
+
+        Ok(BatchUpdateRecommendationResourceExclusionOutput {
+            batch_update_recommendation_resource_exclusion_errors: errors,
+        })
     }
 }

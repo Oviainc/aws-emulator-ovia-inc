@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChecks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChecks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the seeded check catalog from [`crate::state`]: every `CheckSummary`
+//! member comes from the stored [`crate::state::Check`], filtered by the
+//! request's `pillar` / `awsService` / `source` and cut into a page by the
+//! shared cursor helper, so the `@paginated(items=checkSummaries)` contract
+//! walks the whole catalog exactly once.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChecks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `language` is accepted and does not change the text: the catalog carries one
+//! (English) copy of each check's name and description, and inventing a
+//! translation would be fabricating a value the store does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +88,28 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The stored check, as the modelled `CheckSummary`.
+fn check_summary(check: &crate::state::Check) -> CheckSummary {
+    CheckSummary {
+        id: check.id.clone(),
+        arn: check.arn.clone(),
+        name: check.name.clone(),
+        description: check.description.clone(),
+        pillars: check.pillars.clone(),
+        aws_services: check.aws_services.clone(),
+        source: check.source.clone(),
+        metadata: check
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        resource_arn_queryable: check.resource_arn_queryable,
+        aws_resource_types: check.aws_resource_types.clone(),
+        check_granularity: check.check_granularity.clone(),
+        recommendation_id: check.recommendation_id.clone(),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +181,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChecks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChecksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChecks"))
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListChecksErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Trusted Advisor store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Every filter is an equality (or membership) test against the stored
+        // check; an absent filter matches every check.
+        let matching: Vec<(String, CheckSummary)> = state
+            .checks
+            .iter()
+            .filter(|(_, check)| {
+                input
+                    .pillar
+                    .as_ref()
+                    .is_none_or(|pillar| check.pillars.iter().any(|stored| stored == pillar))
+                    && input.aws_service.as_ref().is_none_or(|service| {
+                        check.aws_services.iter().any(|stored| stored == service)
+                    })
+                    && input.source.as_ref().is_none_or(|source| &check.source == source)
+            })
+            .map(|(id, check)| (id.clone(), check_summary(check)))
+            .collect();
+
+        let page = crate::state::paginate(
+            &crate::state::list_scope(
+                "checks",
+                &[
+                    ("pillar", input.pillar.as_deref()),
+                    ("awsService", input.aws_service.as_deref()),
+                    ("source", input.source.as_deref()),
+                ],
+            ),
+            matching,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListChecksErrorModeled::ValidationException(ValidationException {
+                message: "nextToken is not a pagination token this service issued for this list"
+                    .to_string(),
+            })
+        })?;
+
+        Ok(ListChecksOutput {
+            next_token: page.next_token,
+            check_summaries: page.items,
+        })
     }
 }

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecommendationResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecommendationResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the resources of one stored recommendation from [`crate::state`],
+//! filtered by the request's `status` / `exclusionStatus` / `regionCode`, in
+//! resource-ARN order and cut into a page by the shared cursor helper.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecommendationResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A well-formed `recommendationIdentifier` that names nothing in the store is a
+//! `ResourceNotFoundException` (404) — an empty list would claim the
+//! recommendation exists and has no resources.
+//!
+//! `language` is accepted and does not change the text: the store holds one copy
+//! of each resource's metadata.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +91,25 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The stored resource, as the modelled `RecommendationResourceSummary`.
+fn resource_summary(resource: &crate::state::ResourceEntry) -> RecommendationResourceSummary {
+    RecommendationResourceSummary {
+        id: resource.id.clone(),
+        arn: resource.arn.clone(),
+        aws_resource_id: resource.aws_resource_id.clone(),
+        region_code: resource.region_code.clone(),
+        status: resource.status.clone(),
+        metadata: resource
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        last_updated_at: crate::state::date_time(resource.last_updated_at_millis),
+        exclusion_status: resource.exclusion_status.clone(),
+        recommendation_arn: resource.recommendation_arn.clone(),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +182,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecommendationResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecommendationResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecommendationResources"))
+        // `ctx` carries only request metadata; this operation reads nothing from it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRecommendationResourcesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Trusted Advisor store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        if !state
+            .recommendations
+            .contains_key(&input.recommendation_identifier)
+        {
+            return Err(
+                ListRecommendationResourcesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "no recommendation with the identifier {}",
+                            input.recommendation_identifier
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let matching: Vec<(String, RecommendationResourceSummary)> = state
+            .resources_of(&input.recommendation_identifier)
+            .filter(|(_, resource)| {
+                input.status.as_ref().is_none_or(|status| &resource.status == status)
+                    && input
+                        .exclusion_status
+                        .as_ref()
+                        .is_none_or(|exclusion| &resource.exclusion_status == exclusion)
+                    && input
+                        .region_code
+                        .as_ref()
+                        .is_none_or(|region| &resource.region_code == region)
+            })
+            .map(|(arn, resource)| (arn.clone(), resource_summary(resource)))
+            .collect();
+
+        // The cursor's scope names this recommendation AND this read's filters,
+        // so a token issued for one recommendation's resources (or under another
+        // filter set) cannot resume another sequence.
+        let page = crate::state::paginate(
+            &crate::state::list_scope(
+                &format!("resources/{}", input.recommendation_identifier),
+                &[
+                    ("status", input.status.as_deref()),
+                    ("exclusionStatus", input.exclusion_status.as_deref()),
+                    ("regionCode", input.region_code.as_deref()),
+                ],
+            ),
+            matching,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListRecommendationResourcesErrorModeled::ValidationException(ValidationException {
+                message: "nextToken is not a pagination token this service issued for this list"
+                    .to_string(),
+            })
+        })?;
+
+        Ok(ListRecommendationResourcesOutput {
+            next_token: page.next_token,
+            recommendation_resource_summaries: page.items,
+        })
     }
 }
