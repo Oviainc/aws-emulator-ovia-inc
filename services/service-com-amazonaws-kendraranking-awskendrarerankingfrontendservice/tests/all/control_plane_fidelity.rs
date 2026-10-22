@@ -322,7 +322,8 @@ async fn an_id_that_names_no_plan_is_answered_with_the_constant_not_found_messag
     for name in ["deleted-one", "deleted-two"] {
         to_delete.push(create_plan(&router, name).await);
     }
-    // A live plan beside them, so a 404 is about the id and not about an empty store.
+    // A live plan beside them, so the refusal is about the id and not about an empty
+    // store.
     create_plan(&router, "live-plan").await;
     // Every plan is ACTIVE before the deletes: a plan mid-provisioning cannot be
     // deleted, and the live plan has to be able to serve `Rescore`.
@@ -339,12 +340,18 @@ async fn an_id_that_names_no_plan_is_answered_with_the_constant_not_found_messag
         let lookups: Vec<(&str, Value)> = vec![
             ("DescribeRescoreExecutionPlan", json!({ "Id": id })),
             ("DeleteRescoreExecutionPlan", json!({ "Id": id })),
+            (
+                "UpdateRescoreExecutionPlan",
+                json!({ "Id": id, "Name": "no-such-plan" }),
+            ),
             ("Rescore", rescore_body(id)),
         ];
         for (operation, body) in lookups {
             let case = format!("{operation} on {id}");
             let (status, answer) = call(&router, operation, body).await;
-            assert_eq!(status, 404, "case {case:?}: expected HTTP 404, got {answer}");
+            // Every client-side failure of this RPC service carries the protocol's
+            // client-error status; the error TYPE in the body names the failure.
+            assert_eq!(status, 400, "case {case:?}: expected HTTP 400, got {answer}");
             assert_eq!(
                 error_code(&answer),
                 "ResourceNotFoundException",
@@ -478,7 +485,7 @@ async fn rescore_is_refused_while_the_plan_is_not_active_and_served_once_it_is()
                 "RescoreExecutionPlanId": plan,
                 "SearchQuery": "intelligent ranking",
                 "Documents": [
-                    { "Id": "d1", "OriginalScore": 0.4, "Title": "intelligent ranking" },
+                    { "Id": "d1", "OriginalScore": 0.4, "Title": "intelligent ranking", "Body": "a note" },
                     { "Id": "d2", "OriginalScore": 0.9, "TokenizedBody": ["ranking"] },
                 ],
             }),
@@ -513,7 +520,7 @@ async fn rescore_is_refused_while_the_plan_is_not_active_and_served_once_it_is()
     // lookup is answered before the status gate.
     let (status, answer) = call(&router, "Rescore", rescore_body(NEVER_CREATED_PLAN_ID)).await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "an unknown id is not-found, not a status refusal, got {status} {answer}"
     );
 

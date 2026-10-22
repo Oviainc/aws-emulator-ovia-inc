@@ -5,6 +5,10 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
+use crate::ops::types::{
+    Condition, DataLakePrincipal, LFTag, PrincipalResourcePermissions, Resource,
+};
+
 /// One registered data-lake location: the resource ARN Lake Formation manages, the IAM
 /// role it uses to reach it, and the registration flags the caller set.
 ///
@@ -74,6 +78,64 @@ pub struct LfTag {
     pub tag_values: Vec<String>,
 }
 
+/// One explicitly granted Lake Formation permission: the principal it was granted to,
+/// the resource it was granted on, and the two permission sets `GrantPermissions`
+/// carries.
+///
+/// A record's identity is the (catalog, principal, resource, condition) tuple that
+/// [`grant_key`] renders, so granting on the same resource to the same principal twice
+/// UPDATES one record instead of adding a second — which is what makes
+/// `GrantPermissions` idempotent and `ListPermissions` answer exactly one entry for a
+/// repeated grant. Both permission lists are kept as sets in first-granted order, and a
+/// record whose two sets are both empty is dropped rather than kept as an entry with no
+/// permissions at all.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionGrant {
+    /// The Data Catalog the grant was made in ([`resolve_catalog_id`]).
+    pub catalog_id: String,
+    /// `DataLakePrincipal$DataLakePrincipalIdentifier` — the grantee.
+    pub principal: String,
+    /// The resource, as the modelled shape, with the absent catalog ids the model
+    /// documents a default for filled in by [`normalize_resource`], so the same resource
+    /// named twice is one record.
+    pub resource: Resource,
+    /// The permissions held, as a set in first-granted order.
+    pub permissions: Vec<String>,
+    /// The permissions held WITH the grant option, as a set in first-granted order.
+    pub permissions_with_grant_option: Vec<String>,
+    /// `Condition$Expression`, when the grant carried one: part of the record's identity,
+    /// since the same permissions under two conditions are two grants.
+    pub condition_expression: Option<String>,
+}
+
+impl PermissionGrant {
+    /// This record as the wire shape `ListPermissions` projects it.
+    ///
+    /// `AdditionalDetails` carries the RAM resource-share ARNs of a cross-account share
+    /// and `LastUpdated`/`LastUpdatedBy` the audit of the last change; this emulator
+    /// models neither cross-account sharing nor an IAM identity for the caller, so they
+    /// are left absent rather than filled with a fabricated share or identity.
+    pub fn to_wire(&self) -> PrincipalResourcePermissions {
+        PrincipalResourcePermissions {
+            principal: Some(DataLakePrincipal {
+                data_lake_principal_identifier: Some(self.principal.clone()),
+            }),
+            resource: Some(self.resource.clone()),
+            condition: self
+                .condition_expression
+                .clone()
+                .map(|expression| Condition {
+                    expression: Some(expression),
+                }),
+            permissions: Some(self.permissions.clone()),
+            permissions_with_grant_option: Some(self.permissions_with_grant_option.clone()),
+            additional_details: None,
+            last_updated: None,
+            last_updated_by: None,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-lakeformation-awslakeformation. A handler reaches it through [`service_state`].
 ///
 /// # What stops this growing without end
@@ -87,6 +149,10 @@ pub struct LfTag {
 /// catalog id is request-supplied. Passing any of them answers the modelled
 /// `ResourceNumberLimitExceededException`, never a silent insert.
 ///
+/// A permission grant is durable in the same way — only `RevokePermissions` releases one
+/// — and `GrantPermissions`, its single inserting site, refuses a record past
+/// [`MAX_PERMISSION_GRANTS`].
+///
 /// `registered_resources` is bounded the same way, by [`MAX_REGISTERED_RESOURCES`] checked
 /// in `RegisterResource`, the single site that inserts into it.
 #[derive(Debug, Default)]
@@ -95,6 +161,10 @@ pub struct ComAmazonawsLakeformationAwslakeformationState {
     /// is stable and sorted, which is what makes `ListLFTags`' exclusive-start
     /// continuation token resume exactly where the previous page stopped.
     pub lf_tags: BTreeMap<String, BTreeMap<String, LfTag>>,
+    /// [`grant_key`] -> the explicit grant it identifies. A `BTreeMap` for the same
+    /// reason: `ListPermissions` pages through it in key order and its continuation
+    /// token names the key the previous page stopped on.
+    pub permission_grants: BTreeMap<String, PermissionGrant>,
     /// Resource ARN -> its registration. A `BTreeMap` for the same reason: `ListResources`
     /// pages over a stable, sorted order, and `DescribeResource` is an exact-ARN lookup.
     pub registered_resources: BTreeMap<String, RegisteredResource>,
@@ -224,6 +294,415 @@ where
     out
 }
 
+/// The largest page `ListPermissions` answers, and the page size it uses when the caller
+/// names none.
+///
+/// Grounded in the model: `MaxResults` is `PageSize`, `range 1..1000`, and the output
+/// member `PrincipalResourcePermissions` targets `PrincipalResourcePermissionsList`,
+/// which carries no length limit of its own — so the modelled ceiling on `MaxResults` is
+/// what bounds a page.
+pub const MAX_PERMISSIONS_PAGE: i32 = 1000;
+
+/// The most explicit permission grants this store will hold.
+///
+/// A grant is a durable record released only by `RevokePermissions`, and both the
+/// principal and the resource are request-supplied, so without a ceiling a caller that
+/// varies either would grow the store without end. `GrantPermissions` is the single site
+/// that inserts, and it refuses a record past this with the modelled
+/// `InvalidInputException` (the operation models no quota error of its own:
+/// `smithy_query(query="operation",operation="GrantPermissions")` lists only
+/// `ConcurrentModificationException`, `EntityNotFoundException` and
+/// `InvalidInputException`). Emulator-chosen, like the LF-tag ceilings above.
+pub const MAX_PERMISSION_GRANTS: usize = 10_000;
+
+/// The `DataLakeResourceType` values that select `resource`.
+///
+/// From the model: `DataLakeResourceType` is `CATALOG | DATABASE | DATA_LOCATION |
+/// LF_NAMED_TAG_EXPRESSION | LF_TAG | LF_TAG_POLICY | LF_TAG_POLICY_DATABASE |
+/// LF_TAG_POLICY_TABLE | TABLE` (`crate::ops::types::DATA_LAKE_RESOURCE_TYPE_VALUES`),
+/// while `Resource` carries ten members — so the mapping is not one-to-one:
+///
+/// * a column-level grant (`TableWithColumns`) is a grant on a TABLE;
+/// * an LF-tag policy is selected both by the general `LF_TAG_POLICY` and by the
+///   specialisation its own `ResourceType` (`DATABASE | TABLE`) names;
+/// * `DataCellsFilter` and `RLSPolicy` have NO `DataLakeResourceType` member, so no
+///   `ResourceType` filter selects them (a listing that names no `ResourceType` still
+///   does).
+pub fn resource_types(resource: &Resource) -> Vec<&'static str> {
+    if resource.catalog.is_some() {
+        vec!["CATALOG"]
+    } else if resource.database.is_some() {
+        vec!["DATABASE"]
+    } else if resource.table.is_some() || resource.table_with_columns.is_some() {
+        vec!["TABLE"]
+    } else if resource.data_location.is_some() {
+        vec!["DATA_LOCATION"]
+    } else if resource.lf_tag.is_some() {
+        vec!["LF_TAG"]
+    } else if let Some(policy) = &resource.lf_tag_policy {
+        match policy.resource_type.as_str() {
+            "DATABASE" => vec!["LF_TAG_POLICY", "LF_TAG_POLICY_DATABASE"],
+            "TABLE" => vec!["LF_TAG_POLICY", "LF_TAG_POLICY_TABLE"],
+            _ => vec!["LF_TAG_POLICY"],
+        }
+    } else if resource.lf_tag_expression.is_some() {
+        vec!["LF_NAMED_TAG_EXPRESSION"]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Why `resource` cannot name a resource, or `Ok(())` when it names exactly one.
+///
+/// `Resource` is modelled as a STRUCTURE whose ten members are all optional, but it
+/// stands for a choice: every member is a different resource, so naming none leaves the
+/// grant with no target and naming two leaves it ambiguous. The two members that are
+/// themselves a choice — a table named by `Name` or by `TableWildcard`, and the columns
+/// of a `TableWithColumns` named by `ColumnNames` or by `ColumnWildcard` — are checked
+/// the same way. The caller is refused with the modelled `InvalidInputException`; the
+/// message names the member, which is the rule the boundary validator follows for the
+/// constraints the model CAN express.
+pub fn validate_resource(resource: &Resource) -> Result<(), String> {
+    let named: Vec<&str> = [
+        ("Catalog", resource.catalog.is_some()),
+        ("Database", resource.database.is_some()),
+        ("Table", resource.table.is_some()),
+        ("TableWithColumns", resource.table_with_columns.is_some()),
+        ("DataLocation", resource.data_location.is_some()),
+        ("DataCellsFilter", resource.data_cells_filter.is_some()),
+        ("LFTag", resource.lf_tag.is_some()),
+        ("LFTagPolicy", resource.lf_tag_policy.is_some()),
+        ("LFTagExpression", resource.lf_tag_expression.is_some()),
+        ("RLSPolicy", resource.rls_policy.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect();
+    match named.len() {
+        1 => {}
+        0 => {
+            return Err(
+                "Resource must name exactly one resource type, but none was provided".to_string(),
+            )
+        }
+        count => {
+            return Err(format!(
+                "Resource must name exactly one resource type, but {count} were provided: {}",
+                named.join(", ")
+            ))
+        }
+    }
+
+    if let Some(table) = &resource.table {
+        match (table.name.is_some(), table.table_wildcard.is_some()) {
+            (true, true) => {
+                return Err(
+                    "Resource.Table must name either Name or TableWildcard, not both".to_string(),
+                )
+            }
+            (false, false) => {
+                return Err("Resource.Table must name either Name or TableWildcard".to_string())
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(table) = &resource.table_with_columns {
+        match (&table.column_names, &table.column_wildcard) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "Resource.TableWithColumns must name either ColumnNames or ColumnWildcard, \
+                     not both"
+                        .to_string(),
+                )
+            }
+            (None, None) => {
+                return Err(
+                    "Resource.TableWithColumns must name either ColumnNames or ColumnWildcard"
+                        .to_string(),
+                )
+            }
+            (Some(columns), None) if columns.is_empty() => {
+                return Err(
+                    "Resource.TableWithColumns.ColumnNames must name at least one column"
+                        .to_string(),
+                )
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// `resource` with every absent catalog id that the model DOCUMENTS a default for filled
+/// in with `catalog_id`.
+///
+/// "The identifier for the Data Catalog. By default, the account ID." holds for the
+/// catalog id INSIDE a resource too (`smithy_query(query="doc",shape="TableResource",
+/// member="CatalogId")`: "By default, it is the account ID of the caller"), so a grant
+/// on a resource named without one and a grant on the same resource named with the
+/// request's own catalog id are the same grant — which only holds if the stored form is
+/// normalised before [`resource_key`] renders it.
+///
+/// Two members are left exactly as the request named them, because the model documents
+/// no default for either: `CatalogResource$Id` ("An identifier for the catalog
+/// resource" — a catalog resource is named, not defaulted) and nothing else. A
+/// `DataCellsFilterResource$TableCatalogId` ("The ID of the catalog to which the table
+/// belongs") IS defaulted with the rest: the table it belongs to takes the caller's
+/// account as its catalog, so the filter on that table cannot sit in another one, and
+/// leaving it absent would make the same filter named with and without the account id
+/// two records.
+pub fn normalize_resource(resource: &Resource, catalog_id: &str) -> Resource {
+    /// Fills `slot` with `catalog_id` when it names no catalog.
+    fn default_catalog(slot: &mut Option<String>, catalog_id: &str) {
+        if slot.as_deref().is_none_or(str::is_empty) {
+            *slot = Some(catalog_id.to_string());
+        }
+    }
+
+    let mut normalized = resource.clone();
+    if let Some(database) = normalized.database.as_mut() {
+        default_catalog(&mut database.catalog_id, catalog_id);
+    }
+    if let Some(table) = normalized.table.as_mut() {
+        default_catalog(&mut table.catalog_id, catalog_id);
+    }
+    if let Some(table) = normalized.table_with_columns.as_mut() {
+        default_catalog(&mut table.catalog_id, catalog_id);
+    }
+    if let Some(location) = normalized.data_location.as_mut() {
+        default_catalog(&mut location.catalog_id, catalog_id);
+    }
+    if let Some(cells) = normalized.data_cells_filter.as_mut() {
+        default_catalog(&mut cells.table_catalog_id, catalog_id);
+    }
+    if let Some(tag) = normalized.lf_tag.as_mut() {
+        default_catalog(&mut tag.catalog_id, catalog_id);
+    }
+    if let Some(policy) = normalized.lf_tag_policy.as_mut() {
+        default_catalog(&mut policy.catalog_id, catalog_id);
+    }
+    if let Some(expression) = normalized.lf_tag_expression.as_mut() {
+        default_catalog(&mut expression.catalog_id, catalog_id);
+    }
+    if let Some(policy) = normalized.rls_policy.as_mut() {
+        default_catalog(&mut policy.catalog_id, catalog_id);
+    }
+    normalized
+}
+
+/// Appends `value` to `key` length-prefixed (`5:alice`).
+///
+/// Length-prefixing is what makes a composite key INJECTIVE: no value a request supplies
+/// — a table name with a colon, an S3 ARN with a slash — can be read as the next field,
+/// so two different resources can never render the same key and share one grant record.
+fn push_text(key: &mut String, value: &str) {
+    key.push_str(&value.len().to_string());
+    key.push(':');
+    key.push_str(value);
+}
+
+/// Appends an optional value: `-` for absent, `+` and the value for present.
+fn push_optional(key: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            key.push('+');
+            push_text(key, value);
+        }
+        None => key.push('-'),
+    }
+}
+
+/// Appends a SET of values: sorted and de-duplicated, so the order a request listed them
+/// in does not change which resource the key names.
+fn push_set(key: &mut String, values: &[String]) {
+    let mut sorted: Vec<&str> = values.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    key.push('[');
+    for value in sorted {
+        push_text(key, value);
+    }
+    key.push(']');
+}
+
+/// The identity of the resource `resource` names: equal keys are the same resource.
+///
+/// Built from the members of the one `Resource` member that is set, with the lists the
+/// model carries as SETS (a table's columns, an LF-tag's values, an LF-tag policy's
+/// expression) rendered order-insensitively — granting on columns `[b, a]` and on
+/// `[a, b]` is a grant on the same columns. A table named by `TableWildcard` is its own
+/// resource ("every table in the database"), not the table whose name is absent, so it
+/// gets its own key.
+pub fn resource_key(resource: &Resource) -> String {
+    let mut key = String::new();
+    if let Some(catalog) = &resource.catalog {
+        key.push_str("CATALOG|");
+        push_optional(&mut key, catalog.id.as_deref());
+    } else if let Some(database) = &resource.database {
+        key.push_str("DATABASE|");
+        push_optional(&mut key, database.catalog_id.as_deref());
+        push_text(&mut key, &database.name);
+    } else if let Some(table) = &resource.table {
+        key.push_str("TABLE|");
+        push_optional(&mut key, table.catalog_id.as_deref());
+        push_text(&mut key, &table.database_name);
+        match &table.name {
+            Some(name) => push_text(&mut key, name),
+            None => key.push('*'),
+        }
+    } else if let Some(table) = &resource.table_with_columns {
+        key.push_str("TABLE_WITH_COLUMNS|");
+        push_optional(&mut key, table.catalog_id.as_deref());
+        push_text(&mut key, &table.database_name);
+        push_text(&mut key, &table.name);
+        match &table.column_wildcard {
+            Some(wildcard) => {
+                key.push_str("EXCLUDING");
+                push_set(
+                    &mut key,
+                    wildcard.excluded_column_names.as_deref().unwrap_or_default(),
+                );
+            }
+            None => {
+                key.push_str("INCLUDING");
+                push_set(&mut key, table.column_names.as_deref().unwrap_or_default());
+            }
+        }
+    } else if let Some(location) = &resource.data_location {
+        key.push_str("DATA_LOCATION|");
+        push_optional(&mut key, location.catalog_id.as_deref());
+        push_text(&mut key, &location.resource_arn);
+    } else if let Some(filter) = &resource.data_cells_filter {
+        key.push_str("DATA_CELLS_FILTER|");
+        push_optional(&mut key, filter.table_catalog_id.as_deref());
+        push_optional(&mut key, filter.database_name.as_deref());
+        push_optional(&mut key, filter.table_name.as_deref());
+        push_optional(&mut key, filter.name.as_deref());
+    } else if let Some(tag) = &resource.lf_tag {
+        key.push_str("LF_TAG|");
+        push_optional(&mut key, tag.catalog_id.as_deref());
+        push_text(&mut key, &tag.tag_key);
+        push_set(&mut key, &tag.tag_values);
+    } else if let Some(policy) = &resource.lf_tag_policy {
+        key.push_str("LF_TAG_POLICY|");
+        push_optional(&mut key, policy.catalog_id.as_deref());
+        push_text(&mut key, &policy.resource_type);
+        push_optional(&mut key, policy.expression_name.as_deref());
+        let mut expression: Vec<&LFTag> = policy
+            .expression
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .collect();
+        expression.sort_by(|left, right| left.tag_key.cmp(&right.tag_key));
+        key.push('{');
+        for tag in expression {
+            push_text(&mut key, &tag.tag_key);
+            push_set(&mut key, &tag.tag_values);
+        }
+        key.push('}');
+    } else if let Some(expression) = &resource.lf_tag_expression {
+        key.push_str("LF_TAG_EXPRESSION|");
+        push_optional(&mut key, expression.catalog_id.as_deref());
+        push_text(&mut key, &expression.name);
+    } else if let Some(policy) = &resource.rls_policy {
+        key.push_str("RLS_POLICY|");
+        push_optional(&mut key, policy.catalog_id.as_deref());
+        push_text(&mut key, &policy.name);
+    } else {
+        // Unreachable through a handler: `validate_resource` refuses a `Resource` naming
+        // no member before a grant or a filter is keyed.
+        key.push_str("NONE");
+    }
+    key
+}
+
+/// The identity of one grant record: the (catalog, principal, resource, condition) tuple
+/// a `GrantPermissions` call addresses.
+///
+/// Catalog first, then principal, so [`ComAmazonawsLakeformationAwslakeformationState::permission_grants`]
+/// enumerates in a stable order a `ListPermissions` page can resume from.
+pub fn grant_key(
+    catalog_id: &str,
+    principal: &str,
+    resource: &Resource,
+    condition: Option<&str>,
+) -> String {
+    let mut key = String::new();
+    push_text(&mut key, catalog_id);
+    push_text(&mut key, principal);
+    push_optional(&mut key, condition);
+    key.push_str(&resource_key(resource));
+    key
+}
+
+/// Does the grant on `stored` fall under a listing filtered by the resource `filter`?
+///
+/// Identity is the base case. Beyond it the model's own documentation fixes two
+/// relations, both only for a table named by `Name`:
+///
+/// * `ListPermissions$Resource` — "This operation does not support getting privileges on
+///   a table with columns. Instead, call this operation on the table, and the operation
+///   returns the table and the table w columns" — so a table filter also selects the
+///   column-level grants on that same table;
+/// * `ListPermissions$IncludeRelated` — "Set the field to TRUE to show the cell filters
+///   on a table resource" — so with `include_related` a table filter also selects the
+///   data-cells-filter grants on that same table.
+pub fn resource_filter_matches(filter: &Resource, stored: &Resource, include_related: bool) -> bool {
+    if resource_key(filter) == resource_key(stored) {
+        return true;
+    }
+    let Some(table) = filter.table.as_ref() else {
+        return false;
+    };
+    let Some(name) = table.name.as_deref() else {
+        return false;
+    };
+    if let Some(columns) = &stored.table_with_columns {
+        return columns.catalog_id == table.catalog_id
+            && columns.database_name == table.database_name
+            && columns.name == name;
+    }
+    if include_related {
+        if let Some(cells) = &stored.data_cells_filter {
+            return cells.table_catalog_id == table.catalog_id
+                && cells.database_name.as_deref() == Some(table.database_name.as_str())
+                && cells.table_name.as_deref() == Some(name);
+        }
+    }
+    false
+}
+
+/// Adds `added` to `held`, keeping it a set in first-granted order.
+pub fn merge_permissions(held: &mut Vec<String>, added: &[String]) {
+    for permission in added {
+        if !held.iter().any(|existing| existing == permission) {
+            held.push(permission.clone());
+        }
+    }
+}
+
+/// The entries of `requested` that `held` does not carry, in first-named order: what a
+/// revoke cannot take away because it was never granted.
+pub fn missing_permissions(held: &[String], requested: &[String]) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    for permission in requested {
+        if !held.iter().any(|existing| existing == permission)
+            && !missing.iter().any(|existing| existing == permission)
+        {
+            missing.push(permission.clone());
+        }
+    }
+    missing
+}
+
+/// Drops every entry of `removed` from `held`.
+pub fn remove_permissions(held: &mut Vec<String>, removed: &[String]) {
+    held.retain(|permission| !removed.iter().any(|dropped| dropped == permission));
+}
+
 /// The field separator inside a continuation token's plaintext.
 ///
 /// `U+001F` (unit separator) cannot appear in either field: `CatalogIdString` is
@@ -262,6 +741,41 @@ pub fn decode_page_token(token: &str) -> Option<(String, String)> {
         return None;
     }
     Some((catalog_id.to_string(), tag_key.to_string()))
+}
+
+/// The tag identifying a `ListPermissions` continuation token this service minted. It
+/// differs from [`TOKEN_PREFIX`] so a token minted for one paginated operation is not
+/// accepted by the other.
+const PERMISSIONS_TOKEN_PREFIX: &str = "lfperms";
+
+/// An opaque continuation token standing for "resume strictly after this grant key".
+///
+/// Hex-wrapped and self-describing for the same reasons as [`encode_page_token`].
+pub fn encode_permissions_page_token(grant_key: &str) -> String {
+    let plain = format!(
+        "{PERMISSIONS_TOKEN_PREFIX}{TOKEN_SEPARATOR}{TOKEN_VERSION}{TOKEN_SEPARATOR}{grant_key}"
+    );
+    hex::encode(plain)
+}
+
+/// The grant key a token names an exclusive start at, or `None` when the token was not
+/// minted by [`encode_permissions_page_token`] (so the caller is refused rather than
+/// silently served page one).
+///
+/// The key is the token's LAST field and is taken whole (`splitn`), because a grant key
+/// embeds request-supplied text — a `DataLocation` ARN is modelled with no pattern at
+/// all — and must survive the round trip byte for byte.
+pub fn decode_permissions_page_token(token: &str) -> Option<String> {
+    let bytes = hex::decode(token).ok()?;
+    let plain = String::from_utf8(bytes).ok()?;
+    let mut fields = plain.splitn(3, TOKEN_SEPARATOR);
+    let prefix = fields.next()?;
+    let version = fields.next()?;
+    let grant_key = fields.next()?;
+    if prefix != PERMISSIONS_TOKEN_PREFIX || version != TOKEN_VERSION {
+        return None;
+    }
+    Some(grant_key.to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

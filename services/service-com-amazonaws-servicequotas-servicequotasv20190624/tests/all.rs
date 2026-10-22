@@ -23,3 +23,5 @@ mod quota_workflow;
 mod state_roundtrip;
 #[path = "all/support_case_and_templates.rs"]
 mod support_case_and_templates;
+#[path = "all/tags.rs"]
+mod tags;

@@ -159,7 +159,7 @@ async fn the_plan_lifecycle_is_served_from_the_persisted_plan() {
             "Documents": [
                 { "Id": "d1", "OriginalScore": 0.4, "Title": "intelligent ranking guide", "Body": "a guide" },
                 { "Id": "d2", "OriginalScore": 0.9, "Body": "unrelated" },
-                { "Id": "d3", "OriginalScore": 0.1, "Title": "ranking" },
+                { "Id": "d3", "OriginalScore": 0.1, "Title": "ranking", "Body": "notes" },
             ],
         }),
     )
@@ -182,7 +182,7 @@ async fn the_plan_lifecycle_is_served_from_the_persisted_plan() {
 
     let (status, described) =
         call(&router, "DescribeRescoreExecutionPlan", json!({ "Id": id })).await;
-    assert_eq!(status, 404, "describe after delete: got {described}");
+    assert_eq!(status, 400, "describe after delete: got {described}");
     assert_eq!(
         error_code(&described),
         "ResourceNotFoundException",
@@ -254,8 +254,9 @@ async fn repeating_a_client_token_returns_the_one_plan_it_created() {
 #[tokio::test]
 async fn an_id_no_plan_was_created_for_is_not_found_on_every_operation_that_addresses_one() {
     let router = emulator();
-    // A live plan beside it, so the 404 is about the id and not about an empty store.
-    // ACTIVE, so the delete below is about the id and not about the plan's status.
+    // A live plan beside it, so the refusal is about the id and not about an empty
+    // store. ACTIVE, so the delete below is about the id and not about the plan's
+    // status.
     let live = create_active_plan(&router, "live-plan").await;
 
     let cases: Vec<(&str, Value)> = vec![
@@ -272,14 +273,16 @@ async fn an_id_no_plan_was_created_for_is_not_found_on_every_operation_that_addr
             json!({
                 "RescoreExecutionPlanId": UNKNOWN_PLAN_ID,
                 "SearchQuery": "anything",
-                "Documents": [{ "Id": "d1", "OriginalScore": 0.5 }],
+                "Documents": [{ "Id": "d1", "OriginalScore": 0.5, "Body": "a body" }],
             }),
         ),
     ];
 
     for (operation, body) in cases {
         let (status, answer) = call(&router, operation, body).await;
-        assert_eq!(status, 404, "case {operation}: got {answer}");
+        // A client-side failure of this RPC service travels with the protocol's
+        // client-error status; the body's error type says which failure it was.
+        assert_eq!(status, 400, "case {operation}: got {answer}");
         assert_eq!(
             error_code(&answer),
             "ResourceNotFoundException",
@@ -287,7 +290,7 @@ async fn an_id_no_plan_was_created_for_is_not_found_on_every_operation_that_addr
         );
     }
 
-    // And deleting the live plan twice: the second delete is the same 404.
+    // And deleting the live plan twice: the second delete is the same refusal.
     let (status, first) = call(
         &router,
         "DeleteRescoreExecutionPlan",
@@ -301,7 +304,7 @@ async fn an_id_no_plan_was_created_for_is_not_found_on_every_operation_that_addr
         json!({ "Id": live }),
     )
     .await;
-    assert_eq!(status, 404, "second delete: got {second}");
+    assert_eq!(status, 400, "second delete: got {second}");
     assert_eq!(
         error_code(&second),
         "ResourceNotFoundException",
@@ -335,14 +338,14 @@ async fn rescore_ranks_exactly_the_submitted_documents_by_descending_score() {
             documents: json!([
                 { "Id": "d1", "OriginalScore": 0.4, "Title": "intelligent ranking guide", "Body": "a guide" },
                 { "Id": "d2", "OriginalScore": 0.9, "Body": "unrelated" },
-                { "Id": "d3", "OriginalScore": 0.1, "Title": "ranking" },
+                { "Id": "d3", "OriginalScore": 0.1, "Title": "ranking", "Body": "notes" },
             ]),
             expected_order: Some(vec!["d1", "d2", "d3"]),
         },
         RescoreCase {
             case: "a single document",
             query: "lonely",
-            documents: json!([{ "Id": "only", "OriginalScore": 0.5, "Title": "lonely" }]),
+            documents: json!([{ "Id": "only", "OriginalScore": 0.5, "Title": "lonely", "Body": "a note" }]),
             expected_order: Some(vec!["only"]),
         },
         RescoreCase {
@@ -359,11 +362,11 @@ async fn rescore_ranks_exactly_the_submitted_documents_by_descending_score() {
             case: "a title match outranks a body match, which outranks no match",
             query: "cloud search",
             documents: json!([
-                { "Id": "t-both", "OriginalScore": 0.0, "Title": "cloud search engine" },
-                { "Id": "t-one", "OriginalScore": 0.0, "Title": "cloud" },
+                { "Id": "t-both", "OriginalScore": 0.0, "Title": "cloud search engine", "Body": "notes" },
+                { "Id": "t-one", "OriginalScore": 0.0, "Title": "cloud", "Body": "notes" },
                 { "Id": "b-both", "OriginalScore": 0.0, "Body": "cloud search tuning" },
                 { "Id": "tok", "OriginalScore": 0.0, "TokenizedBody": ["cloud", "search"] },
-                { "Id": "plain", "OriginalScore": 0.2 },
+                { "Id": "plain", "OriginalScore": 0.2, "Body": "notes" },
             ]),
             expected_order: Some(vec!["t-both", "t-one", "b-both", "tok", "plain"]),
         },
@@ -371,8 +374,8 @@ async fn rescore_ranks_exactly_the_submitted_documents_by_descending_score() {
             case: "original scores at both published bounds",
             query: "bounds",
             documents: json!([
-                { "Id": "hi", "OriginalScore": 100000.0 },
-                { "Id": "lo", "OriginalScore": -100000.0 },
+                { "Id": "hi", "OriginalScore": 100000.0, "Body": "a note" },
+                { "Id": "lo", "OriginalScore": -100000.0, "Body": "a note" },
             ]),
             expected_order: Some(vec!["hi", "lo"]),
         },
@@ -380,8 +383,8 @@ async fn rescore_ranks_exactly_the_submitted_documents_by_descending_score() {
             case: "a repeated document id still gets one result item each",
             query: "repeat",
             documents: json!([
-                { "Id": "dup", "OriginalScore": 0.3 },
-                { "Id": "dup", "OriginalScore": 0.3 },
+                { "Id": "dup", "OriginalScore": 0.3, "Body": "a note" },
+                { "Id": "dup", "OriginalScore": 0.3, "Body": "a note" },
             ]),
             expected_order: Some(vec!["dup", "dup"]),
         },
@@ -389,8 +392,8 @@ async fn rescore_ranks_exactly_the_submitted_documents_by_descending_score() {
             case: "a query whose terms repeat, over pre-tokenized titles",
             query: "alpha alpha beta",
             documents: json!([
-                { "Id": "both", "OriginalScore": 0.0, "TokenizedTitle": ["Alpha", "BETA"] },
-                { "Id": "one", "OriginalScore": 0.0, "TokenizedTitle": ["alpha"] },
+                { "Id": "both", "OriginalScore": 0.0, "TokenizedTitle": ["Alpha", "BETA"], "Body": "a note" },
+                { "Id": "one", "OriginalScore": 0.0, "TokenizedTitle": ["alpha"], "Body": "a note" },
             ]),
             expected_order: Some(vec!["both", "one"]),
         },
@@ -472,8 +475,8 @@ async fn a_pre_tokenized_field_scores_the_same_as_its_text_form() {
             "RescoreExecutionPlanId": plan,
             "SearchQuery": "alpha beta",
             "Documents": [
-                { "Id": "text", "OriginalScore": 0.2, "Title": "Alpha beta!" },
-                { "Id": "tokens", "OriginalScore": 0.2, "TokenizedTitle": ["alpha", "BETA"] },
+                { "Id": "text", "OriginalScore": 0.2, "Title": "Alpha beta!", "Body": "a note" },
+                { "Id": "tokens", "OriginalScore": 0.2, "TokenizedTitle": ["alpha", "BETA"], "Body": "a note" },
             ],
         }),
     )
@@ -660,6 +663,7 @@ async fn a_request_outside_a_constraint_is_refused_with_validation_exception() {
                     "OriginalScore": 0.5,
                     "Title": "both",
                     "TokenizedTitle": ["both"],
+                    "Body": "a note",
                 }],
             }),
         ),
@@ -712,7 +716,7 @@ async fn a_request_outside_a_constraint_is_refused_with_validation_exception() {
         ("documents one past the ceiling", ceiling + 1, 400),
     ] {
         let documents: Vec<Value> = (0..count)
-            .map(|n| json!({ "Id": format!("d{n}"), "OriginalScore": 0.5 }))
+            .map(|n| json!({ "Id": format!("d{n}"), "OriginalScore": 0.5, "Body": "a note" }))
             .collect();
         let (status, answer) = call(
             &router,
@@ -768,7 +772,9 @@ async fn a_plan_past_the_quota_is_refused_with_the_modelled_quota_error() {
         json!({ "Name": "one-too-many" }),
     )
     .await;
-    assert_eq!(status, 402, "a create past the quota: got {answer}");
+    // The quota refusal is a client-side failure, so it travels with this service's
+    // client-error status like every other one; its error TYPE is what names it.
+    assert_eq!(status, 400, "a create past the quota: got {answer}");
     assert_eq!(
         error_code(&answer),
         "ServiceQuotaExceededException",
@@ -882,7 +888,7 @@ async fn no_operation_of_this_service_is_a_scaffold_any_more() {
             json!({
                 "RescoreExecutionPlanId": plan,
                 "SearchQuery": "census",
-                "Documents": [{ "Id": "d", "OriginalScore": 0.5 }],
+                "Documents": [{ "Id": "d", "OriginalScore": 0.5, "Body": "a note" }],
             }),
         ),
         ("DeleteRescoreExecutionPlan", json!({ "Id": plan })),

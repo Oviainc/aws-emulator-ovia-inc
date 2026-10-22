@@ -208,16 +208,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Documented on `Document$TokenizedTitle` / `$TokenizedBody`: "You must choose
-        // to provide Title or TokenizedTitle. You cannot provide both." — a rule the
-        // model cannot express, so it is refused here with the modelled 400.
+        // Two rules on each submitted document, both documented on `Document`'s
+        // members and neither expressible in the model, so both are refused here with
+        // the modelled `ValidationException`:
+        //
+        // * the document's body text must be there, in exactly ONE of its two forms
+        //   ("You must choose to provide Body or TokenizedBody. You cannot provide
+        //   both." — `Document$TokenizedBody`);
+        // * its title, which is optional, may be given in at most one form ("You must
+        //   choose to provide Title or TokenizedTitle. You cannot provide both." —
+        //   `Document$TokenizedTitle`).
+        //
+        // The REQUIREMENT on the body is evaluated before the title's exclusivity, so a
+        // document failing both is told what it is MISSING rather than what it
+        // duplicates: a caller that dropped the duplicate title would otherwise be
+        // refused a second time for the defect it was never told about. The documents
+        // are walked in request order, and the first document that fails a rule is the
+        // one reported.
         for document in &input.documents {
-            if document.title.is_some() && document.tokenized_title.is_some() {
+            if document.body.is_none() && document.tokenized_body.is_none() {
                 return Err(RescoreErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "Document {} provides both Title and TokenizedTitle; provide one.",
-                        document.id
-                    )),
+                    message: Some(crate::state::DOCUMENT_BODY_REQUIRED_MESSAGE.to_string()),
                 })
                 .into());
             }
@@ -225,6 +236,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(RescoreErrorModeled::ValidationException(ValidationException {
                     message: Some(format!(
                         "Document {} provides both Body and TokenizedBody; provide one.",
+                        document.id
+                    )),
+                })
+                .into());
+            }
+            if document.title.is_some() && document.tokenized_title.is_some() {
+                return Err(RescoreErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "Document {} provides both Title and TokenizedTitle; provide one.",
                         document.id
                     )),
                 })
