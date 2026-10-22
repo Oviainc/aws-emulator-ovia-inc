@@ -20,6 +20,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
+use smithy_server_runtime::{Violation, ViolationKind};
+
 use crate::ops::types::ImportConfiguration;
 
 /// How long after `CreateDatastore` the data store leaves `CREATING` for `ACTIVE`.
@@ -79,6 +81,184 @@ pub const ARN_SERVICE: &str = "medical-imaging";
 
 /// The region an ARN names when the request carries no SigV4 credential scope.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+// ---------------------------------------------------------------------------
+// How this service WORDS a refusal
+//
+// Three wording rules live here because more than one handler — and the
+// `override_refusal` seam in `crate::service` — states them, and a text spelled
+// twice drifts:
+//
+// 1. A missing resource is stated by its KIND, as a constant: the text carries no
+//    identifier from the request, so one caller probing ids cannot read them back
+//    out of the 404 body ([`DATASTORE_NOT_FOUND_MESSAGE`],
+//    [`IMPORT_JOB_NOT_FOUND_MESSAGE`]).
+// 2. A continuation token this service did not issue is refused with ONE fixed
+//    sentence that does not vary with the token supplied
+//    ([`INVALID_NEXT_TOKEN_MESSAGE`]).
+// 3. An input-constraint violation is stated in the AWS envelope over the framework's
+//    own clauses, with every `@pattern` quoted WITHOUT the anchors the model spells it
+//    with — and with the rejected value withheld for the members this service does not
+//    reflect ([`constraint_clause`], [`VALUE_WITHHOLDING_MEMBERS`],
+//    [`validation_envelope`]).
+//
+// A malformed resource ARN is NOT one of them: the ARN parse runs before constraint
+// validation, so `crate::service` answers it with the modelled `BadRequestException`
+// and [`MALFORMED_ARN_MESSAGE`] instead.
+// ---------------------------------------------------------------------------
+
+/// The text this service answers a request naming a data store it does not hold with.
+///
+/// A constant of the service, not of the request: the recorded corpus shows the same
+/// sentence from `GetDatastore`, `DeleteDatastore`, `GetDICOMImportJob` and
+/// `StartDICOMImportJob`, with no data store identifier in it.
+pub const DATASTORE_NOT_FOUND_MESSAGE: &str = "Datastore resource is not found.";
+
+/// The text this service answers a request naming an import job a data store does not
+/// hold with.
+///
+/// The resource KIND is what the sentence states, exactly as
+/// [`DATASTORE_NOT_FOUND_MESSAGE`] does for a data store; AWS's own wording for an
+/// absent import job is not recorded, so this spelling is chosen by analogy. What is
+/// NOT chosen is the shape: no identifier the caller supplied appears in it.
+pub const IMPORT_JOB_NOT_FOUND_MESSAGE: &str = "ImportJob resource is not found.";
+
+/// The text this service refuses a `nextToken` it did not issue with — fixed, and
+/// independent of the token supplied, so the refusal reveals nothing about how a real
+/// token is built.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str =
+    "Failed to perform requested operation due to invalid NextToken. Please try again.";
+
+/// The words that join a constraint clause's subject to its requirement. The framework
+/// renders `Value '<v>' at '<path>'` before it and the requirement after it, so it is
+/// also where [`constraint_clause`] cuts the framework's clause in two.
+const CONSTRAINT_SEPARATOR: &str = " failed to satisfy constraint: ";
+
+/// One constraint violation, worded the way this service words it.
+///
+/// The framework already states every violation class in the AWS sentence
+/// (`Value '<v>' at '<path>' failed to satisfy constraint: <requirement>`), so that
+/// rendering is REUSED — a constraint class this service has never seen is still phrased
+/// like the rest — and exactly two things are changed:
+///
+/// * a `@pattern` requirement quotes the expression WITHOUT the `^` / `$` the model
+///   spells it with. AWS advertises the expression a value must satisfy, not the
+///   anchoring that makes the match total, and a client reconstructing the advertised
+///   pattern from the message must get the one the service really emits.
+/// * a violation on one of [`VALUE_WITHHOLDING_MEMBERS`] (or a DICOM attribute) is
+///   stated as `<path> failed to satisfy constraint: <requirement>`, with no value at
+///   all: this service does not reflect free text a caller composed, a key reference or
+///   patient detail back into an error body. Every other member — including one that
+///   names another AWS resource — keeps the echoed value. Both forms are in the
+///   recorded corpus, from the same operation: the clauses about the data store's name
+///   and its KMS key carry no value where the one about the authorizer's function ARN
+///   does. See [`withholds_value`].
+///
+/// The framework's clause is split at its LAST separator, and a `@pattern` is replaced
+/// in the requirement half only: the echoed value precedes it and is caller-controlled,
+/// so a caller who sends the separator text — or the pattern itself — as the value
+/// cannot have its own value rewritten or read as a requirement.
+pub fn constraint_clause(violation: &Violation) -> String {
+    let rendered = violation.message();
+    let Some((subject, requirement)) = rendered.rsplit_once(CONSTRAINT_SEPARATOR) else {
+        // A clause the framework states in some other shape: keep it verbatim rather
+        // than guessing at its parts.
+        return rendered;
+    };
+    let requirement = match &violation.kind {
+        ViolationKind::Pattern(pattern) => {
+            requirement.replace(pattern.as_str(), unanchored(pattern))
+        }
+        _ => requirement.to_string(),
+    };
+    if withholds_value(&violation.path) {
+        return format!("{}{CONSTRAINT_SEPARATOR}{requirement}", violation.path);
+    }
+    format!("{subject}{CONSTRAINT_SEPARATOR}{requirement}")
+}
+
+/// The members whose value a refusal WITHHOLDS, spelled out so the rule's scope is
+/// visible — every one of them is an input member this service's model constrains, in
+/// the lowerCamel spelling a validation path uses, lowercased for comparison:
+///
+/// * `datastoreName` and `jobName` carry a caller-chosen NAME: free text a caller
+///   composed, which in a clinical service can carry patient detail.
+/// * `kmsKeyArn` names an encryption key, which is credential-adjacent.
+///
+/// A member that names another AWS resource (`lambdaAuthorizerArn`, `dataAccessRoleArn`)
+/// is in neither class and keeps its echoed value — which is what the recorded corpus
+/// shows: the clauses about the data store's name and its KMS key carry no value where
+/// the one about the authorizer's function ARN carries it.
+const VALUE_WITHHOLDING_MEMBERS: &[&str] = &["datastorename", "jobname", "kmskeyarn"];
+
+/// The DICOM attribute members, in the same lowercased spelling. The model marks every
+/// one of them `@sensitive`
+/// (`smithy_query(query="shape",shape="SearchByAttributeValue,DICOMStudyDateAndTime")`:
+/// the five search attributes plus the study date and time), which is the model itself
+/// saying the value must not be reproduced — so a refusal about one withholds it, by the
+/// same rule. Listed one by one rather than matched by prefix, so the scope is exactly
+/// the `@sensitive` set the model declares and a future non-sensitive `DICOM*` member
+/// does not silently join it.
+const SENSITIVE_DICOM_MEMBERS: &[&str] = &[
+    "dicompatientid",
+    "dicomaccessionnumber",
+    "dicomstudyid",
+    "dicomstudyinstanceuid",
+    "dicomseriesinstanceuid",
+    "dicomstudydate",
+    "dicomstudytime",
+];
+
+/// Whether a refusal about `path` withholds the value it refused.
+///
+/// Keyed on the MEMBER — the last segment of the validation path — never on what the
+/// caller sent: the same member withholds its value whatever the violation and whatever
+/// the value was.
+fn withholds_value(path: &str) -> bool {
+    let member = path.rsplit('.').next().unwrap_or(path).to_ascii_lowercase();
+    VALUE_WITHHOLDING_MEMBERS.contains(&member.as_str())
+        || SENSITIVE_DICOM_MEMBERS.contains(&member.as_str())
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with. A `$` escaped
+/// by a backslash is a literal dollar sign inside the expression, not the end anchor, so
+/// it stays.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// The `ValidationException` message for one or more violations: the AWS envelope
+/// (`N validation error(s) detected: `) over one [`constraint_clause`] each, in the
+/// order they were accumulated. `None` when there is nothing to state.
+pub fn validation_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations.iter().map(constraint_clause).collect();
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
+
+/// The envelope for a single violation a HANDLER found itself, so a refusal raised past
+/// the boundary validator reads exactly like one the boundary stated. Delegates to
+/// [`validation_envelope`], so the envelope text is spelled in one place.
+pub fn one_validation_error(violation: &Violation) -> String {
+    validation_envelope(::std::slice::from_ref(violation)).unwrap_or_default()
+}
 
 /// The `@pattern` of `com.amazonaws.medicalimaging#Arn`
 /// (`smithy_query(query="shape",shape="Arn")`), the shape every `resourceArn` path

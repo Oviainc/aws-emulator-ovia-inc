@@ -129,7 +129,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let datastore = store.datastores.get(&input.datastore_id).ok_or_else(|| {
             GetDatastoreErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Datastore {} was not found", input.datastore_id),
+                // Constant, and stated by resource KIND: the requested id is not
+                // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
+                message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
             })
         })?;
 

@@ -170,7 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.datastores.contains_key(&input.datastore_id) {
             return Err(StartDICOMImportJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Datastore {} was not found", input.datastore_id),
+                    // Constant, and stated by resource KIND: the requested id is not
+                    // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
+                    message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
                 },
             )
             .into());
