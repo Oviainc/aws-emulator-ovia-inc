@@ -521,7 +521,9 @@ pub struct WebACLEntry {
     /// `MetricName`, which "you can't change ... after you create the `WebACL`".
     pub metric_name: String,
     /// The `WafActionType` wire value of `DefaultAction`: the action AWS WAF takes for
-    /// a request none of the web ACL's rules match.
+    /// a request none of the web ACL's rules match. Never
+    /// [`crate::ops::create_web_acl::DEFAULT_ACTION_EXCLUDED`], the one value that
+    /// catalog excludes for a default action.
     pub default_action: String,
     /// The rules activated in this web ACL, in priority order. A newly created web ACL
     /// holds none: they arrive through `UpdateWebACL`.

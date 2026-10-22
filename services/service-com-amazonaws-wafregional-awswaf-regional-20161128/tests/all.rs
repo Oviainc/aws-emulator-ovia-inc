@@ -15,6 +15,9 @@
 mod byte_match_set_lifecycle;
 #[path = "all/geo_match_set_lifecycle.rs"]
 mod geo_match_set_lifecycle;
+// The WebACL fixtures the web-ACL suites share, on top of the wire harness.
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
 #[path = "all/rate_based_rule_lifecycle.rs"]
@@ -29,6 +32,8 @@ mod size_constraint_set;
 mod sql_injection_match_set;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/web_acl_default_action.rs"]
+mod web_acl_default_action;
 #[path = "all/web_acl_lifecycle.rs"]
 mod web_acl_lifecycle;
 #[path = "all/wire.rs"]

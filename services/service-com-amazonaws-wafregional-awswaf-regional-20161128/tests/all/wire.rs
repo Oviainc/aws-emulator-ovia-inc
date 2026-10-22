@@ -32,8 +32,24 @@ pub fn router() -> MultiServiceRouter {
     router_on(Arc::new(engine::InMemoryEngine::new()))
 }
 
-/// Call one operation and return `(http status, parsed body)`.
+/// The region the credential scope of [`call`] names.
+pub const DEFAULT_TEST_REGION: &str = "us-east-1";
+
+/// Call one operation, signed for [`DEFAULT_TEST_REGION`], and return
+/// `(http status, parsed body)`.
 pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+    call_in_region(router, DEFAULT_TEST_REGION, operation, body).await
+}
+
+/// Call one operation with a SigV4 credential scope naming `region`, and return
+/// `(http status, parsed body)` — the seam a suite needs to assert what a response
+/// derives from the region the request was signed for.
+pub async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -42,10 +58,12 @@ pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) ->
         // for this router, so the signature itself is never checked.
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20250818/us-east-1/waf-regional/aws4_request, \
-             SignedHeaders=host;x-amz-date;x-amz-target, Signature=0000",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20250818/{region}/waf-regional/\
+                 aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=0000"
+            ),
         )
-        .header("host", "waf-regional.us-east-1.amazonaws.com")
+        .header("host", format!("waf-regional.{region}.amazonaws.com"))
         .header("content-type", "application/x-amz-json-1.1")
         .header(
             "x-amz-target",

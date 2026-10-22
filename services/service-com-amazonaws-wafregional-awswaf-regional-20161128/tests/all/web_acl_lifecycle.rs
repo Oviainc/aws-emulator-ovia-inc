@@ -15,6 +15,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_wafregional_awswaf_regional_20161128::ops::create_web_acl::DEFAULT_ACTION_EXCLUDED;
 use service_com_amazonaws_wafregional_awswaf_regional_20161128::ops::types::WAF_ACTION_TYPE_VALUES;
 use service_com_amazonaws_wafregional_awswaf_regional_20161128::state::{
     MAX_TAGS_PER_RESOURCE, MAX_WEB_ACLS, RESERVED_METRIC_NAMES,
@@ -222,10 +223,11 @@ fn expected_arn(region: &str, web_acl_id: &str) -> String {
 /// `CreateWebACL` stores a new WebACL under a minted id and answers the projection of
 /// that record; `GetWebACL` reads the same record back.
 ///
-/// The table spans the `DefaultAction` catalog (`WafActionType`: the model's
-/// `WAF_ACTION_TYPE_VALUES`), `Name` and `MetricName` lengths and forms. `ResourceName`
-/// carries no uniqueness constraint, so the last two rows share a name and must still
-/// be two distinct resources.
+/// The table spans the actions a `DefaultAction` may carry (the modelled
+/// `WAF_ACTION_TYPE_VALUES` less `COUNT`, which `WafAction$Type` documents a web ACL's
+/// default action may not take — see `web_acl_default_action.rs`), `Name` and
+/// `MetricName` lengths and forms. `ResourceName` carries no uniqueness constraint, so
+/// the last two rows share a name and must still be two distinct resources.
 #[tokio::test]
 async fn create_then_get_reads_back_the_stored_web_acl() {
     let router = router();
@@ -235,7 +237,6 @@ async fn create_then_get_reads_back_the_stored_web_acl() {
         // (label, Name, MetricName, DefaultAction.Type)
         ("allow by default", "bootstrap-webacl", "bootstrapWebACL", "ALLOW"),
         ("block by default", "edge-block", "edgeBlock", "BLOCK"),
-        ("count by default", "edge-count", "edgeCount", "COUNT"),
         ("one character of each (the minimum length)", "x", "m", "ALLOW"),
         (
             "128 characters of each (the maximum length)",
@@ -254,11 +255,16 @@ async fn create_then_get_reads_back_the_stored_web_acl() {
         ("the same name again", "shared-name", "sharedTwo", "BLOCK"),
     ];
 
-    // Every modelled default action is exercised by some row above.
-    for action in WAF_ACTION_TYPE_VALUES {
+    // Every action a default action may carry is exercised by some row above: the
+    // modelled catalog less the one value `WafAction$Type` excludes from a DEFAULT
+    // action, which `web_acl_default_action.rs` covers.
+    for action in WAF_ACTION_TYPE_VALUES
+        .iter()
+        .filter(|action| **action != DEFAULT_ACTION_EXCLUDED)
+    {
         assert!(
             cases.iter().any(|(_, _, _, case_action)| case_action == action),
-            "the table must cover the modelled WafActionType {action:?}"
+            "the table must cover the default-action WafActionType {action:?}"
         );
     }
 

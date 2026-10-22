@@ -156,6 +156,40 @@ impl From<CreateWebACLErrorModeled> for CreateWebACLError {
     }
 }
 
+/// The one `WafActionType` a `WebACL`'s `DefaultAction` may NOT carry.
+///
+/// The member's value catalog is the generated `WAF_ACTION_TYPE_VALUES`, which the
+/// framework already enforces; `WafAction$Type`'s own documentation narrows it for a
+/// DEFAULT action: "`COUNT`: AWS WAF increments a counter of the requests that match
+/// all of the conditions in the rule. … You can't specify `COUNT` for the default
+/// action for a `WebACL`." So a default action takes that catalog less this value,
+/// expressed here as the exclusion rather than as a second copy of the catalog.
+/// `COUNT` remains a valid action for a RULE, so no rule handler excludes it.
+pub const DEFAULT_ACTION_EXCLUDED: &str = "COUNT";
+
+/// The `ParameterExceptionField` a bad `WafAction` is reported under, from the model's
+/// generated `PARAMETER_EXCEPTION_FIELD_VALUES`.
+const FIELD_WAF_ACTION: &str = "WAF_ACTION";
+
+/// The `ParameterExceptionReason` for a value outside a member's catalog, from the
+/// model's generated `PARAMETER_EXCEPTION_REASON_VALUES`.
+const REASON_INVALID_OPTION: &str = "INVALID_OPTION";
+
+/// A `WAFInvalidParameterException` naming the member AWS WAF did not recognise.
+///
+/// `field` is a `ParameterExceptionField` value and `reason` a
+/// `ParameterExceptionReason` value (the model's `PARAMETER_EXCEPTION_FIELD_VALUES` /
+/// `PARAMETER_EXCEPTION_REASON_VALUES`), so a client branching on them sees what the
+/// real service sends.
+fn invalid_parameter(field: &str, parameter: &str, reason: &str) -> CreateWebACLError {
+    CreateWebACLErrorModeled::WAFInvalidParameterException(WAFInvalidParameterException {
+        field: Some(field.to_string()),
+        parameter: Some(parameter.to_string()),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
 /// The `CreateWebACL` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -206,11 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MetricName` "can contain only alphanumeric characters (A-Z, a-z, 0-9) ... It
         // can't contain whitespace or metric names reserved for AWS WAF, including
         // "All" and "Default_Action."" — anything outside that set is a disallowed
-        // name. `DefaultAction.Type` needs no check here: the modelled
-        // `WafActionType` enum (ALLOW, BLOCK, COUNT) is refused before this handler
-        // runs, and those three are exactly the values
-        // `WAFInvalidParameterException`'s documentation accepts for a created
-        // `WebACL`'s `DefaultAction`.
+        // name.
         if !crate::state::metric_name_is_allowed(&input.metric_name) {
             return Err(CreateWebACLErrorModeled::WAFDisallowedNameException(
                 WAFDisallowedNameException {
@@ -220,6 +250,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // The modelled `WafActionType` enum is refused before this handler runs, but a
+        // web ACL's DEFAULT action takes that catalog LESS one value — see
+        // [`DEFAULT_ACTION_EXCLUDED`] for the sentence that narrows it. "You specified
+        // an invalid value" is one of the cases `WAFInvalidParameterException`
+        // documents, and refusing here leaves the request's change token unused:
+        // nothing was changed.
+        if input.default_action.r#type == DEFAULT_ACTION_EXCLUDED {
+            return Err(invalid_parameter(
+                FIELD_WAF_ACTION,
+                &input.default_action.r#type,
+                REASON_INVALID_OPTION,
+            ));
         }
 
         // Two resource limits bound the state one caller can grow: how many WebACL
