@@ -33,12 +33,15 @@ const TARGET_PREFIX: &str = "Lightsail_20161128";
 const ACCOUNT: &str = "000000000000";
 
 /// One emulator with one Lightsail service mounted on one shared engine.
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite in this test target drives the service through the
+/// same front door rather than standing up a second harness.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing; routing is by `X-Amz-Target`.
@@ -50,7 +53,7 @@ impl Emulator {
     }
 
     /// Call `operation` with `body`, answering its HTTP status and parsed body.
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = ::http::Request::builder()
             .method("POST")
             .uri("/")
@@ -69,7 +72,7 @@ impl Emulator {
     }
 
     /// Call `operation` and require success, answering the response body.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(status, 200, "{operation} must succeed, got {parsed:?}");
         parsed

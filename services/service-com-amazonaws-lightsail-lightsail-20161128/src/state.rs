@@ -26,9 +26,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AddOn, AddOnRequest, AvailabilityZone, Domain, DomainEntry, Instance, InstanceHardware,
-    InstanceMetadataOptions, InstanceNetworking, InstancePortInfo, InstanceState, MonthlyTransfer,
-    Operation, Region, ResourceLocation, Tag, REGION_NAME_VALUES,
+    AddOn, AddOnRequest, AvailabilityZone, BucketBundle, Domain, DomainEntry, Instance,
+    InstanceHardware, InstanceMetadataOptions, InstanceNetworking, InstancePortInfo, InstanceState,
+    MonthlyTransfer, Operation, Region, ResourceLocation, Tag, REGION_NAME_VALUES,
 };
 
 // ---------------------------------------------------------------------------
@@ -320,6 +320,117 @@ pub fn bundle_sizes() -> String {
         .map(|spec| spec.size)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// Bucket bundles
+// ---------------------------------------------------------------------------
+
+/// One Lightsail **bucket** bundle: the monthly cost, storage quota and transfer
+/// quota a bucket gets from that plan.
+///
+/// This is the service's published price list for object storage, so it is the
+/// same for every caller and no call changes it — `GetBucketBundles` reports it,
+/// and `CreateBucket`/`UpdateBucketBundle` name an entry of it by `bundle_id`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BucketBundleSpec {
+    /// The id a caller sends for this plan. A bucket bundle id is
+    /// `<size>_<major>_<minor>`, the same `<size>_<version>` form an instance
+    /// bundle id carries.
+    pub bundle_id: &'static str,
+    /// `BucketBundle$storagePerMonthInGb` — "The storage size of the bundle, in
+    /// GB."
+    pub storage_per_month_in_gb: i32,
+    /// `BucketBundle$transferPerMonthInGb` — "The monthly network transfer quota
+    /// of the bundle", in GB.
+    pub transfer_per_month_in_gb: i32,
+    /// `BucketBundle$price` — "The monthly price of the bundle, in US dollars."
+    pub price_usd_per_month: f32,
+    /// `BucketBundle$isActive` — "Indicates whether the bundle is active. Use for
+    /// a new or existing bucket."
+    pub is_active: bool,
+}
+
+/// Every bucket bundle this service publishes, cheapest first: the three
+/// Lightsail object-storage plans from the Lightsail pricing page's object
+/// storage table — 5 GB of storage with 25 GB of data transfer for $1 a month,
+/// 100 GB with 250 GB for $3, and 250 GB with 500 GB for $5 — each the first
+/// (`_1_0`) generation of its size.
+///
+/// Lightsail has retired no bucket plan, so every published plan is active. A
+/// retired generation belongs in this table with `is_active: false`: that is
+/// what makes it reportable only when `GetBucketBundles` is asked to include
+/// inactive bundles, while a bucket already running on it still resolves.
+pub const BUCKET_BUNDLE_SPECS: &[BucketBundleSpec] = &[
+    BucketBundleSpec {
+        bundle_id: "small_1_0",
+        storage_per_month_in_gb: 5,
+        transfer_per_month_in_gb: 25,
+        price_usd_per_month: 1.0,
+        is_active: true,
+    },
+    BucketBundleSpec {
+        bundle_id: "medium_1_0",
+        storage_per_month_in_gb: 100,
+        transfer_per_month_in_gb: 250,
+        price_usd_per_month: 3.0,
+        is_active: true,
+    },
+    BucketBundleSpec {
+        bundle_id: "large_1_0",
+        storage_per_month_in_gb: 250,
+        transfer_per_month_in_gb: 500,
+        price_usd_per_month: 5.0,
+        is_active: true,
+    },
+];
+
+impl BucketBundleSpec {
+    /// This plan as the modelled `BucketBundle`.
+    ///
+    /// `name` is "The name of the bundle" — the label Lightsail gives an object
+    /// storage plan, which is its storage size — so it is DERIVED from
+    /// [`Self::storage_per_month_in_gb`] rather than carried a second time.
+    pub fn view(&self) -> BucketBundle {
+        BucketBundle {
+            bundle_id: Some(self.bundle_id.to_string()),
+            name: Some(format!("{} GB", self.storage_per_month_in_gb)),
+            price: Some(self.price_usd_per_month),
+            storage_per_month_in_gb: Some(self.storage_per_month_in_gb),
+            transfer_per_month_in_gb: Some(self.transfer_per_month_in_gb),
+            is_active: Some(self.is_active),
+        }
+    }
+}
+
+/// The bundles a `GetBucketBundles` call reports out of `specs`: every active
+/// plan, plus the inactive (retired) ones when `include_inactive` is set.
+///
+/// The order is `specs`' own, so two reads answer identically. Taking the catalog
+/// as an argument is what lets the slice rule be exercised against a catalog that
+/// holds a retired plan, which the published one does not yet.
+pub fn bucket_bundles_from(specs: &[BucketBundleSpec], include_inactive: bool) -> Vec<BucketBundle> {
+    specs
+        .iter()
+        .filter(|spec| include_inactive || spec.is_active)
+        .map(BucketBundleSpec::view)
+        .collect()
+}
+
+/// The bucket bundles a `GetBucketBundles` call reports: [`bucket_bundles_from`]
+/// over this service's published catalog, [`BUCKET_BUNDLE_SPECS`].
+pub fn bucket_bundles(include_inactive: bool) -> Vec<BucketBundle> {
+    bucket_bundles_from(BUCKET_BUNDLE_SPECS, include_inactive)
+}
+
+/// The bucket bundle `bundle_id` names — active or not, since a bucket already
+/// running on a retired plan still has to resolve — or `None` when this service
+/// publishes no such plan.
+pub fn bucket_bundle_spec(bundle_id: &str) -> Option<BucketBundleSpec> {
+    BUCKET_BUNDLE_SPECS
+        .iter()
+        .find(|spec| spec.bundle_id == bundle_id)
+        .copied()
 }
 
 // ---------------------------------------------------------------------------
