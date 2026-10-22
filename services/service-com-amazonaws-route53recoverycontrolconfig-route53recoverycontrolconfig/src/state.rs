@@ -348,6 +348,14 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
         found
     }
 
+    /// Every stored cluster, in creation order — the order an account-wide list pages
+    /// through.
+    pub fn ordered_clusters(&self) -> Vec<&ClusterRecord> {
+        let mut found: Vec<&ClusterRecord> = self.clusters.values().collect();
+        found.sort_by_key(|cluster| cluster.seq);
+        found
+    }
+
     /// The stored control panels in creation order: those of one cluster when
     /// `cluster_arn` names one, otherwise every panel in the account.
     ///

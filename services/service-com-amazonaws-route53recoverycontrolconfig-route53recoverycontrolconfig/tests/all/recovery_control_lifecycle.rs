@@ -12,20 +12,16 @@
 //! the published bounds of `MaxResults` and one step outside each, and every resource
 //! level of the hierarchy for the not-found and conflict rules.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_route53recoverycontrolconfig_route53recoverycontrolconfig::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The signing name the model gives this service; it is what the router keys on.
-const SIGNING_NAME: &str = "route53-recovery-control-config";
-
-/// The Region the test signs for. Recovery-control resource ARNs are account-wide, so
-/// it must NOT appear in them.
-const REGION: &str = "us-west-2";
+// The HTTP harness every suite in this target shares.
+use super::common::{
+    call, create_cluster, create_control_panel, create_routing_control, enc, error_code, router,
+    REGION,
+};
 
 /// The account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
@@ -52,102 +48,6 @@ const ENDPOINT_REGIONS: &[&str] = &[
 /// Longer than the span the service gives a `PENDING` -> `DEPLOYED` transition, so a
 /// read after it must observe the deployed resource.
 const PAST_DEPLOYMENT: Duration = Duration::from_millis(900);
-
-/// A router with only this service mounted, over a fresh engine.
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// An ARN as one path segment or query value: every character an ARN can hold that is
-/// not safe there (`:` and `/`) is percent-encoded, which is how an SDK sends it.
-fn enc(arn: &str) -> String {
-    arn.chars()
-        .map(|c| match c {
-            ':' => "%3A".to_string(),
-            '/' => "%2F".to_string(),
-            other => other.to_string(),
-        })
-        .collect()
-}
-
-/// Send one request and return `(status, parsed body)`.
-async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let payload = body.map_or_else(Bytes::new, |value| {
-        Bytes::from(serde_json::to_vec(&value).expect("the request body serializes"))
-    });
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://{SIGNING_NAME}.{REGION}.amazonaws.com{path}"))
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIAEMULATOR/20260101/{REGION}/{SIGNING_NAME}/aws4_request, \
-                 SignedHeaders=host, Signature=0000"
-            ),
-        )
-        .body(payload)
-        .expect("a well-formed request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let bytes = response.into_body();
-    let parsed = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-/// Create one cluster and return its `Cluster` body.
-async fn create_cluster(router: &MultiServiceRouter, body: Value) -> Value {
-    let (status, created) = call(router, "POST", "/cluster", Some(body.clone())).await;
-    assert_eq!(
-        status, 200,
-        "case {body:?}: expected CreateCluster 200, got {status} {created:?}"
-    );
-    created["Cluster"].clone()
-}
-
-/// Create one control panel and return its `ControlPanel` body.
-async fn create_control_panel(router: &MultiServiceRouter, body: Value) -> Value {
-    let (status, created) = call(router, "POST", "/controlpanel", Some(body.clone())).await;
-    assert_eq!(
-        status, 200,
-        "case {body:?}: expected CreateControlPanel 200, got {status} {created:?}"
-    );
-    created["ControlPanel"].clone()
-}
-
-/// Create one routing control and return its `RoutingControl` body.
-async fn create_routing_control(router: &MultiServiceRouter, body: Value) -> Value {
-    let (status, created) = call(router, "POST", "/routingcontrol", Some(body.clone())).await;
-    assert_eq!(
-        status, 200,
-        "case {body:?}: expected CreateRoutingControl 200, got {status} {created:?}"
-    );
-    created["RoutingControl"].clone()
-}
-
-/// The `__type` of an error body, without its optional `namespace#` prefix.
-fn error_code(body: &Value) -> String {
-    let raw = body
-        .get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    raw.rsplit('#').next().unwrap_or_default().to_string()
-}
 
 /// A cluster is answered from the record the create call stored: `DescribeCluster`
 /// returns the same name, endpoints, network type and owner, for every `NetworkType`
