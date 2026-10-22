@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartAssessment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartAssessment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartAssessment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartAssessment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartAssessmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartAssessment"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartAssessmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the migrationhub-strategy assessment store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The store is bounded: past its quota an assessment is refused rather than
+        // adding another record. `ServiceQuotaExceededException` is this operation's
+        // modelled refusal for reaching a quota.
+        if store.assessments.len() >= crate::state::ASSESSMENT_QUOTA {
+            return Err(StartAssessmentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} assessments",
+                        crate::state::ASSESSMENT_QUOTA
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // An assessment collects data for the servers the data source holds when it
+        // starts, so count them with every completion the clock already owed
+        // materialised first.
+        store.settle_all(now);
+        let servers = store.imported_server_count();
+
+        let id = store.mint_assessment_id();
+        let assessment = crate::state::Assessment {
+            id: id.clone(),
+            // Data collection is not done the instant the call returns; the clock owes
+            // the assessment `COMPLETE` once the completion span has passed, and
+            // `StopAssessment` can still stop it until then.
+            status: crate::state::ASSESSMENT_IN_PROGRESS.to_string(),
+            assessment_targets: input.assessment_targets.unwrap_or_default(),
+            assessment_data_source_type: input.assessment_data_source_type,
+            s3bucket_for_analysis_data: input.s3bucket_for_analysis_data,
+            s3bucket_for_report_data: input.s3bucket_for_report_data,
+            start_time: now,
+            completion_time: None,
+            status_message: None,
+            servers,
+            success: 0,
+            failed: 0,
+            // Every server this assessment covers is collecting while it runs.
+            in_progress: servers,
+            completion_due: Some(now + crate::state::COMPLETION_SPAN),
+        };
+        store.assessments.insert(id.clone(), assessment);
+        // `GetLatestAssessmentId` answers with the most recently started assessment.
+        store.latest_assessment_id = Some(id.clone());
+
+        Ok(StartAssessmentOutput {
+            assessment_id: Some(id),
+        })
     }
 }

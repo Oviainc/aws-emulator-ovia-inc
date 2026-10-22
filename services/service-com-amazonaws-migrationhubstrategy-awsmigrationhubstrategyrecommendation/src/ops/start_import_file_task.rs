@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartImportFileTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartImportFileTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartImportFileTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartImportFileTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartImportFileTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartImportFileTask"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartImportFileTaskErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the migrationhub-strategy import file task store is unavailable"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The store is bounded: past its quota an import is refused rather than adding
+        // another record. `ServiceQuotaExceededException` is this operation's modelled
+        // refusal for exactly that ("The AWS account has reached its quota of imports.").
+        if store.import_tasks.len() >= crate::state::IMPORT_TASK_QUOTA {
+            return Err(
+                StartImportFileTaskErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} import file tasks",
+                            crate::state::IMPORT_TASK_QUOTA
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_import_file_task_id();
+        let task = crate::state::ImportFileTask {
+            id: id.clone(),
+            import_name: input.name,
+            input_s3_bucket: input.s3_bucket,
+            input_s3_key: input.s3key,
+            data_source_type: input.data_source_type,
+            group_id: input.group_id.unwrap_or_default(),
+            // Where the import results would be uploaded, when the caller named a
+            // bucket for them. The report object itself is never written, so there is
+            // no `statusReportS3Key` to report.
+            status_report_s3_bucket: input.s3bucket_for_report_data,
+            status_report_s3_key: None,
+            // The import is not done the instant the call returns; the clock owes it a
+            // terminal status once the completion span has passed.
+            status: crate::state::IMPORT_IN_PROGRESS.to_string(),
+            start_time: now,
+            completion_time: None,
+            // No records are counted until the task completes.
+            number_of_records_success: 0,
+            number_of_records_failed: 0,
+            completion_due: Some(now + crate::state::COMPLETION_SPAN),
+        };
+        store.import_tasks.insert(id.clone(), task);
+
+        Ok(StartImportFileTaskOutput { id: Some(id) })
     }
 }
