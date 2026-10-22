@@ -201,7 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the create's. `clientToken` needs no idempotency record here: the operation is
         // `@idempotent`, and replaying the same update leaves the same filter, so a retry
         // is already indistinguishable from the first call.
-        rule.updated_at = ::std::time::SystemTime::now();
+        //
+        // `SystemTime` is the wall clock and is NOT monotonic: an NTP step between the
+        // create and this update can hand back an instant BEFORE `created_at`, and a
+        // resource whose `updatedAt` precedes its own `createdAt` is a state no real
+        // service reports. The invariant is kept here rather than trusted to the clock.
+        rule.updated_at = ::std::time::SystemTime::now().max(rule.created_at);
 
         Ok(UpdateArchiveRuleOutput)
     }

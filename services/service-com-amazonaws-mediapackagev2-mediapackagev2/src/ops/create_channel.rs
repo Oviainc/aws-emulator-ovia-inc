@@ -419,6 +419,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request's own fingerprint: every member it carried EXCEPT the token that
         // identifies the attempt.
         let tags = input.tags.clone().unwrap_or_default();
+        // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
+        // judged against the same bounds before anything is stored.
+        if let Some(rejection) = crate::state::tag_bounds_rejection(&tags) {
+            return Err(CreateChannelErrorModeled::ValidationException(rejection).into());
+        }
         let fingerprint = crate::state::request_fingerprint(&[
             input.channel_group_name.clone(),
             input.channel_name.clone(),
@@ -495,43 +500,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ingest_endpoints(&group.egress_domain, &group.name, &name);
         // The switching and CMSD-header blocks are applied by the service, not merely
         // echoed: a channel created without them still has a switching state, so they
-        // are materialized here and stored.
+        // are materialized here and stored. `Channel::recompute_etag` folds the applied
+        // state into the tag, so the ETag is still derived in ONE place.
         let input_switch_configuration = crate::state::materialized_input_switch_configuration(
             input.input_switch_configuration,
         );
         let output_header_configuration = crate::state::materialized_output_header_configuration(
             input.output_header_configuration,
         );
-        let etag = crate::state::etag(&[
-            arn.clone(),
-            input.description.clone().unwrap_or_default(),
-            input.input_type.clone().unwrap_or_default(),
-            input.output_locking_mode.clone().unwrap_or_default(),
-            // The applied switching state is part of the channel's content, so a channel
-            // that differs only in it has a different ETag. Each member is rendered
-            // explicitly — `mqcs`/`publish` as 0 or 1, an absent preferred input as the
-            // empty string — rather than through a derived `Debug`.
-            format!(
-                "{}/{}/{}",
-                u8::from(
-                    input_switch_configuration
-                        .mqcs_input_switching
-                        .unwrap_or_default()
-                ),
-                input_switch_configuration
-                    .preferred_input
-                    .map(|preferred| preferred.to_string())
-                    .unwrap_or_default(),
-                u8::from(
-                    output_header_configuration
-                        .publish_mqcs
-                        .unwrap_or_default()
-                ),
-            ),
-            crate::state::tag_fingerprint(&tags),
-        ]);
 
-        let channel = crate::state::Channel {
+        let mut channel = crate::state::Channel {
             name: name.clone(),
             group_name: group.name.clone(),
             arn,
@@ -546,14 +524,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: created_at,
             // Nothing has reset this channel yet, so it reports no reset instant.
             reset_at: None,
-            etag,
+            // The create is commit 1. See `state::ChannelGroup::version`.
+            version: 1,
+            etag: String::new(),
             tags,
             client_token: input.client_token,
             fingerprint,
             // No resource policy is attached until `PutChannelPolicy` attaches one.
             policy: None,
+            // And nothing has been pushed to the channel's ingest endpoints yet.
+            ingested_objects: ::std::collections::BTreeMap::new(),
             origin_endpoints: ::std::collections::BTreeMap::new(),
         };
+        // One derivation of the ETag, shared with every update path.
+        channel.recompute_etag();
         group.channels.insert(name.clone(), channel);
         // Answer from what was stored, so the response can only carry what a later
         // `GetChannel` will read.

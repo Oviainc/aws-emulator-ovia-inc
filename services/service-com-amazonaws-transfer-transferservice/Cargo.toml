@@ -23,6 +23,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Codec for the opaque `NextToken` the List* operations hand out (see `src/state.rs`).
 hex = { workspace = true }
+# OpenSSH key formats: generates a server's host key and computes the Base64 SHA256
+# fingerprint `DescribedServer.HostKeyFingerprint` reports (see `src/state.rs`).
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "getrandom"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -30,6 +33,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Generates the OpenSSH host key the HostKey round-trip test supplies, and computes the
+# fingerprint it expects back, independently of the handler under test.
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "getrandom"] }
 # `time` for the clock-due start-transition test's `tokio::time::sleep`.
 tokio = { workspace = true, features = ["time"] }
 

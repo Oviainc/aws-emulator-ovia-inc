@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePullThroughCacheRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePullThroughCacheRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePullThroughCacheRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a pull through cache rule in this emulator's registry: the record is
+//! persisted in [`crate::state`] and every member of the response — the ECR repository
+//! prefix, the upstream registry and its URL, the upstream repository prefix, the
+//! credential and role ARNs and the creation instant — is resolved once here and read
+//! back by `DescribePullThroughCacheRules`. A second rule for the same prefix is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -177,6 +173,14 @@ impl From<CreatePullThroughCacheRuleErrorModeled> for CreatePullThroughCacheRule
     }
 }
 
+/// The rule this operation persists comes from [`crate::state`], so the shared failures
+/// those helpers raise are mapped onto this operation's own modelled error here.
+fn invalid_parameter(fault: crate::state::Fault) -> CreatePullThroughCacheRuleErrorModeled {
+    CreatePullThroughCacheRuleErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(fault.message().to_string()),
+    })
+}
+
 /// The `CreatePullThroughCacheRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -211,20 +215,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePullThroughCacheRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePullThroughCacheRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePullThroughCacheRuleErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `registryId` names the registry to create the rule for; this emulator serves
+        // exactly one registry — its own account's.
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(invalid_parameter)?;
+
+        // The upstream source: named by the request, or resolved from the URL syntax the
+        // `upstreamRegistryUrl` member documents per registry. A URL that names none of
+        // the supported registries, with no `upstreamRegistry` saying which one it is, is
+        // a registry this operation cannot cache from.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePullThroughCacheRule"))
+        // A request that DOES name `upstreamRegistry` is taken at its word rather than
+        // cross-checked against the URL: the documented URL syntax covers eight of the
+        // nine `UpstreamRegistry` values (it gives none for `chainguard`) and two of
+        // those eight are host shapes with a caller-chosen label, so the model does not
+        // determine the URL of every registry a caller may legitimately name.
+        let upstream_registry = match input.upstream_registry {
+            // A value outside `UpstreamRegistry` was already refused at the boundary.
+            Some(registry) => registry,
+            None => crate::state::upstream_registry_for_url(&input.upstream_registry_url)
+                .ok_or_else(|| {
+                    CreatePullThroughCacheRuleErrorModeled::UnsupportedUpstreamRegistryException(
+                        UnsupportedUpstreamRegistryException {
+                            message: Some(format!(
+                                "upstreamRegistryUrl '{}' names no supported upstream \
+                                 registry; specify upstreamRegistry",
+                                input.upstream_registry_url
+                            )),
+                        },
+                    )
+                })?
+                .to_string(),
+        };
+
+        // "When this field isn't specified, Amazon ECR will use the ROOT."
+        let upstream_repository_prefix = input
+            .upstream_repository_prefix
+            .unwrap_or_else(|| crate::state::DEFAULT_UPSTREAM_REPOSITORY_PREFIX.to_string());
+
+        let now = ::std::time::SystemTime::now();
+        let prefix = input.ecr_repository_prefix;
+        // One rule per prefix, whichever way its trailing slash is written.
+        let key = crate::state::normalize_prefix(&prefix);
+        let mut store = state.lock();
+
+        if store.pull_through_cache_rules.contains_key(&key) {
+            return Err(
+                CreatePullThroughCacheRuleErrorModeled::PullThroughCacheRuleAlreadyExistsException(
+                    PullThroughCacheRuleAlreadyExistsException {
+                        message: Some(format!(
+                            "A pull through cache rule with ECR repository prefix \
+                             '{prefix}' already exists for the registry with id '{}'",
+                            crate::state::registry_id()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is bounded: past its cap a create is refused rather than adding
+        // another record. See [`crate::state::MAX_PULL_THROUGH_CACHE_RULES`].
+        if store.pull_through_cache_rules.len() >= crate::state::MAX_PULL_THROUGH_CACHE_RULES {
+            return Err(CreatePullThroughCacheRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this registry already holds the maximum of {} pull through cache \
+                         rules",
+                        crate::state::MAX_PULL_THROUGH_CACHE_RULES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The rule is stored as the modelled `PullThroughCacheRule` the registry reports,
+        // which is the one record `UpdatePullThroughCacheRule`,
+        // `ValidatePullThroughCacheRule`, `DeletePullThroughCacheRule` and
+        // `DescribePullThroughCacheRules` all read.
+        let now = ::aws_smithy_types::DateTime::from(now);
+        let rule = PullThroughCacheRule {
+            ecr_repository_prefix: Some(prefix),
+            upstream_registry_url: Some(input.upstream_registry_url),
+            created_at: Some(now),
+            registry_id: Some(crate::state::registry_id().to_string()),
+            credential_arn: input.credential_arn,
+            custom_role_arn: input.custom_role_arn,
+            upstream_repository_prefix: Some(upstream_repository_prefix),
+            upstream_registry: Some(upstream_registry),
+            // Nothing has changed the rule since it was created, so that instant is also
+            // the one it was last updated at.
+            updated_at: Some(now),
+        };
+
+        // The response is the stored rule projected onto this operation's output shape,
+        // so a create and a later read cannot disagree.
+        let output = CreatePullThroughCacheRuleOutput {
+            ecr_repository_prefix: rule.ecr_repository_prefix.clone(),
+            upstream_registry_url: rule.upstream_registry_url.clone(),
+            created_at: rule.created_at,
+            registry_id: rule.registry_id.clone(),
+            upstream_registry: rule.upstream_registry.clone(),
+            credential_arn: rule.credential_arn.clone(),
+            custom_role_arn: rule.custom_role_arn.clone(),
+            upstream_repository_prefix: rule.upstream_repository_prefix.clone(),
+        };
+        store.pull_through_cache_rules.insert(key, rule);
+
+        Ok(output)
     }
 }

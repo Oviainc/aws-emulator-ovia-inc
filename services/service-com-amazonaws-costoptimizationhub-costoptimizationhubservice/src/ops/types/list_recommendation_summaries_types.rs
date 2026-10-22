@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-costoptimizationhub-costoptimizationhubservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.costoptimizationhub#ListRecommendationSummariesRequest")]
+// `maxResults` carries its OWN `@range` (min 0, max 1000), which overrides the
+// narrower range of the `MaxResults` shape it targets; the schema's constraint
+// walk reads the TARGET shape's range, so the member is excluded from it and
+// the operation's own bound is enforced in
+// `ops::list_recommendation_summaries`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.costoptimizationhub#ListRecommendationSummariesRequest",
+    skip_validation = ["maxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListRecommendationSummariesInput {
     pub filter: Option<Filter>,

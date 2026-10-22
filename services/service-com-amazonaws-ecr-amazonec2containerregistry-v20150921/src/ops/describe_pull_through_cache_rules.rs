@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePullThroughCacheRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePullThroughCacheRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePullThroughCacheRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the pull through cache rules `CreatePullThroughCacheRule` persisted in
+//! [`crate::state`], one page at a time: every member of every rule comes from its
+//! stored record, and a request naming a prefix the registry holds no rule for is
+//! refused rather than answered with a shorter list.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +135,19 @@ pub struct DescribePullThroughCacheRules<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The rules this operation reports come from [`crate::state`], so the shared failures
+/// those helpers raise — a malformed `nextToken`, a `maxResults` out of range, another
+/// account's registry — are mapped onto this operation's own modelled error here.
+fn invalid_parameter(
+    fault: crate::state::Fault,
+) -> DescribePullThroughCacheRulesErrorModeled {
+    DescribePullThroughCacheRulesErrorModeled::InvalidParameterException(
+        InvalidParameterException {
+            message: Some(fault.message().to_string()),
+        },
+    )
+}
+
 impl<Eng> DescribePullThroughCacheRules<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -164,20 +172,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePullThroughCacheRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePullThroughCacheRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePullThroughCacheRules"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribePullThroughCacheRulesErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(invalid_parameter)?;
+
+        let store = state.lock();
+
+        // Every requested prefix must name a rule: ECR refuses the whole call rather
+        // than reporting only the ones it could find. A prefix is looked up whichever
+        // way its trailing slash is written, and the refusal names it as the caller
+        // spelled it; a reported rule carries the spelling the create stored. A request
+        // that carries no prefix at all asks for every rule, which is also what an empty
+        // list would mean here — the modelled `@length(min: 1)` refuses that list at the
+        // boundary, so it cannot reach this handler.
+        let mut wanted: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+        for prefix in input.ecr_repository_prefixes.unwrap_or_default() {
+            if store.pull_through_cache_rule(&prefix).is_none() {
+                return Err(
+                    DescribePullThroughCacheRulesErrorModeled::PullThroughCacheRuleNotFoundException(
+                        PullThroughCacheRuleNotFoundException {
+                            message: Some(
+                                crate::state::pull_through_cache_rule_not_found_message(&prefix),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            wanted.insert(crate::state::normalize_prefix(&prefix));
+        }
+
+        // Keyed by the normalised prefix, which is the order the store holds the rules
+        // in, so a page boundary means the same thing on the next call.
+        let candidates: Vec<(String, PullThroughCacheRule)> = store
+            .pull_through_cache_rules
+            .iter()
+            .filter(|(key, _)| wanted.is_empty() || wanted.contains(key.as_str()))
+            .map(|(key, rule)| (key.clone(), rule.clone()))
+            .collect();
+
+        let (rules, next_token) =
+            crate::state::paginate(candidates, input.next_token.as_ref(), input.max_results)
+                .map_err(invalid_parameter)?;
+
+        Ok(DescribePullThroughCacheRulesOutput {
+            pull_through_cache_rules: Some(rules),
+            next_token,
+        })
     }
 }

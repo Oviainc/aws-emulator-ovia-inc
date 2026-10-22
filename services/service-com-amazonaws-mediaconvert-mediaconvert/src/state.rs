@@ -3,9 +3,9 @@
 //! Engine state for the com-amazonaws-mediaconvert-mediaconvert service.
 //!
 //! The transcoding-job control plane: the `queues` a job can be sent to, the `jobs`
-//! themselves and the account's input `policy`. Every response the handlers in
-//! `src/ops/` build is projected from a record stored here, so a value a caller reads
-//! back is the value some earlier call persisted.
+//! themselves, the output `presets` a job's outputs can name and the account's input
+//! `policy`. Every response the handlers in `src/ops/` build is projected from a record
+//! stored here, so a value a caller reads back is the value some earlier call persisted.
 //!
 //! The account policy is a SINGLETON — the API has no policy name or id, so `PutPolicy`
 //! replaces one record and `DeletePolicy` drops it; it is not caller-driven growth.
@@ -14,11 +14,12 @@
 //!
 //! Nothing here grows without a ceiling and nothing here walks an unbounded set:
 //!
-//! * `queues` is capped at [`MAX_QUEUES`] and `jobs` at [`MAX_JOBS`]; a create past the
-//!   cap is refused with the modelled `ServiceQuotaExceededException` (HTTP 402) instead
-//!   of growing the store. `idempotency` holds at most one entry per stored job, so it
-//!   is bounded by `MAX_JOBS` too, and `endpoints` \u2014 one account endpoint per region a
-//!   request was signed for \u2014 is capped at [`MAX_ENDPOINTS`] the same way.
+//! * `queues` is capped at [`MAX_QUEUES`], `jobs` at [`MAX_JOBS`] and `presets` at
+//!   [`MAX_PRESETS`]; a create past the cap is refused with the modelled
+//!   `ServiceQuotaExceededException` (HTTP 402) instead of growing the store.
+//!   `idempotency` holds at most one entry per stored job, so it is bounded by
+//!   `MAX_JOBS` too, and `endpoints` \u2014 one account endpoint per region a request
+//!   was signed for \u2014 is capped at [`MAX_ENDPOINTS`] the same way.
 //! * `job_templates` is seeded once, at state construction, with the built-in system
 //!   templates and is not grown by any request path yet, so its size is a constant;
 //!   the cap on caller-created templates belongs with `CreateJobTemplate`, which is
@@ -48,7 +49,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AccelerationSettings, HopDestination, Job, JobSettings, JobTemplate, JobTemplateSettings,
-    Policy, Queue, ReservationPlan, ReservationPlanSettings, Timing,
+    Policy, Preset, PresetSettings, Queue, ReservationPlan, ReservationPlanSettings, Timing,
 };
 
 /// The built-in queue a job with no `Queue` member is sent to.
@@ -140,6 +141,11 @@ pub const MAX_QUEUES: usize = 1_000;
 /// bound, as [`MAX_QUEUES`] is, and the ceiling on every walk over the job set.
 pub const MAX_JOBS: usize = 10_000;
 
+/// How many presets this store holds before `CreatePreset` is refused. A chosen
+/// capacity bound, as [`MAX_QUEUES`] is, refused with the same modelled
+/// `ServiceQuotaExceededException`.
+pub const MAX_PRESETS: usize = 1_000;
+
 /// How many per-region account endpoints this store mints before `DescribeEndpoints`
 /// refuses to mint another.
 ///
@@ -229,6 +235,11 @@ pub fn queue_arn(region: &str, name: &str) -> String {
 /// `arn:aws:mediaconvert:<region>:<account>:jobs/<id>`.
 pub fn job_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("jobs/{id}"))
+}
+
+/// `arn:aws:mediaconvert:<region>:<account>:presets/<name>`.
+pub fn preset_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("presets/{name}"))
 }
 
 /// `arn:aws:mediaconvert:<region>:<account>:jobTemplates/<name>`.
@@ -358,6 +369,43 @@ impl QueueRecord {
             status: Some(self.status.clone()),
             submitted_jobs_count: Some(submitted_jobs),
             r#type: Some(self.queue_type.clone()),
+        }
+    }
+}
+
+/// One output preset, exactly as `CreatePreset` persisted it.
+///
+/// The ARN is NOT stored, for the reason [`QueueRecord`]'s is not: it is derived from
+/// the region of the request that reads the preset.
+#[derive(Debug, Clone)]
+pub struct PresetRecord {
+    /// The `Name` exactly as the caller sent it: it is this resource's identity, and
+    /// `GetPreset` looks it up verbatim, so nothing here normalises it.
+    pub name: String,
+    pub category: Option<String>,
+    pub description: Option<String>,
+    pub settings: PresetSettings,
+    /// `SYSTEM` for a built-in preset, `CUSTOM` for one a caller created.
+    pub preset_type: String,
+    pub created_at: SystemTime,
+    pub last_updated: SystemTime,
+    /// The `Tags` a create carried. `Preset` models no tag member, so they are not in
+    /// the view; they are what `ListTagsForResource` reads once it is implemented.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl PresetRecord {
+    /// The modelled `Preset`.
+    pub fn view(&self, region: &str) -> Preset {
+        Preset {
+            arn: Some(preset_arn(region, &self.name)),
+            category: self.category.clone(),
+            created_at: Some(epoch_seconds(self.created_at)),
+            description: self.description.clone(),
+            last_updated: Some(epoch_seconds(self.last_updated)),
+            name: self.name.clone(),
+            settings: self.settings.clone(),
+            r#type: Some(self.preset_type.clone()),
         }
     }
 }
@@ -673,6 +721,9 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     pub queues: BTreeMap<String, QueueRecord>,
     /// Jobs by `Id`. At most [`MAX_JOBS`] entries.
     pub jobs: BTreeMap<String, JobRecord>,
+    /// Presets by `Name`; "Each name must be unique within your account". At most
+    /// [`MAX_PRESETS`] entries.
+    pub presets: BTreeMap<String, PresetRecord>,
     /// The account's input policy, once `PutPolicy` has stored one. `None` until then
     /// and again after `DeletePolicy`, when the account carries no policy and
     /// `GetPolicy` reports none. A single record, never a growing collection: the
@@ -734,6 +785,7 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
         Self {
             queues,
             jobs: BTreeMap::new(),
+            presets: BTreeMap::new(),
             // No policy until a caller puts one; an account carrying no policy is the
             // state `GetPolicy` reports as an absent `Policy`, so nothing is seeded.
             policy: None,
@@ -917,6 +969,11 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// Whether the store is at [`MAX_QUEUES`] and can hold no further queue.
     pub fn queues_at_capacity(&self) -> bool {
         self.queues.len() >= MAX_QUEUES
+    }
+
+    /// Whether the store is at [`MAX_PRESETS`] and can hold no further preset.
+    pub fn presets_at_capacity(&self) -> bool {
+        self.presets.len() >= MAX_PRESETS
     }
 
     /// How many jobs in `queue_name` are `SUBMITTED` and how many are `PROGRESSING`.

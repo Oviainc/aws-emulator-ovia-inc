@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateByteMatchSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateByteMatchSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateByteMatchSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts or deletes `ByteMatchTuple`s in a stored `ByteMatchSet` and consumes the
+//! caller's change token, so `GetByteMatchSet` reads back the tuples this call applied.
+//! Everything that depends only on the request — the batch cap and each update's own
+//! members — is checked before this service's state is reached.
 //!
 //! ## Shape of an operation
 //!
@@ -172,6 +167,22 @@ impl From<UpdateByteMatchSetErrorModeled> for UpdateByteMatchSetError {
     }
 }
 
+/// A `WAFInvalidParameterException` naming the member AWS WAF did not recognise.
+///
+/// `field` is a `ParameterExceptionField` value and `reason` a
+/// `ParameterExceptionReason` value (the model's `PARAMETER_EXCEPTION_FIELD_VALUES` /
+/// `PARAMETER_EXCEPTION_REASON_VALUES`), so a client branching on them sees what the
+/// real service sends. This exception models no `message` member: what it reports is
+/// those three enum values, which name the member at fault rather than quoting prose.
+fn invalid_parameter(field: &str, parameter: &str, reason: &str) -> UpdateByteMatchSetError {
+    UpdateByteMatchSetErrorModeled::WAFInvalidParameterException(WAFInvalidParameterException {
+        field: Some(field.to_string()),
+        parameter: Some(parameter.to_string()),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
 /// The `UpdateByteMatchSet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -208,18 +219,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateByteMatchSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateByteMatchSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // Everything that depends only on the REQUEST is checked here, before this
+        // service's state is reached, so one request neither holds the shared state
+        // while walking a list it chose the length of nor does work no bound covers.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateByteMatchSet"))
+        // The batch cap comes first: `ByteMatchSetUpdates` is modelled `len 1..`, so
+        // nothing upstream bounds how many updates one request may carry.
+        if input.updates.len() > crate::state::MAX_BYTE_MATCH_UPDATES_PER_REQUEST {
+            return Err(UpdateByteMatchSetErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut requested = Vec::with_capacity(input.updates.len());
+        for update in &input.updates {
+            let action = update.action.as_str();
+            let tuple = &update.byte_match_tuple;
+            let field_type = tuple.field_to_match.r#type.as_str();
+
+            // Each of the four members below carries a modelled enum, so a value outside
+            // it is a parameter AWS WAF does not recognise: "You tried to update an
+            // object (ByteMatchSet, IPSet, Rule, or WebACL) using an action other than
+            // INSERT or DELETE", "You tried to update a ByteMatchSet with a FieldToMatch
+            // Type other than …". The accepted values are the model's own value lists,
+            // not a hand-written catalogue.
+            if !CHANGE_ACTION_VALUES.contains(&action) {
+                return Err(invalid_parameter("CHANGE_ACTION", action, "INVALID_OPTION"));
+            }
+            if !MATCH_FIELD_TYPE_VALUES.contains(&field_type) {
+                return Err(invalid_parameter(
+                    "BYTE_MATCH_FIELD_TYPE",
+                    field_type,
+                    "INVALID_OPTION",
+                ));
+            }
+            if !TEXT_TRANSFORMATION_VALUES.contains(&tuple.text_transformation.as_str()) {
+                return Err(invalid_parameter(
+                    "BYTE_MATCH_TEXT_TRANSFORMATION",
+                    &tuple.text_transformation,
+                    "INVALID_OPTION",
+                ));
+            }
+            if !POSITIONAL_CONSTRAINT_VALUES.contains(&tuple.positional_constraint.as_str()) {
+                return Err(invalid_parameter(
+                    "BYTE_MATCH_POSITIONAL_CONSTRAINT",
+                    &tuple.positional_constraint,
+                    "INVALID_OPTION",
+                ));
+            }
+            // "You tried to update a ByteMatchSet with a Field of HEADER but no value
+            // for Data" — the same holds for every `MatchFieldType` whose `FieldToMatch`
+            // names the part of the request to search in `Data`.
+            if crate::state::match_field_takes_data(field_type)
+                && tuple.field_to_match.data.is_none()
+            {
+                return Err(invalid_parameter(
+                    "BYTE_MATCH_FIELD_TYPE",
+                    field_type,
+                    "ILLEGAL_COMBINATION",
+                ));
+            }
+            // "The maximum length of the value is 50 bytes" — of the BYTES, so what is
+            // measured is the blob, not the base64 the wire carried.
+            if tuple.target_string.len() > crate::state::MAX_TARGET_STRING_BYTES {
+                return Err(UpdateByteMatchSetErrorModeled::WAFLimitsExceededException(
+                    WAFLimitsExceededException {
+                        message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                    },
+                )
+                .into());
+            }
+
+            requested.push((
+                action == crate::state::CHANGE_ACTION_INSERT,
+                crate::state::ByteMatchTupleEntry::from_modelled(tuple),
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateByteMatchSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The ByteMatchSet is the CONTAINER the updates go into, and the model reserves
+        // `WAFNonexistentContainerException` for exactly this: "You tried to add a
+        // ByteMatchTuple to or delete a ByteMatchTuple from a ByteMatchSet that doesn't
+        // exist."
+        let Some(stored) = state.byte_match_sets.get(&input.byte_match_set_id) else {
+            return Err(
+                UpdateByteMatchSetErrorModeled::WAFNonexistentContainerException(
+                    WAFNonexistentContainerException {
+                        message: Some(crate::state::MESSAGE_NONEXISTENT_CONTAINER.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every update is applied to a WORKING COPY first, so a request that is refused
+        // part-way through leaves the stored ByteMatchSet (and the change token) exactly
+        // as they were. Each step is a single indexed lookup, so the work here is linear
+        // in the (now bounded) number of updates rather than in their product with the
+        // stored tuples.
+        let mut working = stored.clone();
+        for (insert, entry) in requested {
+            let changed = if insert {
+                // One ByteMatchSet holds at most `MAX_BYTE_MATCH_TUPLES` tuples, so the
+                // tuple state a caller can accumulate over many requests is bounded,
+                // not just the number of updates one request may carry.
+                if working.tuples.len() >= crate::state::MAX_BYTE_MATCH_TUPLES {
+                    return Err(UpdateByteMatchSetErrorModeled::WAFLimitsExceededException(
+                        WAFLimitsExceededException {
+                            message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                        },
+                    )
+                    .into());
+                }
+                working.insert_tuple(entry)
+            } else {
+                working.remove_tuple(&entry)
+            };
+            // "The operation failed because there was nothing to do. For example: … You
+            // tried to remove a ByteMatchTuple from a ByteMatchSet, but the
+            // ByteMatchTuple isn't in the specified WebACL. … You tried to add a
+            // ByteMatchTuple to a ByteMatchSet, but the ByteMatchTuple already exists."
+            if !changed {
+                return Err(UpdateByteMatchSetErrorModeled::WAFInvalidOperationException(
+                    WAFInvalidOperationException {
+                        message: Some(crate::state::MESSAGE_INVALID_OPERATION.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Only a request that will be applied consumes the caller's change token.
+        if !state.consume_change_token(&input.change_token) {
+            return Err(UpdateByteMatchSetErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let byte_match_set_id = working.byte_match_set_id.clone();
+        state.byte_match_sets.insert(byte_match_set_id, working);
+
+        Ok(UpdateByteMatchSetOutput {
+            change_token: Some(input.change_token),
+        })
     }
 }

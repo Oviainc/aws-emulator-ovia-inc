@@ -13,6 +13,10 @@
 //! the rows' stored prices under the caller's effective `savingsEstimationMode`
 //! preference, so a summary never disagrees with `ListRecommendations`.
 //!
+//! `filter.accountIds` asks for other accounts' recommendations, which only the
+//! organization's management account may do, so a populated `accountIds` from
+//! any other caller is refused with the modelled `AccessDeniedException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -173,6 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // This operation's own `@range` on `maxResults`, which the shared
+        // `MaxResults` shape does not bound (see `MAX_RESULTS_MAX`).
+        if let Some(refused) =
+            crate::service::out_of_range("maxResults", input.max_results, 0, MAX_RESULTS_MAX)
+        {
+            return Err(
+                ListRecommendationSummariesErrorModeled::ValidationException(refused).into(),
+            );
+        }
+
         // A `groupBy` that names no dimension a summary can be grouped by
         // cannot be honoured, so the request is refused rather than silently
         // summarised along another dimension.
@@ -222,6 +236,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (mode, rows) = {
             let store = state.lock();
+
+            // Asking for the summaries of accounts other than the caller's is
+            // an organization view, which only the organization's management
+            // account has — the same gate `ListRecommendations` applies to the
+            // same filter member.
+            if input
+                .filter
+                .as_ref()
+                .and_then(|filter| filter.account_ids.as_ref())
+                .is_some_and(|account_ids| !account_ids.is_empty())
+                && !store.is_management_account(crate::state::caller_account_id())
+            {
+                return Err(not_an_organization_view());
+            }
+
             let mode = store
                 .effective_preferences(crate::state::caller_account_id())
                 .savings_estimation_mode;
@@ -289,6 +318,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The list a `nextToken` from this operation belongs to.
 const PAGE_KIND: &str = "recommendation-summaries";
+
+/// The largest page this operation accepts, from the `@range` its OWN
+/// `maxResults` member declares — which overrides the narrower range of the
+/// `MaxResults` shape it targets
+/// (`smithy_query(query="operation", operation="ListRecommendationSummaries")`:
+/// `maxResults` `range` min 0 max 1000). The member is excluded from the
+/// schema's constraint walk (`skip_validation` on
+/// `ListRecommendationSummariesInput`) because that walk reads the target
+/// shape's bound, so the bound is enforced in the handler against the
+/// operation's own.
+const MAX_RESULTS_MAX: i64 = 1000;
 
 /// The one `SummaryMetrics` value the model declares
 /// (`shared_types::SUMMARY_METRICS_VALUES`), which the input documents as the
@@ -377,7 +417,6 @@ fn savings_percentage_is_defined(filter: Option<&Filter>) -> bool {
 fn invalid_next_token() -> ListRecommendationSummariesError {
     field_refusal(
         "nextToken",
-        "nextToken is not a pagination token issued by ListRecommendationSummaries".to_string(),
         "the value is not a pagination token issued by ListRecommendationSummaries".to_string(),
     )
 }
@@ -387,7 +426,6 @@ fn invalid_next_token() -> ListRecommendationSummariesError {
 fn unknown_group_by(group_by: &str) -> ListRecommendationSummariesError {
     field_refusal(
         "groupBy",
-        format!("groupBy {group_by} is not a recommendation dimension"),
         format!("{group_by} is not a dimension recommendations can be grouped by"),
     )
 }
@@ -396,7 +434,6 @@ fn unknown_group_by(group_by: &str) -> ListRecommendationSummariesError {
 fn unsupported_filter(member: &str) -> ListRecommendationSummariesError {
     field_refusal(
         member,
-        format!("{member} is not supported by ListRecommendationSummaries"),
         format!("{member} is not a filter this operation supports"),
     )
 }
@@ -405,25 +442,32 @@ fn unsupported_filter(member: &str) -> ListRecommendationSummariesError {
 fn unknown_metric(metric: &str) -> ListRecommendationSummariesError {
     field_refusal(
         "metrics",
-        format!("metrics {metric} is not a summary metric"),
         format!("{metric} is not a metric this operation reports"),
     )
 }
 
+/// Refuse a caller that is not the organization's management account the
+/// summaries of the organization's member accounts: the modelled
+/// `AccessDeniedException` (403), because what is missing is the caller's
+/// permission and not anything about the values it sent.
+fn not_an_organization_view() -> ListRecommendationSummariesError {
+    ListRecommendationSummariesErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: crate::service::organization_view_denied("recommendation summaries"),
+    })
+    .into()
+}
+
 /// One refused request, attributed to the member it is about: the shape every
-/// handler-raised refusal in this service answers with.
-fn field_refusal(
-    field_name: &str,
-    message: String,
-    field_message: String,
-) -> ListRecommendationSummariesError {
-    ListRecommendationSummariesErrorModeled::ValidationException(ValidationException {
-        message,
-        reason: Some("FieldValidationFailed".to_string()),
-        fields: Some(vec![ValidationExceptionDetail {
+/// handler-raised refusal in this service answers with — the service's fixed
+/// summary, `reason` = `FieldValidationFailed`, and the diagnosis in `fields`,
+/// built by [`crate::service::field_validation_exception`], the one place that
+/// envelope is built.
+fn field_refusal(field_name: &str, field_message: String) -> ListRecommendationSummariesError {
+    ListRecommendationSummariesErrorModeled::ValidationException(
+        crate::service::field_validation_exception(vec![ValidationExceptionDetail {
             field_name: field_name.to_string(),
             message: field_message,
         }]),
-    })
+    )
     .into()
 }

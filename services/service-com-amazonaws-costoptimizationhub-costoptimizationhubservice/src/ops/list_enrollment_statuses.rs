@@ -2,10 +2,14 @@
 
 //! @op ListEnrollmentStatuses
 //!
-//! Reports the enrollment records `UpdateEnrollmentStatus` wrote: the caller's
-//! account alone, or every enrolled account in the organization when
-//! `includeOrganizationInfo` is set, narrowed by `accountId` and paged by
-//! `maxResults`/`nextToken`.
+//! Reports the enrollment record Cost Optimization Hub holds for the calling
+//! account — one per account it knows, `Inactive` until `UpdateEnrollmentStatus`
+//! opts in — paged by `maxResults`/`nextToken`.
+//!
+//! `includeOrganizationInfo` and an `accountId` naming another account both ask
+//! for the enrollment of the organization's member accounts, which only the
+//! organization's management account may read, so either from any other caller
+//! is refused with the modelled `AccessDeniedException`.
 //!
 //! ## Shape of an operation
 //!
@@ -171,10 +175,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = crate::state::caller_account_id();
         let (include_member_accounts, mut enrollments) = {
             let store = state.lock();
+
+            // Both of these ask for accounts other than the caller's — the
+            // organization's enrollment, and one named member account — which
+            // is a view only the organization's management account has.
+            let asks_for_other_accounts = input.include_organization_info
+                || input
+                    .account_id
+                    .as_deref()
+                    .is_some_and(|wanted| wanted != caller);
+            if asks_for_other_accounts && !store.is_management_account(caller) {
+                return Err(not_an_organization_view());
+            }
+
             let include_member_accounts = store
                 .enrollments
                 .get(caller)
-                .map(|enrollment| enrollment.include_member_accounts);
+                .and_then(|enrollment| enrollment.include_member_accounts);
             // Without `includeOrganizationInfo` the answer covers the calling
             // account only; with it, every account enrolled in the organization.
             let scoped: Vec<crate::state::Enrollment> = store
@@ -222,14 +239,23 @@ const PAGE_KIND: &str = "enrollment-statuses";
 
 /// Refuse a `nextToken` this service did not issue for this list.
 fn invalid_next_token() -> ListEnrollmentStatusesError {
-    ListEnrollmentStatusesErrorModeled::ValidationException(ValidationException {
-        message: "nextToken is not a pagination token issued by ListEnrollmentStatuses".to_string(),
-        reason: Some("FieldValidationFailed".to_string()),
-        fields: Some(vec![ValidationExceptionDetail {
+    ListEnrollmentStatusesErrorModeled::ValidationException(
+        crate::service::field_validation_exception(vec![ValidationExceptionDetail {
             field_name: "nextToken".to_string(),
             message: "the value is not a pagination token issued by ListEnrollmentStatuses"
                 .to_string(),
         }]),
+    )
+    .into()
+}
+
+/// Refuse a caller that is not the organization's management account the
+/// enrollment of the organization's member accounts: the modelled
+/// `AccessDeniedException` (403), because what is missing is the caller's
+/// permission and not anything about the values it sent.
+fn not_an_organization_view() -> ListEnrollmentStatusesError {
+    ListEnrollmentStatusesErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: crate::service::organization_view_denied("enrollment statuses"),
     })
     .into()
 }

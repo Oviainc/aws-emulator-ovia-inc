@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePreset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePreset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePreset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +150,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePreset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePresetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePreset"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePresetErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The `Name` is the resource's identity, so it is stored and echoed back exactly
+        // as the caller sent it — never normalised. The trim is only the test for a name
+        // that carries no characters at all, which the model's bare `__string` does not
+        // refuse before this handler runs.
+        let name = input.name;
+        if name.trim().is_empty() {
+            return Err(CreatePresetErrorModeled::BadRequestException(BadRequestException {
+                message: Some("Name must not be empty.".to_string()),
+            })
+            .into());
+        }
+        // `Category` and `Description` are optional free text; an empty string carries no
+        // more information than their absence, so it is stored as absent rather than as a
+        // member a later read would echo back blank.
+        let category = input.category.filter(|value| !value.trim().is_empty());
+        let description = input.description.filter(|value| !value.trim().is_empty());
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // `Name`: "Each name must be unique within your account."
+        if state.presets.contains_key(&name) {
+            return Err(CreatePresetErrorModeled::ConflictException(ConflictException {
+                message: Some(format!("Preset {name} already exists.")),
+            })
+            .into());
+        }
+        // Bounded growth: the store holds at most `MAX_PRESETS` presets, and a create
+        // past that is the quota refusal the model declares rather than more state.
+        if state.presets_at_capacity() {
+            return Err(CreatePresetErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "You have reached the maximum of {} presets.",
+                        crate::state::MAX_PRESETS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::PresetRecord {
+            name: name.clone(),
+            category,
+            description,
+            settings: input.settings,
+            // A preset a caller creates is CUSTOM; only built-in presets are SYSTEM.
+            preset_type: crate::state::TYPE_CUSTOM.to_string(),
+            created_at: now,
+            last_updated: now,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        let preset = record.view(&region);
+        state.presets.insert(name, record);
+
+        Ok(CreatePresetOutput {
+            preset: Some(preset),
+        })
     }
 }

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members an update NAMES to the stored server and leaves every other
+//! member where it was, so `DescribeServer` reports the updated configuration from the
+//! same stored record. `ProtocolDetails` and `S3StorageOptions` stay fully
+//! materialised: the named sub-members change and the rest keep their current values.
+//! `IpAddressType` is the one member the model says cannot change while the server is
+//! online, so changing it is refused unless the server is `OFFLINE`; and the
+//! configuration the server would have AFTER the update must satisfy the same
+//! documented cross-member requirements `CreateServer` enforces, so no update can store
+//! a configuration the service would never host.
+//!
+//! `HostKey` rotates the server's host key when the emulator can read the material:
+//! an OpenSSH private key becomes the server's host key, so `HostKeyFingerprint`
+//! reports that key's own fingerprint. Material in a format it cannot read changes
+//! nothing — the server keeps the key it has and reports that key's genuine
+//! fingerprint rather than one invented for material nothing read (see
+//! `state::supplied_host_key_fingerprint`).
 //!
 //! ## Shape of an operation
 //!
@@ -269,18 +277,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServer"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            UpdateServerErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let now = ::std::time::Instant::now();
+        let mut guard = state.lock();
+        let Some(stored) = guard.servers.get_mut(&input.server_id) else {
+            return Err(st::not_found(
+                UpdateServerErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        };
+        // Materialise what the clock already owed, so the state this update is judged
+        // against is the one a read at `now` would report.
+        stored.settle(now);
+
+        // `IpAddressType`: "It cannot be changed while the server is online. You must
+        // stop the server before modifying this parameter." A request that names the
+        // value the server already has changes nothing and is not refused.
+        if let Some(requested) = input.ip_address_type.as_deref() {
+            if requested != stored.ip_address_type && stored.state != st::SERVER_STATE_OFFLINE {
+                return Err(UpdateServerErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: format!(
+                            "IpAddressType cannot be changed while the server is in the {} \
+                             state; stop the server first",
+                            stored.state
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The configuration the server would HAVE after this update must satisfy the
+        // same documented cross-member requirements `CreateServer` enforces — the
+        // invariant belongs to the stored server, not to one write path — so the
+        // post-update configuration is built from "what the request names, else what the
+        // server has" and refused BEFORE anything is written. `Domain` is
+        // `create-and-read`: an update cannot change it.
+        let next_endpoint_type = input
+            .endpoint_type
+            .clone()
+            .unwrap_or_else(|| stored.endpoint_type.clone());
+        let next_endpoint_details = input
+            .endpoint_details
+            .clone()
+            .or_else(|| stored.endpoint_details.clone());
+        let next_identity_provider_type = input
+            .identity_provider_type
+            .clone()
+            .unwrap_or_else(|| stored.identity_provider_type.clone());
+        let next_identity_provider_details = input
+            .identity_provider_details
+            .clone()
+            .or_else(|| stored.identity_provider_details.clone());
+        let next_ip_address_type = input
+            .ip_address_type
+            .clone()
+            .unwrap_or_else(|| stored.ip_address_type.clone());
+        let next_protocols = input
+            .protocols
+            .clone()
+            .filter(|protocols| !protocols.is_empty())
+            .unwrap_or_else(|| stored.protocols.clone());
+        let next_certificate = input
+            .certificate
+            .clone()
+            .or_else(|| stored.certificate.clone());
+        let violation = st::ServerConfig {
+            domain: &stored.domain,
+            endpoint_type: &next_endpoint_type,
+            endpoint_details: next_endpoint_details.as_ref(),
+            identity_provider_type: &next_identity_provider_type,
+            identity_provider_details: next_identity_provider_details.as_ref(),
+            ip_address_type: &next_ip_address_type,
+            protocols: &next_protocols,
+            certificate: next_certificate.as_deref(),
+        }
+        .cross_member_violation();
+        if let Some(message) = violation {
+            return Err(
+                UpdateServerErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        // Every member the request names replaces the stored one; a member it leaves out
+        // is left alone. The two fully-materialised structures merge per sub-member.
+        if let Some(certificate) = input.certificate {
+            stored.certificate = Some(certificate);
+        }
+        if let Some(protocol_details) = input.protocol_details {
+            stored.protocol_details =
+                st::merge_protocol_details(&stored.protocol_details, protocol_details);
+        }
+        if let Some(endpoint_details) = input.endpoint_details {
+            stored.endpoint_details = Some(endpoint_details);
+        }
+        if let Some(endpoint_type) = input.endpoint_type {
+            stored.endpoint_type = endpoint_type;
+        }
+        if let Some(identity_provider_details) = input.identity_provider_details {
+            stored.identity_provider_details = Some(identity_provider_details);
+        }
+        if let Some(identity_provider_type) = input.identity_provider_type {
+            stored.identity_provider_type = identity_provider_type;
+        }
+        if let Some(logging_role) = input.logging_role {
+            stored.logging_role = Some(logging_role);
+        }
+        if let Some(banner) = input.post_authentication_login_banner {
+            stored.post_authentication_login_banner = Some(banner);
+        }
+        if let Some(banner) = input.pre_authentication_login_banner {
+            stored.pre_authentication_login_banner = Some(banner);
+        }
+        // `Protocols` is modelled `len 1..4`, so an empty list cannot reach here and a
+        // named list always names at least one protocol.
+        if let Some(protocols) = input.protocols {
+            stored.protocols = protocols;
+        }
+        if let Some(security_policy_name) = input.security_policy_name {
+            stored.security_policy_name = security_policy_name;
+        }
+        if let Some(workflow_details) = input.workflow_details {
+            stored.workflow_details = Some(workflow_details);
+        }
+        // "You can clear it, and in effect turn off structured logging, by providing an
+        // empty value for this parameter" — so an empty list is a value, not an absence.
+        if let Some(destinations) = input.structured_log_destinations {
+            stored.structured_log_destinations = destinations;
+        }
+        if let Some(s3_storage_options) = input.s3_storage_options {
+            stored.s3_storage_options =
+                st::merge_s3_storage_options(&stored.s3_storage_options, s3_storage_options);
+        }
+        if let Some(ip_address_type) = input.ip_address_type {
+            stored.ip_address_type = ip_address_type;
+        }
+        // A readable host key replaces the server's own, so the fingerprint it reports
+        // becomes that key's.
+        if let Some(fingerprint) = input
+            .host_key
+            .as_deref()
+            .and_then(st::supplied_host_key_fingerprint)
+        {
+            stored.host_key_fingerprint = fingerprint;
+        }
+
+        let server_id = stored.server_id.clone();
+        drop(guard);
+
+        Ok(UpdateServerOutput { server_id })
     }
 }

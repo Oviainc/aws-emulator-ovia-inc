@@ -4,11 +4,12 @@
 //!
 //! Three stores, all keyed the way Cost Optimization Hub scopes its data:
 //!
-//! * `enrollments` — one [`Enrollment`] per account id, written by
-//!   `UpdateEnrollmentStatus` and read by `ListEnrollmentStatuses` — and by the
-//!   recommendation readers, because Cost Optimization Hub reports
-//!   recommendations for an ENROLLED account only, and only once the analysis
-//!   that enrollment starts is due.
+//! * `enrollments` — one [`Enrollment`] per account id, created with the store
+//!   for the account Cost Optimization Hub knows (status `Inactive`, because it
+//!   has not opted in), written by `UpdateEnrollmentStatus` and read by
+//!   `ListEnrollmentStatuses` — and by the recommendation readers, because Cost
+//!   Optimization Hub reports recommendations for an ENROLLED account only, and
+//!   only once the analysis that enrollment starts is due.
 //! * `preferences` — one [`Preferences`] per account id, written by
 //!   `UpdatePreferences` and read by `GetPreferences` (and by the recommendation
 //!   readers, because `savingsEstimationMode` decides whether the figures they
@@ -44,6 +45,17 @@ pub const AFTER_DISCOUNTS: &str = "AfterDiscounts";
 /// `EnrollmentStatus` values, from the model's enum of the same name.
 pub const STATUS_ACTIVE: &str = "Active";
 
+/// The other `EnrollmentStatus` value: an account Cost Optimization Hub knows
+/// about but that has not opted in, which is what an account's enrollment reads
+/// as before it ever calls `UpdateEnrollmentStatus`.
+pub const STATUS_INACTIVE: &str = "Inactive";
+
+/// The `MemberAccountDiscountVisibility` value that ENABLES member-account
+/// discount visibility; the other value (`None`) leaves it disabled. Both come
+/// from the model's `MemberAccountDiscountVisibility` enum
+/// (`shared_types::MEMBER_ACCOUNT_DISCOUNT_VISIBILITY_VALUES`).
+pub const VISIBILITY_ALL: &str = "All";
+
 /// How long after an account enrolls its recommendations are due.
 ///
 /// Cost Optimization Hub derives recommendations from the enrolled account's
@@ -65,8 +77,11 @@ pub struct Enrollment {
     /// `EnrollmentStatus`: `Active` | `Inactive`.
     pub status: String,
     /// Whether the last `UpdateEnrollmentStatus` asked for the organization's
-    /// member accounts to be enrolled as well.
-    pub include_member_accounts: bool,
+    /// member accounts to be enrolled as well, or `None` while no
+    /// `UpdateEnrollmentStatus` has expressed it — the record Cost Optimization
+    /// Hub holds for a known account carries no such preference until the
+    /// account enrolls, and `ListEnrollmentStatuses` reports what was stored.
+    pub include_member_accounts: Option<bool>,
     pub created_timestamp: DateTime,
     pub last_updated_timestamp: DateTime,
     /// When the analysis this enrollment started is due to have produced
@@ -99,10 +114,13 @@ impl Enrollment {
 /// `GetPreferences` reports for such an account.
 pub const DEFAULT_SAVINGS_ESTIMATION_MODE: &str = AFTER_DISCOUNTS;
 
-/// The `MemberAccountDiscountVisibility` the service applies to an account that
-/// has expressed no preference: the discounts of every member account are
-/// visible (`All`), the widest of the two values the enum offers.
-pub const DEFAULT_MEMBER_ACCOUNT_DISCOUNT_VISIBILITY: &str = "All";
+// `memberAccountDiscountVisibility` has NO default the service applies in an
+// account's place, so there is no constant for it: the preference belongs to the
+// organization's management account (see `ops::update_preferences`), so an
+// account that is not one never set it and the member is not reported for it —
+// which is what the recorded `GetPreferences` body shows (`preferredCommitment`
+// and `savingsEstimationMode` only). A management account that did set it reads
+// back the value it stored.
 
 /// The commitment term the service applies where the account states none. From
 /// the model's `PreferredCommitment$term` doc: "If the value is null, it will
@@ -160,6 +178,9 @@ impl Preferences {
     /// its stored value, and every member it never set carries the default the
     /// service applies in its place, at each level of the record — so a term
     /// stated without a payment option still reports the default payment option.
+    /// `memberAccountDiscountVisibility` is the exception: it has no default to
+    /// apply (the note beside [`DEFAULT_COMMITMENT_TERM`] says why), so it is
+    /// reported only where the account set it.
     ///
     /// This is what a read of an account's preferences reports: the preference
     /// the service acts on, never an empty record, because the service always
@@ -168,11 +189,7 @@ impl Preferences {
         let commitment = self.preferred_commitment.clone().unwrap_or_default();
         Self {
             savings_estimation_mode: Some(self.effective_savings_estimation_mode().to_string()),
-            member_account_discount_visibility: Some(
-                self.member_account_discount_visibility
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_MEMBER_ACCOUNT_DISCOUNT_VISIBILITY.to_string()),
-            ),
+            member_account_discount_visibility: self.member_account_discount_visibility.clone(),
             preferred_commitment: Some(PreferredCommitment {
                 term: Some(
                     commitment
@@ -839,7 +856,9 @@ pub fn paginate<'a, T>(
 /// Per-service state for com-amazonaws-costoptimizationhub-costoptimizationhubservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
-    /// Enrollment per account id, written by `UpdateEnrollmentStatus`.
+    /// Enrollment per account id: the record Cost Optimization Hub holds for
+    /// every account it knows, created with the store and updated by
+    /// `UpdateEnrollmentStatus`.
     pub enrollments: HashMap<String, Enrollment>,
     /// Preferences per account id, written by `UpdatePreferences`.
     pub preferences: HashMap<String, Preferences>,
@@ -847,21 +866,65 @@ pub struct ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
     pub recommendations: HashMap<String, StoredRecommendation>,
     /// The catalog's order, so listing and paging it are stable across calls.
     pub recommendation_order: Vec<String>,
+    /// The account that is the MANAGEMENT account of the organization this
+    /// store records, if any.
+    ///
+    /// Cost Optimization Hub scopes several features to it — writing the
+    /// member-account discount-visibility preference, and reading enrollment or
+    /// recommendations for accounts other than the caller's. This emulator
+    /// presents one account ([`caller_account_id`]) and emulates no
+    /// Organizations control plane, so there is no organization and no
+    /// management account to record: the field holds `None` and every caller is
+    /// a standalone account. Read it through [`Self::is_management_account`],
+    /// which therefore answers `false` for every caller today — the gates that
+    /// ask it state the rule once, and their management-account arm is
+    /// exercised only by this module's own unit test.
+    pub organization_management_account_id: Option<String>,
+}
+
+impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
+    /// Whether `account_id` is the management account of the organization this
+    /// store records. False whenever no management account is recorded, which
+    /// is the only state this emulator has: an organization-only feature is
+    /// then available to nobody.
+    pub fn is_management_account(&self, account_id: &str) -> bool {
+        self.organization_management_account_id.as_deref() == Some(account_id)
+    }
 }
 
 impl Default for ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
-    /// The store's initial value: no enrollment and no preference (nobody has
-    /// called yet), and the recommendation catalog this emulator reports.
+    /// The store's initial value: the caller's enrollment record (the account
+    /// is known to Cost Optimization Hub, and has not opted in), no preference
+    /// (nobody has called `UpdatePreferences` yet), no organization, and the
+    /// recommendation catalog this emulator reports.
     ///
     /// The catalog is part of the initial value rather than something a reader
     /// writes on first use, so `ListRecommendations` and `GetRecommendation`
-    /// serve the same rows without either of them mutating the store.
+    /// serve the same rows without either of them mutating the store. The
+    /// enrollment record is there for the same reason: `ListEnrollmentStatuses`
+    /// reports an account's status whether or not it has ever enrolled, so the
+    /// record cannot be something the first write creates.
     fn default() -> Self {
+        let account_id = caller_account_id().to_string();
+        let created = DateTime::from(std::time::SystemTime::now());
         let mut state = Self {
-            enrollments: HashMap::new(),
+            enrollments: HashMap::from([(
+                account_id.clone(),
+                Enrollment {
+                    account_id: account_id.clone(),
+                    status: STATUS_INACTIVE.to_string(),
+                    include_member_accounts: None,
+                    created_timestamp: created,
+                    last_updated_timestamp: created,
+                    // The account has not opted in, so no analysis has been
+                    // started and no recommendations are owed.
+                    recommendations_due_at: None,
+                },
+            )]),
             preferences: HashMap::new(),
             recommendations: HashMap::new(),
             recommendation_order: Vec::new(),
+            organization_management_account_id: None,
         };
         for recommendation in seed_recommendations() {
             state
@@ -1167,4 +1230,79 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a stored `savingsEstimationMode` does to a row's money members:
+    /// `AfterDiscounts` reports the cost net of every discount the price
+    /// carries, and every other state of the preference — `BeforeDiscounts`,
+    /// or no preference at all — reports the undiscounted cost. Asserted on
+    /// the stored prices directly, because the mode is the management
+    /// account's to enable (see `ops::update_preferences`) and so cannot be
+    /// reached over the wire by the account this emulator presents.
+    #[test]
+    fn the_mode_decides_whether_discounts_are_subtracted() {
+        let pricing = Pricing {
+            cost_before_discounts: 280.32,
+            savings_plans_discount: 20.0,
+            reserved_instances_discount: 5.0,
+            other_discount: 3.03,
+        };
+
+        // (the stored mode, the cost it reports)
+        let cases: [(Option<&str>, f64); 4] = [
+            (None, 280.32),
+            (Some("BeforeDiscounts"), 280.32),
+            (Some(AFTER_DISCOUNTS), 252.29),
+            // A value outside the enum cannot reach the store, and an
+            // unrecognised one is not `AfterDiscounts`: the undiscounted cost.
+            (Some("Nonsense"), 280.32),
+        ];
+        for (mode, expected) in cases {
+            let actual = pricing.cost_for_mode(mode);
+            assert!(
+                (actual - expected).abs() < 0.005,
+                "case {mode:?}: expected cost {expected}, got {actual}"
+            );
+        }
+    }
+
+    /// The store starts with the caller's enrollment record (`Inactive`, no
+    /// `includeMemberAccounts` preference) and with no organization, so no
+    /// account is the management account.
+    #[test]
+    fn the_initial_store_knows_the_caller_and_no_organization() {
+        let state = ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::default();
+        let caller = caller_account_id();
+        let enrollment = state
+            .enrollments
+            .get(caller)
+            .expect("the caller's enrollment record");
+        assert_eq!(
+            enrollment.status, STATUS_INACTIVE,
+            "expected an account that has not opted in, got {:?}",
+            enrollment.status
+        );
+        assert_eq!(
+            enrollment.include_member_accounts, None,
+            "expected no includeMemberAccounts preference, got {:?}",
+            enrollment.include_member_accounts
+        );
+        assert_eq!(
+            state.enrollments.len(),
+            1,
+            "expected only the caller's record, got {:?}",
+            state.enrollments.keys().collect::<Vec<_>>()
+        );
+        for account in [caller, "111122223333", ""] {
+            assert!(
+                !state.is_management_account(account),
+                "case {account:?}: no account is the management account of an \
+                 organization this emulator does not record"
+            );
+        }
+    }
 }

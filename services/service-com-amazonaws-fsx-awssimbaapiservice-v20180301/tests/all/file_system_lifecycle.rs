@@ -22,22 +22,22 @@ const TARGET_PREFIX: &str = "AWSSimbaAPIService_v20180301";
 
 /// The region every request below is signed for. The service reads it from the SigV4
 /// credential scope, so every ARN and DNS name it mints must carry this one.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The one account id a generated emulator presents (`emulator_server::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Longer than the service's own clock-owed transition span, so a transition that was due
 /// has certainly fallen due by the next call.
 const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
 /// A subnet id matching the modelled `SubnetId` pattern `^(subnet-[0-9a-f]{8,})$`.
-const SUBNET_A: &str = "subnet-0123456789abcdef0";
+pub(crate) const SUBNET_A: &str = "subnet-0123456789abcdef0";
 const SUBNET_B: &str = "subnet-00112233445566778";
 
 /// One emulator over one shared engine, with the service mounted the way the router mounts
 /// it in production.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not the subject of these tests; the requests still carry the SigV4
@@ -50,7 +50,11 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Dispatch one operation and return `(status, body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("https://fsx.us-west-2.amazonaws.com/")
@@ -78,7 +82,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// Dispatch one operation, requiring a 200, and return the body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,

@@ -121,7 +121,8 @@
 use super::types::*;
 
 use crate::state::{
-    PendingTransition, TransitionTarget, LIFECYCLE_CREATING, LIFECYCLE_DELETING,
+    deleted_file_system_not_found_message, PendingTransition, TransitionTarget, LIFECYCLE_CREATING,
+    LIFECYCLE_DELETING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -211,9 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(record) = store.file_systems.get_mut(&input.file_system_id) else {
             return Err(DeleteFileSystemErrorModeled::FileSystemNotFound(FileSystemNotFound {
-                message: Some(format!(
-                    "file system {} does not exist",
-                    input.file_system_id
+                // Built from the id the request named: on this operation FSx's `Message` is
+                // that id alone.
+                message: Some(deleted_file_system_not_found_message(
+                    &input.file_system_id,
                 )),
             })
             .into());

@@ -186,7 +186,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // Each level of the address is resolved on its own, because the service words a
-        // not-found by the resource type that is missing.
+        // not-found by the resource type that is missing. Every sentence comes from the
+        // shared builders in `crate::state`, so the wording is decided in ONE place.
         let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
             return Err(
                 GetOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
