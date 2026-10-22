@@ -1025,6 +1025,77 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         }
     }
 
+    /// The tags held by the resource `arn` names, or `None` when no stored resource
+    /// carries that ARN.
+    ///
+    /// Resolution is by the ARN each record was minted with and STORED, never by
+    /// rebuilding one from the request: an ARN naming another account's or another
+    /// Region's resource therefore names nothing this store holds, which is the same
+    /// answer as naming a resource that was never created. Every taggable resource is
+    /// reachable here — the account's accessors, and each network with the members, nodes
+    /// and proposals that belong to it — so one tag set is read and written through this
+    /// one lookup rather than a copy per operation.
+    pub fn tags_for_resource(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(accessor) = self.accessors.values().find(|accessor| accessor.arn == arn) {
+            return Some(&accessor.tags);
+        }
+        for network in self.networks.values() {
+            if network.arn == arn {
+                return Some(&network.tags);
+            }
+            if let Some(member) = network.members.values().find(|member| member.arn == arn) {
+                return Some(&member.tags);
+            }
+            if let Some(node) = network.nodes.values().find(|node| node.arn == arn) {
+                return Some(&node.tags);
+            }
+            if let Some(proposal) = network
+                .proposals
+                .values()
+                .find(|proposal| proposal.arn == arn)
+            {
+                return Some(&proposal.tags);
+            }
+        }
+        None
+    }
+
+    /// The tag set of the resource `arn` names, to write: the same resolution
+    /// [`Self::tags_for_resource`] reads through, so a tag written here is the one a read
+    /// of that resource reports.
+    pub fn tags_for_resource_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(accessor) = self
+            .accessors
+            .values_mut()
+            .find(|accessor| accessor.arn == arn)
+        {
+            return Some(&mut accessor.tags);
+        }
+        for network in self.networks.values_mut() {
+            if network.arn == arn {
+                return Some(&mut network.tags);
+            }
+            if let Some(member) = network
+                .members
+                .values_mut()
+                .find(|member| member.arn == arn)
+            {
+                return Some(&mut member.tags);
+            }
+            if let Some(node) = network.nodes.values_mut().find(|node| node.arn == arn) {
+                return Some(&mut node.tags);
+            }
+            if let Some(proposal) = network
+                .proposals
+                .values_mut()
+                .find(|proposal| proposal.arn == arn)
+            {
+                return Some(&mut proposal.tags);
+            }
+        }
+        None
+    }
+
     /// What the create under this idempotency key already minted, if the ledger still
     /// holds it.
     pub fn replay_idempotent(&self, key: &str) -> Option<CreatedIds> {
@@ -1352,6 +1423,100 @@ pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
     }
 }
 
+/// The `ResourceNotFoundException` for a resource the request named BY ARN and this
+/// service does not hold.
+///
+/// The counterpart of [`not_found`] for the three tagging operations, which identify
+/// their resource by `ResourceArn`: here there IS an ARN to put in
+/// `ResourceNotFoundException$ResourceName` (`ArnString`, `@pattern
+/// ^arn:.+:.+:.+:.+:.+$`), namely the one the request sent, which the modelled pattern
+/// already held it to. `resource_type` is how this service names the type the ARN spells
+/// (see [`taggable_resource_type`]).
+pub fn not_found_arn(resource_type: &str, arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("{resource_type} {arn} not found.")),
+        resource_name: Some(arn.to_string()),
+    }
+}
+
+/// How many tags one resource can carry.
+///
+/// "A resource can have up to 50 tags. If you try to create more than 50 tags for a
+/// resource, your request fails and returns an error" (`TagResource`), which is also what
+/// `InputTagMap`'s `@length(0, 50)` lets one request carry. `OutputTagMap`'s
+/// `@length(0, 200)` bounds the map a READ reports, not how many tags a resource may
+/// hold, so a write is held to the documented 50.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The resource types this service tags: the `<type>` of an ARN's `<type>/<id>` resource
+/// part, paired with how a failure names that type.
+///
+/// These are exactly the shapes whose model declares a `Tags` member — `Network`,
+/// `Member`, `Node`, `Proposal` and `Accessor` — so they are the resources a tag set
+/// exists for. `Invitation` declares none, so no ARN of one names a tag set.
+pub const TAGGABLE_RESOURCE_TYPES: &[(&str, &str)] = &[
+    ("accessors", RESOURCE_ACCESSOR),
+    ("members", RESOURCE_MEMBER),
+    ("networks", RESOURCE_NETWORK),
+    ("nodes", RESOURCE_NODE),
+    ("proposals", RESOURCE_PROPOSAL),
+];
+
+/// How this service names the type of resource `arn` identifies, when `arn` is an ARN in
+/// this service's own namespace that names one of the resource types it tags
+/// ([`TAGGABLE_RESOURCE_TYPES`]).
+///
+/// `None` for anything else — another service's ARN, or one of this service's whose
+/// resource part names a type that holds no tag set: no resource this service could ever
+/// tag is named by such an ARN, whatever the store holds, so the request asks for
+/// something this service cannot do rather than for a resource it has lost.
+pub fn taggable_resource_type(arn: &str) -> Option<&'static str> {
+    // `arn:<partition>:<service>:<region>:<account>:<resource>` — the resource part is
+    // taken whole (it may itself contain colons) and only its `<type>/<id>` head is read.
+    //
+    // The partition, Region and account are deliberately NOT judged here: this answers
+    // only whether the ARN names a KIND of resource this service tags. Whether it names
+    // one this store holds is then decided by matching the ARN a create minted and
+    // stored, so an ARN of another partition, Region or account is a resource that is
+    // not found rather than a request this service cannot understand.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let _partition = fields.next()?;
+    if fields.next()? != ARN_SERVICE {
+        return None;
+    }
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let (resource_type, id) = fields.next()?.split_once('/')?;
+    if id.is_empty() {
+        return None;
+    }
+    TAGGABLE_RESOURCE_TYPES
+        .iter()
+        .find(|(segment, _)| *segment == resource_type)
+        .map(|(_, named)| *named)
+}
+
+/// How this service words a tagging request whose `ResourceArn` names nothing it could
+/// ever tag ([`taggable_resource_type`] answered `None`): the prose of the
+/// `InvalidRequestException` every operation of this service models for a request it
+/// cannot accept, naming the ARN the request sent and the resource types that can carry
+/// tags.
+pub fn not_a_taggable_arn(arn: &str) -> String {
+    let types: Vec<&str> = TAGGABLE_RESOURCE_TYPES
+        .iter()
+        .map(|(segment, _)| *segment)
+        .collect();
+    format!(
+        "{arn} is not the ARN of a taggable {ARN_SERVICE} resource. Expected \
+         arn:<partition>:{ARN_SERVICE}:<region>:<account>:<type>/<id>, where <type> is one \
+         of: {}.",
+        types.join(", ")
+    )
+}
+
 /// The VPC endpoint service name members use to reach a network's resources
 /// (`Network$VpcEndpointServiceName`), shaped as Managed Blockchain publishes it:
 /// `com.amazonaws.<region>.managedblockchain.<NetworkId>`.
@@ -1523,7 +1688,10 @@ fn arn_account_id(arn: &str) -> Option<&str> {
 }
 
 /// A stored tag map as the modelled `OutputTagMap`.
-fn map_out(map: &BTreeMap<String, String>) -> std::collections::HashMap<String, String> {
+///
+/// `pub` because `ListTagsForResource` answers with a resource's tag map itself, where
+/// every other read reaches it as one member of a larger shape.
+pub fn map_out(map: &BTreeMap<String, String>) -> std::collections::HashMap<String, String> {
     map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
