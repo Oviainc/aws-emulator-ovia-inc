@@ -533,6 +533,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     node_resources_fit: config.node_resources_fit,
                 }
             }),
+            // A brand new cluster has no identity provider associated to it;
+            // `AssociateIdentityProviderConfig` is what writes into this map.
+            identity_provider_configs: ::std::collections::BTreeMap::new(),
             kube_controller_manager_config: input.kube_controller_manager_config.map(|config| {
                 KubeControllerManagerConfigResponse {
                     pod_gc_controller_config: config.pod_gc_controller_config.map(|pod_gc| {

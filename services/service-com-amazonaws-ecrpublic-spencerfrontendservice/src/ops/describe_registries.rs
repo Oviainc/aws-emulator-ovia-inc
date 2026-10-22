@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRegistries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRegistries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRegistries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one public registry this emulator serves, read from
+//! [`crate::state`]: its account id, its ARN, its gallery URI and its alias record.
+//! Nothing here mutates — the registry's identity is fixed when the store is created and
+//! every call reports the same thing.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRegistries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRegistriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRegistries"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeRegistriesErrorModeled::ServerException(ServerException {
+                message: Some(
+                    "The ECR Public emulator could not reach its state store.".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let resume_after = match crate::state::decode_page_token(input.next_token.as_deref()) {
+            Ok(resume_after) => resume_after,
+            Err(message) => return Err(invalid_parameter(message)),
+        };
+        let page_size = crate::state::page_size(input.max_results);
+
+        // An account has exactly ONE public registry, so this listing walks a one-entry
+        // sequence keyed by the registry id — the same paging contract the other
+        // `@paginated` operations of this service use, so a token that already named this
+        // registry resumes after it and yields an empty page with no further token.
+        let (registry_id, registry) = {
+            let store = state.lock();
+            (store.registry_id.clone(), registry_of(&store))
+        };
+
+        // The registry id is the only key a page of this listing can end on, so a token
+        // that decodes to anything else is not one this service minted: refuse it instead
+        // of serving a silent empty page.
+        if resume_after
+            .as_deref()
+            .is_some_and(|after| after != registry_id)
+        {
+            return Err(invalid_parameter(crate::state::invalid_token_message()));
+        }
+
+        let page = crate::state::page(
+            vec![(registry_id, registry)],
+            resume_after.as_deref(),
+            page_size,
+        );
+        Ok(DescribeRegistriesOutput {
+            registries: page.items,
+            next_token: page.next_token,
+        })
     }
+}
+
+/// This registry as the modelled `Registry` shape.
+///
+/// `verified` is "whether the account is a verified Amazon Web Services Marketplace
+/// vendor" (`Registry$verified`) — a standing outside this API, which no operation of
+/// this service can confer, so an emulated registry is never verified. The alias record
+/// is the one alias the registry was assigned: it is the alias that appears in every
+/// `repositoryUri`, so it is both the primary and the default alias
+/// (`RegistryAlias$primaryRegistryAlias` is "displayed in … the repository URL",
+/// `RegistryAlias$defaultRegistryAlias` is the one assigned to the registry itself).
+fn registry_of(store: &crate::state::ComAmazonawsEcrpublicSpencerfrontendserviceState) -> Registry {
+    Registry {
+        registry_id: store.registry_id.clone(),
+        registry_arn: store.registry_arn(),
+        registry_uri: store.registry_uri(),
+        verified: false,
+        aliases: vec![RegistryAlias {
+            name: store.registry_alias.clone(),
+            status: crate::state::REGISTRY_ALIAS_STATUS_ACTIVE.to_string(),
+            primary_registry_alias: true,
+            default_registry_alias: true,
+        }],
+    }
+}
+
+/// Refuse a parameter this operation cannot serve, with the one client-input error every
+/// ECR Public operation declares.
+fn invalid_parameter(message: String) -> DescribeRegistriesError {
+    DescribeRegistriesErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
 }
