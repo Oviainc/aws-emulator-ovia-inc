@@ -23,16 +23,34 @@
 //!   `settle` sweep `List*` performs.
 //! * `idempotency_tokens` — an entry is dropped together with the job it points at,
 //!   so this index cannot outgrow `analysis_jobs`.
+//! * `document_classifiers` — [`MAX_DOCUMENT_CLASSIFIER_RECORDS`], enforced by the
+//!   ONE insertion path,
+//!   [`ComAmazonawsComprehendComprehend20171127State::insert_document_classifier`],
+//!   with oldest-first eviction.
 //!
-//! `ops::list_sentiment_detection_jobs` bounds the RESPONSE the same way, with its
-//! `DEFAULT_MAX_RESULTS` and the modelled `MaxResults` ceiling.
+//! `ops::list_sentiment_detection_jobs` and `ops::list_document_classifiers` bound
+//! the RESPONSE the same way, with their `DEFAULT_MAX_RESULTS` and the modelled
+//! `MaxResults` ceiling.
+//!
+//! ## Custom models
+//!
+//! [`DocumentClassifier`] is one trained (or training) custom classification model,
+//! keyed by the `DocumentClassifierArn` that names it everywhere else in the API
+//! (Describe/Delete/StopTraining and the resource-policy operations), and
+//! [`DocumentClassifier::document_classifier_properties`] projects it into the
+//! modelled `DocumentClassifierProperties` shape that `ListDocumentClassifiers` and
+//! `DescribeDocumentClassifier` report.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{InputDataConfig, OutputDataConfig, SentimentDetectionJobProperties, Tag, VpcConfig};
+use crate::ops::types::{
+    ClassifierMetadata, DocumentClassifierInputDataConfig, DocumentClassifierOutputDataConfig,
+    DocumentClassifierProperties, InputDataConfig, OutputDataConfig,
+    SentimentDetectionJobProperties, Tag, VpcConfig,
+};
 
 /// How long a freshly submitted job stays `SUBMITTED` before the clock owes it
 /// `IN_PROGRESS`.
@@ -58,6 +76,16 @@ pub const STOPPING_SPAN: Duration = Duration::from_millis(300);
 /// once the store passes it. It is far above any test or client working set, so
 /// eviction never hides a job a caller is still polling.
 pub const MAX_ANALYSIS_JOB_RECORDS: usize = 1000;
+
+/// The most custom document-classifier records this emulator retains.
+///
+/// The EMULATOR's bound, for the same reason as [`MAX_ANALYSIS_JOB_RECORDS`]: the
+/// oldest record is evicted once the store passes it, so no sequence of requests
+/// can grow this store without limit. AWS's own per-account model quota is
+/// adjustable and is not emulated as a refusal here, so creating a classifier is
+/// never refused for this bound; only the record set is trimmed. The bound also
+/// caps the page `ListDocumentClassifiers` can ever walk.
+pub const MAX_DOCUMENT_CLASSIFIER_RECORDS: usize = 1000;
 
 /// Which `Start*DetectionJob` family a persisted [`AnalysisJob`] belongs to.
 ///
@@ -212,6 +240,139 @@ impl AnalysisJob {
     }
 }
 
+/// One persisted custom document classifier.
+///
+/// Every member is a value the operation that created the classifier was called
+/// with, or a value this service minted for it — never anything a later
+/// `Describe`/`List` request supplied. The record is keyed by its
+/// `DocumentClassifierArn`, which is what every other classifier operation names it
+/// by, and [`Self::document_classifier_properties`] is the ONE place it is projected
+/// into the modelled shape the reporting operations return.
+#[derive(Debug, Clone)]
+pub struct DocumentClassifier {
+    /// Creation order within the service, the stable key
+    /// `ListDocumentClassifiers` pages on.
+    pub seq: u64,
+    /// The classifier's ARN, as [`document_classifier_arn`] renders it.
+    pub classifier_arn: String,
+    /// `DocumentClassifierName`, the name `DocumentClassifierFilter$DocumentClassifierName`
+    /// selects on. Not a member of `DocumentClassifierProperties`: the ARN carries it.
+    pub classifier_name: String,
+    /// `VersionName`, when the classifier was created as a named version.
+    pub version_name: Option<String>,
+    /// One of `super::ops::types::LANGUAGE_CODE_VALUES`.
+    pub language_code: String,
+    /// One of `super::ops::types::MODEL_STATUS_VALUES`.
+    pub status: String,
+    pub message: Option<String>,
+    pub submit_time: SystemTime,
+    pub end_time: Option<SystemTime>,
+    pub training_start_time: Option<SystemTime>,
+    pub training_end_time: Option<SystemTime>,
+    pub input_data_config: Option<DocumentClassifierInputDataConfig>,
+    pub output_data_config: Option<DocumentClassifierOutputDataConfig>,
+    /// The metrics of a finished training run; `None` while nothing has been
+    /// trained, which is what a model that never reached `TRAINED` reports.
+    pub classifier_metadata: Option<ClassifierMetadata>,
+    pub data_access_role_arn: Option<String>,
+    pub volume_kms_key_id: Option<String>,
+    pub model_kms_key_id: Option<String>,
+    pub vpc_config: Option<VpcConfig>,
+    /// One of `super::ops::types::DOCUMENT_CLASSIFIER_MODE_VALUES`.
+    pub mode: String,
+    pub source_model_arn: Option<String>,
+    pub flywheel_arn: Option<String>,
+    pub tags: Vec<Tag>,
+    /// The `ClientRequestToken` the classifier was created under, if any.
+    pub client_request_token: Option<String>,
+}
+
+impl DocumentClassifier {
+    /// A classifier record as it stands the instant it was submitted: the identity
+    /// and the configuration it was created with, nothing trained yet.
+    ///
+    /// `MULTI_CLASS` is the mode `CreateDocumentClassifier` documents as its
+    /// default ("the default is `MULTI_CLASS`" on
+    /// `CreateDocumentClassifierRequest$Mode`); a caller that named a mode
+    /// overwrites the field.
+    pub fn submitted(
+        seq: u64,
+        classifier_arn: String,
+        classifier_name: String,
+        language_code: String,
+        submit_time: SystemTime,
+    ) -> Self {
+        Self {
+            seq,
+            classifier_arn,
+            classifier_name,
+            version_name: None,
+            language_code,
+            status: "SUBMITTED".to_string(),
+            message: None,
+            submit_time,
+            end_time: None,
+            training_start_time: None,
+            training_end_time: None,
+            input_data_config: None,
+            output_data_config: None,
+            classifier_metadata: None,
+            data_access_role_arn: None,
+            volume_kms_key_id: None,
+            model_kms_key_id: None,
+            vpc_config: None,
+            mode: "MULTI_CLASS".to_string(),
+            source_model_arn: None,
+            flywheel_arn: None,
+            tags: Vec::new(),
+            client_request_token: None,
+        }
+    }
+
+    /// Project this record into the modelled `DocumentClassifierProperties` shape.
+    pub fn document_classifier_properties(&self) -> DocumentClassifierProperties {
+        DocumentClassifierProperties {
+            document_classifier_arn: Some(self.classifier_arn.clone()),
+            language_code: Some(self.language_code.clone()),
+            status: Some(self.status.clone()),
+            message: self.message.clone(),
+            submit_time: Some(::aws_smithy_types::DateTime::from(self.submit_time)),
+            end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
+            training_start_time: self
+                .training_start_time
+                .map(::aws_smithy_types::DateTime::from),
+            training_end_time: self
+                .training_end_time
+                .map(::aws_smithy_types::DateTime::from),
+            input_data_config: self.input_data_config.clone(),
+            output_data_config: self.output_data_config.clone(),
+            classifier_metadata: self.classifier_metadata.clone(),
+            data_access_role_arn: self.data_access_role_arn.clone(),
+            volume_kms_key_id: self.volume_kms_key_id.clone(),
+            vpc_config: self.vpc_config.clone(),
+            mode: Some(self.mode.clone()),
+            model_kms_key_id: self.model_kms_key_id.clone(),
+            version_name: self.version_name.clone(),
+            source_model_arn: self.source_model_arn.clone(),
+            flywheel_arn: self.flywheel_arn.clone(),
+        }
+    }
+}
+
+/// The ARN a document classifier carries, stated once here.
+///
+/// The form the modelled `DocumentClassifierArn` pattern requires:
+/// `arn:aws:comprehend:<region>:<account>:document-classifier/<name>` for an
+/// unversioned classifier, with `/version/<version-name>` appended when the
+/// classifier was created as a named version.
+pub fn document_classifier_arn(region: &str, name: &str, version_name: Option<&str>) -> String {
+    let resource = match version_name {
+        Some(version) => format!("document-classifier/{name}/version/{version}"),
+        None => format!("document-classifier/{name}"),
+    };
+    ::emulator_server::emulator_arn("comprehend", region, &resource)
+}
+
 /// Per-service state for com-amazonaws-comprehend-comprehend-20171127. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsComprehendComprehend20171127State {
@@ -226,6 +387,13 @@ pub struct ComAmazonawsComprehendComprehend20171127State {
     /// Monotonic submission counter: the source of both a job's `seq` and the
     /// uniqueness of a minted `JobId`.
     pub job_id_seq: u64,
+    /// Every persisted custom document classifier, keyed by its
+    /// `DocumentClassifierArn`. Bounded by [`MAX_DOCUMENT_CLASSIFIER_RECORDS`]:
+    /// insert through [`Self::insert_document_classifier`], never directly.
+    pub document_classifiers: BTreeMap<String, DocumentClassifier>,
+    /// Monotonic creation counter, the source of a classifier's `seq` — the stable
+    /// order `ListDocumentClassifiers` pages on.
+    pub document_classifier_seq: u64,
 }
 
 impl ComAmazonawsComprehendComprehend20171127State {
@@ -288,6 +456,37 @@ impl ComAmazonawsComprehendComprehend20171127State {
                     self.idempotency_tokens.remove(&index_key);
                 }
             }
+        }
+    }
+
+    /// Mint the next classifier creation sequence number.
+    ///
+    /// A classifier's identity is its ARN (name plus optional version), which the
+    /// caller chooses, so nothing is hashed here: the counter exists only to give
+    /// the records a stable creation order for paging.
+    pub fn mint_document_classifier_seq(&mut self) -> u64 {
+        self.document_classifier_seq += 1;
+        self.document_classifier_seq
+    }
+
+    /// Persist a classifier record and evict the oldest once the store passes
+    /// [`MAX_DOCUMENT_CLASSIFIER_RECORDS`].
+    ///
+    /// The ONE insertion path for [`Self::document_classifiers`], so the bound
+    /// cannot be bypassed by a handler.
+    pub fn insert_document_classifier(&mut self, classifier: DocumentClassifier) {
+        self.document_classifiers
+            .insert(classifier.classifier_arn.clone(), classifier);
+        while self.document_classifiers.len() > MAX_DOCUMENT_CLASSIFIER_RECORDS {
+            let oldest = self
+                .document_classifiers
+                .iter()
+                .min_by(|(left_arn, left), (right_arn, right)| {
+                    (left.seq, left_arn.as_str()).cmp(&(right.seq, right_arn.as_str()))
+                })
+                .map(|(arn, _)| arn.clone());
+            let Some(oldest) = oldest else { break };
+            self.document_classifiers.remove(&oldest);
         }
     }
 }

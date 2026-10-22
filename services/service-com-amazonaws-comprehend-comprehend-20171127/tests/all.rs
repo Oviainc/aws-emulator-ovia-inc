@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/comprehend_client.rs"]
 mod comprehend_client;
+#[path = "all/document_classifiers.rs"]
+mod document_classifiers;
 #[path = "all/sentiment_jobs.rs"]
 mod sentiment_jobs;
 #[path = "all/state_roundtrip.rs"]

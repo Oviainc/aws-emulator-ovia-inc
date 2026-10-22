@@ -28,6 +28,10 @@ pub const ACCOUNT_ID: &str = "000000000000";
 /// One emulator holding one Comprehend service over one shared engine.
 pub struct Comprehend {
     router: MultiServiceRouter,
+    /// The SAME engine the registered service's handlers reach through
+    /// `self.engine`, kept so a suite can seed the store for an operation whose
+    /// creating sibling is still a scaffold stub.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Comprehend {
@@ -38,8 +42,17 @@ impl Comprehend {
         // The suites assert on service behaviour, not on signature verification, and
         // sign with a fixed scope so the region is deterministic.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The shared engine behind this emulator, for a suite that has to seed the
+    /// store directly. Reads and writes go through
+    /// `service_com_amazonaws_comprehend_comprehend_20171127::state::service_state`,
+    /// exactly as a handler's do, so a seeded record is the same record a handler
+    /// serves.
+    pub fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// Call `operation` with `body`, returning the HTTP status and the parsed JSON

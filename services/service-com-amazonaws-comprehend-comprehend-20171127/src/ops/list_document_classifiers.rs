@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDocumentClassifiers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDocumentClassifiers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDocumentClassifiers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Enumerates the persisted document-classifier records in the order
+//! the filter's own documentation states, honours the filter, truncates at
+//! `MaxResults` and hands back an opaque `NextToken` that resumes exactly after the
+//! last classifier on the page.
+//!
+//! A pure report: it computes the page from [`crate::state`] and writes nothing, so
+//! two callers an instant apart see the same list.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +77,93 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{datetime_parts, epoch_parts, DocumentClassifier};
+
+/// The page size used when the request sets no `MaxResults`.
+///
+/// From the modelled member documentation of
+/// `ListDocumentClassifiersRequest$MaxResults`: "The maximum number of results to
+/// return in each page. The default is 100."
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The ceiling a page is clamped to: the modelled `MaxResults` maximum (`@range`
+/// 1..500), so one request can never render an unbounded number of records into one
+/// response even if a value reaches here outside that range.
+const MAX_RESULTS_CEILING: usize = 500;
+
+/// Does `classifier` satisfy `filter`?
+///
+/// Each set member narrows the list the way its own documentation states:
+/// `DocumentClassifierName` and `Status` match exactly, and the submit-time bounds
+/// are read strictly — "submitted before"/"submitted after" exclude a classifier
+/// submitted at the bound itself, which the model leaves unstated.
+fn matches(classifier: &DocumentClassifier, filter: &DocumentClassifierFilter) -> bool {
+    if let Some(name) = filter.document_classifier_name.as_ref() {
+        if &classifier.classifier_name != name {
+            return false;
+        }
+    }
+    if let Some(status) = filter.status.as_ref() {
+        if &classifier.status != status {
+            return false;
+        }
+    }
+    let submitted = epoch_parts(classifier.submit_time);
+    if let Some(before) = filter.submit_time_before.as_ref() {
+        if submitted >= datetime_parts(before) {
+            return false;
+        }
+    }
+    if let Some(after) = filter.submit_time_after.as_ref() {
+        if submitted <= datetime_parts(after) {
+            return false;
+        }
+    }
+    true
+}
+
+/// How many of `filter`'s members are set.
+///
+/// `DocumentClassifierFilter` documents "You can only specify one filtering
+/// parameter in a request", so more than one is refused with the
+/// `InvalidFilterException` this operation declares.
+fn filters_set(filter: &DocumentClassifierFilter) -> usize {
+    usize::from(filter.document_classifier_name.is_some())
+        + usize::from(filter.status.is_some())
+        + usize::from(filter.submit_time_before.is_some())
+        + usize::from(filter.submit_time_after.is_some())
+}
+
+/// Does this filter ask for newest-to-oldest?
+///
+/// The model states the order per filter member, and the two submit-time members
+/// state OPPOSITE orders: `SubmitTimeBefore` is "Classifiers are returned in
+/// ascending order, oldest to newest" and `SubmitTimeAfter` is "Classifiers are
+/// returned in descending order, newest to oldest". Only one filtering parameter
+/// may be specified in a request, so the order each page is served in is
+/// unambiguous: `SubmitTimeAfter` reverses it, every other request keeps the
+/// ascending default.
+fn newest_first(filter: &DocumentClassifierFilter) -> bool {
+    filter.submit_time_after.is_some()
+}
+
+/// Render the page cursor that resumes after the classifier with creation sequence
+/// `seq`, in whichever direction the page was served. Opaque to the caller: the
+/// sequence number is not a member of any modelled shape.
+fn encode_token(seq: u64) -> String {
+    hex::encode(seq.to_be_bytes())
+}
+
+/// Read back a cursor produced by [`encode_token`]; `None` when the string is not
+/// of that form. The caller also checks that the sequence number it carries is one
+/// this service has minted, so a well-formed string naming no page it ever issued
+/// is refused too.
+fn decode_token(token: &str) -> Option<u64> {
+    let bytes = hex::decode(token).ok()?;
+    let bytes: [u8; 8] = bytes.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +236,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDocumentClassifiers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDocumentClassifiersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDocumentClassifiers"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDocumentClassifiersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The service store is unavailable. Retry your request.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let filter = input.filter.unwrap_or_default();
+        if filters_set(&filter) > 1 {
+            return Err(ListDocumentClassifiersErrorModeled::InvalidFilterException(
+                InvalidFilterException {
+                    message: Some(
+                        "Only one filtering parameter can be specified in a request. Specify a \
+                         different filter."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The modelled `@range` of 1..500 is enforced at the boundary, so a value
+        // that reaches here is already inside it; the clamp keeps the page bounded
+        // regardless.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(1, MAX_RESULTS_CEILING);
+
+        let store = state.lock();
+
+        // A cursor is a creation sequence number this service has actually minted,
+        // so a well-formed string that names no page it ever issued — zero, or a
+        // sequence past the newest classifier — is refused rather than silently
+        // read as "from the beginning".
+        let descending = newest_first(&filter);
+        let cursor = match input.next_token.as_deref() {
+            // No cursor: start outside the whole range, at whichever end this
+            // page's order begins from.
+            None => {
+                if descending {
+                    u64::MAX
+                } else {
+                    0
+                }
+            }
+            Some(token) => decode_token(token)
+                .filter(|seq| (1..=store.document_classifier_seq).contains(seq))
+                .ok_or_else(|| {
+                    ListDocumentClassifiersErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(
+                                "NextToken is not a token this service issued.".to_string(),
+                            ),
+                            reason: None,
+                            detail: None,
+                        },
+                    )
+                })?,
+        };
+
+        // The order the filter's own documentation states (see `newest_first`), over
+        // creation order, which is what the record's sequence number is.
+        // `sort_by_key` is load-bearing: the store is keyed by classifier ARN, whose
+        // order is not creation order.
+        let mut selected: Vec<&DocumentClassifier> = store
+            .document_classifiers
+            .values()
+            .filter(|classifier| {
+                let past_cursor = if descending {
+                    classifier.seq < cursor
+                } else {
+                    classifier.seq > cursor
+                };
+                past_cursor && matches(classifier, &filter)
+            })
+            .collect();
+        selected.sort_by_key(|classifier| classifier.seq);
+        if descending {
+            selected.reverse();
+        }
+
+        let page: Vec<&DocumentClassifier> = selected.iter().copied().take(page_size).collect();
+        let next_token = match page.last() {
+            Some(last) if selected.len() > page.len() => Some(encode_token(last.seq)),
+            _ => None,
+        };
+
+        Ok(ListDocumentClassifiersOutput {
+            document_classifier_properties_list: Some(
+                page.iter()
+                    .map(|classifier| classifier.document_classifier_properties())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
