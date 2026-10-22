@@ -132,7 +132,11 @@ async fn template(router: &MultiServiceRouter, label: &str) -> String {
             "description": format!("experiment target account configuration suite: {label}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-experiment-target-accounts",
             "stopConditions": [{ "source": "none" }],
-            "actions": { "wait": { "actionId": "aws:fis:wait" } }
+            // `aws:fis:wait` takes a required `duration`, an ISO 8601 duration within the
+            // documented 1 to 720 minutes.
+            "actions": {
+                "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT5M" } }
+            }
         })),
     )
     .await;

@@ -80,17 +80,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 // The operation's MODELED errors, plus the service-common `InternalServerException`
-// widened in with `extra_errors`: the service declares it for every operation (its
-// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
-// per-operation list the macro checks against does not repeat it.
+// and `ValidationException` widened in with `extra_errors`: the service declares both
+// for every operation (its `common_errors` are AccessDenied / InternalServer /
+// Throttling / Validation), but the per-operation list the macro checks against does
+// not repeat them.
 #[smithy_macros::operation_error(
     "com.amazonaws.dsql#ListTagsForResource",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -159,27 +161,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service's resource reaches this handler. That is a bad request rather than
         // a missing resource: no Aurora DSQL resource can carry such an ARN.
         let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "resourceArn must be the ARN of an Aurora DSQL resource \
-                 (arn:<partition>:{}:<region>:<account>:<type>/<id>), got {}",
-                crate::state::ARN_SERVICE, input.resource_arn,
-            )));
+            return Err(ListTagsForResourceErrorModeled::ValidationException(
+                crate::state::invalid_resource_arn("resourceArn", &input.resource_arn),
+            )
+            .into());
         };
 
         let mut state = state.lock();
         state.settle(std::time::SystemTime::now());
 
-        let tags = match resource.resource_type.as_str() {
-            crate::state::RESOURCE_TYPE_CLUSTER => state
-                .clusters
-                .get(&resource.resource_id)
-                .map(|cluster| cluster.tags.clone()),
-            // Any other Aurora DSQL resource type: this store holds none of them, so
-            // the ARN resolves to nothing and the answer is the modelled 404.
-            _ => None,
-        };
-
-        let Some(tags) = tags else {
+        // The one resolution of a tagging ARN, shared with `UntagResource`, so a read
+        // and a write never disagree about which ARNs name something here.
+        let Some(tags) = state.resource_tags(&resource).cloned() else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(
                     &input.resource_arn,

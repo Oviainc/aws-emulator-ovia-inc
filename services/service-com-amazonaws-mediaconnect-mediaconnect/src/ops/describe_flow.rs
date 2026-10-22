@@ -166,9 +166,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant whether or not anybody called, so it is materialised before reporting.
         store.settle_due_transitions(::std::time::SystemTime::now());
 
+        // The `{FlowArn}` label is an IDENTIFIER, so the store resolves it: a label this
+        // store does not hold (one never minted, one whose flow was deleted, or one that
+        // is not an ARN at all) addresses no flow and is refused `NotFoundException`
+        // rather than judged against the `FlowArn` shape's pattern. See the note on
+        // `DescribeFlowInput` in `super::types` (`describe_flow_types.rs`).
         let Some(flow) = store.flows.get(&input.flow_arn) else {
             return Err(DescribeFlowErrorModeled::NotFoundException(NotFoundException {
-                message: format!("Flow with ARN {} was not found.", input.flow_arn),
+                message: crate::state::not_found_message(&input.flow_arn),
             })
             .into());
         };

@@ -168,7 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The configuration lives on the template that owns it, so one lookup resolves
-        // both halves of its name.
+        // both halves of its name. There are no upsert semantics: this operation changes
+        // a configuration that EXISTS and refuses when none does.
         let configuration = store
             .experiment_templates
             .get_mut(&input.experiment_template_id)

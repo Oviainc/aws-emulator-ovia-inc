@@ -20,6 +20,12 @@
 //! shares — the request's region, the cluster ARN, the connection endpoint, the
 //! encryption details and the modelled "no such resource" errors — so the
 //! handlers compute them one way rather than once each.
+//!
+//! The tagging operations address a resource by a caller-supplied `resourceArn`
+//! rather than by identifier, so the read of that ARN ([`parse_resource_arn`]), the
+//! tags it resolves to ([`ComAmazonawsDsqlDsqlState::resource_tags_mut`]) and the
+//! refusal of a value that names no resource of this service
+//! ([`invalid_resource_arn`]) live here too, for the same reason.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +35,7 @@ use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     EncryptionDetails, MultiRegionProperties, ResourceNotFoundException, TargetDefinition,
+    ValidationException, ValidationExceptionField,
 };
 
 /// The `ClusterStatus` values this service drives a cluster through, spelled as
@@ -83,6 +90,12 @@ pub const RESOURCE_TYPE_STREAM: &str = "stream";
 /// resource-based policy carries. A policy has no ARN of its own: it is addressed
 /// by the cluster's identifier.
 pub const RESOURCE_TYPE_POLICY: &str = "policy";
+
+/// The `ValidationExceptionReason` for a member whose value failed this service's
+/// own check (`smithy_query(query="shape", shape="ValidationExceptionReason")`:
+/// cannotParse | deletionProtectionEnabled | fieldValidationFailed | other |
+/// unknownOperation).
+pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
 /// How long a cluster or a stream stays in a transient status (`CREATING`,
 /// `UPDATING`, `DELETING`) before the clock settles it into its terminal one.
@@ -558,6 +571,75 @@ impl ComAmazonawsDsqlDsqlState {
         }
     }
 
+    /// The cluster, and the stream of it, that a parsed tagging ARN addresses.
+    ///
+    /// Both tagged resources of this service are written under the cluster's own
+    /// resource type: a cluster is `cluster/{identifier}` and a stream of it is
+    /// `cluster/{cluster}/stream/{stream}` (`ClusterArn` / `StreamArn`), and
+    /// [`parse_resource_arn`] splits the resource field at its FIRST separator, so
+    /// a stream arrives as the type `cluster` with the id `{cluster}/stream/{stream}`.
+    /// Anything else addresses nothing here.
+    ///
+    /// `None` here is a resource that is ABSENT, not a request that is malformed:
+    /// the ARN does name this service and one of its resource types, so a sub-path
+    /// this service mints no resource for (`cluster/{id}/foo/bar`, or a stream path
+    /// carrying more segments) belongs with an unknown identifier — the modelled
+    /// 404 — rather than with [`invalid_resource_arn`]'s 400, which is reserved for
+    /// a value that names no Aurora DSQL resource at all.
+    fn addressed_resource(resource: &ArnResource) -> Option<(&str, Option<&str>)> {
+        if resource.resource_type != RESOURCE_TYPE_CLUSTER {
+            return None;
+        }
+        match resource.resource_id.split_once('/') {
+            None => Some((resource.resource_id.as_str(), None)),
+            Some((cluster, rest)) => {
+                let stream = rest
+                    .strip_prefix(RESOURCE_TYPE_STREAM)
+                    .and_then(|rest| rest.strip_prefix('/'))?;
+                (!cluster.is_empty() && !stream.is_empty()).then_some((cluster, Some(stream)))
+            }
+        }
+    }
+
+    /// The tags of the resource `resource` names, if this service holds it.
+    ///
+    /// The one place a parsed `resourceArn` becomes the tag map it addresses, so
+    /// every tagging operation agrees about which ARNs name something here: a
+    /// cluster, a stream of a cluster (see [`Self::addressed_resource`]), and
+    /// nothing else — a well-formed ARN of any other Aurora DSQL resource type
+    /// answers `None` exactly as an unknown cluster id does. A retired (deleted)
+    /// cluster is not addressable either; its tombstone exists only for delete
+    /// idempotency.
+    pub fn resource_tags(&self, resource: &ArnResource) -> Option<&BTreeMap<String, String>> {
+        let (cluster_identifier, stream_identifier) = Self::addressed_resource(resource)?;
+        let cluster = self.clusters.get(cluster_identifier)?;
+        match stream_identifier {
+            Some(stream_identifier) => cluster
+                .streams
+                .get(stream_identifier)
+                .map(|stream| &stream.tags),
+            None => Some(&cluster.tags),
+        }
+    }
+
+    /// [`Self::resource_tags`] for a caller that WRITES the tags — the same
+    /// resolution, so a tag write and a tag read never disagree about which ARNs
+    /// name something.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource: &ArnResource,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        let (cluster_identifier, stream_identifier) = Self::addressed_resource(resource)?;
+        let cluster = self.clusters.get_mut(cluster_identifier)?;
+        match stream_identifier {
+            Some(stream_identifier) => cluster
+                .streams
+                .get_mut(stream_identifier)
+                .map(|stream| &mut stream.tags),
+            None => Some(&mut cluster.tags),
+        }
+    }
+
     /// Keep `cluster` as a delete-idempotency tombstone, evicting the oldest one
     /// first if that would push the map past [`MAX_RETIRED_CLUSTERS`].
     fn retire(&mut self, identifier: String, cluster: Cluster) {
@@ -840,6 +922,27 @@ pub fn resource_not_found(
         message: format!("The resource with ARN {arn} doesn't exist. Verify the ARN and try again."),
         resource_id: resource_id.to_string(),
         resource_type: resource_type.to_string(),
+    }
+}
+
+/// The modelled `ValidationException` for a `resourceArn`-shaped member whose value
+/// names no resource of this service at all, as [`parse_resource_arn`] reads it.
+///
+/// It names the member and the requirement the value failed, the way the boundary
+/// validator does, so the caller can fix the request from the message alone, and it
+/// fills the shape's `@required` `reason` so a client that branches on it can.
+pub fn invalid_resource_arn(member: &str, value: &str) -> ValidationException {
+    let requirement = format!(
+        "must be the ARN of an Aurora DSQL resource \
+         (arn:<partition>:{ARN_SERVICE}:<region>:<account>:<type>/<id>)"
+    );
+    ValidationException {
+        message: format!("{member} {requirement}, got {value}"),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: requirement,
+        }]),
     }
 }
 

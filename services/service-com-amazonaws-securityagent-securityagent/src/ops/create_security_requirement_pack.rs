@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSecurityRequirementPack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSecurityRequirementPack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSecurityRequirementPack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a customer managed security requirement pack: mints the pack's `packId`,
+//! stores a record carrying every supplied input plus the status the service resolved,
+//! and answers with that identity. The stored record is what
+//! `GetSecurityRequirementPack` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSecurityRequirementPack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSecurityRequirementPackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSecurityRequirementPack"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSecurityRequirementPackErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the security requirement pack store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // `name` is `@required` but carries no `@length`, so a request whose name is
+        // empty (or only whitespace) passes the boundary validator and would store a
+        // pack with no usable name. CHOSEN, not cited: nothing in the model pins this
+        // rule, so it is this emulator's, and it only refuses a name that carries no
+        // characters at all — a name with surrounding whitespace is stored verbatim.
+        // Refused with the operation's own modelled `ValidationException` (HTTP 400),
+        // naming the member and its constraint. The name itself is stored exactly as
+        // supplied: it is caller data, not an identity this service normalises.
+        if input.name.trim().is_empty() {
+            return Err(CreateSecurityRequirementPackErrorModeled::ValidationException(
+                ValidationException {
+                    message: "name must not be blank".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "name".to_string(),
+                        message: "must not be blank".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // "The status of the pack. Defaults to ENABLED if not provided." A status the
+        // `SecurityRequirementPackStatus` enum does not admit is refused rather than
+        // stored, so a later read can only ever answer a modelled enum value.
+        let status = match input.status.as_deref() {
+            None => crate::state::PACK_STATUS_ENABLED.to_string(),
+            Some(requested) if crate::state::PACK_STATUS_VALUES.contains(&requested) => {
+                requested.to_string()
+            }
+            Some(requested) => {
+                return Err(CreateSecurityRequirementPackErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "status must be one of {}, got {requested}",
+                            crate::state::PACK_STATUS_VALUES.join(", ")
+                        ),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: "status".to_string(),
+                            message: format!(
+                                "must be one of {}",
+                                crate::state::PACK_STATUS_VALUES.join(", ")
+                            ),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let mut state = state.lock();
+
+        // Every pack is a stored record, so the number of them a caller can create is
+        // bounded, as it is on the real service: past the quota this operation answers
+        // the service's own `ServiceQuotaExceededException` (HTTP 402) instead of
+        // growing the store without end.
+        if state.security_requirement_packs.len() >= crate::state::MAX_SECURITY_REQUIREMENT_PACKS {
+            return Err(
+                CreateSecurityRequirementPackErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The request would exceed the maximum number of security requirement packs ({}) for this account",
+                            crate::state::MAX_SECURITY_REQUIREMENT_PACKS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A fresh identity per call, taken from the locked store's counter: the name is
+        // NOT an identity here, so two calls carrying one name are two distinct packs
+        // and neither call loses its record to the other.
+        let pack_id = state.mint_security_requirement_pack_id();
+        let now = ::std::time::SystemTime::now();
+        let pack = crate::state::SecurityRequirementPack {
+            pack_id: pack_id.clone(),
+            name: input.name,
+            description: input.description,
+            // A pack created through this API is customer managed, so it has no vendor
+            // and no import has been started for it yet.
+            vendor_name: None,
+            management_type: crate::state::MANAGEMENT_TYPE_CUSTOMER_MANAGED.to_string(),
+            status: status.clone(),
+            import_status: None,
+            kms_key_id: input.kms_key_id,
+            // Persisted at create time so the tagging operations have state to read.
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            // A pack that has never been updated was last changed when it was created,
+            // so both stamps start equal and only `updatedAt` moves later.
+            updated_at: now,
+        };
+        let kms_key_id = pack.kms_key_id.clone();
+        state.security_requirement_packs.insert(pack_id.clone(), pack);
+
+        Ok(CreateSecurityRequirementPackOutput {
+            pack_id,
+            status,
+            kms_key_id,
+        })
     }
 }
