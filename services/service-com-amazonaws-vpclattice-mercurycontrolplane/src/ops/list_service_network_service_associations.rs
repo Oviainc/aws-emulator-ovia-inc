@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceNetworkServiceAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceNetworkServiceAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceNetworkServiceAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: one `ServiceNetworkServiceAssociationSummary` per persisted
+//! service-network/service association that matches the request's filters, read out of
+//! this service's state in creation order and paged with `maxResults` and a
+//! round-tripping `nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +120,52 @@ impl From<ListServiceNetworkServiceAssociationsErrorModeled> for ListServiceNetw
     }
 }
 
+/// HTTP 400 for a request this operation refuses, naming the member at fault.
+fn invalid(
+    message: String,
+    fields: Vec<(&str, String)>,
+) -> ListServiceNetworkServiceAssociationsError {
+    ListServiceNetworkServiceAssociationsErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(
+            fields
+                .into_iter()
+                .map(|(name, message)| ValidationExceptionField {
+                    name: name.to_string(),
+                    message,
+                })
+                .collect(),
+        ),
+    })
+    .into()
+}
+
+/// The summary of one stored association, with the status the clock owes it at `now`.
+fn summary_of(
+    association: &crate::state::ServiceNetworkServiceAssociation,
+    now: std::time::SystemTime,
+) -> ServiceNetworkServiceAssociationSummary {
+    ServiceNetworkServiceAssociationSummary {
+        id: Some(association.id.clone()),
+        status: Some(association.status(now).to_string()),
+        arn: Some(association.arn.clone()),
+        created_by: Some(association.created_by.clone()),
+        created_at: Some(crate::state::timestamp(association.created_at)),
+        service_id: Some(association.service_id.clone()),
+        service_name: Some(association.service_name.clone()),
+        service_arn: Some(association.service_arn.clone()),
+        service_network_id: Some(association.service_network_id.clone()),
+        service_network_name: Some(association.service_network_name.clone()),
+        service_network_arn: Some(association.service_network_arn.clone()),
+        dns_entry: Some(DnsEntry {
+            domain_name: Some(association.dns_domain_name.clone()),
+            hosted_zone_id: Some(association.dns_hosted_zone_id.clone()),
+        }),
+        custom_domain_name: association.custom_domain_name.clone(),
+    }
+}
+
 /// The `ListServiceNetworkServiceAssociations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +202,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceNetworkServiceAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceNetworkServiceAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceNetworkServiceAssociations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListServiceNetworkServiceAssociationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the vpc-lattice state store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "You must provide either the service network identifier or the service
+        // identifier" (this operation's own documentation), so a request that filters by
+        // neither is refused rather than answered with the whole store.
+        if input.service_network_identifier.is_none() && input.service_identifier.is_none() {
+            return Err(invalid(
+                "either serviceNetworkIdentifier or serviceIdentifier must be provided"
+                    .to_string(),
+                vec![
+                    (
+                        "serviceNetworkIdentifier",
+                        "provide this or serviceIdentifier".to_string(),
+                    ),
+                    (
+                        "serviceIdentifier",
+                        "provide this or serviceNetworkIdentifier".to_string(),
+                    ),
+                ],
+            ));
+        }
+
+        let Ok(after) = crate::state::decode_cursor(input.next_token.as_deref()) else {
+            // A token no listing of this service ever minted; the model declares
+            // ValidationException for input the service refuses.
+            return Err(invalid(
+                "nextToken is not a token this service issued".to_string(),
+                vec![(
+                    "nextToken",
+                    "the token does not name a page of this result set".to_string(),
+                )],
+            ));
+        };
+
+        // Both filters accept either modelled form of their identifier (the bare id or
+        // the resource's ARN). An identifier that resolves to no id of its kind, or to a
+        // resource nothing is associated with, matches nothing: this operation models no
+        // `ResourceNotFoundException`, so an empty page is the answer.
+        let network_filter = input.service_network_identifier.as_deref().map(|identifier| {
+            crate::state::id_from_identifier(identifier, crate::state::PREFIX_SERVICE_NETWORK)
+        });
+        let service_filter = input.service_identifier.as_deref().map(|identifier| {
+            crate::state::id_from_identifier(identifier, crate::state::PREFIX_SERVICE)
+        });
+
+        // `maxResults` caps one page. Absent, the page carries at most the maximum the
+        // model allows that member (1..100), so one GET can never be made to serialise
+        // every association; `nextToken` pages the rest. Clamped at both ends so the
+        // handler does not rely on the boundary for the invariant: a page of zero would
+        // mint a cursor that never advances.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+
+        // One stable order for every page: creation order, from the monotonic sequence
+        // number each association was stored with. A page's cursor names the ORDER it
+        // ended at, so deleting an association between pages cannot invalidate a cursor.
+        let mut ordered: Vec<&crate::state::ServiceNetworkServiceAssociation> = store
+            .service_associations
+            .values()
+            .filter(|association| {
+                network_filter.as_ref().is_none_or(|wanted| {
+                    wanted.as_deref() == Some(association.service_network_id.as_str())
+                }) && service_filter.as_ref().is_none_or(|wanted| {
+                    wanted.as_deref() == Some(association.service_id.as_str())
+                })
+            })
+            .collect();
+        ordered.sort_by_key(|association| association.sequence);
+
+        let mut items: Vec<ServiceNetworkServiceAssociationSummary> = Vec::new();
+        let mut page_ends_at = after;
+        let mut more_follow = false;
+        for association in ordered
+            .iter()
+            .filter(|association| association.sequence > after)
+        {
+            if items.len() == page_size {
+                // One association beyond the page proves a next page exists; the cursor
+                // names where this page ended, so resuming never repeats or skips one.
+                more_follow = true;
+                break;
+            }
+            page_ends_at = association.sequence;
+            items.push(summary_of(association, now));
+        }
+
+        Ok(ListServiceNetworkServiceAssociationsOutput {
+            items,
+            next_token: more_follow.then(|| crate::state::encode_cursor(page_ends_at)),
+        })
     }
 }
