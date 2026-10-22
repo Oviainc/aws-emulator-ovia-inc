@@ -32,15 +32,19 @@ const USAGE_ACCOUNT_ID: &str = "000000000000";
 const EXPECTED_RETENTION_SECS: i64 = 15 * 24 * 60 * 60;
 
 /// One emulator: a single shared engine behind the production router.
-struct Emulator {
-    router: MultiServiceRouter,
+///
+/// `pub(crate)` so every suite in this test target drives the service the same way:
+/// `tests/all.rs` is one crate, and a second copy of this harness could drift from the
+/// front door this one exercises.
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
     /// The same engine the service's operations hold, so a test can age the store the
     /// way the clock would.
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These requests carry an unsigned `Authorization` header: it is here to name
@@ -51,7 +55,7 @@ impl Emulator {
         Self { router, engine }
     }
 
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -99,7 +103,7 @@ impl Emulator {
 
 /// Whether `value` is a `ResourceId`: the lowercase-hex v4 UUID form
 /// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$` the shape declares.
-fn is_resource_id(value: &str) -> bool {
+pub(crate) fn is_resource_id(value: &str) -> bool {
     const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
     let parts: Vec<&str> = value.split('-').collect();
     parts.len() == GROUPS.len()
@@ -112,7 +116,7 @@ fn is_resource_id(value: &str) -> bool {
 }
 
 /// The `error_code`/`__type` an awsJson1_0 error body carries, without its namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_default()
@@ -122,7 +126,7 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn seconds(value: &Value, field: &str) -> i64 {
+pub(crate) fn seconds(value: &Value, field: &str) -> i64 {
     value[field]
         .as_f64()
         .unwrap_or_else(|| panic!("expected a numeric {field} in {value}")) as i64

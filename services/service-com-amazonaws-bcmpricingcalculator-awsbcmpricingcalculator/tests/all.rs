@@ -15,3 +15,5 @@
 mod bill_scenario_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/workload_estimate_lifecycle.rs"]
+mod workload_estimate_lifecycle;

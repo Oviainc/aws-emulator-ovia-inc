@@ -5,6 +5,10 @@
 //! The bill scenario is this service's root resource: a bill estimate is derived from a
 //! scenario, and a usage modification only exists inside one, so every modification is
 //! stored on its parent scenario rather than in a second map that could drift from it.
+//!
+//! The workload estimate is the other root resource, kept in its own insertion-ordered
+//! collection beside the scenarios, and sharing their id space (every `ResourceId` this
+//! service mints is unique across both) and their idempotency map.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -46,6 +50,50 @@ pub const MAX_BILL_SCENARIOS: usize = 1000;
 /// for the same two reasons as [`MAX_BILL_SCENARIOS`], and answered with the same
 /// modelled `ServiceQuotaExceededException`.
 pub const MAX_USAGE_MODIFICATIONS_PER_BILL_SCENARIO: usize = 2000;
+
+/// How long after creation a workload estimate reports it will expire.
+///
+/// CHOSEN, not documented, for the same reason as [`BILL_SCENARIO_RETENTION_SECS`]:
+/// neither the Smithy model nor the API reference states a retention span for a
+/// workload estimate. The same window is used for both resources so one store ages
+/// uniformly, it is reported through `expiresAt` on create and get, and it is enforced
+/// in [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::purge_expired`].
+pub const WORKLOAD_ESTIMATE_RETENTION_SECS: i64 = BILL_SCENARIO_RETENTION_SECS;
+
+/// The greatest number of workload estimates this emulator holds at once. Chosen for
+/// the same two reasons as [`MAX_BILL_SCENARIOS`] — `CreateWorkloadEstimate` models
+/// `ServiceQuotaExceededException` (HTTP 402), which is unreachable without a cap, and
+/// an uncapped store grows for the life of the process — and answered with that same
+/// modelled error.
+pub const MAX_WORKLOAD_ESTIMATES: usize = 1000;
+
+/// The status a workload estimate carries while the service is still working out its
+/// cost: `WorkloadEstimateStatus`'s own non-terminal value (smithy_query:
+/// `shape="WorkloadEstimateStatus"`, values `UPDATING | VALID | INVALID |
+/// ACTION_NEEDED`).
+pub const WORKLOAD_ESTIMATE_STATUS_UPDATING: &str = "UPDATING";
+
+/// The status a workload estimate settles in once the cost it was computing is in:
+/// `WorkloadEstimateStatus`'s terminal success value.
+pub const WORKLOAD_ESTIMATE_STATUS_VALID: &str = "VALID";
+
+/// How long a workload estimate stays `UPDATING` before the clock owes it
+/// `VALID`.
+///
+/// CHOSEN, not documented: AWS publishes no duration for the recomputation a create
+/// starts. It is deliberately NON-ZERO, so a caller reading the estimate straight after
+/// creating it still sees the transient status the real service reports, and short
+/// enough that a caller polling for the terminal status is not kept waiting.
+pub const WORKLOAD_ESTIMATE_UPDATING_MILLIS: i64 = 500;
+
+/// What the `resourceType` member of a modelled error names a workload estimate as:
+/// the resource's own Smithy shape name (`com.amazonaws.bcmpricingcalculator#\
+/// WorkloadEstimate`), as the bill-scenario handlers name theirs `BillScenario`.
+pub const WORKLOAD_ESTIMATE_RESOURCE_TYPE: &str = "WorkloadEstimate";
+
+/// The only `CurrencyCode` the model declares (smithy_query: `shape="CurrencyCode"`,
+/// values `USD`), so it is the currency every cost this service reports is in.
+pub const COST_CURRENCY: &str = "USD";
 
 /// One stored usage modification of a bill scenario.
 #[derive(Debug, Clone)]
@@ -113,6 +161,46 @@ impl UsageModification {
             _ => None,
         }
     }
+}
+
+/// One stored workload estimate.
+#[derive(Debug, Clone)]
+pub struct WorkloadEstimate {
+    /// The server-assigned `ResourceId` (a lowercase-hex v4 UUID).
+    pub id: String,
+    /// `arn:aws:bcm-pricing-calculator:<region>:<account>:workload-estimate/<id>`,
+    /// built through `engine::emulator_arn` so the account segment is the canonical
+    /// one.
+    ///
+    /// Stored, not yet reported: the operations that address an estimate by ARN
+    /// (`TagResource`, `UntagResource`, `ListTagsForResource`) are still 501 and own
+    /// their own issues, so this is what they will resolve against.
+    pub arn: String,
+    pub name: String,
+    /// A `WorkloadEstimateStatus` value (`UPDATING` | `VALID` | `INVALID` |
+    /// `ACTION_NEEDED`).
+    pub status: String,
+    /// The epoch-millisecond instant at which the clock owes this estimate a move out
+    /// of [`WORKLOAD_ESTIMATE_STATUS_UPDATING`], applied by
+    /// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`].
+    pub status_due_at_millis: i64,
+    pub created_at: DateTime,
+    pub expires_at: DateTime,
+    /// The `WorkloadEstimateRateType` the request asked for, absent when it asked for
+    /// none: the model declares no default for the member, so nothing is invented here.
+    pub rate_type: Option<String>,
+    /// The instant of the pricing rates this estimate is measured against — the moment
+    /// it was created, since that is when the rates were read.
+    pub rate_timestamp: DateTime,
+    /// The estimated cost of this estimate's usage, in [`COST_CURRENCY`].
+    ///
+    /// A newly created estimate holds no usage, so the sum over its usage is `0.0`; the
+    /// operations that add, update and delete that usage
+    /// (`BatchCreateWorkloadEstimateUsage` and its siblings, still scaffolds with their
+    /// own issues) are what maintain this field.
+    pub total_cost: f64,
+    pub failure_message: Option<String>,
+    pub tags: BTreeMap<String, String>,
 }
 
 /// One stored bill scenario.
@@ -202,6 +290,8 @@ pub enum Replay {
 pub struct ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
     /// Every live bill scenario, in creation order so a paginated read is stable.
     pub bill_scenarios: Vec<BillScenario>,
+    /// Every live workload estimate, in creation order so a paginated read is stable.
+    pub workload_estimates: Vec<WorkloadEstimate>,
     /// `<operation>:<clientToken>` -> what that request created, so a replayed
     /// `@idempotencyToken` answers with the first result instead of minting a second
     /// resource. The key carries the operation name because the same token may
@@ -218,6 +308,28 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
     /// The scenario with this id, mutably.
     pub fn bill_scenario_mut(&mut self, id: &str) -> Option<&mut BillScenario> {
         self.bill_scenarios.iter_mut().find(|s| s.id == id)
+    }
+
+    /// The workload estimate with this id, or `None` when it was never created or was
+    /// deleted.
+    pub fn workload_estimate(&self, id: &str) -> Option<&WorkloadEstimate> {
+        self.workload_estimates.iter().find(|e| e.id == id)
+    }
+
+    /// The workload estimate with this id, mutably.
+    pub fn workload_estimate_mut(&mut self, id: &str) -> Option<&mut WorkloadEstimate> {
+        self.workload_estimates.iter_mut().find(|e| e.id == id)
+    }
+
+    /// Drop the workload estimate with this id. `true` when one was removed.
+    pub fn remove_workload_estimate(&mut self, id: &str) -> bool {
+        let before = self.workload_estimates.len();
+        self.workload_estimates.retain(|e| e.id != id);
+        let removed = before != self.workload_estimates.len();
+        if removed {
+            self.prune_idempotency();
+        }
+        removed
     }
 
     /// One fresh `ResourceId`, as [`Self::mint_resource_ids`] mints a batch of them.
@@ -248,6 +360,11 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
                     .map(|modification| modification.id.as_str()),
             );
         }
+        live.extend(
+            self.workload_estimates
+                .iter()
+                .map(|estimate| estimate.id.as_str()),
+        );
         let mut minted: Vec<String> = Vec::with_capacity(count);
         while minted.len() < count {
             let candidate = candidate_resource_id();
@@ -270,19 +387,42 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
         removed
     }
 
-    /// Materialise the expiry the clock has already made due: drop every scenario whose
-    /// `expiresAt` has passed, and the idempotency entries that named it.
+    /// Materialise the expiry the clock has already made due: drop every bill scenario
+    /// and workload estimate whose `expiresAt` has passed, and the idempotency entries
+    /// that named them.
     ///
     /// The expiry is owed at `now_secs` whether or not anybody called, so even a
     /// reporting operation may apply it. Without it the retention window every reader
     /// advertises through `expiresAt` would never be enforced, and the store would grow
     /// for the life of the process.
     pub fn purge_expired(&mut self, now_secs: i64) {
-        let before = self.bill_scenarios.len();
+        let before = (self.bill_scenarios.len(), self.workload_estimates.len());
         self.bill_scenarios
             .retain(|scenario| scenario.expires_at.secs() > now_secs);
-        if before != self.bill_scenarios.len() {
+        self.workload_estimates
+            .retain(|estimate| estimate.expires_at.secs() > now_secs);
+        if before != (self.bill_scenarios.len(), self.workload_estimates.len()) {
             self.prune_idempotency();
+        }
+    }
+
+    /// Materialise EVERYTHING the clock has already made due at `now_millis`: the
+    /// expiry [`Self::purge_expired`] applies, and the move out of the transient
+    /// `UPDATING` status a workload estimate was owed once its recomputation window
+    /// closed.
+    ///
+    /// Both changes were owed at `now_millis` whether or not anybody called, which is
+    /// why a reporting operation may apply them; every operation that resolves a
+    /// workload estimate calls this first, so no reader reports a status the clock has
+    /// already moved on from.
+    pub fn settle(&mut self, now_millis: i64) {
+        self.purge_expired(now_millis.div_euclid(1000));
+        for estimate in &mut self.workload_estimates {
+            if estimate.status == WORKLOAD_ESTIMATE_STATUS_UPDATING
+                && estimate.status_due_at_millis <= now_millis
+            {
+                estimate.status = WORKLOAD_ESTIMATE_STATUS_VALID.to_string();
+            }
         }
     }
 
@@ -314,6 +454,7 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
         // let the compiler see.
         let Self {
             bill_scenarios,
+            workload_estimates,
             idempotency,
         } = self;
         let live: std::collections::HashSet<&str> = bill_scenarios
@@ -326,6 +467,11 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
                         .map(|modification| modification.id.as_str()),
                 )
             })
+            .chain(
+                workload_estimates
+                    .iter()
+                    .map(|estimate| estimate.id.as_str()),
+            )
             .collect();
         idempotency.retain(|_, record| {
             record.ids.retain(|id| live.contains(id.as_str()));
@@ -421,6 +567,14 @@ pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for the sub-second instants a
+/// transient status is due at.
+pub fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
 /// A candidate `ResourceId`: the lowercase-hex v4 UUID form this service's

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkloadEstimate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkloadEstimate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a workload estimate, persists it in [`crate::state`], and answers from what it
+//! stored. The minted `id` is a fresh lowercase-hex v4 UUID, `rateTimestamp` is the
+//! instant the rates were read (the create instant), and `totalCost` is the cost of the
+//! usage the estimate holds — nothing, at create time, so `0.0` in `USD`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkloadEstimate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The estimate is created in the non-terminal `UPDATING` status and the clock owes it
+//! `VALID` [`crate::state::WORKLOAD_ESTIMATE_UPDATING_MILLIS`] later; every operation
+//! that resolves one calls [`crate::state::ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`]
+//! first, so the move is materialised by whoever reads next rather than by a sleep.
+//!
+//! The operation is `@idempotent` and `clientToken` is an `@idempotencyToken`, so a
+//! replayed token answers with the estimate the first call created instead of minting a
+//! second one. A token carrying a request the first call did not make is
+//! `ConflictException` (HTTP 409) rather than a replay of someone else's answer.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +131,22 @@ impl From<CreateWorkloadEstimateErrorModeled> for CreateWorkloadEstimateError {
     }
 }
 
+/// This operation's response, read off the stored estimate.
+fn output_for(estimate: &crate::state::WorkloadEstimate) -> CreateWorkloadEstimateOutput {
+    CreateWorkloadEstimateOutput {
+        id: estimate.id.clone(),
+        name: Some(estimate.name.clone()),
+        status: Some(estimate.status.clone()),
+        created_at: Some(estimate.created_at),
+        expires_at: Some(estimate.expires_at),
+        rate_type: estimate.rate_type.clone(),
+        rate_timestamp: Some(estimate.rate_timestamp),
+        total_cost: Some(estimate.total_cost),
+        cost_currency: Some(crate::state::COST_CURRENCY.to_string()),
+        failure_message: estimate.failure_message.clone(),
+    }
+}
+
 /// The `CreateWorkloadEstimate` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +183,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkloadEstimate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkloadEstimateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkloadEstimate"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateWorkloadEstimateErrorModeled::DataUnavailableException(
+                DataUnavailableException {
+                    message: "the workload estimate store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        let now_millis = crate::state::now_millis();
+        // Materialise what the clock has already made due before answering, so the
+        // retention this store advertises through `expiresAt` is enforced rather than
+        // merely reported, and a replay does not answer with a stale status.
+        state.settle(now_millis);
+        let now = now_millis.div_euclid(1000);
+
+        // A replayed `@idempotencyToken` answers with the estimate the first call
+        // created: the same `id`, not a second estimate. The SAME token carrying a
+        // different request is not a retry, so it is refused as a conflict rather than
+        // answered with another request's estimate.
+        let mut digest_parts: Vec<String> =
+            vec![input.name.clone(), input.rate_type.clone().unwrap_or_default()];
+        // Sorted, because a map's iteration order is not the request's; key and value
+        // go in as SEPARATE parts, which `request_fingerprint` length-prefixes, so
+        // `{"a=b": "c"}` and `{"a": "b=c"}` cannot collide.
+        let mut tags: Vec<(String, String)> =
+            input.tags.clone().unwrap_or_default().into_iter().collect();
+        tags.sort();
+        for (key, value) in tags {
+            digest_parts.push(key);
+            digest_parts.push(value);
+        }
+        let fingerprint = crate::state::request_fingerprint(&digest_parts);
+
+        match state.replay(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Replayed(ids) => {
+                // The record resolves unless pruning has removed the estimate it
+                // named, which `prune_idempotency` only does once that estimate is
+                // gone; falling through then creates what the caller asked for.
+                if let Some(existing) = ids.first().and_then(|id| state.workload_estimate(id)) {
+                    return Ok(output_for(existing));
+                }
+            }
+            crate::state::Replay::Mismatch(created) => {
+                return Err(CreateWorkloadEstimateErrorModeled::ConflictException(
+                    ConflictException {
+                        message: "this clientToken was already used for a different \
+                                  CreateWorkloadEstimate request"
+                            .to_string(),
+                        // The estimate the token already created, so the caller can
+                        // resolve the conflict against it.
+                        resource_id: created.first().cloned().unwrap_or_default(),
+                        resource_type: crate::state::WORKLOAD_ESTIMATE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into());
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        if state.workload_estimates.len() >= crate::state::MAX_WORKLOAD_ESTIMATES {
+            return Err(
+                CreateWorkloadEstimateErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "the maximum of {} workload estimates already exist",
+                            crate::state::MAX_WORKLOAD_ESTIMATES
+                        ),
+                        // `resourceId` is `@required` and no estimate was created, so
+                        // it carries what the request asked for; `resourceType` beside
+                        // it says what that name denotes.
+                        resource_id: input.name.clone(),
+                        resource_type: crate::state::WORKLOAD_ESTIMATE_RESOURCE_TYPE.to_string(),
+                        service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = state.mint_resource_id();
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let estimate = crate::state::WorkloadEstimate {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("workload-estimate/{id}"),
+            ),
+            id: id.clone(),
+            name: input.name.clone(),
+            // The estimate exists while the service works its cost out, so it is
+            // created in the non-terminal status and the clock owes it the terminal one
+            // once the window below closes.
+            status: crate::state::WORKLOAD_ESTIMATE_STATUS_UPDATING.to_string(),
+            status_due_at_millis: now_millis + crate::state::WORKLOAD_ESTIMATE_UPDATING_MILLIS,
+            created_at: ::aws_smithy_types::DateTime::from_secs(now),
+            expires_at: ::aws_smithy_types::DateTime::from_secs(
+                now + crate::state::WORKLOAD_ESTIMATE_RETENTION_SECS,
+            ),
+            rate_type: input.rate_type.clone(),
+            // The rates this estimate is measured against are the ones current when it
+            // was created.
+            rate_timestamp: ::aws_smithy_types::DateTime::from_secs(now),
+            // A fresh estimate holds no usage, so the cost of its usage is zero; the
+            // operations that add usage are what move it.
+            total_cost: 0.0,
+            failure_message: None,
+            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+        };
+
+        let output = output_for(&estimate);
+        state.workload_estimates.push(estimate);
+        state.record_idempotent(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            vec![id],
+        );
+        Ok(output)
     }
 }
