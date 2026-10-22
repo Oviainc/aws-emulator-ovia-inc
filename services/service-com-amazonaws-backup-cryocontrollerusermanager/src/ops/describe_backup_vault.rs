@@ -207,6 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeBackupVaultErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -216,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let store = state.lock();
+        let mut store = state.lock();
         // This operation's `BackupVaultName` targets a plain `string`, so the
         // framework does not apply the vault-name pattern for it; a name the
         // service could never have stored is a bad parameter value, not an
@@ -236,6 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // The ONE write this reporting operation performs: a vault whose
+        // `CREATING` -> `AVAILABLE` transition the clock has already made due
+        // was owed it at that instant whether or not anybody described it.
+        store.settle_vault(&input.backup_vault_name, now);
         // A vault-scoped read decides access before existence: a vault outside the
         // caller's visibility (absent from this account, or addressed with another
         // account's `BackupVaultAccountId`) is refused with 403

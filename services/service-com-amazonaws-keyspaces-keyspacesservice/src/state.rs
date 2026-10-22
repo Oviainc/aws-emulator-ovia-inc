@@ -32,6 +32,16 @@ pub const ARN_NAMESPACE: &str = "cassandra";
 /// region in the SigV4 credential scope; see [`request_region`].
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// `KeyspaceStatus` = `CREATING`: what `CreateKeyspace` puts a new keyspace in.
+///
+/// "`CreateKeyspace` is an asynchronous operation. You can monitor the creation
+/// status of the new keyspace by using the `GetKeyspace` operation." Both
+/// constants below are members of the model's `KeyspaceStatus` value set
+/// (`crate::ops::types::KEYSPACE_STATUS_VALUES`).
+pub const KEYSPACE_STATUS_CREATING: &str = "CREATING";
+/// `KeyspaceStatus` = `ACTIVE`: the status a created keyspace settles into.
+pub const KEYSPACE_STATUS_ACTIVE: &str = "ACTIVE";
+
 /// `TableStatus` = `CREATING`: what `CreateTable` puts a new table in.
 ///
 /// The three constants below are members of the model's `TableStatus` value set
@@ -51,17 +61,21 @@ pub const TABLE_STATUS_DELETING: &str = "DELETING";
 /// `ResourceInUseException`" — only an update can put a table in `UPDATING`.
 pub const TABLE_STATUS_UPDATING: &str = "UPDATING";
 
-/// How long a table stays in a transient status before the clock owes it the
-/// next one: `CREATING` -> `ACTIVE` after `CreateTable`, `UPDATING` -> `ACTIVE`
-/// after `UpdateTable`, and `DELETING` -> gone after `DeleteTable`.
+/// How long a resource stays in a transient status before the clock owes it the
+/// next one: `CREATING` -> `ACTIVE` after `CreateTable` or `CreateKeyspace`,
+/// `UPDATING` -> `ACTIVE` after `UpdateTable`, and `DELETING` -> gone after
+/// `DeleteTable`.
 ///
-/// CHOSEN, not documented: Amazon Keyspaces publishes no duration for either
-/// transition, only that they happen (`CreateTable`: "the status of the table is
-/// set to `CREATING`. You can start using a table when the status is `ACTIVE`";
-/// `DeleteTable`: "the specified table is in the `DELETING` state until Amazon
-/// Keyspaces completes the deletion"). It is deliberately NON-ZERO, so a caller
-/// that reads straight after the call still observes the transient status the
-/// model documents, and short enough that a test can wait it out.
+/// CHOSEN, not documented: Amazon Keyspaces publishes no duration for any of
+/// these transitions, only that they happen (`CreateTable`: "the status of the
+/// table is set to `CREATING`. You can start using a table when the status is
+/// `ACTIVE`"; `CreateKeyspace`: "`CreateKeyspace` is an asynchronous operation.
+/// You can monitor the creation status of the new keyspace by using the
+/// `GetKeyspace` operation"; `DeleteTable`: "the specified table is in the
+/// `DELETING` state until Amazon Keyspaces completes the deletion"). It is
+/// deliberately NON-ZERO, so a caller that reads straight after the call still
+/// observes the transient status the model documents, and short enough that a
+/// test can wait it out.
 pub const TRANSIENT_STATUS_SPAN: Duration = Duration::from_millis(500);
 
 /// `ThroughputMode` = `PAY_PER_REQUEST`: the on-demand mode, which takes no capacity
@@ -332,6 +346,13 @@ pub struct Keyspace {
     /// This keyspace's tags: what `CreateKeyspace` attached, plus what `TagResource`
     /// added and `UntagResource` removed since.
     pub tags: TagSet,
+    /// A `KeyspaceStatus` value: the keyspace's own status, which `GetKeyspace`
+    /// reports per replication Region.
+    pub status: String,
+    /// When the clock owes this keyspace its next status, or `None` once it holds
+    /// a status nothing is pending on. Never slept for: [`ComAmazonawsKeyspacesKeyspacesserviceState::settle`]
+    /// compares it against the clock.
+    pub status_due_at: Option<SystemTime>,
     /// The keyspace's tables, keyed by `tableName`.
     pub tables: BTreeMap<String, Table>,
 }
@@ -385,14 +406,12 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
     /// Record that some table now has a transition due at `due`, so [`Self::settle`]
     /// knows the earliest instant at which it has to look at the store again.
     pub fn note_transition_due(&mut self, due: SystemTime) {
-        self.next_transition_at = Some(match self.next_transition_at {
-            Some(existing) if existing <= due => existing,
-            _ => due,
-        });
+        self.next_transition_at = earlier_of(self.next_transition_at, due);
     }
 
-    /// Materialise every status transition the clock already owes at `now`: a table whose
-    /// `CREATING` or `UPDATING` span has elapsed becomes `ACTIVE`, and a table whose
+    /// Materialise every status transition the clock already owes at `now`: a keyspace
+    /// whose `CREATING` span has elapsed becomes `ACTIVE`, a table whose `CREATING` or
+    /// `UPDATING` span has elapsed becomes `ACTIVE`, and a table whose
     /// `DELETING` span has elapsed is gone.
     ///
     /// Every handler calls this first, including the reporting ones. That is the one write
@@ -408,15 +427,24 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
         }
         let mut earliest: Option<SystemTime> = None;
         for keyspace in self.keyspaces.values_mut() {
+            match keyspace.status_due_at {
+                // Still pending: nothing to materialise, but `settle` has to look at this
+                // keyspace again once its span elapses.
+                Some(due) if now < due => earliest = earlier_of(earliest, due),
+                Some(_) => {
+                    keyspace.status_due_at = None;
+                    if keyspace.status == KEYSPACE_STATUS_CREATING {
+                        keyspace.status = KEYSPACE_STATUS_ACTIVE.to_string();
+                    }
+                }
+                None => {}
+            }
             keyspace.tables.retain(|_, table| {
                 let Some(due) = table.status_due_at else {
                     return true;
                 };
                 if now < due {
-                    earliest = Some(match earliest {
-                        Some(seen) if seen <= due => seen,
-                        _ => due,
-                    });
+                    earliest = earlier_of(earliest, due);
                     return true;
                 }
                 table.status_due_at = None;
@@ -480,6 +508,14 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
             }
         }
     }
+}
+
+/// The earlier of an instant already seen (if any) and `due`: how both
+/// [`ComAmazonawsKeyspacesKeyspacesserviceState::note_transition_due`] and
+/// [`ComAmazonawsKeyspacesKeyspacesserviceState::settle`] keep the single earliest instant at
+/// which the store has a transition to materialise.
+fn earlier_of(seen: Option<SystemTime>, due: SystemTime) -> Option<SystemTime> {
+    Some(seen.map_or(due, |existing| existing.min(due)))
 }
 
 /// The region this request was signed for — the third field of its SigV4

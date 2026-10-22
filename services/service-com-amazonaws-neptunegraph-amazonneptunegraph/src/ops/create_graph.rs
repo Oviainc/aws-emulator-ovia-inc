@@ -199,17 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // boundary validator's regex engine cannot compile — and an uncompilable
         // `@pattern` is treated as matching — so the one input constraint that reaches
         // this handler unchecked is enforced here. Length (1..63) is already refused at
-        // the boundary by the `@length` trait.
+        // the boundary by the `@length` trait, so the value echoed below is bounded by
+        // the model. The refusal is worded by the same builder the boundary refusal
+        // renderer uses (`crate::service`), so a caller cannot tell which side of the
+        // boundary caught the violation.
         if !graph_name_is_well_formed(&input.graph_name) {
             return Err(CreateGraphErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "graphName '{}' does not satisfy the required pattern \
-                     ^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$: it must start with a lowercase \
-                     letter, contain only lowercase letters, digits and hyphens, not start \
-                     with 'g-', not end with a hyphen, and not contain two consecutive \
-                     hyphens",
-                    input.graph_name
-                ),
+                message: crate::state::validation_envelope(&[crate::state::constraint_clause(
+                    "graphName",
+                    Some(&input.graph_name),
+                    &crate::state::pattern_requirement(GRAPH_NAME_PATTERN),
+                )]),
                 reason: Some("CONSTRAINT_VIOLATION".to_string()),
             })
             .into());
@@ -311,6 +311,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// From the member's own documentation: "The number of replicas in other AZs. Min =0,
 /// Max = 2, Default = 1."
 const DEFAULT_REPLICA_COUNT: i32 = 1;
+
+/// The modelled `GraphName` pattern, exactly as the model spells it
+/// (`smithy_query(query="shape",shape="GraphName")`): the expression a refusal reports,
+/// enforced by [`graph_name_is_well_formed`] because the boundary validator's regex
+/// engine cannot compile its leading negative lookahead.
+const GRAPH_NAME_PATTERN: &str = "^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$";
 
 /// The region this request was signed for — the region that names the graph's ARN and
 /// endpoint. Falls back to the emulator-wide default region when the request carries no

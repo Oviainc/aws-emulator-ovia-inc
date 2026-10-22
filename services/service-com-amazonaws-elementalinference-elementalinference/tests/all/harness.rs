@@ -28,6 +28,16 @@ pub fn past_the_transition_span() {
     std::thread::sleep(TRANSITION_SPAN + std::time::Duration::from_millis(250));
 }
 
+/// The ARN form the model gives a dictionary: `dictionary/<id>` under this service's
+/// namespace, in the request's region and the emulator's account (the modelled
+/// `resourceArn` pattern admits `:(feed|dictionary)/[a-zA-Z0-9]{1,19}`).
+pub fn expected_dictionary_arn(id: &str) -> String {
+    format!(
+        "arn:aws:{SIGNING_NAME}:{REGION}:{}:dictionary/{id}",
+        engine::EMULATOR_ACCOUNT_ID
+    )
+}
+
 /// A router serving this service alone over one shared engine.
 pub fn router() -> MultiServiceRouter {
     router_with_engine().0

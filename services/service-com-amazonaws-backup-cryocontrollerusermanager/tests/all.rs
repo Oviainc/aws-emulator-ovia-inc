@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
+#[path = "all/logically_air_gapped_vault.rs"]
+mod logically_air_gapped_vault;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/supported_resource_types.rs"]
