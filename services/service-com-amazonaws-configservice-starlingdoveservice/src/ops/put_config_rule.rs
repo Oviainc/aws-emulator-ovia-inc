@@ -276,9 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 PutConfigRuleErrorModeled::NoAvailableConfigurationRecorderException(
                     NoAvailableConfigurationRecorderException {
                         message: Some(
-                            "there are no customer managed configuration recorders available; \
-                             use PutConfigurationRecorder to create one"
-                                .to_string(),
+                            crate::state::NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE.to_string(),
                         ),
                     },
                 )

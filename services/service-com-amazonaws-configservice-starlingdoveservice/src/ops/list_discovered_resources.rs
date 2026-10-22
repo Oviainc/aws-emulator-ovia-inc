@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDiscoveredResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDiscoveredResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDiscoveredResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource identifiers of ONE resource type out of the discovered-resource
+//! inventory this service's store holds (`discovered_resources` in
+//! [`crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState`]), narrowed by the
+//! request and served one page at a time.
+//!
+//! It is a REPORT: it writes nothing, so the inventory a later caller sees is the one
+//! this call saw.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +188,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDiscoveredResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDiscoveredResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDiscoveredResources"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let requested_ids = input.resource_ids.unwrap_or_default();
+        // A `resourceName` the request carried narrows the listing as it was sent: the
+        // member has no modelled constraint, so an empty name is a name no resource
+        // carries rather than a request that narrows by nothing.
+        let requested_name = input.resource_name.as_deref();
+
+        // "You can specify either resource IDs or a resource name, but not both, in the
+        // same request."
+        if !requested_ids.is_empty() && requested_name.is_some() {
+            return Err(ListDiscoveredResourcesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "resourceIds and resourceName cannot both be specified in the same \
+                         ListDiscoveredResources request; narrow by one or the other"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "You can list a minimum of 1 resourceID and a maximum of 20 resourceIds." The
+        // list carries no modelled length, so the maximum is refused here; an empty list
+        // narrows by nothing, which is the same request as one carrying no `resourceIds`
+        // at all.
+        if requested_ids.len() > crate::state::DISCOVERED_RESOURCES_MAX_RESOURCE_IDS {
+            return Err(ListDiscoveredResourcesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "resourceIds carries {} resource IDs, more than the maximum of {}",
+                        requested_ids.len(),
+                        crate::state::DISCOVERED_RESOURCES_MAX_RESOURCE_IDS,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A limit outside the allowable range is what `InvalidLimitException` reports.
+        // The modelled range refuses one before this handler runs; the check stands so
+        // the condition answers this operation's own modelled error either way.
+        if !(0..=crate::state::DISCOVERED_RESOURCES_MAX_LIMIT).contains(&input.limit) {
+            return Err(ListDiscoveredResourcesErrorModeled::InvalidLimitException(
+                InvalidLimitException {
+                    message: Some(format!(
+                        "limit {} is outside the allowable range 0..{}",
+                        input.limit,
+                        crate::state::DISCOVERED_RESOURCES_MAX_LIMIT,
+                    )),
+                },
+            )
+            .into());
+        }
+        // "If you specify 0, Config uses the default."
+        let page_size = if input.limit == 0 {
+            crate::state::DISCOVERED_RESOURCES_DEFAULT_LIMIT
+        } else {
+            input.limit
+        } as usize;
+
+        let store = state.lock();
+
+        // Resources are discovered by a configuration recorder, so reporting what has
+        // been discovered needs one to exist.
+        if store.recorders.is_empty() {
+            return Err(
+                ListDiscoveredResourcesErrorModeled::NoAvailableConfigurationRecorderException(
+                    NoAvailableConfigurationRecorderException {
+                        message: Some(
+                            crate::state::NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        ListDiscoveredResourcesErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified nextToken is not valid; use the nextToken a \
+                                     previous ListDiscoveredResources response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // Page over the inventory's own ordering, so a token holds the resource id the
+        // next page resumes at and survives resources recorded or deleted between
+        // pages. One type is in play and the inventory is keyed by `(type, id)`, so the
+        // candidates are contiguous and ordered by resource id.
+        let mut identifiers = Vec::new();
+        let mut next_token = None;
+        for ((resource_type, resource_id), entry) in &store.discovered_resources {
+            if resource_type != &input.resource_type {
+                continue;
+            }
+            if resume_at
+                .as_ref()
+                .is_some_and(|resume_at| resource_id < resume_at)
+            {
+                continue;
+            }
+            // "By default, deleted resources are not included."
+            if entry.deleted_at.is_some() && !input.include_deleted_resources {
+                continue;
+            }
+            if !requested_ids.is_empty() && !requested_ids.iter().any(|id| id == resource_id) {
+                continue;
+            }
+            if requested_name.is_some_and(|name| entry.resource_name.as_deref() != Some(name)) {
+                continue;
+            }
+            if identifiers.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(resource_id));
+                break;
+            }
+            identifiers.push(entry.to_identifier());
+        }
+
+        Ok(ListDiscoveredResourcesOutput {
+            resource_identifiers: Some(identifiers),
+            next_token,
+        })
     }
 }

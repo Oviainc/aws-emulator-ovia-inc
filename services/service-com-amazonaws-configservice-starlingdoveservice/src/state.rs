@@ -21,7 +21,7 @@ use crate::ops::types::{
     ConfigurationRecorderStatus, ConfigurationRecorderSummary, DeliveryChannel,
     DeliveryChannelStatus, EvaluationModeConfiguration, ExclusionByResourceTypes,
     OrganizationAggregationSource, PendingAggregationRequest, RecordingGroup, RecordingMode,
-    RecordingStrategy, RetentionConfiguration, Scope, Source, Tag,
+    RecordingStrategy, ResourceIdentifier, RetentionConfiguration, Scope, Source, Tag,
 };
 
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
@@ -207,6 +207,23 @@ pub const DESCRIBE_CONFIGURATION_AGGREGATORS_PAGE_SIZE: i32 = 100;
 /// it matches the `ConfigRuleNames` length maximum (0..25) the same operation
 /// declares.
 pub const DESCRIBE_CONFIG_RULES_PAGE_SIZE: usize = 25;
+
+/// How many resource identifiers one `ListDiscoveredResources` page carries when the
+/// request asks for no limit of its own (`ListDiscoveredResourcesRequest$limit`: "The
+/// maximum number of resource identifiers returned on each page. The default is 100.
+/// ... If you specify 0, Config uses the default").
+pub const DISCOVERED_RESOURCES_DEFAULT_LIMIT: i32 = 100;
+
+/// The largest `limit` a discovered-resource page may ask for
+/// (`com.amazonaws.configservice#Limit`, range 0..100; the same member's doc: "You
+/// cannot specify a number greater than 100"). A value outside the range is what
+/// `InvalidLimitException` reports.
+pub const DISCOVERED_RESOURCES_MAX_LIMIT: i32 = 100;
+
+/// The most resource IDs one discovered-resource read may narrow by
+/// (`ListDiscoveredResourcesRequest$resourceIds`: "You can list a minimum of 1
+/// resourceID and a maximum of 20 resourceIds").
+pub const DISCOVERED_RESOURCES_MAX_RESOURCE_IDS: usize = 20;
 
 /// How many rules one `DescribeComplianceByConfigRule` page carries.
 ///
@@ -575,6 +592,40 @@ impl ConfigRuleEntry {
     }
 }
 
+/// One resource Config has discovered, as its configuration recorder captured it.
+///
+/// A discovered resource SURVIVES its own deletion in Config's inventory —
+/// `ListDiscoveredResources` can be asked to include deleted resources, and reports
+/// `resourceDeletionTime` for each one — so a deletion is recorded as the instant the
+/// resource went away rather than by dropping the entry.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveredResourceEntry {
+    /// The resource's type, a `com.amazonaws.configservice#ResourceType` value.
+    pub resource_type: String,
+    /// The id of the resource (`ResourceIdentifier$resourceId`).
+    pub resource_id: String,
+    /// The resource's custom name, when it has one
+    /// (`ResourceIdentifier$resourceName`: "The custom name of the resource (if
+    /// available)").
+    pub resource_name: Option<String>,
+    /// When set, the instant the resource was deleted
+    /// (`ResourceIdentifier$resourceDeletionTime`: "The time that the resource was
+    /// deleted").
+    pub deleted_at: Option<SystemTime>,
+}
+
+impl DiscoveredResourceEntry {
+    /// The modelled `ResourceIdentifier`, read back out of state.
+    pub fn to_identifier(&self) -> ResourceIdentifier {
+        ResourceIdentifier {
+            resource_type: Some(self.resource_type.clone()),
+            resource_id: Some(self.resource_id.clone()),
+            resource_name: self.resource_name.clone(),
+            resource_deletion_time: self.deleted_at.map(timestamp),
+        }
+    }
+}
+
 /// One persisted retention configuration: the name Config gave the object and the
 /// number of days it keeps historical information for.
 #[derive(Debug, Clone, Default)]
@@ -713,6 +764,21 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration recorder id, so every recorder Config
     /// creates here gets a distinct one.
     pub next_recorder_seq: u64,
+    /// The resources Config has discovered in this account and Region, keyed by
+    /// `(resourceType, resourceId)` — the pair that identifies a resource in Config,
+    /// which is why a resource read takes both. A `BTreeMap` so a discovered-resource
+    /// read pages over a stable ordering (by type, then by resource id) and a page
+    /// token survives resources recorded or deleted between pages.
+    ///
+    /// A deleted resource stays in the inventory carrying its deletion time, because a
+    /// discovered-resource read can be asked to include deleted resources.
+    ///
+    /// Nothing WRITES the inventory yet: the operations that record a resource's
+    /// configuration item (`PutResourceConfig`) and record its deletion
+    /// (`DeleteResourceConfig`) are still scaffolds, each with a stub issue of its own,
+    /// so an account that has called neither has discovered nothing and a
+    /// discovered-resource read reports an empty page for every type.
+    pub discovered_resources: BTreeMap<(String, String), DiscoveredResourceEntry>,
     /// Retention configurations, keyed by `RetentionConfigurationName`. A `BTreeMap`
     /// so `DescribeRetentionConfigurations` pages over a stable ordering; it holds at
     /// most [`RETENTION_CONFIGURATIONS_QUOTA`] entries, because one engine's store
@@ -991,6 +1057,16 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     let bytes = ::aws_smithy_types::base64::decode(token).ok()?;
     String::from_utf8(bytes).ok()
 }
+
+/// How Config words `NoAvailableConfigurationRecorderException`, the refusal every
+/// operation that needs a customer managed configuration recorder answers when the
+/// account and Region holds none (the shape's own doc: "There are no customer managed
+/// configuration recorders available to record your resources. Use the
+/// PutConfigurationRecorder operation to create the customer managed configuration
+/// recorder"). One constant, so those operations word it identically.
+pub const NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE: &str =
+    "there are no customer managed configuration recorders available; use \
+     PutConfigurationRecorder to create one";
 
 /// The separator between the two fields of the key a pending aggregation request page
 /// resumes at. An `AccountId` is twelve digits (`PendingAggregationRequest$
