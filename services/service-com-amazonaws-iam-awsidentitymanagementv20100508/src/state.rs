@@ -9,7 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ops::types::{Policy, PolicyVersion, Role, ServiceSpecificCredentialMetadata, User};
+use crate::ops::types::{
+    Policy, PolicyVersion, Role, ServiceSpecificCredentialMetadata, Tag, User,
+};
 
 /// IAM's default entity path: every entity whose request omits `Path` is created
 /// directly under the account root. The model's `pathType` documentation states
@@ -168,6 +170,18 @@ pub const MAX_MANAGED_POLICIES_PER_ROLE: usize = 10;
 /// "You cannot create tag keys that begin with `aws:` because this prefix is
 /// reserved for Amazon Web Services use."
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// How many tags ONE IAM resource may carry. AWS's "IAM and STS quotas" page gives
+/// the quota "Number of tags per IAM resource: 50" — the same bound `tagListType`
+/// puts on a single request's list (len 0..50,
+/// `smithy_query(query="shape", shape="tagListType")`), which is why the bound has
+/// to be taken against the resource's tag set AFTER the merge and not just against
+/// the request. A tag call that would carry a resource past it is refused with
+/// `LimitExceededException`, whose documentation says "the error message describes
+/// the limit exceeded", and nothing is stored: `TagRole`'s documentation states
+/// "if you exceed the allowed maximum number of tags, then the entire request
+/// fails".
+pub const MAX_TAGS_PER_ENTITY: usize = 50;
 
 /// How many base32 characters follow the prefix in a minted unique id.
 const UNIQUE_ID_SUFFIX_LEN: usize = 17;
@@ -800,6 +814,32 @@ pub fn reserved_tag_key<'a, I: IntoIterator<Item = &'a str>>(keys: I) -> Option<
             key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix)
         })
         .min()
+}
+
+/// The tag set an entity holding `held` carries after a tag call supplying
+/// `incoming`, or `None` when the merged set would pass
+/// [`MAX_TAGS_PER_ENTITY`].
+///
+/// The rule every IAM tag operation follows, in one place: "if a tag with the same
+/// key name already exists, then that tag is overwritten with the new value"
+/// (`TagRole`), so a supplied key REPLACES the held value in place — the held
+/// order is preserved and only a key the entity does not hold yet is appended.
+/// Keys compare exactly: "tag keys and values are case sensitive" ("Tagging IAM
+/// resources", IAM User Guide), so two spellings of one word are two tags. A key
+/// repeated inside one request settles on its LAST value, the same way a second
+/// call would overwrite the first.
+///
+/// The merged set is what the bound is taken against, so re-tagging a held key is
+/// never refused however many tags the entity already carries.
+pub fn merge_tags(held: Option<&Vec<Tag>>, incoming: Vec<Tag>) -> Option<Vec<Tag>> {
+    let mut merged: Vec<Tag> = held.cloned().unwrap_or_default();
+    for tag in incoming {
+        match merged.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value,
+            None => merged.push(tag),
+        }
+    }
+    (merged.len() <= MAX_TAGS_PER_ENTITY).then_some(merged)
 }
 
 /// Whether `document` is an IAM policy document.

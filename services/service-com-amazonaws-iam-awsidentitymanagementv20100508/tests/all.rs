@@ -21,6 +21,8 @@ mod role_attached_policies;
 mod role_inline_policies;
 #[path = "all/role_lifecycle.rs"]
 mod role_lifecycle;
+#[path = "all/role_tags.rs"]
+mod role_tags;
 #[path = "all/service_linked_roles.rs"]
 mod service_linked_roles;
 #[path = "all/service_specific_credentials.rs"]

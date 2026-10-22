@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the tags supplied here are merged into the persisted role in this
+//! service's state (`crate::state`) and read back by `GetRole`.
+//!
+//! A 501 from an operation in this service means "nobody has written it yet", never
+//! "the emulator is broken".
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +184,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagRole"))
+        // `ctx` carries request metadata only; tagging a role depends on nothing in
+        // it — IAM is global, and the role is named in the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagRoleErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter". Checked through the one
+        // definition of that rule in `crate::state`, the same one `CreateRole` uses,
+        // and checked before anything is written: "if any one of the tags is invalid
+        // … then the entire request fails".
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(TagRoleErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // IAM entity names are unique within the account and "are not distinguished
+        // by case", so the role is found under the case-folded name whatever case the
+        // request spelled it in.
+        let key = crate::state::name_key(&input.role_name);
+        let Some(role) = store.roles.get_mut(&key) else {
+            return Err(TagRoleErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "If a tag with the same key name already exists, then that tag is
+        // overwritten with the new value" — the merge, and the per-resource tag bound
+        // it is taken against, are the one shared rule in `crate::state`. Nothing is
+        // stored when the bound is passed: "if you exceed the allowed maximum number
+        // of tags, then the entire request fails".
+        let Some(merged) = crate::state::merge_tags(role.tags.as_ref(), input.tags) else {
+            return Err(TagRoleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot assign more than {} tags to IAM role {}",
+                        crate::state::MAX_TAGS_PER_ENTITY,
+                        role.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // An empty tag set is the same as no tags, which is how `CreateRole` stores
+        // one: the member is reported only when the role actually carries tags.
+        role.tags = (!merged.is_empty()).then_some(merged);
+        Ok(TagRoleOutput)
     }
 }
