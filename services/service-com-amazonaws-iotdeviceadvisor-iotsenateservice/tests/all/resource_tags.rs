@@ -14,8 +14,12 @@
 //! * `TagResource` MERGES: it overwrites the value of a key already there, adds the keys
 //!   that are new, and leaves every other key in place;
 //! * a `resourceArn` the store holds no resource for is a 404, and one that is not an ARN
-//!   of this service is a 400 — for both operations, never a 501 and never a success;
+//!   of this service is a 400 — for `ListTagsForResource`, `TagResource` and
+//!   `UntagResource` alike, never a 501 and never a success;
 //! * a read changes nothing a later caller sees.
+//!
+//! What `UntagResource` REMOVES, and that removing is idempotent, is asserted in
+//! `tests/all/resource_tagging.rs`.
 
 use std::sync::Arc;
 
@@ -54,6 +58,27 @@ fn percent_encode(value: &str) -> String {
 /// The `/tags/{resourceArn}` URI for `arn`.
 fn tags_uri(arn: &str) -> String {
     format!("/tags/{}", percent_encode(arn))
+}
+
+/// Percent-encode one QUERY value, the way an SDK encodes an `@httpQuery` entry:
+/// everything but the unreserved characters, byte by byte. Stricter than
+/// [`percent_encode`] above because a tag key is free text — `String128` carries no
+/// pattern — so it can hold `&`, `=` or a non-ASCII character, none of which may reach
+/// the URI raw.
+fn query_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            other => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{other:02X}");
+            }
+        }
+    }
+    encoded
 }
 
 /// The emulator, assembled in-process with authentication off: this suite asserts
@@ -202,6 +227,18 @@ impl Emulator {
     /// `TagResource` for `arn`.
     async fn tag_resource(&self, arn: &str, tags: &Value) -> Answer {
         self.call("POST", &tags_uri(arn), Some(json!({ "tags": tags })))
+            .await
+    }
+
+    /// `UntagResource` for `arn`: `DELETE /tags/{resourceArn}` with one `tagKeys` query
+    /// entry per key, as an SDK serializes the modelled `@httpQuery` list.
+    async fn untag_resource(&self, arn: &str, tag_keys: &[&str]) -> Answer {
+        let query = tag_keys
+            .iter()
+            .map(|key| format!("tagKeys={}", query_encode(key)))
+            .collect::<Vec<_>>()
+            .join("&");
+        self.call("DELETE", &format!("{}?{query}", tags_uri(arn)), None)
             .await
     }
 }
@@ -476,9 +513,9 @@ async fn tagging_past_the_tag_limit_is_refused_and_changes_nothing() {
 }
 
 /// A `resourceArn` the store holds no resource for is a 404, and one that is not an ARN of
-/// this service is a 400 — identically for the read and for the write.
+/// this service is a 400 — identically for the read, for the merge and for the removal.
 #[tokio::test]
-async fn an_unknown_or_foreign_resource_arn_is_refused_by_both_operations() {
+async fn an_unknown_or_foreign_resource_arn_is_refused_by_every_tagging_operation() {
     let emulator = Emulator::new();
     let (definition_id, definition_arn) = emulator
         .create_definition("refusal-suite", &json!({ "team": "iot" }))
@@ -571,6 +608,10 @@ async fn an_unknown_or_foreign_resource_arn_is_refused_by_both_operations() {
             (
                 "TagResource",
                 emulator.tag_resource(&arn, &json!({ "env": "test" })).await,
+            ),
+            (
+                "UntagResource",
+                emulator.untag_resource(&arn, &["env"]).await,
             ),
         ] {
             assert_eq!(
