@@ -61,10 +61,13 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=deadbeef";
 
 /// The Region of [`AUTHORIZATION`].
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// One emulator: a router with only this service mounted on one shared engine.
-struct Emulator {
+///
+/// Other suites in this test crate drive the same front door through it (see
+/// `tests/all/flow_outputs.rs`), so there is one harness rather than one per file.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The same engine the mounted service holds, so a suite that needs a particular
     /// store contents can set it up without paying a request per record.
@@ -72,7 +75,7 @@ struct Emulator {
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not the subject here; the requests below carry a scope, not a
@@ -142,7 +145,7 @@ impl Emulator {
 
     /// Send one request and return `(status, error code, body)`. The error code is the
     /// restJson1 `x-amzn-errortype` header, absent on success.
-    async fn send(
+    pub(crate) async fn send(
         &self,
         method: &str,
         uri: &str,
@@ -174,11 +177,11 @@ impl Emulator {
         (status, code, parsed)
     }
 
-    async fn create_flow(&self, body: Value) -> (u16, Option<String>, Value) {
+    pub(crate) async fn create_flow(&self, body: Value) -> (u16, Option<String>, Value) {
         self.send("POST", "/v1/flows", Some(body)).await
     }
 
-    async fn describe_flow(&self, flow_arn: &str) -> (u16, Option<String>, Value) {
+    pub(crate) async fn describe_flow(&self, flow_arn: &str) -> (u16, Option<String>, Value) {
         self.send("GET", &format!("/v1/flows/{flow_arn}"), None).await
     }
 

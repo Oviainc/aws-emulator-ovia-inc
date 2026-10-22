@@ -16,7 +16,7 @@
 //! rather than in one operation's file so the six handlers of the target/policy lifecycle
 //! cannot drift from each other.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -171,6 +171,16 @@ pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     /// How many activities have ever been recorded. It only grows, so it both orders the
     /// log and makes each minted `ActivityId` unique.
     pub activities_recorded: u64,
+    /// The targets an update is IN FLIGHT for right now, which is what makes a concurrent
+    /// update of one target observable: `ConcurrentUpdateException` is documented as what
+    /// AWS answers "if you request an update to an Application Auto Scaling resource that
+    /// already has a pending update", so an update has to be pending for the span it
+    /// takes, and a second request for the same target inside that span is refused
+    /// instead of silently overwriting the first one's read-modify-write.
+    ///
+    /// Entered and left by [`Self::begin_target_update`] / [`Self::end_target_update`];
+    /// a span, never a stored status, so nothing has to be cleaned up by a later caller.
+    pub updating: BTreeSet<TargetKey>,
 }
 
 impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
@@ -213,6 +223,18 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
             self.activities.drain(..overflow);
         }
         activity_id
+    }
+
+    /// Mark an update of `target` as in flight, answering `false` when another update of
+    /// the SAME target already is — the caller then refuses its request with the modelled
+    /// `ConcurrentUpdateException`. Updates of DIFFERENT targets never collide.
+    pub fn begin_target_update(&mut self, target: &TargetKey) -> bool {
+        self.updating.insert(target.clone())
+    }
+
+    /// Release the in-flight marker [`Self::begin_target_update`] took.
+    pub fn end_target_update(&mut self, target: &TargetKey) {
+        self.updating.remove(target);
     }
 
     /// Drop the activities that have aged out of the window this service reports over.
@@ -427,14 +449,86 @@ fn uuid_shaped_id(seed: &str) -> String {
 /// names no `RoleARN`: the model documents that "if the service supports service-linked
 /// roles, Application Auto Scaling uses a service-linked role, which it creates if it
 /// does not yet exist".
+///
+/// The role is one PER NAMESPACE, not one per account: it is assumed through that
+/// namespace's own service principal and named for the resource type it scales, so the
+/// name carries that type as a suffix. See [`service_linked_role_name`].
 pub fn service_linked_role_arn(service_namespace: &str) -> String {
     ::emulator_server::emulator_arn(
         "iam",
         "",
         &format!(
-            "role/aws-service-role/{service_namespace}.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling"
+            "role/aws-service-role/{service_namespace}.application-autoscaling.amazonaws.com/{}",
+            service_linked_role_name(service_namespace)
         ),
     )
+}
+
+/// The base name every Application Auto Scaling service-linked role starts with.
+const SERVICE_LINKED_ROLE_BASE: &str = "AWSServiceRoleForApplicationAutoScaling";
+
+/// The resource-type suffix each namespace's service-linked role name carries.
+///
+/// Source: "Service-linked roles for Application Auto Scaling" in the Application Auto
+/// Scaling User Guide, which publishes one role per supported service, each named
+/// `AWSServiceRoleForApplicationAutoScaling_<suffix>`. The rows are the model's own
+/// `ServiceNamespace` value set (`SERVICE_NAMESPACE_VALUES`), so every modelled namespace
+/// has one; a namespace outside the enum — which every handler refuses before reaching
+/// here — falls back to the unsuffixed base name rather than to a guessed suffix.
+const SERVICE_LINKED_ROLE_SUFFIXES: &[(&str, &str)] = &[
+    ("appstream", "AppStreamFleet"),
+    ("cassandra", "CassandraTable"),
+    ("comprehend", "ComprehendEndpoint"),
+    ("custom-resource", "CustomResource"),
+    ("dynamodb", "DynamoDBTable"),
+    ("ec2", "EC2SpotFleetRequest"),
+    ("ecs", "ECSService"),
+    ("elasticache", "ElastiCacheRG"),
+    ("elasticmapreduce", "EMRInstanceGroup"),
+    ("kafka", "KafkaCluster"),
+    ("lambda", "LambdaConcurrency"),
+    ("neptune", "NeptuneCluster"),
+    ("rds", "RDSCluster"),
+    ("sagemaker", "SageMakerEndpoint"),
+    ("workspaces", "WorkSpacesPool"),
+];
+
+/// The name of the service-linked role a namespace's scalable targets are scaled through.
+pub fn service_linked_role_name(service_namespace: &str) -> String {
+    match SERVICE_LINKED_ROLE_SUFFIXES
+        .iter()
+        .find(|(namespace, _)| *namespace == service_namespace)
+    {
+        Some((_, suffix)) => format!("{SERVICE_LINKED_ROLE_BASE}_{suffix}"),
+        None => SERVICE_LINKED_ROLE_BASE.to_string(),
+    }
+}
+
+/// The smallest capacity a scalable dimension can be registered with.
+///
+/// A scalable dimension's capacity is the owning service's own provisioning unit, so its
+/// floor is that service's documented minimum rather than zero for everything: the Amazon
+/// DynamoDB Developer Guide ("Managing settings on DynamoDB provisioned capacity tables":
+/// the smallest provisionable read or write capacity is one unit) and the Amazon Keyspaces
+/// Developer Guide (the same for a provisioned-throughput table) both put that floor at
+/// one unit, so auto scaling cannot be asked to take such a resource below it. A dimension
+/// whose owning service documents no floor — a desired count, a replica count, a node
+/// count — keeps zero, which is what lets a target scale all the way in.
+const MIN_CAPACITY_FLOORS: &[(&str, i32)] = &[
+    ("cassandra:table:ReadCapacityUnits", 1),
+    ("cassandra:table:WriteCapacityUnits", 1),
+    ("dynamodb:index:ReadCapacityUnits", 1),
+    ("dynamodb:index:WriteCapacityUnits", 1),
+    ("dynamodb:table:ReadCapacityUnits", 1),
+    ("dynamodb:table:WriteCapacityUnits", 1),
+];
+
+/// The smallest capacity `scalable_dimension` accepts. See [`MIN_CAPACITY_FLOORS`].
+pub fn min_capacity_floor(scalable_dimension: &str) -> i32 {
+    MIN_CAPACITY_FLOORS
+        .iter()
+        .find(|(dimension, _)| *dimension == scalable_dimension)
+        .map_or(0, |(_, floor)| *floor)
 }
 
 /// `len` lowercase hex characters derived from `seed`, clamped to the 64 characters a
@@ -1064,43 +1158,124 @@ struct PredefinedMetric {
     /// which the model documents as using "20-second CloudWatch metrics […] evaluate
     /// metrics every 20 seconds".
     period: i32,
+    /// The `ScalableDimension` values this metric is published FOR.
+    ///
+    /// A predefined metric is a metric of ONE service's resources, so it only describes
+    /// that service's dimensions: the published table above names the service (and, where
+    /// it splits them, the capacity property) each metric belongs to, and the model itself
+    /// says of the one metric that spans two services that "ALBRequestCountPerTarget -
+    /// This metric type applies only to Spot Fleets and ECS services". Where the guide
+    /// publishes a metric for a service without splitting it by capacity property, every
+    /// dimension of that service is listed rather than a finer split being invented.
+    dimensions: &'static [&'static str],
+    /// The window a `TargetValue` must lie in, where the owning service publishes one.
+    ///
+    /// `None` where it publishes none: the target is then expressed in whatever the metric
+    /// is measured in (a request count per target, a connection count) and nothing bounds
+    /// it. `Some` for the provisioned-throughput utilisation metrics, whose target is a
+    /// percentage of provisioned capacity inside a published window.
+    target_range: Option<(f64, f64)>,
 }
 
+/// DynamoDB's provisioned READ capacity: a table's, and a global secondary index's.
+const DYNAMODB_READ: &[&str] = &[
+    "dynamodb:table:ReadCapacityUnits",
+    "dynamodb:index:ReadCapacityUnits",
+];
+/// DynamoDB's provisioned WRITE capacity.
+const DYNAMODB_WRITE: &[&str] = &[
+    "dynamodb:table:WriteCapacityUnits",
+    "dynamodb:index:WriteCapacityUnits",
+];
+/// Amazon Keyspaces' provisioned read capacity.
+const CASSANDRA_READ: &[&str] = &["cassandra:table:ReadCapacityUnits"];
+/// Amazon Keyspaces' provisioned write capacity.
+const CASSANDRA_WRITE: &[&str] = &["cassandra:table:WriteCapacityUnits"];
+/// An ECS service's task count.
+const ECS_SERVICE: &[&str] = &["ecs:service:DesiredCount"];
+/// A Spot Fleet request's target capacity.
+const SPOT_FLEET: &[&str] = &["ec2:spot-fleet-request:TargetCapacity"];
+/// "ALBRequestCountPerTarget - This metric type applies only to Spot Fleets and ECS
+/// services" (`PredefinedMetricSpecification$PredefinedMetricType`).
+const ALB_REQUEST_COUNT: &[&str] = &[
+    "ecs:service:DesiredCount",
+    "ec2:spot-fleet-request:TargetCapacity",
+];
+/// An Aurora read-replica count.
+const RDS_CLUSTER: &[&str] = &["rds:cluster:ReadReplicaCount"];
+/// A Neptune read-replica count.
+const NEPTUNE_CLUSTER: &[&str] = &["neptune:cluster:ReadReplicaCount"];
+/// An AppStream 2.0 fleet's capacity.
+const APPSTREAM_FLEET: &[&str] = &["appstream:fleet:DesiredCapacity"];
+/// Comprehend's two endpoint kinds, which publish the same inference metric.
+const COMPREHEND_ENDPOINTS: &[&str] = &[
+    "comprehend:document-classifier-endpoint:DesiredInferenceUnits",
+    "comprehend:entity-recognizer-endpoint:DesiredInferenceUnits",
+];
+/// A Lambda function's provisioned concurrency.
+const LAMBDA_CONCURRENCY: &[&str] = &["lambda:function:ProvisionedConcurrency"];
+/// An MSK cluster's broker storage.
+const KAFKA_STORAGE: &[&str] = &["kafka:broker-storage:VolumeSize"];
+/// Every ElastiCache dimension: the guide publishes the engine-CPU and memory metrics for
+/// the service without splitting them by capacity property.
+const ELASTICACHE: &[&str] = &[
+    "elasticache:cache-cluster:Nodes",
+    "elasticache:replication-group:NodeGroups",
+    "elasticache:replication-group:Replicas",
+];
+/// A SageMaker endpoint variant's instance count.
+const SAGEMAKER_VARIANT_INSTANCES: &[&str] = &["sagemaker:variant:DesiredInstanceCount"];
+/// A SageMaker endpoint variant's provisioned concurrency.
+const SAGEMAKER_VARIANT_CONCURRENCY: &[&str] = &["sagemaker:variant:DesiredProvisionedConcurrency"];
+/// A SageMaker inference component's copy count.
+const SAGEMAKER_INFERENCE_COMPONENT: &[&str] = &["sagemaker:inference-component:DesiredCopyCount"];
+/// A WorkSpaces pool's user sessions.
+const WORKSPACES_POOL: &[&str] = &["workspaces:workspacespool:DesiredUserSessions"];
+
+/// The window a provisioned-throughput utilisation target must lie in.
+///
+/// Both services whose scalable dimension IS a provisioned read/write throughput publish
+/// the same one: the Amazon DynamoDB Developer Guide ("Managing throughput capacity
+/// automatically with DynamoDB auto scaling": a target utilisation between 20 and 90
+/// percent) and the Amazon Keyspaces Developer Guide for a provisioned-throughput table.
+const PROVISIONED_UTILIZATION_RANGE: (f64, f64) = (20.0, 90.0);
+
 const PREDEFINED_METRICS: &[PredefinedMetric] = &[
-    metric("DynamoDBReadCapacityUtilization", "AWS/DynamoDB", "ConsumedReadCapacityUnits", "Sum", true, 60),
-    metric("DynamoDBWriteCapacityUtilization", "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "Sum", true, 60),
-    metric("CassandraReadCapacityUtilization", "AWS/Cassandra", "ConsumedReadCapacityUnits", "Sum", true, 60),
-    metric("CassandraWriteCapacityUtilization", "AWS/Cassandra", "ConsumedWriteCapacityUnits", "Sum", true, 60),
-    metric("ALBRequestCountPerTarget", "AWS/ApplicationELB", "RequestCountPerTarget", "Sum", false, 60),
-    metric("ECSServiceAverageCPUUtilization", "AWS/ECS", "CPUUtilization", "Average", false, 60),
-    metric("ECSServiceAverageMemoryUtilization", "AWS/ECS", "MemoryUtilization", "Average", false, 60),
-    metric("ECSServiceAverageCPUUtilizationHighResolution", "AWS/ECS", "CPUUtilization", "Average", false, 20),
-    metric("ECSServiceAverageMemoryUtilizationHighResolution", "AWS/ECS", "MemoryUtilization", "Average", false, 20),
-    metric("EC2SpotFleetRequestAverageCPUUtilization", "AWS/EC2Spot", "CPUUtilization", "Average", false, 60),
-    metric("EC2SpotFleetRequestAverageNetworkIn", "AWS/EC2Spot", "NetworkIn", "Average", false, 60),
-    metric("EC2SpotFleetRequestAverageNetworkOut", "AWS/EC2Spot", "NetworkOut", "Average", false, 60),
-    metric("RDSReaderAverageCPUUtilization", "AWS/RDS", "CPUUtilization", "Average", false, 60),
-    metric("RDSReaderAverageDatabaseConnections", "AWS/RDS", "DatabaseConnections", "Average", false, 60),
-    metric("NeptuneReaderAverageCPUUtilization", "AWS/Neptune", "CPUUtilization", "Average", false, 60),
-    metric("AppStreamAverageCapacityUtilization", "AWS/AppStream", "CapacityUtilization", "Average", false, 60),
-    metric("ComprehendInferenceUtilization", "AWS/Comprehend", "InferenceUtilization", "Average", false, 60),
-    metric("LambdaProvisionedConcurrencyUtilization", "AWS/Lambda", "ProvisionedConcurrencyUtilization", "Average", false, 60),
-    metric("KafkaBrokerStorageUtilization", "AWS/Kafka", "KafkaDataLogsDiskUsed", "Average", false, 60),
-    metric("ElastiCacheEngineCPUUtilization", "AWS/ElastiCache", "EngineCPUUtilization", "Average", false, 60),
-    metric("ElastiCachePrimaryEngineCPUUtilization", "AWS/ElastiCache", "EngineCPUUtilization", "Average", false, 60),
-    metric("ElastiCacheReplicaEngineCPUUtilization", "AWS/ElastiCache", "EngineCPUUtilization", "Average", false, 60),
-    metric("ElastiCacheDatabaseMemoryUsagePercentage", "AWS/ElastiCache", "DatabaseMemoryUsagePercentage", "Average", false, 60),
-    metric("ElastiCacheDatabaseMemoryUsageCountedForEvictPercentage", "AWS/ElastiCache", "DatabaseMemoryUsageCountedForEvictPercentage", "Average", false, 60),
-    metric("ElastiCacheDatabaseCapacityUsageCountedForEvictPercentage", "AWS/ElastiCache", "DatabaseCapacityUsageCountedForEvictPercentage", "Average", false, 60),
-    metric("SageMakerVariantInvocationsPerInstance", "AWS/SageMaker", "InvocationsPerInstance", "Sum", false, 60),
-    metric("SageMakerVariantProvisionedConcurrencyUtilization", "AWS/SageMaker", "ProvisionedConcurrencyUtilization", "Average", false, 60),
-    metric("SageMakerVariantConcurrentRequestsPerModelHighResolution", "AWS/SageMaker", "ConcurrentRequestsPerModel", "Average", false, 20),
-    metric("SageMakerInferenceComponentInvocationsPerCopy", "AWS/SageMaker", "InvocationsPerCopy", "Sum", false, 60),
-    metric("SageMakerInferenceComponentConcurrentRequestsPerCopyHighResolution", "AWS/SageMaker", "ConcurrentRequestsPerCopy", "Average", false, 20),
-    metric("WorkSpacesAverageUserSessionsCapacityUtilization", "AWS/WorkSpaces", "UserSessionsCapacityUtilization", "Average", false, 60),
+    metric("DynamoDBReadCapacityUtilization", "AWS/DynamoDB", "ConsumedReadCapacityUnits", "Sum", true, 60, DYNAMODB_READ, Some(PROVISIONED_UTILIZATION_RANGE)),
+    metric("DynamoDBWriteCapacityUtilization", "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "Sum", true, 60, DYNAMODB_WRITE, Some(PROVISIONED_UTILIZATION_RANGE)),
+    metric("CassandraReadCapacityUtilization", "AWS/Cassandra", "ConsumedReadCapacityUnits", "Sum", true, 60, CASSANDRA_READ, Some(PROVISIONED_UTILIZATION_RANGE)),
+    metric("CassandraWriteCapacityUtilization", "AWS/Cassandra", "ConsumedWriteCapacityUnits", "Sum", true, 60, CASSANDRA_WRITE, Some(PROVISIONED_UTILIZATION_RANGE)),
+    metric("ALBRequestCountPerTarget", "AWS/ApplicationELB", "RequestCountPerTarget", "Sum", false, 60, ALB_REQUEST_COUNT, None),
+    metric("ECSServiceAverageCPUUtilization", "AWS/ECS", "CPUUtilization", "Average", false, 60, ECS_SERVICE, None),
+    metric("ECSServiceAverageMemoryUtilization", "AWS/ECS", "MemoryUtilization", "Average", false, 60, ECS_SERVICE, None),
+    metric("ECSServiceAverageCPUUtilizationHighResolution", "AWS/ECS", "CPUUtilization", "Average", false, 20, ECS_SERVICE, None),
+    metric("ECSServiceAverageMemoryUtilizationHighResolution", "AWS/ECS", "MemoryUtilization", "Average", false, 20, ECS_SERVICE, None),
+    metric("EC2SpotFleetRequestAverageCPUUtilization", "AWS/EC2Spot", "CPUUtilization", "Average", false, 60, SPOT_FLEET, None),
+    metric("EC2SpotFleetRequestAverageNetworkIn", "AWS/EC2Spot", "NetworkIn", "Average", false, 60, SPOT_FLEET, None),
+    metric("EC2SpotFleetRequestAverageNetworkOut", "AWS/EC2Spot", "NetworkOut", "Average", false, 60, SPOT_FLEET, None),
+    metric("RDSReaderAverageCPUUtilization", "AWS/RDS", "CPUUtilization", "Average", false, 60, RDS_CLUSTER, None),
+    metric("RDSReaderAverageDatabaseConnections", "AWS/RDS", "DatabaseConnections", "Average", false, 60, RDS_CLUSTER, None),
+    metric("NeptuneReaderAverageCPUUtilization", "AWS/Neptune", "CPUUtilization", "Average", false, 60, NEPTUNE_CLUSTER, None),
+    metric("AppStreamAverageCapacityUtilization", "AWS/AppStream", "CapacityUtilization", "Average", false, 60, APPSTREAM_FLEET, None),
+    metric("ComprehendInferenceUtilization", "AWS/Comprehend", "InferenceUtilization", "Average", false, 60, COMPREHEND_ENDPOINTS, None),
+    metric("LambdaProvisionedConcurrencyUtilization", "AWS/Lambda", "ProvisionedConcurrencyUtilization", "Average", false, 60, LAMBDA_CONCURRENCY, None),
+    metric("KafkaBrokerStorageUtilization", "AWS/Kafka", "KafkaDataLogsDiskUsed", "Average", false, 60, KAFKA_STORAGE, None),
+    metric("ElastiCacheEngineCPUUtilization", "AWS/ElastiCache", "EngineCPUUtilization", "Average", false, 60, ELASTICACHE, None),
+    metric("ElastiCachePrimaryEngineCPUUtilization", "AWS/ElastiCache", "EngineCPUUtilization", "Average", false, 60, ELASTICACHE, None),
+    metric("ElastiCacheReplicaEngineCPUUtilization", "AWS/ElastiCache", "EngineCPUUtilization", "Average", false, 60, ELASTICACHE, None),
+    metric("ElastiCacheDatabaseMemoryUsagePercentage", "AWS/ElastiCache", "DatabaseMemoryUsagePercentage", "Average", false, 60, ELASTICACHE, None),
+    metric("ElastiCacheDatabaseMemoryUsageCountedForEvictPercentage", "AWS/ElastiCache", "DatabaseMemoryUsageCountedForEvictPercentage", "Average", false, 60, ELASTICACHE, None),
+    metric("ElastiCacheDatabaseCapacityUsageCountedForEvictPercentage", "AWS/ElastiCache", "DatabaseCapacityUsageCountedForEvictPercentage", "Average", false, 60, ELASTICACHE, None),
+    metric("SageMakerVariantInvocationsPerInstance", "AWS/SageMaker", "InvocationsPerInstance", "Sum", false, 60, SAGEMAKER_VARIANT_INSTANCES, None),
+    metric("SageMakerVariantProvisionedConcurrencyUtilization", "AWS/SageMaker", "ProvisionedConcurrencyUtilization", "Average", false, 60, SAGEMAKER_VARIANT_CONCURRENCY, None),
+    metric("SageMakerVariantConcurrentRequestsPerModelHighResolution", "AWS/SageMaker", "ConcurrentRequestsPerModel", "Average", false, 20, SAGEMAKER_VARIANT_INSTANCES, None),
+    metric("SageMakerInferenceComponentInvocationsPerCopy", "AWS/SageMaker", "InvocationsPerCopy", "Sum", false, 60, SAGEMAKER_INFERENCE_COMPONENT, None),
+    metric("SageMakerInferenceComponentConcurrentRequestsPerCopyHighResolution", "AWS/SageMaker", "ConcurrentRequestsPerCopy", "Average", false, 20, SAGEMAKER_INFERENCE_COMPONENT, None),
+    metric("WorkSpacesAverageUserSessionsCapacityUtilization", "AWS/WorkSpaces", "UserSessionsCapacityUtilization", "Average", false, 60, WORKSPACES_POOL, None),
 ];
 
 /// One [`PREDEFINED_METRICS`] row, so the table above reads as a table.
+#[allow(clippy::too_many_arguments)]
 const fn metric(
     metric_type: &'static str,
     namespace: &'static str,
@@ -1108,6 +1283,8 @@ const fn metric(
     statistic: &'static str,
     consumed_units: bool,
     period: i32,
+    dimensions: &'static [&'static str],
+    target_range: Option<(f64, f64)>,
 ) -> PredefinedMetric {
     PredefinedMetric {
         metric_type,
@@ -1116,6 +1293,8 @@ const fn metric(
         statistic,
         consumed_units,
         period,
+        dimensions,
+        target_range,
     }
 }
 
@@ -1124,6 +1303,74 @@ fn predefined_metric(metric_type: &str) -> Option<&'static PredefinedMetric> {
     PREDEFINED_METRICS
         .iter()
         .find(|metric| metric.metric_type == metric_type)
+}
+
+/// The `ScalableDimension` values `metric_type` is published for, when it is a metric this
+/// service scales on. See [`PredefinedMetric::dimensions`].
+pub fn predefined_metric_dimensions(metric_type: &str) -> Option<&'static [&'static str]> {
+    predefined_metric(metric_type).map(|metric| metric.dimensions)
+}
+
+/// The window `metric_type`'s target value must lie in, where its owning service publishes
+/// one. See [`PredefinedMetric::target_range`].
+pub fn predefined_metric_target_range(metric_type: &str) -> Option<(f64, f64)> {
+    predefined_metric(metric_type).and_then(|metric| metric.target_range)
+}
+
+/// Whether a target-tracking policy on `scalable_dimension` may track a CUSTOMIZED metric.
+///
+/// A customized metric is a series of the caller's own choosing, which presupposes that the
+/// resource's capacity can be driven from an arbitrary signal. The two services whose
+/// scalable dimension IS a provisioned read/write throughput — DynamoDB and Amazon
+/// Keyspaces — scale it from their own consumed-capacity utilisation and from nothing else,
+/// and refuse a customized specification (recorded AWS behaviour: a customized metric on a
+/// DynamoDB dimension is answered 400 `ValidationException`).
+pub fn customized_metric_supported(scalable_dimension: &str) -> bool {
+    !matches!(
+        scalable_dimension.split(':').next(),
+        Some("dynamodb" | "cassandra")
+    )
+}
+
+/// The METRIC a target-tracking configuration tracks, as a comparable key.
+///
+/// Two configurations have the same signature when they track the same series: the same
+/// predefined metric type (with the same resource label, which is part of WHICH series a
+/// per-target metric is), or the same customized namespace, metric name, statistic, unit
+/// and dimension set. The target value is deliberately not part of it — two policies
+/// steering one metric towards two values are exactly the conflict the uniqueness rule
+/// refuses.
+pub fn metric_signature(config: &TargetTrackingScalingPolicyConfiguration) -> String {
+    if let Some(predefined) = &config.predefined_metric_specification {
+        return format!(
+            "predefined\u{1f}{}\u{1f}{}",
+            predefined.predefined_metric_type,
+            predefined.resource_label.as_deref().unwrap_or_default()
+        );
+    }
+    match &config.customized_metric_specification {
+        Some(customized) => {
+            let mut dimensions: Vec<String> = customized
+                .dimensions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|dimension| format!("{}={}", dimension.name, dimension.value))
+                .collect();
+            dimensions.sort();
+            format!(
+                "customized\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                customized.namespace.as_deref().unwrap_or_default(),
+                customized.metric_name.as_deref().unwrap_or_default(),
+                customized.statistic.as_deref().unwrap_or_default(),
+                customized.unit.as_deref().unwrap_or_default(),
+                dimensions.join(",")
+            )
+        }
+        // A configuration with neither specification is refused before this is reached; it
+        // tracks no series at all.
+        None => "none".to_string(),
+    }
 }
 
 /// How long an alarm's metric has to stay past its threshold before the alarm fires, as

@@ -201,6 +201,54 @@ impl Emulator {
         );
     }
 
+    /// Register a scalable target on `dimension`, creating the resource it names where this
+    /// emulator owns the service that resource lives in, and answer the three identity
+    /// members of the target so a caller can address it.
+    ///
+    /// The resource id is the form that dimension's resource type documents
+    /// ([`resource_id_for`]), so one call works for every modelled dimension.
+    pub async fn given_target(&self, dimension: &str, min: i64, max: i64) -> Value {
+        let namespace = dimension.split(':').next().unwrap_or_default();
+        let resource_id = resource_id_for(dimension);
+        if namespace == "dynamodb" {
+            let rest = resource_id.trim_start_matches("table/");
+            match rest.split_once("/index/") {
+                Some((table, index)) => {
+                    if !self.table_exists(table).await {
+                        self.create_table_with_index(table, index, "status", 4, 4).await;
+                    }
+                }
+                None => {
+                    if !self.table_exists(rest).await {
+                        self.create_provisioned_table(rest, 4, 4).await;
+                    }
+                }
+            }
+        }
+        let target = json!({
+            "ServiceNamespace": namespace,
+            "ResourceId": resource_id,
+            "ScalableDimension": dimension,
+        });
+        let mut registration = target.clone();
+        registration["MinCapacity"] = json!(min);
+        registration["MaxCapacity"] = json!(max);
+        let (status, body) = self.call("RegisterScalableTarget", registration).await;
+        assert_eq!(
+            status, 200,
+            "case {dimension:?}: expected RegisterScalableTarget to answer 200, got {status} {body:?}"
+        );
+        target
+    }
+
+    /// Whether the DynamoDB store already holds a table by that name.
+    async fn table_exists(&self, name: &str) -> bool {
+        let (status, _) = self
+            .call_dynamodb("DescribeTable", json!({"TableName": name}))
+            .await;
+        status == 200
+    }
+
     /// Every alarm CloudWatch holds under the `TargetTracking` prefix, by alarm name.
     pub async fn target_tracking_alarms(&self) -> Vec<Value> {
         let (status, body) = self
@@ -222,6 +270,88 @@ impl Emulator {
 /// The prefix Application Auto Scaling gives every alarm it mints, which is what lets a
 /// client find them with `DescribeAlarms`.
 pub const ALARM_NAME_PREFIX: &str = "TargetTracking";
+
+/// The resource-type suffix a namespace's service-linked role name carries.
+///
+/// Source: "Service-linked roles for Application Auto Scaling" in the Application Auto
+/// Scaling User Guide, which publishes one role per supported service, each named
+/// `AWSServiceRoleForApplicationAutoScaling_<suffix>`. Spelled out here rather than read
+/// from the emulator's own table, so an assertion is against the PUBLISHED name.
+pub fn service_linked_role_suffix(namespace: &str) -> &'static str {
+    match namespace {
+        "appstream" => "AppStreamFleet",
+        "cassandra" => "CassandraTable",
+        "comprehend" => "ComprehendEndpoint",
+        "custom-resource" => "CustomResource",
+        "dynamodb" => "DynamoDBTable",
+        "ec2" => "EC2SpotFleetRequest",
+        "ecs" => "ECSService",
+        "elasticache" => "ElastiCacheRG",
+        "elasticmapreduce" => "EMRInstanceGroup",
+        "kafka" => "KafkaCluster",
+        "lambda" => "LambdaConcurrency",
+        "neptune" => "NeptuneCluster",
+        "rds" => "RDSCluster",
+        "sagemaker" => "SageMakerEndpoint",
+        "workspaces" => "WorkSpacesPool",
+        other => panic!("case {other:?}: no service-linked role is published for it"),
+    }
+}
+
+/// A `ResourceId` of the form the resource type in `dimension` documents.
+///
+/// One row per resource type the model's own `ResourceId` documentation gives an example
+/// for (`smithy_query(query="doc",shape="com.amazonaws.applicationautoscaling#RegisterScalableTargetRequest",member="ResourceId")`),
+/// so a suite that walks the `ScalableDimension` enum can name a resource for every value
+/// of it instead of carrying its own table.
+pub fn resource_id_for(dimension: &str) -> String {
+    match dimension {
+        "appstream:fleet:DesiredCapacity" => "fleet/sample-fleet".to_string(),
+        "cassandra:table:ReadCapacityUnits" | "cassandra:table:WriteCapacityUnits" => {
+            "keyspace/events/table/clicks".to_string()
+        }
+        "comprehend:document-classifier-endpoint:DesiredInferenceUnits" => format!(
+            "arn:aws:comprehend:{REGION}:{ACCOUNT}:document-classifier-endpoint/classifier"
+        ),
+        "comprehend:entity-recognizer-endpoint:DesiredInferenceUnits" => format!(
+            "arn:aws:comprehend:{REGION}:{ACCOUNT}:entity-recognizer-endpoint/recognizer"
+        ),
+        "custom-resource:ResourceType:Property" => "custom-resource/my-resource".to_string(),
+        "dynamodb:table:ReadCapacityUnits" | "dynamodb:table:WriteCapacityUnits" => {
+            "table/catalog".to_string()
+        }
+        "dynamodb:index:ReadCapacityUnits" | "dynamodb:index:WriteCapacityUnits" => {
+            "table/catalog-indexed/index/by-status".to_string()
+        }
+        "ec2:spot-fleet-request:TargetCapacity" => {
+            "spot-fleet-request/sfr-73fbd2ce-aa30-494c-8788-1cee4EXAMPLE".to_string()
+        }
+        "ecs:service:DesiredCount" => "service/prod-cluster/web-app".to_string(),
+        "elasticache:cache-cluster:Nodes" => "cache-cluster/sessions".to_string(),
+        "elasticache:replication-group:NodeGroups"
+        | "elasticache:replication-group:Replicas" => "replication-group/sessions".to_string(),
+        "elasticmapreduce:instancegroup:InstanceCount" => {
+            "instancegroup/j-2EEZNYKUA1NTV/ig-1791Y4E1L8YI0".to_string()
+        }
+        "kafka:broker-storage:VolumeSize" => format!(
+            "arn:aws:kafka:{REGION}:{ACCOUNT}:cluster/events/abcd1234-1234-abcd-5678-cdef0123ab01-2"
+        ),
+        "lambda:function:ProvisionedConcurrency" => "function:ingest:green".to_string(),
+        "neptune:cluster:ReadReplicaCount" => "cluster:graphdb".to_string(),
+        "rds:cluster:ReadReplicaCount" => "cluster:orders-db".to_string(),
+        "sagemaker:inference-component:DesiredCopyCount" => {
+            "inference-component/ranker".to_string()
+        }
+        "sagemaker:variant:DesiredInstanceCount"
+        | "sagemaker:variant:DesiredProvisionedConcurrency" => {
+            "endpoint/rank/variant/blue".to_string()
+        }
+        "workspaces:workspacespool:DesiredUserSessions" => {
+            "workspacespool/wspool-9f8e7d".to_string()
+        }
+        other => panic!("case {other:?}: this harness names no resource for it"),
+    }
+}
 
 /// Which of a policy's alarms an alarm name is: the segment between the resource id and the
 /// opaque id, as `TargetTracking-<resource id>-<kind>-<id>`.

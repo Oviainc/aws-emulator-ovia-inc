@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-lightsail-lightsail-20161128 service.
 //!
 //! The slice implemented so far is Lightsail's primary resource, the **instance**
-//! (a virtual private server), the **domain** (a DNS zone the account holds
+//! (a virtual private server), the **block storage disk** (additional storage an
+//! instance can attach), the **domain** (a DNS zone the account holds
 //! recordsets in), the **container service** (a compute resource containers are
 //! deployed to), the append-only **operation log** every mutating call writes,
 //! and the service's static **Region catalog** — the Regions and Availability
@@ -92,6 +93,16 @@ pub const DOMAIN_ARN_REGION: &str = "global";
 /// recordset of this account lives in.
 pub const DOMAIN_REGION_NAME: &str = "us-east-1";
 
+/// The resource portion a disk ARN carries before its id. Mirrors the
+/// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
+/// this resource's own `ResourceType` value.
+pub const DISK_ARN_RESOURCE_PREFIX: &str = "Disk/";
+
+/// The `resourceType` a block storage disk and its operations report, from the
+/// modelled `ResourceType` enum — the value the modelled `Disk$resourceType`
+/// documentation names ("The Lightsail resource type (`Disk`)").
+pub const RESOURCE_TYPE_DISK: &str = "Disk";
+
 /// Applied when `CreateInstances` omits `ipAddressType`.
 ///
 /// From that member's own documentation: "The default value is `dualstack`."
@@ -141,14 +152,15 @@ pub const STOPPED: Lifecycle = Lifecycle {
 
 /// How long after the call that starts it the clock owes a resource its next
 /// settled state: an instance's (`pending` -> `running`, `stopping` ->
-/// `stopped`) and a container service's (`PENDING` -> `READY`, and each step of
-/// `PENDING` -> `DEPLOYING` -> `RUNNING`).
+/// `stopped`), a block storage disk's (`pending` -> `available`) and a container
+/// service's (`PENDING` -> `READY`, and each step of `PENDING` -> `DEPLOYING` ->
+/// `RUNNING`).
 ///
 /// CHOSEN, not an AWS duration: AWS takes tens of seconds to minutes, which no
 /// caller can be made to wait for here. The span is deliberately NON-ZERO, so a
 /// caller that reads straight after `CreateInstances`, `StartInstance`,
-/// `StopInstance` or `CreateContainerService` still observes the transient state
-/// exactly as it does against AWS.
+/// `StopInstance`, `CreateDisk` or `CreateContainerService` still observes the
+/// transient state exactly as it does against AWS.
 pub const STATE_TRANSITION_MILLIS: i64 = 500;
 
 /// A state change the clock already owes an instance.
@@ -163,6 +175,39 @@ pub struct DueTransition {
 impl DueTransition {
     /// The transition `state`, due [`STATE_TRANSITION_MILLIS`] after `now_ms`.
     pub fn after(now_ms: i64, state: Lifecycle) -> Self {
+        Self {
+            at_ms: now_ms.saturating_add(STATE_TRANSITION_MILLIS),
+            state,
+        }
+    }
+}
+
+/// `DiskState` values this slice uses, from the modelled `DiskState` enum and the
+/// `Disk$state` documentation: a disk Lightsail is still provisioning is
+/// `pending`, one that exists and is attached to nothing is `available`, and one
+/// an instance is using is `in-use`.
+pub const DISK_STATE_PENDING: &str = "pending";
+/// See [`DISK_STATE_PENDING`].
+pub const DISK_STATE_AVAILABLE: &str = "available";
+/// See [`DISK_STATE_PENDING`].
+pub const DISK_STATE_IN_USE: &str = "in-use";
+
+/// A disk state the clock already owes a disk.
+///
+/// Separate from [`DueTransition`] because a disk's state is a value of the
+/// modelled `DiskState` enum — a name with no numeric code — where an instance's
+/// is an EC2 `InstanceState` (a code and a name together).
+#[derive(Debug, Clone, Copy)]
+pub struct DueDiskState {
+    /// Epoch milliseconds at which the change became (or becomes) due.
+    pub at_ms: i64,
+    /// The state the disk settles into.
+    pub state: &'static str,
+}
+
+impl DueDiskState {
+    /// The transition to `state`, due [`STATE_TRANSITION_MILLIS`] after `now_ms`.
+    pub fn after(now_ms: i64, state: &'static str) -> Self {
         Self {
             at_ms: now_ms.saturating_add(STATE_TRANSITION_MILLIS),
             state,
@@ -192,6 +237,8 @@ pub const OPERATION_TYPE_STOP_INSTANCE: &str = "StopInstance";
 pub const OPERATION_TYPE_DELETE_INSTANCE: &str = "DeleteInstance";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DOMAIN: &str = "CreateDomain";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
 /// The `operationType` the log entry of a change to a zone's recordsets carries.
 ///
 /// The modelled `OperationType` enum has `UpdateDomainEntry` and
@@ -226,6 +273,12 @@ pub const MAX_INSTANCE_NAMES_PER_REQUEST: usize = 50;
 /// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_DOMAINS: usize = 500;
+
+/// The most block storage disks this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
+/// refused with the modelled `InvalidInputException`.
+pub const MAX_DISKS: usize = 500;
 
 /// The most recordset entries this emulator will hold in one domain.
 ///
@@ -1548,6 +1601,114 @@ impl StoredInstance {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Block storage disks
+// ---------------------------------------------------------------------------
+
+/// The smallest block storage disk this service creates, in GB.
+///
+/// The size range Lightsail publishes for an additional block storage disk is
+/// 8 GB to 16 TB; the modelled `CreateDisk$sizeInGb` carries no `@range`, so the
+/// bound is enforced here rather than by the modelled-constraint walk.
+pub const MIN_DISK_SIZE_IN_GB: i32 = 8;
+
+/// The largest block storage disk this service creates, in GB: 16 TB, the upper
+/// end of the same published range as [`MIN_DISK_SIZE_IN_GB`].
+pub const MAX_DISK_SIZE_IN_GB: i32 = 16 * 1024;
+
+/// IOPS per GB of disk, and the floor and ceiling that bracket the figure.
+///
+/// A Lightsail block storage disk is an EBS general purpose SSD (`gp2`) volume,
+/// whose published baseline performance is 3 IOPS per GB, never below 100 IOPS
+/// and never above 16,000.
+const DISK_IOPS_PER_GB: i32 = 3;
+/// See [`DISK_IOPS_PER_GB`].
+const DISK_IOPS_FLOOR: i32 = 100;
+/// See [`DISK_IOPS_PER_GB`].
+const DISK_IOPS_CEILING: i32 = 16_000;
+
+/// The IOPS a block storage disk of `size_in_gb` provides, from the baseline in
+/// [`DISK_IOPS_PER_GB`].
+///
+/// DERIVED from the disk's own size, so every read of one disk reports the same
+/// figure and a larger disk reports more of them.
+pub fn disk_iops(size_in_gb: i32) -> i32 {
+    size_in_gb
+        .saturating_mul(DISK_IOPS_PER_GB)
+        .clamp(DISK_IOPS_FLOOR, DISK_IOPS_CEILING)
+}
+
+/// One stored block storage disk: every member `GetDisk` reports, plus the
+/// clock-owed transition its state is waiting on.
+#[derive(Debug, Clone)]
+pub struct StoredDisk {
+    /// The disk name the request named, kept verbatim — it is this record's
+    /// store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    pub add_ons: Vec<AddOn>,
+    pub size_in_gb: i32,
+    /// The current `DiskState` value: one of [`DISK_STATE_PENDING`],
+    /// [`DISK_STATE_AVAILABLE`] or [`DISK_STATE_IN_USE`].
+    pub state: &'static str,
+    /// The state the clock owes this disk, while one is outstanding.
+    pub due: Option<DueDiskState>,
+    /// The instance this disk is attached to, while one is. `AttachDisk` is what
+    /// sets it; a newly created disk is attached to nothing.
+    pub attached_to: Option<String>,
+    /// The device path the disk is mounted at on the instance it is attached to.
+    /// `AttachDisk` carries it (`diskPath`), so an unattached disk has none.
+    pub path: Option<String>,
+}
+
+impl StoredDisk {
+    /// This record as the modelled `Disk`.
+    pub fn view(&self) -> crate::ops::types::Disk {
+        let attached = self.attached_to.is_some();
+        crate::ops::types::Disk {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_DISK.to_string()),
+            tags: Some(self.tags.clone()),
+            add_ons: Some(self.add_ons.clone()),
+            size_in_gb: Some(self.size_in_gb),
+            // A disk `CreateDisk` created is additional block storage: the only
+            // system disk is the one an instance's bundle provides, which is not
+            // a `Disk` resource of its own.
+            is_system_disk: Some(false),
+            iops: Some(disk_iops(self.size_in_gb)),
+            path: self.path.clone(),
+            state: Some(self.state.to_string()),
+            attached_to: self.attached_to.clone(),
+            is_attached: Some(attached),
+            // The discontinued member the modelled docs say is "still included
+            // in the response" and that `isAttached` replaced, so it reports the
+            // same fact in the older wording.
+            attachment_state: Some(
+                if attached {
+                    "attached".to_string()
+                } else {
+                    "detached".to_string()
+                },
+            ),
+            // Discontinued: the modelled `Disk$gbInUse` documentation says this
+            // parameter "is now discontinued", so Lightsail reports none.
+            gb_in_use: None,
+            // The modelled `Disk$autoMountStatus` documentation says it "only
+            // applies to Lightsail for Research resources"; a disk created
+            // through `CreateDisk` is not one, so there is no mount to report.
+            auto_mount_status: None,
+        }
+    }
+}
+
 /// One stored domain recordset: the DNS zone `CreateDomain` created, with the
 /// entries the account has added to it.
 #[derive(Debug, Clone)]
@@ -2193,6 +2354,10 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// domain operation takes. A `BTreeMap` so `GetDomains` walks a stable,
     /// total order.
     pub domains: BTreeMap<String, StoredDomain>,
+    /// Every block storage disk, keyed by its disk name — the identifier every
+    /// disk operation takes. A `BTreeMap` so `GetDisks` walks a stable, total
+    /// order and a page token can name the next disk.
+    pub disks: BTreeMap<String, StoredDisk>,
     /// The append-only operation log, newest last: the source of truth for the
     /// `operations` every mutating instance call answers with.
     pub operations: Vec<StoredOperation>,
@@ -2247,6 +2412,16 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// this handle; no operation in this slice renames a zone.
     pub fn domain_mut(&mut self, name: &str) -> Option<&mut StoredDomain> {
         self.domains.get_mut(name)
+    }
+
+    /// The block storage disk `name` names, for a reporting operation.
+    pub fn disk(&self, name: &str) -> Option<&StoredDisk> {
+        self.disks.get(name)
+    }
+
+    /// Store a newly created block storage disk.
+    pub fn insert_disk(&mut self, disk: StoredDisk) {
+        self.disks.insert(disk.name.clone(), disk);
     }
 
     /// Remove the instance `name` names, answering it. `None` when nothing
@@ -2400,7 +2575,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// Materialise every transition the clock had already made due at `now_ms`:
-    /// an instance settles into the state it was owed, a container service walks
+    /// an instance or a disk settles into the state it was owed, a container service walks
     /// into the phase it was owed (activating the deployment that was waiting),
     /// and an operation whose work is done settles into `Succeeded`.
     ///
@@ -2408,15 +2583,22 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// owed at this instant whether or not anybody called, so applying it here
     /// cannot show a caller anything a later caller would not also see.
     ///
-    /// Every walk is bounded by [`MAX_INSTANCES`], [`MAX_CONTAINER_SERVICES`] and
-    /// [`MAX_OPERATION_HISTORY`], and a record drops out of the work as soon as
-    /// it has nothing outstanding.
+    /// Every walk is bounded by [`MAX_INSTANCES`], [`MAX_DISKS`],
+    /// [`MAX_CONTAINER_SERVICES`] and [`MAX_OPERATION_HISTORY`], and a record
+    /// drops out of the work as soon as it has nothing outstanding.
     fn advance_clock(&mut self, now_ms: i64) {
         for instance in self.instances.values_mut() {
             let Some(due) = instance.due else { continue };
             if due.at_ms <= now_ms {
                 instance.state = due.state;
                 instance.due = None;
+            }
+        }
+        for disk in self.disks.values_mut() {
+            let Some(due) = disk.due else { continue };
+            if due.at_ms <= now_ms {
+                disk.state = due.state;
+                disk.due = None;
             }
         }
         for service in self.container_services.values_mut() {
@@ -2446,9 +2628,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
 /// accepted; each add-on is stored enabled, carrying the parameters its own
 /// request structure supplies. An `AutoSnapshot` request that names no
 /// `snapshotTimeOfDay` gets the hour Lightsail would pick for it, drawn here from
-/// the instance's own name so the answer is the same on every later read.
+/// the resource's own name so the answer is the same on every later read.
 pub fn add_ons_from_requests(
-    instance_name: &str,
+    resource_name: &str,
     requests: &[AddOnRequest],
 ) -> Result<Vec<AddOn>, String> {
     if requests.len() > MAX_ADD_ONS {
@@ -2468,7 +2650,7 @@ pub fn add_ons_from_requests(
                         .auto_snapshot_add_on_request
                         .as_ref()
                         .and_then(|auto| auto.snapshot_time_of_day.clone())
-                        .unwrap_or_else(|| default_snapshot_time_of_day(instance_name)),
+                        .unwrap_or_else(|| default_snapshot_time_of_day(resource_name)),
                 ),
                 ..Default::default()
             }),
@@ -2493,13 +2675,13 @@ pub fn add_ons_from_requests(
         .collect()
 }
 
-/// The daily automatic-snapshot hour for `instance_name`, in the `HH:00` form the
+/// The daily automatic-snapshot hour for `resource_name`, in the `HH:00` form the
 /// modelled `TimeOfDay` pattern `^(0[0-9]|1[0-9]|2[0-3]):[0-5][0-9]$` requires.
 ///
-/// Derived from the instance's own name rather than drawn per call, so every read
-/// of the instance reports the same hour.
-fn default_snapshot_time_of_day(instance_name: &str) -> String {
-    let digest = Sha256::digest(instance_name.as_bytes());
+/// Derived from the resource's own name rather than drawn per call, so every read
+/// of the resource reports the same hour.
+fn default_snapshot_time_of_day(resource_name: &str) -> String {
+    let digest = Sha256::digest(resource_name.as_bytes());
     format!("{:02}:00", u32::from(digest[0]) % 24)
 }
 
@@ -2725,6 +2907,15 @@ pub fn instance_arn(region: &str, id: &str) -> String {
     )
 }
 
+/// The ARN of the block storage disk `id` in `region`.
+pub fn disk_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{DISK_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
 /// The ARN of the domain recordset `id`. A DNS zone is not regional, so its ARN
 /// carries [`DOMAIN_ARN_REGION`] where an instance ARN carries a region.
 pub fn domain_arn(id: &str) -> String {
@@ -2763,8 +2954,8 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// Run `body` against this service's store, with every clock-owed transition
 /// already applied.
 ///
-/// EVERY handler goes through here, so no handler can observe an instance that
-/// should already have settled. `None` means the engine is not the shared
+/// EVERY handler goes through here, so no handler can observe an instance or a
+/// disk that should already have settled. `None` means the engine is not the shared
 /// in-memory one — answer it with a modelled server error, never with a fresh
 /// engine.
 pub fn with_state<Eng: Send + Sync + 'static, R>(
