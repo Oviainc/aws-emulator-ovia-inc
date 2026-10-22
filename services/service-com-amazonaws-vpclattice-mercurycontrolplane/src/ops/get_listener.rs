@@ -127,12 +127,14 @@ impl From<GetListenerErrorModeled> for GetListenerError {
     }
 }
 
-/// HTTP 404 for an identifier that names no persisted listener of this service.
-fn not_found(identifier: &str, resource_type: &str) -> GetListenerError {
+/// HTTP 404 for an identifier that names no persisted listener of this service (or no
+/// persisted service at all), with AWS's not-found message construction over the
+/// submitted identifier ([`crate::state::ResourceKind::not_found_message`]).
+fn not_found(identifier: &str, kind: crate::state::ResourceKind) -> GetListenerError {
     GetListenerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("{resource_type} {identifier} not found"),
+        message: kind.not_found_message(identifier),
         resource_id: identifier.to_string(),
-        resource_type: resource_type.to_string(),
+        resource_type: kind.arn_kind().to_string(),
     })
     .into()
 }
@@ -190,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(not_found(
                 &input.service_identifier,
-                crate::state::KIND_SERVICE,
+                crate::state::ResourceKind::Service,
             ));
         };
         let Some(listener_id) = crate::state::id_from_identifier(
@@ -199,14 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(not_found(
                 &input.listener_identifier,
-                crate::state::KIND_LISTENER,
+                crate::state::ResourceKind::Listener,
             ));
         };
         let store = state.lock();
         if !store.services.contains_key(&service_id) {
             return Err(not_found(
                 &input.service_identifier,
-                crate::state::KIND_SERVICE,
+                crate::state::ResourceKind::Service,
             ));
         }
         // A listener is a resource OF its service: one stored under a different service
@@ -218,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(not_found(
                 &input.listener_identifier,
-                crate::state::KIND_LISTENER,
+                crate::state::ResourceKind::Listener,
             ));
         };
         Ok(GetListenerOutput {
