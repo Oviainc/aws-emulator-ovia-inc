@@ -409,11 +409,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
         }
 
+        // `EngineVersion`: a version the engine does not offer cannot be run, so the
+        // request is refused with the awsQuery common code for parameters that cannot hold
+        // together — the same rule `CreateDBCluster` applies, and the same catalogue
+        // (`docdb::DOCDB_ENGINE_VERSIONS`). A version named as a line (`5.0`) resolves to
+        // the newest published version in it, which is what gets stored.
+        let engine_version = match &input.engine_version {
+            Some(requested) => Some(
+                docdb::resolve_engine_version(requested)
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::query_common(
+                            crate::scaffolded::QueryCommonError::InvalidParameterCombination,
+                            format!(
+                                "Cannot find version {requested} for {}",
+                                docdb::DOCDB_ENGINE
+                            ),
+                        )
+                    })?
+                    .to_string(),
+            ),
+            None => None,
+        };
+
+        // `DBClusterParameterGroupName` must name a group that exists, or the modelled 404
+        // says which one did not — the same referential rule `CreateDBCluster` applies, and
+        // the group's RESOLVED name is what the record keeps, so the cluster names the group
+        // the way the group is named.
+        let db_cluster_parameter_group = match &input.db_cluster_parameter_group_name {
+            Some(requested) => {
+                let Some(group) =
+                    docdb::resolve_parameter_group(requested, &docdb::request_region(ctx))
+                else {
+                    return Err(
+                        ModifyDBClusterErrorModeled::DBClusterParameterGroupNotFoundFault(
+                            DBClusterParameterGroupNotFoundFault {
+                                message: Some(format!(
+                                    "DBClusterParameterGroup not found: {requested}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                group.db_cluster_parameter_group_name
+            }
+            None => None,
+        };
+
         // `AllowMajorVersionUpgrade`: "You must allow major version upgrades when
         // specifying a value for the EngineVersion parameter that is a different major
         // version than the cluster's current version." Checked here, before any field is
         // written, for the same reason as the cap above.
-        if let Some(requested) = &input.engine_version {
+        if let Some(requested) = &engine_version {
             let current = store
                 .clusters
                 .get(&key)
@@ -455,13 +502,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(protection) = input.deletion_protection {
                 record.deletion_protection = protection;
             }
-            if let Some(group) = input.db_cluster_parameter_group_name {
+            if let Some(group) = db_cluster_parameter_group {
                 record.db_cluster_parameter_group = Some(group);
             }
             if let Some(groups) = input.vpc_security_group_ids {
                 record.vpc_security_group_ids = groups;
             }
-            if let Some(version) = input.engine_version {
+            if let Some(version) = engine_version {
                 record.engine_version = version;
             }
             if let Some(storage_type) = input.storage_type {

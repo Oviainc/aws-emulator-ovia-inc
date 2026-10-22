@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDisk
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDisk`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts one block storage disk into this service's store under the disk name
+//! the request names, in the Availability Zone it names, and answers the
+//! operation-log entry the insert appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDisk::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +169,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDisk` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDiskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDisk"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: the disk's region is the region of the availability
+        // zone the request names, not the one the request signed for.
+        let _ = ctx;
+
+        // `diskName`, `availabilityZone` and `sizeInGb` are modelled `@required`
+        // members and every pattern on this input is a modelled constraint, so
+        // the centralized walk refused anything outside them before this body
+        // ran. What is left is what the model cannot express: the zone must name
+        // a zone this service serves, the size must be within the range
+        // Lightsail creates a disk in, the add-ons must be ones a disk can
+        // carry, the name must not already be taken, and the caller-sized lists
+        // must be within the store's bounds. Every one of those is checked
+        // BEFORE the first write, so a refused request creates nothing.
+        let region = crate::state::region_of_availability_zone(&input.availability_zone)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "availabilityZone '{}' is not a zone of a Lightsail region: it must be \
+                     a region name followed by a zone letter, for one of [{}]",
+                    input.availability_zone,
+                    crate::state::region_names()
+                ))
+            })?;
+        if !(crate::state::MIN_DISK_SIZE_IN_GB..=crate::state::MAX_DISK_SIZE_IN_GB)
+            .contains(&input.size_in_gb)
+        {
+            return Err(invalid(format!(
+                "sizeInGb must be between {} and {} GB, got {}",
+                crate::state::MIN_DISK_SIZE_IN_GB,
+                crate::state::MAX_DISK_SIZE_IN_GB,
+                input.size_in_gb
+            )));
+        }
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        // Of the modelled `AddOnType` members, only `AutoSnapshot` describes a
+        // disk: the other one stops a virtual computer after an idle period
+        // (`StopInstanceOnIdleRequest` — "the amount of idle time in minutes
+        // after which your virtual computer will automatically stop"), which a
+        // block storage disk does not have, so asking for it on a disk is
+        // refused rather than stored as an add-on that can never act.
+        let add_on_requests = input.add_ons.clone().unwrap_or_default();
+        if let Some(request) = add_on_requests
+            .iter()
+            .find(|request| request.add_on_type != ADD_ON_TYPE_AUTO_SNAPSHOT)
+        {
+            return Err(invalid(format!(
+                "addOns[].addOnType '{}' cannot be enabled on a disk: a disk accepts only \
+                 {ADD_ON_TYPE_AUTO_SNAPSHOT}",
+                request.add_on_type
+            )));
+        }
+        let add_ons = crate::state::add_ons_from_requests(&input.disk_name, &add_on_requests)
+            .map_err(invalid)?;
+
+        let name = input.disk_name;
+        let location = crate::state::StoredLocation::zonal(&input.availability_zone, region);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A disk name addresses one disk, so creating one this account
+            // already holds is refused rather than silently replacing the record
+            // an instance may already be using.
+            if store.disk(&name).is_some() {
+                return Err(invalid(format!("a disk named '{name}' already exists")));
+            }
+            if store.disks.len() >= crate::state::MAX_DISKS {
+                return Err(invalid(format!(
+                    "creating a disk would take this account past the {} this emulator \
+                     holds",
+                    crate::state::MAX_DISKS
+                )));
+            }
+
+            let id = store.mint_uuid();
+            // A new disk is not usable yet: the clock owes it `available`, which
+            // is why a read straight after this call still reports `pending`,
+            // exactly as it does against AWS.
+            let due = crate::state::DueDiskState::after(now, crate::state::DISK_STATE_AVAILABLE);
+            store.insert_disk(crate::state::StoredDisk {
+                name: name.clone(),
+                arn: crate::state::disk_arn(region, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags,
+                add_ons,
+                size_in_gb: input.size_in_gb,
+                state: crate::state::DISK_STATE_PENDING,
+                due: Some(due),
+                // Nothing is using the disk yet: `AttachDisk` is what attaches it
+                // to an instance and names the path it is mounted at.
+                attached_to: None,
+                path: None,
+            });
+            // `operations` is a list because other Lightsail creates act on
+            // several resources at once; `CreateDisk` creates exactly one disk,
+            // so it answers exactly one entry, left non-terminal until the
+            // provisioning the clock owes the disk is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_DISK,
+                crate::state::RESOURCE_TYPE_DISK,
+                &name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(CreateDiskOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The one modelled `AddOnType` member a block storage disk can carry: the
+/// automatic snapshot add-on.
+const ADD_ON_TYPE_AUTO_SNAPSHOT: &str = "AutoSnapshot";
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateDiskError {
+    CreateDiskErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateDiskError {
+    CreateDiskErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail disk store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
