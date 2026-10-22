@@ -187,6 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn,
                 whitelist_rules,
                 tags: input.tags.unwrap_or_default(),
+                deleted: false,
             },
         );
 

@@ -17,6 +17,16 @@
 //! * `InvalidStateException` models a single `message`, and both its own model
 //!   documentation and the recorded wire response carry one fixed
 //!   deletion-protection refusal sentence, which names no resource.
+//! * `ConflictException` models a REQUIRED `resources` list — "the list of
+//!   resources referenced with this failed request", each a
+//!   `ResourceConflict{resourceId, resourceType}` — so the collision is
+//!   reported there and the message is one fixed summary, the same for every
+//!   cause (a contested alias name, a name awaiting deletion, a name already
+//!   used inside a store, an idempotency token replayed with other
+//!   parameters) and every operation that can conflict.
+//! * `TooManyTagsException` models `resourceName`, so the resource at the tag
+//!   limit is reported there and neither the count nor the offending key is in
+//!   the message.
 //!
 //! Every assertion goes over the wire through the same `MultiServiceRouter` the
 //! emulator binary serves, reusing the shared harness in [`crate::harness`].
@@ -63,6 +73,23 @@ const RESOURCE_TYPE_VALUES: &[&str] = &[
 
 /// The prefix an alias reference carries, from `CreatePolicyStoreAliasInput$aliasName`.
 const ALIAS_PREFIX: &str = "policy-store-alias/";
+
+/// The one message every `ConflictException` of this service carries.
+///
+/// Written out here rather than imported, for the same reason as the constants
+/// above. It is the text the recordings show the service emitting for two
+/// structurally different conflict causes on `CreatePolicyStoreAlias`, which is
+/// what establishes it as fixed rather than request-derived.
+const CONFLICT_MESSAGE: &str = "Conflict occurred during the processing of this request";
+
+/// The one message every `TooManyTagsException` of this service carries.
+const TOO_MANY_TAGS_MESSAGE: &str = "The request exceeds the maximum number of user tags allowed";
+
+/// Published Verified Permissions quota: *tags per resource*. The model states
+/// it twice — `TagResource`'s documentation ("You can associate as many as 50
+/// tags with a resource") and `TooManyTagsException`'s ("the limit (50) has been
+/// reached").
+const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// `PolicyStoreId`'s published upper length bound (`length 1..200`).
 const MAX_POLICY_STORE_ID_LEN: usize = 200;
@@ -725,5 +752,556 @@ async fn the_deletion_protection_refusal_carries_the_documented_constant() {
         distinct.len(),
         1,
         "the deletion-protection refusal must be ONE constant across every protected store, got {refusals:?}"
+    );
+}
+
+/// One conflict row: the request that collides, the values that must NOT be
+/// spliced into the message, and the `(resourceId, resourceType)` entries the
+/// required `resources` list must report.
+struct Conflict {
+    case: &'static str,
+    operation: &'static str,
+    request: Value,
+    /// Values of the request, or of the state it collided with, that must not
+    /// appear anywhere in the message.
+    absent: Vec<String>,
+    /// The entries `resources` must carry, in order.
+    resources: Vec<(String, &'static str)>,
+}
+
+/// The `(resourceId, resourceType)` pairs a fault's `resources` list carries.
+fn resource_entries(body: &Value) -> Vec<(String, String)> {
+    body["resources"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry["resourceId"].as_str().unwrap_or_default().to_string(),
+                        entry["resourceType"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A second, different Cedar statement, so a row that must collide on a NAME
+/// does not also carry the first policy's text.
+const OTHER_STATEMENT: &str = "forbid(principal, action, resource);";
+
+/// Every conflicting path of this service answers ONE constant message, with
+/// the collision reported in the required `resources` list.
+///
+/// The rows differ along the operation (`CreatePolicyStoreAlias`,
+/// `CreatePolicyStore`, `CreatePolicy`, `CreatePolicyTemplate`,
+/// `CreateIdentitySource`), along the CAUSE of the conflict (a name a live
+/// alias of another store holds, a name awaiting deletion, a name another
+/// resource in the store already carries, an idempotency token replayed with
+/// different parameters), and along the TYPE of resource collided with
+/// (`POLICY_STORE_ALIAS`, `POLICY_STORE`, `POLICY`, `POLICY_TEMPLATE`,
+/// `IDENTITY_SOURCE`).
+#[tokio::test]
+async fn every_conflict_path_answers_the_same_constant_message() {
+    let router = router();
+    let store_a = store_with_mode(&router, "OFF").await;
+    let store_b = store_with_mode(&router, "OFF").await;
+
+    // A live alias of `store_a`: its name cannot be taken for another store.
+    let held_name = "held-by-another-store";
+    let held_alias = format!("{ALIAS_PREFIX}{held_name}");
+    ok(
+        &router,
+        "CreatePolicyStoreAlias",
+        &json!({ "aliasName": held_alias, "policyStoreId": store_a }),
+    )
+    .await;
+
+    // An alias soft-deleted, so its name is held in `PendingDeletion`.
+    let pending_name = "awaiting-deletion";
+    let pending_alias = format!("{ALIAS_PREFIX}{pending_name}");
+    ok(
+        &router,
+        "CreatePolicyStoreAlias",
+        &json!({ "aliasName": pending_alias, "policyStoreId": store_a }),
+    )
+    .await;
+    ok(
+        &router,
+        "DeletePolicyStoreAlias",
+        &json!({ "aliasName": pending_alias }),
+    )
+    .await;
+
+    // A store created under an idempotency token.
+    let store_token = "11111111-1111-1111-1111-111111111111";
+    let tokened_store = ok(
+        &router,
+        "CreatePolicyStore",
+        &json!({
+            "validationSettings": { "mode": "OFF" },
+            "description": "first",
+            "clientToken": store_token,
+        }),
+    )
+    .await;
+    let tokened_store_id = tokened_store["policyStoreId"]
+        .as_str()
+        .expect("policyStoreId is required on the CreatePolicyStore response")
+        .to_string();
+
+    // A named policy, and a policy created under a token, both in `store_a`.
+    let policy_name = "duplicated-policy-name";
+    let named_policy = ok(
+        &router,
+        "CreatePolicy",
+        &json!({
+            "policyStoreId": store_a,
+            "name": policy_name,
+            "definition": { "static": { "statement": STATEMENT } },
+        }),
+    )
+    .await;
+    let named_policy_id = named_policy["policyId"]
+        .as_str()
+        .expect("policyId is required on the CreatePolicy response")
+        .to_string();
+    let policy_token = "22222222-2222-2222-2222-222222222222";
+    let tokened_policy = ok(
+        &router,
+        "CreatePolicy",
+        &json!({
+            "policyStoreId": store_a,
+            "clientToken": policy_token,
+            "definition": { "static": { "statement": OTHER_STATEMENT, "description": "first" } },
+        }),
+    )
+    .await;
+    let tokened_policy_id = tokened_policy["policyId"]
+        .as_str()
+        .expect("policyId is required on the CreatePolicy response")
+        .to_string();
+
+    // A named template, and a template created under a token.
+    let template_name = "duplicated-template-name";
+    let named_template = ok(
+        &router,
+        "CreatePolicyTemplate",
+        &json!({
+            "policyStoreId": store_a,
+            "name": template_name,
+            "statement": TEMPLATE_STATEMENT,
+        }),
+    )
+    .await;
+    let named_template_id = named_template["policyTemplateId"]
+        .as_str()
+        .expect("policyTemplateId is required on the CreatePolicyTemplate response")
+        .to_string();
+    let template_token = "33333333-3333-3333-3333-333333333333";
+    let tokened_template = ok(
+        &router,
+        "CreatePolicyTemplate",
+        &json!({
+            "policyStoreId": store_a,
+            "statement": TEMPLATE_STATEMENT,
+            "description": "first",
+            "clientToken": template_token,
+        }),
+    )
+    .await;
+    let tokened_template_id = tokened_template["policyTemplateId"]
+        .as_str()
+        .expect("policyTemplateId is required on the CreatePolicyTemplate response")
+        .to_string();
+
+    // An identity source created under a token.
+    let source_token = "44444444-4444-4444-4444-444444444444";
+    let tokened_source = ok(
+        &router,
+        "CreateIdentitySource",
+        &json!({
+            "policyStoreId": store_a,
+            "configuration": cognito_configuration(),
+            "principalEntityType": "MyCorp::User",
+            "clientToken": source_token,
+        }),
+    )
+    .await;
+    let tokened_source_id = tokened_source["identitySourceId"]
+        .as_str()
+        .expect("identitySourceId is required on the CreateIdentitySource response")
+        .to_string();
+
+    let rows = vec![
+        Conflict {
+            case: "CreatePolicyStoreAlias, a name a live alias of another store holds",
+            operation: "CreatePolicyStoreAlias",
+            request: json!({ "aliasName": held_alias, "policyStoreId": store_b }),
+            absent: vec![
+                held_alias.clone(),
+                held_name.to_string(),
+                store_a.clone(),
+                store_b.clone(),
+            ],
+            resources: vec![
+                (held_name.to_string(), "POLICY_STORE_ALIAS"),
+                (store_a.clone(), "POLICY_STORE"),
+            ],
+        },
+        Conflict {
+            case: "CreatePolicyStoreAlias, a name awaiting deletion, same store",
+            operation: "CreatePolicyStoreAlias",
+            request: json!({ "aliasName": pending_alias, "policyStoreId": store_a }),
+            absent: vec![
+                pending_alias.clone(),
+                pending_name.to_string(),
+                store_a.clone(),
+                "PendingDeletion".to_string(),
+            ],
+            resources: vec![
+                (pending_name.to_string(), "POLICY_STORE_ALIAS"),
+                (store_a.clone(), "POLICY_STORE"),
+            ],
+        },
+        Conflict {
+            case: "CreatePolicyStoreAlias, a name awaiting deletion, another store",
+            operation: "CreatePolicyStoreAlias",
+            request: json!({ "aliasName": pending_alias, "policyStoreId": store_b }),
+            absent: vec![
+                pending_alias.clone(),
+                pending_name.to_string(),
+                store_b.clone(),
+                "PendingDeletion".to_string(),
+            ],
+            resources: vec![
+                (pending_name.to_string(), "POLICY_STORE_ALIAS"),
+                (store_a.clone(), "POLICY_STORE"),
+            ],
+        },
+        Conflict {
+            case: "CreatePolicyStore, token replayed with a different description",
+            operation: "CreatePolicyStore",
+            request: json!({
+                "validationSettings": { "mode": "OFF" },
+                "description": "second",
+                "clientToken": store_token,
+            }),
+            absent: vec![store_token.to_string(), tokened_store_id.clone()],
+            resources: vec![(tokened_store_id.clone(), "POLICY_STORE")],
+        },
+        Conflict {
+            case: "CreatePolicy, a name another policy in the store already carries",
+            operation: "CreatePolicy",
+            request: json!({
+                "policyStoreId": store_a,
+                "name": policy_name,
+                "definition": { "static": { "statement": OTHER_STATEMENT } },
+            }),
+            absent: vec![
+                policy_name.to_string(),
+                named_policy_id.clone(),
+                store_a.clone(),
+            ],
+            resources: vec![(named_policy_id.clone(), "POLICY")],
+        },
+        Conflict {
+            case: "CreatePolicy, token replayed with a different description",
+            operation: "CreatePolicy",
+            request: json!({
+                "policyStoreId": store_a,
+                "clientToken": policy_token,
+                "definition": {
+                    "static": { "statement": OTHER_STATEMENT, "description": "second" },
+                },
+            }),
+            absent: vec![policy_token.to_string(), tokened_policy_id.clone()],
+            resources: vec![(tokened_policy_id.clone(), "POLICY")],
+        },
+        Conflict {
+            case: "CreatePolicyTemplate, a name another template in the store already carries",
+            operation: "CreatePolicyTemplate",
+            request: json!({
+                "policyStoreId": store_a,
+                "name": template_name,
+                "statement": TEMPLATE_STATEMENT,
+            }),
+            absent: vec![
+                template_name.to_string(),
+                named_template_id.clone(),
+                store_a.clone(),
+            ],
+            resources: vec![(named_template_id.clone(), "POLICY_TEMPLATE")],
+        },
+        Conflict {
+            case: "CreatePolicyTemplate, token replayed with a different description",
+            operation: "CreatePolicyTemplate",
+            request: json!({
+                "policyStoreId": store_a,
+                "statement": TEMPLATE_STATEMENT,
+                "description": "second",
+                "clientToken": template_token,
+            }),
+            absent: vec![template_token.to_string(), tokened_template_id.clone()],
+            resources: vec![(tokened_template_id.clone(), "POLICY_TEMPLATE")],
+        },
+        Conflict {
+            case: "CreateIdentitySource, token replayed with another principal entity type",
+            operation: "CreateIdentitySource",
+            request: json!({
+                "policyStoreId": store_a,
+                "configuration": cognito_configuration(),
+                "principalEntityType": "MyCorp::Employee",
+                "clientToken": source_token,
+            }),
+            absent: vec![source_token.to_string(), tokened_source_id.clone()],
+            resources: vec![(tokened_source_id.clone(), "IDENTITY_SOURCE")],
+        },
+    ];
+
+    let mut seen_messages: Vec<(&str, String)> = Vec::new();
+    for Conflict {
+        case,
+        operation,
+        request,
+        absent,
+        resources,
+    } in &rows
+    {
+        let (status, body) = call(&router, operation, request).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected HTTP 409, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ConflictException",
+            "case {case:?}: unexpected error code, got {body}"
+        );
+
+        let message = fault_message(&body);
+        assert_eq!(
+            message, CONFLICT_MESSAGE,
+            "case {case:?}: expected the constant message {CONFLICT_MESSAGE:?}, got {message:?}"
+        );
+        for value in absent {
+            assert!(
+                !message.contains(value.as_str()),
+                "case {case:?}: the message must not interpolate {value:?}, got {message:?}"
+            );
+        }
+
+        // Nothing is lost by the message being a constant: the collision is in
+        // the required `resources` list.
+        let entries = resource_entries(&body);
+        let expected: Vec<(String, String)> = resources
+            .iter()
+            .map(|(id, kind)| (id.clone(), (*kind).to_string()))
+            .collect();
+        assert_eq!(
+            entries, expected,
+            "case {case:?}: expected resources {expected:?}, got {body}"
+        );
+        for (resource_id, resource_type) in &entries {
+            assert!(
+                !resource_id.is_empty(),
+                "case {case:?}: a conflict entry must carry a resourceId, got {body}"
+            );
+            assert!(
+                RESOURCE_TYPE_VALUES.contains(&resource_type.as_str()),
+                "case {case:?}: {resource_type:?} is not one of the modelled ResourceType values"
+            );
+        }
+
+        seen_messages.push((*case, message));
+    }
+
+    // One text across every row: the point of the rule is that a client keys on
+    // the code and reads the specifics from `resources`.
+    let distinct: std::collections::BTreeSet<&str> = seen_messages
+        .iter()
+        .map(|(_, message)| message.as_str())
+        .collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "the conflict message must be ONE constant across every path, got {seen_messages:?}"
+    );
+}
+
+/// The tag-limit refusal carries `TooManyTagsException`'s constant message and
+/// names the resource in the modelled `resourceName` — whatever shape the merge
+/// that would cross the limit took — while a merge that lands exactly ON the
+/// published limit succeeds.
+///
+/// The rows differ along how the limit is crossed: in one request on an empty
+/// resource (one key past it, and far past it), by one key on a full resource,
+/// and by a merge mixing replacements of keys the resource holds with new ones.
+#[tokio::test]
+async fn the_tag_limit_refusal_carries_the_constant_message_and_names_the_resource() {
+    /// One row: how many tags the resource already holds, the tags the request
+    /// sends, and how many the merge would leave it with.
+    struct Row {
+        case: &'static str,
+        /// Keys `key0..keyN` seeded on the resource before the request.
+        seeded: usize,
+        /// The request's tag map.
+        tags: Value,
+        /// What the merge would leave the resource holding.
+        merged: usize,
+    }
+
+    /// `n` distinct tags, keyed `<prefix>0..<prefix>n-1`.
+    fn tags(prefix: &str, n: usize) -> Value {
+        Value::Object(
+            (0..n)
+                .map(|index| (format!("{prefix}{index}"), json!(format!("v{index}"))))
+                .collect(),
+        )
+    }
+
+    let rows = vec![
+        Row {
+            case: "one request, one key past the limit, on an empty resource",
+            seeded: 0,
+            tags: tags("key", MAX_TAGS_PER_RESOURCE + 1),
+            merged: MAX_TAGS_PER_RESOURCE + 1,
+        },
+        Row {
+            case: "one request, far past the limit, on an empty resource",
+            seeded: 0,
+            tags: tags("key", MAX_TAGS_PER_RESOURCE * 2),
+            merged: MAX_TAGS_PER_RESOURCE * 2,
+        },
+        Row {
+            case: "one new key on a resource already at the limit",
+            seeded: MAX_TAGS_PER_RESOURCE,
+            tags: json!({ "onemore": "v" }),
+            merged: MAX_TAGS_PER_RESOURCE + 1,
+        },
+        Row {
+            case: "a merge mixing a replacement with two new keys",
+            seeded: MAX_TAGS_PER_RESOURCE - 1,
+            tags: json!({ "key0": "replaced", "new-one": "v", "new-two": "v" }),
+            merged: MAX_TAGS_PER_RESOURCE + 1,
+        },
+    ];
+
+    let router = router();
+    let mut refusals: Vec<(&str, String)> = Vec::new();
+    for Row {
+        case,
+        seeded,
+        tags: requested,
+        merged,
+    } in &rows
+    {
+        let store_id = store_with_mode(&router, "OFF").await;
+        let arn = store_arn(&router, &store_id).await;
+        if *seeded > 0 {
+            ok(
+                &router,
+                "TagResource",
+                &json!({ "resourceArn": arn, "tags": tags("key", *seeded) }),
+            )
+            .await;
+        }
+
+        let (status, body) = call(
+            &router,
+            "TagResource",
+            &json!({ "resourceArn": arn, "tags": requested }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "TooManyTagsException",
+            "case {case:?}: unexpected error code, got {body}"
+        );
+
+        let message = fault_message(&body);
+        assert_eq!(
+            message, TOO_MANY_TAGS_MESSAGE,
+            "case {case:?}: expected the constant message {TOO_MANY_TAGS_MESSAGE:?}, \
+             got {message:?}"
+        );
+        assert!(
+            !message.contains(&merged.to_string()),
+            "case {case:?}: the message must not interpolate the merged count {merged}, \
+             got {message:?}"
+        );
+        assert!(
+            !message.contains(arn.as_str()) && !message.contains(store_id.as_str()),
+            "case {case:?}: the message must not interpolate the resource {arn:?}, \
+             got {message:?}"
+        );
+        for key in requested
+            .as_object()
+            .expect("a row's tag map is an object")
+            .keys()
+        {
+            assert!(
+                !message.contains(key.as_str()),
+                "case {case:?}: the message must not interpolate the key {key:?}, got {message:?}"
+            );
+        }
+
+        // The resource at the limit is reported in the member that models it.
+        assert_eq!(
+            body["resourceName"].as_str().unwrap_or_default(),
+            arn.as_str(),
+            "case {case:?}: expected resourceName {arn:?}, got {body}"
+        );
+
+        // And the refusal is a refusal: the stored set is the seeded one.
+        let listed = ok(
+            &router,
+            "ListTagsForResource",
+            &json!({ "resourceArn": arn }),
+        )
+        .await;
+        let kept = listed["tags"]
+            .as_object()
+            .map(serde_json::Map::len)
+            .unwrap_or_default();
+        assert_eq!(
+            kept, *seeded,
+            "case {case:?}: a refused merge must leave {seeded} tags, got {listed}"
+        );
+
+        refusals.push((*case, message));
+    }
+
+    // The published bound itself is accepted, which is what makes the rows above
+    // refusals of crossing it rather than of the limit being off by one.
+    let at_limit = store_with_mode(&router, "OFF").await;
+    let at_limit_arn = store_arn(&router, &at_limit).await;
+    let (status, body) = call(
+        &router,
+        "TagResource",
+        &json!({ "resourceArn": at_limit_arn, "tags": tags("key", MAX_TAGS_PER_RESOURCE) }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"exactly at the published limit\": expected HTTP 200, got {status} {body}"
+    );
+
+    let distinct: std::collections::BTreeSet<&str> = refusals
+        .iter()
+        .map(|(_, message)| message.as_str())
+        .collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "the tag-limit refusal must be ONE constant across every merge, got {refusals:?}"
     );
 }

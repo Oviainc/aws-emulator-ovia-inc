@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeRuleGroupsNamespaceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Workspace not found: {}", input.workspace_id),
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
                         resource_id: input.workspace_id.clone(),
                         resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                     },
@@ -181,10 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeRuleGroupsNamespaceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Rule groups namespace not found: {} in workspace {}",
-                            input.name, input.workspace_id,
-                        ),
+                        message: crate::state::RULE_GROUPS_NAMESPACE_NOT_FOUND_MESSAGE
+                            .to_string(),
                         resource_id: input.name.clone(),
                         resource_type: crate::state::RULE_GROUPS_NAMESPACE_RESOURCE_TYPE
                             .to_string(),

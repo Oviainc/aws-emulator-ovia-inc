@@ -44,10 +44,10 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    BasicLayout, EventBridgeConfiguration, FieldAttributes, FieldOption, FieldValueUnion,
-    InternalServerException, LayoutConfiguration, LayoutContent, LayoutSections, RequiredField,
-    ResourceNotFoundException, Section, ServiceQuotaExceededException, TagPropagationConfiguration,
-    UserUnion, ValidationException,
+    BasicLayout, ConflictException, EventBridgeConfiguration, FieldAttributes, FieldOption,
+    FieldValueUnion, InternalServerException, LayoutConfiguration, LayoutContent, LayoutSections,
+    RequiredField, ResourceNotFoundException, Section, ServiceQuotaExceededException,
+    TagPropagationConfiguration, UserUnion, ValidationException,
 };
 
 /// The ARN namespace (and SigV4 signing name / endpoint prefix) of this service,
@@ -77,15 +77,55 @@ pub const FIELD_TYPE_SINGLE_SELECT: &str = "SingleSelect";
 /// One of `FIELD_NAMESPACE_VALUES` (`Custom | System`).
 pub const FIELD_NAMESPACE_CUSTOM: &str = "Custom";
 
+/// `FieldNamespace` of a field the SERVICE defines, as
+/// [`RESERVED_SYSTEM_FIELDS`] seeds them into every new domain.
+/// One of `FIELD_NAMESPACE_VALUES` (`Custom | System`).
+pub const FIELD_NAMESPACE_SYSTEM: &str = "System";
+
+/// The reserved `System`-namespace fields every Cases domain is provisioned
+/// with, as `(fieldId, FieldType)`. A domain's schema holds these from the
+/// moment it is created — no `CreateField` call makes them — so a case can be
+/// written against them straight away.
+///
+/// The model does NOT enumerate them: `FieldId` is a free-form string
+/// (`smithy_query(query="shape",shape="FieldId")`, `@length 1..500`) and
+/// `FieldNamespace` only names the two namespaces
+/// (`smithy_query(query="shape",shape="FieldNamespace")` = `Custom | System`).
+/// The ids and types below are the service's own reserved vocabulary, as the
+/// Amazon Connect Administrator Guide's "Cases fields" tables list them and as
+/// the recorded traffic shows them: the ids are reserved words, verbatim, not
+/// minted per domain, and each one's `FieldType` is a value of
+/// `FIELD_TYPE_VALUES` so a value written against it is type-checked like any
+/// other field's.
+///
+/// Two of them — `created_datetime` and `last_updated_datetime` — are instants
+/// the real service maintains itself. Neither the model nor the recorded traffic
+/// says whether it refuses, ignores or accepts a caller's write to them, so they
+/// are provisioned as the ordinary `DateTime` fields they are typed as and the
+/// question is left to a recording that settles it.
+pub const RESERVED_SYSTEM_FIELDS: &[(&str, &str)] = &[
+    ("assigned_queue", "Text"),
+    ("assigned_user", "User"),
+    ("case_reason", "SingleSelect"),
+    ("created_datetime", "DateTime"),
+    ("customer_id", "Text"),
+    ("last_updated_datetime", "DateTime"),
+    ("reference_number", "Text"),
+    ("status", "Text"),
+    ("summary", "Text"),
+    ("title", "Text"),
+];
+
 /// Most domains this emulator's store holds. EMULATOR-OWNED ceiling on
 /// request-driven growth, not an AWS-published quota: the real service's limit
 /// is an account quota a support request can raise, while this one exists so a
 /// caller cannot grow the in-memory store without end.
 pub const MAX_DOMAINS: usize = 100;
 
-/// Most fields one domain holds. Emulator-owned ceiling, as [`MAX_DOMAINS`].
-/// It also bounds a case's stored field values, since only a field the domain
-/// defines can be written.
+/// Most fields one domain holds for a caller. Emulator-owned ceiling, as
+/// [`MAX_DOMAINS`]. It also bounds a case's stored field values, since only a
+/// field the domain defines can be written — the reserved
+/// [`RESERVED_SYSTEM_FIELDS`] beside it are a fixed, service-provisioned set.
 pub const MAX_FIELDS_PER_DOMAIN: usize = 500;
 
 /// Most templates one domain holds. Emulator-owned ceiling, as [`MAX_DOMAINS`].
@@ -448,10 +488,19 @@ impl Domain {
         fields
     }
 
-    /// Refuse a new field once the domain holds [`MAX_FIELDS_PER_DOMAIN`].
+    /// Refuse a new field once the domain holds [`MAX_FIELDS_PER_DOMAIN`] of
+    /// them. Only the fields a CALLER made are counted: the ceiling bounds
+    /// request-driven growth, and the reserved `System` fields
+    /// ([`RESERVED_SYSTEM_FIELDS`]) the service provisions the domain with are
+    /// not a caller's doing, so they do not eat a caller's budget.
     pub fn field_capacity(&self) -> Result<(), ServiceQuotaExceededException> {
+        let created_by_a_caller = self
+            .fields
+            .values()
+            .filter(|field| field.namespace != FIELD_NAMESPACE_SYSTEM)
+            .count();
         capacity(
-            self.fields.len(),
+            created_by_a_caller,
             MAX_FIELDS_PER_DOMAIN,
             "fields in this domain",
         )
@@ -1068,6 +1117,127 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// A new domain's field schema: the reserved `System`-namespace fields
+/// [`RESERVED_SYSTEM_FIELDS`] names, keyed by the reserved id each one is
+/// addressed by.
+///
+/// A reserved field's `name` IS its reserved id: the id is the service's own
+/// word for the field, and nothing in the request names it. Its ARN is built
+/// like any other field's, so it is addressable in the domain's region, and it
+/// is created with the domain, so its instants are the domain's.
+pub fn reserved_system_fields(
+    region: &str,
+    domain_id: &str,
+    created_time: SystemTime,
+) -> HashMap<String, Field> {
+    RESERVED_SYSTEM_FIELDS
+        .iter()
+        .map(|(field_id, field_type)| {
+            (
+                (*field_id).to_string(),
+                Field {
+                    field_id: (*field_id).to_string(),
+                    field_arn: field_arn(region, domain_id, field_id),
+                    name: (*field_id).to_string(),
+                    field_type: (*field_type).to_string(),
+                    namespace: FIELD_NAMESPACE_SYSTEM.to_string(),
+                    description: None,
+                    attributes: None,
+                    deleted: false,
+                    tags: HashMap::new(),
+                    // A reserved field is provisioned with no options: only
+                    // `BatchPutFieldOptions` puts them, and nothing has called
+                    // it against a domain that has just been created.
+                    options: BTreeMap::new(),
+                    created_time,
+                    last_modified_time: created_time,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The reserved [`RESERVED_SYSTEM_FIELDS`] a LAYOUT may not place, by their
+/// reserved ids. The model states this for the layout operations in particular:
+/// "Title and Status fields cannot be part of layouts since they are not
+/// configurable" (`smithy_query(query="doc",shape="CreateLayout")`), so a
+/// layout naming one of them is refused even though the domain's schema does
+/// hold it.
+pub const FIELDS_NOT_CONFIGURABLE_IN_A_LAYOUT: &[&str] = &["title", "status"];
+
+/// The ids among `ids` that a layout may not place, each reported once in
+/// first-seen order. Empty means every referenced field is configurable.
+/// Linear in the number of ids.
+pub fn not_configurable_in_a_layout<'a, I: IntoIterator<Item = &'a str>>(ids: I) -> Vec<String> {
+    let mut reported: HashSet<&str> = HashSet::new();
+    let mut refused: Vec<String> = Vec::new();
+    for id in ids {
+        if FIELDS_NOT_CONFIGURABLE_IN_A_LAYOUT.contains(&id) && reported.insert(id) {
+            refused.push(id.to_string());
+        }
+    }
+    refused
+}
+
+/// The per-item error code a batch read reports for an id it cannot resolve.
+///
+/// A batch read partially succeeds — HTTP 200, with the ids it could not
+/// resolve in its own `errors` list — so the code it reports per item is the
+/// service's own per-item vocabulary, which the model leaves as a free string
+/// (`smithy_query(query="shape",shape="FieldError")` targets `errorCode` at
+/// `String` and enumerates nothing). It is NOT the name of a modelled
+/// exception shape: `ResourceNotFoundException` is how a WHOLE call fails,
+/// while one unresolvable item is `ResourceNotFound`.
+pub const BATCH_ITEM_NOT_FOUND_CODE: &str = "ResourceNotFound";
+
+/// The kind of resource a name-conflict refusal is about: the four kinds this
+/// service names within a container. Taking the kind as a value rather than a
+/// string is what makes [`name_conflict`]'s rendering total — there is no
+/// unknown kind to fall back on, and no runtime capitalisation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Domain,
+    Field,
+    Template,
+    Layout,
+}
+
+impl ResourceKind {
+    /// The kind as the conflict template spells it: `(leading, inline)`.
+    fn words(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Domain => ("Domain", "domain"),
+            Self::Field => ("Field", "field"),
+            Self::Template => ("Template", "template"),
+            Self::Layout => ("Layout", "layout"),
+        }
+    }
+}
+
+/// The modelled 409 for a create or a rename refused because a live resource of
+/// the same kind in the same container already holds the requested name.
+///
+/// The message is rendered from the REQUEST's own name with the service's fixed
+/// template — `<Kind> creation failed: <kind> resource with the name <name>
+/// already exists!` — so a client that matches on it reads back only what it
+/// sent, never a server-minted id of the resource that won the name (which the
+/// loser never saw and cannot match on).
+///
+/// `CreateField`'s rendering is the one the recorded traffic pins; the other
+/// kinds are the same rule applied to the other creates that refuse on a taken
+/// name, so the refusals read alike instead of each inventing a sentence. A
+/// RENAME reuses the same sentence deliberately: it is the same rule, about the
+/// same clash, and nothing records a second wording for it — should a recording
+/// show the verb tracking the caller, that is the one place to change.
+pub fn name_conflict(resource_kind: ResourceKind, name: &str) -> ConflictException {
+    let (leading, inline) = resource_kind.words();
+    ConflictException {
+        message: format!(
+            "{leading} creation failed: {inline} resource with the name {name} already exists!"
+        ),
+    }
 }
 
 /// The modelled 404 for a resource this service does not hold.

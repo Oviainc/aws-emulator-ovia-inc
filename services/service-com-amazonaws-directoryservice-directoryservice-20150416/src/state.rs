@@ -3,9 +3,9 @@
 //! Engine state for the com-amazonaws-directoryservice-directoryservice-20150416 service.
 //!
 //! This module owns the records the handlers in `src/ops/` share — the directories
-//! `CreateDirectory` persists, the aliases `CreateAlias` assigns and the tags
-//! `AddTagsToResource` merges — plus the three pieces of behaviour that cannot live in
-//! any single operation file:
+//! `CreateDirectory` persists, the aliases `CreateAlias` assigns, the Amazon SNS topics
+//! `RegisterEventTopic` associates and the tags `AddTagsToResource` merges — plus the
+//! three pieces of behaviour that cannot live in any single operation file:
 //!
 //! * [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`], which
 //!   materialises the stage transition the clock has already made due (a directory
@@ -22,10 +22,10 @@
 //! field here: the model marks it `@sensitive`, no operation reports it back, and state
 //! this emulator does not need is state it must not hold.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{DirectoryDescription, DirectoryVpcSettingsDescription, Tag};
+use crate::ops::types::{DirectoryDescription, DirectoryVpcSettingsDescription, EventTopic, Tag};
 
 /// How long the stage transition a create owes takes to fall due.
 ///
@@ -69,6 +69,38 @@ pub const MAX_DIRECTORIES: usize = 10;
 /// `TagLimitExceededException` reports.
 pub const MAX_TAGS: usize = 50;
 
+/// The `TopicStatus` of an association this emulator has just made.
+///
+/// The first value of the modelled `TopicStatus` enum, and the one the `Status`
+/// member ("The topic registration status") reports for a registration that holds:
+/// the other values describe a topic the SNS data plane this emulator does not have
+/// would have to report on.
+pub const TOPIC_STATUS_REGISTERED: &str = "Registered";
+
+/// The ARN service segment of an Amazon SNS topic, so a reported `TopicArn` is built
+/// through [`::engine::emulator_arn`] rather than written as a literal.
+const SNS_ARN_SERVICE: &str = "sns";
+
+/// The Region an ARN this service reports carries when the request carries no sigv4
+/// credential scope to read one from — the default `emulator_arn` documents for
+/// generated emulators.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The most Amazon SNS topics this emulator will associate with one directory.
+///
+/// NOT an AWS quota: a resource guard. `RegisterEventTopic` is the one write a caller
+/// can repeat with a fresh name forever, so the per-directory index carries its own
+/// bound, enforced at the single insert site in `register_event_topic.rs`.
+pub const MAX_EVENT_TOPICS_PER_DIRECTORY: usize = 50;
+
+/// The most `TopicNames` entries a single `DescribeEventTopics` will resolve.
+///
+/// NOT an AWS quota: a resource guard, deliberately well above any list a caller has
+/// reason to send — a directory holds at most [`MAX_EVENT_TOPICS_PER_DIRECTORY`]
+/// associations, so a longer list can only repeat names — and it is what keeps the
+/// caller-chosen filter from being allocated and scanned unbounded.
+pub const MAX_TOPIC_NAMES_PER_REQUEST: usize = 100;
+
 /// The most entries this emulator keeps in the alias reservation index.
 ///
 /// NOT an AWS quota: a resource guard. An alias "cannot be deleted or reused", so an
@@ -106,6 +138,37 @@ pub const MAX_NEXT_TOKEN_CHARS: usize = 1024;
 /// build is refused rather than misread.
 const CURSOR_VERSION: &str = "v1";
 
+/// One stored association between a directory and an Amazon SNS topic: what
+/// `RegisterEventTopic` persisted and `DescribeEventTopics` reports.
+#[derive(Debug, Clone)]
+pub struct EventTopicRegistration {
+    pub topic_name: String,
+    /// The topic's ARN, built once at registration through [`sns_topic_arn`] so every
+    /// later read reports the same one.
+    pub topic_arn: String,
+    /// When the association was made — the `CreatedDateTime` member's "the date and
+    /// time of when you associated your directory with the Amazon SNS topic".
+    pub created_at: SystemTime,
+    /// One of the modelled `TopicStatus` values; [`TOPIC_STATUS_REGISTERED`] here.
+    pub status: String,
+}
+
+impl EventTopicRegistration {
+    /// This association as the modelled `EventTopic`, reported for `directory_id`.
+    ///
+    /// The one place a stored registration is rendered, so `DescribeEventTopics`
+    /// reports exactly what was persisted.
+    pub fn to_event_topic(&self, directory_id: &str) -> EventTopic {
+        EventTopic {
+            directory_id: Some(directory_id.to_string()),
+            topic_name: Some(self.topic_name.clone()),
+            topic_arn: Some(self.topic_arn.clone()),
+            created_date_time: Some(as_timestamp(self.created_at)),
+            status: Some(self.status.clone()),
+        }
+    }
+}
+
 /// One stored directory: what `CreateDirectory` persisted and `DescribeDirectories`
 /// reports.
 #[derive(Debug, Clone)]
@@ -139,6 +202,11 @@ pub struct Directory {
     /// This directory's tags, keyed by tag key: a second `AddTagsToResource` with a key
     /// already present overwrites that key's value.
     pub tags: BTreeMap<String, String>,
+    /// The Amazon SNS topics `RegisterEventTopic` associated with this directory, keyed
+    /// by topic name — a directory publishes to a given topic at most once, and the
+    /// associations live on the directory record, so deleting the directory takes its
+    /// associations with it.
+    pub event_topics: BTreeMap<String, EventTopicRegistration>,
     /// Creation rank, from
     /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`]. A
     /// listing pages over directories sorted by this, and its opaque `NextToken`
@@ -167,6 +235,18 @@ impl Directory {
             "http://{alias}{ACCESS_URL_SUFFIX}",
             alias = self.effective_alias()
         )
+    }
+
+    /// This directory's associations as the modelled `EventTopics` list, in topic-name
+    /// order, narrowed to `wanted` when the request asked for particular topic names.
+    pub fn event_topic_list(&self, wanted: Option<&BTreeSet<&String>>) -> Vec<EventTopic> {
+        self.event_topics
+            .values()
+            .filter(|registration| {
+                wanted.is_none_or(|names| names.contains(&registration.topic_name))
+            })
+            .map(|registration| registration.to_event_topic(&self.directory_id))
+            .collect()
     }
 
     /// This directory's tags as the modelled `Tags` list, in key order.
@@ -337,8 +417,34 @@ pub fn as_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// The `EntityDoesNotExistException` message for an id that names no stored directory.
 /// Shared so every operation that resolves a directory says the same thing about the
 /// same failure.
+///
+/// The wording follows Directory Service's own: the quoted id the request asked for,
+/// then "does not exist." — so the message is built from the request and names what the
+/// caller has to fix. The request id AWS appends to it is per-run and this emulator
+/// mints none, so none is invented here.
 pub fn no_such_directory(directory_id: &str) -> String {
-    format!("Directory {directory_id} does not exist")
+    format!("Directory: '{directory_id}' does not exist.")
+}
+
+/// The ARN of the Amazon SNS topic named `topic_name` in `region`.
+///
+/// Built through [`::engine::emulator_arn`], so the account segment is the one
+/// canonical account id every generated emulator presents. An SNS topic ARN's resource
+/// portion is the bare topic name.
+pub fn sns_topic_arn(region: &str, topic_name: &str) -> String {
+    ::engine::emulator_arn(SNS_ARN_SERVICE, region, topic_name)
+}
+
+/// The Region a reported ARN carries: the Region of the caller's sigv4 credential
+/// scope, or [`DEFAULT_REGION`] when the request carries none.
+///
+/// The scope is parsed by `emulator_server::sigv4_credential_scope`, the single source
+/// of SigV4-scope parsing, so a header that is not a well-formed sigv4 `Authorization`
+/// yields the default rather than a bogus Region.
+pub fn region_from_request(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
 /// The `InvalidNextTokenException` message for a token this service did not issue.

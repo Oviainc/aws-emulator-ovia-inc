@@ -15,5 +15,7 @@
 mod project_build_lifecycle;
 #[path = "all/sandbox_lifecycle.rs"]
 mod sandbox_lifecycle;
+#[path = "all/source_credentials.rs"]
+mod source_credentials;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -194,20 +194,23 @@ async fn health_reports_one_entry_per_covered_member() {
             expect_tags: &["Devops-guru-production=batch", "Devops-guru-production=web"],
         },
         Case {
-            name: "two app boundary keys alongside stacks",
+            // An account has exactly ONE app-boundary key
+            // (`APP_BOUNDARY_KEYS_PER_ACCOUNT`), so a wider tag coverage is more VALUES
+            // under that key, carried alongside the stacks.
+            name: "several tag values of the one app boundary key alongside stacks",
             steps: &[(
                 "ADD",
                 &["payments", "ingest"],
                 &[
-                    ("Devops-guru-rds", &["primary"]),
+                    ("Devops-guru-web", &["primary"]),
                     ("Devops-guru-web", &["edge", "origin"]),
                 ],
             )],
             expect_stacks: &["ingest", "payments"],
             expect_tags: &[
-                "Devops-guru-rds=primary",
                 "Devops-guru-web=edge",
                 "Devops-guru-web=origin",
+                "Devops-guru-web=primary",
             ],
         },
         Case {

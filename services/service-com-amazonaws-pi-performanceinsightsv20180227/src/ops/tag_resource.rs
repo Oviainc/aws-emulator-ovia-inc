@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds the request's tags to the report the `ResourceARN` names —
+//! overwriting the value of a key the report already carries and appending one it does
+//! not — so a later `ListTagsForResource` of that ARN reports them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An ARN inside the modelled `AmazonResourceName` pattern that names no report this
+//! account holds is refused with the modelled `NotAuthorizedException` (HTTP 400)
+//! under the service-wide [`crate::state::NOT_AUTHORIZED_MESSAGE`], and a write that
+//! would leave the resource with more tags than the modelled `TagList` maximum
+//! ([`crate::state::MAX_TAGS_PER_REPORT`]) is refused with `InvalidArgumentException`,
+//! adding no tag at all.
+//!
+//! Implementing this operation alongside `ListTagsForResource` and `UntagResource` is
+//! what makes the tag slice READABLE end to end: the three share one home for a
+//! report's tags (the report record), so no two of them can report a different set.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +148,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServiceError(
+                InternalServiceError {
+                    message: Some(
+                        "the Performance Insights report store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // `ServiceType` is required by the model and refused at the boundary when it
+        // is not one of its values; it adds no gate here, because the `ResourceARN`
+        // is what names the resource the tags are added to.
+        let _ = ctx;
+
+        let mut store = state.lock();
+        let Some(report) = store.report_by_arn_mut(&input.resource_arn) else {
+            // A well-formed ARN naming no report this account holds: the uniform
+            // authorization refusal, and nothing is tagged anywhere.
+            return Err(not_authorized());
+        };
+
+        report.apply_tags(&input.tags).map_err(|message| {
+            TagResourceError::from(TagResourceErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            ))
+        })?;
+
+        Ok(TagResourceOutput {})
     }
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal this service answers
+/// for a resource the caller may not see — including an ARN that names no report
+/// at all, so neither answer discloses the other.
+fn not_authorized() -> TagResourceError {
+    TagResourceErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
 }

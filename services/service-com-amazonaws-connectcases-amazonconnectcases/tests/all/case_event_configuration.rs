@@ -16,7 +16,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_EVENT_INCLUDED_FIELD_IDS;
 
-use crate::case_lifecycle::{domain, Emulator};
+use crate::harness::{domain, Emulator};
 
 /// The URI both operations bind to for `domain_id`
 /// (`smithy_query(query="operation", operation="PutCaseEventConfiguration")`:

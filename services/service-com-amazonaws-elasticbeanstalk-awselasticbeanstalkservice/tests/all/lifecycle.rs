@@ -1411,24 +1411,69 @@ async fn the_account_quotas_are_enforced_with_the_modelled_errors() {
     );
 }
 
+/// Every operation whose handler still carries the scaffold marker, as the
+/// `@op <Name>` its header declares, read from this crate's own sources.
+///
+/// The marker line `//! SCAFFOLDED, NOT IMPLEMENTED:` is the stub census, so
+/// the census — not a name written here — is what the probe below walks: an
+/// operation implemented by a later change leaves the list by itself instead
+/// of failing a test that named it.
+fn scaffolded_operations() -> Vec<String> {
+    let ops = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ops");
+    let mut operations = Vec::new();
+    for entry in std::fs::read_dir(&ops).expect("this crate has a src/ops directory") {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("a readable handler");
+        if !source
+            .lines()
+            .any(|line| line.starts_with("//! SCAFFOLDED, NOT IMPLEMENTED:"))
+        {
+            continue;
+        }
+        let operation = source
+            .lines()
+            .find_map(|line| line.strip_prefix("//! @op "))
+            .unwrap_or_else(|| panic!("{} declares no @op name", path.display()))
+            .trim()
+            .to_string();
+        operations.push(operation);
+    }
+    operations.sort();
+    operations
+}
+
 #[tokio::test]
-async fn an_unimplemented_operation_still_answers_501() {
+async fn every_still_scaffolded_operation_refuses_the_call() {
     let emulator = Emulator::new();
-    // The slice this change implements is the application/environment
-    // lifecycle; every other operation keeps the scaffold's 501 until its own
-    // issue is fixed.
-    let refused = emulator
-        .call("CheckDNSAvailability", &[("CNAMEPrefix", "some-prefix")])
-        .await;
-    assert_eq!(
-        refused.status, 501,
-        "case \"CheckDNSAvailability\": expected HTTP 501, got {} and body {}",
-        refused.status, refused.body
+    let operations = scaffolded_operations();
+    assert!(
+        !operations.is_empty(),
+        "no handler carries the scaffold marker any more: delete this probe with the last stub"
     );
-    assert_eq!(
-        refused.error_code(),
-        "NotImplemented",
-        "case \"CheckDNSAvailability\": unexpected error code in {}",
-        refused.body
-    );
+
+    // A stub answers 501 `NotImplemented` — never an empty 200, which a client
+    // cannot tell from a real implementation. An operation whose input has a
+    // required member is refused by the boundary validator before its handler
+    // runs, so a parameterless call to one of those answers 400 instead; what
+    // must never happen is a success.
+    for operation in &operations {
+        let answer = emulator.call(operation, &[]).await;
+        assert!(
+            answer.status == 501 || answer.status == 400,
+            "case {operation:?}: a scaffolded operation must refuse the call, got {} and body {}",
+            answer.status,
+            answer.body
+        );
+        if answer.status == 501 {
+            assert_eq!(
+                answer.error_code(),
+                "NotImplemented",
+                "case {operation:?}: unexpected error code in {}",
+                answer.body
+            );
+        }
+    }
 }

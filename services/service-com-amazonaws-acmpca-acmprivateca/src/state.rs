@@ -145,6 +145,23 @@ pub const ISSUANCE_INVALID_STATE_MESSAGE: &str =
 /// the CA matches: one sentence about the certificate, naming no ARN of its own.
 pub const CERTIFICATE_NOT_FOUND_MESSAGE: &str = "Could not find specified certificate.";
 
+/// What Amazon Web Services Private CA answers when a request names no private CA it can
+/// resolve: one sentence about the CA, naming no ARN of its own, the same for every
+/// operation that resolves one.
+///
+/// `DeletePolicy` answers it for a CA that does not hold its own certificate yet as well:
+/// the behavioural corpus records that call answering
+/// `("ResourceNotFoundException", "Could not find specified CA")`
+/// (`acm-pca.delete-policy-on-pending-ca-is-noop`) rather than the policy sentence below —
+/// such a CA keeps no policy at all, so what it cannot find is the CA.
+pub const CA_NOT_FOUND_MESSAGE: &str = "Could not find specified CA";
+
+/// What Amazon Web Services Private CA answers for a resource-based policy document it
+/// will not attach: the model's own sentence for `InvalidPolicyException`, naming no
+/// request of its own.
+pub const INVALID_POLICY_MESSAGE: &str =
+    "The resource policy is invalid or is missing a required statement.";
+
 /// What Amazon Web Services Private CA answers when a deleted CA has no restoration
 /// period to be restored inside: "A private CA deleted in the CREATING or FAILED state
 /// has no assigned restoration period and cannot be restored."
@@ -168,7 +185,8 @@ pub const PERMISSION_NOT_FOUND_MESSAGE: &str = "Could not find specified permiss
 /// `GetPolicy`'s docs make the two absences one refusal — "If either the private CA
 /// resource or the policy cannot be found, this action returns a
 /// ResourceNotFoundException" — so the sentence is about the POLICY, the thing the
-/// operation was asked for, and names no resource of the request's own.
+/// operation was asked for, and names no resource of the request's own. The corpus records
+/// it there (`acm-pca.get-policy-not-found`).
 pub const POLICY_NOT_FOUND_MESSAGE: &str = "Could not find policy for specified resource.";
 
 /// `SigningAlgorithm`'s members in the order the model DECLARES them, which is the order
@@ -569,6 +587,19 @@ impl CertificateAuthorityRecord {
             None => ca_certificate.clone(),
         })
     }
+
+    /// Whether the resource-based policy operations resolve this CA at all.
+    ///
+    /// A CA that does not hold its own certificate yet keeps no policy: the corpus records
+    /// `DeletePolicy` against a CA still waiting for one answering
+    /// [`CA_NOT_FOUND_MESSAGE`] — the sentence for a CA that cannot be found — rather than
+    /// [`POLICY_NOT_FOUND_MESSAGE`] or a success
+    /// (`acm-pca.delete-policy-on-pending-ca-is-noop`). Read off the certificate rather
+    /// than off `ACTIVE`, because what a later status (disabled, expired) keeps is the
+    /// certificate it was activated with.
+    pub fn resolves_policies(&self) -> bool {
+        self.ca_certificate_pem.is_some()
+    }
 }
 
 /// The `RevocationConfiguration` a reported `CertificateAuthority` carries.
@@ -594,6 +625,44 @@ pub fn reported_revocation_configuration(
                 .unwrap_or_default(),
         ),
     }
+}
+
+/// Whether `document` is a resource-based policy this service will attach to a private CA.
+///
+/// "If this policy does not contain all required statements or if it includes any statement
+/// that is not allowed, the PutPolicy action returns an InvalidPolicyException. For
+/// information about IAM policy and statement structure, see Overview of JSON Policies."
+/// (`PutPolicyRequest$Policy` docs) — so the grammar an IAM resource policy has to satisfy:
+/// a JSON object carrying a `Statement` that is a non-empty list of statement objects (or
+/// a single statement object), each with an `Effect` of exactly `Allow` or `Deny` and an
+/// `Action`. The document is read as JSON by `serde_json`, never matched as text.
+///
+/// The same grammar is checked by Amazon S3's `is_valid_policy_document`
+/// (`services/service-com-amazonaws-s3-amazons3/src/state.rs`) for `PutBucketPolicy`; both
+/// are service-private today, and lifting the one grammar into `services/common` is a
+/// cross-service refactor of its own rather than part of this service's policy operations.
+pub fn is_well_formed_policy(document: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(document) else {
+        return false;
+    };
+    let Some(members) = parsed.as_object() else {
+        return false;
+    };
+    // An IAM policy's statements are its `Statement` element: one statement object, or an
+    // array of them that is not empty.
+    let statements: Vec<&serde_json::Value> = match members.get("Statement") {
+        Some(serde_json::Value::Array(list)) => list.iter().collect(),
+        Some(single @ serde_json::Value::Object(_)) => vec![single],
+        _ => return false,
+    };
+    !statements.is_empty()
+        && statements.iter().all(|statement| {
+            let Some(statement) = statement.as_object() else {
+                return false;
+            };
+            let effect = statement.get("Effect").and_then(serde_json::Value::as_str);
+            matches!(effect, Some("Allow") | Some("Deny")) && statement.contains_key("Action")
+        })
 }
 
 // ---------------------------------------------------------------------------

@@ -198,6 +198,18 @@ pub async fn list_tags(h: &Harness, resource_arn: &str) -> Reply {
     .await
 }
 
+/// `TagResource`: `PUT /tags/{resourceArn}`, whose body carries the `tags` map.
+pub async fn tag(h: &Harness, resource_arn: &str, tags: &Value) -> Reply {
+    send(
+        h,
+        "PUT",
+        REGION,
+        &format!("/tags/{}", percent_encode(resource_arn)),
+        Some(&json!({ "tags": tags })),
+    )
+    .await
+}
+
 /// `UntagResource`: `DELETE /tags/{resourceArn}?tagKeys=…`.
 pub async fn untag(h: &Harness, resource_arn: &str, tag_keys: &[&str]) -> Reply {
     let query: Vec<String> = tag_keys

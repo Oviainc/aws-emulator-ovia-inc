@@ -29,7 +29,11 @@ pub struct UpdateGuardrailInput {
     pub kms_key_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#UpdateGuardrailResponse")]
+/// `UpdateGuardrailResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `updatedAt` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="UpdateGuardrail")`), which the derive
+/// does not put on a member schema — see `types/date_time_wire.rs`.
 #[derive(Debug, Clone)]
 pub struct UpdateGuardrailOutput {
     pub guardrail_id: String,
@@ -37,4 +41,16 @@ pub struct UpdateGuardrailOutput {
     pub version: String,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+bedrock_schema_and_codec!(
+    UpdateGuardrailOutput,
+    UPDATE_GUARDRAIL_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#UpdateGuardrailResponse",
+    "com.amazonaws.bedrock",
+    "UpdateGuardrailResponse",
+    (M_GUARDRAIL_ID, guardrail_id, "guardrailId", 0, req, string),
+    (M_GUARDRAIL_ARN, guardrail_arn, "guardrailArn", 1, req, string),
+    (M_VERSION, version, "version", 2, req, string),
+    (M_UPDATED_AT, updated_at, "updatedAt", 3, req, date_time),
+);
 

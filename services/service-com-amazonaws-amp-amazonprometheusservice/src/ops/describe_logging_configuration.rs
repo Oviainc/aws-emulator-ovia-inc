@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Workspace not found: {}", input.workspace_id),
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
                         resource_id: input.workspace_id.clone(),
                         resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                     },
@@ -179,10 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Logging configuration not found for workspace: {}",
-                            input.workspace_id
-                        ),
+                        // One constant sentence for a workspace that holds no logging
+                        // configuration: it names the kind of resource that is missing,
+                        // not the request's workspace, which `resourceId` carries.
+                        message: crate::state::LOGGING_NOT_FOUND_MESSAGE.to_string(),
                         resource_id: input.workspace_id.clone(),
                         resource_type: crate::state::LOGGING_CONFIGURATION_RESOURCE_TYPE
                             .to_string(),

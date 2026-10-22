@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTelemetryPipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTelemetryPipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTelemetryPipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one telemetry pipeline record in the region the request was signed for and
+//! answers its ARN. The record holds the configuration body verbatim, the create and
+//! last-update instants, the tags, and the instant the `CREATING` -> `ACTIVE`
+//! transition this create started comes due; `GetTelemetryPipeline` reports every one
+//! of them back from that single record.
+//!
+//! The emulator verifies every request's signature centrally and models no IAM policy
+//! evaluation, so the modelled `AccessDeniedException` is deliberately unreachable
+//! here: a 200 from this operation is not evidence that a principal is authorized.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +164,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTelemetryPipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTelemetryPipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTelemetryPipeline"))
+        // `Name`'s 3..28 length and `[a-z][a-z0-9\-]+` pattern, `Configuration`'s
+        // presence with its required `Body` of 1..24000 characters, and the `Tags`
+        // map's 1..50 length are modelled, so the centralized request walk has
+        // already refused anything outside them with a 400 `ValidationException`
+        // before this body runs. The body itself is stored VERBATIM and reported
+        // back verbatim: this service's model carries no schema for the sources,
+        // processors and sinks a pipeline definition names, and
+        // `ValidateTelemetryPipelineConfiguration` — the operation whose documented
+        // job is to report per-field configuration errors — is a separate scaffold
+        // stub with its own issue, so nothing here invents a verdict about the
+        // document's contents.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTelemetryPipelineErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the telemetry pipeline store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The presented access-key id is an identifier, never a secret: it is what the
+        // audit record below attributes this state-changing call to.
+        let principal = ::emulator_server::extract_akid(&ctx.parts().headers);
+
+        let created_at = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+
+        // "The name must be unique within your account", so a second create cannot
+        // take a name already in use in the region the caller signed for.
+        if store.pipeline_name_taken(&region, &input.name) {
+            drop(store);
+            ::tracing::info!(
+                target: "audit",
+                operation = Self::NAME,
+                outcome = "rejected-name-in-use",
+                principal = %principal,
+                region = %region,
+                resource = %input.name,
+                "refused a telemetry pipeline create"
+            );
+            return Err(CreateTelemetryPipelineErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "a telemetry pipeline named '{}' already exists in {region}",
+                        input.name
+                    )),
+                    resource_id: Some(input.name.clone()),
+                    resource_type: Some(crate::state::PIPELINE_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The store is finite, and the cap that matters is store-WIDE: a record is
+        // keyed by the region of the caller's own credential scope, so the per-region
+        // budget alone would reset for every scope a caller signs with. A create past
+        // either cap is refused BEFORE a record is allocated.
+        if store.pipeline_count(&region) >= crate::state::MAX_TELEMETRY_PIPELINES
+            || store.would_exceed_pipeline_store(1)
+        {
+            drop(store);
+            ::tracing::info!(
+                target: "audit",
+                operation = Self::NAME,
+                outcome = "rejected-quota-exceeded",
+                principal = %principal,
+                region = %region,
+                resource = %input.name,
+                "refused a telemetry pipeline create"
+            );
+            return Err(
+                CreateTelemetryPipelineErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} telemetry pipelines \
+                             in {region}, or this create would take the store past its {} \
+                             pipeline records",
+                            crate::state::MAX_TELEMETRY_PIPELINES,
+                            crate::state::MAX_STORED_PIPELINE_RECORDS
+                        )),
+                        resource_id: Some(input.name.clone()),
+                        resource_type: Some(crate::state::PIPELINE_RESOURCE_TYPE.to_string()),
+                        service_code: Some(crate::state::ARN_SERVICE.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let arn = crate::state::pipeline_arn(&region, &input.name);
+        let name = input.name;
+        store.insert_pipeline(crate::state::StoredTelemetryPipeline {
+            name: name.clone(),
+            region: region.clone(),
+            arn: arn.clone(),
+            configuration_body: input.configuration.body,
+            created_timestamp_ms: created_at,
+            last_update_timestamp_ms: created_at,
+            // The pipeline is `CREATING` until this instant and `ACTIVE` from it on, so
+            // a caller reading straight after this create still observes `CREATING`.
+            active_at_ms: created_at.saturating_add(crate::state::PIPELINE_ACTIVATION_DELAY_MS),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        });
+        drop(store);
+
+        // Audit record for a state-changing call: who asked, what changed, and how it
+        // ended. The configuration body is deliberately not in it.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "created",
+            principal = %principal,
+            region = %region,
+            resource = %name,
+            resource_arn = %arn,
+            "created a telemetry pipeline"
+        );
+
+        Ok(CreateTelemetryPipelineOutput { arn: Some(arn) })
     }
 }

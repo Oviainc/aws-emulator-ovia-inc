@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
-        if !guard.clusters.contains_key(&cluster_name) {
+        if !guard.has_active_cluster(&cluster_name) {
             return Err(DescribeTasksErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
                     message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),

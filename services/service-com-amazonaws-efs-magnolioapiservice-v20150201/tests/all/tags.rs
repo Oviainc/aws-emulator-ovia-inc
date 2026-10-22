@@ -81,7 +81,7 @@ struct TagSetCase {
 /// the modelled patterns (`smithy_query(query="shape",shape="TagKey,TagValue")`):
 /// `TagKey` is 1..128 of `[\p{L}\p{Z}\p{N}_.:/=+\-@]`, `TagValue` the same class at
 /// 0..256 — so an empty value and a non-ASCII letter are both in the class, and the
-/// 50-tag row is the published quota [`state::MAX_TAGS_PER_FILE_SYSTEM`].
+/// 50-tag row is the published quota [`state::MAX_TAGS_PER_RESOURCE`].
 fn tag_set_table() -> Vec<TagSetCase> {
     let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
         pairs
@@ -117,7 +117,7 @@ fn tag_set_table() -> Vec<TagSetCase> {
         },
         TagSetCase {
             case: "the 50-tag per-file-system quota",
-            tags: numbered_tags(state::MAX_TAGS_PER_FILE_SYSTEM),
+            tags: numbered_tags(state::MAX_TAGS_PER_RESOURCE),
         },
     ]
 }
@@ -192,7 +192,7 @@ async fn max_items_does_not_change_the_reported_tag_set() {
     // return in the response. Currently, this number is automatically set to 100, and
     // other values are ignored."
     let efs = Emulator::new();
-    let tags = numbered_tags(state::MAX_TAGS_PER_FILE_SYSTEM);
+    let tags = numbered_tags(state::MAX_TAGS_PER_RESOURCE);
     let created = efs
         .create_file_system(json!({
             "CreationToken": "max-items",
@@ -244,7 +244,7 @@ async fn max_items_does_not_change_the_reported_tag_set() {
 #[tokio::test]
 async fn marker_continues_the_tag_set_where_the_previous_call_left_off() {
     let efs = Emulator::new();
-    for count in [3usize, state::MAX_TAGS_PER_FILE_SYSTEM] {
+    for count in [3usize, state::MAX_TAGS_PER_RESOURCE] {
         let tags = numbered_tags(count);
         let created = efs
             .create_file_system(json!({

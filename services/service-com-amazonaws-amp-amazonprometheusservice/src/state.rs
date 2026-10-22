@@ -6,6 +6,7 @@
 //! workspace handler needs (the ARN, the Prometheus endpoint, the request's region,
 //! a fresh workspace id), so `src/ops/*.rs` share ONE copy of each rule.
 
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -205,6 +206,37 @@ pub const QUERY_LOGGING_STATUS_DELETING: &str = "DELETING";
 /// [`WORKSPACE_RESOURCE_TYPE`] is for a workspace.
 pub const QUERY_LOGGING_RESOURCE_TYPE: &str = "AWS::APS::QueryLoggingConfiguration";
 
+/// The `message` the modelled `ResourceNotFoundException` reports for a workspace this
+/// account does not hold.
+///
+/// One CONSTANT sentence, exactly as [`QUERY_LOGGING_NOT_FOUND_MESSAGE`] is for a
+/// configuration: `ResourceNotFoundException` models `resourceId` (@required) beside
+/// `message`, so the identifier of the missing resource has its own home and the
+/// sentence carries nothing from the request. Every per-workspace operation shares this
+/// one constant, so a caller comparing the not-found message across calls — or across
+/// operations — reads the same value every time.
+pub const WORKSPACE_NOT_FOUND_MESSAGE: &str = "Workspace not found.";
+
+/// The `message` the modelled `ResourceNotFoundException` reports for a `resourceArn`
+/// the `/tags/{resourceArn}` operations resolve to nothing. Constant and id-free for the
+/// same reason [`WORKSPACE_NOT_FOUND_MESSAGE`] is; the ARN is reported in `resourceId`.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
+
+/// The `message` the modelled `ResourceNotFoundException` reports for a rule groups
+/// namespace a workspace does not hold. Constant and id-free for the same reason
+/// [`WORKSPACE_NOT_FOUND_MESSAGE`] is; the namespace name is reported in `resourceId`.
+pub const RULE_GROUPS_NAMESPACE_NOT_FOUND_MESSAGE: &str = "Rule groups namespace not found.";
+
+/// The `message` the modelled `ResourceNotFoundException` reports for a workspace that
+/// holds no rules-and-alerting logging configuration — constant and id-free for the same
+/// reason [`QUERY_LOGGING_NOT_FOUND_MESSAGE`] is.
+pub const LOGGING_NOT_FOUND_MESSAGE: &str = "Logging configuration not found.";
+
+/// The `message` the modelled `ResourceNotFoundException` reports for a workspace that
+/// holds no resource-based policy — constant and id-free for the same reason
+/// [`WORKSPACE_NOT_FOUND_MESSAGE`] is; the workspace is reported in `resourceId`.
+pub const POLICY_NOT_FOUND_MESSAGE: &str = "Resource-based policy not found.";
+
 /// The `message` the modelled `ResourceNotFoundException` reports for a workspace that
 /// holds no query logging configuration.
 ///
@@ -247,6 +279,33 @@ pub const RULE_GROUPS_NAMESPACES_PER_WORKSPACE: usize = 1_000;
 pub const WORKSPACE_PAGE_LIMIT: i32 = 1_000;
 /// See [`WORKSPACE_PAGE_LIMIT`].
 pub const WORKSPACE_PAGE_DEFAULT: i32 = 100;
+
+/// The largest page `ListScrapers` serves, and the page size it uses when the request
+/// names no `maxResults`: `ListScrapersRequest$maxResults` is modelled
+/// `@range(min: 1, max: 1000)` and documented "The maximum number of scrapers to return
+/// in one ListScrapers operation. The range is 1-1000. If you omit this parameter, the
+/// default of 100 is used." Clamped by the handler rather than trusted from the request,
+/// exactly as [`WORKSPACE_PAGE_LIMIT`] is.
+pub const SCRAPER_PAGE_LIMIT: i32 = 1_000;
+/// See [`SCRAPER_PAGE_LIMIT`].
+pub const SCRAPER_PAGE_DEFAULT: i32 = 100;
+
+/// The filter keys `ListScrapers` honours, as `ListScrapersRequest$filters` documents
+/// them: "Keys include `status`, `sourceArn`, `destinationArn`, and `alias`."
+///
+/// A key that is not one of these four is not a filter this service defines, and it is
+/// IGNORED rather than refused: the member documents the keys it includes without saying
+/// that any other is rejected, so refusing one would invent a refusal. The `@httpQuery`
+/// members (`nextToken`, `maxResults`) never reach the map at all — the
+/// `@httpQueryParams` binding in `crate::ops::list_scrapers` leaves them out, as the
+/// trait requires.
+pub const SCRAPER_FILTER_STATUS: &str = "status";
+/// See [`SCRAPER_FILTER_STATUS`].
+pub const SCRAPER_FILTER_SOURCE_ARN: &str = "sourceArn";
+/// See [`SCRAPER_FILTER_STATUS`].
+pub const SCRAPER_FILTER_DESTINATION_ARN: &str = "destinationArn";
+/// See [`SCRAPER_FILTER_STATUS`].
+pub const SCRAPER_FILTER_ALIAS: &str = "alias";
 
 /// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException` /
 /// `ServiceQuotaExceededException` report for an anomaly detector — the resource's AWS
@@ -544,6 +603,38 @@ pub struct QueryLoggingConfiguration {
     pub client_token: Option<String>,
 }
 
+/// One stored scraper: every member `ScraperSummary` reports.
+///
+/// `ListScrapers` reports the scrapers this store HOLDS, so the listing is computed from
+/// state rather than announced. Nothing writes this map yet — `CreateScraper` is still
+/// scaffolded and answers 501, which is its own stub issue — so an account that has never
+/// created one lists the empty page AWS lists for it; when `CreateScraper` lands it
+/// inserts here and the listing needs no change.
+#[derive(Debug, Clone)]
+pub struct Scraper {
+    pub scraper_id: String,
+    pub arn: String,
+    /// `None` when the scraper carries no alias; `ScraperSummary$alias` is optional.
+    pub alias: Option<String>,
+    pub role_arn: String,
+    /// One entry of the modelled `ScraperStatusCode` enum
+    /// (`crate::ops::types::SCRAPER_STATUS_CODE_VALUES`).
+    pub status_code: String,
+    /// "If there is a failure, the reason for the failure"
+    /// (`ScraperSummary$statusReason`), so `None` while nothing has failed.
+    pub status_reason: Option<String>,
+    pub created_at: SystemTime,
+    pub last_modified_at: SystemTime,
+    pub tags: BTreeMap<String, String>,
+    /// "The Amazon EKS cluster from which the scraper collects metrics."
+    pub source: crate::ops::types::Source,
+    /// "The destination where the scraper sends metrics."
+    pub destination: crate::ops::types::Destination,
+    pub role_configuration: Option<crate::ops::types::RoleConfiguration>,
+    /// `ScraperSummary$exporters` is modelled `len ..1`; empty when none is configured.
+    pub exporters: Vec<crate::ops::types::ExporterConfiguration>,
+}
+
 /// One stored anomaly detector: every member `AnomalyDetectorDescription` /
 /// `AnomalyDetectorSummary` report, plus the bookkeeping its lifecycle needs.
 #[derive(Debug, Clone)]
@@ -575,6 +666,9 @@ pub struct AnomalyDetector {
 pub struct ComAmazonawsAmpAmazonprometheusserviceState {
     /// Every workspace this emulator holds, keyed by `workspaceId`.
     pub workspaces: HashMap<String, Workspace>,
+    /// Every scraper this emulator holds, keyed by `scraperId` — what `ListScrapers`
+    /// reports. Ordered, so a page boundary means the same thing on every call.
+    pub scrapers: BTreeMap<String, Scraper>,
     /// Each workspace's query logging configuration, keyed by `workspaceId`. A
     /// workspace holds at most one, and it is dropped with the workspace.
     pub query_logging: HashMap<String, QueryLoggingConfiguration>,
@@ -915,6 +1009,13 @@ pub const TAGS_PER_RESOURCE_LIMIT: usize = 50;
 /// not begin with aws:".
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// The requirement a `tags` member fails when it carries a reserved key, worded as
+/// [`constraint_requirement`] words a modelled constraint, so a rule the service
+/// enforces itself reads like one the model declares.
+pub fn reserved_tag_key_requirement() -> String {
+    format!("Member must not contain a key beginning with {RESERVED_TAG_KEY_PREFIX}")
+}
+
 /// The reserved tag key a request carries, if any — the lowest one, so the refusal
 /// names the same key however the request's map was iterated.
 pub fn reserved_tag_key<'a, I: IntoIterator<Item = &'a String>>(keys: I) -> Option<&'a str> {
@@ -1090,3 +1191,251 @@ pub fn query_logging_metadata(
         modified_at: ::aws_smithy_types::DateTime::from(configuration.modified_at),
     }
 }
+
+// =============================================================================
+// The media type this service answers in
+// =============================================================================
+
+/// The media type every aps response announces.
+///
+/// RECORDED BEHAVIOUR: the model declares `restJson1`, whose serializer stamps
+/// [`JSON_CONTENT_TYPE`] on a JSON body, but every recorded real-aps response — a
+/// success and a failure alike, on 200s, 400s and 404s — carries
+/// `application/x-amz-json-1.1`, which is what a client content-negotiating or
+/// protocol-asserting on the response reads. The body is the same JSON either way, so
+/// nothing but the announced type changes. Applied in
+/// [`crate::service::EmulatedService`], which is the one place this service's responses
+/// pass through.
+pub const RESPONSE_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
+
+/// The media type the `restJson1` serializer stamps on a JSON body — the one value
+/// [`RESPONSE_CONTENT_TYPE`] replaces. A response whose body is NOT that JSON envelope
+/// (a `@httpPayload` blob's `application/octet-stream`, a string payload's
+/// `text/plain`) announces its own type and is left alone.
+pub const JSON_CONTENT_TYPE: &str = "application/json";
+
+// =============================================================================
+// Validation: how this service states a refused request
+// =============================================================================
+
+/// The `reason` every aps `ValidationException` carries.
+///
+/// RECORDED BEHAVIOUR, like [`RESPONSE_CONTENT_TYPE`]: `ValidationException$reason` is
+/// @required and targets `ValidationExceptionReason`, whose declared value set is
+/// `UNKNOWN_OPERATION` / `CANNOT_PARSE` / `FIELD_VALIDATION_FAILED` / `OTHER`
+/// (`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`) — but every recorded
+/// real-aps 400, across four operations in four fixtures, reports `Validation error`,
+/// and `reason` is the member a client branches on. The shape is a STRING with a
+/// declared value set rather than a closed enum type — which is why the member is a
+/// `String` here and why a value outside that set still deserializes — so answering the
+/// value the service actually answers costs a client nothing.
+///
+/// One value for every refusal this service raises, whether a member is at fault or the
+/// request is wrong as a whole: that is the one value observed, and a client cannot read
+/// two vocabularies for one error shape. WHICH member is at fault is reported in
+/// `fieldList`, which is absent exactly when no single member is.
+pub const VALIDATION_REASON: &str = "Validation error";
+
+/// `ValidationException`'s own documentation, which is what a refusal naming no member
+/// can say about itself: "The input fails to satisfy the constraints specified by an
+/// Amazon Web Services service."
+const VALIDATION_EXCEPTION_DOC: &str =
+    "The input fails to satisfy the constraints specified by an Amazon Web Services service.";
+
+/// This service's modelled 400 for the members a request got wrong.
+///
+/// ONE composition, shared by the request boundary and by every handler that refuses a
+/// rule the model cannot express, so a caller reads one form for both: `fieldList`
+/// carries a `{name, message}` entry per refused member, `reason` is
+/// [`VALIDATION_REASON`], and `message` names the first refused member and the
+/// requirement it failed — `Invalid <member>: <requirement>`. The submitted VALUE is
+/// never echoed: the caller named the member, and aps keeps its error text free of
+/// caller input.
+pub fn validation_failed(
+    fields: Vec<crate::ops::types::ValidationExceptionField>,
+) -> crate::ops::types::ValidationException {
+    let message = fields.first().map_or_else(
+        || VALIDATION_EXCEPTION_DOC.to_string(),
+        |field| format!("Invalid {}: {}", field.name, field.message),
+    );
+    crate::ops::types::ValidationException {
+        message,
+        reason: VALIDATION_REASON.to_string(),
+        field_list: Some(fields),
+    }
+}
+
+/// [`validation_failed`] for a single refused member: the member's name as the wire
+/// names it, and the requirement it failed.
+pub fn member_validation_failed(
+    name: &str,
+    requirement: &str,
+) -> crate::ops::types::ValidationException {
+    validation_failed(vec![crate::ops::types::ValidationExceptionField {
+        name: name.to_string(),
+        message: requirement.to_string(),
+    }])
+}
+
+/// This service's modelled 400 for a request that is wrong as a WHOLE rather than at one
+/// member: there is no per-field breakdown to report, so `fieldList` is absent, and
+/// `message` is one constant sentence carrying nothing from the request.
+pub fn request_validation_failed(message: &str) -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: message.to_string(),
+        reason: VALIDATION_REASON.to_string(),
+        field_list: None,
+    }
+}
+
+/// [`validation_failed`] for the constraint violations the framework's own walk found at
+/// the request boundary — one `fieldList` entry per refused MEMBER, in the order the
+/// walk visits them, so a member that violates two constraints is reported once (by the
+/// first requirement it failed) rather than twice.
+pub fn constraint_validation_failed(
+    violations: &[Violation],
+) -> crate::ops::types::ValidationException {
+    let mut fields: Vec<crate::ops::types::ValidationExceptionField> = Vec::new();
+    for violation in violations {
+        if fields.iter().any(|field| field.name == violation.path) {
+            continue;
+        }
+        fields.push(crate::ops::types::ValidationExceptionField {
+            name: violation.path.clone(),
+            message: constraint_requirement(&violation.kind),
+        });
+    }
+    validation_failed(fields)
+}
+
+/// The requirement a violated constraint states, as this service states it.
+///
+/// The wording is the framework's own vocabulary for each constraint class, with ONE
+/// difference: a `@pattern` is stated [`unanchored`], because the anchors are how the
+/// model says "the whole value", not part of what the caller has to match.
+///
+/// MIGRATION NOTE, as `services/common/src/validation.rs` asks of anything that inlines
+/// these rules again: the requirement half of the sentence and the `@pattern`
+/// anchor-stripping are the SAME for every service, and that module stages them for one
+/// migration of its own (`grep -rln 'fn unanchored' services/*/src` lists the crates
+/// carrying a copy — this crate is now one of them). What stays this service's own is the
+/// DIALECT around it: `Invalid <member>: <requirement>` with one `fieldList` entry per
+/// member ([`validation_failed`]). When that migration lands, these two functions are to
+/// be deleted and called from the common module, not copied further.
+pub fn constraint_requirement(kind: &ViolationKind) -> String {
+    match kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        ViolationKind::Pattern(pattern) => format!(
+            "Member must satisfy regular expression pattern: {}",
+            unanchored(pattern)
+        ),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        // `ViolationKind` is `#[non_exhaustive]`: a constraint class the framework adds
+        // later is still reported as a refused member rather than going unworded.
+        _ => VALIDATION_EXCEPTION_DOC.to_string(),
+    }
+}
+
+/// A `@pattern` as a message states it: without the `^` and `$` anchors.
+///
+/// Rendering only — never a decision about whether a value is acceptable, which is the
+/// framework's constraint walk over the model's own pattern. A trailing `$` is kept when
+/// it is escaped (`\$`, the literal dollar sign), since that one is a character the
+/// pattern admits rather than an anchor.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(head) if !head.ends_with('\\') => head,
+        _ => body,
+    }
+}
+
+// =============================================================================
+// Scrapers
+// =============================================================================
+
+/// The stored scraper as the `ScraperSummary` `ListScrapers` reports — every member read
+/// back off the persisted record.
+pub fn scraper_summary(scraper: &Scraper) -> crate::ops::types::ScraperSummary {
+    crate::ops::types::ScraperSummary {
+        scraper_id: scraper.scraper_id.clone(),
+        arn: scraper.arn.clone(),
+        alias: scraper.alias.clone(),
+        role_arn: scraper.role_arn.clone(),
+        status: crate::ops::types::ScraperStatus {
+            status_code: scraper.status_code.clone(),
+        },
+        status_reason: scraper.status_reason.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(scraper.created_at),
+        last_modified_at: ::aws_smithy_types::DateTime::from(scraper.last_modified_at),
+        tags: tag_map(&scraper.tags),
+        source: scraper.source.clone(),
+        destination: scraper.destination.clone(),
+        role_configuration: scraper.role_configuration.clone(),
+        exporters: Some(scraper.exporters.clone()),
+    }
+}
+
+/// The ARN of the resource a scraper reads from, for the `sourceArn` filter.
+///
+/// `Source` is a union: `eksConfiguration` names the EKS cluster by ARN, and
+/// `vpcConfiguration` models no ARN at all — it names security groups and subnets — so a
+/// VPC source has no `sourceArn` to match and never satisfies that filter.
+pub fn scraper_source_arn(source: &crate::ops::types::Source) -> Option<&str> {
+    match source {
+        crate::ops::types::Source::eksConfiguration(eks) => Some(eks.cluster_arn.as_str()),
+        crate::ops::types::Source::vpcConfiguration(_) => None,
+    }
+}
+
+/// The ARN of the resource a scraper writes to, for the `destinationArn` filter: the
+/// workspace of an `ampConfiguration`, or the dataset of a `cloudWatchConfiguration`.
+pub fn scraper_destination_arn(destination: &crate::ops::types::Destination) -> Option<&str> {
+    match destination {
+        crate::ops::types::Destination::ampConfiguration(amp) => {
+            Some(amp.workspace_arn.as_str())
+        }
+        crate::ops::types::Destination::cloudWatchConfiguration(cloud_watch) => {
+            Some(cloud_watch.dataset_arn.as_str())
+        }
+    }
+}
+
+/// Whether `scraper` satisfies every filter in `filters`.
+///
+/// `ListScrapersRequest$filters` documents the rule: "Filters on the same key are `OR`'d
+/// together, and filters on different keys are `AND`'d together." The keys honoured are
+/// the four the member documents ([`SCRAPER_FILTER_STATUS`] and friends); any other key
+/// is not a filter this service defines and is ignored.
+pub fn scraper_matches_filters(
+    scraper: &Scraper,
+    filters: &HashMap<String, Vec<String>>,
+) -> bool {
+    filters.iter().all(|(key, wanted)| {
+        let held: Option<&str> = match key.as_str() {
+            SCRAPER_FILTER_STATUS => Some(scraper.status_code.as_str()),
+            SCRAPER_FILTER_ALIAS => scraper.alias.as_deref(),
+            SCRAPER_FILTER_SOURCE_ARN => scraper_source_arn(&scraper.source),
+            SCRAPER_FILTER_DESTINATION_ARN => scraper_destination_arn(&scraper.destination),
+            // Not one of the documented filter keys: nothing to filter on.
+            _ => return true,
+        };
+        held.is_some_and(|held| wanted.iter().any(|value| value == held))
+    })
+}
+

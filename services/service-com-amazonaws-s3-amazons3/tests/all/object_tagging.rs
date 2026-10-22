@@ -583,10 +583,13 @@ async fn a_tagging_parameter_this_emulator_cannot_serve_is_refused_not_guessed()
         text(&put)
     );
 
-    // `versionId` names one version of an object, and this emulator keeps one object per
-    // key, so neither handler may answer it over the current object. The version ids are
-    // the shapes a client sends: a generated-looking id and the literal `null` S3 uses for
-    // an object written before versioning was enabled.
+    // `versionId` names one version of an object. The store does keep versions (see the
+    // `object_versioning` suite), but these two handlers act on the CURRENT object alone —
+    // a tag write goes through the byte budgets of the object at the key, which is the
+    // current one — so neither may answer a request naming a version over it: tagging one
+    // version of a key is its own behaviour, and until it is written the scaffold's 501
+    // says so. The version ids below are the shapes a client sends: a generated-looking id
+    // and the literal `null` S3 uses for an object written before versioning was enabled.
     for version in ["3HL4kqtJlcpXroDTDmjVBH40Nrjfkd", "null"] {
         let read = get_object_tagging(
             &router,

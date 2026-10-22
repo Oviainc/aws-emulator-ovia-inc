@@ -77,7 +77,7 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::JobFamily;
+use crate::state::{JobFamily, JOB_ALREADY_TERMINAL_MESSAGE, JOB_NOT_FOUND_MESSAGE};
 
 /// The family this operation's `JobId` is looked up in.
 const FAMILY: JobFamily = JobFamily::SentimentDetection;
@@ -170,30 +170,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&(FAMILY, input.job_id.clone()))
             .ok_or_else(|| {
                 StopSentimentDetectionJobErrorModeled::JobNotFoundException(JobNotFoundException {
-                    message: Some(format!(
-                        "The sentiment detection job with id '{}' was not found.",
-                        input.job_id
-                    )),
+                    // The fixed sentence every Comprehend job not-found refusal
+                    // carries: it names no caller-supplied identifier.
+                    message: Some(JOB_NOT_FOUND_MESSAGE.to_string()),
                 })
             })?;
 
-        // Settle first: the job may already have reached a terminal status before
-        // this call, which is exactly the case the operation refuses.
+        // Settle first: the clock may already have owed this job a transition
+        // before the call, including the terminal status this operation refuses.
+        // That transition was due whether or not anybody called, so materialising
+        // it reports the status the job already had; the refusal below writes
+        // nothing of its own.
         job.settle(now);
 
-        // The operation's documented lifecycle: a job already in `COMPLETED` or
-        // `FAILED` is refused with a 400; otherwise `AnalysisJob::request_stop`
-        // applies the transition (a processing job is marked for termination and
-        // reaches `STOPPED` when the clock owes it; one that has not started
-        // processing stops outright; one already stopping changes nothing).
+        // A job that has reached a status it can never leave has nothing to mark
+        // for termination, so the stop is refused and the record keeps that
+        // status. Every other job is still owed a transition, so the stop is
+        // accepted: `AnalysisJob::request_stop` marks it for termination
+        // (`STOP_REQUESTED`) and the clock owes it `STOPPED`.
         if job.is_terminal() {
             return Err(StopSentimentDetectionJobErrorModeled::InvalidRequestException(
                 InvalidRequestException {
-                    message: Some(format!(
-                        "The sentiment detection job with id '{}' is in the {} state and \
-                         cannot be stopped.",
-                        job.job_id, job.job_status
-                    )),
+                    message: Some(JOB_ALREADY_TERMINAL_MESSAGE.to_string()),
                     reason: None,
                     detail: None,
                 },

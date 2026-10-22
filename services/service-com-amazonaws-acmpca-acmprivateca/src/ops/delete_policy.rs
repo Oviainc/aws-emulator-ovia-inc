@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## Where the modelled doc and the service differ
+//!
+//! The doc text below says "If there is no policy attached to the private CA, this action
+//! will return successful". The service does not: the behavioural corpus records
+//! `DeletePolicy` answering HTTP 400 `ResourceNotFoundException` when it resolves no
+//! policy to remove — "Could not find specified CA" against a CA that does not hold its
+//! certificate yet, and so keeps no policy at all
+//! (`acm-pca.delete-policy-on-pending-ca-is-noop`). A CA that does keep policies and has
+//! none answers the policy sentence `GetPolicy` is recorded with
+//! (`acm-pca.get-policy-not-found`), the pair this operation's sibling documents: "If
+//! either the private CA resource or the policy cannot be found, this action returns a
+//! ResourceNotFoundException". The recording is what this handler follows.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +191,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePolicy"))
+        let _ = ctx;
+        let arn = input.resource_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(invalid_arn());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeletePolicyErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The lookup also materialises the CREATING -> PENDING_CERTIFICATE change the
+        // clock already owed, so the CA this call acts on is the one it is at this
+        // instant rather than the one its last caller left behind.
+        let Some(record) = state.certificate_authority_mut(&arn, ::std::time::SystemTime::now())
+        else {
+            return Err(ca_not_found());
+        };
+
+        // Removing the attached policy IS the deletion: `take` reports whether one was
+        // attached and leaves the CA with none either way, so a later `GetPolicy` or
+        // `DeletePolicy` resolves nothing.
+        if record.resource_policy.take().is_some() {
+            return Ok(DeletePolicyOutput);
+        }
+
+        // Nothing was attached, and which absence that is decides the sentence: a CA that
+        // keeps policies at all — one holding its own certificate — cannot find the
+        // POLICY, while a CA that does not hold its certificate yet keeps none, so what
+        // cannot be found is the CA (the recorded case).
+        if record.resolves_policies() {
+            return Err(DeletePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::POLICY_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        Err(ca_not_found())
     }
 }
+
+/// "The requested Amazon Resource Name (ARN) does not refer to an existing resource."
+fn invalid_arn() -> DeletePolicyError {
+    DeletePolicyErrorModeled::InvalidArnException(InvalidArnException {
+        message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy
+/// cannot be found." — the answer for an ARN no private CA of this service answers to, and
+/// for one whose CA keeps no policy because it does not hold its certificate yet.
+fn ca_not_found() -> DeletePolicyError {
+    DeletePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::CA_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+

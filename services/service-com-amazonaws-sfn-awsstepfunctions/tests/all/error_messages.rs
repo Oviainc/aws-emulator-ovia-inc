@@ -40,7 +40,12 @@ use crate::state_machine_lifecycle::{
 
 /// This service's Smithy model, read at compile time so the fractional-member
 /// list below can be checked against the model it was derived from.
-const MODEL: &str = include_str!("../../smithy-model/com-amazonaws-sfn-awsstepfunctions.json");
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a
+/// sibling suite reading the model reads THIS copy rather than embedding a
+/// second one.
+pub(crate) const MODEL: &str =
+    include_str!("../../smithy-model/com-amazonaws-sfn-awsstepfunctions.json");
 
 /// A second definition, different from [`HELLO_DEFINITION`], so a repeat create
 /// under the same name is the documented conflict rather than the documented
@@ -56,7 +61,10 @@ const MAP_RUN_ARN: &str =
 /// `(status, errorCode, message)` of a call that must fail.
 ///
 /// The `__type` split is the harness's own `error_code`, not a copy of it.
-async fn failure(
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a
+/// sibling suite asserting another message rule reads the same helper rather
+/// than carrying a second copy of it.
+pub(crate) async fn failure(
     emulator: &Emulator,
     case: &str,
     operation: &str,
@@ -230,6 +238,22 @@ async fn a_client_error_names_its_condition_and_the_request_value() {
             "InvalidName",
             "Invalid Name: 'bad name'".to_string(),
         ),
+        // `UpdateStateMachine` states the same template, whichever member of the
+        // update the request carried.
+        (
+            "UpdateStateMachine's definition on a state machine that was never created",
+            "UpdateStateMachine",
+            json!({ "stateMachineArn": absent_machine, "definition": HELLO_DEFINITION }),
+            "StateMachineDoesNotExist",
+            format!("State Machine Does Not Exist: '{absent_machine}'"),
+        ),
+        (
+            "UpdateStateMachine's roleArn on a deleted state machine",
+            "UpdateStateMachine",
+            json!({ "stateMachineArn": deleted, "roleArn": ROLE_ARN }),
+            "StateMachineDoesNotExist",
+            format!("State Machine Does Not Exist: '{deleted}'"),
+        ),
     ];
 
     for (case, operation, body, expected_code, expected_message) in cases {
@@ -288,6 +312,18 @@ async fn the_deleting_condition_is_stated_with_the_arn_too() {
             "StartExecution on a state machine being deleted",
             "StartExecution",
             json!({ "stateMachineArn": arn, "name": "msg-deleting-exec" }),
+        ),
+        // Both members of an update reach the same precondition, and each reads
+        // the same sentence.
+        (
+            "UpdateStateMachine's definition on a state machine being deleted",
+            "UpdateStateMachine",
+            json!({ "stateMachineArn": arn, "definition": OTHER_DEFINITION }),
+        ),
+        (
+            "UpdateStateMachine's roleArn on a state machine being deleted",
+            "UpdateStateMachine",
+            json!({ "stateMachineArn": arn, "roleArn": ROLE_ARN }),
         ),
     ];
 

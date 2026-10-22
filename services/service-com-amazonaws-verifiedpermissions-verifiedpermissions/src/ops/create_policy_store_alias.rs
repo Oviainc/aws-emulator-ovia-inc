@@ -97,32 +97,29 @@ impl<Eng> CreatePolicyStoreAlias<Eng> {
     }
 }
 
-/// The conflict answered when `alias_name` is already taken: it names the alias
-/// involved, which is the resource the caller has to deal with.
-fn already_taken(
-    alias_name: &str,
-    held_by: &crate::state::PolicyStoreAlias,
-) -> CreatePolicyStoreAliasErrorModeled {
-    let detail = if held_by.state == crate::state::ALIAS_STATE_PENDING_DELETION {
-        format!(
-            "it is in the {} state",
-            crate::state::ALIAS_STATE_PENDING_DELETION
-        )
-    } else {
-        format!(
-            "it is already associated with policy store {}",
-            held_by.policy_store_id
-        )
-    };
-    CreatePolicyStoreAliasErrorModeled::ConflictException(ConflictException {
-        message: format!(
-            "the policy store alias {alias_name} cannot be created because {detail}"
+/// The conflict answered when the requested name is already taken — whether by
+/// a live alias of another store or by one awaiting deletion.
+///
+/// Both causes answer `ConflictException`'s one fixed message
+/// ([`crate::state::CONFLICT_MESSAGE`], through [`crate::ops::conflict`]) and
+/// report the collision in the required `resources` list: the ALIAS that holds
+/// the name, and the POLICY STORE it is associated with, which is what a caller
+/// racing for the name needs to learn. Nothing of the request or of the stored
+/// state is spliced into the text.
+///
+/// The alias is reported by its OWN id — its name without the documented
+/// `policy-store-alias/` resource path, through
+/// [`crate::state::alias_reference`] — which is the same identity this service's
+/// `ResourceNotFoundException` reports for an alias.
+fn already_taken(held_by: &crate::state::PolicyStoreAlias) -> CreatePolicyStoreAliasErrorModeled {
+    let alias = crate::state::alias_reference(&held_by.alias_name);
+    CreatePolicyStoreAliasErrorModeled::ConflictException(crate::ops::conflict([
+        crate::ops::resource_conflict(&alias.resource_id, &alias.resource_type),
+        crate::ops::resource_conflict(
+            &held_by.policy_store_id,
+            crate::state::RESOURCE_TYPE_POLICY_STORE,
         ),
-        resources: vec![ResourceConflict {
-            resource_id: held_by.alias_name.clone(),
-            resource_type: "POLICY_STORE_ALIAS".to_string(),
-        }],
-    })
+    ]))
 }
 
 /// Render a persisted alias as this operation's output, so a value that was never
@@ -208,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
                 return Ok(output);
             }
-            return Err(already_taken(&input.alias_name, existing).into());
+            return Err(already_taken(existing).into());
         }
 
         // The alias table is the one structure this request grows, so the bound is

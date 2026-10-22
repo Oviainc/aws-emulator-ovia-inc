@@ -90,12 +90,13 @@ async fn account_health_counts_the_persisted_coverage() {
             expect_resources: 2,
         },
         HealthCase {
-            name: "two app boundary keys, three tag values between them",
-            steps: &[(
-                "ADD",
-                &[],
-                &[("boundary-one", &["only"]), ("boundary-two", &["a", "b"])],
-            )],
+            // One app-boundary key per account (`APP_BOUNDARY_KEYS_PER_ACCOUNT`), so a
+            // larger tag coverage is more VALUES under that one key.
+            name: "one app boundary key with three tag values, added by two requests",
+            steps: &[
+                ("ADD", &[], &[("boundary-one", &["only"])]),
+                ("ADD", &[], &[("boundary-one", &["a", "b"])]),
+            ],
             expect_resources: 3,
         },
         HealthCase {

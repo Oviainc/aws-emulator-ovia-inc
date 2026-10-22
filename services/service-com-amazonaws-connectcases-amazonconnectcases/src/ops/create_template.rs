@@ -221,20 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateTemplateErrorModeled::ServiceQuotaExceededException)?;
 
         // A template name identifies the template within its domain.
-        if let Some(existing) = domain
+        if domain
             .templates
             .values()
-            .find(|t| !t.deleted && t.name == input.name)
+            .any(|t| !t.deleted && t.name == input.name)
         {
-            return Err(
-                CreateTemplateErrorModeled::ConflictException(ConflictException {
-                    message: format!(
-                        "a template named {} already exists in domain {} (templateId {})",
-                        input.name, input.domain_id, existing.template_id
-                    ),
-                })
-                .into(),
-            );
+            return Err(CreateTemplateErrorModeled::ConflictException(
+                crate::state::name_conflict(crate::state::ResourceKind::Template, &input.name),
+            )
+            .into());
         }
 
         // Every id the body references is resolved against the domain BEFORE

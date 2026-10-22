@@ -158,14 +158,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
 /// This operation's output, as the wire carries it: NOTHING.
 ///
-/// A successful delete answers "204 No Content", and an HTTP 204 response has no body,
-/// so the modelled output's three members — `x-amz-delete-marker` and `x-amz-version-id`
-/// (both bucket versioning, which this emulator does not keep) and `x-amz-request-charged`
-/// (a Requester Pays charge it does not model) — have nothing to report and the generated
-/// output shape would still serialize an empty `DeleteObjectOutput` document into that
-/// 204. The local empty structure is what keeps the body empty, the way `DeleteBucket`'s
-/// does; `with_http` carries the modelled 204, without which the status falls back to the
-/// protocol default of 200.
+/// A successful delete answers "204 No Content", and an HTTP 204 response has no body, so
+/// the generated output shape would still serialize an empty `DeleteObjectOutput` document
+/// into that 204. The local empty structure is what keeps the body empty, the way
+/// `DeleteBucket`'s does; `with_http` carries the modelled 204, without which the status
+/// falls back to the protocol default of 200.
+///
+/// It reports none of the modelled output's three header members either:
+/// `x-amz-request-charged` is a Requester Pays charge this emulator does not model, and
+/// `x-amz-delete-marker` / `x-amz-version-id` describe the delete marker a versioned
+/// delete creates, which this handler does not record (see `handle`). A delete that names
+/// a `versionId` is answered by removing exactly that version, and the caller already
+/// holds the id it named.
 #[derive(Debug, Clone, Default)]
 pub struct DeleteObjectNoContent;
 
@@ -257,19 +261,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A conditional delete answers 412 when the condition fails, and a versioned
-        // delete acts on one version of an object this store does not keep versions of.
+        // A conditional delete answers 412 when the condition fails.
         if input.if_match.is_some()
             || input.if_match_last_modified_time.is_some()
             || input.if_match_size.is_some()
         {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "DeleteObject with a conditional If-Match / x-amz-if-match-* header",
-            ));
-        }
-        if input.version_id.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "DeleteObject with a versionId (S3 Versioning)",
             ));
         }
 
@@ -282,18 +280,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
+        // "To permanently delete an object in a versioned bucket, you must include the
+        // object's versionId in the request" — so a delete that names one removes exactly
+        // that stored version, and the newest version left becomes the key's current one.
+        // A `versionId` the bucket holds no version for is `NoSuchVersion` (HTTP 404), a
+        // code this model carries no shape for, so it goes out through the unmodelled
+        // channel rather than as a success that deleted nothing.
+        if let Some(version_id) = input.version_id.as_deref() {
+            return match store.remove_object_version(&input.bucket, &input.key, version_id) {
+                None => Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into()),
+                Some(false) => Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_VERSION_CODE,
+                    404,
+                    crate::state::NO_SUCH_VERSION_MESSAGE,
+                )),
+                Some(true) => Ok(DeleteObjectNoContent),
+            };
+        }
+
         // Deleting a key that is not there is a success — "Removes an object from a
         // bucket… if there isn't a null version, Amazon S3 does not remove anything" —
         // so what the answer turns on is only whether the BUCKET exists: `None` is the
-        // bucket this emulator does not hold. The removal releases everything the
-        // object retained, which is what lets a later write back into the store's
-        // byte budgets.
+        // bucket this emulator does not hold. On a bucket that is not versioning-enabled
+        // the removal releases everything the object retained, which is what lets a later
+        // write back into the store's byte budgets; on one that is, the version the delete
+        // displaces is kept and stays addressable by its id, which is the state behind
+        // "the operation inserts a delete marker, which becomes the current version of the
+        // object" — a read without a `versionId` answers `NoSuchKey` afterwards, and the
+        // marker itself is not recorded because this operation answers 204 with no body
+        // and so can report neither it nor its version id.
         if store.remove_object(&input.bucket, &input.key).is_none() {
             return Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         }
 
-        // No versioning on this bucket, so no delete marker is created and there is no
-        // version id to report.
         Ok(DeleteObjectNoContent)
     }
 }

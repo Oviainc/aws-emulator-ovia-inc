@@ -3,7 +3,9 @@
 //! @op CreateEnvironment
 //! Implemented: stores the environment the request asks for, in the `Launching` status a
 //! newly created environment reports, and answers with the `EnvironmentDescription` built
-//! from what was stored. This is the ONLY file to touch for this operation.
+//! from what was stored. A CNAME prefix the caller supplies has to be one a host name
+//! label can carry and must not already be held by a live environment — the same rule
+//! `CheckDNSAvailability` reports on. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -282,6 +284,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.application_versions.contains_key(&key) {
                 return Err(CreateEnvironmentError::invalid_parameter_value(format!(
                     "No Application Version named '{version_label}' found."
+                )));
+            }
+        }
+
+        // The CNAME a prefix forms is a DNS name, so it has to be one a host name
+        // can carry, and it can be reserved by at most ONE live environment —
+        // which is exactly what CheckDNSAvailability reports on. A prefix that
+        // fails either half cannot be used for this environment's URL. Only a
+        // prefix the CALLER supplied is checked for legality: the generated one is
+        // derived from values this service already holds.
+        if let Some(cname_prefix) = input.cname_prefix.as_ref() {
+            if !crate::state::is_legal_cname_prefix(cname_prefix) {
+                return Err(CreateEnvironmentError::invalid_parameter_value(format!(
+                    "Invalid CNAME prefix: {cname_prefix}. A CNAME prefix can contain only \
+                     letters, numbers, and hyphens, and cannot start or end with a hyphen."
+                )));
+            }
+            let cname = crate::state::environment_cname(cname_prefix, &region);
+            if crate::state::environment_holding_cname(&store, &cname).is_some() {
+                return Err(CreateEnvironmentError::invalid_parameter_value(format!(
+                    "DNS name ({cname}) is not available."
                 )));
             }
         }

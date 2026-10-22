@@ -187,19 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
         // its own tag keys, so it holds for the tags a detector is created with too.
-        if let Some(reserved) =
-            crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys()))
+        if crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys())).is_some()
         {
             return Err(field_validation(
                 "tags",
-                format!(
-                    "keys must not begin with {}",
-                    crate::state::RESERVED_TAG_KEY_PREFIX
-                ),
-                format!(
-                    "tag key {reserved} is reserved: keys must not begin with {}",
-                    crate::state::RESERVED_TAG_KEY_PREFIX,
-                ),
+                &crate::state::reserved_tag_key_requirement(),
             ));
         }
 
@@ -216,8 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
             return Err(field_validation(
                 "workspaceId",
-                "no workspace with this id exists".to_string(),
-                format!("Workspace not found: {}", input.workspace_id),
+                "Member must name a workspace this account holds",
             ));
         };
 
@@ -228,8 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateAnomalyDetectorErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
-                        "Workspace {} is {}; it cannot take new anomaly detectors",
-                        workspace.workspace_id,
+                        "The workspace is {}; it cannot take new anomaly detectors",
                         crate::state::STATUS_DELETING,
                     ),
                     resource_id: workspace.workspace_id.clone(),
@@ -259,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateAnomalyDetectorErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
                         message: format!(
-                            "workspace {workspace_id} already holds the maximum of \
+                            "The workspace already holds the maximum of \
                              {detector_quota} anomaly detectors"
                         ),
                         // The bound is per workspace, so the workspace is the resource
@@ -322,22 +312,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled `ValidationException` for one member of the request: `reason`
-/// `FIELD_VALIDATION_FAILED` and a `fieldList` entry naming the member, the way the
-/// boundary validator reports a refused member.
-fn field_validation(
-    field: &str,
-    field_message: String,
-    message: String,
-) -> CreateAnomalyDetectorError {
-    CreateAnomalyDetectorErrorModeled::ValidationException(ValidationException {
-        message,
-        reason: "FIELD_VALIDATION_FAILED".to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: field.to_string(),
-            message: field_message,
-        }]),
-    })
+/// The modelled `ValidationException` for one member of the request, in the one form
+/// every aps refusal takes ([`crate::state::member_validation_failed`]): `reason` set, a
+/// `fieldList` entry naming the member and the requirement it failed, and a `message` of
+/// `Invalid <member>: <requirement>` that never echoes the value the caller sent.
+fn field_validation(field: &str, requirement: &str) -> CreateAnomalyDetectorError {
+    CreateAnomalyDetectorErrorModeled::ValidationException(
+        crate::state::member_validation_failed(field, requirement),
+    )
     .into()
 }
 
@@ -358,14 +340,9 @@ fn check_configuration(
     }
     Err(field_validation(
         "configuration.randomCutForest.query",
-        format!(
-            "a Random Cut Forest query must be wrapped by one of the supported PromQL \
-             aggregation operators ({})",
-            operators.join(", ")
-        ),
-        format!(
-            "query {:?} is not wrapped by a supported PromQL aggregation operator ({})",
-            random_cut_forest.query,
+        &format!(
+            "Member must be wrapped by one of the supported PromQL aggregation operators \
+             ({})",
             operators.join(", ")
         ),
     ))

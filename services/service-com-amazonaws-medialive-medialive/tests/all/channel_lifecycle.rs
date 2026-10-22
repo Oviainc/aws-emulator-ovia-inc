@@ -189,7 +189,9 @@ async fn the_channel_lifecycle_runs_the_pipelines_the_class_gives_it() {
             stopped["state"]
         );
 
-        // delete -> DELETING -> gone from both the reader and the list.
+        // delete -> DELETING -> the terminal DELETED the channel keeps. The
+        // record stays in the account, which is what lets the SDK's
+        // `ChannelDeleted` waiter poll `DescribeChannel` for that state.
         let (status, deleting) = call(&router, "DELETE", &format!("/prod/channels/{id}"), None).await;
         assert_eq!(status, 200, "case {case:?}: DeleteChannel: got {status}: {deleting}");
         assert_eq!(
@@ -200,24 +202,53 @@ async fn the_channel_lifecycle_runs_the_pipelines_the_class_gives_it() {
         );
 
         wait_for_the_clock();
-        let (status, gone) = describe(&router, &id).await;
+        let (status, deleted) = describe(&router, &id).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected a deleted channel to be gone, got {status}: {gone}"
+            status, 200,
+            "case {case:?}: expected a deleted channel to still be readable, got {status}: {deleted}"
         );
         assert_eq!(
-            error_code(status, &gone),
-            "NotFoundException",
-            "case {case:?}: expected NotFoundException, got {gone}"
+            deleted["state"],
+            json!("DELETED"),
+            "case {case:?}: expected a deleted channel to settle to DELETED, got {:?}",
+            deleted["state"]
+        );
+        assert_eq!(
+            deleted["pipelinesRunningCount"],
+            json!(0),
+            "case {case:?}: expected no pipelines running on a DELETED channel, got {:?}",
+            deleted["pipelinesRunningCount"]
         );
 
+        // `DELETED` is terminal: a second delete is refused rather than
+        // starting the deletion over.
+        let (status, again) = call(&router, "DELETE", &format!("/prod/channels/{id}"), None).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected deleting a DELETED channel to conflict, got {status}: {again}"
+        );
+        assert_eq!(
+            error_code(status, &again),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {again}"
+        );
+
+        // The deleted channel is still this account's record of it, so the list
+        // goes on carrying it in that state.
         let (status, listed) = call(&router, "GET", "/prod/channels", None).await;
         assert_eq!(status, 200, "case {case:?}: ListChannels: got {status}: {listed}");
+        let channels = listed["channels"].as_array().cloned().unwrap_or_default();
         assert_eq!(
-            listed["channels"],
-            json!([]),
-            "case {case:?}: expected a deleted channel to leave the list empty, got {:?}",
+            channels.len(),
+            1,
+            "case {case:?}: expected the deleted channel to still be listed, got {:?}",
             listed["channels"]
+        );
+        assert_eq!(
+            (&channels[0]["id"], &channels[0]["state"]),
+            (&json!(id), &json!("DELETED")),
+            "case {case:?}: expected the deleted channel listed as DELETED, got {:?}",
+            channels[0]
         );
     }
 }

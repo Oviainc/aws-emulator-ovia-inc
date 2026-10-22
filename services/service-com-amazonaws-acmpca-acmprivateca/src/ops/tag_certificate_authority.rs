@@ -215,9 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anyway, and that transition came due at the same instant either way.
         let Some(record) = state.certificate_authority_mut(&arn, ::std::time::SystemTime::now())
         else {
-            return Err(not_found(format!(
-                "the certificate authority {arn} was not found"
-            )));
+            return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
         };
 
         // A deleted CA is waiting to be restored or permanently deleted: its tag set is

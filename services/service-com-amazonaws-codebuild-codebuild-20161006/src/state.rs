@@ -4,9 +4,11 @@
 //!
 //! Every implemented CodeBuild operation computes its answer from the records
 //! here: `CreateProject` writes a [`Project`], `StartBuild` writes a
-//! [`StoredBuild`], `StartSandbox` writes a [`StoredSandbox`], and the reporting
-//! operations (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetSandboxes`,
-//! `ListProjects`, `ListBuildsForProject`) only read them.
+//! [`StoredBuild`], `StartSandbox` writes a [`StoredSandbox`],
+//! `ImportSourceCredentials` writes a [`StoredSourceCredentials`], and the
+//! reporting operations (`BatchGetProjects`, `BatchGetBuilds`,
+//! `BatchGetSandboxes`, `ListProjects`, `ListBuildsForProject`,
+//! `ListSourceCredentials`) only read them.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
 //! the structure the write persisted rather than a second, drifting copy of the
@@ -16,6 +18,7 @@ use std::collections::BTreeMap;
 
 use crate::ops::types::{
     Build, BuildPhase, PhaseContext, Project, Sandbox, SandboxSession, SandboxSessionPhase,
+    SourceCredentialsInfo,
 };
 
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
@@ -69,6 +72,22 @@ pub const SANDBOX_IDEMPOTENCY_TOKEN_TTL_MILLIS: i64 = IDEMPOTENCY_TOKEN_TTL_MILL
 /// `BuildIds` (`@length(min: 1, max: 100)`) and `ListProjects$projects` targets
 /// `ProjectNames` (same bound) — so a page can hold no more than this.
 pub const MAX_PAGE_SIZE: usize = 100;
+
+/// The `AuthType` values whose `token` is a resource ARN rather than a secret,
+/// from `SourceCredentialsInfo$resource`: "The connection ARN if your authType is
+/// CODECONNECTIONS or SECRETS_MANAGER."
+pub const RESOURCE_ARN_AUTH_TYPES: &[&str] = &["CODECONNECTIONS", "SECRETS_MANAGER"];
+
+/// The one `AuthType` `ImportSourceCredentials` cannot create, from
+/// `ImportSourceCredentialsInput$authType`: "An OAUTH connection is not supported
+/// by the API and must be created using the CodeBuild console."
+pub const CONSOLE_ONLY_AUTH_TYPE: &str = "OAUTH";
+
+/// The one `AuthType` `ImportSourceCredentialsInput$username` is accepted for,
+/// from that member's own documentation: "The Bitbucket username when the
+/// authType is BASIC_AUTH. This parameter is not valid for other types of source
+/// providers or connections."
+pub const USERNAME_AUTH_TYPE: &str = "BASIC_AUTH";
 
 /// Build projects this emulator holds for the account.
 ///
@@ -179,6 +198,18 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     pub next_build_numbers: BTreeMap<String, i64>,
     /// `StartBuild` idempotency tokens, keyed by (project name, token).
     pub start_build_tokens: BTreeMap<(String, String), StartBuildToken>,
+    /// Imported source-repository credentials, keyed by the `ServerType` they
+    /// were imported for.
+    ///
+    /// One entry per server type is what the resource's own identity allows: a
+    /// credential is addressed only by its token ARN, and that ARN carries
+    /// nothing but the server type (see [`source_credential_arn`]), so two
+    /// credentials for one server type could not be told apart by
+    /// `DeleteSourceCredentials`. It is also what `ImportSourceCredentials`'s
+    /// `shouldOverwrite` member and its `ResourceAlreadyExistsException` are
+    /// about. Keying by the server type therefore bounds this map at the five
+    /// values `ServerType` declares, with no eviction to do.
+    pub source_credentials: BTreeMap<String, StoredSourceCredentials>,
     /// Sandboxes, keyed by sandbox id (`<projectName>:<uuid>`).
     pub sandboxes: BTreeMap<String, StoredSandbox>,
     /// Sandbox ids per project, in start order — which is the order
@@ -217,6 +248,38 @@ pub struct StoredBuild {
     pub start_millis: i64,
     /// Epoch millis at which this build's terminal transition became due.
     pub settle_due_millis: i64,
+}
+
+/// One set of imported source-repository credentials.
+///
+/// The caller's `token` is NOT kept. Nothing this emulator serves authenticates
+/// to a source provider, and no operation reports the token back, so the secret
+/// is read and dropped; the only part retained is the connection or secret ARN
+/// that `SourceCredentialsInfo$resource` reports ("The connection ARN if your
+/// authType is CODECONNECTIONS or SECRETS_MANAGER"), which is a resource
+/// identifier rather than a credential.
+#[derive(Debug, Clone)]
+pub struct StoredSourceCredentials {
+    /// The token ARN this credential is addressed by.
+    pub arn: String,
+    /// The `ServerType` it was imported for — the key this record is held under.
+    pub server_type: String,
+    /// The `AuthType` it was imported with.
+    pub auth_type: String,
+    /// The connection or secret ARN, for the auth types whose token IS one.
+    pub resource: Option<String>,
+}
+
+impl StoredSourceCredentials {
+    /// This record as the modelled shape every reader hands back.
+    pub fn info(&self) -> SourceCredentialsInfo {
+        SourceCredentialsInfo {
+            arn: Some(self.arn.clone()),
+            server_type: Some(self.server_type.clone()),
+            auth_type: Some(self.auth_type.clone()),
+            resource: self.resource.clone(),
+        }
+    }
 }
 
 /// A persisted sandbox: the modelled [`Sandbox`] plus the instants its timestamps
@@ -689,6 +752,21 @@ pub fn project_arn(region: &str, name: &str) -> String {
 /// `arn:aws:codebuild:<region>:<account>:build/<id>`.
 pub fn build_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("build/{id}"))
+}
+
+/// `arn:aws:codebuild:<region>:<account>:token/<server type, lowercased>` — the
+/// token ARN `ImportSourceCredentials` returns and `DeleteSourceCredentials`
+/// takes, as AWS documents it for the CLI
+/// (`--arn arn:aws:codebuild:us-west-2:<account>:token/github`).
+///
+/// The server type is the only request value in it, which is why a credential is
+/// held per server type.
+pub fn source_credential_arn(region: &str, server_type: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("token/{}", server_type.to_ascii_lowercase()),
+    )
 }
 
 /// `arn:aws:codebuild:<region>:<account>:sandbox/<id>`.

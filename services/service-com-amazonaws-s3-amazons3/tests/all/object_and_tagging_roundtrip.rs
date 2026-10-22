@@ -64,6 +64,8 @@ fn sized_object(length: usize) -> Object {
         website_redirect_location: None,
         metadata: std::collections::BTreeMap::new(),
         tags: Vec::new(),
+        // The store mints an object's version id; one handed to `put_object` carries none.
+        version_id: None,
         body,
     }
 }
@@ -681,11 +683,13 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
         );
     }
 
+    // `versionId` is NOT in this table: it names one stored version of the key, which
+    // this emulator does keep (see the `object_versioning` suite), so a read naming one
+    // is answered rather than refused.
     for (case, headers, query) in [
         ("a ranged read", &[("range", "bytes=0-3")][..], ""),
         ("a conditional read", &[("if-none-match", "\"x\"")][..], ""),
         ("a part number", &[][..], "?partNumber=1"),
-        ("a version id", &[][..], "?versionId=null"),
     ] {
         let refused = get_object(&router, "refusal-bucket", "dags/held.py", query, headers).await;
         assert_eq!(

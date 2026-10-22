@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers the tags the addressed Performance Insights resource carries,
+//! read from the report the `ResourceARN` names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The `ResourceARN` is the handle a Performance Insights resource is tagged by, and
+//! the only resource this service issues an ARN for is a performance analysis report
+//! (`CreatePerformanceAnalysisReport`). An ARN inside the modelled
+//! `AmazonResourceName` pattern that names no report this account holds is refused
+//! with the modelled `NotAuthorizedException` (HTTP 400) under the service-wide
+//! [`crate::state::NOT_AUTHORIZED_MESSAGE`] — one sentence for "never existed",
+//! "deleted" and "another account's", so the refusal discloses which it was. An ARN
+//! OUTSIDE that pattern never reaches this handler: the boundary validator refuses it
+//! first, which is what keeps the two stages a client branches on distinguishable.
+//!
+//! The tags come from the report record itself, the single home for them, so this
+//! operation, a listing's `ListTags` summary and the two tag writers cannot disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +154,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServiceError(
+                InternalServiceError {
+                    message: Some(
+                        "the Performance Insights report store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // `ServiceType` is required by the model and refused at the boundary when it
+        // is not one of its values; it adds no gate here, because the `ResourceARN`
+        // is what names the resource — and the ARN of a report already carries the
+        // service type and the data source it was created for.
+        let _ = ctx;
+
+        let store = state.lock();
+        let Some(report) = store.report_by_arn(&input.resource_arn) else {
+            // A well-formed ARN naming no report this account holds: the uniform
+            // authorization refusal, which says nothing about whether such a
+            // report ever existed.
+            return Err(not_authorized());
+        };
+
+        // Reading tags writes nothing: the report's own list is reported as it
+        // stands.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(report.tags.clone()),
+        })
     }
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal this service answers
+/// for a resource the caller may not see — including an ARN that names no report
+/// at all, so neither answer discloses the other.
+fn not_authorized() -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
 }

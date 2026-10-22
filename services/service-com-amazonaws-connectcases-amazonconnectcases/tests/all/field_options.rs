@@ -29,7 +29,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
     MAX_BATCH_FIELD_OPTIONS, MAX_FIELD_OPTIONS_PER_FIELD, MAX_FIELD_OPTION_TEXT_LEN,
 };
 
-use crate::case_lifecycle::{domain, field_of_type, fields_of_every_type, string_at, Emulator};
+use crate::harness::{domain, field_of_type, fields_of_every_type, string_at, Emulator};
 
 /// `FieldOptionValue` forms the service accepts: "max length 100 and must be
 /// alphanumeric with hyphens and underscores"

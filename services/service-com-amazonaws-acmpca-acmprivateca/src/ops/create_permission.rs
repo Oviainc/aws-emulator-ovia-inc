@@ -215,9 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // emulator reaches accepts one; the modelled `InvalidStateException` is reserved
         // for a CA that is no longer there to grant on.
         let Some(record) = state.certificate_authority_mut(&arn, now) else {
-            return Err(not_found(format!(
-                "the certificate authority {arn} was not found"
-            )));
+            return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
         };
 
         // One grant per (CA, principal, source account): a second call naming the same

@@ -356,9 +356,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owes its removal: the next read within the span sees `deleting`, and every
         // read after it is a `DBInstanceNotFoundFault`.
         record.begin_deletion();
+        let dbi_resource_id = record.dbi_resource_id.clone();
+        let db_instance = record.to_wire();
+        // The resource is on its way out, so this service stops claiming the id it
+        // minted: a monitoring service must not be told that an id whose resource is
+        // being deleted is still one of ours.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            directory.lock().forget(&dbi_resource_id);
+        }
 
         Ok(DeleteDBInstanceOutput {
-            db_instance: Some(record.to_wire()),
+            db_instance: Some(db_instance),
         })
     }
 }

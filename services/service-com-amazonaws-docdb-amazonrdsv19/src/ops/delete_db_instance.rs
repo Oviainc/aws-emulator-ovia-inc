@@ -205,6 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         record.status = docdb::STATUS_DELETING.to_string();
         record.available_at = None;
+        // The instance is gone from the store, so this service stops claiming the
+        // `DbiResourceId` it minted for it.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            directory.lock().forget(&record.dbi_resource_id);
+        }
         Ok(DeleteDBInstanceOutput {
             db_instance: Some(docdb::instance_to_shape(
                 &record,

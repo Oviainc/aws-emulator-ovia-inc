@@ -4,7 +4,8 @@
 //!
 //! The slice implemented so far is Lightsail's primary resource, the **instance**
 //! (a virtual private server), the **block storage disk** (additional storage an
-//! instance can attach), the **domain** (a DNS zone the account holds
+//! instance can attach), the **disk snapshot** (a point-in-time copy of a disk
+//! or of an instance's system volume), the **domain** (a DNS zone the account holds
 //! recordsets in), the **container service** (a compute resource containers are
 //! deployed to), the **bucket** (an object-storage resource of the Lightsail
 //! object storage service) together with the **access keys** it grants
@@ -117,6 +118,17 @@ pub const DISK_ARN_RESOURCE_PREFIX: &str = "Disk/";
 /// documentation names ("The Lightsail resource type (`Disk`)").
 pub const RESOURCE_TYPE_DISK: &str = "Disk";
 
+/// The resource portion a disk snapshot ARN carries before its id. Mirrors the
+/// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
+/// this resource's own `ResourceType` value.
+pub const DISK_SNAPSHOT_ARN_RESOURCE_PREFIX: &str = "DiskSnapshot/";
+
+/// The `resourceType` a disk snapshot and its operations report, from the
+/// modelled `ResourceType` enum — the value the modelled
+/// `DiskSnapshot$resourceType` documentation names ("The Lightsail resource type
+/// (`DiskSnapshot`)").
+pub const RESOURCE_TYPE_DISK_SNAPSHOT: &str = "DiskSnapshot";
+
 /// Applied when `CreateInstances` omits `ipAddressType`.
 ///
 /// From that member's own documentation: "The default value is `dualstack`."
@@ -206,11 +218,23 @@ pub const DISK_STATE_AVAILABLE: &str = "available";
 /// See [`DISK_STATE_PENDING`].
 pub const DISK_STATE_IN_USE: &str = "in-use";
 
-/// A disk state the clock already owes a disk.
+/// `DiskSnapshotState` values this slice uses, from the modelled
+/// `DiskSnapshotState` enum and the `DiskSnapshot$state` documentation ("The
+/// status of the disk snapshot operation"): a snapshot Lightsail is still taking
+/// is `pending` and one whose data is all captured is `completed`. The enum's
+/// `error` and `unknown` members describe a snapshot that failed or whose status
+/// Lightsail cannot report, neither of which this store can produce — nothing
+/// here fails a copy.
+pub const DISK_SNAPSHOT_STATE_PENDING: &str = "pending";
+/// See [`DISK_SNAPSHOT_STATE_PENDING`].
+pub const DISK_SNAPSHOT_STATE_COMPLETED: &str = "completed";
+
+/// A disk or disk-snapshot state the clock already owes a record.
 ///
-/// Separate from [`DueTransition`] because a disk's state is a value of the
-/// modelled `DiskState` enum — a name with no numeric code — where an instance's
-/// is an EC2 `InstanceState` (a code and a name together).
+/// Separate from [`DueTransition`] because a disk's state — like a disk
+/// snapshot's — is a value of a modelled string enum (`DiskState`,
+/// `DiskSnapshotState`): a name with no numeric code, where an instance's is an
+/// EC2 `InstanceState` (a code and a name together).
 #[derive(Debug, Clone, Copy)]
 pub struct DueDiskState {
     /// Epoch milliseconds at which the change became (or becomes) due.
@@ -256,6 +280,8 @@ pub const OPERATION_TYPE_CREATE_BUCKET: &str = "CreateBucket";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_BUCKET_ACCESS_KEY: &str = "CreateBucketAccessKey";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_BUCKET_ACCESS_KEY: &str = "DeleteBucketAccessKey";
@@ -299,6 +325,12 @@ pub const MAX_DOMAINS: usize = 500;
 /// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_DISKS: usize = 500;
+
+/// The most disk snapshots this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
+/// refused with the modelled `InvalidInputException`.
+pub const MAX_DISK_SNAPSHOTS: usize = 500;
 
 /// The most recordset entries this emulator will hold in one domain.
 ///
@@ -2558,6 +2590,102 @@ impl StoredDisk {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Disk snapshots
+// ---------------------------------------------------------------------------
+
+/// The resource one disk snapshot was taken of: the modelled `DiskSnapshot`
+/// reports the source's name AND its ARN, and a snapshot has exactly one source
+/// — the modelled `CreateDiskSnapshot$diskName` and `$instanceName`
+/// documentation says the two "are mutually exclusive" — so the pair is stored
+/// as one value rather than as four independent members that could disagree.
+#[derive(Debug, Clone)]
+pub enum DiskSnapshotSource {
+    /// A block storage disk, snapshotted through `CreateDiskSnapshot`'s
+    /// `diskName`.
+    Disk { name: String, arn: String },
+    /// An instance's system volume, snapshotted through `instanceName`: "When
+    /// this is defined, a snapshot of the instance's system volume is created."
+    Instance { name: String, arn: String },
+}
+
+/// The `progress` a disk snapshot in `state` reports.
+///
+/// DERIVED from the snapshot's own state: a snapshot Lightsail is still taking
+/// has nothing captured yet as far as this store knows, and one that completed
+/// has captured all of the source volume. The percentage form is the one the
+/// EC2 snapshot `Progress` this member mirrors uses (`"100%"`); the modelled
+/// `DiskSnapshot$progress` documentation says only "The progress of the
+/// snapshot", so the FORM is emulator-chosen while the fact it reports is the
+/// store's own state.
+fn disk_snapshot_progress(state: &str) -> &'static str {
+    if state == DISK_SNAPSHOT_STATE_COMPLETED {
+        "100%"
+    } else {
+        "0%"
+    }
+}
+
+/// One stored disk snapshot: every member `GetDiskSnapshot` reports, plus the
+/// clock-owed transition its state is waiting on.
+#[derive(Debug, Clone)]
+pub struct StoredDiskSnapshot {
+    /// The snapshot name the request named, kept verbatim — it is this record's
+    /// store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    /// The size of the snapshotted volume, copied from the source at the instant
+    /// the snapshot was taken — the size a disk created from this snapshot
+    /// starts at, so it does not follow a later change to the source.
+    pub size_in_gb: i32,
+    /// The current `DiskSnapshotState` value: [`DISK_SNAPSHOT_STATE_PENDING`] or
+    /// [`DISK_SNAPSHOT_STATE_COMPLETED`].
+    pub state: &'static str,
+    /// The state the clock owes this snapshot, while one is outstanding.
+    pub due: Option<DueDiskState>,
+    /// What the snapshot was taken of.
+    pub source: DiskSnapshotSource,
+}
+
+impl StoredDiskSnapshot {
+    /// This record as the modelled `DiskSnapshot`.
+    pub fn view(&self) -> crate::ops::types::DiskSnapshot {
+        let (from_disk_name, from_disk_arn, from_instance_name, from_instance_arn) = match
+            &self.source
+        {
+            DiskSnapshotSource::Disk { name, arn } => {
+                (Some(name.clone()), Some(arn.clone()), None, None)
+            }
+            DiskSnapshotSource::Instance { name, arn } => {
+                (None, None, Some(name.clone()), Some(arn.clone()))
+            }
+        };
+        crate::ops::types::DiskSnapshot {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_DISK_SNAPSHOT.to_string()),
+            tags: Some(self.tags.clone()),
+            size_in_gb: Some(self.size_in_gb),
+            state: Some(self.state.to_string()),
+            progress: Some(disk_snapshot_progress(self.state).to_string()),
+            from_disk_name,
+            from_disk_arn,
+            from_instance_name,
+            from_instance_arn,
+            // `CreateDiskSnapshot` is an explicit snapshot the caller asked
+            // for, so it is not one the `AutoSnapshot` add-on took.
+            is_from_auto_snapshot: Some(false),
+        }
+    }
+}
+
 /// One stored domain recordset: the DNS zone `CreateDomain` created, with the
 /// entries the account has added to it.
 #[derive(Debug, Clone)]
@@ -3314,6 +3442,10 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// disk operation takes. A `BTreeMap` so `GetDisks` walks a stable, total
     /// order and a page token can name the next disk.
     pub disks: BTreeMap<String, StoredDisk>,
+    /// Every disk snapshot, keyed by its snapshot name — the identifier every
+    /// disk snapshot operation takes. A `BTreeMap` so `GetDiskSnapshots` walks a
+    /// stable, total order and a page token can name the next snapshot.
+    pub disk_snapshots: BTreeMap<String, StoredDiskSnapshot>,
     /// The append-only operation log, newest last: the source of truth for the
     /// `operations` every mutating instance call answers with.
     pub operations: Vec<StoredOperation>,
@@ -3385,6 +3517,16 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Store a newly created block storage disk.
     pub fn insert_disk(&mut self, disk: StoredDisk) {
         self.disks.insert(disk.name.clone(), disk);
+    }
+
+    /// The disk snapshot `name` names, for a reporting operation.
+    pub fn disk_snapshot(&self, name: &str) -> Option<&StoredDiskSnapshot> {
+        self.disk_snapshots.get(name)
+    }
+
+    /// Store a newly created disk snapshot.
+    pub fn insert_disk_snapshot(&mut self, snapshot: StoredDiskSnapshot) {
+        self.disk_snapshots.insert(snapshot.name.clone(), snapshot);
     }
 
     /// Remove the instance `name` names, answering it. `None` when nothing
@@ -3573,7 +3715,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// Materialise every transition the clock had already made due at `now_ms`:
-    /// an instance or a disk settles into the state it was owed, a container service walks
+    /// an instance, a disk or a disk snapshot settles into the state it was owed, a container service walks
     /// into the phase it was owed (activating the deployment that was waiting),
     /// and an operation whose work is done settles into `Succeeded`.
     ///
@@ -3582,8 +3724,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// cannot show a caller anything a later caller would not also see.
     ///
     /// Every walk is bounded by [`MAX_INSTANCES`], [`MAX_DISKS`],
-    /// [`MAX_CONTAINER_SERVICES`] and [`MAX_OPERATION_HISTORY`], and a record
-    /// drops out of the work as soon as it has nothing outstanding.
+    /// [`MAX_DISK_SNAPSHOTS`], [`MAX_CONTAINER_SERVICES`] and
+    /// [`MAX_OPERATION_HISTORY`], and a record drops out of the work as soon as
+    /// it has nothing outstanding.
     fn advance_clock(&mut self, now_ms: i64) {
         for instance in self.instances.values_mut() {
             let Some(due) = instance.due else { continue };
@@ -3597,6 +3740,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
             if due.at_ms <= now_ms {
                 disk.state = due.state;
                 disk.due = None;
+            }
+        }
+        for snapshot in self.disk_snapshots.values_mut() {
+            let Some(due) = snapshot.due else { continue };
+            if due.at_ms <= now_ms {
+                snapshot.state = due.state;
+                snapshot.due = None;
             }
         }
         for service in self.container_services.values_mut() {
@@ -3911,6 +4061,15 @@ pub fn disk_arn(region: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{DISK_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The ARN of the disk snapshot `id` in `region`.
+pub fn disk_snapshot_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{DISK_SNAPSHOT_ARN_RESOURCE_PREFIX}{id}"),
     )
 }
 

@@ -596,6 +596,10 @@ async fn the_item_figures_a_table_reports_are_the_metered_ones() {
             "case {case:?}: expected PutItem to answer 200, got {status} {body:?}"
         );
     }
+
+    // The figures a description reports are the METERED ones, which those writes do not
+    // move: "DynamoDB updates this value approximately every six hours. Recent changes
+    // might not be reflected in this value" (the `TableDescription$ItemCount` doc).
     let (status, body) = emulator
         .call_dynamodb("DescribeTable", json!({"TableName": "orders"}))
         .await;

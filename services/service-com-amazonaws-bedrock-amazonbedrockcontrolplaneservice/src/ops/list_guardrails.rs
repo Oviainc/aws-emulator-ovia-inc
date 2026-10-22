@@ -164,12 +164,11 @@ fn cursor_belongs(token: &str, filtered_id: Option<&str>) -> bool {
 fn summary(
     guardrail: &crate::state::Guardrail,
     revision: &crate::state::GuardrailRevision,
-    now: ::std::time::SystemTime,
 ) -> GuardrailSummary {
     GuardrailSummary {
         id: guardrail.id.clone(),
         arn: guardrail.arn.clone(),
-        status: revision.status_at(now).to_string(),
+        status: revision.status.to_string(),
         name: guardrail.name.clone(),
         description: revision.description.clone(),
         version: revision.version.clone(),
@@ -205,7 +204,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let now = ::std::time::SystemTime::now();
         let store = state.lock();
 
         // In cursor order: with an identifier, every revision of that one guardrail;
@@ -226,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 for revision in guardrail.revisions() {
                     rows.push((
                         cursor_of(&guardrail.id, &revision.version),
-                        summary(guardrail, revision, now),
+                        summary(guardrail, revision),
                     ));
                 }
             }
@@ -239,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     };
                     rows.push((
                         cursor_of(&guardrail.id, &guardrail.draft.version),
-                        summary(guardrail, &guardrail.draft, now),
+                        summary(guardrail, &guardrail.draft),
                     ));
                 }
             }

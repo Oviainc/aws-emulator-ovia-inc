@@ -419,16 +419,30 @@ pub const TASK_DEFINITION_NOT_FOUND_MESSAGE: &str = "Unable to describe task def
 pub const CONTAINER_INSTANCE_NOT_FOUND_MESSAGE: &str =
     "The referenced container instance was not found";
 
-/// `ClusterContainsServicesException$message`: the shape's own doc sentence, which names
-/// no cluster (`smithy_query` query="shape" shape="ClusterContainsServicesException").
+/// `ClusterContainsServicesException$message`: the sentence the wire corpus records for
+/// this refusal, which names no cluster. It is the RECORDED text rather than the shape's
+/// doc paraphrase ("You can't delete a cluster that contains services."), because the
+/// recording is what the wire carries.
 pub const CLUSTER_CONTAINS_SERVICES_MESSAGE: &str =
-    "You can't delete a cluster that contains services.";
+    "The Cluster cannot be deleted while Services are active.";
 
 /// `ClusterContainsTasksException$message`: the shape's own doc sentence, which names no
-/// cluster (`smithy_query` query="shape" shape="ClusterContainsTasksException").
+/// cluster (`smithy_query` query="shape" shape="ClusterContainsTasksException"). No
+/// recording fixes this one; what the rule fixes is that the sentence is the SAME for
+/// every request that meets the condition.
 pub const CLUSTER_CONTAINS_TASKS_MESSAGE: &str = "You can't delete a cluster that has active tasks.";
 
-/// A cluster, as `CreateCluster` left it.
+/// `InvalidParameterException$message` when `DeleteService` is asked to delete a service
+/// that is still scaled up. The operation's doc: "You can delete a service if you have no
+/// running tasks in it and the desired task count is zero" — a condition of the service,
+/// so the sentence names no resource either.
+pub const SERVICE_SCALED_ABOVE_ZERO_MESSAGE: &str =
+    "The service cannot be stopped while it is scaled above 0.";
+
+/// A cluster, as `CreateCluster` left it. A DELETED cluster is still one of these, with
+/// `status` [`CLUSTER_INACTIVE`]: `DeleteCluster` tombstones the record rather than
+/// dropping it, because "Clusters with an INACTIVE status may remain discoverable in your
+/// account for a period of time."
 #[derive(Debug, Clone)]
 pub struct ClusterRecord {
     pub name: String,
@@ -1579,13 +1593,37 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
     }
 
-    /// Whether `cluster_name` still holds a service that has not gone `INACTIVE`.
+    /// The cluster an operation may act IN: one that exists and has not been deleted.
+    ///
+    /// A tombstone (`status` [`CLUSTER_INACTIVE`]) is not one — the `Cluster$status` doc:
+    /// "The cluster has been deleted" — so every operation that resolves a `cluster` to
+    /// work in refuses it exactly as it refuses a name that never existed. The three
+    /// operations that own the tombstone read `clusters` directly instead:
+    /// `DescribeClusters` reports it, `DeleteCluster` answers idempotently with it, and
+    /// `CreateCluster` creates a new cluster over it.
+    pub fn active_cluster(&self, cluster_name: &str) -> Option<&ClusterRecord> {
+        self.clusters
+            .get(cluster_name)
+            .filter(|cluster| cluster.status != CLUSTER_INACTIVE)
+    }
+
+    /// Whether [`Self::active_cluster`] names one — the existence check an operation that
+    /// only needs to know the cluster is there makes.
+    pub fn has_active_cluster(&self, cluster_name: &str) -> bool {
+        self.active_cluster(cluster_name).is_some()
+    }
+
+    /// Whether `cluster_name` still holds an `ACTIVE` service — one the caller has NOT
+    /// deleted yet, and so one of the cluster's `activeServicesCount`.
+    ///
     /// `DeleteCluster`'s `ClusterContainsServicesException`: "You can't delete a cluster
-    /// that contains services."
+    /// that contains services. First, update the service to reduce its desired task count
+    /// to 0, and then delete the service" — so a service already being drained away
+    /// (`DRAINING`) or deleted (`INACTIVE`) is not what that refusal is about.
     pub fn cluster_has_active_services(&self, cluster_name: &str) -> bool {
         self.services
             .values()
-            .any(|service| service.cluster_name == cluster_name && service.status != SERVICE_INACTIVE)
+            .any(|service| service.cluster_name == cluster_name && service.is_active())
     }
 
     /// Drain a DELETED service: it keeps nothing running and keeps no task set.
@@ -1864,11 +1902,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         tally
     }
 
-    /// Whether `cluster_name` still holds a task that has not stopped.
+    /// Whether `cluster_name` still holds a task the caller has NOT released: one that is
+    /// neither stopped nor stopping, i.e. whose `desiredStatus` is still `RUNNING`.
+    ///
+    /// `DeleteCluster`'s `ClusterContainsTasksException`: "You can't delete a cluster that
+    /// has active tasks." A task that has been asked to stop is on its way out and is
+    /// already excluded from everything else that counts a cluster's tasks
+    /// (`Service$runningCount`, `ListTasks`' default filter), so it does not hold the
+    /// cluster open either.
     pub fn cluster_has_active_tasks(&self, cluster_name: &str) -> bool {
-        self.tasks
-            .values()
-            .any(|task| task.cluster_name == cluster_name && task.is_active())
+        self.tasks.values().any(|task| {
+            task.cluster_name == cluster_name
+                && task.desired_status == STATUS_RUNNING
+                && task.is_active()
+        })
     }
 
     /// The `Cluster` a cluster-returning operation reports.
@@ -1908,21 +1955,26 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             } else {
                 None
             },
-            settings: if fields.settings {
-                Some(cluster.effective_settings())
+            // `settings`, `tags` and `statistics` are LISTS a described cluster always
+            // carries: `include` decides whether they are materialised, not whether the
+            // member is there, so a cluster read without `include` reports them empty
+            // rather than absent and a client cannot mistake "not asked for" for "none
+            // stored".
+            settings: Some(if fields.settings {
+                cluster.effective_settings()
             } else {
-                None
-            },
-            tags: if fields.tags {
-                Some(cluster.tags.clone())
+                Vec::new()
+            }),
+            tags: Some(if fields.tags {
+                cluster.tags.clone()
             } else {
-                None
-            },
-            statistics: if fields.statistics {
-                Some(cluster_statistics(&tally))
+                Vec::new()
+            }),
+            statistics: Some(if fields.statistics {
+                cluster_statistics(&tally)
             } else {
-                None
-            },
+                Vec::new()
+            }),
             // Capacity-provider attachments are created by
             // PutClusterCapacityProviders, which is not part of this slice, so a
             // cluster here has none to report.
@@ -1979,8 +2031,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// How many clusters the account holds — the top-level `clusterCount` a
     /// cluster-mutating response carries, read after the call has been applied. See
     /// [`ClusterCountEnvelope`] for why it is not a modelled member.
+    ///
+    /// A DELETED cluster is not one of them: the record stays as a tombstone so a reader
+    /// can still describe it ("The cluster has been deleted"), but the account no longer
+    /// holds that cluster, so it is not counted.
     pub fn cluster_count(&self) -> i32 {
-        i32::try_from(self.clusters.len()).unwrap_or(i32::MAX)
+        let live = self
+            .clusters
+            .values()
+            .filter(|cluster| cluster.status != CLUSTER_INACTIVE)
+            .count();
+        i32::try_from(live).unwrap_or(i32::MAX)
     }
 }
 

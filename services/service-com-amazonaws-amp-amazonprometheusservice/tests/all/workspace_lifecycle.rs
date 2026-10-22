@@ -32,7 +32,8 @@ fn kms_key_arn(region: &str) -> String {
     )
 }
 
-/// One response, as a test reads it: the HTTP status and the parsed body.
+/// One response, as a test reads it: the HTTP status, the response headers and the
+/// parsed body.
 ///
 /// `pub(crate)`, with [`Amp`], [`text`] and [`wait_for_due_transition`], because every
 /// suite in this crate drives the service over the same request path — a second copy of
@@ -40,6 +41,7 @@ fn kms_key_arn(region: &str) -> String {
 #[derive(Debug)]
 pub(crate) struct Reply {
     pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
     pub(crate) body: serde_json::Value,
 }
 
@@ -48,12 +50,21 @@ impl Reply {
     pub(crate) fn error_code(&self) -> String {
         text(&self.body["__type"])
     }
+
+    /// One response header, as the wire carries it — `None` when the response has none
+    /// by that name.
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|value| value.to_str().ok())
+    }
 }
 
 /// The emulator under test: this service on its own shared engine. Shared with the
 /// other suites in this test target, which drive the same request path.
 pub(crate) struct Amp {
     router: MultiServiceRouter,
+    /// The SAME engine the mounted service reads and writes, so a suite can seed a
+    /// record the operations under test then read it back over HTTP.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Amp {
@@ -61,8 +72,18 @@ impl Amp {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// This service's store in that shared engine — the one the handlers reach through
+    /// `crate::state::service_state`.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_amp_amazonprometheusservice::ComAmazonawsAmpAmazonprometheusserviceState,
+    > {
+        self.engine.state()
     }
 
     /// Dispatch one request, signed (unverified — authentication is off here) for
@@ -86,6 +107,7 @@ impl Amp {
 
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let headers = response.headers().clone();
         let bytes = response.into_body();
         let body = if bytes.is_empty() {
             serde_json::Value::Null
@@ -97,7 +119,11 @@ impl Amp {
                 )
             })
         };
-        Reply { status, body }
+        Reply {
+            status,
+            headers,
+            body,
+        }
     }
 
     async fn create(&self, region: &str, body: &serde_json::Value) -> Reply {

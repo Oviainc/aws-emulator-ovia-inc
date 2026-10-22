@@ -6,8 +6,14 @@
 //! HeadBucket answer from a bucket's own record, and the object-storage loop
 //! (PutObject / GetObject / ListObjectsV2 / DeleteObject / DeleteBucket) computes
 //! every response from the objects stored inside it.
+//!
+//! A bucket whose versioning status is `Enabled` holds more than one version of a key:
+//! the CURRENT one, which every reader that names no `versionId` answers with, and the
+//! noncurrent ones a later write or a delete displaced, each addressable by the version id
+//! the store minted for it ([`mint_version_id`]). Every stored version counts against the
+//! same ceilings a current object does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use md5::{Digest, Md5};
@@ -104,6 +110,23 @@ pub const MAX_OBJECTS_TOTAL: usize = 10_000;
 /// `MAX_TOTAL_HOSTED_CONFIGURATION_BYTES`, codeguruprofiler's `MAX_RETAINED_PROFILE_BYTES`).
 /// A write that would take the whole store past it is refused rather than recorded.
 pub const MAX_OBJECT_BYTES_TOTAL: usize = 64 * 1024 * 1024;
+
+/// The version id an object written while the bucket was NOT versioning-enabled is
+/// addressed by.
+///
+/// "Objects stored in your bucket before you set the versioning state have a version ID
+/// of null", and `PutBucketVersioning`'s own documentation says the same of a suspended
+/// bucket: "Suspended—Disables versioning for the objects in the bucket. All objects
+/// added to the bucket receive the version ID null." Such a version is stored with no
+/// minted id at all ([`Object::version_id`] is `None`), so this is the string a request
+/// names it by rather than a value this store keeps.
+pub const NULL_VERSION_ID: &str = "null";
+
+/// The `BucketVersioningStatus` value that makes a bucket version its objects.
+///
+/// "Enabled—Enables versioning for the objects in the bucket. All objects added to the
+/// bucket receive a unique version ID" (`PutBucketVersioning`'s documentation).
+pub const VERSIONING_ENABLED_STATUS: &str = "Enabled";
 
 /// The most user-defined metadata one stored object may carry, in UTF-8 bytes summed
 /// over every `x-amz-meta-` key and value.
@@ -355,6 +378,342 @@ pub struct BucketVersioning {
     pub mfa_delete: Option<String>,
 }
 
+/// Every value the `Event` enum publishes: the bucket events a notification configuration
+/// may ask to be notified about, and so the only values one may name.
+///
+/// Re-exported from the model-generated value list for the shape rather than restated, so
+/// there is ONE source of truth and a regenerated model cannot leave this behind.
+pub use crate::ops::types::EVENT_VALUES;
+
+/// Every value the `FilterRuleName` enum publishes: a key-name filter rule filters on the
+/// prefix or on the suffix of an object key and on nothing else. Re-exported from the
+/// model-generated value list, like [`EVENT_VALUES`].
+pub use crate::ops::types::FILTER_RULE_NAME_VALUES;
+
+/// How many destination configurations one bucket's notification configuration may carry.
+///
+/// `PutBucketNotificationConfiguration`'s own documentation points at the published quota
+/// for this ("For more information about the number of event notification configurations
+/// that you can create per bucket, see Amazon S3 service quotas"), which is 100 event
+/// notification configurations per bucket; nothing in the model bounds the three lists
+/// (`TopicConfigurationList` and its siblings carry no `@length`), so this is also what
+/// bounds the records one bucket can park in this process's memory. A put past it is
+/// refused rather than recorded, the way a create past [`MAX_BUCKETS_PER_ACCOUNT`] is.
+pub const MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET: usize = 100;
+
+/// Which destination a notification configuration publishes to, which is what decides the
+/// member its ARN arrives on and the service that ARN has to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationDestination {
+    /// An Amazon SNS topic (`TopicConfiguration`).
+    Topic,
+    /// An Amazon SQS queue (`QueueConfiguration`).
+    Queue,
+    /// A Lambda function (`LambdaFunctionConfiguration`).
+    LambdaFunction,
+}
+
+impl NotificationDestination {
+    /// The member the destination ARN arrives on, as the wire spells it — the `xmlName`
+    /// each required ARN member carries (`Topic`, `Queue` and `CloudFunction`
+    /// respectively, from `smithy_query(query="shape",shape="TopicConfiguration")` and its
+    /// siblings). Used to name the offending member in a refusal.
+    pub fn arn_member(self) -> &'static str {
+        match self {
+            Self::Topic => "Topic",
+            Self::Queue => "Queue",
+            Self::LambdaFunction => "CloudFunction",
+        }
+    }
+
+    /// The service field the destination's ARN names: an SNS topic ARN for a
+    /// `TopicConfiguration`, an SQS queue ARN for a `QueueConfiguration` and a Lambda
+    /// function ARN for a `LambdaFunctionConfiguration` — the three destinations
+    /// `PutBucketNotificationConfiguration`'s documentation describes.
+    pub fn arn_service(self) -> &'static str {
+        match self {
+            Self::Topic => "sns",
+            Self::Queue => "sqs",
+            Self::LambdaFunction => "lambda",
+        }
+    }
+}
+
+/// One object key name filtering rule of a configuration's `Filter`.
+///
+/// Both members are optional in the model (`smithy_query(query="shape",shape="FilterRule")`),
+/// so each is kept exactly as the request carried it rather than defaulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationFilterRule {
+    /// A `FilterRuleName` value — one of [`FILTER_RULE_NAME_VALUES`] — or `None` when the
+    /// rule named none.
+    pub name: Option<String>,
+    /// "The value that the filter searches for in object key names" (`FilterRule$Value`),
+    /// or `None` when the rule named none.
+    pub value: Option<String>,
+}
+
+/// One destination configuration a bucket's notification configuration carries: a topic,
+/// a queue or a Lambda function, with the events it is notified about.
+///
+/// The three lists have identical members (an optional `Id`, a required destination ARN, a
+/// required `Events` list and an optional `Filter`), so one record serves all three and
+/// the destination kind travels beside it as a [`NotificationDestination`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NotificationTarget {
+    /// The configuration's id. `None` only before the store has seen it: "An optional
+    /// unique identifier for configurations in a notification configuration. If you don't
+    /// provide one, Amazon S3 will assign an ID" (`NotificationId`), so
+    /// [`ComAmazonawsS3Amazons3State::put_notification_configuration`] mints one for every
+    /// record that arrives without, and every STORED record carries `Some`.
+    pub id: Option<String>,
+    /// The destination's ARN, verbatim.
+    pub arn: String,
+    /// The bucket events this destination is notified about, in the order the request
+    /// carried them. Each is one of [`EVENT_VALUES`].
+    pub events: Vec<String>,
+    /// The key-name filter rules of the configuration's `Filter`, or `None` when it
+    /// carries no `Filter` (and so matches every key).
+    pub filter_rules: Option<Vec<NotificationFilterRule>>,
+}
+
+/// The whole notification configuration a bucket carries.
+///
+/// A bucket is created with the EMPTY value of this: "By default, your bucket has no event
+/// notifications configured. That is, the notification configuration will be an empty
+/// NotificationConfiguration" (`PutBucketNotificationConfiguration`'s documentation),
+/// which is why this is a plain field rather than an `Option` — "no notifications" and "an
+/// empty NotificationConfiguration" are the same state, and a put carrying an empty
+/// container is how notifications are turned back off.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BucketNotificationConfiguration {
+    /// The SNS topic configurations, in the order the request carried them.
+    pub topic_configurations: Vec<NotificationTarget>,
+    /// The SQS queue configurations, in the order the request carried them.
+    pub queue_configurations: Vec<NotificationTarget>,
+    /// The Lambda function configurations, in the order the request carried them.
+    pub lambda_function_configurations: Vec<NotificationTarget>,
+    /// Whether the configuration carries an `EventBridgeConfiguration`, which "enables
+    /// delivery of events to Amazon EventBridge"
+    /// (`NotificationConfiguration$EventBridgeConfiguration`). The shape has no members,
+    /// so its PRESENCE is the whole state and a `bool` records it exactly.
+    pub event_bridge_enabled: bool,
+}
+
+impl BucketNotificationConfiguration {
+    /// Every destination configuration, with its destination kind, in list order:
+    /// topics, then queues, then Lambda functions.
+    pub fn targets(&self) -> impl Iterator<Item = (NotificationDestination, &NotificationTarget)> {
+        self.topic_configurations
+            .iter()
+            .map(|target| (NotificationDestination::Topic, target))
+            .chain(
+                self.queue_configurations
+                    .iter()
+                    .map(|target| (NotificationDestination::Queue, target)),
+            )
+            .chain(
+                self.lambda_function_configurations
+                    .iter()
+                    .map(|target| (NotificationDestination::LambdaFunction, target)),
+            )
+    }
+
+    /// The same records, for writing — what lets the store mint an id into each record
+    /// that arrived without one.
+    fn targets_mut(&mut self) -> impl Iterator<Item = &mut NotificationTarget> {
+        self.topic_configurations
+            .iter_mut()
+            .chain(self.queue_configurations.iter_mut())
+            .chain(self.lambda_function_configurations.iter_mut())
+    }
+
+    /// How many destination configurations the container carries, across all three lists —
+    /// what [`MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`] bounds.
+    pub fn configuration_count(&self) -> usize {
+        self.topic_configurations.len()
+            + self.queue_configurations.len()
+            + self.lambda_function_configurations.len()
+    }
+
+    /// Whether the bucket has no event notifications configured at all — the state a
+    /// bucket is created in, and the one an empty `NotificationConfiguration` puts it back
+    /// into.
+    pub fn is_empty(&self) -> bool {
+        self.configuration_count() == 0 && !self.event_bridge_enabled
+    }
+}
+
+/// Why a `NotificationConfiguration` cannot be applied to a bucket.
+///
+/// Every one of these is a request S3 refuses with `InvalidArgument` (HTTP 400) rather
+/// than recording, so a refused put leaves the bucket's current configuration exactly as
+/// it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationConfigurationRejection {
+    /// An event outside [`EVENT_VALUES`].
+    UnsupportedEvent {
+        /// The member the configuration arrived on, for the message.
+        member: &'static str,
+        /// The value that is not a published event.
+        event: String,
+    },
+    /// A configuration naming no event at all: `Events` is a REQUIRED member of each
+    /// configuration shape, so a configuration with an empty list asks for nothing to be
+    /// published and cannot be applied.
+    NoEvents {
+        /// The member the configuration arrived on.
+        member: &'static str,
+    },
+    /// A filter rule whose `Name` is not one of [`FILTER_RULE_NAME_VALUES`].
+    InvalidFilterRuleName {
+        /// The rule's `Name`, or the empty string when it named none.
+        name: String,
+    },
+    /// Two configurations carrying the same `Id`: "An optional UNIQUE identifier for
+    /// configurations in a notification configuration" (`NotificationId`).
+    DuplicateConfigurationId {
+        /// The id that is used twice.
+        id: String,
+    },
+    /// A destination ARN that is not an ARN of the service that destination lives in.
+    InvalidDestinationArn {
+        /// The member the ARN arrived on (`Topic`, `Queue` or `CloudFunction`).
+        member: &'static str,
+        /// The service field such an ARN has to name.
+        service: &'static str,
+        /// The value that is not such an ARN.
+        arn: String,
+    },
+    /// More configurations than [`MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET`].
+    TooManyConfigurations {
+        /// How many the request carried.
+        count: usize,
+    },
+}
+
+impl std::fmt::Display for NotificationConfigurationRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedEvent { member, event } => write!(
+                f,
+                "The event {event} is not supported for notifications (member {member})"
+            ),
+            Self::NoEvents { member } => write!(
+                f,
+                "A {member} configuration must specify at least one event"
+            ),
+            Self::InvalidFilterRuleName { name } => write!(
+                f,
+                "filter rule name must be either prefix or suffix, got {name}"
+            ),
+            Self::DuplicateConfigurationId { id } => {
+                write!(f, "Configuration ID {id} is not unique")
+            }
+            Self::InvalidDestinationArn {
+                member,
+                service,
+                arn,
+            } => write!(
+                f,
+                "The {member} ARN {arn} is not a valid {service} ARN"
+            ),
+            Self::TooManyConfigurations { count } => write!(
+                f,
+                "A notification configuration may carry at most \
+                 {MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET} configurations, got {count}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NotificationConfigurationRejection {}
+
+/// Whether `arn` is an ARN of `service`.
+///
+/// The ARN grammar AWS publishes: `arn:<partition>:<service>:<region>:<account-id>:<resource>`,
+/// so the first field is the literal `arn`, the third IS the service, and the partition,
+/// Region, account and resource fields are non-empty. A Lambda function ARN carries extra
+/// `:`-separated fields in its resource part, which is why only the first six are examined.
+fn is_arn_of_service(arn: &str, service: &str) -> bool {
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    fields.len() == 6
+        && fields[0] == "arn"
+        && !fields[1].is_empty()
+        && fields[2] == service
+        && !fields[3].is_empty()
+        && !fields[4].is_empty()
+        && !fields[5].is_empty()
+}
+
+/// Whether `configuration` is one S3 applies to a bucket, and what is wrong with it when
+/// it is not.
+///
+/// Checked BEFORE anything is written, because "the PUT notification is an atomic
+/// operation … If the message fails, the entire PUT action will fail, and Amazon S3 will
+/// not add the configuration to your bucket" (`PutBucketNotificationConfiguration`'s own
+/// documentation).
+///
+/// Three of the rules here are ALSO modelled constraints, and the boundary validator
+/// refuses those before any handler runs (`Event` and `FilterRuleName` are enums and
+/// `Events` is required, so a request breaking one never reaches the store). They are
+/// still checked here because this function, not the wire, is what guards the STORE: a
+/// configuration no reader could report back is never recorded, whoever writes it.
+pub fn validate_notification_configuration(
+    configuration: &BucketNotificationConfiguration,
+) -> Result<(), NotificationConfigurationRejection> {
+    let count = configuration.configuration_count();
+    if count > MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET {
+        return Err(NotificationConfigurationRejection::TooManyConfigurations { count });
+    }
+
+    let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
+    for (destination, target) in configuration.targets() {
+        let member = destination.arn_member();
+
+        if !is_arn_of_service(&target.arn, destination.arn_service()) {
+            return Err(NotificationConfigurationRejection::InvalidDestinationArn {
+                member,
+                service: destination.arn_service(),
+                arn: target.arn.clone(),
+            });
+        }
+
+        if target.events.is_empty() {
+            return Err(NotificationConfigurationRejection::NoEvents { member });
+        }
+        for event in &target.events {
+            if !EVENT_VALUES.contains(&event.as_str()) {
+                return Err(NotificationConfigurationRejection::UnsupportedEvent {
+                    member,
+                    event: event.clone(),
+                });
+            }
+        }
+
+        for rule in target.filter_rules.iter().flatten() {
+            let name = rule.name.as_deref().unwrap_or_default();
+            if !FILTER_RULE_NAME_VALUES.contains(&name) {
+                return Err(NotificationConfigurationRejection::InvalidFilterRuleName {
+                    name: name.to_string(),
+                });
+            }
+        }
+
+        if let Some(id) = target.id.as_deref() {
+            if !seen_ids.insert(id) {
+                return Err(
+                    NotificationConfigurationRejection::DuplicateConfigurationId {
+                        id: id.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// One rule of a bucket's default server-side-encryption configuration: one
 /// `ServerSideEncryptionRule` of the `ServerSideEncryptionConfiguration` a
 /// `PutBucketEncryption` carried.
@@ -452,6 +811,19 @@ pub struct Bucket {
     ///
     /// Private, like `tags`, so the pair of accessors below is the only way in or out.
     ownership_controls: Option<Vec<String>>,
+    /// The bucket's event notification configuration, as
+    /// `PutBucketNotificationConfiguration` last set it.
+    ///
+    /// NOT an `Option`, unlike `ownership_controls`: a bucket is created with the EMPTY
+    /// configuration ("By default, your bucket has no event notifications configured. That
+    /// is, the notification configuration will be an empty NotificationConfiguration"), and
+    /// a put carrying an empty container is how notifications are turned off again — the
+    /// same state, so there is nothing for a `None` to mean.
+    ///
+    /// Private, like `tags`: the accessor pair below and
+    /// [`ComAmazonawsS3Amazons3State::put_notification_configuration`] (which mints the
+    /// ids) are the only way in or out.
+    notification: BucketNotificationConfiguration,
     /// The bucket's own default server-side-encryption configuration: one entry per
     /// `ServerSideEncryptionRule` the last `PutBucketEncryption` carried, in that order,
     /// or `None` while no configuration of the bucket's own is associated with it.
@@ -466,10 +838,25 @@ pub struct Bucket {
     encryption: Option<Vec<BucketEncryptionRule>>,
     /// The objects the bucket holds, by key, as `PutObject` last recorded each.
     ///
-    /// Private for the same reason as `tags`, and sorted by key because that is the order
-    /// S3 lists objects in ("returns some or all of the objects in a bucket … in
-    /// lexicographical order").
+    /// The CURRENT version of each key, and so the whole of a bucket that was never
+    /// versioning-enabled. Private for the same reason as `tags`, and sorted by key
+    /// because that is the order S3 lists objects in ("returns some or all of the objects
+    /// in a bucket … in lexicographical order").
     objects: BTreeMap<String, Object>,
+    /// The NONCURRENT versions of each key, newest first.
+    ///
+    /// A version lands here only when it stops being the current one on a bucket whose
+    /// versioning status is `Enabled`: "when you enable versioning for a bucket, if Amazon
+    /// S3 receives multiple write requests for the same object simultaneously, it stores
+    /// all of the objects" (`PutObject`'s documentation), and a delete on such a bucket
+    /// "inserts a delete marker" rather than removing what was there
+    /// (`DeleteObject`'s). Each entry keeps its own [`Object::version_id`], which is what
+    /// makes it addressable after it is no longer current.
+    ///
+    /// Private, and written only through [`Self::put_object`] / [`Self::remove_object`],
+    /// so a version cannot be recorded without passing the ceilings every stored version
+    /// counts against.
+    noncurrent_versions: BTreeMap<String, Vec<Object>>,
 }
 
 impl Bucket {
@@ -510,6 +897,14 @@ impl Bucket {
         });
     }
 
+    /// Whether the bucket's versioning status is `Enabled`, which is what makes a write
+    /// mint a version id and keep the version it supersedes.
+    pub fn versioning_enabled(&self) -> bool {
+        self.versioning
+            .as_ref()
+            .is_some_and(|versioning| versioning.status == VERSIONING_ENABLED_STATUS)
+    }
+
     /// Remove the bucket's tag set, leaving no tags associated with it.
     pub fn clear_tags(&mut self) {
         self.tags.clear();
@@ -532,6 +927,16 @@ impl Bucket {
         self.ownership_controls = Some(rules);
     }
 
+    /// The bucket's event notification configuration — empty when the bucket has no event
+    /// notifications configured, which is the state it is created in.
+    ///
+    /// Every destination configuration it holds carries an `Id`, minted by
+    /// [`ComAmazonawsS3Amazons3State::put_notification_configuration`] when the request
+    /// named none.
+    pub fn notification_configuration(&self) -> &BucketNotificationConfiguration {
+        &self.notification
+    }
+
     /// The bucket's own default server-side-encryption rules, in the order they were
     /// applied, or `None` when no configuration of the bucket's own is associated with it
     /// — in which case [`default_encryption_rule`] is what applies to the bucket.
@@ -550,8 +955,45 @@ impl Bucket {
     }
 
     /// The object stored at `key`, or `None` when the bucket holds no such key.
+    ///
+    /// The CURRENT version: what a read that names no `versionId` answers with, and the
+    /// only version a bucket that was never versioning-enabled has.
     pub fn object(&self, key: &str) -> Option<&Object> {
         self.objects.get(key)
+    }
+
+    /// The version of `key` that `version_id` names — current or noncurrent — or `None`
+    /// when the bucket holds no such version.
+    ///
+    /// [`NULL_VERSION_ID`] names the version a write made while the bucket was not
+    /// versioning-enabled, which is stored with no minted id of its own.
+    pub fn object_version(&self, key: &str, version_id: &str) -> Option<&Object> {
+        let named = |held: &&Object| match held.version_id.as_deref() {
+            Some(id) => id == version_id,
+            None => version_id == NULL_VERSION_ID,
+        };
+        self.objects
+            .get(key)
+            .filter(named)
+            .or_else(|| self.noncurrent_versions.get(key)?.iter().find(named))
+    }
+
+    /// Every version of `key` the bucket holds, newest first: the current one (when the
+    /// key has one) followed by its noncurrent versions.
+    ///
+    /// The read seam for anything that reports a key's versions rather than its current
+    /// object, so no caller reaches into either map.
+    pub fn object_versions(&self, key: &str) -> Vec<&Object> {
+        self.objects
+            .get(key)
+            .into_iter()
+            .chain(
+                self.noncurrent_versions
+                    .get(key)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )
+            .collect()
     }
 
     /// Every object the bucket holds, keyed by object key.
@@ -567,11 +1009,30 @@ impl Bucket {
 
     /// Remove the object at `key`, reporting whether the bucket held one.
     ///
+    /// A current version that is [`Self::keeps_superseded`] is kept as a noncurrent version
+    /// instead of being destroyed: "If bucket versioning is enabled, the operation inserts
+    /// a delete marker, which becomes the current version of the object. To permanently
+    /// delete an object in a versioned bucket, you must include the object's versionId in
+    /// the request" (`DeleteObject`'s documentation) — so the version a delete displaces
+    /// is still addressable by its id afterwards, and its bytes are still retained.
+    /// Removing the `null` version of a bucket that is not versioning-enabled releases
+    /// everything that object retained.
+    ///
     /// PRIVATE, so a delete goes through
     /// [`ComAmazonawsS3Amazons3State::remove_object`] and cannot name a bucket that does
     /// not exist.
     fn remove_object(&mut self, key: &str) -> bool {
-        self.objects.remove(key).is_some()
+        let keeps = self.keeps_superseded(key);
+        let Some(removed) = self.objects.remove(key) else {
+            return false;
+        };
+        if keeps {
+            self.noncurrent_versions
+                .entry(key.to_string())
+                .or_default()
+                .insert(0, removed);
+        }
+        true
     }
 
     /// The object stored at `key` for writing one of its subresources, or `None` when the
@@ -585,8 +1046,7 @@ impl Bucket {
         self.objects.get_mut(key)
     }
 
-    /// Store `object` at `key`, replacing any object already there, and report what that
-    /// did.
+    /// Store `object` at `key` as the key's current version, reporting what that did.
     ///
     /// A replacement, not a merge: "If it receives multiple write requests for the same
     /// object simultaneously, it overwrites all but the last object written", and "You
@@ -594,16 +1054,28 @@ impl Bucket {
     /// object. You must put the entire object with updated metadata" (`PutObject`'s own
     /// documentation).
     ///
+    /// `minted` is the version id this write mints, which the caller passes exactly when
+    /// the bucket's versioning status is `Enabled` — "All objects added to the bucket
+    /// receive a unique version ID" (`PutBucketVersioning`).
+    ///
+    /// What the write does to the version it supersedes is [`Self::keeps_superseded`]: on
+    /// a versioning-enabled bucket it is KEPT as a noncurrent version, so both stay
+    /// addressable, and so is a version that carries an id of its own whatever the
+    /// bucket's status is now; the `null` version of a bucket that is not
+    /// versioning-enabled is replaced in place — "Suspended … All objects added to the
+    /// bucket receive the version ID null".
+    ///
     /// PRIVATE, and reached only through
     /// [`ComAmazonawsS3Amazons3State::put_object`]: the per-bucket ceilings checked here
     /// cannot see the service-wide ones, so a handler calling this directly would bypass
     /// them. NOTHING is written unless the answer is [`ObjectWrite::Created`] or
     /// [`ObjectWrite::Replaced`]: an over-long key, metadata past
-    /// [`MAX_OBJECT_METADATA_BYTES`], a bucket at [`MAX_OBJECTS_PER_BUCKET`] objects and a
-    /// write past [`MAX_OBJECT_BYTES_PER_BUCKET`] retained bytes are each refused here.
-    /// Replacing an object releases everything it retained, so the budget is over what the
-    /// bucket WOULD hold, not over everything ever written.
-    fn put_object(&mut self, key: &str, object: Object) -> ObjectWrite {
+    /// [`MAX_OBJECT_METADATA_BYTES`], a bucket at [`MAX_OBJECTS_PER_BUCKET`] stored
+    /// versions and a write past [`MAX_OBJECT_BYTES_PER_BUCKET`] retained bytes are each
+    /// refused here. Replacing an object releases everything it retained, so the budget is
+    /// over what the bucket WOULD hold, not over everything ever written — while a
+    /// versioned write releases nothing, because the version it supersedes is still there.
+    fn put_object(&mut self, key: &str, mut object: Object, minted: Option<String>) -> ObjectWrite {
         if key.len() > MAX_OBJECT_KEY_BYTES {
             return ObjectWrite::KeyTooLong { bytes: key.len() };
         }
@@ -613,39 +1085,155 @@ impl Bucket {
                 bytes: metadata_bytes,
             };
         }
-        let replacing = self.objects.contains_key(key);
-        if !replacing && self.objects.len() >= MAX_OBJECTS_PER_BUCKET {
+        // The id is on the object before anything is measured, so the bytes it retains are
+        // inside the budgets like every other string kept beside the payload.
+        object.version_id = minted;
+        let retaining = self.keeps_superseded(key);
+        let held = self.objects.contains_key(key);
+        if (retaining || !held) && self.stored_versions() >= MAX_OBJECTS_PER_BUCKET {
             return ObjectWrite::ObjectCountReached;
         }
-        let would_hold = self.retained_bytes_excluding(key) + object.retained_bytes();
+        let would_hold = self.retained_bytes_after_write(key, retaining) + object.retained_bytes();
         if would_hold > MAX_OBJECT_BYTES_PER_BUCKET {
             return ObjectWrite::ByteBudgetReached { would_hold };
         }
-        self.objects.insert(key.to_string(), object);
-        if replacing {
+        let superseded = self.objects.insert(key.to_string(), object);
+        if let (true, Some(superseded)) = (retaining, superseded) {
+            self.noncurrent_versions
+                .entry(key.to_string())
+                .or_default()
+                .insert(0, superseded);
+        }
+        if held {
             ObjectWrite::Replaced
         } else {
             ObjectWrite::Created
         }
     }
 
+    /// Every key the bucket holds at least one version of, in ascending UTF-8 byte order
+    /// — the keys with a current object, plus the keys whose only versions left are
+    /// noncurrent ones.
+    ///
+    /// The read seam for a listing over VERSIONS (`ListObjectVersions`), the way
+    /// [`Self::objects`] is the seam for a listing over current objects. Ascending order,
+    /// because that is the order S3 lists keys in.
+    pub fn version_keys(&self) -> Vec<&str> {
+        let mut keys: ::std::collections::BTreeSet<&str> = self
+            .objects
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.extend(self.noncurrent_versions.keys().map(String::as_str));
+        keys.into_iter().collect()
+    }
+
+    /// Remove the version of `key` that `version_id` names, reporting whether the bucket
+    /// held such a version.
+    ///
+    /// "To permanently delete an object in a versioned bucket, you must include the
+    /// object's versionId in the request" (`DeleteObject`'s documentation). Removing the
+    /// key's CURRENT version promotes the newest version left to current, which is what
+    /// makes a versioned bucket's delete reversible: the version before it becomes what a
+    /// read without a `versionId` answers with. Everything the removed version retained is
+    /// released with it.
+    ///
+    /// PRIVATE, so a delete goes through
+    /// [`ComAmazonawsS3Amazons3State::remove_object_version`] and cannot name a bucket
+    /// that does not exist.
+    fn remove_version(&mut self, key: &str, version_id: &str) -> bool {
+        let names = |held: &Object| match held.version_id.as_deref() {
+            Some(id) => id == version_id,
+            None => version_id == NULL_VERSION_ID,
+        };
+        let removed_current = self.objects.get(key).is_some_and(names);
+        if removed_current {
+            self.objects.remove(key);
+            if let Some(remaining) = self.noncurrent_versions.get_mut(key) {
+                if !remaining.is_empty() {
+                    self.objects.insert(key.to_string(), remaining.remove(0));
+                }
+            }
+        } else {
+            let Some(remaining) = self.noncurrent_versions.get_mut(key) else {
+                return false;
+            };
+            let Some(position) = remaining.iter().position(names) else {
+                return false;
+            };
+            remaining.remove(position);
+        }
+        if self
+            .noncurrent_versions
+            .get(key)
+            .is_some_and(Vec::is_empty)
+        {
+            self.noncurrent_versions.remove(key);
+        }
+        true
+    }
+
+    /// Whether a write or a delete at `key` KEEPS the version it displaces rather than
+    /// releasing it.
+    ///
+    /// Two things keep it. A bucket whose versioning status is `Enabled` keeps every
+    /// version it already holds, including one stored before versioning was enabled ("All
+    /// objects added to the bucket receive a unique version ID", and the objects that were
+    /// there keep "a version ID of null"). And a version that carries an id of its own is
+    /// kept whatever the bucket's status is now, because nothing but a delete naming that
+    /// id takes it away ("To permanently delete an object in a versioned bucket, you must
+    /// include the object's versionId in the request") — which is what makes suspension a
+    /// state of the bucket rather than of the versions it holds.
+    ///
+    /// What is left is the `null` version of a bucket that is not versioning-enabled:
+    /// "Suspended … All objects added to the bucket receive the version ID null", so a
+    /// write replaces it and a delete removes it, in place.
+    fn keeps_superseded(&self, key: &str) -> bool {
+        self.versioning_enabled()
+            || self
+                .objects
+                .get(key)
+                .is_some_and(|held| held.version_id.is_some())
+    }
+
+    /// How many object versions this bucket stores: the current object at each key plus
+    /// every noncurrent version it keeps.
+    ///
+    /// What [`MAX_OBJECTS_PER_BUCKET`] counts, because a retained noncurrent version holds
+    /// this process's memory exactly as a current one does.
+    fn stored_versions(&self) -> usize {
+        self.objects.len()
+            + self
+                .noncurrent_versions
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+    }
+
     /// How many bytes this bucket's objects retain — payloads AND every string kept
-    /// beside them, so no part of a stored object escapes the budgets.
+    /// beside them, over every version it stores, so no part of a stored object escapes
+    /// the budgets.
     fn retained_bytes(&self) -> usize {
         self.objects
             .values()
+            .chain(self.noncurrent_versions.values().flatten())
             .map(Object::retained_bytes)
             .sum()
     }
 
-    /// How many bytes this bucket's objects retain at keys OTHER than `key` — what it
-    /// would still hold if the object at `key` were replaced.
-    fn retained_bytes_excluding(&self, key: &str) -> usize {
-        self.objects
-            .iter()
-            .filter(|(held_key, _)| held_key.as_str() != key)
-            .map(|(_, held)| held.retained_bytes())
-            .sum()
+    /// How many bytes this bucket would still retain with a write at `key` applied, not
+    /// counting the incoming object itself.
+    ///
+    /// Everything it holds now, less the current object at `key` when that object is
+    /// replaced in place — which is every write except one that mints a version id, since
+    /// such a write keeps what it supersedes.
+    fn retained_bytes_after_write(&self, key: &str, retaining_current: bool) -> usize {
+        let released = if retaining_current {
+            0
+        } else {
+            self.objects.get(key).map_or(0, Object::retained_bytes)
+        };
+        self.retained_bytes().saturating_sub(released)
     }
 }
 
@@ -658,6 +1246,14 @@ impl Bucket {
 pub struct Object {
     /// The object's bytes, exactly as the request carried them.
     pub body: Vec<u8>,
+    /// The version id this stored version is addressed by, or `None` for the `null`
+    /// version — a version written while the bucket's versioning status was not `Enabled`.
+    ///
+    /// Minted by [`ComAmazonawsS3Amazons3State::put_object`], the one place that sees both
+    /// the bucket's versioning state and the store's version sequence, so no handler
+    /// constructs one: an `Object` handed to that call carries `None` and comes back
+    /// stored with whatever the bucket's state called for.
+    pub version_id: Option<String>,
     /// The object's entity tag, including the quotes S3 reports it with — see
     /// [`object_etag`].
     pub etag: String,
@@ -698,6 +1294,7 @@ impl Object {
         self.body.len()
             + self.etag.len()
             + self.storage_class.len()
+            + self.version_id.as_ref().map_or(0, String::len)
             + self.metadata_bytes()
             + tag_set_bytes(&self.tags)
             + [
@@ -745,6 +1342,36 @@ pub fn content_md5(body: &[u8]) -> String {
     ::aws_smithy_types::base64::encode(Md5::digest(body))
 }
 
+/// The version id a write into a versioning-enabled bucket is stored under.
+///
+/// S3's version ids are OPAQUE: `ObjectVersionId` is a plain string in the model
+/// (`smithy_query(query="shape",shape="ObjectVersionId")` reports no pattern and no
+/// length), and the only thing documented about them is that each is unique ("All objects
+/// added to the bucket receive a unique version ID" — `PutBucketVersioning`). So this is
+/// DERIVED rather than drawn from a generator: the SHA-256 of the bucket, the key and the
+/// store's monotonic mint sequence, Base64 encoded to the 32 characters an S3 version id
+/// is shaped like. Two versions of a key — and two versions anywhere in the store —
+/// therefore never collide, and the value stays what it was once stored, because nothing
+/// re-derives it.
+///
+/// The URL-safe Base64 alphabet (RFC 4648 §5), so the id survives a round trip through the
+/// `versionId` query parameter a client sends it back in: `+` would arrive decoded as a
+/// space and `/` would end the path segment.
+pub fn mint_version_id(bucket: &str, key: &str, sequence: u64) -> String {
+    use ::sha2::Digest;
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(bucket.as_bytes());
+    // A separator, so ("a", "bc") and ("ab", "c") cannot hash the same bytes.
+    digest.update([0u8]);
+    digest.update(key.as_bytes());
+    digest.update([0u8]);
+    digest.update(sequence.to_be_bytes());
+    // 24 bytes encode to exactly 32 unpadded Base64 characters.
+    ::aws_smithy_types::base64::encode(&digest.finalize()[..24])
+        .replace('+', "-")
+        .replace('/', "_")
+}
+
 /// Per-service state for com-amazonaws-s3-amazons3. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsS3Amazons3State {
@@ -756,6 +1383,17 @@ pub struct ComAmazonawsS3Amazons3State {
     /// Services Regions within a partition" (`CreateBucket`'s documentation). Sorted,
     /// because S3 lists buckets in name order.
     buckets: BTreeMap<String, Bucket>,
+    /// How many object versions this store has minted an id for, ever.
+    ///
+    /// The sequence [`mint_version_id`] derives each id from, so two versions of one key
+    /// — and two versions anywhere in the store — can never carry the same id, whatever
+    /// the clock does. Only [`Self::put_object`] advances it.
+    minted_versions: u64,
+    /// How many notification configuration ids this store has minted.
+    ///
+    /// Only ever increases, so [`Self::mint_notification_configuration_id`] cannot hand
+    /// out the same id twice however many configurations are put.
+    minted_notification_configuration_ids: u64,
 }
 
 impl ComAmazonawsS3Amazons3State {
@@ -786,6 +1424,14 @@ impl ComAmazonawsS3Amazons3State {
     /// `None` when this emulator holds no such bucket (so an object write refuses a name
     /// that is not a bucket instead of creating one).
     ///
+    /// This is also where an object's VERSION ID is minted, because this is the only place
+    /// that sees both the bucket's versioning state and the store's version sequence: a
+    /// write into a bucket whose status is `Enabled` mints a fresh id and keeps the version
+    /// it supersedes ("All objects added to the bucket receive a unique version ID" —
+    /// `PutBucketVersioning`), and a write anywhere else mints none and replaces what the
+    /// key held, which is the `null` version. The id the write stored is read back off the
+    /// stored object, so nothing reports an id the store did not record.
+    ///
     /// This is the ONLY way an object is recorded, because it is the only place that can
     /// see BOTH the per-bucket ceilings and the service-wide ones: the per-bucket pair
     /// alone would leave the store bounded only by their product with
@@ -793,39 +1439,48 @@ impl ComAmazonawsS3Amazons3State {
     /// and [`MAX_OBJECT_BYTES_TOTAL`]) are what bound this process's object memory
     /// whatever a caller does. Nothing is written unless the answer is
     /// [`ObjectWrite::Created`] or [`ObjectWrite::Replaced`]; a refusal leaves every
-    /// stored object exactly as it was.
+    /// stored object exactly as it was, and mints nothing.
     pub fn put_object(&mut self, bucket: &str, key: &str, object: Object) -> Option<ObjectWrite> {
-        if !self.buckets.contains_key(bucket) {
-            return None;
-        }
+        let held_bucket = self.buckets.get(bucket)?;
+        let versioned = held_bucket.versioning_enabled();
+        // Whether this write keeps the version it supersedes, which is what decides
+        // whether it adds a stored version to the store's counts and budgets or replaces
+        // one in place. It turns on the superseded version, not on the bucket's status.
+        let keeps = held_bucket.keeps_superseded(key);
+        let held = held_bucket.object(key).is_some();
 
         // What the whole store would hold after this write: every other bucket's bytes,
-        // plus what this bucket would hold with the object at `key` replaced. The counts
-        // work the same way — a key the bucket already holds adds no entry.
-        let replacing = self
-            .buckets
-            .get(bucket)
-            .is_some_and(|held| held.object(key).is_some());
-        let held_objects: usize = self
+        // plus what this bucket would hold with the object at `key` written. The counts
+        // work the same way — a key the bucket already holds adds no entry, unless the
+        // version there is kept rather than replaced.
+        let held_versions: usize = self
             .buckets
             .values()
-            .map(|held| held.objects.len())
+            .map(Bucket::stored_versions)
             .sum::<usize>();
-        if !replacing && held_objects >= MAX_OBJECTS_TOTAL {
+        if (keeps || !held) && held_versions >= MAX_OBJECTS_TOTAL {
             return Some(ObjectWrite::TotalObjectCountReached);
         }
+        // The id is minted before the budgets are measured, so the bytes it retains are
+        // counted; a refusal below leaves it unused, which costs nothing but the sequence
+        // number it consumed (ids are opaque, and nothing numbers them).
+        let minted = versioned.then(|| {
+            self.minted_versions = self.minted_versions.saturating_add(1);
+            mint_version_id(bucket, key, self.minted_versions)
+        });
+        let incoming = object.retained_bytes() + minted.as_ref().map_or(0, String::len);
         let would_hold: usize = self
             .buckets
             .iter()
             .map(|(name, held)| {
                 if name == bucket {
-                    held.retained_bytes_excluding(key)
+                    held.retained_bytes_after_write(key, keeps)
                 } else {
                     held.retained_bytes()
                 }
             })
             .sum::<usize>()
-            + object.retained_bytes();
+            + incoming;
         if would_hold > MAX_OBJECT_BYTES_TOTAL {
             return Some(ObjectWrite::TotalByteBudgetReached { would_hold });
         }
@@ -833,7 +1488,65 @@ impl ComAmazonawsS3Amazons3State {
         // Then the per-bucket ceilings, which also perform the write.
         self.buckets
             .get_mut(bucket)
-            .map(|held| held.put_object(key, object))
+            .map(|held| held.put_object(key, object, minted))
+    }
+
+    /// Record `configuration` as the whole notification configuration of the bucket named
+    /// `bucket`, reporting `None` when this emulator holds no such bucket (so a put
+    /// refuses a name that is not a bucket instead of creating one).
+    ///
+    /// A REPLACEMENT, not a merge: "This action replaces the existing notification
+    /// configuration with the configuration you include in the request body"
+    /// (`PutBucketNotificationConfiguration`'s own documentation), so what the bucket
+    /// carries afterwards is exactly what this request carried — an empty container
+    /// included, which turns notifications off.
+    ///
+    /// Every record that arrives without an `Id` is given one here, because "if you don't
+    /// provide one, Amazon S3 will assign an ID" (`NotificationId`). A minted id is
+    /// recorded with the configuration, so every later read reports the same one, and it
+    /// never collides with an id the request named itself.
+    pub fn put_notification_configuration(
+        &mut self,
+        bucket: &str,
+        mut configuration: BucketNotificationConfiguration,
+    ) -> Option<()> {
+        if !self.buckets.contains_key(bucket) {
+            return None;
+        }
+
+        let mut taken: BTreeSet<String> = configuration
+            .targets()
+            .filter_map(|(_, target)| target.id.clone())
+            .collect();
+        for target in configuration.targets_mut() {
+            if target.id.is_none() {
+                let id = self.mint_notification_configuration_id(&taken);
+                taken.insert(id.clone());
+                target.id = Some(id);
+            }
+        }
+
+        self.buckets.get_mut(bucket)?.notification = configuration;
+        Some(())
+    }
+
+    /// An opaque configuration id no configuration in this store carries.
+    ///
+    /// S3's own assigned ids are opaque strings, so this is the MD5 digest of the counter
+    /// above rendered as hex — the digest helper this module already uses for an object's
+    /// ETag. Uniqueness comes from the counter, not from the digest, and an id a request
+    /// named itself (`taken`) is stepped over rather than reused.
+    fn mint_notification_configuration_id(&mut self, taken: &BTreeSet<String>) -> String {
+        loop {
+            self.minted_notification_configuration_ids += 1;
+            let mut digest = Md5::new();
+            digest.update(b"s3-notification-configuration-id:");
+            digest.update(self.minted_notification_configuration_ids.to_be_bytes());
+            let id = hex::encode(digest.finalize());
+            if !taken.contains(&id) {
+                return id;
+            }
+        }
     }
 
     /// Replace the tag set of the object at `key` in the bucket named `bucket`, reporting
@@ -934,6 +1647,26 @@ impl ComAmazonawsS3Amazons3State {
             .map(|held| held.remove_object(key))
     }
 
+    /// Remove the version of `key` that `version_id` names from the bucket named
+    /// `bucket`, reporting whether the bucket held such a version — or `None` when this
+    /// emulator holds no such bucket, so a delete can tell "no such bucket" from "no such
+    /// version".
+    ///
+    /// This is the permanent delete a versioned bucket needs ("To permanently delete an
+    /// object in a versioned bucket, you must include the object's versionId in the
+    /// request"), and the only way a stored version's bytes are released, which is what
+    /// lets a later write back into the byte budgets [`Self::put_object`] checks.
+    pub fn remove_object_version(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Option<bool> {
+        self.buckets
+            .get_mut(bucket)
+            .map(|held| held.remove_version(key, version_id))
+    }
+
     /// Remove the bucket named `bucket_name`, releasing everything it still held.
     /// `false` when this emulator holds no such bucket.
     pub fn remove_bucket(&mut self, bucket_name: &str) -> bool {
@@ -958,6 +1691,14 @@ pub const NO_SUCH_BUCKET_MESSAGE: &str = "The specified bucket does not exist";
 pub const NO_SUCH_KEY_CODE: &str = "NoSuchKey";
 /// See [`NO_SUCH_KEY_CODE`].
 pub const NO_SUCH_KEY_MESSAGE: &str = "The specified key does not exist.";
+/// The code S3 answers a read or a write that names a `versionId` the bucket holds no
+/// version for: "Indicates that the version ID specified in the request does not match an
+/// existing version", with HTTP 404. Not a shape in this model, so it is answered through
+/// the unmodelled channel.
+pub const NO_SUCH_VERSION_CODE: &str = "NoSuchVersion";
+/// See [`NO_SUCH_VERSION_CODE`].
+pub const NO_SUCH_VERSION_MESSAGE: &str =
+    "The specified version does not exist.";
 /// The code S3 answers a write whose `Content-MD5` is not the digest of the bytes it
 /// carried: "The Content-MD5 or checksum value that you specified did not match what the
 /// server received."
@@ -1020,6 +1761,18 @@ pub const KMS_SSE_ALGORITHMS: [&str; 2] = ["aws:kms", "aws:kms:dsse"];
 /// "InvalidArgument - Invalid Argument", HTTP 400 (Amazon S3 "Error responses", list of
 /// error codes).
 pub const INVALID_ARGUMENT_CODE: &str = "InvalidArgument";
+
+/// The HTTP status [`INVALID_ARGUMENT_CODE`] is rendered with: 400, from the same list.
+pub const INVALID_ARGUMENT_STATUS: u16 = 400;
+
+/// The code S3 answers a request it could not carry out at all: "InternalError - We
+/// encountered an internal error. Please try again" (same list) — what a handler answers
+/// when the shared store is unreachable, since every other code would be a false statement
+/// about the bucket.
+pub const INTERNAL_ERROR_CODE: &str = "InternalError";
+
+/// The HTTP status [`INTERNAL_ERROR_CODE`] is rendered with: 500, from the same list.
+pub const INTERNAL_ERROR_STATUS: u16 = 500;
 
 /// How many default-encryption rules this emulator records for one bucket.
 ///
@@ -1137,7 +1890,218 @@ mod tests {
             website_redirect_location: None,
             metadata: BTreeMap::new(),
             tags: Vec::new(),
+            // The store mints the id; an object handed to `put_object` carries none.
+            version_id: None,
         }
+    }
+
+    /// A notification configuration carrying exactly `targets` as its queue
+    /// configurations, so a validation row names only what it is about.
+    fn queue_configuration(targets: Vec<NotificationTarget>) -> BucketNotificationConfiguration {
+        BucketNotificationConfiguration {
+            queue_configurations: targets,
+            ..BucketNotificationConfiguration::default()
+        }
+    }
+
+    /// One queue configuration publishing `events` to the emulator's account.
+    fn queue_target(id: Option<&str>, events: &[&str]) -> NotificationTarget {
+        NotificationTarget {
+            id: id.map(str::to_string),
+            arn: "arn:aws:sqs:us-east-1:123456789012:object-events".to_string(),
+            events: events.iter().map(|event| (*event).to_string()).collect(),
+            filter_rules: None,
+        }
+    }
+
+    #[test]
+    fn a_notification_configuration_is_validated_against_the_published_sets() {
+        // (case, the configuration, what must be wrong with it — `None` for one that is
+        // applied as given). The rows cover every rule the store enforces, the three the
+        // boundary validator also refuses included, since this function is what guards the
+        // store whoever writes to it.
+        let rows: Vec<(&str, BucketNotificationConfiguration, Option<&str>)> = vec![
+            (
+                "a published event with no id",
+                queue_configuration(vec![queue_target(None, &["s3:ObjectCreated:*"])]),
+                None,
+            ),
+            (
+                "the last published event of the catalog",
+                queue_configuration(vec![queue_target(
+                    Some("last"),
+                    &[EVENT_VALUES[EVENT_VALUES.len() - 1]],
+                )]),
+                None,
+            ),
+            (
+                "an event outside the published catalog",
+                queue_configuration(vec![queue_target(None, &["s3:ObjectCreated:Rename"])]),
+                Some("not supported"),
+            ),
+            (
+                "a configuration naming no event",
+                queue_configuration(vec![queue_target(None, &[])]),
+                Some("at least one event"),
+            ),
+            (
+                "a filter rule name outside the published set",
+                queue_configuration(vec![NotificationTarget {
+                    filter_rules: Some(vec![NotificationFilterRule {
+                        name: Some("Prefix".to_string()),
+                        value: Some("logs/".to_string()),
+                    }]),
+                    ..queue_target(None, &["s3:ObjectCreated:Put"])
+                }]),
+                Some("prefix or suffix"),
+            ),
+            (
+                "both published filter rule names",
+                queue_configuration(vec![NotificationTarget {
+                    filter_rules: Some(
+                        FILTER_RULE_NAME_VALUES
+                            .iter()
+                            .map(|name| NotificationFilterRule {
+                                name: Some((*name).to_string()),
+                                value: Some("logs/".to_string()),
+                            })
+                            .collect(),
+                    ),
+                    ..queue_target(None, &["s3:ObjectCreated:Put"])
+                }]),
+                None,
+            ),
+            (
+                "the same id twice",
+                queue_configuration(vec![
+                    queue_target(Some("twice"), &["s3:ObjectCreated:Put"]),
+                    queue_target(Some("twice"), &["s3:ObjectCreated:Post"]),
+                ]),
+                Some("not unique"),
+            ),
+            (
+                "an SQS ARN where a topic ARN belongs",
+                BucketNotificationConfiguration {
+                    topic_configurations: vec![queue_target(None, &["s3:ObjectCreated:Put"])],
+                    ..BucketNotificationConfiguration::default()
+                },
+                Some("not a valid sns ARN"),
+            ),
+            (
+                "exactly as many configurations as a bucket may carry",
+                queue_configuration(
+                    (0..MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET)
+                        .map(|_| queue_target(None, &["s3:ObjectCreated:Put"]))
+                        .collect(),
+                ),
+                None,
+            ),
+            (
+                "one configuration past the bound",
+                queue_configuration(
+                    (0..=MAX_NOTIFICATION_CONFIGURATIONS_PER_BUCKET)
+                        .map(|_| queue_target(None, &["s3:ObjectCreated:Put"]))
+                        .collect(),
+                ),
+                Some("at most"),
+            ),
+        ];
+
+        for (case, configuration, rejected_for) in rows {
+            let outcome = validate_notification_configuration(&configuration);
+            match rejected_for {
+                None => assert!(
+                    outcome.is_ok(),
+                    "case {case:?}: expected the configuration to be applied as given, got \
+                     {outcome:?}"
+                ),
+                Some(expected) => {
+                    let rejection = outcome
+                        .expect_err(&format!("case {case:?}: the configuration must be refused"));
+                    assert!(
+                        rejection.to_string().contains(expected),
+                        "case {case:?}: expected a refusal mentioning {expected:?}, got \
+                         {rejection}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stored_configuration_carries_an_id_the_request_named_or_one_the_store_minted() {
+        let mut store = ComAmazonawsS3Amazons3State::default();
+        assert_eq!(
+            store.create_bucket("notified", DEFAULT_BUCKET_REGION),
+            BucketCreation::Created
+        );
+
+        // A bucket is created with no event notifications configured at all.
+        assert!(
+            store
+                .bucket("notified")
+                .expect("the bucket exists")
+                .notification_configuration()
+                .is_empty(),
+            "a fresh bucket carries the empty notification configuration"
+        );
+
+        assert_eq!(
+            store.put_notification_configuration(
+                "notified",
+                queue_configuration(vec![
+                    queue_target(Some("named"), &["s3:ObjectCreated:Put"]),
+                    queue_target(None, &["s3:ObjectCreated:Post"]),
+                    queue_target(None, &["s3:ObjectCreated:Copy"]),
+                ]),
+            ),
+            Some(()),
+            "a bucket this store holds takes a notification configuration"
+        );
+
+        let ids: Vec<String> = store
+            .bucket("notified")
+            .expect("the bucket exists")
+            .notification_configuration()
+            .targets()
+            .map(|(_, target)| {
+                target
+                    .id
+                    .clone()
+                    .expect("every stored configuration carries an id")
+            })
+            .collect();
+        assert_eq!(
+            ids[0], "named",
+            "an id the request named is kept verbatim, got {:?}",
+            ids[0]
+        );
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "every configuration carries a distinct id, got {ids:?}"
+        );
+        assert!(
+            ids[1..].iter().all(|id| !id.is_empty()),
+            "a minted id is not empty, got {ids:?}"
+        );
+
+        // A put naming no bucket this store holds records nothing.
+        assert_eq!(
+            store.put_notification_configuration(
+                "not-a-bucket",
+                queue_configuration(vec![queue_target(None, &["s3:ObjectCreated:Put"])]),
+            ),
+            None,
+            "a put refuses a name that is not a bucket instead of creating one"
+        );
+        assert!(
+            store.bucket("not-a-bucket").is_none(),
+            "nothing was created by the refused put"
+        );
     }
 
     #[test]
@@ -1255,6 +2219,137 @@ mod tests {
             store.remove_object("one", "kept"),
             None,
             "a removed bucket holds no objects to delete"
+        );
+    }
+
+    #[test]
+    fn a_versioned_write_keeps_what_it_supersedes_and_counts_it_against_the_budgets() {
+        let mut store = ComAmazonawsS3Amazons3State::default();
+        assert_eq!(
+            store.create_bucket("one", DEFAULT_BUCKET_REGION),
+            BucketCreation::Created
+        );
+
+        // Unversioned first: a second write to the same key REPLACES what was there, so
+        // the store holds one version of it and the first one's bytes are released.
+        for round in 0..2 {
+            assert!(
+                store.put_object("one", "key", object(4)).is_some(),
+                "round {round}: the write is recorded"
+            );
+        }
+        let bucket = store.bucket("one").expect("bucket one exists");
+        assert_eq!(
+            bucket.object_versions("key").len(),
+            1,
+            "an unversioned key holds exactly its current object, got {}",
+            bucket.object_versions("key").len()
+        );
+        assert_eq!(
+            bucket.retained_bytes(),
+            object(4).retained_bytes(),
+            "the replaced version's bytes are released"
+        );
+
+        // With versioning enabled, each write keeps the version before it, and every
+        // stored version counts toward what the bucket retains.
+        store
+            .bucket_mut("one")
+            .expect("bucket one exists")
+            .set_versioning(VERSIONING_ENABLED_STATUS, None);
+        for round in 0..2 {
+            assert!(
+                store.put_object("one", "key", object(4)).is_some(),
+                "versioned round {round}: the write is recorded"
+            );
+        }
+        let bucket = store.bucket("one").expect("bucket one exists");
+        let versions = bucket.object_versions("key");
+        assert_eq!(
+            versions.len(),
+            3,
+            "two versioned writes over a null version leave three stored versions, got {}",
+            versions.len()
+        );
+        let ids: Vec<Option<&str>> = versions
+            .iter()
+            .map(|held| held.version_id.as_deref())
+            .collect();
+        assert_eq!(
+            ids.iter().filter(|id| id.is_some()).count(),
+            2,
+            "only the two versioned writes carry an id, got {ids:?}"
+        );
+        assert!(
+            ids[0] != ids[1],
+            "every minted id differs, got {ids:?}"
+        );
+        assert!(
+            bucket.retained_bytes() > object(4).retained_bytes() * 2,
+            "every stored version is counted, got {} retained bytes",
+            bucket.retained_bytes()
+        );
+
+        // Each stored version is reachable by its id, and the null version by `null`.
+        for id in ids.iter().flatten() {
+            assert!(
+                bucket.object_version("key", id).is_some(),
+                "the version {id:?} is addressable by its id"
+            );
+        }
+        assert!(
+            bucket.object_version("key", NULL_VERSION_ID).is_some(),
+            "the version written before versioning was enabled is the null version"
+        );
+        assert!(
+            bucket.object_version("key", "no-such-version").is_none(),
+            "an id no version carries addresses nothing"
+        );
+
+        // Only a delete that NAMES a version releases it; the current one it displaces
+        // stays addressable.
+        let displaced = ids[0].expect("the newest version carries an id").to_string();
+        assert_eq!(
+            store.remove_object("one", "key"),
+            Some(true),
+            "the key held a current object"
+        );
+        let bucket = store.bucket("one").expect("bucket one exists");
+        assert!(
+            bucket.object("key").is_none(),
+            "the delete took the key out of the current view"
+        );
+        assert!(
+            bucket.object_version("key", &displaced).is_some(),
+            "the displaced version is still addressable by its id"
+        );
+        let held_before = bucket.retained_bytes();
+        assert_eq!(
+            store.remove_object_version("one", "key", &displaced),
+            Some(true),
+            "naming the version removes it"
+        );
+        assert_eq!(
+            store.remove_object_version("one", "key", &displaced),
+            Some(false),
+            "a version removed once is no longer there"
+        );
+        assert_eq!(
+            store.remove_object_version("absent", "key", &displaced),
+            None,
+            "naming a bucket this store does not hold reports no bucket at all"
+        );
+        let bucket = store.bucket("one").expect("bucket one exists");
+        assert!(
+            bucket.retained_bytes() < held_before,
+            "removing a version releases its bytes, still holding {} of {held_before}",
+            bucket.retained_bytes()
+        );
+        assert_eq!(
+            bucket.object_versions("key").len(),
+            2,
+            "the two versions the delete did not name are still stored, got {}",
+            bucket.object_versions("key").len()
         );
     }
 }

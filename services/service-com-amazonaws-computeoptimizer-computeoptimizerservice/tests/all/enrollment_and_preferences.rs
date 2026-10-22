@@ -2,121 +2,19 @@
 
 //! The enrollment + recommendation-preference workflow, end to end over the wire.
 //!
-//! Every call here goes through the same `MultiServiceRouter::dispatch` the emulator's
-//! front door uses: `POST /` with `X-Amz-Target: ComputeOptimizerService.<Operation>` and
-//! an `awsJson1_0` body. Nothing reaches into the state struct, so what these tests prove
-//! is what a client sees.
+//! Every call here goes through the shared wire harness (`tests/all/harness.rs`), i.e. the
+//! same `MultiServiceRouter::dispatch` the emulator's front door uses. Nothing reaches
+//! into the state struct, so what these tests prove is what a client sees.
 
-use std::sync::Arc;
-
-use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_PREFERENCE_RECORDS,
 };
-use service_com_amazonaws_computeoptimizer_computeoptimizerservice::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The account that owns every resource named below. A `Scope` of `AccountId` must be a
-/// 12-digit account id (the model's `Scope$value` doc), and an account-level preference
-/// applies to the resources of that account.
-const ACCOUNT: &str = "111122223333";
-
-/// An EC2 instance ARN — one of the two ARN forms the preference API accepts.
-fn instance_arn(instance_id: &str) -> String {
-    format!("arn:aws:ec2:us-east-1:{ACCOUNT}:instance/{instance_id}")
-}
-
-/// An Auto Scaling group ARN — the other accepted form.
-fn auto_scaling_group_arn(name: &str) -> String {
-    format!(
-        "arn:aws:autoscaling:us-east-1:{ACCOUNT}:autoScalingGroup:\
-         12345678-1234-1234-1234-123456789012:autoScalingGroupName/{name}"
-    )
-}
-
-/// One emulator: one engine, one shared store, reached only over HTTP.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Call one operation and return the HTTP status and the parsed JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("ComputeOptimizerService.{operation}"))
-        // The SigV4 credential scope is what routes a request to its service.
-        .header(
-            "authorization",
-            "AWS4-HMAC-SHA256 \
-             Credential=AKIDEXAMPLE/20260101/us-east-1/compute-optimizer/aws4_request, \
-             SignedHeaders=host;x-amz-target, Signature=not-verified",
-        )
-        .body(Bytes::from(body.to_string()))
-        .expect("build the request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-/// The wire error code (`__type`) of an error response.
-fn error_code(body: &Value) -> String {
-    body["__type"].as_str().unwrap_or_default().to_string()
-}
-
-/// Opt the account in, which every preference operation requires.
-async fn opt_in(router: &MultiServiceRouter) {
-    let (status, body) = call(
-        router,
-        "UpdateEnrollmentStatus",
-        json!({"status": "Active", "includeMemberAccounts": false}),
-    )
-    .await;
-    assert_eq!(status, 200, "opting in: expected 200, got {status}: {body}");
-}
-
-/// Write one preference, asserting it was accepted.
-async fn put_preference(router: &MultiServiceRouter, request: &Value) {
-    let (status, body) = call(router, "PutRecommendationPreferences", request.clone()).await;
-    assert_eq!(
-        status, 200,
-        "put {request}: expected 200, got {status}: {body}"
-    );
-    assert_eq!(
-        body,
-        json!({}),
-        "put {request}: PutRecommendationPreferences has an empty output, got {body}"
-    );
-}
-
-/// Read the preference records stored for `resource_type`, optionally at one scope.
-async fn get_preferences(
-    router: &MultiServiceRouter,
-    resource_type: &str,
-    scope: Option<&Value>,
-) -> Value {
-    let mut request = json!({"resourceType": resource_type});
-    if let Some(scope) = scope {
-        request["scope"] = scope.clone();
-    }
-    let (status, body) = call(router, "GetRecommendationPreferences", request.clone()).await;
-    assert_eq!(
-        status, 200,
-        "get {request}: expected 200, got {status}: {body}"
-    );
-    body
-}
+use crate::harness::{
+    auto_scaling_group_arn, call, effective_for, emulator, error_code, get_preferences,
+    instance_arn, opt_in, put_preference, ACCOUNT,
+};
 
 /// `GetEnrollmentStatus` reports the documented default before any write, and afterwards
 /// exactly what the last accepted `UpdateEnrollmentStatus` stored — while `Pending` and
@@ -211,19 +109,14 @@ async fn enrollment_defaults_to_inactive_and_round_trips_every_settable_status()
             got["lastUpdatedTimestamp"].as_f64().unwrap_or_default() > 0.0,
             "case {case:?}: a write sets lastUpdatedTimestamp, got {got}"
         );
-        if include_member_accounts && wanted == "Active" {
-            assert_eq!(
-                got["numberOfMemberAccountsOptedIn"],
-                json!(0),
-                "case {case:?}: this organization holds no member accounts, so zero of them \
-                 are opted in, got {got}"
-            );
-        } else {
-            assert!(
-                got["numberOfMemberAccountsOptedIn"].is_null(),
-                "case {case:?}: member accounts are not enrolled, so there is no count, got {got}"
-            );
-        }
+        // The opted-in member-account count is a count, reported whatever it is: this
+        // organization holds no member accounts, so it is `0` on every row — never an
+        // absent member a client cannot tell from "none opted in".
+        assert_eq!(
+            got["numberOfMemberAccountsOptedIn"],
+            json!(0),
+            "case {case:?}: expected the member-account count 0, got {got}"
+        );
     }
 
     // The two refusals above changed nothing: the last accepted row is still in force.
@@ -726,21 +619,6 @@ async fn effective_preferences_resolve_by_scope_precedence() {
             "resourceArn {unsupported:?}: expected InvalidParameterValueException, got {body}"
         );
     }
-}
-
-/// The effective preferences in force for one resource.
-async fn effective_for(router: &MultiServiceRouter, resource_arn: &str) -> Value {
-    let (status, body) = call(
-        router,
-        "GetEffectiveRecommendationPreferences",
-        json!({"resourceArn": resource_arn}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "effective preferences for {resource_arn}: expected 200, got {status}: {body}"
-    );
-    body
 }
 
 /// `DeleteRecommendationPreferences` removes exactly the preferences it names, from

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListScrapers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListScrapers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the scrapers this store HOLDS, filtered by the request's
+//! `filters` and paged by `nextToken`/`maxResults`. @readonly — it only materialises the
+//! transitions the clock already owes. An account that holds no scraper lists the empty
+//! page: `scrapers` is @required, so it is always reported, as `[]` when nothing matches.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListScrapers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +122,79 @@ impl From<ListScrapersErrorModeled> for ListScrapersError {
     }
 }
 
+/// This operation's input, bound from the request's QUERY STRING by this file rather
+/// than by the framework's HTTP binding.
+///
+/// WHY it is bound here: `filters` carries `@httpQueryParams` over
+/// `map<FilterKey, FilterValues>`, whose VALUE is a LIST — a repeated query key is one
+/// entry holding several values, which is exactly how the member documents its `OR`
+/// ("`status=ACTIVE&status=CREATING`"). The framework's `@httpQueryParams` binding reads
+/// a map of STRINGS and refuses a list-valued one ("cannot read a list from a single
+/// HTTP-bound string value"), so a request carrying ANY query parameter never becomes an
+/// input and is refused 400 where AWS answers 200 with the matching page. The vendored
+/// binding is read-only from a service crate, so this operation binds its own input;
+/// `crate::service` serves it through that binding instead of the generated walk, and
+/// the model's constraints are then validated by the framework's own walk exactly as
+/// they are for every other operation. The gap itself is filed as
+/// `issues/things-that-do-not-work/20261022T170500Z-gap-smithy-schema-server-httpqueryparams-cannot-read-a-map-of-value-lists.md`
+/// — this binding is to be DELETED, not copied, once the framework reads a list-valued
+/// `@httpQueryParams` map.
+///
+/// Nothing about the binding is invented: `nextToken` and `maxResults` are the
+/// `@httpQuery` members the model declares, and — as the `@httpQueryParams` trait
+/// requires — they are NOT also collected into `filters`, which holds every remaining
+/// query key with that key's values in arrival order. An absent `filters` (no query key
+/// left over) is reported as an absent MEMBER, never as an empty map, so the member's
+/// `@length(min: 1)` is not read as "this request names no filter". The query string
+/// itself is decoded by the framework's own parser
+/// (`aws_smithy_schema_server::query::parse_form_urlencoded`), so this file states no
+/// decoding rule of its own.
+///
+/// The error is this service's modelled `ValidationException`: a `maxResults` that is not
+/// an integer is a member this operation cannot read, which is a caller error and not a
+/// reason to fail the listing.
+pub fn input_from_query(
+    query: &str,
+) -> Result<ListScrapersInput, crate::ops::types::ValidationException> {
+    let mut filters: ::std::collections::HashMap<String, Vec<String>> =
+        ::std::collections::HashMap::new();
+    let mut next_token: Option<String> = None;
+    let mut max_results: Option<i32> = None;
+
+    // The framework's own query parser owns the percent-decoding and the `+`-as-space
+    // rule a query component follows, so this file states neither.
+    for (key, value) in ::aws_smithy_schema_server::query::parse_form_urlencoded(query.as_bytes())
+    {
+        match key.as_str() {
+            // `@httpQuery("nextToken")`, a string. A scalar query member takes the FIRST
+            // value of a repeated key, which is what the framework's own binding does
+            // for every other operation's `@httpQuery` member.
+            "nextToken" if next_token.is_none() => next_token = Some(value),
+            // `@httpQuery("maxResults")`, an Integer. A value that is not one cannot
+            // become the member at all.
+            "maxResults" if max_results.is_none() => {
+                max_results = Some(value.parse::<i32>().map_err(|_| {
+                    crate::state::member_validation_failed(
+                        "maxResults",
+                        "Member must be an integer",
+                    )
+                })?);
+            }
+            // A repeat of either `@httpQuery` member: the first one already won, and it
+            // is NOT a filter — `@httpQueryParams` excludes the parameters the structure
+            // binds elsewhere.
+            "nextToken" | "maxResults" => {}
+            _ => filters.entry(key).or_default().push(value),
+        }
+    }
+
+    Ok(ListScrapersInput {
+        filters: (!filters.is_empty()).then_some(filters),
+        next_token,
+        max_results,
+    })
+}
+
 /// The `ListScrapers` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,18 +231,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListScrapers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListScrapersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListScrapers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListScrapersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // Every member of this input is OPTIONAL, so a call that carries none of them is
+        // a listing of everything the account holds — which is the empty page while it
+        // holds nothing. `filters` was bound from the query string by
+        // [`input_from_query`], which leaves the `@httpQuery` members out of it;
+        // `scraper_matches_filters` honours the four keys the member documents and
+        // ignores any other, rather than refusing a request AWS accepts.
+        let empty = ::std::collections::HashMap::new();
+        let filters = input.filters.as_ref().unwrap_or(&empty);
+
+        // The store is ordered by `scraperId`, so a page boundary means the same thing
+        // on every call.
+        let mut scrapers: Vec<&crate::state::Scraper> = store
+            .scrapers
+            .values()
+            .filter(|scraper| crate::state::scraper_matches_filters(scraper, filters))
+            .collect();
+
+        // `nextToken` is the page cursor this operation itself emitted: the id of the
+        // last summary of the previous page, so the next page starts after it.
+        if let Some(cursor) = input.next_token.as_deref() {
+            scrapers.retain(|scraper| scraper.scraper_id.as_str() > cursor);
+        }
+
+        // "The range is 1-1000. If you omit this parameter, the default of 100 is used."
+        // Clamped here rather than trusted from the request, so the amount of work one
+        // call does is bounded by this service, not chosen by its caller.
+        let page_size = input.max_results.map_or(crate::state::SCRAPER_PAGE_DEFAULT, |max| {
+            max.clamp(1, crate::state::SCRAPER_PAGE_LIMIT)
+        }) as usize;
+
+        let has_more = scrapers.len() > page_size;
+        scrapers.truncate(page_size);
+        let next_token = if has_more {
+            scrapers.last().map(|scraper| scraper.scraper_id.clone())
+        } else {
+            None
+        };
+
+        Ok(ListScrapersOutput {
+            scrapers: scrapers
+                .into_iter()
+                .map(crate::state::scraper_summary)
+                .collect(),
+            next_token,
+        })
     }
 }

@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateWorkspaceConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Workspace not found: {}", input.workspace_id),
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
                         resource_id: input.workspace_id.clone(),
                         resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                     },
@@ -218,9 +218,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateWorkspaceConfigurationErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
-                        "Workspace {} is {}; an update is disallowed until workspace \
+                        "The workspace is {}; an update is disallowed until workspace \
                          status is {}",
-                        workspace.workspace_id,
                         workspace.status_code,
                         crate::state::STATUS_ACTIVE,
                     ),
@@ -250,9 +249,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateWorkspaceConfigurationErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
-                        "the configuration of workspace {} is {}; an update is \
-                         disallowed until workspace configuration is {}",
-                        workspace.workspace_id,
+                        "The workspace configuration is {}; an update is disallowed \
+                         until workspace configuration is {}",
                         workspace.configuration.status_code,
                         crate::state::CONFIG_STATUS_ACTIVE,
                     ),
@@ -337,17 +335,12 @@ fn status_response(
     }
 }
 
-/// A modelled `ValidationException` (400) naming the member that failed and why, the
-/// way the boundary validator does.
+/// A modelled `ValidationException` (400) naming the member that failed and why, in the
+/// one form every aps refusal takes ([`crate::state::member_validation_failed`]).
 fn field_validation(field: &str, message: &str) -> UpdateWorkspaceConfigurationError {
-    UpdateWorkspaceConfigurationErrorModeled::ValidationException(ValidationException {
-        message: format!("{field}: {message}"),
-        reason: "FIELD_VALIDATION_FAILED".to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: field.to_string(),
-            message: message.to_string(),
-        }]),
-    })
+    UpdateWorkspaceConfigurationErrorModeled::ValidationException(
+        crate::state::member_validation_failed(field, message),
+    )
     .into()
 }
 

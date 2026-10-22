@@ -30,7 +30,11 @@ pub struct CreateGuardrailInput {
     pub client_request_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#CreateGuardrailResponse")]
+/// `CreateGuardrailResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="CreateGuardrail")`), which the derive
+/// does not put on a member schema — see `types/date_time_wire.rs`.
 #[derive(Debug, Clone)]
 pub struct CreateGuardrailOutput {
     pub guardrail_id: String,
@@ -38,4 +42,16 @@ pub struct CreateGuardrailOutput {
     pub version: String,
     pub created_at: ::aws_smithy_types::DateTime,
 }
+
+bedrock_schema_and_codec!(
+    CreateGuardrailOutput,
+    CREATE_GUARDRAIL_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#CreateGuardrailResponse",
+    "com.amazonaws.bedrock",
+    "CreateGuardrailResponse",
+    (M_GUARDRAIL_ID, guardrail_id, "guardrailId", 0, req, string),
+    (M_GUARDRAIL_ARN, guardrail_arn, "guardrailArn", 1, req, string),
+    (M_VERSION, version, "version", 2, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, req, date_time),
+);
 

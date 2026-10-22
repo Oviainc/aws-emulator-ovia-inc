@@ -245,7 +245,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         draft.blocked_outputs_messaging = input.blocked_outputs_messaging;
         draft.set_policies(policies, &region);
         draft.updated_at = now;
-        draft.begin_transition(crate::state::STATUS_UPDATING, now);
 
         let output = UpdateGuardrailOutput {
             guardrail_id: guardrail.id.clone(),

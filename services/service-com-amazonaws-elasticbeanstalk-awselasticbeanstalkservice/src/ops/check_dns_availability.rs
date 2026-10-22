@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CheckDNSAvailability
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CheckDNSAvailability`'s real behaviour. Implement it here — this is
+//! Implemented: reports whether the CNAME the requested prefix forms in the request's
+//! region is still free — no live environment in the store holds it, and the prefix can
+//! form a DNS label at all — and the fully qualified CNAME that prefix would reserve.
+//! Reserves nothing: this is a report on the store, not a claim on the name. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CheckDNSAvailability::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -133,18 +129,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CheckDNSAvailability` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CheckDNSAvailabilityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CheckDNSAvailability"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CheckDNSAvailabilityError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // A CNAME held by an environment whose termination the clock has already
+        // completed is free again, so settle the owed transitions before reading.
+        // That is the only write this report performs, and each of those changes
+        // was due at an instant already past, whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "The fully qualified CNAME to reserve when CreateEnvironment is called
+        // with the provided prefix" — the same derivation CreateEnvironment stores,
+        // so the two cannot disagree about which name a prefix names. It is
+        // reported for an unusable prefix too: the member says which name the
+        // prefix WOULD form, and `Available` is what says it cannot be had.
+        let fully_qualified_cname = crate::state::environment_cname(&input.cname_prefix, &region);
+        // Available unless the name cannot exist at all, or a live environment
+        // already holds it. Nothing is written for the answer: checking a prefix
+        // neither reserves a free one nor releases a held one.
+        let available = crate::state::is_legal_cname_prefix(&input.cname_prefix)
+            && crate::state::environment_holding_cname(&store, &fully_qualified_cname).is_none();
+
+        Ok(CheckDNSAvailabilityOutput {
+            available: Some(available),
+            fully_qualified_cname: Some(fully_qualified_cname),
+        })
     }
 }

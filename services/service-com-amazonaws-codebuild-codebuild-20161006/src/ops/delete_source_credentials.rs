@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSourceCredentials
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSourceCredentials`'s real behaviour. Implement it here — this is
+//! Removes one stored set of source-repository credentials by its token ARN: this is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSourceCredentials::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +131,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSourceCredentials` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSourceCredentialsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSourceCredentials"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this operation models no server fault, and 501 is
+            // the only honest answer for "this emulator cannot serve the call at
+            // all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteSourceCredentials (this engine carries no CodeBuild state)",
+            ));
+        };
+        // The credential is addressed by ARN alone, so nothing about the request's
+        // metadata takes part in resolving it.
+        let _ = ctx;
+
+        let mut guard = state.lock();
+        // The ARN is the credential's whole identity, so it is matched against the
+        // stored ARN rather than re-derived from the input: a caller holding an ARN
+        // minted in another region addresses the record that ARN names, or nothing.
+        let held = guard
+            .source_credentials
+            .iter()
+            .find(|(_, stored)| stored.arn == input.arn)
+            .map(|(server_type, _)| server_type.clone());
+
+        let Some(server_type) = held else {
+            return Err(
+                DeleteSourceCredentialsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Source credentials not found: {}", input.arn)),
+                    },
+                )
+                .into(),
+            );
+        };
+        guard.source_credentials.remove(&server_type);
+
+        Ok(DeleteSourceCredentialsOutput {
+            arn: Some(input.arn),
+        })
     }
 }

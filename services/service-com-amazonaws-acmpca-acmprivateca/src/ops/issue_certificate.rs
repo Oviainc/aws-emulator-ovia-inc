@@ -253,9 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.certificate_authority_mut(&ca_arn, now) else {
             return Err(IssueCertificateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "the certificate authority {ca_arn} was not found"
-                    )),
+                    message: Some(crate::state::CA_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -247,18 +247,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Renaming a template to the name it already has is not a conflict with
         // itself.
         if let Some(name) = input.name.as_deref() {
-            if let Some(existing) = domain.templates.values().find(|template| {
-                !template.deleted && template.name == name && template.template_id != input.template_id
+            if domain.templates.values().any(|template| {
+                !template.deleted
+                    && template.name == name
+                    && template.template_id != input.template_id
             }) {
-                return Err(
-                    UpdateTemplateErrorModeled::ConflictException(ConflictException {
-                        message: format!(
-                            "a template named {} already exists in domain {} (templateId {})",
-                            name, input.domain_id, existing.template_id
-                        ),
-                    })
-                    .into(),
-                );
+                return Err(UpdateTemplateErrorModeled::ConflictException(
+                    crate::state::name_conflict(crate::state::ResourceKind::Template, name),
+                )
+                .into());
             }
         }
 

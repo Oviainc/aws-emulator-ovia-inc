@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
             return Err(DescribeResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Workspace not found: {}", input.workspace_id),
+                    message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
                     resource_id: input.workspace_id.clone(),
                     resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                 },
@@ -182,10 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(policy) = workspace.policy.as_ref() else {
             return Err(DescribeResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Workspace {} has no resource-based policy",
-                        input.workspace_id
-                    ),
+                    message: crate::state::POLICY_NOT_FOUND_MESSAGE.to_string(),
                     resource_id: input.workspace_id.clone(),
                     resource_type: crate::state::POLICY_RESOURCE_TYPE.to_string(),
                 },

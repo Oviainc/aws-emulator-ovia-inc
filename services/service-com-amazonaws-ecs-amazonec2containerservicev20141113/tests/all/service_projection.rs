@@ -29,8 +29,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ecs_wire::{count, list, ok, refused, service, string, ACCOUNT, SIGNED_REGION};
-use crate::task_lifecycle::container;
+use crate::ecs_wire::{
+    count, list, ok, refused, register_definition, service, string, ACCOUNT, SIGNED_REGION,
+};
 
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to
 /// fall due, with margin for a loaded test machine.
@@ -39,21 +40,6 @@ const ONE_SPAN: Duration = Duration::from_millis(900);
 /// The access key id the harness signs every request with, so `createdBy` reports THIS
 /// caller rather than a fabricated identity.
 const CALLER_AKID: &str = "AKIDECSTEST";
-
-/// Register one revision of `family` with a single container and return its ARN.
-async fn register(router: &MultiServiceRouter, family: &str, case: &str) -> String {
-    let body = ok(
-        router,
-        "RegisterTaskDefinition",
-        json!({
-            "family": family,
-            "containerDefinitions": [container("web", "public.ecr.aws/nginx/nginx:latest")],
-        }),
-        case,
-    )
-    .await;
-    string(&body["taskDefinition"], "taskDefinitionArn", case)
-}
 
 /// Describe one service, asserting it is reported (rather than failed) and returning it.
 async fn describe(
@@ -126,7 +112,7 @@ async fn a_created_service_materialises_its_documented_defaults_and_reads_them_b
         "setup",
     )
     .await;
-    let definition_arn = register(&router, "projectedfamily", "setup").await;
+    let definition_arn = register_definition(&router, "projectedfamily", "setup").await;
 
     // The service-linked role ARN, from the `role` doc: "If your account has already
     // created the Amazon ECS service-linked role, that role is used for your service
@@ -386,7 +372,7 @@ async fn a_rollout_reaches_its_steady_state_on_the_clock_and_writes_its_events()
         "setup",
     )
     .await;
-    let definition_arn = register(&router, "settlingfamily", "setup").await;
+    let definition_arn = register_definition(&router, "settlingfamily", "setup").await;
 
     // The rule generalises over the number of tasks the rollout has to place, zero
     // included: a deployment is never COMPLETED in the instant it was started.
@@ -516,7 +502,7 @@ async fn a_deleted_service_stays_describable_as_inactive_and_refuses_updates() {
         "setup",
     )
     .await;
-    let definition_arn = register(&router, "deletingfamily", "setup").await;
+    let definition_arn = register_definition(&router, "deletingfamily", "setup").await;
 
     // The rows differ along what the service still holds when it is deleted and how the
     // request addresses it: a service scaled to zero needs no cleanup and is INACTIVE at

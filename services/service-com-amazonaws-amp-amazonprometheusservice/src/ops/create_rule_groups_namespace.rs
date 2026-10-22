@@ -189,24 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
         // its own tag keys, so it holds for the tags a namespace is created with too.
-        if let Some(reserved) =
-            crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys()))
+        // Stated in the one form every aps refusal takes.
+        if crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys())).is_some()
         {
             return Err(CreateRuleGroupsNamespaceErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "tag key {reserved} is reserved: keys must not begin with {}",
-                        crate::state::RESERVED_TAG_KEY_PREFIX,
-                    ),
-                    reason: "FIELD_VALIDATION_FAILED".to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "tags".to_string(),
-                        message: format!(
-                            "keys must not begin with {}",
-                            crate::state::RESERVED_TAG_KEY_PREFIX
-                        ),
-                    }]),
-                },
+                crate::state::member_validation_failed(
+                    "tags",
+                    &crate::state::reserved_tag_key_requirement(),
+                ),
             )
             .into());
         }
@@ -220,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateRuleGroupsNamespaceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Workspace not found: {}", input.workspace_id),
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
                         resource_id: input.workspace_id.clone(),
                         resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                     },
@@ -252,8 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateRuleGroupsNamespaceErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
-                        "Workspace {} is {}; a rule groups namespace can be created only when the workspace status is {}",
-                        workspace.workspace_id,
+                        "The workspace is {}; a rule groups namespace can be created only when the workspace status is {}",
                         workspace.status_code,
                         crate::state::STATUS_ACTIVE,
                     ),
@@ -271,10 +260,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = workspace.rule_groups_namespaces.get(&input.name) {
             return Err(CreateRuleGroupsNamespaceErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "Rule groups namespace {} already exists in workspace {}; use PutRuleGroupsNamespace to update it",
-                        existing.name, workspace.workspace_id,
-                    ),
+                    message: "A rule groups namespace with that name already exists in \
+                              the workspace; use PutRuleGroupsNamespace to update it."
+                        .to_string(),
                     resource_id: existing.arn.clone(),
                     resource_type: crate::state::RULE_GROUPS_NAMESPACE_RESOURCE_TYPE.to_string(),
                 },
@@ -292,8 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateRuleGroupsNamespaceErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
                         message: format!(
-                            "workspace {} already holds the maximum of {} rule groups namespaces",
-                            workspace.workspace_id,
+                            "The workspace already holds the maximum of {} rule groups namespaces",
                             crate::state::RULE_GROUPS_NAMESPACES_PER_WORKSPACE,
                         ),
                         // The bound is per workspace, so the workspace is the resource

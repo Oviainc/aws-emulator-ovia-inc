@@ -323,6 +323,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         record.status = docdb::STATUS_DELETING.to_string();
         record.available_at = None;
+        // The cluster is gone from the store, so this service stops claiming the
+        // `DbClusterResourceId` it minted for it.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            directory.lock().forget(&record.resource_id);
+        }
         Ok(DeleteDBClusterOutput {
             db_cluster: Some(docdb::cluster_to_shape(&record, &store.instances)),
         })

@@ -19,12 +19,12 @@ use std::sync::Arc;
 
 use service_com_amazonaws_devopsguru_capstonecontrolplaneservice::state::{
     ComAmazonawsDevopsguruCapstonecontrolplaneserviceState, InsightRecord, MAX_COVERED_STACK_NAMES,
-    MAX_COVERED_TAG_KEYS, MAX_NOTIFICATION_CHANNELS, MAX_TAG_VALUES_PER_KEY, PAGE_SIZE,
+    MAX_NOTIFICATION_CHANNELS, MAX_TAG_VALUES_PER_KEY, PAGE_SIZE,
 };
 
 /// Host that routes a request to this service: `resolve_route_key` falls back to the
 /// `Host` header's first label, which is this service's endpoint prefix.
-const HOST: &str = "devops-guru.us-east-1.amazonaws.com";
+pub(crate) const HOST: &str = "devops-guru.us-east-1.amazonaws.com";
 
 /// One reply, as a client sees it.
 ///
@@ -35,7 +35,7 @@ pub(crate) struct Reply {
     pub(crate) body: Value,
     /// The error SHAPE NAME the reply carries, from the `x-amzn-errortype` header or
     /// the body's `__type`, with any namespace/URL prefix stripped. Empty on a success.
-    error_name: String,
+    pub(crate) error_name: String,
     pub(crate) raw: String,
 }
 
@@ -67,7 +67,7 @@ impl Reply {
 ///
 /// Shared with the sibling suites of this test target (see `tests/all.rs`).
 pub(crate) struct Emulator {
-    router: MultiServiceRouter,
+    pub(crate) router: MultiServiceRouter,
     /// The one engine the registered service reads and writes, kept so a suite can
     /// seed the records DevOps Guru's own analysis would write — no modelled
     /// operation mints an insight, so this is the only way to drive the insight
@@ -173,12 +173,12 @@ impl Emulator {
         self.call("GET", &path, None).await
     }
 
-    async fn add_notification_channel(&self, config: Value) -> Reply {
+    pub(crate) async fn add_notification_channel(&self, config: Value) -> Reply {
         self.call("PUT", "/channels", Some(&json!({ "Config": config })))
             .await
     }
 
-    async fn list_notification_channels(&self, next: Option<&str>) -> Reply {
+    pub(crate) async fn list_notification_channels(&self, next: Option<&str>) -> Reply {
         let body = match next {
             Some(token) => json!({ "NextToken": token }),
             None => json!({}),
@@ -186,15 +186,15 @@ impl Emulator {
         self.call("POST", "/channels", Some(&body)).await
     }
 
-    async fn remove_notification_channel(&self, id: &str) -> Reply {
+    pub(crate) async fn remove_notification_channel(&self, id: &str) -> Reply {
         self.call("DELETE", &format!("/channels/{id}"), None).await
     }
 
-    async fn describe_service_integration(&self) -> Reply {
+    pub(crate) async fn describe_service_integration(&self) -> Reply {
         self.call("GET", "/service-integrations", None).await
     }
 
-    async fn update_service_integration(&self, integration: Value) -> Reply {
+    pub(crate) async fn update_service_integration(&self, integration: Value) -> Reply {
         self.call(
             "PUT",
             "/service-integrations",
@@ -255,7 +255,7 @@ impl Emulator {
 /// `NotificationChannelId`'s pattern, from
 /// `smithy_query(query="shape",shape="NotificationChannelId")`:
 /// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`, length 36..36.
-fn is_modeled_channel_id(value: &str) -> bool {
+pub(crate) fn is_modeled_channel_id(value: &str) -> bool {
     let groups = [8usize, 4, 4, 4, 12];
     let parts: Vec<&str> = value.split('-').collect();
     value.len() == 36
@@ -274,7 +274,7 @@ fn reported_stack_names(reply: &Reply) -> Vec<String> {
 }
 
 /// The `ResourceCollection.Tags` a read reported, as (AppBoundaryKey, TagValues).
-fn reported_tag_collections(reply: &Reply) -> Vec<(String, Vec<String>)> {
+pub(crate) fn reported_tag_collections(reply: &Reply) -> Vec<(String, Vec<String>)> {
     reply
         .at("/ResourceCollection/Tags")
         .and_then(Value::as_array)
@@ -401,33 +401,33 @@ async fn coverage_is_a_set_that_add_unions_and_remove_subtracts() {
             expect_tags: &[("Devops-guru-app", &["x", "y", "z"])],
         },
         CoverageCase {
-            name: "several app boundary keys are kept apart",
+            name: "the same app boundary key twice in one request",
             steps: &[(
                 "ADD",
                 &[],
                 &[
-                    ("Devops-guru-rds", &["prod"]),
-                    ("Devops-guru-app", &["prod", "test"]),
+                    ("Devops-guru-app", &["prod"]),
+                    ("Devops-guru-app", &["test"]),
                 ],
             )],
             expect_stacks: &[],
-            expect_tags: &[
-                ("Devops-guru-app", &["prod", "test"]),
-                ("Devops-guru-rds", &["prod"]),
-            ],
+            expect_tags: &[("Devops-guru-app", &["prod", "test"])],
         },
         CoverageCase {
             name: "a key left with no values stops being covered",
             steps: &[
-                (
-                    "ADD",
-                    &[],
-                    &[
-                        ("Devops-guru-app", &["x"]),
-                        ("Devops-guru-rds", &["q"]),
-                    ],
-                ),
+                ("ADD", &[], &[("Devops-guru-app", &["x", "q"])]),
+                ("REMOVE", &[], &[("Devops-guru-app", &["x", "q"])]),
+            ],
+            expect_stacks: &[],
+            expect_tags: &[],
+        },
+        CoverageCase {
+            name: "a different key may be adopted once none is covered",
+            steps: &[
+                ("ADD", &[], &[("Devops-guru-app", &["x"])]),
                 ("REMOVE", &[], &[("Devops-guru-app", &["x"])]),
+                ("ADD", &[], &[("Devops-guru-rds", &["q"])]),
             ],
             expect_stacks: &[],
             expect_tags: &[("Devops-guru-rds", &["q"])],
@@ -504,7 +504,10 @@ async fn coverage_is_a_set_that_add_unions_and_remove_subtracts() {
 /// The same RULE as above, checked as an INVARIANT against a model rather than against
 /// hand-written rows: a long, deterministic walk of interleaved ADD/REMOVE requests is
 /// applied both to the service and to a `BTreeSet`/`BTreeMap` model, and after EVERY
-/// step the read must report exactly what the model holds.
+/// step the read must report exactly what the model holds. The model also predicts the
+/// account-singleton refusal — an `ADD` naming an app-boundary key other than the
+/// configured one is refused and applies NOTHING, not even the stack names the same
+/// request carried.
 ///
 /// The walk is generated by fixed arithmetic rather than by a random generator, so the
 /// case list is bounded, reproducible and needs nothing on disk; the step index plays
@@ -541,26 +544,49 @@ async fn every_step_of_an_add_remove_walk_matches_the_set_model() {
             "Tags": [{ "AppBoundaryKey": key, "TagValues": [value_a, value_b] }],
         });
         let reply = emulator.update_resource_collection(action, collection).await;
-        assert_eq!(
-            reply.status, 200,
-            "step {step}: {action} must succeed, got status {} body {}",
-            reply.status, reply.raw
-        );
 
-        if action == "ADD" {
-            model_stacks.insert(stack_a.to_string());
-            model_stacks.insert(stack_b.to_string());
-            let values = model_tags.entry(key.to_string()).or_default();
-            values.insert(value_a.to_string());
-            values.insert(value_b.to_string());
+        // The account covers exactly one app-boundary key, so an ADD naming a different
+        // one is refused whole: the model stays as it was, stack names included.
+        let conflicting_key =
+            action == "ADD" && model_tags.keys().any(|covered| covered != key);
+        if conflicting_key {
+            assert_eq!(
+                reply.status, 400,
+                "step {step}: ADD of key {key:?} while {:?} is covered must be refused, got status {} body {}",
+                model_tags.keys().collect::<Vec<_>>(),
+                reply.status,
+                reply.raw
+            );
+            assert!(
+                reply.names_error("ValidationException"),
+                "step {step}: expected a ValidationException, got {}",
+                reply.raw
+            );
         } else {
-            model_stacks.remove(stack_a);
-            model_stacks.remove(stack_b);
-            if let Some(values) = model_tags.get_mut(key) {
-                values.remove(value_a);
-                values.remove(value_b);
-                if values.is_empty() {
-                    model_tags.remove(key);
+            assert_eq!(
+                reply.status, 200,
+                "step {step}: {action} must succeed, got status {} body {}",
+                reply.status, reply.raw
+            );
+        }
+
+        // A refused ADD applies nothing, so the model is left exactly as it was.
+        if !conflicting_key {
+            if action == "ADD" {
+                model_stacks.insert(stack_a.to_string());
+                model_stacks.insert(stack_b.to_string());
+                let values = model_tags.entry(key.to_string()).or_default();
+                values.insert(value_a.to_string());
+                values.insert(value_b.to_string());
+            } else {
+                model_stacks.remove(stack_a);
+                model_stacks.remove(stack_b);
+                if let Some(values) = model_tags.get_mut(key) {
+                    values.remove(value_a);
+                    values.remove(value_b);
+                    if values.is_empty() {
+                        model_tags.remove(key);
+                    }
                 }
             }
         }
@@ -720,8 +746,9 @@ async fn repeating_a_read_reports_the_same_state() {
 /// RULE: `AddNotificationChannel` mints a fresh `NotificationChannelId` and stores the
 /// submitted `Config` under it, so `ListNotificationChannels` reports that id with
 /// exactly the config submitted; the SNS topic identifies the channel, so a second add
-/// of the same topic is a `ConflictException`; `RemoveNotificationChannel` deletes it,
-/// after which the id names nothing and a repeat delete is a `ResourceNotFoundException`.
+/// of the same topic returns that one channel's id instead of a second channel;
+/// `RemoveNotificationChannel` deletes it, after which the id names nothing and a
+/// repeat delete is a successful no-op.
 ///
 /// The rows differ in the FORM of `Config.Filters` — absent, one list, the other list,
 /// both, and empty lists — which is what the round-trip generalises over.
@@ -781,30 +808,33 @@ async fn a_channel_round_trips_its_config_and_its_topic_is_unique() {
             "case {name:?}: expected the submitted channel back, got {actual_channels}"
         );
 
-        // The topic, not the request, is the channel's identity.
-        let conflict = emulator.add_notification_channel(config.clone()).await;
+        // The topic, not the request, is the channel's identity: a repeat add is the
+        // registration already in place.
+        let repeat = emulator.add_notification_channel(config.clone()).await;
         assert_eq!(
-            conflict.status, 409,
-            "case {name:?}: a second add of the same topic must conflict, got {}",
-            conflict.raw
+            repeat.status, 200,
+            "case {name:?}: a second add of the same topic must succeed, got {}",
+            repeat.raw
         );
-        assert!(
-            conflict.names_error("ConflictException"),
-            "case {name:?}: expected a ConflictException, got {}",
-            conflict.raw
+        assert_eq!(
+            repeat.at("/Id").and_then(Value::as_str),
+            Some(id.as_str()),
+            "case {name:?}: expected the first id {id:?} back, got {}",
+            repeat.raw
+        );
+        let after_repeat = emulator.list_notification_channels(None).await;
+        let listed_again = after_repeat.at("/Channels").cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            listed_again, expected_channels,
+            "case {name:?}: expected still exactly one channel, got {listed_again}"
         );
 
-        // An unknown but well-formed id names no channel.
+        // An unknown but well-formed id names no channel, so removing it is a no-op.
         let unknown = "00000000-0000-4000-8000-000000000000";
         let missing = emulator.remove_notification_channel(unknown).await;
         assert_eq!(
-            missing.status, 404,
-            "case {name:?}: removing an unknown id must be a 404, got {}",
-            missing.raw
-        );
-        assert!(
-            missing.names_error("ResourceNotFoundException"),
-            "case {name:?}: expected a ResourceNotFoundException, got {}",
+            missing.status, 200,
+            "case {name:?}: removing an unknown id must be a no-op 200, got {}",
             missing.raw
         );
 
@@ -830,13 +860,8 @@ async fn a_channel_round_trips_its_config_and_its_topic_is_unique() {
 
         let again = emulator.remove_notification_channel(&id).await;
         assert_eq!(
-            again.status, 404,
-            "case {name:?}: a repeat remove must be a 404, got {}",
-            again.raw
-        );
-        assert!(
-            again.names_error("ResourceNotFoundException"),
-            "case {name:?}: expected a ResourceNotFoundException, got {}",
+            again.status, 200,
+            "case {name:?}: a repeat remove must be a no-op 200, got {}",
             again.raw
         );
     }
@@ -1162,18 +1187,19 @@ async fn service_integration_defaults_to_opted_out_and_updates_only_what_it_name
 /// would take it past that cap is refused with the operation's modelled client error
 /// and stores NOTHING — the store is left exactly as it was, not half-applied.
 ///
-/// The rows are the three coverage caps in `crate::state`
-/// (`MAX_COVERED_STACK_NAMES`, `MAX_COVERED_TAG_KEYS`, `MAX_TAG_VALUES_PER_KEY`), which
-/// differ in which collection grows and in whether one request or a stream of them
-/// reaches the cap. Each row fills to exactly the cap, checks that succeeded, then
-/// submits one more member.
+/// The rows are the two coverage caps in `crate::state` (`MAX_COVERED_STACK_NAMES` and
+/// `MAX_TAG_VALUES_PER_KEY`), which differ in which collection grows and in whether one
+/// request or a stream of them reaches the cap. Each row fills to exactly the cap,
+/// checks that succeeded, then submits one more member. (The account's single
+/// app-boundary key is an AWS invariant rather than a store cap, and is pinned by
+/// `an_account_covers_exactly_one_app_boundary_key`.)
 #[tokio::test]
 async fn an_add_past_a_coverage_cap_is_refused_and_stores_nothing() {
     // `UpdateStackNames` and `UpdateTagValues` are both capped at 100 entries per
     // request (smithy_query), so filling a larger cap takes several requests.
     const PER_REQUEST: usize = 100;
 
-    for kind in ["stack names", "app boundary keys", "tag values per key"] {
+    for kind in ["stack names", "tag values per key"] {
         let emulator = Emulator::new();
 
         match kind {
@@ -1225,58 +1251,6 @@ async fn an_add_past_a_coverage_cap_is_refused_and_stores_nothing() {
                 assert_eq!(
                     after, at_cap,
                     "case {kind:?}: the refused add changed the store: {} names before, {} after",
-                    at_cap.len(),
-                    after.len()
-                );
-            }
-            "app boundary keys" => {
-                let batch: Vec<Value> = (0..MAX_COVERED_TAG_KEYS)
-                    .map(|index| {
-                        json!({
-                            "AppBoundaryKey": format!("Devops-guru-key-{index:05}"),
-                            "TagValues": ["prod"],
-                        })
-                    })
-                    .collect();
-                let reply = emulator
-                    .update_resource_collection("ADD", json!({ "Tags": batch }))
-                    .await;
-                assert_eq!(
-                    reply.status, 200,
-                    "case {kind:?}: filling to the cap must succeed, got {}",
-                    reply.raw
-                );
-                let at_cap = emulator.all_tag_collections().await;
-                assert_eq!(
-                    at_cap.len(),
-                    MAX_COVERED_TAG_KEYS,
-                    "case {kind:?}: expected {MAX_COVERED_TAG_KEYS} covered keys, got {}",
-                    at_cap.len()
-                );
-
-                let over = emulator
-                    .update_resource_collection(
-                        "ADD",
-                        json!({ "Tags": [{
-                            "AppBoundaryKey": "Devops-guru-one-key-too-many",
-                            "TagValues": ["prod"],
-                        }] }),
-                    )
-                    .await;
-                assert_eq!(
-                    over.status, 400,
-                    "case {kind:?}: the over-cap add must be refused, got status {} body {}",
-                    over.status, over.raw
-                );
-                assert!(
-                    over.names_error("ValidationException"),
-                    "case {kind:?}: expected a ValidationException, got {}",
-                    over.raw
-                );
-                let after = emulator.all_tag_collections().await;
-                assert_eq!(
-                    after, at_cap,
-                    "case {kind:?}: the refused add changed the store: {} keys before, {} after",
                     at_cap.len(),
                     after.len()
                 );

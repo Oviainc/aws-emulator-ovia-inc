@@ -19,5 +19,7 @@ mod managed_scaling_policy;
 mod release_label_catalog;
 #[path = "all/release_labels.rs"]
 mod release_labels;
+#[path = "all/security_configurations.rs"]
+mod security_configurations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

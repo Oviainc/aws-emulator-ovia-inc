@@ -174,6 +174,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The gate comes before the store is even reached, so an unauthorized
         // read performs no write at all — not even the clock-owed status
         // transition below.
+        if let Some(message) = crate::state::service_type_refusal(
+            &*self.engine,
+            &input.service_type,
+            &input.identifier,
+        ) {
+            // The `ServiceType` does not own the data source this `Identifier`
+            // names, so the pair addresses no report at all: the modelled
+            // argument error (see [`crate::state::service_type_refusal`]).
+            return Err(
+                GetPerformanceAnalysisReportErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         if !crate::state::is_data_source_identifier(&input.identifier) {
             return Err(not_authorized());
         }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/cluster_projection.rs"]
 mod cluster_projection;
+#[path = "all/cluster_tombstone.rs"]
+mod cluster_tombstone;
 #[path = "all/container_instances.rs"]
 mod container_instances;
 #[path = "all/ecs_wire.rs"]

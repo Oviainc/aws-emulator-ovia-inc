@@ -3,7 +3,9 @@
 //! @op UpdateResourceCollection
 //! Maintains the analysis coverage in [`crate::state::ResourceCoverage`]: `ADD` unions
 //! the submitted CloudFormation stack names and tag key/value pairs into it, `REMOVE`
-//! subtracts them. Coverage is a SET, so repeating a request changes nothing.
+//! subtracts them. Coverage is a SET, so repeating a request changes nothing. The
+//! account has exactly ONE tag app-boundary key, so an `ADD` that would leave it
+//! covering a second, different key is refused and stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +136,41 @@ fn over_cap(
     .into()
 }
 
+/// A `ValidationException` (HTTP 400) refusing an `ADD` whose tag filters would leave
+/// the account covering more than the one app-boundary key it can hold
+/// ([`crate::state::APP_BOUNDARY_KEYS_PER_ACCOUNT`]) — either a key different from the
+/// one already configured, or several keys in one request.
+///
+/// The message is built from the request and the stored coverage: the keys configured
+/// now and the keys the request names.
+fn different_app_boundary_key(
+    existing: &std::collections::BTreeSet<&str>,
+    provided: &std::collections::BTreeSet<&str>,
+) -> UpdateResourceCollectionError {
+    let joined = |keys: &std::collections::BTreeSet<&str>| {
+        keys.iter().copied().collect::<Vec<_>>().join(", ")
+    };
+    UpdateResourceCollectionErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "Different app boundary key provided in request (existing={{{}}}, provided={{{}}}), \
+             cant add these resource collection filters",
+            joined(existing),
+            joined(provided)
+        ),
+        reason: Some(
+            crate::state::VALIDATION_REASON_PARAMETER_INCONSISTENT_WITH_SERVICE_STATE.to_string(),
+        ),
+        fields: Some(vec![ValidationExceptionField {
+            name: "ResourceCollection.Tags[].AppBoundaryKey".to_string(),
+            message: format!(
+                "an account has exactly {} app boundary key, which is its DevOps Guru analysis boundary",
+                crate::state::APP_BOUNDARY_KEYS_PER_ACCOUNT
+            ),
+        }]),
+    })
+    .into()
+}
+
 /// The `UpdateResourceCollection` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -238,19 +275,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
 
-            let new_keys: std::collections::BTreeSet<&str> = submitted_tags
+            let submitted_keys: std::collections::BTreeSet<&str> = submitted_tags
                 .iter()
                 .map(|tag| tag.app_boundary_key.as_str())
-                .filter(|key| !coverage.tag_collections.contains_key(*key))
                 .collect();
-            let prospective_keys = coverage.tag_collections.len() + new_keys.len();
-            if prospective_keys > crate::state::MAX_COVERED_TAG_KEYS {
-                return Err(over_cap(
-                    "ResourceCollection.Tags",
-                    crate::state::MAX_COVERED_TAG_KEYS,
-                    prospective_keys,
-                    "app boundary keys",
-                ));
+            let existing_keys: std::collections::BTreeSet<&str> = coverage
+                .tag_collections
+                .keys()
+                .map(String::as_str)
+                .collect();
+            // ACCOUNT SINGLETON. Every resource tagged with the app-boundary key makes up
+            // the account's DevOps Guru analysis boundary, so the account holds exactly
+            // one such key: adding values under the configured key is additive, but an
+            // ADD that would leave the account covering a second, different key — whether
+            // it names one key while another is configured, or names several keys at once
+            // — is refused here, before any write, so nothing is persisted.
+            let prospective_keys: std::collections::BTreeSet<&str> =
+                existing_keys.union(&submitted_keys).copied().collect();
+            if prospective_keys.len() > crate::state::APP_BOUNDARY_KEYS_PER_ACCOUNT {
+                return Err(different_app_boundary_key(&existing_keys, &submitted_keys));
             }
 
             let mut prospective_values: std::collections::BTreeMap<

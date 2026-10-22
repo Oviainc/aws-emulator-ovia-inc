@@ -74,7 +74,7 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::JobFamily;
+use crate::state::{JobFamily, JOB_NOT_FOUND_MESSAGE};
 
 /// The family this operation's `JobId` is looked up in.
 const FAMILY: JobFamily = JobFamily::SentimentDetection;
@@ -169,10 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeSentimentDetectionJobErrorModeled::JobNotFoundException(
                     JobNotFoundException {
-                        message: Some(format!(
-                            "The sentiment detection job with id '{}' was not found.",
-                            input.job_id
-                        )),
+                        // The fixed sentence every Comprehend job not-found
+                        // refusal carries: it names no caller-supplied
+                        // identifier.
+                        message: Some(JOB_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
             })?;

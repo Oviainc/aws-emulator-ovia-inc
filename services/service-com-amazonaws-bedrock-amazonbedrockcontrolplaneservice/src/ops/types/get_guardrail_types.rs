@@ -18,7 +18,14 @@ pub struct GetGuardrailInput {
     pub guardrail_version: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetGuardrailResponse")]
+/// `GetGuardrailResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="GetGuardrail")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetGuardrailOutput {
     pub name: String,
@@ -42,6 +49,111 @@ pub struct GetGuardrailOutput {
     pub blocked_outputs_messaging: String,
     pub kms_key_arn: Option<String>,
 }
+
+bedrock_schema_and_codec!(
+    GetGuardrailOutput,
+    GET_GUARDRAIL_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetGuardrailResponse",
+    "com.amazonaws.bedrock",
+    "GetGuardrailResponse",
+    (M_NAME, name, "name", 0, req, string),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (M_GUARDRAIL_ID, guardrail_id, "guardrailId", 2, req, string),
+    (M_GUARDRAIL_ARN, guardrail_arn, "guardrailArn", 3, req, string),
+    (M_VERSION, version, "version", 4, req, string),
+    (M_STATUS, status, "status", 5, req, string),
+    (
+        M_TOPIC_POLICY,
+        topic_policy,
+        "topicPolicy",
+        6,
+        opt,
+        struct_of(GuardrailTopicPolicy)
+    ),
+    (
+        M_CONTENT_POLICY,
+        content_policy,
+        "contentPolicy",
+        7,
+        opt,
+        struct_of(GuardrailContentPolicy)
+    ),
+    (
+        M_WORD_POLICY,
+        word_policy,
+        "wordPolicy",
+        8,
+        opt,
+        struct_of(GuardrailWordPolicy)
+    ),
+    (
+        M_SENSITIVE_INFORMATION_POLICY,
+        sensitive_information_policy,
+        "sensitiveInformationPolicy",
+        9,
+        opt,
+        struct_of(GuardrailSensitiveInformationPolicy)
+    ),
+    (
+        M_CONTEXTUAL_GROUNDING_POLICY,
+        contextual_grounding_policy,
+        "contextualGroundingPolicy",
+        10,
+        opt,
+        struct_of(GuardrailContextualGroundingPolicy)
+    ),
+    (
+        M_AUTOMATED_REASONING_POLICY,
+        automated_reasoning_policy,
+        "automatedReasoningPolicy",
+        11,
+        opt,
+        struct_of(GuardrailAutomatedReasoningPolicy)
+    ),
+    (
+        M_CROSS_REGION_DETAILS,
+        cross_region_details,
+        "crossRegionDetails",
+        12,
+        opt,
+        struct_of(GuardrailCrossRegionDetails)
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 13, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 14, req, date_time),
+    (
+        M_STATUS_REASONS,
+        status_reasons,
+        "statusReasons",
+        15,
+        opt,
+        list_of_string
+    ),
+    (
+        M_FAILURE_RECOMMENDATIONS,
+        failure_recommendations,
+        "failureRecommendations",
+        16,
+        opt,
+        list_of_string
+    ),
+    (
+        M_BLOCKED_INPUT_MESSAGING,
+        blocked_input_messaging,
+        "blockedInputMessaging",
+        17,
+        req,
+        string
+    ),
+    (
+        M_BLOCKED_OUTPUTS_MESSAGING,
+        blocked_outputs_messaging,
+        "blockedOutputsMessaging",
+        18,
+        req,
+        string
+    ),
+    (M_KMS_KEY_ARN, kms_key_arn, "kmsKeyArn", 19, opt, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GuardrailTopicPolicy")]
 #[derive(Debug, Clone, Default)]

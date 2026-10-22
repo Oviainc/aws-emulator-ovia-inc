@@ -23,7 +23,7 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_PAGE_SIZE;
 
 // The crate's shared test harness: one emulator behind the production router,
 // and the domain-creating helper every suite in this target uses.
-use crate::case_lifecycle::{domain, string_at, Emulator};
+use crate::harness::{domain, string_at, Emulator};
 
 /// Create a template in `domain_id`, optionally with an explicit `status`, and
 /// hand back its id.

@@ -264,9 +264,21 @@ pub struct ResourceCoverage {
     pub cloudformation_stack_names: BTreeSet<String>,
     /// `UpdateTagCollectionFilter.{AppBoundaryKey,TagValues}`, reported as
     /// `ResourceCollectionFilter.Tags`: one entry per app-boundary key, each
-    /// holding that key's tag values.
+    /// holding that key's tag values. The account's analysis boundary is a single
+    /// tag key, so this holds at most [`APP_BOUNDARY_KEYS_PER_ACCOUNT`] entry.
     pub tag_collections: BTreeMap<String, BTreeSet<String>>,
 }
+
+/// How many app-boundary keys one account's coverage holds: ONE.
+///
+/// DevOps Guru's own invariant, not an emulator guard (so it does not live with the
+/// store bounds below): `TagCollection`'s `AppBoundaryKey` documentation says "All
+/// Amazon Web Services resources in your account and Region tagged with this key make up
+/// your DevOps Guru application and analysis boundary", so an account has a single
+/// analysis boundary and therefore a single such key. `UpdateResourceCollection` adds
+/// tag VALUES under the configured key, and refuses an `ADD` that would leave the
+/// account covering a second, different key.
+pub const APP_BOUNDARY_KEYS_PER_ACCOUNT: usize = 1;
 
 impl ResourceCoverage {
     /// How many resources this coverage puts under DevOps Guru analysis.
@@ -360,14 +372,30 @@ pub struct KmsServerSideEncryptionRecord {
 /// this same constant.
 pub const OPT_IN_STATUS_DISABLED: &str = "DISABLED";
 
-/// The `ResourceType` a channel-shaped `ConflictException` or
-/// `ResourceNotFoundException` reports. `ResourceIdType` is an unconstrained string,
-/// so this value names the kind of resource the reported `ResourceId` belongs to.
-pub const NOTIFICATION_CHANNEL_RESOURCE_TYPE: &str = "NOTIFICATION_CHANNEL";
+/// `OptInStatus` as the model spells "on" — the other of `OPT_IN_STATUS_VALUES`.
+pub const OPT_IN_STATUS_ENABLED: &str = "ENABLED";
+
+/// The `ServerSideEncryptionType` whose key the CUSTOMER supplies — see
+/// `SERVER_SIDE_ENCRYPTION_TYPE_VALUES` in `ops/types/shared_types.rs`. The other
+/// value, `AWS_OWNED_KMS_KEY`, names a key DevOps Guru owns, so it carries no
+/// caller-supplied `KMSKeyId`.
+pub const SERVER_SIDE_ENCRYPTION_TYPE_CUSTOMER_MANAGED_KEY: &str = "CUSTOMER_MANAGED_KEY";
+
+/// The `ValidationExceptionReason` a refusal reports when the request is inconsistent
+/// with what the account already holds — see `VALIDATION_EXCEPTION_REASON_VALUES` in
+/// `ops/types/shared_types.rs`.
+pub const VALIDATION_REASON_PARAMETER_INCONSISTENT_WITH_SERVICE_STATE: &str =
+    "PARAMETER_INCONSISTENT_WITH_SERVICE_STATE";
+
+/// The `ValidationExceptionReason` a refusal reports when the request's members cannot
+/// hold together — one requires another the request did not supply, say. Another of
+/// `VALIDATION_EXCEPTION_REASON_VALUES`.
+pub const VALIDATION_REASON_INVALID_PARAMETER_COMBINATION: &str =
+    "INVALID_PARAMETER_COMBINATION";
 
 /// The `ResourceType` an insight-shaped `ResourceNotFoundException` reports — the
-/// kind of resource the refused `ResourceId` would have named. See
-/// [`NOTIFICATION_CHANNEL_RESOURCE_TYPE`].
+/// kind of resource the refused `ResourceId` would have named. `ResourceIdType` is an
+/// unconstrained string, so this value is what says which kind that is.
 pub const INSIGHT_RESOURCE_TYPE: &str = "INSIGHT";
 
 /// Before any `UpdateServiceIntegration`, every integration is opted out: a
@@ -420,8 +448,8 @@ pub const PAGE_SIZE: usize = 100;
 // len 1..128, `TagValue` len 0..256, `TopicArn` len 36..1024, `KMSKeyId` len
 // 1..2048. Nothing caller-sized reaches the store unchecked.
 //
-// The product is therefore finite: at most MAX_COVERED_STACK_NAMES stack names, at
-// most MAX_COVERED_TAG_KEYS app-boundary keys each holding at most
+// The product is therefore finite: at most MAX_COVERED_STACK_NAMES stack names, the
+// account's one app-boundary key ([`APP_BOUNDARY_KEYS_PER_ACCOUNT`]) holding at most
 // MAX_TAG_VALUES_PER_KEY values, at most MAX_NOTIFICATION_CHANNELS channels, and one
 // service-integration record of fixed shape.
 //
@@ -435,14 +463,9 @@ pub const PAGE_SIZE: usize = 100;
 /// Amazon Web Services CloudFormation stacks."
 pub const MAX_COVERED_STACK_NAMES: usize = 500;
 
-/// Emulator resource guard, NOT a published AWS quota: the most app-boundary keys this
-/// store holds. `UpdateTagCollectionFilters` declares no list length, so without this
-/// one request could add arbitrarily many keys. Set well above any real use — DevOps
-/// Guru's own guidance is a single app-boundary key per account.
-pub const MAX_COVERED_TAG_KEYS: usize = 100;
-
 /// Emulator resource guard, NOT a published AWS quota: the most tag values this store
-/// holds for one app-boundary key. See [`MAX_COVERED_TAG_KEYS`].
+/// holds for the account's app-boundary key. `UpdateTagCollectionFilters` declares no
+/// list length, so without this one request could add arbitrarily many values.
 pub const MAX_TAG_VALUES_PER_KEY: usize = 500;
 
 /// Emulator resource guard, NOT a published AWS quota: the most notification channels

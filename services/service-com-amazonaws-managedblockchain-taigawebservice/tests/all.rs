@@ -29,6 +29,8 @@ mod network_and_node_lifecycle;
 mod proposal_lifecycle;
 #[path = "all/public_networks_and_membership.rs"]
 mod public_networks_and_membership;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_node_log_publishing.rs"]

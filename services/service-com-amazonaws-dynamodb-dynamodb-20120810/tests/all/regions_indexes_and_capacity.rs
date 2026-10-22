@@ -19,7 +19,6 @@
 //! generalise over — the region, the projection type, the key-schema shape, the
 //! direction of a capacity change — rather than one recorded example.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -27,24 +26,15 @@ use serde_json::{json, Value};
 use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{
     MAX_ATTRIBUTE_DEFINITIONS, MAX_GLOBAL_SECONDARY_INDEXES, MAX_REGIONS, STATUS_TRANSITION,
 };
-use service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-// The refusal-code reader is the harness's, so there is one implementation of it.
-use crate::emulator::error_code;
+// The emulator constructors and the refusal-code reader are the harness's, so there is
+// one implementation of each.
+use crate::emulator::{emulator, error_code, index_named};
 
 /// The regions these tests span. `CreateTable`'s uniqueness scope is the region, so the
 /// rows differ in nothing but the region they are signed for.
 const REGIONS: [&str; 4] = ["us-east-1", "us-west-2", "eu-central-1", "ap-southeast-2"];
-
-/// One emulator holding only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
 
 /// A SigV4-shaped `Authorization` header for `region`: its credential scope is what
 /// routes the request to this service (signing name `dynamodb`) and names the region
@@ -103,20 +93,13 @@ async fn wait_until_active(router: &MultiServiceRouter, region: &str, name: &str
     described
 }
 
-/// The `GlobalSecondaryIndexes` of a description, keyed by index name.
+/// The `GlobalSecondaryIndexes` of a description, in the order it reports them. One
+/// index BY NAME is the harness's [`index_named`].
 fn indexes(description: &Value) -> Vec<Value> {
     description["GlobalSecondaryIndexes"]
         .as_array()
         .cloned()
         .unwrap_or_default()
-}
-
-/// One index of a description, by name.
-fn index_named(description: &Value, name: &str) -> Value {
-    indexes(description)
-        .into_iter()
-        .find(|index| index["IndexName"] == json!(name))
-        .unwrap_or(Value::Null)
 }
 
 #[tokio::test]
@@ -421,7 +404,10 @@ async fn create_table_stores_the_global_secondary_indexes_it_is_given() {
         );
     }
 
-    // The item figures are COMPUTED from the table's items: an item reaches an index
+    // The item figures are SNAPSHOTS the six-hourly refresh takes from the table's
+    // items — "DynamoDB updates this value approximately every six hours. Recent
+    // changes might not be reflected in this value" (the
+    // `GlobalSecondaryIndexDescription$ItemCount` doc) — and an item reaches an index
     // only when it carries that index's key attributes.
     ok(
         &router,

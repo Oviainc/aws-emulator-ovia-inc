@@ -12,16 +12,23 @@
 //! window, its effective period and its metric keys from the request, and
 //! reports no data points at all, so reading metrics never writes.
 //!
-//! The data sources themselves are not stored either — no Performance Insights
-//! operation registers one, they are the DB resources other services own — so
-//! whether a request addresses a data source this account may see is decided by
-//! [`is_data_source_identifier`], the authorization gate every operation in this
-//! crate applies before it answers.
+//! The data sources themselves are not stored here either — no Performance
+//! Insights operation registers one, they are the DB resources other services
+//! own. Two questions are asked about them, and they have different answers:
+//!
+//! * whether a request addresses a data source this account may see at all is
+//!   decided by [`is_data_source_identifier`], the authorization gate every
+//!   operation in this crate applies before it answers; and
+//! * whether the request's `ServiceType` is the service that OWNS the addressed
+//!   data source is decided by [`service_type_refusal`], against the shared
+//!   data-source directory the database control planes write when they mint a
+//!   resource id ([`::service_common::db_data_sources`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use ::aws_smithy_types::DateTime;
+use ::service_common::db_data_sources::DataSourceDirectory;
 
 use crate::ops::types::{Insight, Tag};
 
@@ -90,7 +97,11 @@ pub struct AnalysisReportRecord {
     /// already made due (see
     /// [`ComAmazonawsPiPerformanceinsightsv20180227State::materialize_due_statuses`]).
     pub status_due: Instant,
-    /// The metadata Create persisted, in the order the caller sent it.
+    /// The report's metadata tags: the ones Create persisted, in the order the
+    /// caller sent them, as `TagResource` and `UntagResource` have since left
+    /// them. This is the ONLY home for a report's tags — a listing's summary,
+    /// `ListTagsForResource` and the two tag writers all read and write this one
+    /// list, so no two of them can report a different tag set for one report.
     pub tags: Vec<Tag>,
     /// Creation sequence within this store, used as the stable tiebreak when two
     /// reports of one resource analyse windows with the same start time.
@@ -98,6 +109,50 @@ pub struct AnalysisReportRecord {
     /// The insights the analysis produced. The emulator has no DB session data
     /// to analyse, so this stays empty rather than carrying invented findings.
     pub insights: Vec<Insight>,
+}
+
+/// How many tags one report holds.
+///
+/// The modelled `TagList` length maximum (0..200), which bounds both the tags a
+/// single `TagResource` call carries and the tags `ListTagsForResource` reports —
+/// so a stored set past it could not be reported at all. A write that would
+/// exceed it is refused with the operation's modelled `InvalidArgumentException`
+/// rather than accepted and silently clipped.
+pub const MAX_TAGS_PER_REPORT: usize = 200;
+
+impl AnalysisReportRecord {
+    /// Add `tags` to this report, overwriting the value of a key it already
+    /// carries and appending a key it does not.
+    ///
+    /// `Err` names the constraint when the resulting set would pass
+    /// [`MAX_TAGS_PER_REPORT`]; the report is then left exactly as it was, so a
+    /// refused write adds no tag at all.
+    pub fn apply_tags(&mut self, tags: &[Tag]) -> Result<(), String> {
+        let added = tags
+            .iter()
+            .filter(|tag| !self.tags.iter().any(|held| held.key == tag.key))
+            .count();
+        if self.tags.len() + added > MAX_TAGS_PER_REPORT {
+            return Err(format!(
+                "Tags would leave the resource with {} tags, more than the maximum of \
+                 {MAX_TAGS_PER_REPORT} tags a resource holds.",
+                self.tags.len() + added
+            ));
+        }
+        for tag in tags {
+            match self.tags.iter_mut().find(|held| held.key == tag.key) {
+                Some(held) => held.value = tag.value.clone(),
+                None => self.tags.push(tag.clone()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove every tag whose key is in `keys`. A key the report does not carry
+    /// removes nothing, which is what makes `UntagResource` idempotent.
+    pub fn remove_tags(&mut self, keys: &[String]) {
+        self.tags.retain(|tag| !keys.contains(&tag.key));
+    }
 }
 
 /// Per-service state for com-amazonaws-pi-performanceinsightsv20180227. A handler reaches it through [`service_state`].
@@ -109,9 +164,6 @@ pub struct ComAmazonawsPiPerformanceinsightsv20180227State {
     /// Monotonic report counter, mixed into the minted id so two reports of one
     /// resource can never share an id.
     pub report_seq: u64,
-    /// Tags by resource ARN, written by Create so the Tag/Untag/ListTagsForResource
-    /// slice has one home for them.
-    pub tags_by_arn: HashMap<String, BTreeMap<String, String>>,
 }
 
 impl ComAmazonawsPiPerformanceinsightsv20180227State {
@@ -200,6 +252,26 @@ impl ComAmazonawsPiPerformanceinsightsv20180227State {
         reports
     }
 
+    /// The report one `ResourceARN` names, wherever it is filed.
+    ///
+    /// The tag operations address a report by its ARN alone, and an ARN is minted
+    /// once per report and never changes, so this resolves the same report the
+    /// `(ServiceType, Identifier, AnalysisReportId)` triple does.
+    pub fn report_by_arn(&self, resource_arn: &str) -> Option<&AnalysisReportRecord> {
+        self.reports
+            .values()
+            .flatten()
+            .find(|report| arn_addresses_report(&report.resource_arn, resource_arn))
+    }
+
+    /// The same report, for a tag write.
+    pub fn report_by_arn_mut(&mut self, resource_arn: &str) -> Option<&mut AnalysisReportRecord> {
+        self.reports
+            .values_mut()
+            .flatten()
+            .find(|report| arn_addresses_report(&report.resource_arn, resource_arn))
+    }
+
     /// One report of one monitored resource.
     pub fn report(
         &self,
@@ -224,9 +296,9 @@ impl ComAmazonawsPiPerformanceinsightsv20180227State {
     /// there is room for it.
     ///
     /// Checked BEFORE anything is written, so a refused Create leaves the store
-    /// exactly as it was. One report costs one `reports` entry and one
-    /// `tags_by_arn` entry, and `remove_report` drops both, so bounding the
-    /// reports bounds both maps.
+    /// exactly as it was. A report costs one entry in `reports` — its tags live
+    /// on the record itself, bounded by [`MAX_TAGS_PER_REPORT`] — so bounding the
+    /// reports bounds the store.
     pub fn capacity_refusal(&self, service_type: &str, identifier: &str) -> Option<String> {
         let key = (service_type.to_string(), identifier.to_string());
         match self.reports.get(&key) {
@@ -245,8 +317,8 @@ impl ComAmazonawsPiPerformanceinsightsv20180227State {
         }
     }
 
-    /// Remove one report, and the tags filed under its ARN. `false` when the
-    /// resource holds no report with that id.
+    /// Remove one report, with the tags it carries. `false` when the resource
+    /// holds no report with that id.
     pub fn remove_report(
         &mut self,
         service_type: &str,
@@ -263,8 +335,7 @@ impl ComAmazonawsPiPerformanceinsightsv20180227State {
         else {
             return false;
         };
-        let removed = reports.remove(position);
-        self.tags_by_arn.remove(&removed.resource_arn);
+        reports.remove(position);
         true
     }
 }
@@ -314,6 +385,11 @@ const DATA_SOURCE_ID_PREFIXES: [&str; 2] = ["db-", "cluster-"];
 /// can decide — and does, uniformly for every operation — is that an identifier
 /// of a form this service could never have handed out addresses nothing, and is
 /// never served as if the account owned it.
+///
+/// It says nothing about WHICH service owns the identifier, because the form
+/// cannot: RDS and DocumentDB mint ids of the same two forms. That question is
+/// [`service_type_refusal`]'s, and it is answered from the record the minting
+/// service left, never from the id's shape.
 pub fn is_data_source_identifier(identifier: &str) -> bool {
     DATA_SOURCE_ID_PREFIXES.iter().any(|prefix| {
         identifier.strip_prefix(prefix).is_some_and(|token| {
@@ -322,6 +398,71 @@ pub fn is_data_source_identifier(identifier: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
         })
+    })
+}
+
+/// Whether `requested` addresses the report whose ARN is `minted`.
+///
+/// Every segment is compared EXACTLY — so another account's, another region's,
+/// another data source's or another report's ARN addresses nothing here — except
+/// the one carrying the `ServiceType`, which is compared without regard to case.
+///
+/// That one segment is the only place an ARN restates a value the request already
+/// carries as a modelled ENUM, and it identifies nothing on its own: a report is
+/// already named uniquely by the data source and the `AnalysisReportId` beside it,
+/// both compared exactly, so no two reports can differ only in the case of this
+/// segment and the tolerance can never resolve one report's ARN to another. It
+/// exists because no response member of this model carries a report's ARN: a
+/// client that tags a report BUILDS the ARN from the `ServiceType` and
+/// `Identifier` it created the report with and the `AnalysisReportId` it got
+/// back, and writes the enum value in whichever case it holds it.
+pub fn arn_addresses_report(minted: &str, requested: &str) -> bool {
+    match (split_report_arn(minted), split_report_arn(requested)) {
+        (Some(minted), Some(requested)) => {
+            minted.prefix == requested.prefix
+                && minted.service_type.eq_ignore_ascii_case(requested.service_type)
+                && minted.identifier == requested.identifier
+                && minted.analysis_report_id == requested.analysis_report_id
+        }
+        // Not an ARN of the form this service mints for a report: only an exact
+        // match could address one, and nothing of that form is stored.
+        _ => minted == requested,
+    }
+}
+
+/// The parts of a report ARN [`arn_addresses_report`] compares.
+struct ReportArnParts<'a> {
+    /// Everything up to the resource: `arn:<partition>:pi:<region>:<account>`.
+    prefix: &'a str,
+    /// The `ServiceType` segment of the resource.
+    service_type: &'a str,
+    /// The data source the report analyses.
+    identifier: &'a str,
+    /// The report's own id.
+    analysis_report_id: &'a str,
+}
+
+/// Split an ARN of the form [`report_arn`] mints, or `None` when it is not one.
+///
+/// A report's resource part carries no `:`, so the LAST `:` separates the ARN's
+/// prefix from it.
+fn split_report_arn(arn: &str) -> Option<ReportArnParts<'_>> {
+    let (prefix, resource) = arn.rsplit_once(':')?;
+    let mut parts = resource.split('/');
+    let (Some("perf-reports"), Some(service_type), Some(identifier), Some(analysis_report_id), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    Some(ReportArnParts {
+        prefix,
+        service_type,
+        identifier,
+        analysis_report_id,
     })
 }
 
@@ -407,6 +548,57 @@ pub fn timestamp_key(value: DateTime) -> (i64, u32) {
     (value.secs(), value.subsec_nanos())
 }
 
+/// The refusal a `(ServiceType, Identifier)` pair earns when the identifier
+/// names a data source a DIFFERENT Amazon Web Services service owns, or `None`
+/// when nothing this emulator has recorded contradicts the pair.
+///
+/// Performance Insights serves a data source under the `ServiceType` of the
+/// service that OWNS it: a resource id belonging to one service's namespace,
+/// queried under the other's, names no data source, and the pair is an invalid
+/// ARGUMENT combination rather than an authorization outcome — the operations
+/// model `InvalidArgumentException` (HTTP 400, one of the arguments provided is
+/// invalid for this request) for exactly that.
+///
+/// The owning service cannot be read off the identifier: RDS and DocumentDB both
+/// mint `db-<TOKEN>` for an instance and `cluster-<TOKEN>` for a cluster (RDS
+/// `mint_dbi_resource_id`, DocumentDB `CreateDBInstance` / `CreateDBCluster`), so
+/// the form is silent about ownership. What decides it is the record the minting
+/// service left in the shared data-source directory
+/// ([`::service_common::db_data_sources`]), which also carries the engine the
+/// resource runs — so the refusal names the engine for which the requested
+/// `ServiceType` is wrong, the way the real service's does, computed from the
+/// stored resource and not from any one request.
+///
+/// A data source the directory holds no record of is UNDECIDED, not refused: this
+/// emulator can only know what it minted itself, and refusing every id it did not
+/// mint would turn a missing record into a wrong answer. Such a pair is then
+/// decided by [`is_data_source_identifier`] alone, as before.
+pub fn service_type_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    service_type: &str,
+    identifier: &str,
+) -> Option<String> {
+    let directory = data_source_directory(engine)?;
+    let db_engine = {
+        let guard = directory.lock();
+        guard
+            .registered_elsewhere(identifier, service_type)
+            .map(|record| record.engine.clone())?
+    };
+    Some(wrong_service_type_message(&db_engine))
+}
+
+/// The message a `ServiceType` that does not own the addressed data source is
+/// refused with.
+///
+/// The modelled requirement is the status (400) and the error code
+/// (`InvalidArgumentException`); the sentence states the reason the refusal has,
+/// built from the engine the stored resource runs, so a client that passed the
+/// wrong `ServiceType` can see which engine it addressed.
+pub fn wrong_service_type_message(db_engine: &str) -> String {
+    format!("The specified ServiceType is invalid for engine {db_engine}.")
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -416,4 +608,27 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsPiPerformanceinsightsv20180227State>)
+}
+
+/// The SHARED data-source directory in the shared engine: call it with a
+/// handler's `&*self.engine`.
+///
+/// A data source is minted by a database control plane (Amazon RDS, Amazon
+/// DocumentDB) and monitored here, so which service owns a resource id is ONE
+/// record under one shared type —
+/// [`::service_common::db_data_sources::DataSourceDirectory`] — and not a second
+/// copy inside [`ComAmazonawsPiPerformanceinsightsv20180227State`]: the engine
+/// keys state by TYPE, so a copy of its own here would be invisible to the
+/// services that mint the ids.
+///
+/// LOCK ORDER: this directory is taken and RELEASED before [`service_state`] is
+/// locked (see [`service_type_refusal`], its only reader here), so a handler
+/// never holds both at once and the writers' order — their own store first, this
+/// one second — cannot invert against it.
+pub fn data_source_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<DataSourceDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<DataSourceDirectory>)
 }

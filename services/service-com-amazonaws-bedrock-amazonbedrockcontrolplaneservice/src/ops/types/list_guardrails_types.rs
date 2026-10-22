@@ -26,7 +26,11 @@ pub struct ListGuardrailsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GuardrailSummary")]
+/// `GuardrailSummary`, the row `ListGuardrails` carries. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="GuardrailSummary")`), which the derive does not
+/// put on a member schema — see `types/date_time_wire.rs`.
 #[derive(Debug, Clone)]
 pub struct GuardrailSummary {
     pub id: String,
@@ -39,4 +43,28 @@ pub struct GuardrailSummary {
     pub updated_at: ::aws_smithy_types::DateTime,
     pub cross_region_details: Option<GuardrailCrossRegionDetails>,
 }
+
+bedrock_schema_and_codec!(
+    GuardrailSummary,
+    GUARDRAIL_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrock#GuardrailSummary",
+    "com.amazonaws.bedrock",
+    "GuardrailSummary",
+    (M_ID, id, "id", 0, req, string),
+    (M_ARN, arn, "arn", 1, req, string),
+    (M_STATUS, status, "status", 2, req, string),
+    (M_NAME, name, "name", 3, req, string),
+    (M_DESCRIPTION, description, "description", 4, opt, string),
+    (M_VERSION, version, "version", 5, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 6, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 7, req, date_time),
+    (
+        M_CROSS_REGION_DETAILS,
+        cross_region_details,
+        "crossRegionDetails",
+        8,
+        opt,
+        struct_of(GuardrailCrossRegionDetails)
+    ),
+);
 

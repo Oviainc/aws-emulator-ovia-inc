@@ -21,8 +21,12 @@ mod query_logging_configuration;
 mod resource_policy_lifecycle;
 #[path = "all/rule_groups_namespace_lifecycle.rs"]
 mod rule_groups_namespace_lifecycle;
+#[path = "all/scraper_listing.rs"]
+mod scraper_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/wire_fidelity.rs"]
+mod wire_fidelity;
 #[path = "all/workspace_configuration.rs"]
 mod workspace_configuration;
 #[path = "all/workspace_lifecycle.rs"]

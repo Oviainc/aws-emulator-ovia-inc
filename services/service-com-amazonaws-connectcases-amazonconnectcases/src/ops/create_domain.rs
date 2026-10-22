@@ -173,18 +173,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A Cases domain name is unique for the account, so a create under a name
         // already taken is refused instead of shadowing the domain that holds it.
-        if let Some(existing) = store.domains.values().find(|d| d.name == input.name) {
-            return Err(CreateDomainErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "a Cases domain named {} already exists (domainId {})",
-                    input.name, existing.domain_id
-                ),
-            })
+        if store.domains.values().any(|d| d.name == input.name) {
+            return Err(CreateDomainErrorModeled::ConflictException(
+                crate::state::name_conflict(crate::state::ResourceKind::Domain, &input.name),
+            )
             .into());
         }
 
         let domain_id = crate::state::new_id();
         let domain_arn = crate::state::domain_arn(&region, &domain_id);
+        // A domain is provisioned with the service's reserved System-namespace
+        // fields, so its schema resolves them from the moment it exists.
+        let fields = crate::state::reserved_system_fields(&region, &domain_id, created_time);
         // Read the answer back out of the record just stored, so the response can
         // only report what a later GetDomain will find.
         let stored = store
@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_time,
                 domain_status: crate::state::DOMAIN_STATUS_ACTIVE.to_string(),
                 tags: ::std::collections::HashMap::new(),
-                fields: ::std::collections::HashMap::new(),
+                fields,
                 templates: ::std::collections::HashMap::new(),
                 layouts: ::std::collections::HashMap::new(),
                 cases: ::std::collections::HashMap::new(),

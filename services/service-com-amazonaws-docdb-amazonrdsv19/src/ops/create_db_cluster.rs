@@ -526,8 +526,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clusters
             .get(&identifier)
             .expect("the cluster was inserted on the line above");
+        let resource_id = stored.resource_id.clone();
+        let engine = stored.engine.clone();
+        let db_cluster = docdb::cluster_to_shape(stored, &store.instances);
+        // The `DbClusterResourceId` just minted is recorded in the SHARED
+        // data-source directory, so a service that monitors this cluster
+        // (Performance Insights addresses a data source by its resource id) can tell
+        // that THIS service owns the id — the id's form cannot say so, because Amazon
+        // RDS mints ids of the same form. The DocumentDB store is already locked and
+        // the directory is taken second, the order its doc fixes.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            directory.lock().register(
+                &resource_id,
+                ::service_common::db_data_sources::SERVICE_TYPE_DOCDB,
+                &engine,
+            );
+        }
         Ok(CreateDBClusterOutput {
-            db_cluster: Some(docdb::cluster_to_shape(stored, &store.instances)),
+            db_cluster: Some(db_cluster),
         })
     }
 }

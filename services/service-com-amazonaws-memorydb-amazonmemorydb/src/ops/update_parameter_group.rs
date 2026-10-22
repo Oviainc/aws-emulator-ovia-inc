@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists the supplied parameter values on the named group in
+//! [`crate::state`] and answers the stored `ParameterGroup`. Each pair is checked
+//! against the engine default parameter of the group's FAMILY it names — an unknown
+//! name or a value outside that parameter's domain is refused and NOTHING is written,
+//! so a refused update leaves the group exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +145,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateParameterGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); the request is refused rather than
+            // reported as an update nothing persisted.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        // "You must supply at least one parameter name and value": an empty list
+        // supplies none, which is a combination this operation cannot act on.
+        if input.parameter_name_values.is_empty() {
+            return Err(
+                UpdateParameterGroupErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "ParameterNameValues must supply at least one parameter name \
+                             and value."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "A maximum of 20 parameters may be updated per request."
+        if input.parameter_name_values.len() > crate::state::MAX_PARAMETERS_PER_UPDATE {
+            return Err(
+                UpdateParameterGroupErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "At most {} parameters may be updated per request — got {}.",
+                            crate::state::MAX_PARAMETERS_PER_UPDATE,
+                            input.parameter_name_values.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+        // Besides this update's own write, the only one: the status transitions the
+        // clock already owed the stored clusters and ACLs at this instant.
+        state.settle(std::time::Instant::now());
+
+        // The borrow checker needs the group looked up twice (once to read its family,
+        // once to write), so the not-found refusal is built HERE and cannot differ
+        // between the two sites.
+        let not_found = || {
+            UpdateParameterGroupErrorModeled::ParameterGroupNotFoundFault(
+                ParameterGroupNotFoundFault {
+                    message: Some(format!(
+                        "Parameter group {} not found.",
+                        input.parameter_group_name
+                    )),
+                },
+            )
+        };
+        let Some(group) = state.parameter_groups.get(&input.parameter_group_name) else {
+            return Err(not_found().into());
+        };
+        let family = group.family.clone();
+
+        // EVERY pair is checked before ANY is applied, so a request carrying one bad
+        // pair leaves the whole group unchanged rather than half-applied. A name
+        // supplied twice in one request takes its last value, as the map insert below
+        // does.
+        let mut applied: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for pair in &input.parameter_name_values {
+            let name = pair.parameter_name.clone().unwrap_or_default();
+            let Some(parameter) = crate::state::family_parameter(&family, &name) else {
+                return Err(
+                    UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(format!(
+                                "Unknown parameter {name:?} for parameter group family \
+                                 {family}."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // `ParameterValue` is optional in the model, so a pair that names a
+            // parameter without a value says nothing to apply to it.
+            let Some(value) = pair.parameter_value.clone() else {
+                return Err(
+                    UpdateParameterGroupErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(format!(
+                                "ParameterValue is required for parameter {name}."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if let Err(reason) = parameter.domain.accepts(parameter.name, &value) {
+                return Err(
+                    UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(reason),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            applied.insert(parameter.name.to_string(), value);
+        }
+
+        let Some(group) = state.parameter_groups.get_mut(&input.parameter_group_name) else {
+            // The group was looked up under the same lock that is still held, so this
+            // cannot be reached; refusing beats answering with an unpersisted group.
+            return Err(not_found().into());
+        };
+        for (name, value) in applied {
+            // A value equal to the family's engine default is still an override the
+            // caller set: only `ResetParameterGroup` takes one back off the group.
+            group.parameter_values.insert(name, value);
+        }
+        Ok(UpdateParameterGroupOutput {
+            parameter_group: Some(group.to_api()),
+        })
     }
 }

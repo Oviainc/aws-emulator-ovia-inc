@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the named tag keys from the report the `ResourceARN` names,
+//! so a later `ListTagsForResource` of that ARN no longer reports them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An ARN inside the modelled `AmazonResourceName` pattern that names no report this
+//! account holds is refused with the modelled `NotAuthorizedException` (HTTP 400)
+//! under the service-wide [`crate::state::NOT_AUTHORIZED_MESSAGE`]; an ARN outside
+//! that pattern, or a `TagKeys` list past its modelled bound, never reaches this
+//! handler — the boundary validator refuses those first.
+//!
+//! Removing a key the report does not carry removes nothing and still succeeds, so a
+//! client may repeat the call: the operation is idempotent in its effect.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +146,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServiceError(
+                InternalServiceError {
+                    message: Some(
+                        "the Performance Insights report store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // `ServiceType` is required by the model and refused at the boundary when it
+        // is not one of its values; it adds no gate here, because the `ResourceARN`
+        // is what names the resource the keys are removed from.
+        let _ = ctx;
+
+        let mut store = state.lock();
+        let Some(report) = store.report_by_arn_mut(&input.resource_arn) else {
+            // A well-formed ARN naming no report this account holds: the uniform
+            // authorization refusal, and nothing is removed anywhere.
+            return Err(not_authorized());
+        };
+
+        report.remove_tags(&input.tag_keys);
+
+        Ok(UntagResourceOutput {})
     }
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal this service answers
+/// for a resource the caller may not see — including an ARN that names no report
+/// at all, so neither answer discloses the other.
+fn not_authorized() -> UntagResourceError {
+    UntagResourceErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
 }

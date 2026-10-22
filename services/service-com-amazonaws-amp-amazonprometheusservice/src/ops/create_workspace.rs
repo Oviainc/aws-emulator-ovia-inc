@@ -183,24 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
         // its own tag keys, so it holds for the tags a workspace is created with too.
-        if let Some(reserved) =
-            crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys()))
+        // Stated in the one form every aps refusal takes, which names the member and the
+        // requirement it failed and never echoes the value the caller sent.
+        if crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys())).is_some()
         {
             return Err(CreateWorkspaceErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "tag key {reserved} is reserved: keys must not begin with {}",
-                        crate::state::RESERVED_TAG_KEY_PREFIX,
-                    ),
-                    reason: "FIELD_VALIDATION_FAILED".to_string(),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "tags".to_string(),
-                        message: format!(
-                            "keys must not begin with {}",
-                            crate::state::RESERVED_TAG_KEY_PREFIX
-                        ),
-                    }]),
-                },
+                crate::state::member_validation_failed(
+                    "tags",
+                    &crate::state::reserved_tag_key_requirement(),
+                ),
             )
             .into());
         }

@@ -22,7 +22,10 @@ use smithy_server_runtime::MultiServiceRouter;
 const REGION: &str = "us-west-2";
 
 /// One emulator: a single shared engine behind a router mounting only Redshift.
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite under `tests/all/` drives requests through the
+/// same harness instead of writing a second copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The same engine the router handed the service, so a suite can seed a
     /// record no implemented operation mints.
@@ -30,25 +33,25 @@ struct Emulator {
 }
 
 /// A served response, reduced to what the assertions read.
-struct Answer {
-    status: u16,
-    body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Answer {
     /// The `<Code>` of an awsQuery `<ErrorResponse>`, or `None` on a success.
-    fn error_code(&self) -> Option<String> {
+    pub(crate) fn error_code(&self) -> Option<String> {
         first_text(&self.body, "Code")
     }
 
     /// The text of the first element with this local name, anywhere in the body.
-    fn text(&self, tag: &str) -> Option<String> {
+    pub(crate) fn text(&self, tag: &str) -> Option<String> {
         first_text(&self.body, tag)
     }
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // The one shared engine, exactly as `router/src/lib.rs` builds it: every
         // request in this suite observes the same store.
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -84,7 +87,7 @@ impl Emulator {
     }
 
     /// POST one awsQuery action with these form parameters.
-    async fn call(&self, action: &str, params: &[(&str, &str)]) -> Answer {
+    pub(crate) async fn call(&self, action: &str, params: &[(&str, &str)]) -> Answer {
         let mut body = format!("Action={action}&Version=2012-12-01");
         for (name, value) in params {
             body.push('&');
@@ -112,7 +115,7 @@ impl Emulator {
     }
 
     /// Create a cluster with just the three required members.
-    async fn create_minimal(&self, identifier: &str) -> Answer {
+    pub(crate) async fn create_minimal(&self, identifier: &str) -> Answer {
         self.call(
             "CreateCluster",
             &[
@@ -154,7 +157,7 @@ fn form_encode(value: &str) -> String {
 /// suite reads, and is produced by the framework's own escaping serializer, so
 /// matching one element's open/close pair is exact for this input. Element names
 /// are matched whole (`<Port>` cannot match `<PortRange>`).
-fn all_text(xml: &str, tag: &str) -> Vec<String> {
+pub(crate) fn all_text(xml: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let mut found = Vec::new();

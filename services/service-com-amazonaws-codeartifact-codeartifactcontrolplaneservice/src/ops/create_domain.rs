@@ -209,12 +209,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Bound once: the domain and the root package group it is created with report the
+        // same owner and the same `createdTime`, because they are created together.
+        let owner = ::engine::emulator_account_id().to_string();
+        let created_time = ::std::time::SystemTime::now();
+
         let domain = crate::state::Domain {
             name: input.domain.clone(),
-            owner: ::engine::emulator_account_id().to_string(),
+            owner: owner.clone(),
             arn: crate::state::domain_arn(&region, &input.domain),
             status: crate::state::DOMAIN_STATUS_ACTIVE.to_string(),
-            created_time: ::std::time::SystemTime::now(),
+            created_time,
             // CodeArtifact encrypts a domain with the key the caller named, or with a
             // managed key it selects for the domain when the caller named none — and
             // reports the key either way.
@@ -226,6 +231,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.clone().unwrap_or_default(),
             policy: None,
             repositories: ::std::collections::BTreeMap::new(),
+            // A domain is created WITH its root package group `/*`: it is the ancestor
+            // every later package group inherits its origin restrictions from, so a
+            // domain without it would have no hierarchy to hang them on.
+            package_groups: crate::state::initial_package_groups(
+                &region,
+                &input.domain,
+                &owner,
+                created_time,
+            ),
         };
 
         // The response is the projection of the record that was just STORED, so a later

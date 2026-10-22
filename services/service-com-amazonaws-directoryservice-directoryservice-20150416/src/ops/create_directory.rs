@@ -255,6 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sso_enabled: false,
             desired_number_of_domain_controllers: None,
             tags,
+            // `RegisterEventTopic` is what associates an Amazon SNS topic with the
+            // directory; a fresh directory publishes to none.
+            event_topics: ::std::collections::BTreeMap::new(),
             seq,
         };
         store.directories.insert(directory_id.clone(), record);

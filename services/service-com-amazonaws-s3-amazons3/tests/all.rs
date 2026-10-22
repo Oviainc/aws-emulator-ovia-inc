@@ -15,6 +15,8 @@
 mod bucket_encryption;
 #[path = "all/bucket_lifecycle.rs"]
 mod bucket_lifecycle;
+#[path = "all/bucket_notification_configuration.rs"]
+mod bucket_notification_configuration;
 #[path = "all/bucket_ownership_controls.rs"]
 mod bucket_ownership_controls;
 #[path = "all/bucket_policy_and_tagging.rs"]
@@ -37,6 +39,8 @@ mod object_listing_and_deletion;
 mod object_storage;
 #[path = "all/object_tagging.rs"]
 mod object_tagging;
+#[path = "all/object_versioning.rs"]
+mod object_versioning;
 #[path = "all/object_write_and_read_back.rs"]
 mod object_write_and_read_back;
 #[path = "all/objects.rs"]

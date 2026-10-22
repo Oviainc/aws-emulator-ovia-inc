@@ -183,13 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documentation says role sessions created through a permission set "continue
         // based on the duration configured in the permission set" after logout.
         if !state.lock().invalidate_session(&input.access_token, now) {
-            return Err(LogoutErrorModeled::UnauthorizedException(UnauthorizedException {
-                message: Some(
-                    "the access token presented in x-amz-sso_bearer_token is not a valid \
-                     IAM Identity Center sign-in session"
-                        .to_string(),
-                ),
-            })
+            // One gate, one refusal (see `crate::state::unauthorized_session`).
+            return Err(LogoutErrorModeled::UnauthorizedException(
+                crate::state::unauthorized_session(),
+            )
             .into());
         }
 

@@ -748,6 +748,36 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsDocdbAmazonrdsv19State>)
 }
 
+/// The SHARED data-source directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A monitoring service addresses a DB resource by the immutable resource id THIS
+/// service minted for it (`DbClusterResourceId`, `DbiResourceId`), and the form of
+/// that id does not say which service minted it — Amazon RDS mints ids of the same
+/// forms. So a minted id is recorded here, in ONE directory under one shared type
+/// ([`::service_common::db_data_sources::DataSourceDirectory`]), which is how
+/// Performance Insights can decide whether its request's `ServiceType` is the service
+/// that owns the resource the request names. The engine keys state by TYPE, so a copy
+/// of its own inside [`ComAmazonawsDocdbAmazonrdsv19State`] would be invisible to the
+/// readers.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and
+/// no reader holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` by leaving the directory unwritten: the record is an aid to another
+/// service, never part of this operation's own answer.
+pub fn data_source_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::db_data_sources::DataSourceDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::db_data_sources::DataSourceDirectory,
+            >,
+        )
+}
+
 /// The region the caller signed this request for, read from its SigV4 credential scope.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)

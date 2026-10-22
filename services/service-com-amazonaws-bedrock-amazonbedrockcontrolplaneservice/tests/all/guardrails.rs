@@ -8,190 +8,9 @@
 //! (which policies a guardrail carries, which form a KMS key id takes, how large a page
 //! is, which constraint a request breaks), never a rename of one recorded request.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use serde_json::{json, Value};
-use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
-/// The region every request in this suite signs for; it is what the minted ARNs must
-/// carry.
-const REGION: &str = "us-west-2";
-
-/// The canonical emulator account id every ARN carries.
-const ACCOUNT: &str = "000000000000";
-
-/// Longer than the transient-status window `crate::state` opens on a create, update or
-/// version, so a read after this has waited observes the status the clock owes.
-///
-/// A REAL wait, not a paused-clock one: the handlers compare `SystemTime::now()`
-/// against a stored due instant, which `tokio::time::pause` does not move.
-const PAST_TRANSITION: Duration = Duration::from_millis(1100);
-
-/// One emulator answer: the HTTP status, the parsed JSON body, and the wire error code
-/// when it is a failure.
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    body: Value,
-    error: Option<String>,
-}
-
-impl Reply {
-    /// The body member `name`, or `Value::Null` when the response omits it.
-    fn get(&self, name: &str) -> Value {
-        self.body.get(name).cloned().unwrap_or(Value::Null)
-    }
-
-    /// The body member `name` as a string; panics naming the member when it is absent.
-    fn text(&self, name: &str) -> String {
-        self.get(name)
-            .as_str()
-            .unwrap_or_else(|| panic!("response has no string member {name}: {:?}", self.body))
-            .to_string()
-    }
-
-    /// The body member `name` as the epoch-seconds instant the wire carries a
-    /// `Timestamp` as; panics naming the member when it is not one.
-    fn instant(&self, name: &str) -> f64 {
-        self.get(name).as_f64().unwrap_or_else(|| {
-            panic!("response has no timestamp member {name}: {:?}", self.body)
-        })
-    }
-}
-
-/// An identifier as an SDK writes it into a path label: an ARN carries `:` and `/`, and
-/// both are percent-encoded so the whole identifier stays ONE path segment.
-fn label(identifier: &str) -> String {
-    identifier
-        .replace('%', "%25")
-        .replace(':', "%3A")
-        .replace('/', "%2F")
-}
-
-/// The emulator under test: one shared engine, one registered service, dispatched
-/// in-process.
-struct Emulator {
-    router: smithy_server_runtime::MultiServiceRouter,
-}
-
-fn emulator() -> Emulator {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = smithy_server_runtime::MultiServiceRouter::new();
-    router.register_service(bedrock::EmulatedService::new(engine));
-    Emulator { router }
-}
-
-impl Emulator {
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
-        let payload = body.map_or_else(Vec::new, |value| {
-            serde_json::to_vec(&value).expect("a serializable request body")
-        });
-        let request = http::Request::builder()
-            .method(method)
-            .uri(format!("https://bedrock.{REGION}.amazonaws.com{path}"))
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/bedrock/\
-                     aws4_request, SignedHeaders=host, Signature=00"
-                ),
-            )
-            .header("content-type", "application/json")
-            .body(bytes::Bytes::from(payload))
-            .expect("a well-formed request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let header_error = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| error_code(value).to_string());
-        let body: Value = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        let error = header_error.or_else(|| {
-            body.get("__type")
-                .and_then(Value::as_str)
-                .map(|value| error_code(value).to_string())
-        });
-        Reply {
-            status,
-            body,
-            error,
-        }
-    }
-
-    async fn create(&self, body: Value) -> Reply {
-        self.call("POST", "/guardrails", Some(body)).await
-    }
-
-    async fn get(&self, identifier: &str, version: Option<&str>) -> Reply {
-        let identifier = label(identifier);
-        let path = match version {
-            Some(version) => format!("/guardrails/{identifier}?guardrailVersion={version}"),
-            None => format!("/guardrails/{identifier}"),
-        };
-        self.call("GET", &path, None).await
-    }
-
-    async fn list(&self, query: &str) -> Reply {
-        let path = if query.is_empty() {
-            "/guardrails".to_string()
-        } else {
-            format!("/guardrails?{query}")
-        };
-        self.call("GET", &path, None).await
-    }
-
-    async fn update(&self, identifier: &str, body: Value) -> Reply {
-        let identifier = label(identifier);
-        self.call("PUT", &format!("/guardrails/{identifier}"), Some(body))
-            .await
-    }
-
-    async fn create_version(&self, identifier: &str, body: Value) -> Reply {
-        let identifier = label(identifier);
-        self.call("POST", &format!("/guardrails/{identifier}"), Some(body))
-            .await
-    }
-
-    async fn delete(&self, identifier: &str, version: Option<&str>) -> Reply {
-        let identifier = label(identifier);
-        let path = match version {
-            Some(version) => format!("/guardrails/{identifier}?guardrailVersion={version}"),
-            None => format!("/guardrails/{identifier}"),
-        };
-        self.call("DELETE", &path, None).await
-    }
-
-    /// Create a guardrail with only the required members and hand back its id.
-    async fn create_named(&self, name: &str) -> String {
-        let reply = self
-            .create(json!({
-                "name": name,
-                "blockedInputMessaging": "blocked in",
-                "blockedOutputsMessaging": "blocked out",
-            }))
-            .await;
-        assert_eq!(
-            reply.status, 202,
-            "case {name}: CreateGuardrail must answer 202, got {} {:?}",
-            reply.status, reply.body
-        );
-        reply.text("guardrailId")
-    }
-}
-
-/// The bare error code out of an `__type` / `x-amzn-errortype` value, which may carry a
-/// namespace or a URL beside it.
-fn error_code(raw: &str) -> &str {
-    let without_url = raw.split(':').next().unwrap_or(raw);
-    without_url.rsplit('#').next().unwrap_or(without_url)
-}
+use crate::support::{emulator, ACCOUNT, REGION};
 
 /// One `CreateGuardrail` request and the members `GetGuardrail` must then report. An
 /// expected `null` means the response must OMIT that member.
@@ -228,7 +47,12 @@ async fn create_then_get_reports_the_stored_guardrail() {
                 "version": "DRAFT",
                 "blockedInputMessaging": "input blocked",
                 "blockedOutputsMessaging": "output blocked",
-                "wordPolicy": { "words": [ { "text": "nope" } ] },
+                // `managedWordLists` admits zero entries, so it is reported as the
+                // empty list rather than omitted.
+                "wordPolicy": {
+                    "words": [ { "text": "nope" } ],
+                    "managedWordLists": [],
+                },
                 "topicPolicy": null,
                 "contentPolicy": null,
                 "kmsKeyArn": null,
@@ -277,6 +101,9 @@ async fn create_then_get_reports_the_stored_guardrail() {
                         "inputStrength": "HIGH",
                         "outputStrength": "MEDIUM",
                     } ],
+                    // The request configured no content-filter tier, so the guardrail
+                    // is on the default one.
+                    "tier": { "tierName": "CLASSIC" },
                 },
                 "wordPolicy": null,
                 "kmsKeyArn": kms_key_arn.clone(),
@@ -328,6 +155,7 @@ async fn create_then_get_reports_the_stored_guardrail() {
                 "name": "grounding",
                 "contextualGroundingPolicy": {
                     "filters": [ { "type": "GROUNDING", "threshold": 0.75 } ],
+                    "tier": { "tierName": "CLASSIC" },
                 },
                 // An alias resolves to a key id only inside KMS, so no key ARN is
                 // reported rather than one being invented.
@@ -586,36 +414,24 @@ async fn a_guardrail_name_is_unique_within_the_account() {
     );
 }
 
-/// The statuses the clock owes: a create reports CREATING, an update UPDATING and a new
-/// version VERSIONING until the transition is due, and READY from then on.
+/// A guardrail is READY on the read that follows the call that created, updated or
+/// versioned it, and stays READY however often it is read.
 #[tokio::test]
-async fn a_guardrail_reaches_ready_when_the_clock_owes_it() {
+async fn a_guardrail_is_ready_on_the_read_that_follows_every_call() {
     let emulator = emulator();
     let id = emulator.create_named("transitions").await;
 
-    let creating = emulator.get(&id, None).await;
-    assert_eq!(
-        creating.text("status"),
-        "CREATING",
-        "case straight after create: expected CREATING, got {:?}",
-        creating.get("status")
-    );
-
-    tokio::time::sleep(PAST_TRANSITION).await;
-    let ready = emulator.get(&id, None).await;
-    assert_eq!(
-        ready.text("status"),
-        "READY",
-        "case after the creation window: expected READY, got {:?}",
-        ready.get("status")
-    );
-    let still_ready = emulator.get(&id, None).await;
-    assert_eq!(
-        still_ready.text("status"),
-        "READY",
-        "case read twice: READY is terminal, got {:?}",
-        still_ready.get("status")
-    );
+    // Straight after the create, with no wait: there is no window in which a guardrail
+    // reports a non-terminal status, because no call here returns one.
+    for read in 0..3 {
+        let got = emulator.get(&id, None).await;
+        assert_eq!(
+            got.text("status"),
+            "READY",
+            "case read {read} after create: expected READY, got {:?}",
+            got.get("status")
+        );
+    }
 
     let updated = emulator
         .update(
@@ -632,12 +448,12 @@ async fn a_guardrail_reaches_ready_when_the_clock_owes_it() {
         "case update: expected 202, got {} {:?}",
         updated.status, updated.body
     );
-    let updating = emulator.get(&id, None).await;
+    let after_update = emulator.get(&id, None).await;
     assert_eq!(
-        updating.text("status"),
-        "UPDATING",
-        "case straight after update: expected UPDATING, got {:?}",
-        updating.get("status")
+        after_update.text("status"),
+        "READY",
+        "case straight after update: expected READY, got {:?}",
+        after_update.get("status")
     );
 
     let versioned = emulator.create_version(&id, json!({})).await;
@@ -646,22 +462,36 @@ async fn a_guardrail_reaches_ready_when_the_clock_owes_it() {
         "case version: expected 202, got {} {:?}",
         versioned.status, versioned.body
     );
-    let versioning = emulator.get(&id, Some("1")).await;
-    assert_eq!(
-        versioning.text("status"),
-        "VERSIONING",
-        "case straight after CreateGuardrailVersion: expected VERSIONING, got {:?}",
-        versioning.get("status")
-    );
-
-    tokio::time::sleep(PAST_TRANSITION).await;
     for version in [None, Some("1")] {
         let settled = emulator.get(&id, version).await;
         assert_eq!(
             settled.text("status"),
             "READY",
-            "case {version:?} after its window: expected READY, got {:?}",
+            "case {version:?} straight after CreateGuardrailVersion: expected READY, got {:?}",
             settled.get("status")
+        );
+    }
+
+    // The listing reports the same status as the read, for the DRAFT and for the
+    // numbered version.
+    let listed = emulator.list(&format!("guardrailIdentifier={id}")).await;
+    let rows = listed
+        .get("guardrails")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        rows.len(),
+        2,
+        "case listing: the DRAFT and version 1, got {:?}",
+        listed.body
+    );
+    for row in rows {
+        assert_eq!(
+            row.get("status").and_then(Value::as_str),
+            Some("READY"),
+            "case listed {:?}: expected READY, got {row}",
+            row.get("version")
         );
     }
 }
@@ -736,7 +566,10 @@ async fn versions_are_snapshots_the_draft_cannot_change() {
         "description": "the second configuration",
         "blockedInputMessaging": "second in",
         "blockedOutputsMessaging": "second out",
-        "wordPolicy": { "words": [ { "text": "second" } ] },
+        "wordPolicy": {
+            "words": [ { "text": "second" } ],
+            "managedWordLists": [],
+        },
         "topicPolicy": null,
         "version": "DRAFT",
     });
@@ -766,13 +599,18 @@ async fn versions_are_snapshots_the_draft_cannot_change() {
         "description": "snapshot one",
         "blockedInputMessaging": "first in",
         "blockedOutputsMessaging": "first out",
-        "wordPolicy": { "words": [ { "text": "first" } ] },
+        "wordPolicy": {
+            "words": [ { "text": "first" } ],
+            "managedWordLists": [],
+        },
         "topicPolicy": {
             "topics": [ {
                 "name": "Topic",
                 "definition": "the first topic",
                 "type": "DENY",
+                "examples": [],
             } ],
+            "tier": { "tierName": "CLASSIC" },
         },
     });
     for (member, expected) in expected_snapshot.as_object().expect("an object") {
@@ -795,7 +633,7 @@ async fn versions_are_snapshots_the_draft_cannot_change() {
     let second_snapshot = emulator.get(&id, Some("2")).await;
     assert_eq!(
         second_snapshot.get("wordPolicy"),
-        json!({ "words": [ { "text": "second" } ] }),
+        json!({ "words": [ { "text": "second" } ], "managedWordLists": [] }),
         "case version 2: it snapshots the draft as it is now, got {:?}",
         second_snapshot.get("wordPolicy")
     );

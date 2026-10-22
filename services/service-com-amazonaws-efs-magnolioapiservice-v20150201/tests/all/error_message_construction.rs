@@ -75,10 +75,12 @@ enum FileSystemEntry {
     PutLifecycleConfiguration,
     DescribeLifecycleConfiguration,
     UpdateFileSystem,
+    CreateAccessPoint,
+    DescribeAccessPoints,
 }
 
 impl FileSystemEntry {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 9] = [
         Self::DescribeFileSystems,
         Self::DeleteFileSystem,
         Self::DescribeMountTargets,
@@ -86,6 +88,8 @@ impl FileSystemEntry {
         Self::PutLifecycleConfiguration,
         Self::DescribeLifecycleConfiguration,
         Self::UpdateFileSystem,
+        Self::CreateAccessPoint,
+        Self::DescribeAccessPoints,
     ];
 
     fn takes_id_in_path(self) -> bool {
@@ -141,6 +145,17 @@ impl FileSystemEntry {
                     Some(json!({ "ThroughputMode": "elastic" })),
                 )
                 .await
+            }
+            Self::CreateAccessPoint => {
+                efs.create_access_point(json!({
+                    "ClientToken": "construction-access-point",
+                    "FileSystemId": requested,
+                }))
+                .await
+            }
+            Self::DescribeAccessPoints => {
+                efs.describe_access_points(&format!("FileSystemId={requested}"))
+                    .await
             }
         }
     }
@@ -269,6 +284,102 @@ async fn access_point_not_found_is_built_from_the_requested_id() {
             "AccessPointNotFound",
             "Access point",
             named,
+        );
+
+        let described = efs
+            .describe_access_points(&format!("AccessPointId={requested}"))
+            .await;
+        assert_not_found(
+            &format!("DescribeAccessPoints(AccessPointId={requested})"),
+            &described,
+            "AccessPointNotFound",
+            "Access point",
+            named,
+        );
+    }
+}
+
+#[tokio::test]
+async fn access_point_already_exists_names_the_existing_access_point_and_the_request_token() {
+    let efs = Emulator::new();
+    let file_system_id = efs.available_file_system("construction-access-point-1").await;
+
+    // The same construction as `FileSystemAlreadyExists`, over the same token table: the
+    // existing resource's id and the token the request carried, each single-quoted.
+    for token in creation_tokens() {
+        let created = efs
+            .create_access_point(json!({
+                "ClientToken": token,
+                "FileSystemId": file_system_id,
+            }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {token:?}: CreateAccessPoint expected 200, got {} {:?}",
+            created.status, created.body
+        );
+        let access_point_id = created.string("AccessPointId");
+
+        let repeat = efs
+            .create_access_point(json!({
+                "ClientToken": token,
+                "FileSystemId": file_system_id,
+            }))
+            .await;
+        assert_eq!(
+            repeat.status, 409,
+            "case {token:?}: repeat CreateAccessPoint expected 409, got {} {:?}",
+            repeat.status, repeat.body
+        );
+        assert_eq!(
+            repeat.error_type.as_deref(),
+            Some("AccessPointAlreadyExists"),
+            "case {token:?}: unexpected error type, got {:?}",
+            repeat.error_type
+        );
+        let message = repeat.string("Message");
+        assert_eq!(
+            message,
+            format!(
+                "Access point '{access_point_id}' already exists with creation token '{token}'"
+            ),
+            "case {token:?}: unexpected Message construction, got {message:?}"
+        );
+        assert_eq!(
+            quoted_values(&message),
+            vec![access_point_id.clone(), token.clone()],
+            "case {token:?}: expected the existing id then the request token quoted, got \
+             {message:?}"
+        );
+        assert_eq!(
+            repeat.string("AccessPointId"),
+            access_point_id,
+            "case {token:?}: AccessPointAlreadyExists$AccessPointId must be the existing id, \
+             got {:?}",
+            repeat.get("AccessPointId")
+        );
+
+        // ROUND TRIP: the conflict named an access point that really is stored under that
+        // token, and the repeat created no second one.
+        let described = efs
+            .describe_access_points(&format!("AccessPointId={access_point_id}"))
+            .await;
+        let listed = described
+            .get("AccessPoints")
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {token:?}: expected exactly the one access point the conflict named, got \
+             {listed:?}"
+        );
+        assert_eq!(
+            listed[0]["ClientToken"].as_str().unwrap_or_default(),
+            token,
+            "case {token:?}: the named access point holds the request's token, got {:?}",
+            listed[0]
         );
     }
 }

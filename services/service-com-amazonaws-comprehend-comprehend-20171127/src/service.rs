@@ -41,9 +41,76 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with — the
+/// same code (and HTTP 400) the framework would otherwise have named, restated
+/// here because `override_refusal` replaces the code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The requirement a NUMERIC-bound violation states, in the phrasing the
+/// validation envelope uses. `None` for every other violation class, which keeps
+/// the framework's own clause for it ([`ViolationKind`] is `#[non_exhaustive]`, so
+/// a class added upstream falls here too).
+fn range_requirement(kind: &ViolationKind) -> Option<String> {
+    Some(match kind {
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        _ => return None,
+    })
+}
+
+/// One clause for one violated member.
+///
+/// Whether the rejected value is echoed follows the violation's CLASS, as AWS's
+/// own request validator does: a value outside a member's `@range` is reported
+/// WITHOUT it — `Value at '<member>' failed to satisfy constraint: Member must
+/// have value greater than or equal to <bound>` — because the bound and the
+/// member name are the whole of what a caller has to act on, and the magnitude it
+/// sent is not restated. Every other class (an absent member, a `@length`, a
+/// `@pattern`, an enum value set) keeps the framework's clause, which does echo
+/// the value, so only the numeric classes are reworded here.
+fn violation_clause(violation: &Violation) -> String {
+    match range_requirement(&violation.kind) {
+        Some(requirement) => format!(
+            "Value at '{}' failed to satisfy constraint: {requirement}",
+            violation.path
+        ),
+        None => violation.message(),
+    }
+}
+
+/// The `ValidationException` message for a framework refusal: the same
+/// `<N> validation error(s) detected: ` envelope the framework renders, over one
+/// clause per violated member.
+///
+/// `None` when no violation is a numeric-bound one, which declines the refusal
+/// and keeps the framework's wording verbatim rather than re-deriving it here.
+fn validation_envelope(violations: &[Violation]) -> Option<String> {
+    if !violations
+        .iter()
+        .any(|violation| range_requirement(&violation.kind).is_some())
+    {
+        return None;
+    }
+    // At least one violation reached here — the check above returned otherwise —
+    // so the envelope always has a clause to carry.
+    let clauses: Vec<String> = violations.iter().map(violation_clause).collect();
+    match clauses.as_slice() {
+        [only] => Some(format!("1 validation error detected: {only}")),
+        many => Some(format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-comprehend-comprehend-20171127` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +165,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Comprehend words such a refusal as a `ValidationException` (HTTP 400 —
+        // the status and code the framework would also have answered, so only the
+        // wording changes). The one difference from the framework's own rendering
+        // is the clause for a numeric `@range` violation, which names the member
+        // and the bound and echoes NO value; see [`violation_clause`]. An
+        // authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: validation_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

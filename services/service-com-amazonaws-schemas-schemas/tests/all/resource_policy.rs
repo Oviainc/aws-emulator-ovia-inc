@@ -20,7 +20,10 @@ use crate::registry_schema_lifecycle::{create_registry, Answer, Emulator};
 
 /// `/v1/policy`, with the `registryName` query parameter the model binds
 /// `RegistryName` to; `None` omits it.
-fn policy_uri(registry: Option<&str>) -> String {
+///
+/// Shared with the sibling policy suite in `malformed_content_and_policy_deletion.rs`,
+/// so the binding is encoded once.
+pub(crate) fn policy_uri(registry: Option<&str>) -> String {
     match registry {
         Some(registry) => format!("/v1/policy?registryName={registry}"),
         None => "/v1/policy".to_string(),

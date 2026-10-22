@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    EffectivePreferredResource, ExternalMetricsPreference, PreferredResource,
-    PutRecommendationPreferencesInput, RecommendationPreferencesDetail, Scope,
+    CustomizableMetricParameters, EffectivePreferredResource, ExternalMetricsPreference,
+    PreferredResource, PutRecommendationPreferencesInput, RecommendationPreferencesDetail, Scope,
     UtilizationPreference,
 };
 
@@ -81,9 +81,10 @@ pub struct Enrollment {
     pub member_accounts_enrolled: bool,
     /// When the enrollment record was last written; `None` until the first write.
     pub last_updated_timestamp: Option<DateTime>,
-    /// How many organization member accounts are opted in; `None` unless member
-    /// accounts are enrolled at all.
-    pub number_of_member_accounts_opted_in: Option<i32>,
+    /// How many organization member accounts are opted in. A COUNT, not a flag: it is
+    /// zero while no member account is opted in, never absent, because
+    /// `GetEnrollmentStatus` reports the count whatever it is.
+    pub number_of_member_accounts_opted_in: i32,
 }
 
 impl Default for Enrollment {
@@ -93,7 +94,7 @@ impl Default for Enrollment {
             status_reason: None,
             member_accounts_enrolled: false,
             last_updated_timestamp: None,
-            number_of_member_accounts_opted_in: None,
+            number_of_member_accounts_opted_in: 0,
         }
     }
 }
@@ -251,18 +252,23 @@ pub fn is_recommendation_preference_name(name: &str) -> bool {
 }
 
 /// A `PreferredResource` as the service reports it back: the stored include and exclude
-/// lists plus `effectiveIncludeList`, which "resolves any wildcard expressions and
-/// returns the effective list of candidate resource type values".
+/// lists plus `effectiveIncludeList`, "the expanded version of your preferred resource's
+/// include list" — the preference "resolves any wildcard expressions and returns the
+/// effective list of candidate resource type values".
 ///
-/// Resolving a wildcard needs the EC2 instance-type catalog, which this emulator does not
-/// hold, so the effective list is reported only for an include list that carries no
-/// wildcard — where resolution is the identity — and is omitted rather than invented when
-/// one does.
+/// A value that is no wildcard expands to itself, and so does the catch-all
+/// [`INCLUDE_EVERY_RESOURCE_TYPE`], which already names every candidate. Expanding a
+/// NARROWER wildcard (`m5*`) needs the EC2 instance-type catalog, which this emulator does
+/// not hold, so the effective list is omitted rather than invented for one of those.
 pub fn effective_preferred_resource(resource: &PreferredResource) -> EffectivePreferredResource {
     let include_list = resource.include_list.clone();
     let effective_include_list = include_list
         .as_ref()
-        .filter(|values| values.iter().all(|value| !value.contains('*')))
+        .filter(|values| {
+            values
+                .iter()
+                .all(|value| value == INCLUDE_EVERY_RESOURCE_TYPE || !value.contains('*'))
+        })
         .cloned();
     EffectivePreferredResource {
         name: resource.name.clone(),
@@ -270,6 +276,59 @@ pub fn effective_preferred_resource(resource: &PreferredResource) -> EffectivePr
         effective_include_list,
         exclude_list: resource.exclude_list.clone(),
     }
+}
+
+/// The only `PreferredResourceName` the service supports: "Compute Optimizer only supports
+/// the customization of `Ec2InstanceTypes`" (`PreferredResource$name`).
+pub const PREFERRED_RESOURCE_NAME_EC2_INSTANCE_TYPES: &str = "Ec2InstanceTypes";
+
+/// The wildcard expression that includes every candidate resource type, i.e. the state
+/// `PreferredResource$excludeList` describes when no preference narrows the candidates: "if
+/// this isn't specified, all supported resources are included by default".
+pub const INCLUDE_EVERY_RESOURCE_TYPE: &str = "*";
+
+/// The `CustomizableMetricName` values, from the model's enum of the same name.
+pub const METRIC_CPU_UTILIZATION: &str = "CpuUtilization";
+/// See [`METRIC_CPU_UTILIZATION`].
+pub const METRIC_MEMORY_UTILIZATION: &str = "MemoryUtilization";
+
+/// The utilization preferences in force when no preference sets them, from the model's own
+/// `PutRecommendationPreferences$utilizationPreferences` documentation: "When this
+/// preference isn't specified, we use the following default values. CPU utilization:
+/// `P99_5` for threshold, `PERCENT_20` for headroom. Memory utilization: `PERCENT_20` for
+/// headroom." The threshold setting "isn't available for memory utilization", so the memory
+/// entry carries headroom only.
+pub fn default_utilization_preferences() -> Vec<UtilizationPreference> {
+    vec![
+        UtilizationPreference {
+            metric_name: Some(METRIC_CPU_UTILIZATION.to_string()),
+            metric_parameters: Some(CustomizableMetricParameters {
+                threshold: Some("P99_5".to_string()),
+                headroom: Some("PERCENT_20".to_string()),
+            }),
+        },
+        UtilizationPreference {
+            metric_name: Some(METRIC_MEMORY_UTILIZATION.to_string()),
+            metric_parameters: Some(CustomizableMetricParameters {
+                threshold: None,
+                headroom: Some("PERCENT_20".to_string()),
+            }),
+        },
+    ]
+}
+
+/// The preferred resources in force when no preference sets them: the one list name the
+/// service supports, including every candidate resource type and excluding none, because
+/// `PreferredResource$excludeList` documents that "if this isn't specified, all supported
+/// resources are included by default". Projected through
+/// [`effective_preferred_resource`], so the reported `effectiveIncludeList` is the
+/// expansion of that include list and not a second statement of it.
+pub fn default_preferred_resources() -> Vec<EffectivePreferredResource> {
+    vec![effective_preferred_resource(&PreferredResource {
+        name: Some(PREFERRED_RESOURCE_NAME_EC2_INSTANCE_TYPES.to_string()),
+        include_list: Some(vec![INCLUDE_EVERY_RESOURCE_TYPE.to_string()]),
+        exclude_list: Some(Vec::new()),
+    })]
 }
 
 /// An EC2 instance or Auto Scaling group ARN, split into the parts the preference rules

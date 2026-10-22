@@ -195,6 +195,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Create mints nothing. The cross-member window check above runs first,
         // so a request whose values do not hold together is still answered as
         // the argument error it is.
+        if let Some(message) = crate::state::service_type_refusal(
+            &*self.engine,
+            &input.service_type,
+            &input.identifier,
+        ) {
+            // The `ServiceType` is not the service that owns the data source
+            // this `Identifier` names, so the pair addresses nothing: the
+            // modelled argument error, not an authorization outcome (see
+            // [`crate::state::service_type_refusal`]).
+            return Err(
+                CreatePerformanceAnalysisReportErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         if !crate::state::is_data_source_identifier(&input.identifier) {
             return Err(not_authorized());
         }
@@ -224,14 +242,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.service_type,
             &input.identifier,
             &analysis_report_id,
-        );
-        // The report's tags also go in under its ARN, the handle the
-        // Tag/Untag/ListTagsForResource slice addresses a report by.
-        store.tags_by_arn.insert(
-            resource_arn.clone(),
-            tags.iter()
-                .map(|tag| (tag.key.clone(), tag.value.clone()))
-                .collect(),
         );
         store.insert_report(crate::state::AnalysisReportRecord {
             analysis_report_id: analysis_report_id.clone(),

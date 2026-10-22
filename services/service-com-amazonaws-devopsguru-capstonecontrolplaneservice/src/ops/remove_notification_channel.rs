@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveNotificationChannel
-//! Deletes the stored notification channel with the given id; an id that names no
-//! stored channel — including one already removed — is a `ResourceNotFoundException`.
+//! Deletes the stored notification channel with the given id. IDEMPOTENT — an id that
+//! names no stored channel, including one an earlier call already removed, is a
+//! successful no-op that returns the empty output.
 //!
 //! ## Shape of an operation
 //!
@@ -157,21 +158,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
-        // Deleting is not idempotent here: the channel is gone after the first call, so
-        // the second call names a channel that does not exist.
-        if guard.notification_channels.remove(&input.id).is_none() {
-            return Err(
-                RemoveNotificationChannelErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("no notification channel with id {} exists", input.id),
-                        resource_id: input.id.clone(),
-                        resource_type: crate::state::NOTIFICATION_CHANNEL_RESOURCE_TYPE
-                            .to_string(),
-                    },
-                )
-                .into(),
-            );
-        }
+        // IDEMPOTENT BY TARGET. Removal states that the id names no channel; the first
+        // call establishes that, and for every repeat it already holds. So an id that
+        // names no stored channel is a successful no-op rather than a failure, which is
+        // what lets a teardown path and a retry after an ambiguous network result
+        // converge instead of having to special-case an error.
+        guard.notification_channels.remove(&input.id);
 
         Ok(RemoveNotificationChannelOutput::default())
     }

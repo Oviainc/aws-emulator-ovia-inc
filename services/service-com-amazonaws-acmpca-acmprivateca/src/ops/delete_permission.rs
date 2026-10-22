@@ -206,9 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this emulator reaches accepts one, exactly as a grant does.
         let Some(record) = state.certificate_authority_mut(&arn, ::std::time::SystemTime::now())
         else {
-            return Err(not_found(format!(
-                "the certificate authority {arn} was not found"
-            )));
+            return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
         };
 
         // A permission exists only between its grant and its revocation, so a revocation

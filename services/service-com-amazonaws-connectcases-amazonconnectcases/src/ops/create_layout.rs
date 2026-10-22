@@ -197,31 +197,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model's own words for `name`: "It must be unique for the Cases
         // domain". So a create under a name already taken is refused instead of
-        // shadowing the layout that holds it, as a template name is.
-        if let Some(existing) = domain
+        // shadowing the layout that holds it, as a template name is, with the
+        // service's own conflict template.
+        if domain
             .layouts
             .values()
-            .find(|layout| !layout.deleted && layout.name == input.name)
+            .any(|layout| !layout.deleted && layout.name == input.name)
         {
-            return Err(
-                CreateLayoutErrorModeled::ConflictException(ConflictException {
-                    message: format!(
-                        "a layout named {} already exists in domain {} (layoutId {})",
-                        input.name, input.domain_id, existing.layout_id
-                    ),
-                })
-                .into(),
-            );
+            return Err(CreateLayoutErrorModeled::ConflictException(
+                crate::state::name_conflict(crate::state::ResourceKind::Layout, &input.name),
+            )
+            .into());
         }
 
         // Every field id the content references is resolved against the domain
         // BEFORE anything is stored, so a layout never records a reference that
         // cannot be followed: a layout naming a non-existent fieldId is a
         // `ValidationException`. The documented refusal of the Title and Status
-        // fields ("they are not configurable") is subsumed by this check: a
-        // domain in this emulator holds only the Custom fields `CreateField`
-        // stored, so there is no System field to name.
+        // fields ("they are not configurable") is its own check, since the
+        // domain's schema DOES hold those reserved System fields.
         let referenced = crate::state::layout_field_ids(&input.content);
+        let not_configurable =
+            crate::state::not_configurable_in_a_layout(referenced.iter().map(String::as_str));
+        if !not_configurable.is_empty() {
+            return Err(
+                CreateLayoutErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "content names field ids that cannot be part of a layout because they \
+                         are not configurable: {}",
+                        crate::state::name_ids(&not_configurable)
+                    ),
+                })
+                .into(),
+            );
+        }
         let unknown = domain.unknown_field_ids(referenced.iter().map(String::as_str));
         if !unknown.is_empty() {
             return Err(

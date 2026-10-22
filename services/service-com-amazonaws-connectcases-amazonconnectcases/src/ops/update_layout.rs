@@ -214,27 +214,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rule the create path applies. Renaming a layout to the name it
         // already has is not a conflict with itself.
         if let Some(name) = input.name.as_deref() {
-            if let Some(existing) = domain.layouts.values().find(|layout| {
+            if domain.layouts.values().any(|layout| {
                 !layout.deleted && layout.name == name && layout.layout_id != input.layout_id
             }) {
-                return Err(
-                    UpdateLayoutErrorModeled::ConflictException(ConflictException {
-                        message: format!(
-                            "a layout named {} already exists in domain {} (layoutId {})",
-                            name, input.domain_id, existing.layout_id
-                        ),
-                    })
-                    .into(),
-                );
+                return Err(UpdateLayoutErrorModeled::ConflictException(
+                    crate::state::name_conflict(crate::state::ResourceKind::Layout, name),
+                )
+                .into());
             }
         }
 
         // Every field id the new content references is resolved against the
         // domain BEFORE anything is written, as on the create path: "A
         // ValidationException is returned when you add non-existent fieldIds to
-        // a layout."
+        // a layout." The reserved fields a layout may not place are refused
+        // here too, for the same reason the create path refuses them.
         if let Some(content) = input.content.as_ref() {
             let referenced = crate::state::layout_field_ids(content);
+            let not_configurable =
+                crate::state::not_configurable_in_a_layout(referenced.iter().map(String::as_str));
+            if !not_configurable.is_empty() {
+                return Err(
+                    UpdateLayoutErrorModeled::ValidationException(ValidationException {
+                        message: format!(
+                            "content names field ids that cannot be part of a layout because \
+                             they are not configurable: {}",
+                            crate::state::name_ids(&not_configurable)
+                        ),
+                    })
+                    .into(),
+                );
+            }
             let unknown = domain.unknown_field_ids(referenced.iter().map(String::as_str));
             if !unknown.is_empty() {
                 return Err(
