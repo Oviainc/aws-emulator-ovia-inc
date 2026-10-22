@@ -240,7 +240,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::time::SystemTime::now(),
         );
 
-        let guard = state.lock();
+        let mut guard = state.lock();
+        // Before reporting, materialise the status transitions the clock has
+        // already made due, so this reader and `GetAutomationEvent` agree on
+        // every event's status and a status filter selects on the current one.
+        guard.events.settle_due(::std::time::SystemTime::now());
         let matching: Vec<AutomationEvent> = guard
             .events
             .iter_in_order()

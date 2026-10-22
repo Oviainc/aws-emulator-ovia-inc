@@ -18,7 +18,8 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     AutomationEvent, AutomationEventFilter, AutomationRule, Criteria, EstimatedMonthlySavings,
-    Filter, OrganizationConfiguration, Schedule, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES,
+    Filter, OrganizationConfiguration, RecommendedAction, Schedule, Tag,
+    AUTOMATION_EVENT_FILTER_NAME_VALUES,
 };
 
 /// The ARN namespace this service stamps on a rule ARN, from the model's
@@ -42,9 +43,39 @@ pub const DEFAULT_ENROLLMENT_STATUS: &str = "Inactive";
 /// the largest page a caller may ask for is also the default.
 pub const DEFAULT_MAX_RESULTS: i32 = 100;
 
-/// The number of `ruleId` characters, from the `RuleId` pattern
-/// `^[0-9A-Za-z]{16}$`.
-const RULE_ID_LEN: usize = 16;
+/// The number of characters in a minted id. `RuleId`, `EventId` and
+/// `RecommendedActionId` all share the pattern `^[0-9A-Za-z]{16}$`, so one
+/// length serves all three
+/// (`smithy_query(query="shape",shape="RuleId,EventId,RecommendedActionId")`).
+const MINTED_ID_LEN: usize = 16;
+
+/// The status an automation event carries while its automation is running, one
+/// of the model's `EventStatus` values
+/// (`smithy_query(query="shape",shape="EventStatus")`). `StartAutomationEvent`
+/// accepted the request, so the event it mints is not yet terminal.
+pub const EVENT_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// The modelled `EventStatus` an automation event that did not complete carries.
+pub const EVENT_STATUS_FAILED: &str = "Failed";
+
+/// Why an automation event this emulator started never completes.
+///
+/// Automating a recommended action means changing the referenced resource (take
+/// a snapshot and delete an EBS volume, change a volume's type). This emulator
+/// performs no such work, so the event it starts is not reported as `Complete`:
+/// it reaches the modelled failure status carrying this reason, and never claims
+/// an automation that nothing ran.
+pub const EVENT_UNPERFORMED_REASON: &str =
+    "The automation was not performed: this emulator does not change the resources a \
+     recommended action applies to.";
+
+/// How long after the start call an automation event's terminal status is due.
+///
+/// CHOSEN span: neither the model nor the operation docs give how long an
+/// automation takes. It is non-zero so a caller that reads the event straight
+/// after starting it still sees the transient `InProgress` status, and short
+/// enough that a test need not wait long for the terminal one.
+pub const EVENT_SETTLEMENT_DELAY: Duration = Duration::from_millis(500);
 
 /// How far back an automation event stays reportable. `ListAutomationEvents`
 /// documents "You can retrieve events that were created within the past year"
@@ -94,6 +125,61 @@ pub fn caller_account_id() -> String {
 /// `RuleArn` pattern requires.
 pub fn rule_arn(rule_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, "", &format!("automation-rule/{rule_id}"))
+}
+
+/// Does `candidate` name an automation rule of this service at all?
+///
+/// The form is the model's `RuleArn`
+/// (`^arn:aws:compute-optimizer::[0-9]{12}:automation-rule/[a-zA-Z0-9_-]+$`,
+/// from `smithy_query(query="shape",shape="RuleArn")`): the service's own ARN
+/// namespace, an EMPTY region segment, a 12-digit account and the
+/// `automation-rule/<ruleId>` resource. A string that does not have it names no
+/// resource of this service, whether or not a rule with that ARN exists.
+///
+/// Checked by hand rather than with a regex engine: the pattern is a fixed
+/// prefix plus two character classes, and this runs on the dispatch path.
+pub fn names_automation_rule(candidate: &str) -> bool {
+    let Some(rest) = candidate
+        .strip_prefix("arn:aws:")
+        .and_then(|rest| rest.strip_prefix(ARN_NAMESPACE))
+        .and_then(|rest| rest.strip_prefix("::"))
+    else {
+        return false;
+    };
+    let Some((account_id, resource)) = rest.split_once(':') else {
+        return false;
+    };
+    if account_id.len() != 12 || !account_id.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some(rule_id) = resource.strip_prefix("automation-rule/") else {
+        return false;
+    };
+    !rule_id.is_empty()
+        && rule_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Is `key` the form the model's `TagKey` declares?
+///
+/// `TagKeyList`'s member targets a plain `String`
+/// (`smithy_query(query="shape",shape="TagKeyList,TagKey")`), so the boundary
+/// validator checks nothing for a key sent to `UntagResource` — but a tag key of
+/// this service is a `TagKey`, which carries `@length(min: 1, max: 128)` and
+/// `@pattern ^[\w\s\.\-\:\/\=\+\@]+$`, so that is the form checked here. `\w` is
+/// `[A-Za-z0-9_]` plus the Unicode word characters `char::is_alphanumeric`
+/// covers.
+pub fn tag_key_is_valid(key: &str) -> bool {
+    let length = key.chars().count();
+    if !(1..=128).contains(&length) {
+        return false;
+    }
+    key.chars().all(|c| {
+        c.is_alphanumeric()
+            || c.is_whitespace()
+            || matches!(c, '_' | '.' | '-' | ':' | '/' | '=' | '+' | '@')
+    })
 }
 
 /// Now, as the wire timestamp type. The ONE clock the handlers read, so a stored
@@ -418,9 +504,30 @@ pub struct StoredEvent {
     pub created_timestamp: ::aws_smithy_types::DateTime,
     pub completed_timestamp: Option<::aws_smithy_types::DateTime>,
     pub estimated_monthly_savings: Option<EstimatedMonthlySavings>,
+    /// When this event's terminal status falls due, or `None` when it owes no
+    /// transition (it is already terminal). Stored as an instant rather than
+    /// slept for, so no handler blocks on it.
+    pub settles_at: Option<SystemTime>,
 }
 
 impl StoredEvent {
+    /// Materialise the status the clock has already made due.
+    ///
+    /// The transition was owed at `settles_at` whether or not anybody called, so
+    /// applying it on a read reports what the event already is rather than
+    /// advancing it because it was read. A no-op before the due instant and
+    /// after the event has settled.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.settles_at else { return };
+        if now < due {
+            return;
+        }
+        self.event_status = EVENT_STATUS_FAILED.to_string();
+        self.event_status_reason = Some(EVENT_UNPERFORMED_REASON.to_string());
+        self.completed_timestamp = Some(::aws_smithy_types::DateTime::from(due));
+        self.settles_at = None;
+    }
+
     /// This event as the `AutomationEvent` the list and get operations return.
     pub fn to_automation_event(&self) -> AutomationEvent {
         AutomationEvent {
@@ -474,6 +581,67 @@ impl EventStore {
     /// Every stored event, in creation order.
     pub fn iter_in_order(&self) -> impl Iterator<Item = &StoredEvent> {
         self.order.iter().filter_map(|id| self.by_id.get(id))
+    }
+
+    /// The event an `eventId` names, which is how every event-scoped operation
+    /// reaches one.
+    pub fn get(&self, event_id: &str) -> Option<&StoredEvent> {
+        self.by_id.get(event_id)
+    }
+
+    /// As [`get`](Self::get), for a caller that has to materialise the status
+    /// the clock owes the event (see [`StoredEvent::settle`]).
+    pub fn get_mut(&mut self, event_id: &str) -> Option<&mut StoredEvent> {
+        self.by_id.get_mut(event_id)
+    }
+
+    /// Materialise every status transition the clock has already made due, so
+    /// each reader of this store reports the same status for an event (see
+    /// [`StoredEvent::settle`]). A no-op for an event that owes none.
+    pub fn settle_due(&mut self, now: SystemTime) {
+        for event in self.by_id.values_mut() {
+            event.settle(now);
+        }
+    }
+
+    pub fn contains(&self, event_id: &str) -> bool {
+        self.by_id.contains_key(event_id)
+    }
+}
+
+/// A newly started automation event for `action`, owned by `account_id`.
+///
+/// The event is built from the stored recommended action — never from the
+/// request — and starts in the non-terminal [`EVENT_STATUS_IN_PROGRESS`] with
+/// its terminal status due [`EVENT_SETTLEMENT_DELAY`] later.
+pub fn event_for_action(
+    event_id: String,
+    action: &RecommendedAction,
+    account_id: String,
+    started_at: SystemTime,
+) -> StoredEvent {
+    StoredEvent {
+        event_id,
+        event_description: None,
+        // `EventType` and `RecommendedActionType` carry the same value set, and
+        // the event automates exactly this action
+        // (`smithy_query(query="shape",shape="EventType,RecommendedActionType")`).
+        event_type: action.recommended_action_type.clone().unwrap_or_default(),
+        event_status: EVENT_STATUS_IN_PROGRESS.to_string(),
+        event_status_reason: None,
+        resource_arn: action.resource_arn.clone(),
+        resource_id: action.resource_id.clone(),
+        recommended_action_id: action.recommended_action_id.clone(),
+        account_id,
+        region: action.region.clone(),
+        // The rule whose schedule started the event; an on-demand
+        // `StartAutomationEvent` has none.
+        rule_id: None,
+        resource_type: action.resource_type.clone().unwrap_or_default(),
+        created_timestamp: ::aws_smithy_types::DateTime::from(started_at),
+        completed_timestamp: None,
+        estimated_monthly_savings: action.estimated_monthly_savings.clone(),
+        settles_at: Some(started_at + EVENT_SETTLEMENT_DELAY),
     }
 }
 
@@ -578,6 +746,37 @@ pub enum TokenOutcome {
     TokenInUse,
 }
 
+/// Which resource a client token's first use acted on.
+///
+/// A replay is recomputed from the store through this, so it can never report a
+/// resource that is no longer there — and the two kinds this service mints are
+/// named apart, because an `eventId` is not a rule ARN.
+#[derive(Debug, Clone)]
+pub enum TokenSubject {
+    /// The `ruleArn` of the automation rule the call acted on.
+    Rule(String),
+    /// The `eventId` of the automation event the call started.
+    Event(String),
+}
+
+impl TokenSubject {
+    /// The rule ARN this subject names, or `None` when it names an event.
+    pub fn rule_arn(&self) -> Option<&str> {
+        match self {
+            Self::Rule(rule_arn) => Some(rule_arn),
+            Self::Event(_) => None,
+        }
+    }
+
+    /// The event id this subject names, or `None` when it names a rule.
+    pub fn event_id(&self) -> Option<&str> {
+        match self {
+            Self::Event(event_id) => Some(event_id),
+            Self::Rule(_) => None,
+        }
+    }
+}
+
 /// One entry of the client-token ledger. It records WHICH resource the call
 /// acted on rather than a serialized body, so a replay is recomputed from the
 /// store and can never report a resource that is no longer there.
@@ -585,7 +784,7 @@ pub enum TokenOutcome {
 pub struct IdempotencyRecord {
     pub operation: &'static str,
     pub request_fingerprint: String,
-    pub rule_arn: Option<String>,
+    pub subject: Option<TokenSubject>,
     /// When the token was first used, for the [`IDEMPOTENCY_TTL`] window.
     pub recorded_at: SystemTime,
 }
@@ -600,14 +799,23 @@ pub struct ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationservi
     /// Every automation event, in creation order. Written by the operations
     /// that start and roll back an event; read by the event readers.
     pub events: EventStore,
+    /// The recommended actions this service can automate, by
+    /// `recommendedActionId`.
+    ///
+    /// A recommended action is produced by Compute Optimizer's analysis of the
+    /// account's resources, which this emulator does not perform, so nothing
+    /// populates this map yet and `StartAutomationEvent` resolves every id
+    /// against it — one lookup, one place for a recommendation source
+    /// (`ListRecommendedActions`, still a stub) to write into.
+    pub recommended_actions: HashMap<String, RecommendedAction>,
     /// `clientToken` -> what the call that first used it did. Bounded by
     /// [`MAX_IDEMPOTENCY_ENTRIES`] and [`IDEMPOTENCY_TTL`].
     pub idempotency: HashMap<String, IdempotencyRecord>,
     /// The tokens in `idempotency`, oldest first, so the ledger can evict.
     idempotency_order: VecDeque<String>,
-    /// Monotonic counter mixed into a minted `ruleId`, so two rules created in
+    /// Monotonic counter mixed into a minted id, so two resources created in
     /// the same nanosecond still get different ids.
-    rule_id_sequence: u64,
+    id_sequence: u64,
 }
 
 impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceState {
@@ -617,22 +825,39 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
         self.enrollments.get(account_id).cloned().unwrap_or_default()
     }
 
-    /// A fresh `ruleId` matching the model's `^[0-9A-Za-z]{16}$`: the leading
-    /// hex of a digest over this store's counter and the current clock, retried
-    /// in the (astronomically unlikely) event of a collision with a live rule.
+    /// A fresh `ruleId` matching the model's `^[0-9A-Za-z]{16}$`, retried in the
+    /// (astronomically unlikely) event of a collision with a live rule.
     pub fn mint_rule_id(&mut self) -> String {
         loop {
-            self.rule_id_sequence += 1;
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default();
-            let digest = Sha256::digest(format!("{}:{nanos}", self.rule_id_sequence).as_bytes());
-            let candidate: String = hex::encode(digest).chars().take(RULE_ID_LEN).collect();
+            let candidate = self.next_id();
             if !self.rules.contains_rule_id(&candidate) {
                 return candidate;
             }
         }
+    }
+
+    /// A fresh `eventId` matching the model's `^[0-9A-Za-z]{16}$`, retried in
+    /// the (astronomically unlikely) event of a collision with a live event.
+    pub fn mint_event_id(&mut self) -> String {
+        loop {
+            let candidate = self.next_id();
+            if !self.events.contains(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// The next candidate id: the leading hex of a digest over this store's
+    /// counter and the current clock. The ONE place an id's characters are
+    /// chosen, so every minted id satisfies the same `^[0-9A-Za-z]{16}$`.
+    fn next_id(&mut self) -> String {
+        self.id_sequence += 1;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let digest = Sha256::digest(format!("{}:{nanos}", self.id_sequence).as_bytes());
+        hex::encode(digest).chars().take(MINTED_ID_LEN).collect()
     }
 
     /// What the ledger says about `token` for `operation` with `request_fingerprint`.
@@ -673,7 +898,7 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
         token: Option<&str>,
         operation: &'static str,
         request_fingerprint: &str,
-        rule_arn: Option<String>,
+        subject: Option<TokenSubject>,
     ) {
         let Some(token) = token else { return };
         let now = SystemTime::now();
@@ -686,7 +911,7 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
                 IdempotencyRecord {
                     operation,
                     request_fingerprint: request_fingerprint.to_string(),
-                    rule_arn,
+                    subject,
                     recorded_at: now,
                 },
             )

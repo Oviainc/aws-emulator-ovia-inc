@@ -134,7 +134,7 @@ pub(crate) fn string_member(body: &Value, name: &str) -> String {
 }
 
 /// `RuleId` is modelled as `^[0-9A-Za-z]{16}$`.
-fn is_rule_id(value: &str) -> bool {
+pub(crate) fn is_rule_id(value: &str) -> bool {
     value.len() == 16 && value.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
@@ -1047,27 +1047,29 @@ async fn delete_is_revision_checked_and_observable() {
     );
 }
 
-/// An ARN that cannot name a rule is refused on its form (400), and a
-/// well-formed ARN no rule has is a 404.
+/// A resource string that names no automation rule of this service is refused
+/// by AUTHORIZATION (403 `AccessDeniedException`) — authorization is evaluated
+/// against the string as supplied, before the service parses it — while a
+/// well-formed ARN no rule has gets as far as the lookup and is a 404.
 #[tokio::test]
-async fn an_arn_is_judged_on_its_form_then_on_whether_it_names_a_rule() {
+async fn an_arn_is_authorized_on_its_form_then_looked_up() {
     let router = emulator();
 
     // (case, ruleArn, expected status)
     let cases = [
-        ("not-an-arn", "my-rule".to_string(), 400u16),
+        ("not-an-arn", "my-rule".to_string(), 403u16),
         (
             "wrong-service-namespace",
             format!(
                 "arn:aws:compute-optimizer-automation::{}:automation-rule/abcdefghij123456",
                 engine::EMULATOR_ACCOUNT_ID
             ),
-            400,
+            403,
         ),
         (
             "account-not-twelve-digits",
             "arn:aws:compute-optimizer::1:automation-rule/abcdefghij123456".to_string(),
-            400,
+            403,
         ),
         (
             "well-formed-but-unknown",
@@ -1080,8 +1082,8 @@ async fn an_arn_is_judged_on_its_form_then_on_whether_it_names_a_rule() {
     ];
 
     for (case, rule_arn, expected_status) in &cases {
-        let expected_code = if *expected_status == 400 {
-            "InvalidParameterValueException"
+        let expected_code = if *expected_status == 403 {
+            "AccessDeniedException"
         } else {
             "ResourceNotFoundException"
         };

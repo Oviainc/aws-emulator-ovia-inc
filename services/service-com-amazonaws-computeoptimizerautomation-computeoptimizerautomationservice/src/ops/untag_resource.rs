@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Removes the named tag keys from the automation rule the ARN
+//! names. A key outside the modelled `TagKey` form is refused with
+//! `InvalidParameterValueException` (400) before anything is removed, a
+//! `ruleRevision` other than the rule's current one is refused the same way, and
+//! an ARN no rule has is `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        // `TagKeyList`'s member targets a plain `String`, so the boundary
+        // validator admitted keys the service's own `TagKey` shape would refuse.
+        // Checked here, BEFORE the store is touched, so a rejected request
+        // removes nothing.
+        if input
+            .tag_keys
+            .iter()
+            .any(|key| !crate::state::tag_key_is_valid(key))
+        {
+            // The requirement is the modelled code and its 400 status; this is
+            // the fixed text the service states a tag-validation rejection
+            // with, and it echoes no caller-supplied key.
+            return Err(invalid_parameter("Tag validation failed".to_string()));
+        }
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+
+        let mut guard = state.lock();
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            // A retry of the same removal: the keys are already gone, which is
+            // the state the first call left. Reported as that first call was.
+            crate::state::TokenOutcome::Replay(_) => {
+                return match guard.rules.get(&input.resource_arn) {
+                    Some(_) => Ok(UntagResourceOutput {}),
+                    None => Err(not_found()),
+                };
+            }
+            crate::state::TokenOutcome::ParameterMismatch => {
+                return Err(
+                    UntagResourceErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::TokenInUse => {
+                return Err(UntagResourceErrorModeled::IdempotencyTokenInUseException(
+                    IdempotencyTokenInUseException {
+                        message: Some("The specified client token is already in use.".into()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(rule) = guard.rules.get(&input.resource_arn) else {
+            return Err(not_found());
+        };
+        // "This ensures you're untagging the correct version of the rule": the
+        // revision is the rule's optimistic-concurrency token, so a request
+        // carrying another one is refused rather than applied to whatever the
+        // rule has become. The rejection states the CURRENT revision, which is
+        // what a caller needs to re-read and retry.
+        if rule.rule_revision != input.rule_revision {
+            return Err(invalid_parameter(crate::state::revision_mismatch_message(
+                rule.rule_revision,
+            )));
+        }
+
+        let Some(rule) = guard.rules.get_mut(&input.resource_arn) else {
+            return Err(not_found());
+        };
+        // Remove exactly the keys named; a key the rule does not carry leaves
+        // the rule as it is, so the same request may be repeated (the operation
+        // is modelled `@idempotent`). For the same reason the removal does not
+        // advance `ruleRevision`: a repeat would then fail the check above.
+        rule.tags.retain(|tag| !input.tag_keys.contains(&tag.key));
+
+        guard.record_token(
+            client_token,
+            Self::NAME,
+            &request_fingerprint,
+            Some(crate::state::TokenSubject::Rule(input.resource_arn.clone())),
+        );
+
+        Ok(UntagResourceOutput {})
     }
+}
+
+/// The modelled 404 (`ResourceNotFoundException`, HTTP 404), worded with this
+/// service's fixed not-found text, which names no resource.
+fn not_found() -> UntagResourceError {
+    UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.into()),
+    })
+    .into()
+}
+
+/// The modelled 400 for a parameter value this operation refuses.
+fn invalid_parameter(message: String) -> UntagResourceError {
+    UntagResourceErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
 }

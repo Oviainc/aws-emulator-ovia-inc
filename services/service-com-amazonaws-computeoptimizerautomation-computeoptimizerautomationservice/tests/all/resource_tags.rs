@@ -208,9 +208,10 @@ async fn an_update_that_names_no_tags_leaves_the_tag_list_alone() {
 }
 
 /// A `resourceArn` no resource has is the modelled `ResourceNotFoundException`
-/// (404), and one that does not satisfy the modelled `RuleArn` pattern is refused
-/// at the boundary with `InvalidParameterValueException` (400). Neither answers
-/// 501: the operation is implemented.
+/// (404), while a string that names no automation rule of this service at all is
+/// refused by authorization with the modelled `AccessDeniedException` (403) —
+/// authorization is evaluated against the supplied resource string before the
+/// service parses it. Neither answers 501: the operation is implemented.
 #[tokio::test]
 async fn an_unknown_or_malformed_resource_arn_is_refused() {
     let router = emulator();
@@ -262,8 +263,8 @@ async fn an_unknown_or_malformed_resource_arn_is_refused() {
         (
             "not-an-arn",
             "automation-rule/aaaaaaaaaaaaaaaa".to_string(),
-            400,
-            "InvalidParameterValueException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "wrong-arn-service",
@@ -271,14 +272,14 @@ async fn an_unknown_or_malformed_resource_arn_is_refused() {
                 "arn:aws:compute-optimiser::{}:automation-rule/aaaaaaaaaaaaaaaa",
                 engine::EMULATOR_ACCOUNT_ID
             ),
-            400,
-            "InvalidParameterValueException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "arn-with-an-account-that-is-not-12-digits",
             "arn:aws:compute-optimizer::12345:automation-rule/aaaaaaaaaaaaaaaa".to_string(),
-            400,
-            "InvalidParameterValueException",
+            403,
+            "AccessDeniedException",
         ),
     ];
 
