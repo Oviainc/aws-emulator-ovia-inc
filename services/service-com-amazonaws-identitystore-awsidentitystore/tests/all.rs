@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/get_group_id.rs"]
 mod get_group_id;
+#[path = "all/group_membership_lookup.rs"]
+mod group_membership_lookup;
 #[path = "all/identity_store_lifecycle.rs"]
 mod identity_store_lifecycle;
 #[path = "all/state_roundtrip.rs"]
