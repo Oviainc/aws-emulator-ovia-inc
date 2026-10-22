@@ -21,6 +21,11 @@
 //! those ARNs are well formed. The partition, the vendor and the resource are not:
 //! an ARN that names no resource, or no vendor, addresses nothing.
 //!
+//! [`region_of`] is the one reader with a grammar of its own: a service that resolves a
+//! caller-supplied ARN against the vendor's endpoint in the ARN's own Region puts that
+//! label in a URL, so it is read under the Region grammar the models state rather than
+//! as the arbitrary text [`Arn::region`] reports.
+//!
 //! `service-com-amazonaws-emrserverless-awstoledowebservice/src/service.rs` still
 //! carries its own copy of this parse (as `arn_vendor`), inlined before this module
 //! existed and pinned by that service's own refusal-wording suite; it is to be
@@ -115,9 +120,41 @@ pub fn parse_of<'a>(value: &'a str, expected: &str) -> Option<Arn<'a>> {
     parse(value).filter(|arn| arn.vendor == expected)
 }
 
+/// The longest Region label this parse will report.
+///
+/// Every `*Arn` pattern in the AWS models bounds the Region field at `[a-z0-9-]{1,20}`,
+/// so a longer label is not a Region any AWS endpoint has.
+const MAX_REGION_LENGTH: usize = 20;
+
+/// The REGION of `value` when it is a well-formed resource ARN of `expected_vendor` AND
+/// that field is a Region LABEL rather than arbitrary text.
+///
+/// For a service that has to ACT on a caller-supplied ARN's Region — reaching the
+/// vendor's endpoint in that Region to resolve the resource the ARN names. A Region read
+/// for that is not just data: it ends up in an endpoint URL's authority, so this is
+/// stricter than [`Arn::region`], which reports the field as submitted. The label must
+/// be non-empty, at most [`MAX_REGION_LENGTH`] characters, and composed only of
+/// `[a-z0-9-]` — the grammar every model's ARN pattern states for it — so a value
+/// carrying `/`, `@`, `:`, `?` or `#` (which would re-point or truncate an authority) is
+/// reported as no Region at all and the caller falls back to its own default.
+///
+/// `None` therefore means "this value names no Region of that vendor", which covers a
+/// value that is not an ARN, an ARN of another vendor, a partition-global ARN whose
+/// Region field is empty, and a Region field outside the grammar.
+#[must_use]
+pub fn region_of<'value>(value: &'value str, expected_vendor: &str) -> Option<&'value str> {
+    let region = parse_of(value, expected_vendor)?.region;
+    let well_formed = !region.is_empty()
+        && region.len() <= MAX_REGION_LENGTH
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    well_formed.then_some(region)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_resource_arn_of, parse, parse_of, vendor};
+    use super::{is_resource_arn_of, parse, parse_of, region_of, vendor};
 
     /// The vendor field is read from the third position, whatever the resource
     /// field's own shape, and only from a value that carries all six fields.
@@ -206,6 +243,92 @@ mod tests {
             !is_resource_arn_of("dp-1", "aws-marketplace"),
             "a value that is not an ARN is nobody's resource ARN"
         );
+    }
+
+    /// The Region a service may ACT on: read only from an ARN of the vendor asked
+    /// about, and only when the field is a Region label rather than arbitrary text —
+    /// because the caller puts it in an endpoint URL's authority.
+    #[test]
+    fn the_region_is_read_only_from_a_well_formed_label() {
+        // (case, value, vendor asked about, the Region the parse must report)
+        let rows: &[(&str, &str, &str, Option<&str>)] = &[
+            (
+                "its own vendor",
+                "arn:aws:lambda:us-east-1:000000000000:function:tools",
+                "lambda",
+                Some("us-east-1"),
+            ),
+            (
+                "a Region of another partition",
+                "arn:aws-cn:lambda:cn-north-1:000000000000:function:tools",
+                "lambda",
+                Some("cn-north-1"),
+            ),
+            (
+                "a GovCloud Region, at the published length",
+                "arn:aws-us-gov:lambda:us-gov-west-1:000000000000:function:tools",
+                "lambda",
+                Some("us-gov-west-1"),
+            ),
+            (
+                "another vendor's ARN",
+                "arn:aws:s3:us-east-1:000000000000:bucket/key",
+                "lambda",
+                None,
+            ),
+            (
+                "a partition-global ARN, whose Region field is empty",
+                "arn:aws:lambda::000000000000:function:tools",
+                "lambda",
+                None,
+            ),
+            (
+                "a Region field carrying a path separator",
+                "arn:aws:lambda:us-east-1/evil.example.com:000000000000:function:tools",
+                "lambda",
+                None,
+            ),
+            (
+                "a Region field carrying userinfo",
+                "arn:aws:lambda:us-east-1@evil.example.com:000000000000:function:tools",
+                "lambda",
+                None,
+            ),
+            (
+                "a Region field carrying a query",
+                "arn:aws:lambda:us-east-1?x=1:000000000000:function:tools",
+                "lambda",
+                None,
+            ),
+            (
+                "a Region field in upper case",
+                "arn:aws:lambda:US-EAST-1:000000000000:function:tools",
+                "lambda",
+                None,
+            ),
+            (
+                "a Region field one character past the published bound",
+                "arn:aws:lambda:us-east-1-us-east-1xy:000000000000:function:tools",
+                "lambda",
+                None,
+            ),
+            (
+                "a Region field exactly at the published bound",
+                "arn:aws:lambda:us-east-1-us-east-1x:000000000000:function:tools",
+                "lambda",
+                Some("us-east-1-us-east-1x"),
+            ),
+            ("not an ARN at all", "my-function", "lambda", None),
+            ("the empty string", "", "lambda", None),
+        ];
+
+        for (case, value, expected_vendor, expected) in rows {
+            let read = region_of(value, expected_vendor);
+            assert_eq!(
+                read, *expected,
+                "case {case:?}: expected region {expected:?}, got {read:?}"
+            );
+        }
     }
 
     /// The five fields a row expects, in the order `parse` reads them: partition,

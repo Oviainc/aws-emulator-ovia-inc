@@ -16,7 +16,7 @@
 //! message changes the commit id — it is simply not byte-identical to the SHA-1 a git
 //! client would compute for the same object.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -100,6 +100,72 @@ pub const MAX_COMMITS_RETAINED: usize = 256;
 /// 6 MB".
 pub const MAX_FOLDER_CONTENT_BYTES: i64 = 6 * 1024 * 1024;
 
+/// How many distinct principals' reactions one comment holds before
+/// `PutCommentReaction` refuses a new one.
+///
+/// CodeCommit documents the per-user half of this limit — "Reactions are limited
+/// to one reaction per user for each individual comment ID" — and this is the
+/// emulator's OWN bound on the number of such users, because the principal a
+/// reaction is keyed by comes from the request's own credential and would
+/// otherwise let one caller grow a comment's reaction map without end. A caller
+/// already holding a reaction always gets to change it; it is only a new
+/// principal past the cap that is refused, with the modelled
+/// `ReactionLimitExceededException`.
+pub const MAX_REACTIONS_PER_COMMENT: usize = 100;
+
+/// The emoji reactions CodeCommit accepts on a comment.
+///
+/// One row per reaction: the form this emulator reports it under (the markdown
+/// shortcode), then every form a caller may send it as — the shortcode aliases
+/// and the emoji character itself. The catalog is the emoji reaction table in the
+/// CodeCommit User Guide, which the model's `reactionValue` documentation links to
+/// (`smithy_query(query="doc",shape="PutCommentReactionInput",member="reactionValue")`).
+pub const REACTION_TABLE: &[(&str, &[&str])] = &[
+    (":thumbsup:", &[":thumbsup:", ":+1:", "\u{1f44d}"]),
+    (":thumbsdown:", &[":thumbsdown:", ":-1:", "\u{1f44e}"]),
+    (":smile:", &[":smile:", "\u{1f604}"]),
+    (":confused:", &[":confused:", "\u{1f615}"]),
+    (":eyes:", &[":eyes:", "\u{1f440}"]),
+    (":heart:", &[":heart:", "\u{2764}"]),
+    (":hooray:", &[":hooray:", ":tada:", "\u{1f389}"]),
+    (":rocket:", &[":rocket:", "\u{1f680}"]),
+];
+
+/// The reaction value that REMOVES the caller's reaction rather than naming one:
+/// "To remove a reaction, provide a value of blank or null. You can also provide
+/// the value of none."
+/// (`smithy_query(query="doc",shape="PutCommentReactionInput",member="reactionValue")`).
+pub const REACTION_NONE: &str = "none";
+
+/// The form this service reports a reaction value under, or `None` when the
+/// reaction table holds no such reaction.
+///
+/// A caller may send a reaction as any of the forms the table lists, so the value
+/// is first reduced to one comparable form: trimmed, lowercased, and with the
+/// Unicode variation selector an emoji may carry (U+FE0F) removed, so `"❤️"` and
+/// `"❤"` are the one reaction the table lists.
+pub fn canonical_reaction(value: &str) -> Option<&'static str> {
+    let normalized: String = value
+        .trim()
+        .chars()
+        .filter(|character| *character != '\u{fe0f}')
+        .flat_map(char::to_lowercase)
+        .collect();
+    REACTION_TABLE.iter().find_map(|(canonical, forms)| {
+        forms
+            .iter()
+            .any(|form| *form == normalized)
+            .then_some(*canonical)
+    })
+}
+
+/// Does this reaction value ask for the caller's reaction to be REMOVED rather
+/// than naming one? Blank, or the documented value `none`.
+pub fn is_reaction_removal(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case(REACTION_NONE)
+}
+
 /// Per-service state for com-amazonaws-codecommit-codecommit-20150413. A handler reaches it through [`service_state`].
 ///
 /// Bounded on every axis a caller drives: at most [`REPOSITORY_QUOTA`]
@@ -110,6 +176,27 @@ pub const MAX_FOLDER_CONTENT_BYTES: i64 = 6 * 1024 * 1024;
 pub struct ComAmazonawsCodecommitCodecommit20150413State {
     /// Live repositories, keyed by `repositoryName` (unique per account).
     pub repositories: BTreeMap<String, Repository>,
+}
+
+impl ComAmazonawsCodecommitCodecommit20150413State {
+    /// The comment this `commentId` names, wherever it was posted.
+    ///
+    /// A comment id is addressable on its own — `GetComment` takes nothing else —
+    /// while a comment's lifetime is its repository's, so the comments live on the
+    /// repository that holds them and are found through this one lookup rather
+    /// than through a second index that could disagree with it.
+    pub fn comment(&self, comment_id: &str) -> Option<&CommentRecord> {
+        self.repositories
+            .values()
+            .find_map(|repository| repository.comments.get(comment_id))
+    }
+
+    /// The same lookup, for a caller that goes on to modify the comment.
+    pub fn comment_mut(&mut self, comment_id: &str) -> Option<&mut CommentRecord> {
+        self.repositories
+            .values_mut()
+            .find_map(|repository| repository.comments.get_mut(comment_id))
+    }
 }
 
 /// One repository and everything reachable from it.
@@ -224,6 +311,11 @@ pub struct ComparedCommit {
 pub struct CommentRecord {
     pub comment_id: String,
     pub content: String,
+    /// The content the comment was POSTED with, which an idempotency token is
+    /// judged against: a token replay repeats the request the token was first
+    /// accepted for, so a later edit of the comment must not turn that replay
+    /// into a parameter mismatch.
+    pub posted_content: String,
     /// The comment this one replies to; `None` for the root of a thread.
     pub in_reply_to: Option<String>,
     pub creation_date: SystemTime,
@@ -233,6 +325,12 @@ pub struct CommentRecord {
     pub client_request_token: Option<String>,
     pub comparison: ComparedCommit,
     pub location: Option<Location>,
+    /// The emoji reactions left on this comment, keyed by the ARN of the
+    /// principal that left each one, so a principal holds at most one reaction
+    /// per comment ("Reactions are limited to one reaction per user for each
+    /// individual comment ID") and `callerReactions` is that principal's own
+    /// entry. Bounded by [`MAX_REACTIONS_PER_COMMENT`] principals.
+    pub reactions: BTreeMap<String, String>,
     /// Post order within the repository: the lowest sequence is the oldest
     /// comment, and that is the order comments are reported in.
     pub sequence: u64,
@@ -243,6 +341,23 @@ impl CommentRecord {
     /// projection is written, so `PostCommentForComparedCommit` and
     /// `GetCommentsForComparedCommit` cannot disagree about a stored comment.
     pub fn comment(&self) -> Comment {
+        self.comment_for(None)
+    }
+
+    /// The same projection for a NAMED caller: `callerReactions` is that
+    /// principal's own reaction, which is the one member of a comment that
+    /// depends on who is asking.
+    pub fn comment_as(&self, caller_arn: &str) -> Comment {
+        self.comment_for(Some(caller_arn))
+    }
+
+    fn comment_for(&self, caller_arn: Option<&str>) -> Comment {
+        // `reactionCounts` is how many principals hold each reaction, counted
+        // from the stored map rather than tallied anywhere else.
+        let mut reaction_counts: HashMap<String, i32> = HashMap::new();
+        for reaction in self.reactions.values() {
+            *reaction_counts.entry(reaction.clone()).or_insert(0) += 1;
+        }
         Comment {
             comment_id: Some(self.comment_id.clone()),
             // A deleted comment keeps its record but reports no content, which is
@@ -254,9 +369,10 @@ impl CommentRecord {
             author_arn: Some(self.author_arn.clone()),
             deleted: self.deleted,
             client_request_token: self.client_request_token.clone(),
-            // Reactions belong to `PutCommentReaction`, which stores none yet.
-            caller_reactions: None,
-            reaction_counts: None,
+            caller_reactions: caller_arn
+                .and_then(|caller_arn| self.reactions.get(caller_arn))
+                .map(|reaction| vec![reaction.clone()]),
+            reaction_counts: (!reaction_counts.is_empty()).then_some(reaction_counts),
         }
     }
 }
@@ -435,6 +551,43 @@ fn repository_id(name: &str, created: SystemTime) -> String {
     ))
 }
 
+/// Is this a syntactically valid comment id — the canonical 8-4-4-4-12 textual
+/// form of the UUID this service mints a comment id as?
+pub fn is_comment_id(candidate: &str) -> bool {
+    let groups: Vec<&str> = candidate.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(group, width)| {
+                group.len() == width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+}
+
+/// Why a `commentId` cannot name a comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentIdProblem {
+    /// The id is absent or blank: the operations model `CommentIdRequiredException`
+    /// for this.
+    Missing,
+    /// The id is not the form a comment id takes: `InvalidCommentIdException`.
+    Invalid,
+}
+
+/// The comment id a request names, with surrounding space removed, or why it
+/// names none. Every operation that takes a `commentId` classifies it here, so
+/// they cannot disagree about which ids are addressable.
+pub fn normalize_comment_id(raw: &str) -> Result<&str, CommentIdProblem> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CommentIdProblem::Missing);
+    }
+    if !is_comment_id(trimmed) {
+        return Err(CommentIdProblem::Invalid);
+    }
+    Ok(trimmed)
+}
+
 /// A comment's opaque `commentId`: the same kind of version-8 UUID, over the
 /// account, the repository, the comment's post order and the instant it was
 /// posted. It is therefore stable for the life of the comment and distinct from
@@ -459,8 +612,7 @@ fn uuid_v8(seed: &str) -> String {
     let digest = Sha256::digest(seed.as_bytes());
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
-    // Version 8 in the version nibble, and the RFC's variant bits, so the value is a
-    // well-formed UUID rather than a hex string shaped like one.
+    // Version 8 in the version nibble, and the RFC's variant bits.
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex = ::hex::encode(bytes);
