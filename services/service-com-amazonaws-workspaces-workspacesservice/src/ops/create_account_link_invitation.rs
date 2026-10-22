@@ -7,6 +7,12 @@
 //! call. The records live in [`crate::state`], which the other five
 //! account-link operations read and write too.
 //!
+//! A well-formed `TargetAccountId` is only the first gate: the account it names
+//! has to EXIST in the caller's parent organization, so the store resolves it
+//! against the accounts this emulator holds ([`crate::state::ComAmazonawsWorkspacesWorkspacesserviceState::organization_accounts`])
+//! and refuses an id that names none of them with `AccessDeniedException`,
+//! persisting nothing.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -108,7 +114,9 @@ impl From<CreateAccountLinkInvitationErrorModeled> for CreateAccountLinkInvitati
 
 /// Lift a store refusal into this operation's modelled errors.
 ///
-/// Each kind maps to the shape the model declares for it: an invalid request to
+/// Each kind maps to the shape the model declares for it: a target account that
+/// exists in no organization the caller belongs to to `AccessDeniedException`
+/// ("The user is not authorized to access a resource"), an invalid request to
 /// `ValidationException` ("You either haven't provided a `TargetAccountId` or are
 /// using the same value for `TargetAccountId` and `SourceAccountId`"), and a
 /// target account that is already linked or invited to `ConflictException`
@@ -118,6 +126,11 @@ fn account_link_error(
 ) -> CreateAccountLinkInvitationError {
     use crate::state::AccountLinkFailure;
     match failure {
+        AccountLinkFailure::AccessDenied(message) => {
+            CreateAccountLinkInvitationErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(message),
+            })
+        }
         AccountLinkFailure::Conflict(message) => {
             CreateAccountLinkInvitationErrorModeled::ConflictException(ConflictException {
                 message: Some(message),

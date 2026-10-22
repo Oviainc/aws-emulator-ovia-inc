@@ -112,13 +112,19 @@ impl From<RejectAccountLinkInvitationErrorModeled> for RejectAccountLinkInvitati
 /// Each kind maps to the shape the model declares for it: a link identifier that
 /// names no stored link to `ResourceNotFoundException` (which carries the
 /// identifier in its `ResourceId` member), a link whose current status forbids
-/// the change to `ConflictException`, and an invalid request to
-/// `ValidationException`.
+/// the change to `ConflictException`, an invalid request to
+/// `ValidationException`, and an account the caller may not act on to
+/// `AccessDeniedException`.
 fn account_link_error(
     failure: crate::state::AccountLinkFailure,
 ) -> RejectAccountLinkInvitationError {
     use crate::state::AccountLinkFailure;
     match failure {
+        AccountLinkFailure::AccessDenied(message) => {
+            RejectAccountLinkInvitationErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(message),
+            })
+        }
         AccountLinkFailure::Validation(message) => {
             RejectAccountLinkInvitationErrorModeled::ValidationException(ValidationException {
                 message: Some(message),

@@ -114,13 +114,19 @@ impl From<DeleteAccountLinkInvitationErrorModeled> for DeleteAccountLinkInvitati
 /// Each kind maps to the shape the model declares for it: a link identifier that
 /// names no stored link to `ResourceNotFoundException` (which carries the
 /// identifier in its `ResourceId` member), a link whose current status forbids
-/// the deletion to `ConflictException`, and an invalid request to
-/// `ValidationException`.
+/// the deletion to `ConflictException`, an invalid request to
+/// `ValidationException`, and an account the caller may not act on to
+/// `AccessDeniedException`.
 fn account_link_error(
     failure: crate::state::AccountLinkFailure,
 ) -> DeleteAccountLinkInvitationError {
     use crate::state::AccountLinkFailure;
     match failure {
+        AccountLinkFailure::AccessDenied(message) => {
+            DeleteAccountLinkInvitationErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(message),
+            })
+        }
         AccountLinkFailure::Validation(message) => {
             DeleteAccountLinkInvitationErrorModeled::ValidationException(ValidationException {
                 message: Some(message),

@@ -34,7 +34,7 @@
 //! bundle catalog it starts empty — a directory exists in WorkSpaces only once
 //! it has been registered.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
@@ -700,6 +700,16 @@ impl ConnectionAliasRecord {
 /// a request without one cannot be served a larger page either.
 pub const DEFAULT_ACCOUNT_LINK_PAGE_SIZE: usize = 25;
 
+/// The message an account-link request naming an account that does not exist in
+/// the caller's organization is refused with.
+///
+/// AWS publishes no wording for `AccessDeniedException`; this is the text a
+/// recorded WorkSpaces response carried, kept because it describes the refusal.
+/// What is load-bearing is the error SHAPE (`AccessDeniedException`, HTTP 400)
+/// and that nothing is persisted — not this sentence.
+pub const ACCOUNT_LINK_ACCESS_DENIED_MESSAGE: &str =
+    "Please ensure both accounts to be linked exist and belong to the same parent AWS Organization.";
+
 /// The most account links this emulator stores at once.
 ///
 /// This is the emulator's OWN bound on an in-memory store, not an AWS quota: a
@@ -800,6 +810,15 @@ impl AccountLinkRecord {
     }
 }
 
+/// Whether `value` is a well-formed AWS account id.
+///
+/// The model's `AwsAccount` is `^\d{12}$` (see
+/// `smithy_query(query="shape",shape="AwsAccount")`), which is exactly twelve
+/// ASCII digits.
+fn is_aws_account_id(value: &str) -> bool {
+    value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// The key a connection string occupies in the store.
 ///
 /// A fully qualified domain name is case-insensitive (RFC 4343), so two spellings
@@ -883,6 +902,10 @@ impl WorkspaceBundleRecord {
 /// error enum.
 #[derive(Debug, Clone)]
 pub enum AccountLinkFailure {
+    /// The caller may not link the account the request names, because that
+    /// account does not exist in the caller's organization:
+    /// `AccessDeniedException`.
+    AccessDenied(String),
     /// The request is invalid: `ValidationException`.
     Validation(String),
     /// The link's current state forbids the change, or the target account is
@@ -897,6 +920,12 @@ pub enum AccountLinkFailure {
 }
 
 impl AccountLinkFailure {
+    /// The `AccessDeniedException` for a target account that exists in no
+    /// organization this caller is part of.
+    fn access_denied() -> Self {
+        Self::AccessDenied(ACCOUNT_LINK_ACCESS_DENIED_MESSAGE.to_string())
+    }
+
     /// The `ResourceNotFoundException` for a link identifier that names no
     /// stored link.
     fn not_found(resource_id: &str) -> Self {
@@ -1001,6 +1030,19 @@ pub struct ComAmazonawsWorkspacesWorkspacesserviceState {
     /// Monotonic counter behind both the minted `AccountLinkId` and the
     /// creation order [`Self::ordered_account_links`] reports.
     next_account_link_seq: u64,
+    /// The accounts that EXIST in this emulator's AWS Organization, held sorted
+    /// so [`Self::organization_accounts`] reports a stable order.
+    ///
+    /// An account link can only be created between accounts that exist and
+    /// belong to one parent organization, so this is the set
+    /// [`Self::create_account_link_invitation`] resolves a `TargetAccountId`
+    /// against — a well-formed id that names no account here is refused rather
+    /// than linked. A fresh store holds exactly the emulator's own account (see
+    /// [`Self::default`]): accounts are created by AWS Organizations, not by
+    /// WorkSpaces, so nothing in THIS service's API adds one and
+    /// [`Self::register_organization_account`] — this service's own tests' way
+    /// to state that a second account exists — is its only writer.
+    organization_accounts: BTreeSet<String>,
     /// The account-wide BYOL configuration. Account-scoped, so one value rather
     /// than a map: `ModifyAccount` writes it through [`Self::modify_byol`] and
     /// `DescribeAccount` reads it through [`Self::byol`].
@@ -1037,6 +1079,10 @@ impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
     /// built, which is stable for the life of the emulator.
     ///
     /// BYOL starts off, which is what an account nobody has modified reports.
+    ///
+    /// The organization holds exactly one account — this emulator's own — because
+    /// that is the only account a fresh emulator knows exists; an account link
+    /// can therefore name no other until one is registered.
     fn default() -> Self {
         let mut state = Self {
             workspaces: HashMap::new(),
@@ -1050,6 +1096,7 @@ impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
             account_links: BTreeMap::new(),
             account_link_ids: HashMap::new(),
             next_account_link_seq: 0,
+            organization_accounts: BTreeSet::from([::engine::emulator_account_id().to_string()]),
             byol: AccountByolConfig::default(),
             bundles: BTreeMap::new(),
             bundle_ids: HashMap::new(),
@@ -1591,10 +1638,46 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         })
     }
 
+    /// Every account known to exist in this emulator's organization, in
+    /// ascending id order.
+    pub fn organization_accounts(&self) -> Vec<&str> {
+        self.organization_accounts
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Whether `account_id` names an account that exists in this emulator's
+    /// organization, and so is an account a link may name.
+    pub fn is_organization_account(&self, account_id: &str) -> bool {
+        self.organization_accounts.contains(account_id)
+    }
+
+    /// Record that `account_id` exists in this emulator's organization.
+    ///
+    /// Answers whether the set changed; an id that is not a well-formed AWS
+    /// account id (the model's `AwsAccount` is `^\d{12}$`) names no account and
+    /// is not added. WorkSpaces does not create accounts, so no handler in this
+    /// crate calls this: it is how this service's own tests state that a second
+    /// account exists, the way `RegisterWorkspaceDirectory` states that a
+    /// directory does.
+    pub fn register_organization_account(&mut self, account_id: &str) -> bool {
+        if !is_aws_account_id(account_id) {
+            return false;
+        }
+        self.organization_accounts.insert(account_id.to_string())
+    }
+
     /// Invite `target_account_id` to link with `source_account_id`.
     ///
     /// The invitation is persisted awaiting the target account's own accept or
     /// reject call, which is the status `CreateAccountLinkInvitation` reports.
+    ///
+    /// A link is only creatable between accounts that EXIST and belong to one
+    /// parent organization, so a `TargetAccountId` that names no account in
+    /// [`Self::organization_accounts`] is refused with
+    /// [`AccountLinkFailure::AccessDenied`] and persists nothing — a
+    /// well-formed id is not by itself grounds for a link.
     pub fn create_account_link_invitation(
         &mut self,
         source_account_id: &str,
@@ -1609,6 +1692,16 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
             return Err(AccountLinkFailure::Validation(format!(
                 "TargetAccountId {target_account_id} must not be the same value as SourceAccountId."
             )));
+        }
+
+        // Both accounts have to exist and share one parent organization. The
+        // target is resolved against the accounts this emulator knows exist, so
+        // a well-formed id that names none of them is refused BEFORE anything is
+        // stored, rather than linked on the strength of its format alone.
+        if !self.is_organization_account(target_account_id)
+            || !self.is_organization_account(source_account_id)
+        {
+            return Err(AccountLinkFailure::access_denied());
         }
 
         // `ClientToken` is "a string of up to 64 ASCII characters that Amazon

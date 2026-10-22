@@ -13,13 +13,17 @@
 //! * `CreateAccountLinkInvitation` mints an `AccountLinkId` matching the model's
 //!   `^link-.{8,24}$`, reports the emulator's account as `SourceAccountId` and the
 //!   requested account as `TargetAccountId`, and persists the link awaiting the target
-//!   account's answer.
+//!   account's answer. Every case that creates one first states that its target account
+//!   EXISTS in this emulator's organization, which is the gate
+//!   `account_link_eligibility` is about.
 //! * `GetAccountLink` reports the stored link a `LinkId` or a `LinkedAccountId` names.
 //! * `ListAccountLinks` reports the stored links whose status the request's
 //!   `LinkStatusFilter` names, paginated over a stable creation order.
 //! * `AcceptAccountLinkInvitation`, `RejectAccountLinkInvitation` and
 //!   `DeleteAccountLinkInvitation` move or remove that persisted link, and refuse a
 //!   link whose current status forbids the change.
+
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_workspaces_workspacesservice::state::{
@@ -41,6 +45,29 @@ const MODELLED_STATUSES: &[&str] = &[
 
 /// The status a link carries while it waits for the target account to answer.
 const PENDING: &str = "PENDING_ACCEPTANCE_BY_TARGET_ACCOUNT";
+
+/// State that each of `accounts` EXISTS in this emulator's organization, which is
+/// what makes it an account an invitation may name.
+///
+/// WorkSpaces creates no accounts — AWS Organizations does — so there is no wire
+/// call for this precondition; it is stated through the same state API the
+/// handler resolves a `TargetAccountId` against, the way the store-bound case
+/// below fills the link store directly.
+///
+/// `pub(crate)`: `tests/all.rs` compiles every suite into ONE test crate, so
+/// `account_link_eligibility` shares this rather than copying it.
+pub(crate) fn accounts_exist<S: AsRef<str>>(engine: &Arc<engine::InMemoryEngine>, accounts: &[S]) {
+    let state = service_state(&**engine).expect("the WorkSpaces state store");
+    let mut state = state.lock();
+    for account in accounts {
+        let account = account.as_ref();
+        state.register_organization_account(account);
+        assert!(
+            state.is_organization_account(account),
+            "case {account}: the account must exist in the organization once registered"
+        );
+    }
+}
 
 /// Target accounts spanning the `AwsAccount` pattern `^\d{12}$`: the lowest and
 /// highest twelve-digit values, a leading-zero one, and two arbitrary ones. None
@@ -127,7 +154,9 @@ async fn list_page(
 
 /// Every `AccountLinkId` `ListAccountLinks` reports for `request`, following
 /// `NextToken` to the last page.
-async fn list_all(router: &MultiServiceRouter, request: &Value) -> Vec<String> {
+///
+/// `pub(crate)`: see [`accounts_exist`].
+pub(crate) async fn list_all(router: &MultiServiceRouter, request: &Value) -> Vec<String> {
     let mut page_request = request.clone();
     let mut seen = Vec::new();
     loop {
@@ -144,7 +173,9 @@ async fn list_all(router: &MultiServiceRouter, request: &Value) -> Vec<String> {
 }
 
 /// The wire error code of a refused call: the `__type` the JSON protocols carry.
-fn error_code(body: &Value) -> String {
+///
+/// `pub(crate)`: see [`accounts_exist`].
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_default()
@@ -156,7 +187,8 @@ fn error_code(body: &Value) -> String {
 
 #[tokio::test]
 async fn created_invitations_are_persisted_and_read_back() {
-    let (router, _engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_engine();
+    accounts_exist(&engine, &target_account_table());
     let source = engine::emulator_account_id();
 
     let mut created: Vec<(String, String)> = Vec::new();
@@ -224,7 +256,16 @@ async fn created_invitations_are_persisted_and_read_back() {
 
 #[tokio::test]
 async fn list_filters_by_status_over_the_modelled_catalog() {
-    let (router, _engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_engine();
+    accounts_exist(
+        &engine,
+        &[
+            "000000000001",
+            "000000000002",
+            "000000000003",
+            "000000000004",
+        ],
+    );
     let accepted = invite_id(&router, "000000000001").await;
     let rejected = invite_id(&router, "000000000002").await;
     let pending_one = invite_id(&router, "000000000003").await;
@@ -301,10 +342,12 @@ async fn list_filters_by_status_over_the_modelled_catalog() {
 
 #[tokio::test]
 async fn list_paginates_over_a_stable_creation_order() {
-    let (router, _engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_engine();
+    let targets: Vec<String> = (1..=7u32).map(|index| format!("{index:012}")).collect();
+    accounts_exist(&engine, &targets);
     let mut expected = Vec::new();
-    for index in 1..=7u32 {
-        expected.push(invite_id(&router, &format!("{index:012}")).await);
+    for target in &targets {
+        expected.push(invite_id(&router, target).await);
     }
 
     // Each row is a page size; the pages it produces must concatenate back to the
@@ -337,7 +380,8 @@ async fn list_paginates_over_a_stable_creation_order() {
 
 #[tokio::test]
 async fn list_accepts_the_published_max_results_bounds_and_refuses_the_rest() {
-    let (router, _engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_engine();
+    accounts_exist(&engine, &["000000000001"]);
     invite_id(&router, "000000000001").await;
 
     // `ListAccountLinksRequest$MaxResults` is `range 1..25`: each published bound
@@ -361,7 +405,8 @@ async fn list_accepts_the_published_max_results_bounds_and_refuses_the_rest() {
 
 #[tokio::test]
 async fn an_invitation_is_answered_once_and_a_linked_account_stays_linked() {
-    let (router, _engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_engine();
+    accounts_exist(&engine, &["000000000001", "000000000002"]);
     let accepted = invite_id(&router, "000000000001").await;
     let rejected = invite_id(&router, "000000000002").await;
     let (status, _body) = call_with_link(&router, "AcceptAccountLinkInvitation", &accepted).await;
@@ -405,7 +450,11 @@ async fn an_invitation_is_answered_once_and_a_linked_account_stays_linked() {
 
 #[tokio::test]
 async fn deleting_an_invitation_removes_it_from_the_store() {
-    let (router, _engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_engine();
+    accounts_exist(
+        &engine,
+        &["000000000001", "000000000002", "000000000003"],
+    );
     let kept = invite_id(&router, "000000000001").await;
     let rejected = invite_id(&router, "000000000002").await;
     let (status, _body) = call_with_link(&router, "RejectAccountLinkInvitation", &rejected).await;
@@ -463,7 +512,11 @@ async fn deleting_an_invitation_removes_it_from_the_store() {
 
 #[tokio::test]
 async fn a_target_account_is_invited_once_while_the_invitation_holds() {
-    let (router, _engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_engine();
+    accounts_exist(
+        &engine,
+        &["000000000001", "000000000002", "000000000003"],
+    );
 
     // Each row is a target invited twice: the second invitation is refused while
     // the first holds the account, and allowed once it no longer does.
@@ -507,7 +560,16 @@ async fn a_target_account_is_invited_once_while_the_invitation_holds() {
 
 #[tokio::test]
 async fn a_client_token_makes_creation_idempotent() {
-    let (router, _engine) = emulator_with_engine();
+    let (router, engine) = emulator_with_engine();
+    accounts_exist(
+        &engine,
+        &[
+            "000000000001",
+            "000000000002",
+            "000000000003",
+            "999999999999",
+        ],
+    );
 
     // Each row is a client token repeated for the same target: the repeat reports
     // the link the token already created rather than a second one.
@@ -660,8 +722,10 @@ async fn the_account_link_store_refuses_to_grow_past_its_bound() {
     {
         let state = service_state(&*engine).expect("the WorkSpaces state store");
         let mut state = state.lock();
+        state.register_organization_account("999999999999");
         for index in 1..=MAX_STORED_ACCOUNT_LINKS {
             let target = format!("{index:012}");
+            state.register_organization_account(&target);
             state
                 .create_account_link_invitation(engine::emulator_account_id(), &target, None)
                 .unwrap_or_else(|failure| {
