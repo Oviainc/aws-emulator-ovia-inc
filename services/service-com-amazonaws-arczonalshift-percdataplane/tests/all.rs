@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/access_denied_precedence.rs"]
 mod access_denied_precedence;
+#[path = "all/autoshift_observer_notification.rs"]
+mod autoshift_observer_notification;
 #[path = "all/refusal_message_rules.rs"]
 mod refusal_message_rules;
 #[path = "all/state_roundtrip.rs"]
