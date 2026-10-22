@@ -41,6 +41,22 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # How this service refuses a request on its input constraints
+//!
+//! PartnerCentral Benefits answers a member outside a modelled constraint with its own
+//! `ValidationException` — `@httpError 400`, with the prose in the `Message` member the
+//! model declares beside the `Reason` it also marks @required
+//! (`smithy_query(query="shape",shape="ValidationException")`). The framework's
+//! pre-dispatch renderer gets the status and the error code right, but writes the prose
+//! into a framework-chosen lowercase `message` key that is the same for every awsJson
+//! service, so the body carries no `Message` at all and an SDK deserializing the modelled
+//! shape surfaces a constraint refusal with no reason.
+//!
+//! [`ModelledValidation`] closes that gap: every modelled operation is served through it,
+//! and a request it finds refusable is answered through the modelled `ValidationException`
+//! instead. The violations come from the framework's OWN deserializer and constraint walk,
+//! so the front cannot refuse a different set of requests than the walk behind it.
 
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, Refusal, Refused, Service,
@@ -52,8 +68,8 @@ use std::sync::Arc;
 /// The error code this service answers an input-constraint violation with: its own
 /// modelled `ValidationException`, which every operation declares with `@httpError 400`
 /// (`smithy_query(query="shape",shape="ValidationException")`). It is also the code the
-/// framework would have chosen, restated here because `override_refusal` replaces the
-/// code and the message together.
+/// framework would have chosen, restated here because `override_refusal` names the code
+/// and the message together.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// The requirement one violation class states, in this service's wording.
@@ -85,8 +101,14 @@ pub fn constraint_requirement(kind: &ViolationKind) -> Option<String> {
             "Member must satisfy regular expression pattern: {}",
             unanchored(pattern)
         ),
+        // A value set is stated in ASCENDING order, not in the order the model happens
+        // to declare its enum members in: the recorded refusals list a set sorted, and
+        // this crate's own model-derived `*_VALUES` constants are emitted sorted too, so
+        // the set a caller is shown does not depend on the model's member order.
         ViolationKind::EnumValue(allowed) => {
-            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+            let mut sorted: Vec<&str> = allowed.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            format!("Member must satisfy enum value set: [{}]", sorted.join(", "))
         }
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
@@ -109,17 +131,79 @@ pub fn member_clause(path: &str, requirement: &str, subject_null: bool) -> Strin
 /// Render one constraint violation the way PartnerCentral states it: the member path
 /// and the constraint it failed, and NOTHING of the value that was rejected.
 ///
+/// A violation on an ELEMENT of a collection is reported against the COLLECTION MEMBER
+/// itself — no element index and no `member` step — with the element's requirement
+/// nested inside `Member must satisfy constraint: [ … ]`, which is what tells a caller
+/// the violation is on an element rather than on the collection. A violation of the
+/// collection ITSELF (its `@length`, its `@uniqueItems`) is not nested, and neither is
+/// one on a member INSIDE a structure element, which keeps its own full path.
+///
 /// Returns `None` for a violation class this service has no wording for, which lets
 /// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
 /// rather than invent a sentence ([`ViolationKind`] is `#[non_exhaustive]`, so a class
 /// can be added upstream).
 pub fn constraint_clause(violation: &Violation) -> Option<String> {
-    let requirement = constraint_requirement(&violation.kind)?;
+    reported(violation).map(|(_, _, clause)| clause)
+}
+
+/// One violation as the clause it states, with the MEMBER it is reported against and the
+/// number of collection steps its path collapsed through (0 for a violation of the member
+/// itself, 1 for one of its elements, 2 for an element of those, …).
+///
+/// [`constraint_envelope`] orders the clauses of one member by that depth, so the
+/// requirement on a collection is stated before the requirements on its elements.
+fn reported(violation: &Violation) -> Option<(String, usize, String)> {
+    let mut requirement = constraint_requirement(&violation.kind)?;
+    // Walk out of every collection step the path ends with, nesting the requirement once
+    // per step: a list of lists nests twice, for the same reason it nests once.
+    let mut path = violation.path.as_str();
+    let mut depth = 0usize;
+    while let Some(collection) = enclosing_collection(path) {
+        requirement = element_requirement(&requirement);
+        path = collection;
+        depth += 1;
+    }
     // An absent member has no submitted value at all, so it is reported as the null it
     // was: that is a fact of the request's shape, not a rendering of a value the caller
     // sent. Every other violation names the member only.
     let absent = matches!(violation.kind, ViolationKind::MissingRequiredMember);
-    Some(member_clause(&violation.path, &requirement, absent))
+    Some((
+        path.to_string(),
+        depth,
+        member_clause(path, &requirement, absent),
+    ))
+}
+
+/// The segment the framework's validation path carries for the step from a collection
+/// into one of its elements: `aws_smithy_schema_server::constraints::path::element`
+/// spells an element as its 1-based position followed by this segment
+/// (`fulfillmentTypes.1.member`).
+const COLLECTION_STEP: &str = ".member";
+
+/// The requirement every element of a collection carries beyond the constraint it
+/// failed: none of this service's lists is `@sparse` (the model declares the trait
+/// nowhere), so an element may not be null, and the element's requirement set states it.
+const ELEMENT_NOT_NULL: &str = "Member must not be null";
+
+/// One requirement as it reads for a collection ELEMENT: the element's requirement set,
+/// bracketed — the constraint it failed, then the requirement that it be present at all.
+pub fn element_requirement(requirement: &str) -> String {
+    format!("Member must satisfy constraint: [{requirement}, {ELEMENT_NOT_NULL}]")
+}
+
+/// The path of the collection a violation's path points INTO, when the violation is on
+/// one of that collection's elements.
+///
+/// An element path ends with the collection step preceded by the element's 1-based
+/// position (`fulfillmentTypes.1.member` -> `fulfillmentTypes`). The position is what
+/// identifies the step, so neither a map entry (`tags.someKey.member`) nor a member that
+/// happens to be NAMED `member` is mistaken for one.
+fn enclosing_collection(path: &str) -> Option<&str> {
+    let (head, position) = path.strip_suffix(COLLECTION_STEP)?.rsplit_once('.')?;
+    if position.is_empty() || !position.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(head)
 }
 
 /// A `@pattern` expression without the anchors the model may spell it with. A `$`
@@ -143,12 +227,40 @@ fn unanchored(pattern: &str) -> &str {
 /// The `ValidationException` message for a refused request: the AWS validation envelope
 /// (`N validation error(s) detected: `) over one clause per violation.
 ///
+/// Two elements of one collection failing the same constraint state the SAME clause once
+/// their paths collapse onto the collection member, so an identical clause is reported
+/// once: the member is named once however many of its elements were refused, and the
+/// count prefix counts the clauses the caller is shown.
+///
+/// The clauses of one member are stated OUTERMOST FIRST — the requirement on the member
+/// itself (its `@length`, its `@uniqueItems`) before the requirements on its elements —
+/// whichever order the walk happened to find them in; members themselves keep the order
+/// the request declares them in.
+///
 /// `None` declines the whole refusal — see [`constraint_clause`].
 pub fn constraint_envelope(violations: &[Violation]) -> Option<String> {
-    let clauses: Vec<String> = violations
-        .iter()
-        .map(constraint_clause)
-        .collect::<Option<Vec<_>>>()?;
+    // (the member's position in the request, the collapse depth, the clause).
+    let mut members: Vec<String> = Vec::new();
+    let mut reported_clauses: Vec<(usize, usize, String)> = Vec::with_capacity(violations.len());
+    for violation in violations {
+        let (member, depth, clause) = reported(violation)?;
+        let position = match members.iter().position(|seen| *seen == member) {
+            Some(position) => position,
+            None => {
+                members.push(member);
+                members.len() - 1
+            }
+        };
+        reported_clauses.push((position, depth, clause));
+    }
+    // Stable, so the walk's order is kept among clauses of the same member and depth.
+    reported_clauses.sort_by_key(|(position, depth, _)| (*position, *depth));
+    let mut clauses: Vec<String> = Vec::with_capacity(reported_clauses.len());
+    for (_, _, clause) in reported_clauses {
+        if !clauses.contains(&clause) {
+            clauses.push(clause);
+        }
+    }
     validation_envelope(&clauses)
 }
 
@@ -388,8 +500,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it.
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
         //
         // PartnerCentral states a constraint violation WITHOUT the value that violated
         // it: the message names the member path and the constraint only, so a caller's
