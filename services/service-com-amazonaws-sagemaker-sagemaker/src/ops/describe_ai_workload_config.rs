@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAIWorkloadConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAIWorkloadConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAIWorkloadConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replays the AI workload configuration `CreateAIWorkloadConfig` stored under this name,
+//! or refuses with the modelled `ResourceNotFound`. Reporting only: it writes nothing.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +143,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAIWorkloadConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAIWorkloadConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAIWorkloadConfig"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let store = state.lock();
+        let Some(config) = store
+            .ai_workload_configs
+            .get(&input.ai_workload_config_name)
+        else {
+            // Never a 200 with empty fields: a caller cannot tell that from a
+            // configuration that exists and carries nothing. `ResourceNotFound` is the
+            // not-found failure this operation models.
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                crate::state::AI_WORKLOAD_CONFIG_KIND,
+                &input.ai_workload_config_name,
+            );
+            return Err(DescribeAIWorkloadConfigErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(format!("Could not find AI workload config \"{arn}\".")),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeAIWorkloadConfigOutput {
+            ai_workload_config_name: config.name.clone(),
+            ai_workload_config_arn: config.arn.clone(),
+            dataset_config: config.dataset_config.clone(),
+            ai_workload_configs: config.workload_configs.clone(),
+            // The modelled member is optional and the create accepts no tags at all, so an
+            // untagged configuration reports absent rather than an empty list.
+            tags: (!config.tags.is_empty()).then(|| config.tags.clone()),
+            creation_time: crate::state::timestamp(config.creation_time),
+        })
     }
 }

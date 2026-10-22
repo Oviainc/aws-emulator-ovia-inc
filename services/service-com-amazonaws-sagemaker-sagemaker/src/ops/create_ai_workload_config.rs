@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAIWorkloadConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAIWorkloadConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAIWorkloadConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers an AI workload configuration in this service's state, keyed by
+//! `AIWorkloadConfigName` (unique per account and Region), and answers the ARN it minted.
+//! `DescribeAIWorkloadConfig` replays what is stored here; this is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAIWorkloadConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAIWorkloadConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAIWorkloadConfig"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::AI_WORKLOAD_CONFIG_KIND,
+            &input.ai_workload_config_name,
+        );
+
+        let mut store = state.lock();
+        // The name is unique per account and Region (the member's own documentation), so a
+        // name already in use is refused rather than overwritten: otherwise the caller
+        // reads a 200 for a configuration it did not create, and the one it did create is
+        // gone. `ResourceInUse` is the in-use failure this operation models, and it is
+        // checked FIRST: re-creating an existing name adds no record, so a full store is
+        // not the reason that request is refused.
+        if store
+            .ai_workload_configs
+            .contains_key(&input.ai_workload_config_name)
+        {
+            return Err(CreateAIWorkloadConfigErrorModeled::ResourceInUse(ResourceInUse {
+                // The service's one in-use sentence, stated in `crate::state` so every
+                // create that models `ResourceInUse` refuses with the same wording.
+                message: Some(crate::state::RESOURCE_IN_USE_MESSAGE.to_string()),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `AIWorkloadConfigName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.ai_workload_configs_below_quota() {
+            return Err(CreateAIWorkloadConfigErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for AI workload configurations is {}, \
+                         with current utilization of {} and a request delta of 1.",
+                        crate::state::AI_WORKLOAD_CONFIG_QUOTA,
+                        store.ai_workload_configs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.ai_workload_configs.insert(
+            input.ai_workload_config_name.clone(),
+            crate::state::AIWorkloadConfig {
+                name: input.ai_workload_config_name.clone(),
+                arn: arn.clone(),
+                dataset_config: input.dataset_config,
+                workload_configs: input.ai_workload_configs,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: ::std::time::SystemTime::now(),
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateAIWorkloadConfigOutput {
+            ai_workload_config_arn: arn,
+        })
     }
 }

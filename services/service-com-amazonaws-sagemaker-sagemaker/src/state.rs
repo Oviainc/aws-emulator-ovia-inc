@@ -2,8 +2,9 @@
 
 //! Engine state for the com-amazonaws-sagemaker-sagemaker service.
 //!
-//! The inference-deployment lifecycle (model -> endpoint config -> endpoint) is kept
-//! here, in `BTreeMap`s keyed by the resource name AWS keys them by, so
+//! The inference-deployment lifecycle (model -> endpoint config -> endpoint) and the
+//! AI benchmarking control plane's workload configurations are kept here, in
+//! `BTreeMap`s keyed by the resource name AWS keys them by, so
 //! `ListModels` has one stable order to sort and paginate over and every
 //! `Describe*` replays exactly what the matching `Create*` stored. The Studio
 //! AppImageConfig registry and the Git repositories `CreateCodeRepository` registers
@@ -585,6 +586,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Lineage artifacts, keyed by `ArtifactArn` — the only identifier `DescribeArtifact`
     /// resolves one by, and the one `CreateArtifact` mints.
     pub artifacts: BTreeMap<String, Artifact>,
+    /// Keyed by `AIWorkloadConfigName`. See [`AIWorkloadConfig`], at the end of this
+    /// module with the rest of the AI-benchmarking workload-configuration slice.
+    pub ai_workload_configs: BTreeMap<String, AIWorkloadConfig>,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -712,8 +716,8 @@ pub const NO_STATE: &str =
 /// It is a CONSTANT of the service, not built from the request: SageMaker answers the
 /// same sentence whatever resource kind and whatever name the caller asked for, and the
 /// name is not repeated back. Stated once here so each create that MODELS
-/// `ResourceInUse` refuses with the same wording — today `CreateAppImageConfig`, the
-/// only such create implemented so far; an operation whose model does not bind
+/// `ResourceInUse` refuses with the same wording — today `CreateAppImageConfig` and
+/// `CreateAIWorkloadConfig`; an operation whose model does not bind
 /// `ResourceInUse` (`CreateModel`, `CreateModelPackageGroup`) refuses with its own
 /// `ValidationException` text instead and does not use this.
 pub const RESOURCE_IN_USE_MESSAGE: &str = "The ID or Name specified is already in use.";
@@ -925,4 +929,45 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// order against each other without going through a lossy float.
 pub fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
+}
+
+// ---------------------------------------------------------------------------
+// The AI-benchmarking workload-configuration slice: `CreateAIWorkloadConfig` and
+// `DescribeAIWorkloadConfig`. Kept together at the end of this module, rather than
+// spread through the blocks above, so this one resource kind reads as one slice.
+// ---------------------------------------------------------------------------
+
+/// The ARN resource kind an AI workload configuration carries, i.e. the `<kind>` in
+/// [`resource_arn`]. Fixed by `AIWorkloadConfigArn`'s modelled pattern
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:ai-workload-config/...`), and named
+/// once here so the create and the describe mint and match the same ARN.
+pub const AI_WORKLOAD_CONFIG_KIND: &str = "ai-workload-config";
+
+/// See [`MODEL_QUOTA`]. Bounds the AI workload configuration store the same way, and is
+/// what `CreateAIWorkloadConfig` answers `ResourceLimitExceeded` past.
+pub const AI_WORKLOAD_CONFIG_QUOTA: usize = 1_000;
+
+/// An AI workload configuration created by `CreateAIWorkloadConfig`, as
+/// `DescribeAIWorkloadConfig` replays it.
+///
+/// A workload configuration is inert data — a dataset configuration plus a benchmark
+/// tool specification — so it carries no status: the service returns it ready, and
+/// there is no transition for the clock to owe.
+#[derive(Debug, Clone)]
+pub struct AIWorkloadConfig {
+    pub name: String,
+    pub arn: String,
+    pub dataset_config: Option<crate::ops::types::AIDatasetConfig>,
+    pub workload_configs: Option<crate::ops::types::AIWorkloadConfigs>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another AI workload configuration fits, i.e. the store is below
+    /// [`AI_WORKLOAD_CONFIG_QUOTA`]. A second inherent `impl` block, beside this slice's
+    /// own types rather than in the one above.
+    pub fn ai_workload_configs_below_quota(&self) -> bool {
+        self.ai_workload_configs.len() < AI_WORKLOAD_CONFIG_QUOTA
+    }
 }
