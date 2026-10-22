@@ -46,6 +46,9 @@ const NAME_MAX_LEN: usize = 128;
 
 /// An in-process client: the one shared engine, this service mounted on a router, and a
 /// signed-looking request per call.
+///
+/// `pub(crate)` so the other suites in this test target drive the service through the
+/// SAME harness instead of each growing its own copy of it.
 pub(crate) struct Client {
     router: MultiServiceRouter,
 }
@@ -68,7 +71,12 @@ impl Client {
 
     /// Call `operation` with a credential scope naming `region`, which is the region
     /// segment of any ARN the service mints for the call.
-    async fn call_in_region(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_in_region(
+        &self,
+        region: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -133,7 +141,7 @@ pub(crate) fn error_code(body: &Value) -> String {
 
 /// One row of the table: an export definition, in the members the model names.
 #[derive(Debug, Clone)]
-struct Case {
+pub(crate) struct Case {
     label: String,
     name: String,
     description: Option<String>,
@@ -203,7 +211,7 @@ impl Case {
         )
     }
 
-    fn create_request(&self) -> Value {
+    pub(crate) fn create_request(&self) -> Value {
         json!({ "Export": self.export(), "ResourceTags": self.resource_tags() })
     }
 }
@@ -214,7 +222,7 @@ impl Case {
 /// carry (`COMPRESSION_OPTION_VALUES`, `FORMAT_OPTION_VALUES`, `S3_OUTPUT_TYPE_VALUES`,
 /// `OVERWRITE_OPTION_VALUES`, `FREQUENCY_OPTION_VALUES` in `ops::types::shared_types`),
 /// so a value the issue never cited is covered too.
-fn cases() -> Vec<Case> {
+pub(crate) fn cases() -> Vec<Case> {
     let base_output = (
         S3_OUTPUT_TYPE_VALUES[0],
         FORMAT_OPTION_VALUES[0],

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/export_lifecycle.rs"]
 mod export_lifecycle;
+#[path = "all/not_found_message.rs"]
+mod not_found_message;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/table_catalog.rs"]

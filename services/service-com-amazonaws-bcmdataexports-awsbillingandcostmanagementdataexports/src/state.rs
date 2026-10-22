@@ -141,10 +141,22 @@ pub fn export_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(SIGNING_NAME, region, &format!("export/{name}"))
 }
 
+/// The `Message` every `ResourceNotFoundException` of this service carries.
+///
+/// Recorded AWS behavior: BCM Data Exports answers a lookup of an export ARN that
+/// resolves to nothing with this one fixed string, whatever the ARN was — an ARN in the
+/// caller's own account naming an export that was never created and an ARN naming a
+/// DIFFERENT account get byte-identical replies, so the body confirms nothing about the
+/// ARN the caller supplied. The message is therefore a constant and never interpolates
+/// the request: the identity of the ARN that was not found is reported in the modelled
+/// `ResourceId` member ("The identifier of the resource that was not found"), which is
+/// where the model puts it.
+pub const EXPORT_NOT_FOUND_MESSAGE: &str = "No matching definition found";
+
 /// The modelled 404 for an export ARN that names nothing.
 pub fn export_not_found(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("No export found for the Amazon Resource Name (ARN) {arn}."),
+        message: EXPORT_NOT_FOUND_MESSAGE.to_string(),
         resource_id: arn.to_string(),
         resource_type: EXPORT_RESOURCE_TYPE.to_string(),
     }
