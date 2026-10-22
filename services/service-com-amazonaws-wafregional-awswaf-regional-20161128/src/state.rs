@@ -2,17 +2,18 @@
 
 //! Engine state for the com-amazonaws-wafregional-awswaf-regional-20161128 service.
 //!
-//! AWS WAF Classic's `IPSet`, `Rule`, `RateBasedRule`, `RuleGroup`,
+//! AWS WAF Classic's `IPSet`, `RateBasedRule`, `RegexPatternSet`, `Rule`, `RuleGroup`,
 //! `SizeConstraintSet`, `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet` records and
 //! the change tokens every mutating call consumes live here, so `GetChangeToken`,
 //! `GetChangeTokenStatus` and the `Create*`, `Update*`, `Get*`, `List*` and `Delete*`
 //! handlers of every resource kind all read and write ONE copy of each resource. The
 //! helpers below (id minting, the change-token protocol, pagination, CIDR parsing,
 //! metric-name validation, resource-ARN resolution onto the tagged resource's own tag
-//! set, filter identity, the `IPSet`/`IPSetSummary`, `Rule`,
-//! `RateBasedRule`/`RuleSummary`, `RuleGroup`, `SizeConstraintSet`,
-//! `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet`/`XssMatchSetSummary`
-//! projections) are shared by those handlers rather than duplicated per operation.
+//! set, filter identity, the `IPSet`/`IPSetSummary`,
+//! `RateBasedRule`/`RuleSummary`, `RegexPatternSet`, `Rule`, `RuleGroup`,
+//! `SizeConstraintSet`, `SqlInjectionMatchSet`, `WebACL` and
+//! `XssMatchSet`/`XssMatchSetSummary` projections) are shared by those handlers rather
+//! than duplicated per operation.
 //!
 //! The `ByteMatchSet` records and bounds live at the END of this file, under "AWS WAF
 //! Classic ByteMatchSet records", so this one store carries them beside every other
@@ -27,9 +28,10 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, RateBasedRule, Rule, RuleGroup,
-    RuleSummary, SizeConstraint, SizeConstraintSet, SqlInjectionMatchSet, SqlInjectionMatchTuple,
-    WafAction, WebACL, XssMatchSet, XssMatchSetSummary, XssMatchTuple,
+    ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, RateBasedRule,
+    RegexPatternSet, Rule, RuleGroup, RuleSummary, SizeConstraint, SizeConstraintSet,
+    SqlInjectionMatchSet, SqlInjectionMatchTuple, WafAction, WebACL, XssMatchSet,
+    XssMatchSetSummary, XssMatchTuple,
 };
 
 // The shapes the ByteMatchSet records at the end of this file project onto. A `use` of
@@ -101,6 +103,18 @@ pub const MAX_IP_SETS: usize = 50;
 /// an IPSet (10,000 IP address ranges). Together with [`MAX_IP_SETS`] it bounds the
 /// total descriptor state a caller can grow, not just the number of IPSets.
 pub const MAX_IP_SET_DESCRIPTORS: usize = 10_000;
+
+/// The most `RegexPatternSet`s this emulator stores for the account before
+/// `CreateRegexPatternSet` answers its modelled `WAFLimitsExceededException`.
+///
+/// The model states no quota and this file cites none, so this bound is CHOSEN: every
+/// created pattern set is a stored record, so the number a caller can create has to be
+/// bounded the way [`MAX_IP_SETS`] bounds IPSets. It is deliberately smaller in
+/// magnitude than its siblings ([`MAX_IP_SETS`], [`MAX_SQL_INJECTION_MATCH_SETS`]),
+/// which carry AWS's published per-account figures: no figure is cited for pattern
+/// sets, so the bound is only large enough to be well above the handful of pattern sets
+/// a regex match condition refers to, and small enough that a test can reach it.
+pub const MAX_REGEX_PATTERN_SETS: usize = 10;
 
 /// The most `SqlInjectionMatchSet`s this emulator stores for the account before
 /// `CreateSqlInjectionMatchSet` answers its modelled `WAFLimitsExceededException`.
@@ -536,6 +550,41 @@ impl IPSetEntry {
     }
 }
 
+/// One stored `RegexPatternSet`.
+#[derive(Debug, Clone)]
+pub struct RegexPatternSetEntry {
+    pub regex_pattern_set_id: String,
+    pub name: String,
+    /// The `RegexPatternString`s this set holds, in insertion order.
+    ///
+    /// Empty on creation: `CreateRegexPatternSet` documents that it answers "a
+    /// RegexPatternSet that contains no objects", and directs the caller to
+    /// `UpdateRegexPatternSet` "to specify the regular expression (regex) pattern that
+    /// you want AWS WAF to search for".
+    pub patterns: Vec<String>,
+}
+
+impl RegexPatternSetEntry {
+    /// A new, empty RegexPatternSet record.
+    pub fn new(regex_pattern_set_id: String, name: String) -> Self {
+        Self {
+            regex_pattern_set_id,
+            name,
+            patterns: Vec::new(),
+        }
+    }
+
+    /// This record projected onto the modelled `RegexPatternSet` shape the Get and
+    /// Create responses carry: the stored record's own fields, never request input.
+    pub fn to_modelled(&self) -> RegexPatternSet {
+        RegexPatternSet {
+            regex_pattern_set_id: self.regex_pattern_set_id.clone(),
+            name: Some(self.name.clone()),
+            regex_pattern_strings: self.patterns.clone(),
+        }
+    }
+}
+
 /// One stored `SizeConstraintSet`.
 ///
 /// A set is created empty — `CreateSizeConstraintSet` documents that it answers "a
@@ -961,6 +1010,10 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// walks them in one stable order and a `NextMarker` taken on one page resumes at
     /// the right place on the next.
     pub ip_sets: BTreeMap<String, IPSetEntry>,
+    /// Every stored `RegexPatternSet`, keyed by its `RegexPatternSetId`. A `BTreeMap`
+    /// for the same reason as [`Self::ip_sets`]: one stable order for the list and
+    /// pagination of these records.
+    pub regex_pattern_sets: BTreeMap<String, RegexPatternSetEntry>,
     /// Every stored `WebACL`, keyed by its `WebACLId`. A `BTreeMap` so `ListWebACLs`
     /// walks them in one stable order and a `NextMarker` taken on one page resumes at
     /// the right place on the next.

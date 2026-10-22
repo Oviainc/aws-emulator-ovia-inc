@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRegexPatternSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRegexPatternSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRegexPatternSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one `RegexPatternSet` record in this service's state: it consumes the
+//! caller's change token, mints a `RegexPatternSetId`, stores the set with NO patterns
+//! (they arrive through `UpdateRegexPatternSet`) and answers the projection of the
+//! record it stored, so `GetRegexPatternSet` reads back the same resource.
+//!
+//! Reads and writes nothing else: the modelled `WAFDisallowedNameException` is left
+//! unconstructed on purpose, because neither the model nor this operation's
+//! documentation states which names are disallowed for a pattern set, and the modelled
+//! `ResourceName` constraints (`len 1..128, pattern \S`) are already refused before the
+//! handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +165,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRegexPatternSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRegexPatternSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRegexPatternSet"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateRegexPatternSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the AWS WAF RegexPatternSet store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // Every RegexPatternSet is a stored record, so the number a caller can create
+        // is bounded, as it is on the real service. This gate runs BEFORE the change
+        // token is consumed, so a request refused for the quota leaves the caller's
+        // token usable: the request changed nothing, and `GetChangeToken` documents a
+        // token as consumed by "a create, update, or delete request", which this
+        // refusal never became.
+        if state.regex_pattern_sets.len() >= crate::state::MAX_REGEX_PATTERN_SETS {
+            return Err(CreateRegexPatternSetErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(format!(
+                        "The request would exceed the maximum number of RegexPatternSet \
+                         objects ({}) allowed for this account",
+                        crate::state::MAX_REGEX_PATTERN_SETS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The change-token protocol every mutating AWS WAF Classic call follows: the
+        // token must be one `GetChangeToken` minted and no other mutating call has
+        // used, since "each create, update, or delete request must use a unique change
+        // token".
+        if !state.consume_change_token(&input.change_token) {
+            return Err(CreateRegexPatternSetErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(format!(
+                        "The change token {} is not a change token this request can use; \
+                         call GetChangeToken for a new one",
+                        input.change_token
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A fresh id per call: `ResourceName` carries no uniqueness constraint, so two
+        // pattern sets created with the same `Name` are two distinct resources, each
+        // stored under its own `RegexPatternSetId`.
+        let regex_pattern_set_id = state.mint_id();
+        // A new set holds no patterns — this operation documents that it answers "a
+        // RegexPatternSet that contains no objects"; the patterns arrive through
+        // `UpdateRegexPatternSet`.
+        let entry =
+            crate::state::RegexPatternSetEntry::new(regex_pattern_set_id.clone(), input.name);
+        // The response is the projection of the record that was STORED, not of the
+        // request.
+        let regex_pattern_set = entry.to_modelled();
+        state.regex_pattern_sets.insert(regex_pattern_set_id, entry);
+
+        Ok(CreateRegexPatternSetOutput {
+            regex_pattern_set: Some(regex_pattern_set),
+            change_token: Some(input.change_token),
+        })
     }
 }
+
