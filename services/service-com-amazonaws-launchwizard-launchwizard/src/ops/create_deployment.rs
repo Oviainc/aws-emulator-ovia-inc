@@ -175,14 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The workload and its deployment pattern are resolved against the seeded
         // catalogue: an unknown one is a 404, not a deployment of something that does
-        // not exist.
+        // not exist. Both messages are the fixed, identifier-free ones a catalogue
+        // lookup carries (see `state::WORKLOAD_NOT_FOUND_MESSAGE`), so the names the
+        // caller asked about are not echoed back.
         let Some(workload) = store.workloads.get(&input.workload_name) else {
             return Err(CreateDeploymentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Workload '{}' was not found.",
-                        input.workload_name
-                    )),
+                    message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -190,10 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !workload.patterns.contains(&input.deployment_pattern_name) {
             return Err(CreateDeploymentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Deployment pattern '{}' was not found for workload '{}'.",
-                        input.deployment_pattern_name, input.workload_name
-                    )),
+                    message: Some(crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -34,21 +34,21 @@ const ACCOUNT: &str = "000000000000";
 const SETTLE: Duration = Duration::from_millis(1_400);
 
 /// One response, reduced to what the assertions below read.
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// The wire error code, from `x-amzn-errortype` or the body's `__type`.
-    error_code: Option<String>,
-    body: Value,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 /// A router carrying only this service, over one shared engine — the same dispatch
 /// path the production emulator uses.
-struct Harness {
+pub(crate) struct Harness {
     router: MultiServiceRouter,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are the emulator's own concern and are not what this suite is
@@ -58,7 +58,7 @@ impl Harness {
         Self { router }
     }
 
-    async fn call(&self, path: &str, body: &Value) -> Reply {
+    pub(crate) async fn call(&self, path: &str, body: &Value) -> Reply {
         let payload = serde_json::to_vec(body).expect("a test request body serializes");
         let request = http::Request::builder()
             .method("POST")
@@ -95,7 +95,7 @@ impl Harness {
     }
 
     /// Call `path`, requiring HTTP 200, and hand back the response body.
-    async fn ok(&self, case: &str, path: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, path: &str, body: Value) -> Value {
         let reply = self.call(path, &body).await;
         assert_eq!(
             reply.status, 200,
@@ -106,7 +106,14 @@ impl Harness {
     }
 
     /// Call `path`, requiring the given HTTP status and wire error code.
-    async fn refused(&self, case: &str, path: &str, body: Value, status: u16, code: &str) -> Value {
+    pub(crate) async fn refused(
+        &self,
+        case: &str,
+        path: &str,
+        body: Value,
+        status: u16,
+        code: &str,
+    ) -> Value {
         let reply = self.call(path, &body).await;
         assert_eq!(
             reply.status, status,
@@ -130,7 +137,7 @@ fn short_code(raw: &str) -> String {
 }
 
 /// A `CreateDeployment` request body.
-fn create_body(workload: &str, pattern: &str, name: &str, dry_run: bool) -> Value {
+pub(crate) fn create_body(workload: &str, pattern: &str, name: &str, dry_run: bool) -> Value {
     json!({
         "workloadName": workload,
         "deploymentPatternName": pattern,
@@ -142,7 +149,13 @@ fn create_body(workload: &str, pattern: &str, name: &str, dry_run: bool) -> Valu
 }
 
 /// Create a deployment that must succeed, returning its `deploymentId`.
-async fn create(harness: &Harness, case: &str, workload: &str, pattern: &str, name: &str) -> String {
+pub(crate) async fn create(
+    harness: &Harness,
+    case: &str,
+    workload: &str,
+    pattern: &str,
+    name: &str,
+) -> String {
     let body = harness
         .ok(
             case,
@@ -175,7 +188,7 @@ async fn get(harness: &Harness, case: &str, id: &str) -> Value {
 
 /// Every `workloadName` in the seeded catalogue, in the order `ListWorkloads` pages
 /// them.
-async fn catalogue(harness: &Harness) -> Vec<String> {
+pub(crate) async fn catalogue(harness: &Harness) -> Vec<String> {
     let body = harness.ok("catalogue", "/listWorkloads", json!({})).await;
     body["workloads"]
         .as_array()
@@ -514,7 +527,7 @@ async fn create_resolves_the_workload_and_pattern_against_the_catalogue() {
 ///
 /// Mirrors `state::seeded_workloads`, whose entries are the Launch Wizard
 /// applications and deployment patterns AWS documents.
-fn first_pattern(workload: &str) -> &'static str {
+pub(crate) fn first_pattern(workload: &str) -> &'static str {
     match workload {
         "SAP" => "SapHanaSingle",
         "SQLServer" => "SqlServerSingle",

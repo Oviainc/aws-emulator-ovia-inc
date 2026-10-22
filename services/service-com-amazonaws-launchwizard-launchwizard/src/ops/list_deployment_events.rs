@@ -158,12 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due(now);
 
         let Some(deployment) = store.deployments.get(&input.deployment_id) else {
+            // Fixed, identifier-free message: see `state::DEPLOYMENT_NOT_FOUND_MESSAGE`.
             return Err(ListDeploymentEventsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Deployment '{}' was not found.",
-                        input.deployment_id
-                    )),
+                    message: Some(crate::state::DEPLOYMENT_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

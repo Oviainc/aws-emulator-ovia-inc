@@ -56,6 +56,32 @@ pub const EVENT_COMPLETED: &str = "COMPLETED";
 /// `WORKLOAD_STATUS_VALUES`.
 pub const WORKLOAD_ACTIVE: &str = "ACTIVE";
 
+/// The message a deployment lookup that finds nothing carries.
+///
+/// Launch Wizard's `ResourceNotFoundException` message is FIXED per kind of resource
+/// looked up and never renders the identifier the caller asked for (the existence of
+/// an id is not disclosed through the error channel), so every handler that resolves
+/// a `deploymentId` answers with this constant rather than a per-request template.
+/// This text is Launch Wizard's recorded wording for a deployment lookup.
+pub const DEPLOYMENT_NOT_FOUND_MESSAGE: &str = "The specified deployment does not exist.";
+
+/// The message a workload-catalogue lookup that finds nothing carries.
+///
+/// See [`DEPLOYMENT_NOT_FOUND_MESSAGE`]: identifier-free and fixed. Launch Wizard's
+/// recorded wording for a workload lookup deliberately conflates "absent" with "you
+/// may not see it", so a caller cannot probe the catalogue through the error channel.
+pub const WORKLOAD_NOT_FOUND_MESSAGE: &str =
+    "The specified workload does not exist or insufficient permissions.";
+
+/// The message a deployment-pattern lookup that finds nothing carries.
+///
+/// Neither AWS's docs nor the recordings state the wording for a pattern lookup, so
+/// this text is CHOSEN; what the contract requires, and what this constant exists to
+/// hold, is that the message is fixed and identifier-free like the two above, which a
+/// pattern name (caller input, and a probe of the catalogue) must not breach either.
+pub const DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE: &str =
+    "The specified deployment pattern does not exist or insufficient permissions.";
+
 /// How many deployment records this emulator keeps at once.
 ///
 /// AWS publishes no deployment quota, so this is the EMULATOR's own bound, not a
@@ -88,6 +114,8 @@ pub struct Workload {
     pub workload_name: String,
     /// `WorkloadDataSummary$displayName`.
     pub display_name: String,
+    /// `WorkloadData$description`: what the workload deploys.
+    pub description: String,
     /// `WorkloadDataSummary$status`, one of `WORKLOAD_STATUS_VALUES`.
     pub status: String,
     /// `DeploymentPatternName`s this workload supports: len 1..256,
@@ -107,6 +135,25 @@ impl Workload {
             display_name: Some(self.display_name.clone()),
             status: Some(self.status.clone()),
             account_constraints: None,
+        }
+    }
+
+    /// This workload as the `WorkloadData` `GetWorkload` returns.
+    ///
+    /// `accountConstraints` is absent for the reason [`Workload::to_summary`] gives.
+    /// `documentationUrl` and `iconUrl` are absent because this emulator hosts no
+    /// workload document and no icon, so there is no URL to report; `statusMessage` is
+    /// absent because an `ACTIVE` catalogue entry has nothing to say about its status.
+    pub fn to_data(&self) -> WorkloadData {
+        WorkloadData {
+            workload_name: Some(self.workload_name.clone()),
+            display_name: Some(self.display_name.clone()),
+            status: Some(self.status.clone()),
+            account_constraints: None,
+            description: Some(self.description.clone()),
+            documentation_url: None,
+            icon_url: None,
+            status_message: None,
         }
     }
 }
@@ -374,27 +421,32 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
         (
             "SAP",
             "SAP",
+            "Deploy SAP HANA and SAP NetWeaver applications on Amazon Web Services.",
             &["SapHanaSingle", "SapHanaMultiNode", "SapNWOnHanaHA"][..],
         ),
         (
             "SQLServer",
             "Microsoft SQL Server",
+            "Deploy Microsoft SQL Server, standalone or highly available, on Amazon Web Services.",
             &["SqlServerSingle", "SqlServerHA"][..],
         ),
         (
             "ActiveDirectory",
             "Microsoft Active Directory",
+            "Deploy AWS Managed Microsoft AD or self-managed Active Directory on Amazon Web \
+             Services.",
             &["AWSManagedAD", "SelfManagedAD"][..],
         ),
     ];
     catalogue
         .into_iter()
-        .map(|(workload_name, display_name, patterns)| {
+        .map(|(workload_name, display_name, description, patterns)| {
             (
                 workload_name.to_string(),
                 Workload {
                     workload_name: workload_name.to_string(),
                     display_name: display_name.to_string(),
+                    description: description.to_string(),
                     status: WORKLOAD_ACTIVE.to_string(),
                     patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
                 },
