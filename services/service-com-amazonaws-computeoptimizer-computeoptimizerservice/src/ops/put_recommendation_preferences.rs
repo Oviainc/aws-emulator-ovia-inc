@@ -317,33 +317,62 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
         ));
     }
 
-    // `externalMetricsPreference`: "This preference can only be set for the Ec2Instance
-    // resource type."
-    if input.external_metrics_preference.is_some()
-        && input.resource_type != crate::state::RESOURCE_TYPE_EC2_INSTANCE
-    {
-        return Some(format!(
-            "The value supplied for parameter externalMetricsPreference is not valid: it can \
-             only be set for the {} resource type, not {}.",
-            crate::state::RESOURCE_TYPE_EC2_INSTANCE, input.resource_type,
-        ));
+    // EVERY preference this operation can set is settable only for the resource types the
+    // service supports it for, and a request that sets one for another resource type is
+    // refused — the preference a resource type does not carry cannot be put on it. One
+    // table so no member's restriction can drift from another's; the allowed lists are
+    // each the resource types that preference's own documentation names.
+    for (member, is_set, resource_types) in [
+        (
+            "enhancedInfrastructureMetrics",
+            input.enhanced_infrastructure_metrics.is_some(),
+            ENHANCED_INFRASTRUCTURE_METRICS_RESOURCE_TYPES,
+        ),
+        (
+            "externalMetricsPreference",
+            input.external_metrics_preference.is_some(),
+            EXTERNAL_METRICS_RESOURCE_TYPES,
+        ),
+        (
+            "lookBackPeriod",
+            input.look_back_period.is_some(),
+            PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES,
+        ),
+        (
+            "preferredResources",
+            input
+                .preferred_resources
+                .as_deref()
+                .is_some_and(|resources| !resources.is_empty()),
+            PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES,
+        ),
+        (
+            "utilizationPreferences",
+            input
+                .utilization_preferences
+                .as_deref()
+                .is_some_and(|preferences| !preferences.is_empty()),
+            UTILIZATION_PREFERENCES_RESOURCE_TYPES,
+        ),
+    ] {
+        if is_set && !resource_types.contains(&input.resource_type.as_str()) {
+            return Some(format!(
+                "The value supplied for parameter resourceType is not valid: the {} resource \
+                 type does not support the {member} preference. Specify one of {} in your \
+                 request and try again.",
+                input.resource_type,
+                resource_types.join(", "),
+            ));
+        }
     }
 
-    // `utilizationPreferences`: "You can only set CPU and memory utilization preferences
-    // for the Amazon EC2 instance resource type" and "The threshold setting isn't
-    // available for memory utilization."
+    // `utilizationPreferences`: "The threshold setting isn't available for memory
+    // utilization."
     if let Some(preferences) = input
         .utilization_preferences
         .as_ref()
         .filter(|preferences| !preferences.is_empty())
     {
-        if input.resource_type != crate::state::RESOURCE_TYPE_EC2_INSTANCE {
-            return Some(format!(
-                "The value supplied for parameter utilizationPreferences is not valid: it can \
-                 only be set for the {} resource type, not {}.",
-                crate::state::RESOURCE_TYPE_EC2_INSTANCE, input.resource_type,
-            ));
-        }
         for preference in preferences {
             let carries_threshold = preference
                 .metric_parameters
@@ -372,30 +401,44 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
         }
     }
 
-    // `lookBackPeriod`: "You can only set this preference for the Amazon EC2 instance,
-    // Auto Scaling group, Amazon EBS volume, Amazon ECS service on Fargate, Amazon RDS DB
-    // instance, and Aurora DB cluster storage resource types."
-    if input.look_back_period.is_some()
-        && !LOOK_BACK_PERIOD_RESOURCE_TYPES.contains(&input.resource_type.as_str())
-    {
-        return Some(format!(
-            "The value supplied for parameter lookBackPeriod is not valid: it cannot be set for \
-             the {} resource type.",
-            input.resource_type,
-        ));
-    }
-
     None
 }
 
 /// The `CustomizableMetricName` value whose headroom, but not threshold, is settable.
 const MEMORY_UTILIZATION: &str = "MemoryUtilization";
 
-/// The `ResourceType` values a `lookBackPeriod` preference may be set for, from this
-/// operation's `lookBackPeriod` documentation.
-const LOOK_BACK_PERIOD_RESOURCE_TYPES: &[&str] = &[
-    "Ec2Instance",
-    "AutoScalingGroup",
+/// The `ResourceType` values an `enhancedInfrastructureMetrics` preference may be set for.
+/// The feature exists for EC2 instances and Auto Scaling groups: the effective-preference
+/// member of the same name documents its application as reviewable through "the
+/// GetAutoScalingGroupRecommendations and GetEC2InstanceRecommendations actions", and no
+/// other resource type's recommendations carry it.
+const ENHANCED_INFRASTRUCTURE_METRICS_RESOURCE_TYPES: &[&str] = &[
+    crate::state::RESOURCE_TYPE_EC2_INSTANCE,
+    crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
+];
+
+/// The `ResourceType` values an `externalMetricsPreference` may be set for: "This
+/// preference can only be set for the Ec2Instance resource type."
+const EXTERNAL_METRICS_RESOURCE_TYPES: &[&str] = &[crate::state::RESOURCE_TYPE_EC2_INSTANCE];
+
+/// The `ResourceType` values a `utilizationPreferences` preference may be set for: "You
+/// can only set CPU and memory utilization preferences for the Amazon EC2 instance
+/// resource type."
+const UTILIZATION_PREFERENCES_RESOURCE_TYPES: &[&str] =
+    &[crate::state::RESOURCE_TYPE_EC2_INSTANCE];
+
+/// The `ResourceType` values whose recommendations this service analyses per resource, and
+/// so the ones that carry a `lookBackPeriod` or a `preferredResources` preference. Both
+/// members document the SAME six types — `lookBackPeriod`: "You can only set this
+/// preference for the Amazon EC2 instance, Auto Scaling group, Amazon EBS volume, Amazon
+/// ECS service on Fargate, Amazon RDS DB instance, and Aurora DB cluster storage resource
+/// types", and `preferredResources` the same list — so they share one constant rather than
+/// two that can drift. (The `PreferredResource` shape's own note names a narrower pair;
+/// this operation's member documents what this operation accepts, so the wider list is
+/// what it refuses outside.)
+const PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES: &[&str] = &[
+    crate::state::RESOURCE_TYPE_EC2_INSTANCE,
+    crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
     "EbsVolume",
     "EcsService",
     "RdsDBInstance",

@@ -4,7 +4,9 @@
 //!
 //! IMPLEMENTED: resolves each preference field for one resource from the stored records,
 //! taking it from the most specific scope that sets it — resource, then account, then the
-//! account default, then organization — and falling back to the service default.
+//! account default, then organization — and falling back to the service's documented
+//! default (`lookBackPeriod`, `utilizationPreferences`, `preferredResources`), which the
+//! list members report as a list rather than as an absent member.
 //!
 //! ## Shape of an operation
 //!
@@ -269,18 +271,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .and_then(|record| record.look_back_period.clone())
                     .unwrap_or_else(|| crate::state::DEFAULT_LOOK_BACK_PERIOD.to_string()),
             ),
-            utilization_preferences: effective(|record| {
-                !record.utilization_preferences.is_empty()
-            })
-            .map(|record| record.utilization_preferences.clone()),
-            preferred_resources: effective(|record| !record.preferred_resources.is_empty()).map(
-                |record| {
-                    record
-                        .preferred_resources
-                        .iter()
-                        .map(crate::state::effective_preferred_resource)
-                        .collect()
-                },
+            // Every list member is reported, with the service's documented default when no
+            // record sets it — the same reporting rule `lookBackPeriod` follows above.
+            // "You can only set CPU and memory utilization preferences for the Amazon EC2
+            // instance resource type", so for any other resource type there is no default
+            // to report and the list is empty.
+            utilization_preferences: Some(
+                effective(|record| !record.utilization_preferences.is_empty())
+                    .map(|record| record.utilization_preferences.clone())
+                    .unwrap_or_else(|| {
+                        if resource.resource_type == crate::state::RESOURCE_TYPE_EC2_INSTANCE {
+                            crate::state::default_utilization_preferences()
+                        } else {
+                            Vec::new()
+                        }
+                    }),
+            ),
+            // `PreferredResource` "is only available for the Amazon EC2 instance and Auto
+            // Scaling group resource types" — both of the types a `resourceArn` can name —
+            // so the default applies to every resource this operation accepts.
+            preferred_resources: Some(
+                effective(|record| !record.preferred_resources.is_empty())
+                    .map(|record| {
+                        record
+                            .preferred_resources
+                            .iter()
+                            .map(crate::state::effective_preferred_resource)
+                            .collect()
+                    })
+                    .unwrap_or_else(crate::state::default_preferred_resources),
             ),
         })
     }

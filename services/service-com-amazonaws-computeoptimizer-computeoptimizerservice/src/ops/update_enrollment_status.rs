@@ -213,14 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         enrollment.last_updated_timestamp = Some(::aws_smithy_types::DateTime::from(
             ::std::time::SystemTime::now(),
         ));
-        // "The count of organization member accounts that are opted in to the service, if
-        // your account is an organization management account." This emulator's
-        // organization holds no member accounts, so enrolling them opts in zero of them;
-        // a call that leaves member accounts out is not enrolling an organization at all,
-        // and the count is then absent.
-        enrollment.number_of_member_accounts_opted_in = (input.include_member_accounts
-            && input.status == crate::state::STATUS_ACTIVE)
-            .then_some(0);
+        // The opted-in member-account count is not moved by this call: "the count of
+        // organization member accounts that are opted in to the service" is zero whatever
+        // this request enrolls, because this emulator's organization holds no member
+        // accounts (`Enrollment::number_of_member_accounts_opted_in`, which starts there
+        // and has nothing to count up from).
 
         Ok(UpdateEnrollmentStatusOutput {
             status: Some(enrollment.status.clone()),
