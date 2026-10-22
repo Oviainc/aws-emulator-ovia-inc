@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Validates the requested `MetricName` against the character set and reserved names
+//! AWS WAF documents, consumes the caller's change token, mints a `RuleId` and stores a
+//! new, predicate-free `Rule` under it, so `GetRule` (and `UpdateRule`/`ListRules` once
+//! they are implemented) see the record this call created. Answers the stored record
+//! and the change token it consumed.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +189,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRule"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateRuleErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The `MetricName` rule, which the model's length and `\S` constraints do not
+        // cover: "The name can contain only alphanumeric characters (A-Z, a-z, 0-9) …
+        // It can't contain whitespace or metric names reserved for AWS WAF, including
+        // "All" and "Default_Action."" A name outside that is a disallowed name, and
+        // refusing it leaves the request's change token unused: nothing was changed.
+        if !crate::state::metric_name_is_allowed(&input.metric_name) {
+            return Err(CreateRuleErrorModeled::WAFDisallowedNameException(
+                WAFDisallowedNameException {
+                    message: Some(crate::state::MESSAGE_DISALLOWED_NAME.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Every Rule is a stored record, so the number a caller can create is bounded,
+        // as it is on the real service \u2014 and so is the tag set each one carries, which
+        // the model bounds only from below (`TagList` is `len 1..`).
+        let tag_count = input.tags.as_ref().map_or(0, Vec::len);
+        if state.rules.len() >= crate::state::MAX_RULES
+            || tag_count > crate::state::MAX_TAGS_PER_RESOURCE
+        {
+            return Err(CreateRuleErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The change-token protocol every mutating AWS WAF Classic call follows: the
+        // token must be one `GetChangeToken` minted and no other mutating call has
+        // used, since "each create, update, or delete request must use a unique change
+        // token".
+        if !state.consume_change_token(&input.change_token) {
+            return Err(CreateRuleErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A fresh id per call: `ResourceName` carries no uniqueness constraint, so two
+        // Rules created with the same `Name` are two distinct resources, each stored
+        // under its own `RuleId`.
+        let rule_id = state.mint_id();
+        // A new Rule holds no predicates: they arrive through `UpdateRule`.
+        let mut entry = crate::state::RuleEntry::new(rule_id.clone(), input.name, input.metric_name);
+        // A tag set is keyed by `Key`, so a key repeated in one request keeps the last
+        // value given for it.
+        for tag in input.tags.into_iter().flatten() {
+            entry.tags.insert(tag.key, tag.value);
+        }
+        // The response is the projection of the record that was STORED, not of the
+        // request.
+        let rule = entry.to_modelled();
+        state.rules.insert(rule_id, entry);
+
+        Ok(CreateRuleOutput {
+            rule: Some(rule),
+            change_token: Some(input.change_token),
+        })
     }
 }
