@@ -36,6 +36,35 @@ pub const PROFILE_STATUS_CANCELED: &str = "Canceled";
 /// The status `RevokeSigningProfile` moves a profile to.
 pub const PROFILE_STATUS_REVOKED: &str = "Revoked";
 
+// Every Signer error shape models BOTH `message` (prose) and `code` (`ErrorCode`,
+// `smithy_query(query="shape",shape="ResourceNotFoundException")`), and a client
+// branches on the code rather than on the prose — so every error this service
+// answers with names the condition it refused in `code`. The codes below are the
+// ones Signer publishes for the conditions this crate can refuse; a refusal of
+// the request's own values carries the error SHAPE's name instead, which is what
+// that shape already says.
+
+/// No profile of that name (or not one this account holds).
+pub const ERROR_CODE_PROFILE_NOT_FOUND: &str = "ProfileNotFound";
+/// No signing job of that id.
+pub const ERROR_CODE_JOB_NOT_FOUND: &str = "JobNotFound";
+/// A `nextToken` that is not one this service handed out.
+pub const ERROR_CODE_INVALID_NEXT_TOKEN: &str = "InvalidNextToken";
+/// A request refused for the values it carried, rather than for a condition of
+/// the resource: the modelled shape's own name.
+pub const ERROR_CODE_VALIDATION: &str = "ValidationException";
+/// The store could not be reached — this emulator's own fault, not the request's.
+pub const ERROR_CODE_INTERNAL_SERVICE_ERROR: &str = "InternalServiceErrorException";
+
+/// The error code a refusal carries when the PROFILE'S STATUS is what forbids
+/// the call: `Profile` followed by that status, which is how Signer spells the
+/// refusal of a canceled or revoked profile (`ProfileRevoked` for a profile in
+/// `Revoked`). `SigningProfileStatus` is `Active | Canceled | Revoked`, so the
+/// code is derived from the stored status rather than written out per call site.
+pub fn profile_status_error_code(status: &str) -> String {
+    format!("Profile{status}")
+}
+
 /// `SigningStatus`'s values, spelled as the model spells them (see
 /// [`crate::ops::types::SIGNING_STATUS_VALUES`]).
 pub const JOB_STATUS_IN_PROGRESS: &str = "InProgress";
@@ -129,6 +158,11 @@ impl SigningProfileRecord {
     /// signing jobs", and a revoked one signs nothing either.
     pub fn can_sign(&self) -> bool {
         self.status == PROFILE_STATUS_ACTIVE
+    }
+
+    /// Whether this profile has been revoked.
+    pub fn is_revoked(&self) -> bool {
+        self.status == PROFILE_STATUS_REVOKED
     }
 
     /// The stored tags, as the wire map — absent when there are none.
@@ -404,31 +438,88 @@ pub fn signed_object_of(destination: &Destination, job_id: &str) -> SignedObject
     }
 }
 
-/// The display name AWS Signer publishes for a signing platform, or `None` for a
-/// platform id this emulator holds no entry for.
+/// One signing platform this emulator publishes.
+#[derive(Debug, Clone, Copy)]
+pub struct SigningPlatformEntry {
+    /// The `platformId` a `PutSigningProfile` names.
+    pub platform_id: &'static str,
+    /// The `displayName` AWS Signer publishes for it.
+    pub display_name: &'static str,
+    /// Whether a profile on this platform must name the ACM certificate its
+    /// signatures are issued under (`signingMaterial`).
+    pub requires_signing_material: bool,
+}
+
+/// The signing platforms this emulator publishes, with the two facts the
+/// profile/job slice needs about each.
 ///
-/// Source: the `platformId` / `displayName` pairs of the signing platforms AWS
-/// Signer documents. The catalog itself is what `ListSigningPlatforms` and
-/// `GetSigningPlatform` serve — both are still stubs, with their own gap issues —
-/// so this is the one lookup into it the profile/job slice needs, and a platform
-/// outside it simply has no display name to report.
-pub fn platform_display_name(platform_id: &str) -> Option<String> {
-    const CATALOG: &[(&str, &str)] = &[
-        (
-            "AWSIoTDeviceManagement-SHA256-ECDSA",
-            "AWS IoT Device Management SHA256-ECDSA",
-        ),
-        ("AWSLambda-SHA384-ECDSA", "AWS Lambda"),
-        ("AmazonFreeRTOS-Default", "AmazonFreeRTOS SHA256-ECDSA"),
-        (
-            "AmazonFreeRTOS-TI-CC3220SF",
-            "AmazonFreeRTOS SHA1-RSA CC3220SF-Format",
-        ),
-    ];
-    CATALOG
+/// Source: the `platformId` / `displayName` pairs of the code-signing platforms
+/// AWS Signer documents (AWS IoT Device Management, AWS Lambda, FreeRTOS). The
+/// catalog itself is what `ListSigningPlatforms` and `GetSigningPlatform` serve —
+/// both are still stubs, with their own gap issues — so the two lookups below are
+/// the ones this slice needs.
+///
+/// `requires_signing_material` is a SEPARATE fact from publishing a display name,
+/// stated per entry rather than inferred from membership: for each of these
+/// platforms the recorded `PutSigningProfile` accepts a profile created with no
+/// `signingMaterial`, while a platform this catalog does not name is refused
+/// ("signing material cannot be null."). A platform added here for its display
+/// name alone must therefore state its own answer — see
+/// [`platform_requires_signing_material`] for what an UNPUBLISHED platform
+/// answers and why.
+pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
+    SigningPlatformEntry {
+        platform_id: "AWSIoTDeviceManagement-SHA256-ECDSA",
+        display_name: "AWS IoT Device Management SHA256-ECDSA",
+        requires_signing_material: false,
+    },
+    SigningPlatformEntry {
+        platform_id: "AWSLambda-SHA384-ECDSA",
+        display_name: "AWS Lambda",
+        requires_signing_material: false,
+    },
+    SigningPlatformEntry {
+        platform_id: "AmazonFreeRTOS-Default",
+        display_name: "AmazonFreeRTOS SHA256-ECDSA",
+        requires_signing_material: false,
+    },
+    SigningPlatformEntry {
+        platform_id: "AmazonFreeRTOS-TI-CC3220SF",
+        display_name: "AmazonFreeRTOS SHA1-RSA CC3220SF-Format",
+        requires_signing_material: false,
+    },
+];
+
+/// The catalog entry for `platform_id`, or `None` for a platform this emulator
+/// publishes no entry for.
+pub fn signing_platform(platform_id: &str) -> Option<&'static SigningPlatformEntry> {
+    SIGNING_PLATFORM_CATALOG
         .iter()
-        .find(|(id, _)| *id == platform_id)
-        .map(|(_, display)| (*display).to_string())
+        .find(|entry| entry.platform_id == platform_id)
+}
+
+/// The display name AWS Signer publishes for a signing platform, or `None` for a
+/// platform id [`SIGNING_PLATFORM_CATALOG`] holds no entry for — such a platform
+/// simply has no display name to report.
+pub fn platform_display_name(platform_id: &str) -> Option<String> {
+    signing_platform(platform_id).map(|entry| entry.display_name.to_string())
+}
+
+/// Whether a profile on `platform_id` must carry `signingMaterial` — the ACM
+/// certificate its signatures are issued under.
+///
+/// A published platform answers with its own
+/// [`SigningPlatformEntry::requires_signing_material`]. A platform this emulator
+/// publishes NO entry for defaults to requiring it: a profile on a platform whose
+/// signing configuration is unknown here holds the certificate itself, which is
+/// what the recorded `PutSigningProfile` shows — it refuses such a request with
+/// "signing material cannot be null." rather than accepting it.
+///
+/// The model cannot express the distinction: `signingMaterial` is one optional
+/// member for every platform
+/// (`smithy_query(query="shape",shape="PutSigningProfileRequest")`).
+pub fn platform_requires_signing_material(platform_id: &str) -> bool {
+    signing_platform(platform_id).is_none_or(|entry| entry.requires_signing_material)
 }
 
 /// True when `value` satisfies `ProfileName`'s `@length(2, 64)` and

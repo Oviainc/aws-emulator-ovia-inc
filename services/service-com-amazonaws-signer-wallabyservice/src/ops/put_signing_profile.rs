@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(PutSigningProfileErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
                     message: Some("the signer profile store is unavailable".to_string()),
-                    code: None,
+                    code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
                 },
             )
             .into());
@@ -181,6 +181,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+
+        // A signing profile signs with a certificate, and which platforms hold
+        // that certificate on the profile — rather than having AWS Signer issue it
+        // — is what `crate::state::platform_requires_signing_material` states,
+        // with the recorded evidence for the split. Refused HERE, before anything
+        // is written, so a profile that could not exist on AWS never reaches the
+        // store.
+        if input.signing_material.is_none()
+            && crate::state::platform_requires_signing_material(&input.platform_id)
+        {
+            return Err(PutSigningProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("signing material cannot be null.".to_string()),
+                    code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
 
         // A profile keeps its identity across puts — same name, same ARN, same

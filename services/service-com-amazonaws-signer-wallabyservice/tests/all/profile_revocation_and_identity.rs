@@ -200,10 +200,16 @@ fn profile_cases() -> Vec<ProfileCase> {
             }),
         },
         // A platform the documented catalog does not name, with a YEARS period.
+        // Such a platform's profile holds the certificate its signatures are
+        // issued under, so the request names one (see
+        // `crate::state::platform_requires_signing_material`).
         ProfileCase {
             name: "Private_Platform_Profile",
             request: json!({
                 "platformId": "PrivatePlatform-SHA256-ECDSA",
+                "signingMaterial": {
+                    "certificateArn": "arn:aws:acm:eu-west-1:000000000000:certificate/abc",
+                },
                 "signatureValidityPeriod": { "value": 2, "type": "YEARS" },
             }),
         },

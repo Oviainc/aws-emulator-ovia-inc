@@ -89,8 +89,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-signer-wallabyservice.j
 pub struct RevokeSigningProfileOutput;
 
 impl RevokeSigningProfileOutput {
-    // `with_http` carries this operation's modelled response status. Remove it and
-    // the status falls back to the protocol default, so a modelled 204 answers 200.
+    // `with_http` carries this operation's response status. The model gives this
+    // operation `output: Unit` with no `@http(code:)` of its own, so the model's
+    // value is the protocol default 200; the RECORDED success is 204 — an empty
+    // (Unit) output and No Content — and the wire is what a client reads, so 204
+    // is what this emulator answers. Remove the trait and the status falls back to
+    // the protocol default, so a 204 would answer 200.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
@@ -149,10 +153,14 @@ impl From<RevokeSigningProfileErrorModeled> for RevokeSigningProfileError {
 
 /// The modelled 404 for a profile, or a profile version, this account holds none
 /// of.
+///
+/// `code` names the condition a client branches on: the profile resource the
+/// request named — a name, or a version of that name — does not exist. Both are
+/// the same condition to a caller, which is why they carry the one code.
 fn not_found(message: String) -> RevokeSigningProfileError {
     RevokeSigningProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(message),
-        code: None,
+        code: Some(crate::state::ERROR_CODE_PROFILE_NOT_FOUND.to_string()),
     })
     .into()
 }
@@ -200,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 RevokeSigningProfileErrorModeled::InternalServiceErrorException(
                     InternalServiceErrorException {
                         message: Some("the signer profile store is unavailable".to_string()),
-                        code: None,
+                        code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
                     },
                 )
                 .into(),
@@ -217,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(profile) = store.profiles.get_mut(&input.profile_name) else {
             return Err(not_found(format!(
-                "Signing profile {} not found",
+                "profile with name {} does not exists",
                 input.profile_name
             )));
         };

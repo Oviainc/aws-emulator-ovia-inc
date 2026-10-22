@@ -795,3 +795,125 @@ async fn a_value_outside_a_modelled_constraint_is_a_validation_error() {
         }
     }
 }
+
+/// A required member the request supplied nothing for is refused for the
+/// constraint it ACTUALLY violated, named together with the member.
+///
+/// For the LIST member that constraint is "must not be null or empty": a
+/// query-bound list that is absent and one that is empty are the SAME request —
+/// an SDK serializing an empty list emits no parameter at all — so the refusal
+/// cannot assert the value was null. For a single-value member absence IS null,
+/// so those keep the framework's own wording, which says exactly that.
+///
+/// One row per required member (the model marks all five `@required` +
+/// `@httpQuery`), plus the row that omits every one of them, plus the row where
+/// the member is present and its VALUE is what fails — a different constraint,
+/// which keeps its own wording.
+#[tokio::test]
+async fn a_missing_required_member_is_refused_for_the_constraint_it_violated() {
+    let emulator = Emulator::new();
+    let profile = profile_version_arn("constraint");
+    let job = job_arn("constraint");
+    let hash = certificate_hash("constraint");
+    let complete = params(
+        base_instant(),
+        PLATFORM,
+        &profile,
+        &job,
+        std::slice::from_ref(&hash),
+    );
+
+    // The one LIST member: `certificateHashes` targets `CertificateHashes`
+    // (smithy_query(query="shape",shape="CertificateHashes") — type "list");
+    // every other required member targets a single value.
+    let list_member = "certificateHashes";
+    let required = [
+        "signatureTimestamp",
+        "platformId",
+        "profileVersionArn",
+        "jobArn",
+        list_member,
+    ];
+
+    for omitted in required {
+        let case = format!("omitted={omitted}");
+        let partial: Vec<(&str, String)> = complete
+            .iter()
+            .filter(|(name, _)| *name != omitted)
+            .cloned()
+            .collect();
+        let (status, body) = emulator.get(&partial).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected HTTP 400, got {status} with {body}"
+        );
+        let (code, message) = error_of(&body, &case);
+        assert_eq!(
+            code, "ValidationException",
+            "case {case}: expected ValidationException, got {body}"
+        );
+        if omitted == list_member {
+            assert_eq!(
+                message,
+                format!("{omitted} must not be null or empty"),
+                "case {case}: expected the refusal to name the member and the empty-or-null \
+                 constraint it violated, got {message:?}"
+            );
+        } else {
+            assert!(
+                message.contains(omitted) && message.contains("must not be null"),
+                "case {case}: expected the refusal to name the member and that it must not be \
+                 null, got {message:?}"
+            );
+            assert!(
+                !message.contains("or empty"),
+                "case {case}: a single-value member has no empty form, so the refusal must not \
+                 claim one, got {message:?}"
+            );
+        }
+    }
+
+    // Nothing on the query string: a mixed refusal, which keeps the framework's
+    // wording naming every member.
+    let (status, body) = emulator.get(&[]).await;
+    assert_eq!(
+        status, 400,
+        "case omitted=all: expected HTTP 400, got {status} with {body}"
+    );
+    let (_, message) = error_of(&body, "omitted=all");
+    for member in required {
+        assert!(
+            message.contains(member),
+            "case omitted=all: expected the message to name {member}, got {message:?}"
+        );
+    }
+
+    // A member that IS supplied, with a value that fails a bound, is a different
+    // refusal: it keeps the wording that echoes the offending value, and must not
+    // claim the member was absent. `CertificateHash` is `@length(1, 2048)`, so an
+    // empty hash is a value violation rather than an empty list.
+    let empty_hash: Vec<(&str, String)> = complete
+        .iter()
+        .map(|(name, value)| {
+            if *name == list_member {
+                (*name, String::new())
+            } else {
+                (*name, value.clone())
+            }
+        })
+        .collect();
+    let (status, body) = emulator.get(&empty_hash).await;
+    assert_eq!(
+        status, 400,
+        "case certificateHashes=<empty value>: expected HTTP 400, got {status} with {body}"
+    );
+    let (code, message) = error_of(&body, "certificateHashes=<empty value>");
+    assert_eq!(
+        code, "ValidationException",
+        "case certificateHashes=<empty value>: expected ValidationException, got {body}"
+    );
+    assert!(
+        message.contains(list_member),
+        "case certificateHashes=<empty value>: the refusal must name the member, got {message:?}"
+    );
+}

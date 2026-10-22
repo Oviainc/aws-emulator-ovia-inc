@@ -3,7 +3,9 @@
 //! @op CancelSigningProfile
 //!
 //! Implemented: moves the stored profile to `Canceled`. Signer does not delete a
-//! canceled profile — it stays viewable, and stops signing.
+//! canceled profile — it stays viewable, and stops signing. A profile that has
+//! been REVOKED cannot be canceled, and the attempt is refused with the modelled
+//! 400 rather than performed.
 //!
 //! The success answer is `204 No Content` with no body: the output is `Unit`, and
 //! the recorded AWS answer to this `DELETE` is 204, not the 200 the model's
@@ -112,13 +114,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for CancelSigningProfileOutp
 // here — hence the `CancelSigningProfileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.signer#CancelSigningProfile")]
+//
+// `extra_errors` widens the set with `ValidationException`, a shape the SERVICE
+// models (`message` + `code`, `@httpError 400`) and other operations list, which
+// this one does not: it is the 400 a cancel of a REVOKED profile is refused with,
+// and the only modelled shape that can carry the `code` naming that condition.
+#[smithy_macros::operation_error(
+    "com.amazonaws.signer#CancelSigningProfile",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum CancelSigningProfileErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServiceErrorException(InternalServiceErrorException),
     ResourceNotFoundException(ResourceNotFoundException),
     TooManyRequestsException(TooManyRequestsException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -180,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CancelSigningProfileErrorModeled::InternalServiceErrorException(
                     InternalServiceErrorException {
                         message: Some("the signer profile store is unavailable".to_string()),
-                        code: None,
+                        code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
                     },
                 )
                 .into(),
@@ -193,20 +204,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CancelSigningProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!(
-                            "Signing profile {} not found",
+                            "profile with name {} does not exists",
                             input.profile_name
                         )),
-                        code: None,
+                        code: Some(crate::state::ERROR_CODE_PROFILE_NOT_FOUND.to_string()),
                     },
                 )
                 .into(),
             );
         };
 
-        // "Changes the state of an ACTIVE signing profile to CANCELED. A canceled
-        // profile is still viewable with the ListSigningProfiles operation, but it
-        // cannot perform new signing jobs." So the record stays; only its status
-        // moves, and a cancel of an already-canceled profile changes nothing.
+        // "Changes the state of an ACTIVE signing profile to CANCELED", and a
+        // profile that has been revoked is not active — so the transition is
+        // refused rather than performed, with the `code` naming the status that
+        // forbids it. The gate reads the status the store holds NOW, not the
+        // profile's history: a later `PutSigningProfile` re-versions the profile
+        // and makes it `Active` again, and then the same cancel is admitted.
+        if profile.is_revoked() {
+            return Err(CancelSigningProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Signing Profile {} cannot be canceled because it has been revoked. \
+                         A revoked profile cannot be canceled.",
+                        profile.profile_name
+                    )),
+                    code: Some(crate::state::profile_status_error_code(&profile.status)),
+                },
+            )
+            .into());
+        }
+
+        // "A canceled profile is still viewable with the ListSigningProfiles
+        // operation, but it cannot perform new signing jobs." So the record stays;
+        // only its status moves, and a cancel of an already-canceled profile
+        // changes nothing.
         profile.status = crate::state::PROFILE_STATUS_CANCELED.to_string();
 
         Ok(CancelSigningProfileOutput)
