@@ -95,15 +95,6 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     }
 }
 
-/// The modelled failure for a taggable ARN the store holds no resource under.
-fn not_found(resource_arn: &str) -> ListTagsForResourceError {
-    ListTagsForResourceErrorModeled::ResourceNotFound(ResourceNotFound {
-        message: Some(crate::state::resource_not_found_message(resource_arn)),
-        resource_name: Some(resource_arn.to_string()),
-    })
-    .into()
-}
-
 /// The `ListTagsForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -146,42 +137,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // The same ARN rule `TagResource` reads: `resourceArn` is "the ARN for the
-        // Step Functions state machine or activity", and anything else — another
-        // service's ARN, another Step Functions resource type, another region's ARN —
-        // is an ARN this operation cannot read, which `InvalidArn` reports with its
-        // own HTTP 400, before any resource resolution.
+        // The ARN is VALIDATED before anything is looked up: `resourceArn` is "the ARN
+        // for the Step Functions state machine or activity", and anything else —
+        // another service's ARN, another Step Functions resource type, another
+        // region's ARN — is an ARN this operation cannot read, which `InvalidArn`
+        // reports with its own HTTP 400, before any resource resolution.
         let endpoint_region = crate::state::request_region(ctx.parts());
-        let target = match crate::state::read_taggable_arn(&input.resource_arn, &endpoint_region) {
-            Ok(target) => target,
-            Err(message) => {
-                return Err(ListTagsForResourceErrorModeled::InvalidArn(InvalidArn {
-                    message: Some(message),
-                })
-                .into())
-            }
-        };
+        if let Err(message) = crate::state::read_taggable_arn(&input.resource_arn, &endpoint_region)
+        {
+            return Err(ListTagsForResourceErrorModeled::InvalidArn(InvalidArn {
+                message: Some(message),
+            })
+            .into());
+        }
 
         let mut store = state.lock();
         // Materialising a deletion the clock already owes is the one write a report
         // may make: it was due at the same instant whether or not anybody called.
         store.settle(crate::state::now());
 
-        // No activity can be in the store — `CreateActivity` is still scaffolded — so
-        // an activity ARN names a resource that could not be found.
-        match target {
-            crate::state::TaggableResource::Activity(_) => Err(not_found(&input.resource_arn)),
-            crate::state::TaggableResource::StateMachine(_) => {
-                match store.state_machines.get(&input.resource_arn) {
-                    None => Err(not_found(&input.resource_arn)),
-                    // A resource with no tags has an EMPTY tag list, not an absent
-                    // one: the member is "an array of tags associated with the
-                    // resource", and the array of a resource nothing tagged is empty.
-                    Some(machine) => Ok(ListTagsForResourceOutput {
-                        tags: Some(machine.tags.clone()),
-                    }),
-                }
-            }
-        }
+        // Past that validation this operation REPORTS the tags recorded under the ARN;
+        // it does not resolve the resource. `tags` is "an array of tags associated
+        // with the resource", and the array of an ARN nothing is tagged under is
+        // EMPTY — for a resource that carries no tags, for one whose last tag was
+        // removed, and for an ARN the store holds nothing under at all (a state
+        // machine that was never created or has been deleted, a version or alias
+        // qualifier, an activity). So the read answers 200 with an empty `TagList`
+        // instead of reporting the resource as absent.
+        //
+        // That is the RECORDED behaviour, not an inference: the wire recording of
+        // `states-resource-tagging-workflow` step task#13 asks for
+        // `arn:aws:states:<region>:<account>:stateMachine:never-created`, a name
+        // nothing in the fixture ever created, and the service answers HTTP 200 with
+        // `tags: []`. The modelled `ResourceNotFound` therefore belongs to the tag
+        // WRITE paths (`TagResource`, `UntagResource`), which are what need the
+        // resource to be there; no request this emulator can serve reaches it here.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(store.tags_of(&input.resource_arn)),
+        })
     }
 }

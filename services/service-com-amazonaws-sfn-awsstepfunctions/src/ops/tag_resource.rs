@@ -109,9 +109,13 @@ fn not_found(resource_arn: &str) -> TagResourceError {
 }
 
 /// The modelled failure for a tag write a resource cannot take.
-fn too_many_tags(resource_arn: &str, message: String) -> TagResourceError {
+///
+/// The text is the service's FIXED `TooManyTags` string
+/// ([`crate::state::TOO_MANY_TAGS_MESSAGE`]): the refusal carries no request
+/// values, so neither the limit nor the request's tag count is echoed into it.
+fn too_many_tags(resource_arn: &str) -> TagResourceError {
     TagResourceErrorModeled::TooManyTags(TooManyTags {
-        message: Some(message),
+        message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
         resource_name: Some(resource_arn.to_string()),
     })
     .into()
@@ -181,14 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before the store is touched: every loop below then runs over at most
         // `MAX_TAGS` entries, whatever the request's length.
         if input.tags.len() > crate::state::MAX_TAGS {
-            return Err(too_many_tags(
-                &input.resource_arn,
-                format!(
-                    "a Step Functions resource accepts at most {} tags, got {} in one request",
-                    crate::state::MAX_TAGS,
-                    input.tags.len()
-                ),
-            ));
+            return Err(too_many_tags(&input.resource_arn));
         }
 
         // A tag is a key-value PAIR and the key is what the write is keyed by, so an
@@ -224,24 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Err(crate::state::TagWriteRejection::NotFound) => {
                         Err(not_found(&input.resource_arn))
                     }
-                    Err(crate::state::TagWriteRejection::TooManyTags(would_hold)) => {
-                        Err(too_many_tags(
-                            &input.resource_arn,
-                            format!(
-                                "a Step Functions resource accepts at most {} tags; this request \
-                                 would leave it holding {would_hold}",
-                                crate::state::MAX_TAGS
-                            ),
-                        ))
-                    }
-                    Err(crate::state::TagWriteRejection::NoRoom) => Err(too_many_tags(
-                        &input.resource_arn,
-                        format!(
-                            "these tags would take the store past the {} bytes this emulator \
-                             retains",
-                            crate::state::MAX_STORE_BYTES
-                        ),
-                    )),
+                    // Both remaining rejections are the one modelled limit error,
+                    // and it carries the service's fixed text: a merge that would
+                    // leave the resource past `MAX_TAGS`, and one that would take
+                    // this emulator's store past `MAX_STORE_BYTES`.
+                    Err(
+                        crate::state::TagWriteRejection::TooManyTags(_)
+                        | crate::state::TagWriteRejection::NoRoom,
+                    ) => Err(too_many_tags(&input.resource_arn)),
                 }
             }
         }
