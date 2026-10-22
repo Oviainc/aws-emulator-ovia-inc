@@ -398,6 +398,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whole store.
         store.track_pending_run(&input.scan_name, run_index, settle_due_millis);
 
+        // A recorded scan is a CodeGuru Security resource of this account, so by here the
+        // account is onboarded to the service and its configuration record exists (see
+        // `crate::state::Store::onboard_account`): idempotent, so an account that already
+        // had one keeps the key it configured.
+        store.onboard_account(now);
+
         if let Some(token) = input.client_token.clone() {
             store
                 .idempotency

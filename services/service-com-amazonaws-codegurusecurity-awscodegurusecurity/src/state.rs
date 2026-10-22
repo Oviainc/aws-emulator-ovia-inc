@@ -177,6 +177,24 @@ pub struct ScanRun {
     pub settle_due_millis: i64,
 }
 
+/// The account's CodeGuru Security configuration record — the resource
+/// `GetAccountConfiguration` reports and `UpdateAccountConfiguration` updates.
+///
+/// Its EXISTENCE is what distinguishes an account that CodeGuru Security holds a
+/// configuration for from one it does not: an account with a record may be using the
+/// default AWS-managed key (`encryption_kms_key_arn` absent), which is a different state
+/// from having no record at all.
+#[derive(Debug, Clone)]
+pub struct AccountConfiguration {
+    /// The account's `encryptionConfig.kmsKeyArn`: the customer-managed KMS key, or
+    /// absent while the account uses the AWS-managed key ("If an AWS-managed key is used
+    /// for encryption, returns empty", `EncryptionConfig$kmsKeyArn`).
+    pub encryption_kms_key_arn: Option<String>,
+    /// Epoch milliseconds at which the record came into existence (see
+    /// [`Store::onboard_account`]).
+    pub created_at_millis: i64,
+}
+
 /// A scan: the unique name CodeGuru Security tracks revisions of a resource under,
 /// plus every run recorded against it.
 #[derive(Debug, Clone)]
@@ -261,15 +279,14 @@ pub struct ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// scan name as well as the token, so a token reused for a different scan can never
     /// answer for the other scan's run.
     pub idempotency: HashMap<(String, String), String>,
-    /// The account's `encryptionConfig.kmsKeyArn`, which decides the server-side
-    /// encryption headers `CreateUploadUrl` requires for an upload. Absent until
-    /// `UpdateAccountConfiguration` sets one — "By default, CodeGuru Security uses an
-    /// AWS-managed key for encryption" (`GetAccountConfigurationResponse$encryptionConfig`)
-    /// — and absent again once an update passes an `encryptionConfig` with no key. The
-    /// SINGLE copy of the configuration: `GetAccountConfiguration` reports it and
-    /// `CreateUploadUrl` derives an upload's encryption headers from it, so there is no
-    /// second copy to drift.
-    pub encryption_kms_key_arn: Option<String>,
+    /// The account's configuration record, absent until the account is onboarded to
+    /// CodeGuru Security ([`Self::onboard_account`]). The SINGLE copy of the
+    /// configuration: `GetAccountConfiguration` reports it, `UpdateAccountConfiguration`
+    /// updates it (and refuses while it is absent) and `CreateUploadUrl` derives an
+    /// upload's server-side-encryption headers from it, so there is no second copy to
+    /// drift. One record, not a map: every request this emulator serves is for the one
+    /// emulator account (`engine::emulator_account_id`).
+    pub account_configuration: Option<AccountConfiguration>,
 }
 
 /// Shorthand for this service's state, used in the doc links above.
@@ -317,6 +334,38 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         for key in due {
             self.artifact_expiry.remove(&key);
             self.upload_artifacts.remove(&key.1);
+        }
+    }
+
+    /// The account's configured customer-managed `encryptionConfig.kmsKeyArn`: the key
+    /// of the account's configuration record, and none when the account has no record or
+    /// its record names no key (both are the documented AWS-managed default — "By
+    /// default, CodeGuru Security uses an AWS-managed key for encryption",
+    /// `GetAccountConfigurationResponse$encryptionConfig`).
+    pub fn encryption_kms_key_arn(&self) -> Option<String> {
+        self.account_configuration
+            .as_ref()
+            .and_then(|config| config.encryption_kms_key_arn.clone())
+    }
+
+    /// Bring the account's configuration record into existence, if it does not exist yet,
+    /// as the account's first CodeGuru Security resource does.
+    ///
+    /// CodeGuru Security holds an account configuration for an account that is ONBOARDED
+    /// to the service, and its API has no onboarding operation: the record appears when
+    /// the account starts using the service. This emulator therefore creates it on the
+    /// first call that registers a resource for the account (`CreateUploadUrl`,
+    /// `CreateScan`), and a newly created record names no customer-managed key, so the
+    /// account keeps using the AWS-managed key until an update names one.
+    ///
+    /// IDEMPOTENT: an account that already has a record keeps it, with the key it
+    /// configured and the instant it was created.
+    pub fn onboard_account(&mut self, now_millis: i64) {
+        if self.account_configuration.is_none() {
+            self.account_configuration = Some(AccountConfiguration {
+                encryption_kms_key_arn: None,
+                created_at_millis: now_millis,
+            });
         }
     }
 
