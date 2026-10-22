@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFacet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFacet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFacet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a facet, with its attribute definitions, object type and style, on the
+//! schema named by the `x-amz-data-partition` header. Published schemas are immutable,
+//! so only a development or an applied schema accepts a new facet.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +170,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFacet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFacetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFacet"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateFacetErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Cloud Directory state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The enum members are modelled as open enums, so their values are checked here
+        // against the model's own value lists rather than at the boundary.
+        if let Some(object_type) = input.object_type.as_deref() {
+            if !OBJECT_TYPE_VALUES.contains(&object_type) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "ObjectType must be one of {}; got {object_type:?}",
+                    OBJECT_TYPE_VALUES.join(", ")
+                )));
+            }
+        }
+        if let Some(facet_style) = input.facet_style.as_deref() {
+            if !FACET_STYLE_VALUES.contains(&facet_style) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "FacetStyle must be one of {}; got {facet_style:?}",
+                    FACET_STYLE_VALUES.join(", ")
+                )));
+            }
+        }
+
+        // Bounded BEFORE the list is copied or the store lock is taken: the facet's
+        // attribute list is caller-sized and is read again by every later CreateObject
+        // that names this facet, so it is the second factor of that per-request work.
+        let requested_attribute_count = input.attributes.as_ref().map_or(0, Vec::len);
+        if requested_attribute_count > crate::state::ATTRIBUTES_PER_FACET_QUOTA {
+            return Err(CreateFacetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Attributes holds {requested_attribute_count} entries; a facet \
+                         defines at most {}",
+                        crate::state::ATTRIBUTES_PER_FACET_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let attributes = input.attributes.clone().unwrap_or_default();
+        for attribute in &attributes {
+            validate_facet_attribute(attribute)?;
+        }
+
+        let mut store = state.lock();
+        let Some(schema) = store.schemas.get_mut(&input.schema_arn) else {
+            return Err(CreateFacetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no schema exists at {}", input.schema_arn)),
+                },
+            )
+            .into());
+        };
+        if schema.stage == crate::state::SchemaStage::Published {
+            // From `CreateSchema`'s own documentation: "Published schemas are
+            // immutable", while "Applied schemas are mutable in a way that allows you
+            // to add new schema facets" — so only the published stage is refused here.
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "{} is a published schema; published schemas are immutable",
+                input.schema_arn
+            )));
+        }
+        if schema.facets.contains_key(&input.name) {
+            return Err(CreateFacetErrorModeled::FacetAlreadyExistsException(
+                FacetAlreadyExistsException {
+                    message: Some(format!(
+                        "a facet named {} already exists on schema {}",
+                        input.name, input.schema_arn
+                    )),
+                },
+            )
+            .into());
+        }
+        // A schema's facet set is bounded: it holds state for the life of the process
+        // and every request may add to it.
+        if schema.facets.len() >= crate::state::FACETS_PER_SCHEMA_QUOTA {
+            return Err(CreateFacetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "schema {} already holds the maximum of {} facets",
+                        input.schema_arn,
+                        crate::state::FACETS_PER_SCHEMA_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        schema.facets.insert(
+            input.name.clone(),
+            crate::state::FacetRecord {
+                name: input.name.clone(),
+                object_type: input.object_type.clone(),
+                facet_style: input.facet_style.clone(),
+                attributes,
+            },
+        );
+
+        Ok(CreateFacetOutput {})
     }
+}
+
+/// Refuse a facet attribute the service cannot store a value against.
+///
+/// A `FacetAttribute` carries EITHER its own `AttributeDefinition` or an
+/// `AttributeReference` to another facet's attribute — never both and never neither,
+/// because a facet with no resolvable type cannot validate an object's value. The
+/// `Type`, `RequiredBehavior` and `Rules` values are checked against the model's own
+/// value lists for `FacetAttributeType`, `RequiredAttributeBehavior` and `RuleType`.
+fn validate_facet_attribute(attribute: &FacetAttribute) -> Result<(), CreateFacetError> {
+    let facet_validation = |message: String| -> CreateFacetError {
+        CreateFacetErrorModeled::FacetValidationException(FacetValidationException {
+            message: Some(message),
+        })
+        .into()
+    };
+
+    match (
+        attribute.attribute_definition.as_ref(),
+        attribute.attribute_reference.as_ref(),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(facet_validation(format!(
+                "attribute {}: exactly one of AttributeDefinition and AttributeReference \
+                 may be set, not both",
+                attribute.name
+            )))
+        }
+        (None, None) => {
+            return Err(facet_validation(format!(
+                "attribute {}: one of AttributeDefinition or AttributeReference is required",
+                attribute.name
+            )))
+        }
+        (Some(definition), None) => {
+            if !FACET_ATTRIBUTE_TYPE_VALUES.contains(&definition.r#type.as_str()) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "attribute {}: AttributeDefinition.Type must be one of {}; got {:?}",
+                    attribute.name,
+                    FACET_ATTRIBUTE_TYPE_VALUES.join(", "),
+                    definition.r#type
+                )));
+            }
+            for (name, rule) in definition.rules.iter().flatten() {
+                let Some(rule_type) = rule.r#type.as_deref() else {
+                    continue;
+                };
+                if !RULE_TYPE_VALUES.contains(&rule_type) {
+                    return Err(CreateFacetErrorModeled::InvalidRuleException(
+                        InvalidRuleException {
+                            message: Some(format!(
+                                "attribute {}: rule {name}: Type must be one of {}; got \
+                                 {rule_type:?}",
+                                attribute.name,
+                                RULE_TYPE_VALUES.join(", ")
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+        (None, Some(_)) => {}
+    }
+
+    if let Some(behavior) = attribute.required_behavior.as_deref() {
+        if !REQUIRED_ATTRIBUTE_BEHAVIOR_VALUES.contains(&behavior) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "attribute {}: RequiredBehavior must be one of {}; got {behavior:?}",
+                attribute.name,
+                REQUIRED_ATTRIBUTE_BEHAVIOR_VALUES.join(", ")
+            )));
+        }
+    }
+
+    Ok(())
 }
