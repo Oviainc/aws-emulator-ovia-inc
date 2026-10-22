@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-marketplacecatalog-awsmpseymour.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.marketplacecatalog#ListEntitiesRequest")]
+// `skip_validation` names `Catalog` and `NextToken` (see `ListAssessmentsInput`) plus
+// `EntityType`: a letters-only value satisfies the modelled `@pattern` and may still name
+// no entity type at all, and only the handler holds the set of types this catalog has
+// (`crate::state::ENTITY_TYPES`), so it is what judges the member.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.marketplacecatalog#ListEntitiesRequest",
+    skip_validation = ["Catalog", "EntityType", "NextToken"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListEntitiesInput {
     pub catalog: String,

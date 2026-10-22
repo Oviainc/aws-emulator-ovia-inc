@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateKeyDescription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateKeyDescription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replaces the stored description of the key a `KeyId` names, so the
+//! `DescribeKey` that follows reports the value just written. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateKeyDescription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The description is the only thing this write touches: the key's spec, usage, state
+//! and material are untouched, and the operation answers the modelled `Unit` output
+//! (HTTP 200 with an empty body).
+//!
+//! A key awaiting deletion is refused with `KMSInvalidStateException`: "The key state
+//! of the KMS key is not compatible with the operation"
+//! (`smithy_query(query="doc",shape="KMSInvalidStateException")`) — the key has to be
+//! restored with `CancelKeyDeletion` before its metadata can be edited again.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +185,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateKeyDescription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateKeyDescriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateKeyDescription"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateKeyDescriptionErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        let key = match state.resolve_mut(&region, &input.key_id) {
+            crate::state::KeyRefMut::Found(key) => key,
+            crate::state::KeyRefMut::MalformedArn => {
+                return Err(UpdateKeyDescriptionErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(format!(
+                            "The specified ARN is not valid: {}.",
+                            input.key_id
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRefMut::NotFound => {
+                return Err(UpdateKeyDescriptionErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(
+                            &region,
+                            &input.key_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // A key scheduled for deletion is not in a state this operation accepts: its
+        // metadata stays as it was until `CancelKeyDeletion` restores it.
+        if key.key_state == crate::state::KEY_STATE_PENDING_DELETION {
+            return Err(UpdateKeyDescriptionErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(format!(
+                        "{} is not in a valid state for this operation. Its key state is {}.",
+                        key.arn, key.key_state
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "New description for the KMS key"
+        // (`smithy_query(query="doc",shape="UpdateKeyDescriptionRequest",member="Description")`):
+        // the member is required and its length is modelled, so what arrives here
+        // REPLACES the stored description, whatever it was — including with the empty
+        // string, which the modelled `@length(0..8192)` allows.
+        key.description = input.description.clone();
+
+        Ok(UpdateKeyDescriptionOutput)
     }
 }

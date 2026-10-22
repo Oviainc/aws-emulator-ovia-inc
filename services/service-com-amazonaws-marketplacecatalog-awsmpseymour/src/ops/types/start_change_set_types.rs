@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-marketplacecatalog-awsmpseymour.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.marketplacecatalog#StartChangeSetRequest")]
+// `skip_validation` names `Catalog` (see `CancelChangeSetInput`) plus `ChangeSetName` and
+// `ClientRequestToken`, whose faults quote the syntax this service publishes — the
+// modelled `@pattern` with the modelled `@length` folded into it — rather than the raw
+// pattern, so the HANDLER judges them and answers the modelled `ValidationException`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.marketplacecatalog#StartChangeSetRequest",
+    skip_validation = ["Catalog", "ChangeSetName", "ClientRequestToken"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct StartChangeSetInput {
     pub catalog: String,

@@ -151,15 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `EntityRequest$Catalog` documents the same fixed value every other
-        // operation's `Catalog` does, so an entry naming another catalog is a
-        // bad request rather than a missing entity: it is refused for the whole
-        // call, before any entity is read.
+        // operation's `Catalog` does, and it selects the STORE the whole call
+        // reads rather than one entry's record, so an entry naming another
+        // catalog is a bad request rather than a missing entity: it is refused
+        // for the whole call, before any entity is read.
         for request in &input.entity_request_list {
-            if request.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
-                return Err(BatchDescribeEntitiesErrorModeled::ValidationException(
-                    crate::state::wrong_catalog(&request.catalog),
-                )
-                .into());
+            if let Err(fault) = crate::state::check_catalog(&request.catalog) {
+                return Err(BatchDescribeEntitiesErrorModeled::ValidationException(fault).into());
             }
         }
 
@@ -178,8 +176,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut errors: ::std::collections::HashMap<String, BatchDescribeErrorDetail> =
             ::std::collections::HashMap::new();
         for request in &input.entity_request_list {
-            // `EntityRequest$EntityId` is modelled with `EntityId`'s own
-            // pattern, so a malformed id never reaches this handler.
+            // An entry's `EntityId` is judged PER ENTRY, not at the boundary
+            // (`skip_validation` on `EntityRequest`): a batch read reports what
+            // went wrong with one entry under that entry's own id and still
+            // serves the rest, so one malformed id neither fails the call nor
+            // costs the caller the entities the other entries asked for. The
+            // form is checked before the lookup, so a malformed id is reported
+            // as a validation failure and only a well-formed one as missing —
+            // the same two answers, under the same two codes, a single read of
+            // that entity gives.
+            if !crate::state::is_entity_id(&request.entity_id) {
+                errors.insert(
+                    request.entity_id.clone(),
+                    BatchDescribeErrorDetail {
+                        error_code: Some(crate::state::BATCH_ERROR_VALIDATION.to_string()),
+                        error_message: Some(crate::state::invalid_entity_id_message(
+                            &request.entity_id,
+                        )),
+                    },
+                );
+                continue;
+            }
             match store.entities.get(&request.entity_id) {
                 Some(entity) => {
                     entity_details.insert(
