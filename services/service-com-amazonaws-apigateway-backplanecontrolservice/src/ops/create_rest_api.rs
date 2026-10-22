@@ -3,7 +3,11 @@
 //! @op CreateRestApi
 //! IMPLEMENTED: persists a `RestApi` record in [`crate::state`] together with the
 //! implicit root resource every API is created with, and answers from the stored
-//! record.
+//! record. The members the service fills in when the request leaves them out —
+//! `apiKeySource`, `endpointConfiguration` (its endpoint types and its IP address type)
+//! and `securityPolicy` — are defaulted into that record, so the create answer and
+//! every later read of the API report the same values; see `crate::state`'s
+//! `DEFAULT_*` constants and `defaulted_endpoint_configuration`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,48 +161,6 @@ const MAX_COMPRESSION_SIZE: i32 = 10_485_760;
 /// The `apiStatus` a freshly created API is in: it is immediately usable, so it is
 /// created in the terminal `AVAILABLE` state and no later call moves it.
 const API_STATUS_AVAILABLE: &str = "AVAILABLE";
-
-/// The `apiKeySource` a REST API created without one gets: "HEADER to read the API key
-/// from the X-API-Key header of a request" (`RestApi$apiKeySource`) is API Gateway's
-/// default source, and a recorded create of an API that set none reports `HEADER`.
-const DEFAULT_API_KEY_SOURCE: &str = "HEADER";
-
-/// The endpoint type such an API gets: edge-optimized, as a recorded create of an API
-/// that set no `endpointConfiguration` reports (`{types: ['EDGE'], ipAddressType:
-/// 'ipv4'}`).
-const DEFAULT_ENDPOINT_TYPE: &str = "EDGE";
-
-/// The `ipAddressType` such an API gets; see [`DEFAULT_ENDPOINT_TYPE`].
-const DEFAULT_IP_ADDRESS_TYPE: &str = "ipv4";
-
-/// The `securityPolicy` such an API reports — "the Transport Layer Security (TLS)
-/// version + cipher suite for this RestApi" (`RestApi$securityPolicy`) — as a recorded
-/// create of an edge-optimized API that set none reports.
-const DEFAULT_SECURITY_POLICY: &str = "TLS_1_0";
-
-/// The `endpointConfiguration` a created API is stored with: what the request asked
-/// for, with each member AWS fills in itself defaulted where the request left it out.
-///
-/// AWS answers a created API with this structure populated whether or not the request
-/// carried one, so a client that reads `types` to decide edge-versus-regional behaviour
-/// or `ipAddressType` to choose a call path always has a value.
-fn defaulted_endpoint_configuration(
-    requested: Option<EndpointConfiguration>,
-) -> EndpointConfiguration {
-    let requested = requested.unwrap_or_default();
-    EndpointConfiguration {
-        types: match requested.types {
-            Some(types) if !types.is_empty() => Some(types),
-            _ => Some(vec![DEFAULT_ENDPOINT_TYPE.to_string()]),
-        },
-        ip_address_type: Some(
-            requested
-                .ip_address_type
-                .unwrap_or_else(|| DEFAULT_IP_ADDRESS_TYPE.to_string()),
-        ),
-        vpc_endpoint_ids: requested.vpc_endpoint_ids,
-    }
-}
 
 /// The `path` of an API's implicit root resource.
 pub const ROOT_RESOURCE_PATH: &str = "/";
@@ -511,20 +473,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The members AWS fills in itself when the request sets none: a created API
             // always reports an api key source, an endpoint configuration and a
             // security policy, so they are stored at create time rather than left
-            // absent for every later read to omit.
+            // absent for every later read to omit. The values and the nested
+            // completion live in `crate::state`, the one place that defaults them.
             api_key_source: Some(
                 input
                     .api_key_source
-                    .unwrap_or_else(|| DEFAULT_API_KEY_SOURCE.to_string()),
+                    .unwrap_or_else(|| crate::state::DEFAULT_API_KEY_SOURCE.to_string()),
             ),
-            endpoint_configuration: Some(defaulted_endpoint_configuration(
+            endpoint_configuration: Some(crate::state::defaulted_endpoint_configuration(
                 input.endpoint_configuration,
             )),
             policy: input.policy,
             security_policy: Some(
                 input
                     .security_policy
-                    .unwrap_or_else(|| DEFAULT_SECURITY_POLICY.to_string()),
+                    .unwrap_or_else(|| crate::state::DEFAULT_SECURITY_POLICY.to_string()),
             ),
             endpoint_access_mode: input.endpoint_access_mode,
             api_status: Some(API_STATUS_AVAILABLE.to_string()),
