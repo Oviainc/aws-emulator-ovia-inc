@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutLifecycleConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutLifecycleConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutLifecycleConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the file system's one `LifecycleConfiguration` on its
+//! [`crate::state`] record, replacing whatever it held (an empty `LifecyclePolicies`
+//! array therefore deletes it), and answers with the policies it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +176,195 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutLifecycleConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutLifecycleConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutLifecycleConfiguration"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        // A `FileSystemId` member accepts either the id or the ARN of the file system.
+        let file_system_id = efs::file_system_id_of(&input.file_system_id).to_string();
+        let Some(file_system) = state.file_systems.get(&file_system_id) else {
+            return Err(not_found(efs::file_system_not_found_message(
+                &file_system_id,
+            )));
+        };
+        // `IncorrectFileSystemLifeCycleState`: "Returned if the file system's lifecycle
+        // state is not available."
+        if file_system.life_cycle_state != efs::LIFE_CYCLE_AVAILABLE {
+            return Err(incorrect_life_cycle_state(format!(
+                "File system {file_system_id} is in life cycle state {}, not {}",
+                file_system.life_cycle_state,
+                efs::LIFE_CYCLE_AVAILABLE
+            )));
+        }
+        let throughput_mode = file_system.throughput_mode.clone();
+        let performance_mode = file_system.performance_mode.clone();
+
+        // "Amazon EFS requires that each LifecyclePolicy object have only have a single
+        // transition", and one configuration cannot name the same transition twice: it
+        // "applies to all files in the file system", so a transition has one value.
+        let mut by_transition: ::std::collections::BTreeMap<&str, &str> =
+            ::std::collections::BTreeMap::new();
+        for (index, policy) in input.lifecycle_policies.iter().enumerate() {
+            let named = transitions(policy);
+            let [(member, value)] = named[..] else {
+                return Err(bad_request(format!(
+                    "LifecyclePolicies[{index}] must name exactly one transition; it names {}",
+                    named.len()
+                )));
+            };
+            if let Some(previous) = by_transition.insert(member, value) {
+                return Err(bad_request(format!(
+                    "LifecyclePolicies names {member} more than once: {previous} and {value}"
+                )));
+            }
+        }
+
+        if let Some(archive) = by_transition.get(TRANSITION_TO_ARCHIVE).copied() {
+            // "The Archive storage class is available only for file systems that use the
+            // Elastic throughput mode and the General Purpose performance mode."
+            if throughput_mode != efs::THROUGHPUT_MODE_ELASTIC
+                || performance_mode != efs::PERFORMANCE_MODE_GENERAL_PURPOSE
+            {
+                return Err(bad_request(format!(
+                    "{TRANSITION_TO_ARCHIVE} requires ThroughputMode {} and PerformanceMode \
+                     {}; file system {file_system_id} uses {throughput_mode} and \
+                     {performance_mode}",
+                    efs::THROUGHPUT_MODE_ELASTIC,
+                    efs::PERFORMANCE_MODE_GENERAL_PURPOSE
+                )));
+            }
+            // "File systems cannot transition into Archive storage before transitioning
+            // into IA storage. Therefore, TransitionToArchive must either not be set or
+            // must be later than TransitionToIA" — so a configuration that moves files
+            // into Archive has to move them into IA first, and sooner.
+            let archive_days = after_days(archive).ok_or_else(|| {
+                bad_request(format!(
+                    "{TRANSITION_TO_ARCHIVE} value {archive} does not name a number of days"
+                ))
+            })?;
+            let Some(ia) = by_transition.get(TRANSITION_TO_IA).copied() else {
+                return Err(bad_request(format!(
+                    "{TRANSITION_TO_ARCHIVE} is set to {archive}, so {TRANSITION_TO_IA} must \
+                     be set to an earlier transition"
+                )));
+            };
+            let ia_days = after_days(ia).ok_or_else(|| {
+                bad_request(format!(
+                    "{TRANSITION_TO_IA} value {ia} does not name a number of days"
+                ))
+            })?;
+            if archive_days <= ia_days {
+                return Err(bad_request(format!(
+                    "{TRANSITION_TO_ARCHIVE} ({archive}) must be later than \
+                     {TRANSITION_TO_IA} ({ia})"
+                )));
+            }
+        }
+
+        // "If a LifecycleConfiguration object already exists for the specified file
+        // system, a PutLifecycleConfiguration call modifies the existing configuration",
+        // and a call "with an empty LifecyclePolicies array in the request body deletes
+        // any existing LifecycleConfiguration" — both are this one replacement, since an
+        // empty stored array IS no configuration.
+        let policies = input.lifecycle_policies.clone();
+        let Some(file_system) = state.file_systems.get_mut(&file_system_id) else {
+            return Err(internal_server_error());
+        };
+        file_system.lifecycle_policies = policies.clone();
+
+        Ok(PutLifecycleConfigurationOutput {
+            lifecycle_policies: Some(policies),
+        })
     }
+}
+
+/// `LifecyclePolicy$TransitionToIA`.
+const TRANSITION_TO_IA: &str = "TransitionToIA";
+/// `LifecyclePolicy$TransitionToArchive`.
+const TRANSITION_TO_ARCHIVE: &str = "TransitionToArchive";
+/// `LifecyclePolicy$TransitionToPrimaryStorageClass`.
+const TRANSITION_TO_PRIMARY_STORAGE_CLASS: &str = "TransitionToPrimaryStorageClass";
+
+/// The transitions one `LifecyclePolicy` object names, as (member name, value) pairs —
+/// the three transition members the shape carries
+/// (`smithy_query(query="shape",shape="LifecyclePolicy")`).
+fn transitions(policy: &LifecyclePolicy) -> Vec<(&'static str, &str)> {
+    [
+        (TRANSITION_TO_IA, policy.transition_to_ia.as_deref()),
+        (
+            TRANSITION_TO_ARCHIVE,
+            policy.transition_to_archive.as_deref(),
+        ),
+        (
+            TRANSITION_TO_PRIMARY_STORAGE_CLASS,
+            policy.transition_to_primary_storage_class.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(member, value)| value.map(|value| (member, value)))
+    .collect()
+}
+
+/// The number of days a storage-class transition value names. Every value of the two
+/// day-based transition enums is `AFTER_<n>_DAY(S)`
+/// (`smithy_query(query="shape",shape="TransitionToIARules")` -> AFTER_1_DAY |
+/// AFTER_7_DAYS | AFTER_14_DAYS | AFTER_30_DAYS | AFTER_60_DAYS | AFTER_90_DAYS |
+/// AFTER_180_DAYS | AFTER_270_DAYS | AFTER_365_DAYS), so one transition is later than
+/// another exactly when its day count is larger. `None` for a value naming no day
+/// count, which the modelled enums never produce.
+fn after_days(value: &str) -> Option<u32> {
+    let (count, unit) = value.strip_prefix("AFTER_")?.split_once('_')?;
+    if !matches!(unit, "DAY" | "DAYS") {
+        return None;
+    }
+    count.parse().ok()
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> PutLifecycleConfigurationError {
+    PutLifecycleConfigurationErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 404 `FileSystemNotFound`: "the specified FileSystemId value doesn't exist in the
+/// requester's Amazon Web Services account".
+fn not_found(message: impl Into<String>) -> PutLifecycleConfigurationError {
+    PutLifecycleConfigurationErrorModeled::FileSystemNotFound(FileSystemNotFound {
+        error_code: "FileSystemNotFound".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 409 `IncorrectFileSystemLifeCycleState`: "the file system's lifecycle state is not
+/// available".
+fn incorrect_life_cycle_state(message: impl Into<String>) -> PutLifecycleConfigurationError {
+    PutLifecycleConfigurationErrorModeled::IncorrectFileSystemLifeCycleState(
+        IncorrectFileSystemLifeCycleState {
+            error_code: "IncorrectFileSystemLifeCycleState".to_string(),
+            message: Some(message.into()),
+        },
+    )
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> PutLifecycleConfigurationError {
+    PutLifecycleConfigurationErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

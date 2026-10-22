@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLifecycleConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLifecycleConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLifecycleConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the `LifecycleConfiguration` [`crate::state`] holds for the
+//! named file system — an empty array for a file system that has none. It writes only
+//! the lifecycle transitions the clock already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLifecycleConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLifecycleConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLifecycleConfiguration"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // The only write a report makes: the `creating` -> `available` transitions the
+        // clock already owed, due at the same instant whether or not anybody called.
+        state.materialize_due_transitions(now);
+
+        // A `FileSystemId` member accepts either the id or the ARN of the file system.
+        let file_system_id = efs::file_system_id_of(&input.file_system_id).to_string();
+        let Some(file_system) = state.file_systems.get(&file_system_id) else {
+            return Err(not_found(efs::file_system_not_found_message(
+                &file_system_id,
+            )));
+        };
+
+        // "Returns the current LifecycleConfiguration object for the specified EFS file
+        // system. ... For a file system without a LifecycleConfiguration object, the call
+        // returns an empty array in the response."
+        Ok(DescribeLifecycleConfigurationOutput {
+            lifecycle_policies: Some(file_system.lifecycle_policies.clone()),
+        })
     }
+}
+
+/// A 404 `FileSystemNotFound`: "the specified FileSystemId value doesn't exist in the
+/// requester's Amazon Web Services account".
+fn not_found(message: impl Into<String>) -> DescribeLifecycleConfigurationError {
+    DescribeLifecycleConfigurationErrorModeled::FileSystemNotFound(FileSystemNotFound {
+        error_code: "FileSystemNotFound".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> DescribeLifecycleConfigurationError {
+    DescribeLifecycleConfigurationErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }
