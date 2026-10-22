@@ -13,8 +13,8 @@
 //!    by a later read.
 //! 2. GuardDuty allows exactly one detector per account per Region; a replayed
 //!    `ClientToken` returns the detector the first create minted.
-//! 3. A reporting operation handed an id the store does not hold answers the modelled
-//!    `BadRequestException` (HTTP 400), never a hollow 200.
+//! 3. A reporting operation handed an id the store does not hold answers HTTP 400
+//!    under the `InvalidInputException` class, never a hollow 200.
 //! 4. Everything about a generated sample finding is derived from the finding TYPE,
 //!    following GuardDuty's documented finding-type naming convention.
 //! 5. Paging a list with any `maxResults` yields each item exactly once, in order.
@@ -39,7 +39,7 @@ fn auth_for(region: &str) -> String {
 
 /// A well-formed `DetectorId` (32 lowercase hex characters) that no create ever
 /// minted.
-const ABSENT_DETECTOR_ID: &str = "deadbeefdeadbeefdeadbeefdeadbeef";
+pub(crate) const ABSENT_DETECTOR_ID: &str = "deadbeefdeadbeefdeadbeefdeadbeef";
 
 /// A router carrying only this service, over its own engine.
 pub(crate) fn new_router() -> Router {
@@ -54,12 +54,17 @@ pub(crate) fn new_router() -> Router {
 
 /// Send one request and return its status and parsed JSON body (`Value::Null` for an
 /// empty body).
-pub(crate) async fn call(router: &Router, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &Router,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
     call_signed(router, AUTH, method, path, body).await
 }
 
 /// [`call`], signed for a chosen Region.
-async fn call_in(
+pub(crate) async fn call_in(
     router: &Router,
     region: &str,
     method: &str,
@@ -101,8 +106,9 @@ async fn call_signed(
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
-    // The restJson1 error shape is resolved from the header, not the body, so the
-    // header is folded in to give assertions one place to read the error code from.
+    // The `x-amzn-errortype` header is folded into the body under a key of its own,
+    // so an assertion can read the error SHAPE it carries beside the error CLASS the
+    // body's `__type` carries. The two are different facts on this service.
     if !error_type.is_empty() {
         if let Some(object) = parsed.as_object_mut() {
             object.insert("__errorType".to_string(), Value::String(error_type));
@@ -111,9 +117,10 @@ async fn call_signed(
     (status, parsed)
 }
 
-/// The modelled error code an error response carries.
+/// The error CLASS an error response carries: the body's `__type` discriminator,
+/// which is what a client switches on.
 pub(crate) fn error_code(body: &Value) -> String {
-    for key in ["__errorType", "__type", "code"] {
+    for key in ["__type", "__errorType", "code"] {
         if let Some(value) = body.get(key).and_then(Value::as_str) {
             return value
                 .rsplit('#')
@@ -126,6 +133,18 @@ pub(crate) fn error_code(body: &Value) -> String {
         }
     }
     String::new()
+}
+
+/// The error SHAPE an error response resolves to: the `x-amzn-errortype` header,
+/// which restJson1 — not the body — is what an SDK unmarshals the response with.
+pub(crate) fn error_shape(body: &Value) -> String {
+    body.get("__errorType")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .rsplit('#')
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub(crate) async fn create_detector(router: &Router, body: Value) -> (u16, Value) {
@@ -254,7 +273,7 @@ async fn the_detector_lifecycle_is_observable_through_stored_state() {
     assert_eq!(status, 400, "second create-detector: got {status} {refused:?}");
     assert_eq!(
         error_code(&refused),
-        "BadRequestException",
+        "InvalidInputException",
         "second create-detector: got {refused:?}"
     );
     let (_, body) = call(&router, "GET", "/detector", None).await;
@@ -302,7 +321,7 @@ async fn the_detector_lifecycle_is_observable_through_stored_state() {
     assert_eq!(status, 400, "get-detector after delete: got {status} {body:?}");
     assert_eq!(
         error_code(&body),
-        "BadRequestException",
+        "InvalidInputException",
         "get-detector after delete: got {body:?}"
     );
     let (_, body) = call(&router, "GET", "/detector", None).await;
@@ -493,7 +512,7 @@ async fn a_feature_list_the_service_cannot_accept_is_refused() {
     assert_eq!(status, 400, "create-detector with both runtime features: got {status} {body:?}");
     assert_eq!(
         error_code(&body),
-        "BadRequestException",
+        "InvalidInputException",
         "create-detector with both runtime features: got {body:?}"
     );
     let (_, listed) = call(&router, "GET", "/detector", None).await;
@@ -968,7 +987,7 @@ async fn paging_a_findings_list_yields_each_finding_exactly_once() {
         );
         assert_eq!(
             error_code(&body),
-            "BadRequestException",
+            "InvalidInputException",
             "case nextToken={token:?}: got {body:?}"
         );
     }
@@ -1040,7 +1059,7 @@ async fn list_findings_applies_the_finding_criteria_it_is_given() {
     );
     assert_eq!(
         error_code(&body),
-        "BadRequestException",
+        "InvalidInputException",
         "an unevaluable criterion: got {body:?}"
     );
 
@@ -1226,7 +1245,7 @@ async fn list_findings_orders_the_result_by_the_sort_criteria_it_is_given() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 3: an id the store does not hold is a modelled 400, on every operation.
+// Rule 3: an id the store does not hold is a classified 400, on every operation.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1268,7 +1287,7 @@ async fn every_operation_refuses_a_detector_id_the_store_does_not_hold() {
             );
             assert_eq!(
                 error_code(&response),
-                "BadRequestException",
+                "InvalidInputException",
                 "case {operation} (store populated: {populated}): got {response:?}"
             );
         }

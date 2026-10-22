@@ -2,8 +2,8 @@
 
 //! @op GetDetector
 //! IMPLEMENTED: reports the persisted detector named by `DetectorId`. An id this
-//! account never created, or one `DeleteDetector` removed, is refused with
-//! `BadRequestException` rather than answered with a hollow 200.
+//! account never created, or one `DeleteDetector` removed, is refused with HTTP 400
+//! under the `InvalidInputException` class rather than answered with a hollow 200.
 //!
 //! The whole response is a projection of [`crate::state::Detector`]: `DataSources`
 //! is the deprecated view of the detector's feature switches — each node carrying
@@ -163,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetDetectorErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    message: Some("the GuardDuty state store is unavailable".to_string()),
-                    r#type: None,
-                },
+                crate::state::state_unavailable(),
             )
             .into());
         };
@@ -175,14 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure report: nothing below writes to the store.
         let state = state.lock();
         let Some(detector) = state.detector_in(&region, &input.detector_id) else {
-            return Err(GetDetectorErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "The request is rejected because the specified detector ID does not exist: {}.",
-                    input.detector_id
-                )),
-                r#type: None,
-            })
-            .into());
+            // Classified from the REQUEST — a malformed id is a parameter failure,
+            // a well-formed one this account does not hold an ownership failure —
+            // and answered under the error class, not the envelope shape.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::detector_id_rejection(&input.detector_id),
+            ));
         };
 
         Ok(GetDetectorOutput {

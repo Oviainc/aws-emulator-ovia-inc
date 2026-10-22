@@ -2,9 +2,9 @@
 
 //! @op CreateDetector
 //! IMPLEMENTED: mints a detector and persists it in [`crate::state`]. GuardDuty allows
-//! exactly one detector per account per Region, so a second create is refused with
-//! `BadRequestException`, and a replayed `ClientToken` returns the detector the first
-//! call minted.
+//! exactly one detector per account per Region, so a second create is refused with HTTP
+//! 400 under the `InvalidInputException` class, and a replayed `ClientToken` returns the
+//! detector the first call minted.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -163,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateDetectorErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    message: Some("the GuardDuty state store is unavailable".to_string()),
-                    r#type: None,
-                },
+                crate::state::state_unavailable(),
             )
             .into());
         };
@@ -203,10 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create a detector in each Region where you enable the service"
         // (`smithy_query(query="doc",shape="CreateDetector")`), so the limit is
         // scoped to the Region the request was signed for.
-        if let Some(existing) = state.detector_ids_in(&region).first() {
-            return Err(bad_request(format!(
-                "The request is rejected because a detector already exists for this account in {region}: {existing}."
-            )));
+        if !state.detector_ids_in(&region).is_empty() {
+            return Err(bad_request(crate::state::DETECTOR_ALREADY_EXISTS_MESSAGE));
         }
 
         let now = state.tick_millis();
@@ -288,11 +283,9 @@ const MALWARE_PROTECTION_SERVICE_LINKED_ROLE: &str = "role/aws-service-role/malw
 /// `smithy_query(shape="FindingPublishingFrequency")`.
 const DEFAULT_FINDING_PUBLISHING_FREQUENCY: &str = "SIX_HOURS";
 
-/// Refuse the request with this operation's modeled 400.
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
 fn bad_request(message: impl Into<String>) -> CreateDetectorError {
-    CreateDetectorErrorModeled::BadRequestException(BadRequestException {
-        message: Some(message.into()),
-        r#type: None,
-    })
-    .into()
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

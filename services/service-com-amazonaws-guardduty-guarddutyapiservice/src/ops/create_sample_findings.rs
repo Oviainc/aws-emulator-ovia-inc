@@ -147,10 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateSampleFindingsErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    message: Some("the GuardDuty state store is unavailable".to_string()),
-                    r#type: None,
-                },
+                crate::state::state_unavailable(),
             )
             .into());
         };
@@ -184,9 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = ::engine::emulator_account_id().to_string();
         let mut state = state.lock();
         if state.detector_in(&region, &input.detector_id).is_none() {
-            return Err(invalid_input(format!(
-                "The request is rejected because the specified detector ID does not exist: {}.",
-                input.detector_id
+            // Classified from the REQUEST, under the error CLASS: a value that cannot
+            // be a detector id is a parameter failure, a well-formed one this account
+            // does not hold an ownership failure.
+            return Err(invalid_input(crate::state::detector_id_rejection(
+                &input.detector_id,
             )));
         }
 
@@ -510,25 +509,16 @@ const FINDING_TYPE_CATALOG: &[(&str, f64)] = &[
     ("UnauthorizedAccess:Runtime/TorRelay", SEVERITY_HIGH),
 ];
 
-/// The error CLASS a GuardDuty client rejection reports in the `Type` member of its
-/// `BadRequestException` ("The error type", `smithy_query(shape="BadRequestException")`):
-/// a request this service refuses for what it carries is an invalid input.
-const INVALID_INPUT_EXCEPTION: &str = "InvalidInputException";
-
 /// The wording GuardDuty answers a `findingTypes` entry that is not a finding type
 /// with. The HTTP status (400) and the error class are the requirement; the text
 /// states the rule and names no value from the request, as the service's own does.
 const INVALID_FINDING_TYPE_MESSAGE: &str =
     "The request is rejected because of invalid finding type is specified.";
 
-/// Refuse the request with this operation's modeled 400, classified as an invalid
-/// input.
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type` member.
 fn invalid_input(message: impl Into<String>) -> CreateSampleFindingsError {
-    CreateSampleFindingsErrorModeled::BadRequestException(BadRequestException {
-        message: Some(message.into()),
-        r#type: Some(INVALID_INPUT_EXCEPTION.to_string()),
-    })
-    .into()
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }
 
 /// The first segment of a finding type: everything before the `:`.

@@ -2,8 +2,10 @@
 
 //! Helpers shared by this crate's test suites.
 //!
-//! One copy of the two pieces every suite here needs: the SDK's percent-encoding
-//! for a path segment or a query value, and the error code a failed call reported.
+//! One copy of the pieces every suite here needs: the SDK's percent-encoding for a
+//! path segment or a query value, and the three accessors over an answered body —
+//! the error code, the message, and the `fieldName` the modelled
+//! `ValidationException` carries beside it.
 
 use serde_json::Value;
 
@@ -32,5 +34,23 @@ pub fn error_code(body: &Value) -> String {
         .rsplit('#')
         .next()
         .unwrap_or("<no __type>")
+        .to_string()
+}
+
+/// The `message` of an answered body, whichever casing the envelope spells it with.
+pub fn message(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+        .to_string()
+}
+
+/// The `fieldName` of an error body — the modelled `ValidationException` carries it
+/// beside the message, naming the member the refusal is about.
+pub fn field_name(body: &Value) -> String {
+    body.get("fieldName")
+        .and_then(Value::as_str)
+        .unwrap_or("<no fieldName>")
         .to_string()
 }

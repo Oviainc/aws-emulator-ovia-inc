@@ -208,13 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = (ctx, &self.engine);
 
         // Documented on `StartTime`: "The value for StartTime must be earlier than
-        // the value for EndTime."
+        // the value for EndTime." The RULE is the model's; the sentence is the
+        // service-wide one every handler enforcing it shares (see
+        // [`crate::service::TIME_RANGE_ORDERING_MESSAGE`]).
         let start_key = crate::state::timestamp_key(input.start_time);
         let end_key = crate::state::timestamp_key(input.end_time);
         if start_key >= end_key {
-            return Err(invalid_argument(
-                "The value for StartTime must be earlier than the value for EndTime.",
-            ));
+            return Err(invalid_argument(crate::service::TIME_RANGE_ORDERING_MESSAGE));
         }
 
         // Nothing about the data source is answered until the request is
