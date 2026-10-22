@@ -95,8 +95,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
         let alias = state.aliases.get(&input.alias_name).ok_or_else(|| {
+            // `resourceId` is the alias's own name, without the resource path
+            // its `aliasName` carries: an id a caller can feed back into the
+            // API, which a prefixed one is not.
             GetPolicyStoreAliasErrorModeled::ResourceNotFoundException(
-                crate::ops::resource_not_found(&input.alias_name, "POLICY_STORE_ALIAS"),
+                crate::state::alias_reference(&input.alias_name).not_found(),
             )
         })?;
 

@@ -106,23 +106,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The region a resource this request creates lives in: the one the caller signed for,
-/// since an ARN names the region the request was addressed to. Falls back to the
-/// emulator's default region for a request that carries no SigV4 credential scope, and
-/// for a scope region the modelled `RoomArn` pattern (`[a-z0-9-]+`) would not admit.
-fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    const DEFAULT_REGION: &str = "us-east-1";
-    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
-        .map(|scope| scope.region)
-        .filter(|region| {
-            !region.is_empty()
-                && region
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
-}
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -227,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateRoomErrorModeled::ValidationException)?;
         }
 
-        let region = request_region(ctx);
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 

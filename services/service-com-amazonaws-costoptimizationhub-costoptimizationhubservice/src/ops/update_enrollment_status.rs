@@ -11,6 +11,11 @@
 //! recommendations, so the record carries the instant those recommendations come
 //! due; opting out clears it, and opting in again starts a fresh analysis.
 //!
+//! The accepted `status` values are the set the service takes on the WIRE
+//! (`crate::state::ENROLLMENT_STATUS_WIRE_VALUES`), which carries the terminal
+//! `Failed` state beside the two the published enum lists; a value outside that
+//! set is refused with the modelled `ValidationException`, which advertises it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -160,6 +165,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The status is judged against the value set the service accepts on the
+        // WIRE, which is wider than the published model's enum — so the member's
+        // enum trait is kept off the generated schema (`skip_validation`) and the
+        // refusal of a value outside the wire set advertises that set. Checked
+        // first, before anything about the call is derived or stored.
+        if let Some(refused) = crate::service::not_in_enum(
+            "status",
+            &input.status,
+            crate::state::ENROLLMENT_STATUS_WIRE_VALUES,
+        ) {
+            return Err(UpdateEnrollmentStatusErrorModeled::ValidationException(refused).into());
+        }
 
         let account_id = crate::state::caller_account_id().to_string();
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGroupId
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGroupId`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGroupId::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves a group's primary identity from a NON-primary identifier within one
+//! identity store: an `ExternalId` (issuer + id) an identity provider stored on the
+//! group, or a `UniqueAttribute` naming the one unique attribute this operation
+//! supports — `displayName`. The match is looked up in persisted state and the group's
+//! stored `GroupId` / `GroupArn` reported; nothing is written, so a resolution never
+//! changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -100,11 +97,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `GetGroupIdError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#GetGroupId")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#GetGroupId",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetGroupIdErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,20 +160,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGroupId` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGroupIdErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGroupId"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetGroupIdErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        // Which group the alternate identifier names. Resolved BEFORE the store is
+        // reached, so an identifier this operation cannot interpret is refused as a bad
+        // request whether or not the named store exists.
+        let lookup = GroupLookup::from_identifier(&input.alternate_identifier)?;
+
+        // A read: the store is looked up rather than vivified and nothing is written,
+        // so resolving a group id can never change what a later caller sees.
+        let state = state.lock();
+        let not_found = || {
+            GetGroupIdErrorModeled::ResourceNotFoundException(
+                crate::state::not_found_by_alternate_identifier(
+                    crate::state::ResourceKind::Group,
+                    lookup.subject(),
+                ),
+            )
+        };
+        let store = state.store(&input.identity_store_id).ok_or_else(not_found)?;
+        let group = lookup.find(store).ok_or_else(not_found)?;
+
+        Ok(GetGroupIdOutput {
+            identity_store_id: store.identity_store_id.clone(),
+            group_id: group.group_id.clone(),
+            group_arn: group.group_arn.clone(),
+        })
     }
+}
+
+/// The only `UniqueAttribute` attribute path that identifies a GROUP.
+///
+/// `GetGroupIdRequest$AlternateIdentifier`: "For the unique attribute, the only valid
+/// path is displayName"
+/// (`smithy_query(query="doc",shape="GetGroupIdRequest",member="AlternateIdentifier")`).
+const GROUP_UNIQUE_ATTRIBUTE_PATH: &str = "displayName";
+
+/// A resolved `AlternateIdentifier`: which stored group it selects.
+///
+/// Keeping the interpretation of the union separate from the state lookup is what lets
+/// an identifier this operation cannot interpret be refused with the modelled
+/// `ValidationException` before any state is touched.
+enum GroupLookup<'a> {
+    /// The group an identity provider stored this `issuer`/`id` pair on.
+    ExternalId { issuer: &'a str, id: &'a str },
+    /// The group holding this `DisplayName`.
+    DisplayName(&'a str),
+}
+
+impl<'a> GroupLookup<'a> {
+    /// The lookup `identifier` asks for, or the modelled `ValidationException` when it
+    /// names an attribute this operation does not resolve a group by, or carries a
+    /// value of a type that attribute cannot hold.
+    fn from_identifier(identifier: &'a AlternateIdentifier) -> Result<Self, GetGroupIdError> {
+        match identifier {
+            AlternateIdentifier::ExternalId(external) => Ok(Self::ExternalId {
+                issuer: &external.issuer,
+                id: &external.id,
+            }),
+            AlternateIdentifier::UniqueAttribute(attribute) => {
+                // SCIM attribute names are case-insensitive (RFC 7643 §2.1, "Attribute
+                // names are case insensitive"), so `displayname` names the same
+                // attribute as `displayName`; any OTHER path is one this operation does
+                // not resolve a group by.
+                if !attribute
+                    .attribute_path
+                    .eq_ignore_ascii_case(GROUP_UNIQUE_ATTRIBUTE_PATH)
+                {
+                    return Err(invalid(format!(
+                        "AlternateIdentifier.UniqueAttribute.AttributePath must be \
+                         {GROUP_UNIQUE_ATTRIBUTE_PATH} for GetGroupId, got {:?}",
+                        attribute.attribute_path
+                    )));
+                }
+                // `DisplayName` is a string, so only a string value can match one. The
+                // value itself stays out of the message: it is `@sensitive`.
+                match &attribute.attribute_value {
+                    ::aws_smithy_types::Document::String(display_name) => {
+                        Ok(Self::DisplayName(display_name))
+                    }
+                    _ => Err(invalid(format!(
+                        "AlternateIdentifier.UniqueAttribute.AttributeValue must be a string \
+                         for the {GROUP_UNIQUE_ATTRIBUTE_PATH} attribute"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Which identifier this lookup used, for the not-found message: the kind of
+    /// identifier, never the value, which is `@sensitive` in both forms.
+    fn subject(&self) -> &'static str {
+        match self {
+            Self::ExternalId { .. } => "ExternalId",
+            Self::DisplayName(_) => "UniqueAttribute displayName",
+        }
+    }
+
+    /// The group `store` holds for this identifier, or `None` when it holds none.
+    fn find<'s>(
+        &self,
+        store: &'s crate::state::IdentityStoreData,
+    ) -> Option<&'s crate::state::Group> {
+        match *self {
+            Self::ExternalId { issuer, id } => store.group_by_external_id(issuer, id),
+            Self::DisplayName(display_name) => store.group_by_display_name(display_name),
+        }
+    }
+}
+
+/// The modelled `ValidationException` (HTTP 400) for an `AlternateIdentifier` this
+/// operation cannot interpret.
+///
+/// The model's own shape rather than the scaffold's synthetic one, because this
+/// operation declares it. `Reason` is left unset: every modelled
+/// `ValidationExceptionReason` value is about a KMS key
+/// (`smithy_query(query="shape",shape="ValidationExceptionReason")`), none of which is
+/// this.
+fn invalid(message: String) -> GetGroupIdError {
+    GetGroupIdErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
 }

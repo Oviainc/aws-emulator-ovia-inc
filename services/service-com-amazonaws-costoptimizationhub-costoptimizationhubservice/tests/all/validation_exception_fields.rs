@@ -5,10 +5,12 @@
 //! multi-service router the emulator boots.
 //!
 //! The rule under test: a request Cost Optimization Hub refuses because a member
-//! is outside a constraint its model declares is answered with HTTP 400
-//! `ValidationException` carrying `reason` = `FieldValidationFailed` and one
-//! `fields` entry per violation, each naming the member it is attributed to and
-//! the constraint that member must satisfy
+//! is outside a constraint that member must satisfy — one its model declares, or
+//! the value set the service accepts on the wire where that is the wider of the
+//! two (`status` below) — is answered with HTTP 400 `ValidationException`
+//! carrying `reason` = `FieldValidationFailed` and one `fields` entry per
+//! violation, each naming the member it is attributed to and the constraint that
+//! member must satisfy
 //! (`smithy_query(query="shape", shape="ValidationException,ValidationExceptionDetail,ValidationExceptionReason")`).
 //!
 //! It is asserted over a table that spans the constraint classes the model uses
@@ -27,9 +29,15 @@ use crate::cost_optimization_hub::{call, error_code, router, FIELD_VALIDATION_FA
 /// model data the constraint walk checks against, so the clause a refusal states
 /// is compared with the model rather than with a list copied into this file.
 use cost_optimization_hub::ops::types::shared_types::{
-    ENROLLMENT_STATUS_VALUES, GRANULARITY_TYPE_VALUES, IMPLEMENTATION_EFFORT_VALUES,
+    GRANULARITY_TYPE_VALUES, IMPLEMENTATION_EFFORT_VALUES,
     MEMBER_ACCOUNT_DISCOUNT_VISIBILITY_VALUES, SAVINGS_ESTIMATION_MODE_VALUES,
 };
+
+/// The `EnrollmentStatus` values the SERVICE accepts on the wire, which is what
+/// `UpdateEnrollmentStatus` judges its `status` against — wider than the
+/// published model's enum, so this set is read from the service rather than from
+/// the generated catalogue (`crate::rejection_fidelity` owns that rule).
+use cost_optimization_hub::state::ENROLLMENT_STATUS_WIRE_VALUES;
 
 /// The `fields` list of a `ValidationException` body as `(fieldName, message)`
 /// pairs, SORTED so a case does not depend on the order the walk found the
@@ -167,7 +175,10 @@ async fn a_constraint_refusal_names_every_member_and_its_constraint() {
         (
             // `MaxResults` is `@range(min: 0, max: 100)`, so each published bound
             // is accepted (see `every_request_inside_its_constraints_is_served`)
-            // and one past it is refused.
+            // and one past it is refused. This operation's own `maxResults`
+            // member declares the same bound, so the shape's is the one applied;
+            // the three operations whose member widens it to 0..1000 are
+            // asserted in `crate::rejection_fidelity`.
             "range above the published maximum",
             "ListEnrollmentStatuses",
             json!({"includeOrganizationInfo": false, "maxResults": 101}),
@@ -186,10 +197,12 @@ async fn a_constraint_refusal_names_every_member_and_its_constraint() {
             )],
         ),
         (
+            // The accepted set is the service's wire set, not the published
+            // model's enum: the member's own validation is the handler's.
             "enum membership on a required member",
             "UpdateEnrollmentStatus",
             json!({"status": "Enabled"}),
-            vec![enum_entry("status", ENROLLMENT_STATUS_VALUES)],
+            vec![enum_entry("status", ENROLLMENT_STATUS_WIRE_VALUES)],
         ),
         (
             "a required member absent altogether",
@@ -498,9 +511,9 @@ async fn every_request_inside_its_constraints_is_served() {
             200,
         ),
     ];
-    // Every value the model's `EnrollmentStatus` enum holds is accepted, so the
-    // refusal above is about membership and not about the member.
-    for status in ENROLLMENT_STATUS_VALUES {
+    // Every value the service's `EnrollmentStatus` wire set holds is accepted, so
+    // the refusal above is about membership and not about the member.
+    for status in ENROLLMENT_STATUS_WIRE_VALUES {
         cases.push((
             format!("the enrollment status {status:?}"),
             "UpdateEnrollmentStatus",

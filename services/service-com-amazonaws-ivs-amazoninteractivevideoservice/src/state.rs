@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Channel, MultitrackInputConfiguration, RecordingConfiguration, RenditionConfiguration,
-    StreamKey, ThumbnailConfiguration,
+    AdConfiguration, Channel, MultitrackInputConfiguration, RecordingConfiguration,
+    RenditionConfiguration, StreamKey, ThumbnailConfiguration,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -30,6 +30,10 @@ pub struct ComAmazonawsIvsAmazoninteractivevideoserviceState {
     /// a key to its channel: `ListStreamKeys` filters on it and `DeleteChannel`
     /// drops every key that names the channel it removed.
     pub stream_keys: BTreeMap<String, StreamKey>,
+    /// Every persisted ad configuration, keyed by its ARN. A `BTreeMap` for the
+    /// same reason as `channels`: `ListAdConfigurations` is paginated, so the one
+    /// stable order is what lets a `nextToken` resume where a page stopped.
+    pub ad_configurations: BTreeMap<String, AdConfiguration>,
     /// Every persisted recording configuration, keyed by its ARN, each with the
     /// instant its `CREATING` → `ACTIVE` transition falls due. A `BTreeMap` for the
     /// same reason as [`Self::channels`]: one stable order for
@@ -132,6 +136,13 @@ pub fn channel_arn(region: &str, id: &str) -> String {
 /// A `StreamKeyArn`: `arn:aws:ivs:<region>:<account>:stream-key/<id>`.
 pub fn stream_key_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("ivs", region, &format!("stream-key/{id}"))
+}
+
+/// An `AdConfigurationArn`: `arn:aws:ivs:<region>:<account>:ad-configuration/<id>`,
+/// the form the modelled `AdConfigurationArn` pattern
+/// `^arn:aws:ivs:[a-z0-9-]+:[0-9]+:ad-configuration/[a-zA-Z0-9-]+$` pins.
+pub fn ad_configuration_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("ivs", region, &format!("ad-configuration/{id}"))
 }
 
 /// A `RecordingConfigurationArn`:
@@ -253,6 +264,13 @@ pub const MAX_CHANNELS: usize = 5_000;
 
 /// See [`MAX_CHANNELS`].
 pub const MAX_STREAM_KEYS_PER_CHANNEL: usize = 100;
+
+/// The ceiling on how many ad configurations this store holds. See [`MAX_CHANNELS`]
+/// for why a cap exists at all: `CreateAdConfiguration` is the only thing that adds
+/// one, it never expires, and past the cap the operation answers the
+/// `ServiceQuotaExceededException` (HTTP 402) IVS models on it. The number is the
+/// emulator's own bound, not a published AWS default.
+pub const MAX_AD_CONFIGURATIONS: usize = 1_000;
 
 /// How many stream keys are currently bound to `channel_arn`, which is what
 /// [`MAX_STREAM_KEYS_PER_CHANNEL`] bounds.

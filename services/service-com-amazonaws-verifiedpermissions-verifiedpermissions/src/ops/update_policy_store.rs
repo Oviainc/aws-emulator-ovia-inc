@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let not_found = || {
             UpdatePolicyStoreErrorModeled::ResourceNotFoundException(
-                crate::ops::resource_not_found(&input.policy_store_id, "POLICY_STORE"),
+                crate::state::policy_store_reference(&input.policy_store_id).not_found(),
             )
         };
 

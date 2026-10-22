@@ -198,6 +198,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // "The unique identifier of the agreement": an `agreementId` the store
+        // holds no agreement for names no agreement of this account, so it is
+        // not a valid value for the member rather than a filter that selects
+        // nothing. This operation models no `ResourceNotFoundException`, so the
+        // refusal is its modelled `ValidationException` carrying the
+        // `INVALID_AGREEMENT_ID` reason a client branches on.
+        if let Some(agreement_id) = input.agreement_id.as_deref() {
+            if !store.agreements.contains_key(agreement_id) {
+                return Err(
+                    ListBillingAdjustmentRequestsErrorModeled::ValidationException(
+                        crate::state::validation_exception("INVALID_AGREEMENT_ID", "agreementId"),
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // A report, so the only write is the status change the clock had already
         // made due before this call: the processing of a submitted adjustment
         // was owed at its own instant whether or not anybody listed.

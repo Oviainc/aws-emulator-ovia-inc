@@ -393,7 +393,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
         stack.region = region;
-        stack.parameters = parameters;
+        // What the stack reports as `Parameters`: the values the request supplied, plus
+        // the template's own `Default` for a declared parameter it passed none for.
+        stack.parameters = crate::state::parameters_in_force(&stack.template_body, parameters);
         stack.capabilities = input.capabilities.clone().unwrap_or_default();
         stack.tags = crate::state::stored_tags(input.tags.as_deref().unwrap_or_default());
         stack.notification_arns = input.notification_ar_ns.clone().unwrap_or_default();

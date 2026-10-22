@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies ONE setting change — or a set of added columns — to a table in
+//! [`crate::state`], leaves it `UPDATING` until the clock owes it `ACTIVE` again, and
+//! answers with the table's ARN. This is the ONLY file to touch for `UpdateTable`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Four input members are NOT served here and are refused with a 501 that says so rather
+//! than stored and forgotten: `autoScalingSpecification`, `replicaSpecifications`,
+//! `cdcSpecification` and `warmThroughputSpecification`, each of which is reported by an
+//! operation that is still scaffolded. `CreateTable` refuses the same four.
+//!
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -204,18 +206,245 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTable"))
+        // The names, `addColumns`' minimum length and `defaultTimeToLive`'s range are
+        // modelled, so the boundary validator has already refused a request that breaks
+        // one with 400 `ValidationException`. What is left here is what the model cannot
+        // state.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateTableErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // Members this slice cannot serve faithfully yet — the same four `CreateTable`
+        // refuses, each reported by an operation that is still scaffolded
+        // (`autoScalingSpecification` by `GetTableAutoScalingSettings`, the other three by
+        // `GetTable`'s replica, CDC and warm-throughput summaries). Accepting one would
+        // mean storing a setting nothing here can answer for. The honest 501 says so, and
+        // is worded so it is not read as "UpdateTable is a stub": the operation IS
+        // implemented, this part of its surface is not.
+        let unimplemented: Vec<&str> = [
+            (
+                "autoScalingSpecification",
+                input.auto_scaling_specification.is_some(),
+            ),
+            ("replicaSpecifications", input.replica_specifications.is_some()),
+            ("cdcSpecification", input.cdc_specification.is_some()),
+            (
+                "warmThroughputSpecification",
+                input.warm_throughput_specification.is_some(),
+            ),
+        ]
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| *name)
+        .collect();
+        if !unimplemented.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: format!(
+                        "UpdateTable is implemented in this emulator, but not its {} \
+                         member(s): omit them, or the table would be stored with settings \
+                         no operation here can report.",
+                        unimplemented.join(", ")
+                    ),
+                },
+            ));
+        }
+
+        let invalid = |message: String| -> UpdateTableError {
+            UpdateTableErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // "Adds new columns to the table or updates ONE of the table's settings ... Note
+        // that you can only update one specific table setting per update operation." So a
+        // request names exactly one of these, and a request naming none changes nothing
+        // and is not an update at all.
+        let requested: Vec<&str> = [
+            ("addColumns", input.add_columns.is_some()),
+            ("capacitySpecification", input.capacity_specification.is_some()),
+            (
+                "encryptionSpecification",
+                input.encryption_specification.is_some(),
+            ),
+            ("pointInTimeRecovery", input.point_in_time_recovery.is_some()),
+            ("ttl", input.ttl.is_some()),
+            ("defaultTimeToLive", input.default_time_to_live.is_some()),
+            (
+                "clientSideTimestamps",
+                input.client_side_timestamps.is_some(),
+            ),
+        ]
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| *name)
+        .collect();
+        if requested.len() != 1 {
+            return Err(invalid(if requested.is_empty() {
+                "UpdateTable requires one table setting to update: addColumns, \
+                 capacitySpecification, encryptionSpecification, pointInTimeRecovery, \
+                 ttl, defaultTimeToLive or clientSideTimestamps"
+                    .to_string()
+            } else {
+                format!(
+                    "you can only update one specific table setting per update operation, \
+                     but this request names {}",
+                    requested.join(", ")
+                )
+            }));
+        }
+
+        // What the model cannot state about the capacity specification: which modes take
+        // the capacity units. Checked before the store is touched, so a refused update
+        // leaves the table exactly as it was.
+        let capacity_specification = match input.capacity_specification {
+            Some(supplied) => {
+                Some(crate::state::resolve_capacity(Some(supplied)).map_err(invalid)?)
+            }
+            None => None,
+        };
+        let encryption_specification = match input.encryption_specification {
+            Some(supplied) => {
+                Some(crate::state::resolve_encryption(Some(supplied)).map_err(invalid)?)
+            }
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
+            return Err(UpdateTableErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.keyspace_name),
+            )
+            .into());
+        };
+        let Some(table) = keyspace.tables.get_mut(&input.table_name) else {
+            return Err(UpdateTableErrorModeled::ResourceNotFoundException(
+                crate::state::table_not_found(&region, &input.keyspace_name, &input.table_name),
+            )
+            .into());
+        };
+
+        // A table is updatable only from `ACTIVE`: "The operation tried to access a
+        // keyspace, table, or type that doesn't exist. The resource might not be
+        // specified correctly, or its status might not be ACTIVE." While another change
+        // is still settling, this is the modelled conflict — "you try to perform an
+        // action and the same or a different action is already in progress".
+        if table.status != crate::state::TABLE_STATUS_ACTIVE {
+            return Err(UpdateTableErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Table '{}.{}' is in status {} and cannot be updated until it is {}.",
+                    input.keyspace_name,
+                    input.table_name,
+                    table.status,
+                    crate::state::TABLE_STATUS_ACTIVE
+                )),
+            })
+            .into());
+        }
+
+        if let Some(added) = input.add_columns {
+            // The schema is the one part of a stored table that GROWS, and it never
+            // shrinks: `addColumns` is modelled `len 1..` with no maximum, and every
+            // accepted update appends again. So the column count is capped the way this
+            // crate caps its other two caller-driven growth dimensions, refused past the
+            // cap with the quota error this operation models — checked BEFORE anything is
+            // stored, so neither one oversized list nor a run of updates can grow the
+            // schema without bound, and the scan below stays bounded too.
+            if table.schema_definition.all_columns.len() + added.len()
+                > crate::state::MAX_COLUMNS_PER_TABLE
+            {
+                return Err(UpdateTableErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "adding {} column(s) to table '{}.{}' would exceed the limit of {} \
+                             columns per table, which it already has {} of",
+                            added.len(),
+                            input.keyspace_name,
+                            input.table_name,
+                            crate::state::MAX_COLUMNS_PER_TABLE,
+                            table.schema_definition.all_columns.len()
+                        )),
+                    },
+                )
+                .into());
+            }
+            // A column holds one name: `allColumns` declares each of "the columns of the
+            // table" once (`SchemaDefinition`), which is the same rule
+            // `crate::state::validate_schema` enforces on a create. A name the table
+            // already has, or one this request repeats, is refused naming the member the
+            // caller has to fix — the alternative would be a schema with two columns of
+            // one name.
+            let mut declared: ::std::collections::BTreeSet<&str> = table
+                .schema_definition
+                .all_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect();
+            for column in &added {
+                if !declared.insert(column.name.as_str()) {
+                    return Err(invalid(format!(
+                        "addColumns names column '{}', which the table's schema already declares",
+                        column.name
+                    )));
+                }
+            }
+            // The added columns are regular columns of the table, so they join
+            // `allColumns` and take no key or static role.
+            table.schema_definition.all_columns.extend(added);
+        }
+        if let Some(capacity) = capacity_specification {
+            // "The timestamp of the last operation that changed the provisioned
+            // throughput capacity of a table": the summary member is named for a move TO
+            // `PAY_PER_REQUEST`, so it is stamped only when this update is that move. An
+            // update that re-sets the mode a table is ALREADY in changed no throughput
+            // capacity, so it deliberately leaves the existing stamp where it is.
+            if capacity.throughput_mode != table.capacity_specification.throughput_mode
+                && capacity.throughput_mode == crate::state::PAY_PER_REQUEST_THROUGHPUT_MODE
+            {
+                table.last_update_to_pay_per_request = Some(now);
+            }
+            table.capacity_specification = capacity;
+        }
+        if let Some(encryption) = encryption_specification {
+            table.encryption_specification = encryption;
+        }
+        if let Some(point_in_time_recovery) = input.point_in_time_recovery {
+            table.point_in_time_recovery = point_in_time_recovery;
+        }
+        // `TimeToLiveStatus` and `ClientSideTimestampsStatus` each model exactly one
+        // value, `ENABLED` (`crate::ops::types::TIME_TO_LIVE_STATUS_VALUES`,
+        // `CLIENT_SIDE_TIMESTAMPS_STATUS_VALUES`), so the boundary validator already
+        // refuses the disable the documentation says is impossible once either is on
+        // ("After ttl is enabled, you can't disable it for the table"; "Once client-side
+        // timestamps are enabled for a table, this setting cannot be disabled").
+        if let Some(ttl) = input.ttl {
+            table.ttl = Some(ttl);
+        }
+        if let Some(default_time_to_live) = input.default_time_to_live {
+            table.default_time_to_live = Some(default_time_to_live);
+        }
+        if let Some(client_side_timestamps) = input.client_side_timestamps {
+            table.client_side_timestamps = Some(client_side_timestamps);
+        }
+
+        // The change is accepted now and the table is `UPDATING` until the clock owes it
+        // `ACTIVE` one span from here; `settle` materialises that, and nothing sleeps.
+        let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
+        table.status = crate::state::TABLE_STATUS_UPDATING.to_string();
+        table.status_due_at = Some(settles_at);
+        let resource_arn = table.resource_arn.clone();
+        store.note_transition_due(settles_at);
+
+        Ok(UpdateTableOutput { resource_arn })
     }
 }

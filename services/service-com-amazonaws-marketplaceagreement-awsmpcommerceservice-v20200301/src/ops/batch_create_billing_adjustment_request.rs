@@ -5,12 +5,12 @@
 //! reports the entries it could not on the per-entry `errors` channel.
 //! This is the ONLY file to touch for this operation.
 //!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `BatchCreateBillingAdjustmentRequest::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! Rules about the BATCH itself — no entries at all, more entries than one call
+//! may carry, entries spanning more than one agreement, two entries sharing a
+//! `clientToken` — refuse the whole call, as the modelled `ValidationException`.
+//! The bound on how many adjustment requests the STORE holds is enforced per
+//! entry instead, on the batch's own `errors` channel, so a call whose other
+//! entries still fit is answered rather than refused.
 //!
 //! ## Reaching this service's state
 //!
@@ -269,7 +269,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             else {
                 errors.push(BatchCreateBillingAdjustmentError {
                     code: crate::state::BILLING_ADJUSTMENT_ERROR_NOT_FOUND.to_string(),
-                    message: format!("agreement {} not found", entry.agreement_id),
+                    message: crate::state::BILLING_ADJUSTMENT_AGREEMENT_NOT_FOUND_MESSAGE
+                        .to_string(),
                     client_token: entry.client_token.clone(),
                 });
                 continue;
@@ -281,6 +282,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: format!(
                         "adjustmentAmount {:?} is not a positive amount",
                         entry.adjustment_amount
+                    ),
+                    client_token: entry.client_token.clone(),
+                });
+                continue;
+            }
+
+            // The store is BOUNDED: past its quota no further adjustment
+            // request is created, and the entry that would have created one is
+            // refused on the batch's own per-entry error channel. Re-checked per
+            // entry, because one call may carry up to
+            // `BILLING_ADJUSTMENT_BATCH_LIMIT` of them.
+            if store.billing_adjustment_requests.len()
+                >= crate::state::BILLING_ADJUSTMENT_REQUEST_QUOTA
+            {
+                errors.push(BatchCreateBillingAdjustmentError {
+                    code: crate::state::BILLING_ADJUSTMENT_ERROR_VALIDATION.to_string(),
+                    message: format!(
+                        "this account already holds the maximum of {} billing adjustment requests",
+                        crate::state::BILLING_ADJUSTMENT_REQUEST_QUOTA
                     ),
                     client_token: entry.client_token.clone(),
                 });

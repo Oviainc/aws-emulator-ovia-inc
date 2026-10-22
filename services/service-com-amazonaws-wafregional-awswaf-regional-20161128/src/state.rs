@@ -224,6 +224,24 @@ pub const MAX_RATE_BASED_RULES: usize = 10;
 /// create has to be bounded somewhere.
 pub const MAX_RULES: usize = 100;
 
+/// The most `Predicate`s one `Rule` may hold.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes per
+/// rule (10 conditions per rule); with [`MAX_RULES`] bounding the number of rules it
+/// keeps the predicate state a caller can grow bounded.
+pub const MAX_RULE_PREDICATES: usize = 10;
+
+/// The most `RuleUpdate`s one `UpdateRule` request may carry.
+///
+/// The model states no per-request quota for this operation, so this bound is CHOSEN,
+/// not cited, on the same reasoning as [`MAX_XSS_MATCH_SET_UPDATES_PER_REQUEST`]: a
+/// request can at most empty a rule ([`MAX_RULE_PREDICATES`] deletes) and then fill it
+/// again ([`MAX_RULE_PREDICATES`] inserts), since a delete must name a predicate the
+/// rule holds and an insert one it does not, so no larger request can leave the rule in
+/// a state a request of this size cannot. It caps the work one caller can ask for
+/// before the handler takes the shared store's lock.
+pub const MAX_RULE_UPDATES_PER_REQUEST: usize = 2 * MAX_RULE_PREDICATES;
+
 /// The most tags one resource may carry, and so the most `Tags` entries one create
 /// request may bring.
 ///
@@ -326,6 +344,10 @@ pub const MESSAGE_NONEXISTENT_CONTAINER: &str = "The referenced item does not ex
 /// The fixed sentence for `WAFNonEmptyEntityException`, the refusal of a delete of a
 /// resource that still holds filters or addresses — see [`MESSAGE_DISALLOWED_NAME`].
 pub const MESSAGE_NON_EMPTY_ENTITY: &str = "The referenced entity is not empty.";
+/// The fixed sentence for `WAFReferencedItemException`, the refusal of a delete of a
+/// resource another resource still points at, from the shape's own documentation ("you
+/// tried to delete an object that is still in use") — see [`MESSAGE_DISALLOWED_NAME`].
+pub const MESSAGE_REFERENCED_ITEM: &str = "The referenced item is still in use.";
 /// The fixed sentence for `WAFInvalidOperationException`, the refusal of an update that
 /// would leave the resource as it was — see [`MESSAGE_DISALLOWED_NAME`].
 pub const MESSAGE_INVALID_OPERATION: &str = "The operation is not valid.";
@@ -780,6 +802,20 @@ impl XssMatchSetEntry {
     }
 }
 
+/// The `PredicateType` whose `DataId` names an `IPSet`, from the model's
+/// `PREDICATE_TYPE_VALUES`.
+pub const PREDICATE_TYPE_IP_MATCH: &str = "IPMatch";
+/// The `PredicateType` whose `DataId` names a `SqlInjectionMatchSet`.
+pub const PREDICATE_TYPE_SQL_INJECTION_MATCH: &str = "SqlInjectionMatch";
+/// The `PredicateType` whose `DataId` names an `XssMatchSet`.
+pub const PREDICATE_TYPE_XSS_MATCH: &str = "XssMatch";
+/// The `PredicateType` whose `DataId` names a `SizeConstraintSet`.
+pub const PREDICATE_TYPE_SIZE_CONSTRAINT: &str = "SizeConstraint";
+/// The `PredicateType` whose `DataId` names a `ByteMatchSet`.
+pub const PREDICATE_TYPE_BYTE_MATCH: &str = "ByteMatch";
+/// The `PredicateType` whose `DataId` names a `GeoMatchSet`.
+pub const PREDICATE_TYPE_GEO_MATCH: &str = "GeoMatch";
+
 /// One `Predicate` stored on a `Rule`.
 ///
 /// The predicates themselves arrive through `UpdateRule`; a rule `CreateRule` just
@@ -795,6 +831,26 @@ pub struct PredicateEntry {
 }
 
 impl PredicateEntry {
+    /// The record for a modelled `Predicate` an `UpdateRule` request carried.
+    pub fn from_modelled(predicate: &Predicate) -> Self {
+        Self {
+            negated: predicate.negated,
+            kind: predicate.r#type.clone(),
+            data_id: predicate.data_id.clone(),
+        }
+    }
+
+    /// Whether this record is the predicate `predicate` names.
+    ///
+    /// A predicate's identity is the whole modelled `Predicate` — `Negated`, `Type` and
+    /// `DataId`, all three of which `RuleUpdate` requires — so a `DELETE` naming any one
+    /// of them differently names a predicate the rule does not hold.
+    pub fn matches(&self, predicate: &Predicate) -> bool {
+        self.negated == predicate.negated
+            && self.kind == predicate.r#type
+            && self.data_id == predicate.data_id
+    }
+
     /// This record projected onto the modelled `Predicate` shape.
     pub fn to_modelled(&self) -> Predicate {
         Predicate {
@@ -828,6 +884,25 @@ impl RuleEntry {
             predicates: Vec::new(),
             tags: BTreeMap::new(),
         }
+    }
+
+    /// Add `predicate`, unless the rule already holds one with the same identity (see
+    /// [`PredicateEntry::matches`]). Answers whether the rule changed.
+    pub fn insert_predicate(&mut self, predicate: &Predicate) -> bool {
+        if self.predicates.iter().any(|stored| stored.matches(predicate)) {
+            return false;
+        }
+        self.predicates
+            .push(PredicateEntry::from_modelled(predicate));
+        true
+    }
+
+    /// Remove the predicate `predicate` names, if the rule holds it. Answers whether the
+    /// rule changed.
+    pub fn remove_predicate(&mut self, predicate: &Predicate) -> bool {
+        let before = self.predicates.len();
+        self.predicates.retain(|stored| !stored.matches(predicate));
+        self.predicates.len() != before
     }
 
     /// This record projected onto the modelled `Rule` shape the Create and Get
@@ -1126,6 +1201,51 @@ impl ComAmazonawsWafregionalAwswafRegional20161128State {
             self.outstanding_change_token = None;
         }
         true
+    }
+
+    /// Whether this service stores the condition set a `Predicate` of type `kind`
+    /// points at with `data_id`.
+    ///
+    /// Each `PredicateType` resolves its `DataId` against the store of that condition
+    /// kind — `IPMatch` against the `IPSet`s, `SqlInjectionMatch` against the
+    /// `SqlInjectionMatchSet`s, `XssMatch` against the `XssMatchSet`s, `SizeConstraint`
+    /// against the `SizeConstraintSet`s, `ByteMatch` against the `ByteMatchSet`s and
+    /// `GeoMatch` against the `GeoMatchSet`s. `RegexMatch` is the one `PredicateType`
+    /// left whose `Create*` is still a scaffold, so this service holds no
+    /// `RegexMatchSet` under any id and no `DataId` of that type can resolve.
+    pub fn condition_set_exists(&self, kind: &str, data_id: &str) -> bool {
+        match kind {
+            PREDICATE_TYPE_IP_MATCH => self.ip_sets.contains_key(data_id),
+            PREDICATE_TYPE_SQL_INJECTION_MATCH => {
+                self.sql_injection_match_sets.contains_key(data_id)
+            }
+            PREDICATE_TYPE_XSS_MATCH => self.xss_match_sets.contains_key(data_id),
+            PREDICATE_TYPE_SIZE_CONSTRAINT => self.size_constraint_sets.contains_key(data_id),
+            PREDICATE_TYPE_BYTE_MATCH => self.byte_match_sets.contains_key(data_id),
+            PREDICATE_TYPE_GEO_MATCH => self.geo_match_sets.contains_key(data_id),
+            _ => false,
+        }
+    }
+
+    /// Whether any stored rule — a `Rule` or a `RateBasedRule`, both of which hold a
+    /// predicate list — points at `data_id`.
+    ///
+    /// Every resource id this service mints comes from one sequence ([`Self::mint_id`]),
+    /// so an id identifies one condition set whatever its kind, and a `DataId` match is
+    /// a reference to that set. A `Delete*` of a referenced condition set is refused:
+    /// "You can't delete an IPSet if it's still used in any Rules", and the same
+    /// sentence appears on every condition kind's delete.
+    pub fn is_referenced_by_a_rule(&self, data_id: &str) -> bool {
+        let points_at = |rule: &RuleEntry| {
+            rule.predicates
+                .iter()
+                .any(|predicate| predicate.data_id == data_id)
+        };
+        self.rules.values().any(points_at)
+            || self
+                .rate_based_rules
+                .values()
+                .any(|rate_based| points_at(&rate_based.rule))
     }
 
     /// The status of `token`, or `None` when this service holds no such token.

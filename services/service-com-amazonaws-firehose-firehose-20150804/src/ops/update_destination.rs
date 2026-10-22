@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rewrites one destination of a stream held in [`crate::state`] and bumps the stream's
+//! `VersionId`, under the conditional-update rules the model documents:
+//!
+//! * the update is conditional on `CurrentDeliveryStreamVersionId` — "the service updates
+//!   the configuration only if the existing configuration has a version ID that matches",
+//!   otherwise `ConcurrentModificationException`;
+//! * "If the destination type is the same, Firehose merges the configuration parameters
+//!   specified with the destination configuration that already exists on the delivery
+//!   stream. If any of the parameters are not specified in the call, the existing values
+//!   are retained";
+//! * "If the destination type is not the same ... Firehose does not merge any parameters.
+//!   In this case, all parameters must be specified" — a required member the new
+//!   configuration lacks is refused with `InvalidArgumentException`;
+//! * "Switching between Amazon OpenSearch Service and other services is not supported. For
+//!   an Amazon OpenSearch Service destination, you can only update to another Amazon
+//!   OpenSearch Service destination" — also `InvalidArgumentException`.
+//!
+//! The stream's own status is untouched: "The target Firehose stream remains active while
+//! the configurations are updated." A stream that is not `ACTIVE` (still `CREATING`, or
+//! already `DELETING`) is in use by that lifecycle change and cannot be reconfigured, so
+//! the update is refused with `ResourceInUseException`.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +203,918 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDestination"))
+        // Unreachable through the router, which mounts every service on one shared
+        // `InMemoryEngine`; this operation models no server-side error to report it with.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateDestination",
+            ));
+        };
+        let _ = ctx;
+
+        // Exactly as on the create path, the request carries ONE destination: the model
+        // offers one `*DestinationUpdate` member per destination type and a destination has
+        // exactly one type.
+        let update = sole_update(&input)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialise_due(now);
+
+        let Some(stream) = store.streams.get_mut(&input.delivery_stream_name) else {
+            return Err(UpdateDestinationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Firehose stream {} not found",
+                        input.delivery_stream_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A stream still being created, or already marked for deletion, is in use by that
+        // lifecycle change: only an `ACTIVE` stream's configuration can be updated ("The
+        // target Firehose stream remains active while the configurations are updated").
+        if stream.status != crate::state::StreamStatus::Active {
+            return Err(UpdateDestinationErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Firehose stream {} is in status {}; its destination cannot be \
+                         updated until it is ACTIVE",
+                        input.delivery_stream_name,
+                        stream.status.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Firehose uses CurrentDeliveryStreamVersionId to avoid race conditions and
+        // conflicting merges ... the service updates the configuration only if the existing
+        // configuration has a version ID that matches."
+        if !version_matches(&input.current_delivery_stream_version_id, stream.version_id) {
+            return Err(
+                UpdateDestinationErrorModeled::ConcurrentModificationException(
+                    ConcurrentModificationException {
+                        message: Some(format!(
+                            "Cannot update Firehose stream {}: the current version id is {} \
+                             and the specified version id is {}",
+                            input.delivery_stream_name,
+                            stream.version_id,
+                            input.current_delivery_stream_version_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(destination) = stream
+            .destinations
+            .iter_mut()
+            .find(|destination| destination.destination_id == input.destination_id)
+        else {
+            // The id is a well-formed `DestinationId` (the model's pattern is checked
+            // before this handler runs) that names no destination of this stream, so it is
+            // an input parameter with a value that is not valid for this stream.
+            return Err(invalid_argument(format!(
+                "destination id {} is not a destination of Firehose stream {}",
+                input.destination_id, input.delivery_stream_name
+            )));
+        };
+
+        destination.config = applied(&destination.config, update)?;
+        // "After the update is applied successfully, the version ID is updated, and can be
+        // retrieved using DescribeDeliveryStream."
+        stream.version_id += 1;
+        stream.last_update_timestamp = now;
+
+        Ok(UpdateDestinationOutput {})
     }
+}
+
+/// Refuse an input combination the model cannot express, with this operation's own
+/// `InvalidArgumentException`: "The specified input parameter has a value that is not
+/// valid."
+fn invalid_argument(message: String) -> UpdateDestinationError {
+    UpdateDestinationErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Whether `supplied` names the stream's current version.
+///
+/// `DeliveryStreamVersionId` is a decimal number (`^[0-9]+$`, up to 50 digits), so it is
+/// compared by value and not by spelling; a value too large for any version this emulator
+/// mints cannot match.
+fn version_matches(supplied: &str, current: u64) -> bool {
+    supplied.parse::<u64>().is_ok_and(|supplied| supplied == current)
+}
+
+/// One destination type's update, as the request supplied it.
+///
+/// Boxed per variant for the same reason the stored configurations are: these are large
+/// structures.
+enum DestinationUpdateKind {
+    S3(Box<S3DestinationUpdate>),
+    ExtendedS3(Box<ExtendedS3DestinationUpdate>),
+    Redshift(Box<RedshiftDestinationUpdate>),
+    Elasticsearch(Box<ElasticsearchDestinationUpdate>),
+    AmazonOpenSearchService(Box<AmazonopensearchserviceDestinationUpdate>),
+    Splunk(Box<SplunkDestinationUpdate>),
+    HttpEndpoint(Box<HttpEndpointDestinationUpdate>),
+    Snowflake(Box<SnowflakeDestinationUpdate>),
+    AmazonOpenSearchServerless(Box<AmazonOpenSearchServerlessDestinationUpdate>),
+    Iceberg(Box<IcebergDestinationUpdate>),
+}
+
+impl DestinationUpdateKind {
+    /// The `*DestinationUpdate` member this update came from, for a refusal message.
+    fn member(&self) -> &'static str {
+        match self {
+            Self::S3(_) => "S3DestinationUpdate",
+            Self::ExtendedS3(_) => "ExtendedS3DestinationUpdate",
+            Self::Redshift(_) => "RedshiftDestinationUpdate",
+            Self::Elasticsearch(_) => "ElasticsearchDestinationUpdate",
+            Self::AmazonOpenSearchService(_) => "AmazonopensearchserviceDestinationUpdate",
+            Self::Splunk(_) => "SplunkDestinationUpdate",
+            Self::HttpEndpoint(_) => "HttpEndpointDestinationUpdate",
+            Self::Snowflake(_) => "SnowflakeDestinationUpdate",
+            Self::AmazonOpenSearchServerless(_) => "AmazonOpenSearchServerlessDestinationUpdate",
+            Self::Iceberg(_) => "IcebergDestinationUpdate",
+        }
+    }
+
+    /// Which Amazon OpenSearch Service offering this destination type belongs to, if any.
+    fn search_offering(&self) -> Option<SearchOffering> {
+        match self {
+            Self::Elasticsearch(_) | Self::AmazonOpenSearchService(_) => {
+                Some(SearchOffering::Domain)
+            }
+            Self::AmazonOpenSearchServerless(_) => Some(SearchOffering::Serverless),
+            _ => None,
+        }
+    }
+}
+
+/// The Amazon OpenSearch Service offerings a destination can belong to. Switching a
+/// destination between an offering and anything outside it is not supported, so these are
+/// the groups a type change may not cross.
+#[derive(PartialEq, Eq)]
+enum SearchOffering {
+    /// Amazon OpenSearch Service (domains) — the `Elasticsearch` and
+    /// `Amazonopensearchservice` destination types, the same offering under its old and
+    /// new names.
+    Domain,
+    /// The Serverless offering for Amazon OpenSearch Service.
+    Serverless,
+}
+
+/// Which Amazon OpenSearch Service offering a STORED destination belongs to, if any.
+fn stored_search_offering(config: &crate::state::DestinationConfigKind) -> Option<SearchOffering> {
+    use crate::state::DestinationConfigKind as Kind;
+    match config {
+        Kind::Elasticsearch(_) | Kind::AmazonOpenSearchService(_) => Some(SearchOffering::Domain),
+        Kind::AmazonOpenSearchServerless(_) => Some(SearchOffering::Serverless),
+        _ => None,
+    }
+}
+
+/// The one destination update the request carries, refusing both none and more than one.
+///
+/// Credentials supplied inside an update (a Redshift password, a Snowflake private key or
+/// passphrase, an HTTP endpoint access key) are dropped rather than stored, exactly as on
+/// the create path: every one is `@sensitive` and no modelled description carries it back.
+fn sole_update(
+    input: &UpdateDestinationInput,
+) -> Result<DestinationUpdateKind, UpdateDestinationError> {
+    use DestinationUpdateKind as Kind;
+
+    let mut supplied: Vec<Kind> = Vec::new();
+    if let Some(update) = input.s3_destination_update.clone() {
+        supplied.push(Kind::S3(Box::new(update)));
+    }
+    if let Some(update) = input.extended_s3_destination_update.clone() {
+        supplied.push(Kind::ExtendedS3(Box::new(update)));
+    }
+    if let Some(mut update) = input.redshift_destination_update.clone() {
+        update.password = None;
+        supplied.push(Kind::Redshift(Box::new(update)));
+    }
+    if let Some(update) = input.elasticsearch_destination_update.clone() {
+        supplied.push(Kind::Elasticsearch(Box::new(update)));
+    }
+    if let Some(update) = input.amazonopensearchservice_destination_update.clone() {
+        supplied.push(Kind::AmazonOpenSearchService(Box::new(update)));
+    }
+    if let Some(update) = input.splunk_destination_update.clone() {
+        supplied.push(Kind::Splunk(Box::new(update)));
+    }
+    if let Some(mut update) = input.http_endpoint_destination_update.clone() {
+        if let Some(endpoint) = update.endpoint_configuration.as_mut() {
+            endpoint.access_key = None;
+        }
+        supplied.push(Kind::HttpEndpoint(Box::new(update)));
+    }
+    if let Some(mut update) = input.snowflake_destination_update.clone() {
+        update.private_key = None;
+        update.key_passphrase = None;
+        supplied.push(Kind::Snowflake(Box::new(update)));
+    }
+    if let Some(update) = input
+        .amazon_open_search_serverless_destination_update
+        .clone()
+    {
+        supplied.push(Kind::AmazonOpenSearchServerless(Box::new(update)));
+    }
+    if let Some(update) = input.iceberg_destination_update.clone() {
+        supplied.push(Kind::Iceberg(Box::new(update)));
+    }
+
+    if supplied.len() > 1 {
+        let members: Vec<&str> = supplied.iter().map(DestinationUpdateKind::member).collect();
+        return Err(invalid_argument(format!(
+            "only one destination update may be specified, but {} were: {}",
+            members.len(),
+            members.join(", ")
+        )));
+    }
+    supplied
+        .pop()
+        .ok_or_else(|| invalid_argument("a destination update must be specified".to_string()))
+}
+
+/// The stored configuration this destination has AFTER `update` is applied.
+///
+/// Same destination type: the supplied parameters are merged over what the stream already
+/// holds, and an unspecified parameter keeps its existing value. Different destination
+/// type: nothing is merged, so the update must carry every required parameter of the new
+/// type — and a change into or out of an Amazon OpenSearch Service offering is refused.
+fn applied(
+    stored: &crate::state::DestinationConfigKind,
+    update: DestinationUpdateKind,
+) -> Result<crate::state::DestinationConfigKind, UpdateDestinationError> {
+    use crate::state::DestinationConfigKind as Kind;
+    use DestinationUpdateKind as Update;
+
+    match (stored, update) {
+        // `S3DestinationUpdate` is the deprecated spelling of the Amazon S3 destination
+        // and `ExtendedS3DestinationUpdate` its superset, so they address ONE destination
+        // type: either update merges into a stored Amazon S3 destination, and an extended
+        // update promotes a plain configuration to the extended one it is a subset of.
+        (Kind::S3(config), Update::S3(update)) => {
+            let mut config = config.clone();
+            merge_s3(&mut config, &update);
+            Ok(Kind::S3(config))
+        }
+        (Kind::S3(config), Update::ExtendedS3(update)) => {
+            let mut promoted = extended_from_s3(config);
+            merge_extended_s3(&mut promoted, &update)?;
+            Ok(Kind::ExtendedS3(Box::new(promoted)))
+        }
+        (Kind::ExtendedS3(config), Update::S3(update)) => {
+            let mut config = config.clone();
+            merge_s3_into_extended(&mut config, &update);
+            Ok(Kind::ExtendedS3(config))
+        }
+        (Kind::ExtendedS3(config), Update::ExtendedS3(update)) => {
+            let mut config = config.clone();
+            merge_extended_s3(&mut config, &update)?;
+            Ok(Kind::ExtendedS3(config))
+        }
+        (Kind::Redshift(config), Update::Redshift(update)) => {
+            let mut config = config.clone();
+            merge_redshift(&mut config, &update)?;
+            Ok(Kind::Redshift(config))
+        }
+        (Kind::Elasticsearch(config), Update::Elasticsearch(update)) => {
+            let mut config = config.clone();
+            merge_elasticsearch(&mut config, &update)?;
+            Ok(Kind::Elasticsearch(config))
+        }
+        (Kind::AmazonOpenSearchService(config), Update::AmazonOpenSearchService(update)) => {
+            let mut config = config.clone();
+            merge_opensearch_service(&mut config, &update)?;
+            Ok(Kind::AmazonOpenSearchService(config))
+        }
+        (Kind::Splunk(config), Update::Splunk(update)) => {
+            let mut config = config.clone();
+            merge_splunk(&mut config, &update)?;
+            Ok(Kind::Splunk(config))
+        }
+        (Kind::HttpEndpoint(config), Update::HttpEndpoint(update)) => {
+            let mut config = config.clone();
+            merge_http_endpoint(&mut config, &update)?;
+            Ok(Kind::HttpEndpoint(config))
+        }
+        (Kind::Snowflake(config), Update::Snowflake(update)) => {
+            let mut config = config.clone();
+            merge_snowflake(&mut config, &update)?;
+            Ok(Kind::Snowflake(config))
+        }
+        (
+            Kind::AmazonOpenSearchServerless(config),
+            Update::AmazonOpenSearchServerless(update),
+        ) => {
+            let mut config = config.clone();
+            merge_opensearch_serverless(&mut config, &update)?;
+            Ok(Kind::AmazonOpenSearchServerless(config))
+        }
+        (Kind::Iceberg(config), Update::Iceberg(update)) => {
+            let mut config = config.clone();
+            merge_iceberg(&mut config, &update);
+            Ok(Kind::Iceberg(config))
+        }
+        // The destination type changes.
+        (stored, update) => {
+            // "Switching between Amazon OpenSearch Service and other services is not
+            // supported. For an Amazon OpenSearch Service destination, you can only update
+            // to another Amazon OpenSearch Service destination."
+            let (from, to) = (stored_search_offering(stored), update.search_offering());
+            if (from.is_some() || to.is_some()) && from != to {
+                return Err(invalid_argument(format!(
+                    "changing the destination type to or from an Amazon OpenSearch Service \
+                     offering is not supported, so {} cannot be applied to this destination",
+                    update.member()
+                )));
+            }
+            // "If the destination type is not the same ... Firehose does not merge any
+            // parameters. In this case, all parameters must be specified."
+            replaced(update)
+        }
+    }
+}
+
+/// The configuration a destination of a NEW type is built from: every required parameter
+/// of that type must be present in the update, since nothing is merged.
+fn replaced(
+    update: DestinationUpdateKind,
+) -> Result<crate::state::DestinationConfigKind, UpdateDestinationError> {
+    use crate::state::DestinationConfigKind as Kind;
+    use DestinationUpdateKind as Update;
+
+    match update {
+        Update::S3(update) => Ok(Kind::S3(Box::new(s3_from_update(
+            &update,
+            "S3DestinationUpdate",
+        )?))),
+        Update::ExtendedS3(update) => {
+            let member = "ExtendedS3DestinationUpdate";
+            let mut config = ExtendedS3DestinationConfiguration {
+                role_arn: required(&update.role_arn, member, "RoleARN")?,
+                bucket_arn: required(&update.bucket_arn, member, "BucketARN")?,
+                ..ExtendedS3DestinationConfiguration::default()
+            };
+            merge_extended_s3(&mut config, &update)?;
+            Ok(Kind::ExtendedS3(Box::new(config)))
+        }
+        Update::Redshift(update) => {
+            let member = "RedshiftDestinationUpdate";
+            let mut config = RedshiftDestinationConfiguration {
+                role_arn: required(&update.role_arn, member, "RoleARN")?,
+                cluster_jdbcurl: required(&update.cluster_jdbcurl, member, "ClusterJDBCURL")?,
+                copy_command: required(&update.copy_command, member, "CopyCommand")?,
+                s3_configuration: nested_s3(&update.s3_update, member, "S3Update")?,
+                ..RedshiftDestinationConfiguration::default()
+            };
+            merge_redshift(&mut config, &update)?;
+            Ok(Kind::Redshift(config.into()))
+        }
+        Update::Elasticsearch(update) => {
+            let member = "ElasticsearchDestinationUpdate";
+            let mut config = ElasticsearchDestinationConfiguration {
+                role_arn: required(&update.role_arn, member, "RoleARN")?,
+                index_name: required(&update.index_name, member, "IndexName")?,
+                s3_configuration: nested_s3(&update.s3_update, member, "S3Update")?,
+                ..ElasticsearchDestinationConfiguration::default()
+            };
+            merge_elasticsearch(&mut config, &update)?;
+            Ok(Kind::Elasticsearch(config.into()))
+        }
+        Update::AmazonOpenSearchService(update) => {
+            let member = "AmazonopensearchserviceDestinationUpdate";
+            let mut config = AmazonopensearchserviceDestinationConfiguration {
+                role_arn: required(&update.role_arn, member, "RoleARN")?,
+                index_name: required(&update.index_name, member, "IndexName")?,
+                s3_configuration: nested_s3(&update.s3_update, member, "S3Update")?,
+                ..AmazonopensearchserviceDestinationConfiguration::default()
+            };
+            merge_opensearch_service(&mut config, &update)?;
+            Ok(Kind::AmazonOpenSearchService(config.into()))
+        }
+        Update::Splunk(update) => {
+            let member = "SplunkDestinationUpdate";
+            let mut config = SplunkDestinationConfiguration {
+                hec_endpoint: required(&update.hec_endpoint, member, "HECEndpoint")?,
+                hec_endpoint_type: required(&update.hec_endpoint_type, member, "HECEndpointType")?,
+                s3_configuration: nested_s3(&update.s3_update, member, "S3Update")?,
+                ..SplunkDestinationConfiguration::default()
+            };
+            merge_splunk(&mut config, &update)?;
+            Ok(Kind::Splunk(config.into()))
+        }
+        Update::HttpEndpoint(update) => {
+            let member = "HttpEndpointDestinationUpdate";
+            let mut config = HttpEndpointDestinationConfiguration {
+                endpoint_configuration: required(
+                    &update.endpoint_configuration,
+                    member,
+                    "EndpointConfiguration",
+                )?,
+                s3_configuration: nested_s3(&update.s3_update, member, "S3Update")?,
+                ..HttpEndpointDestinationConfiguration::default()
+            };
+            merge_http_endpoint(&mut config, &update)?;
+            Ok(Kind::HttpEndpoint(config.into()))
+        }
+        Update::Snowflake(update) => {
+            let member = "SnowflakeDestinationUpdate";
+            let mut config = SnowflakeDestinationConfiguration {
+                account_url: required(&update.account_url, member, "AccountUrl")?,
+                database: required(&update.database, member, "Database")?,
+                schema: required(&update.schema, member, "Schema")?,
+                table: required(&update.table, member, "Table")?,
+                role_arn: required(&update.role_arn, member, "RoleARN")?,
+                s3_configuration: nested_s3(&update.s3_update, member, "S3Update")?,
+                ..SnowflakeDestinationConfiguration::default()
+            };
+            merge_snowflake(&mut config, &update)?;
+            Ok(Kind::Snowflake(config.into()))
+        }
+        Update::AmazonOpenSearchServerless(update) => {
+            let member = "AmazonOpenSearchServerlessDestinationUpdate";
+            let mut config = AmazonOpenSearchServerlessDestinationConfiguration {
+                role_arn: required(&update.role_arn, member, "RoleARN")?,
+                index_name: required(&update.index_name, member, "IndexName")?,
+                s3_configuration: nested_s3(&update.s3_update, member, "S3Update")?,
+                ..AmazonOpenSearchServerlessDestinationConfiguration::default()
+            };
+            merge_opensearch_serverless(&mut config, &update)?;
+            Ok(Kind::AmazonOpenSearchServerless(config.into()))
+        }
+        Update::Iceberg(update) => {
+            let member = "IcebergDestinationUpdate";
+            let mut config = IcebergDestinationConfiguration {
+                role_arn: required(&update.role_arn, member, "RoleARN")?,
+                catalog_configuration: required(
+                    &update.catalog_configuration,
+                    member,
+                    "CatalogConfiguration",
+                )?,
+                s3_configuration: required(&update.s3_configuration, member, "S3Configuration")?,
+                ..IcebergDestinationConfiguration::default()
+            };
+            merge_iceberg(&mut config, &update);
+            Ok(Kind::Iceberg(config.into()))
+        }
+    }
+}
+
+/// A parameter the new destination type requires: "all parameters must be specified" when
+/// the destination type changes, so an absent one is refused rather than defaulted.
+fn required<T: Clone>(
+    value: &Option<T>,
+    update_member: &str,
+    member: &str,
+) -> Result<T, UpdateDestinationError> {
+    value.clone().ok_or_else(|| {
+        invalid_argument(format!(
+            "{update_member}.{member} must be specified when the destination type changes, \
+             because no parameter is merged in that case"
+        ))
+    })
+}
+
+/// A nested Amazon S3 configuration built from scratch out of an `S3DestinationUpdate`,
+/// for a destination type that requires one.
+fn nested_s3(
+    update: &Option<S3DestinationUpdate>,
+    update_member: &str,
+    member: &str,
+) -> Result<S3DestinationConfiguration, UpdateDestinationError> {
+    let update = update.as_ref().ok_or_else(|| {
+        invalid_argument(format!(
+            "{update_member}.{member} must be specified when the destination type changes, \
+             because no parameter is merged in that case"
+        ))
+    })?;
+    s3_from_update(update, &format!("{update_member}.{member}"))
+}
+
+/// An `S3DestinationConfiguration` built entirely from an update, for a destination that
+/// holds none to merge into.
+fn s3_from_update(
+    update: &S3DestinationUpdate,
+    update_member: &str,
+) -> Result<S3DestinationConfiguration, UpdateDestinationError> {
+    Ok(S3DestinationConfiguration {
+        role_arn: required(&update.role_arn, update_member, "RoleARN")?,
+        bucket_arn: required(&update.bucket_arn, update_member, "BucketARN")?,
+        prefix: update.prefix.clone(),
+        error_output_prefix: update.error_output_prefix.clone(),
+        buffering_hints: update.buffering_hints.clone(),
+        compression_format: update.compression_format.clone(),
+        encryption_configuration: update.encryption_configuration.clone(),
+        cloud_watch_logging_options: update.cloud_watch_logging_options.clone(),
+    })
+}
+
+/// The extended Amazon S3 configuration a plain one is the subset of: every member of
+/// `S3DestinationConfiguration` is a member of `ExtendedS3DestinationConfiguration` with
+/// the same meaning, so the promotion keeps the destination as it was.
+fn extended_from_s3(config: &S3DestinationConfiguration) -> ExtendedS3DestinationConfiguration {
+    ExtendedS3DestinationConfiguration {
+        role_arn: config.role_arn.clone(),
+        bucket_arn: config.bucket_arn.clone(),
+        prefix: config.prefix.clone(),
+        error_output_prefix: config.error_output_prefix.clone(),
+        buffering_hints: config.buffering_hints.clone(),
+        compression_format: config.compression_format.clone(),
+        encryption_configuration: config.encryption_configuration.clone(),
+        cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+        ..ExtendedS3DestinationConfiguration::default()
+    }
+}
+
+/// Overwrite `stored` with `supplied` only when the update carries the parameter: "If any
+/// of the parameters are not specified in the call, the existing values are retained."
+fn merge_optional<T: Clone>(stored: &mut Option<T>, supplied: &Option<T>) {
+    if supplied.is_some() {
+        *stored = supplied.clone();
+    }
+}
+
+/// The same rule for a parameter the stored configuration always holds (one the
+/// configuration shape declares `@required`).
+fn merge_required<T: Clone>(stored: &mut T, supplied: &Option<T>) {
+    if let Some(supplied) = supplied {
+        *stored = supplied.clone();
+    }
+}
+
+/// Merge an `S3DestinationUpdate` into a nested Amazon S3 configuration the destination
+/// already holds.
+fn merge_s3(stored: &mut S3DestinationConfiguration, update: &S3DestinationUpdate) {
+    merge_required(&mut stored.role_arn, &update.role_arn);
+    merge_required(&mut stored.bucket_arn, &update.bucket_arn);
+    merge_optional(&mut stored.prefix, &update.prefix);
+    merge_optional(&mut stored.error_output_prefix, &update.error_output_prefix);
+    merge_optional(&mut stored.buffering_hints, &update.buffering_hints);
+    merge_optional(&mut stored.compression_format, &update.compression_format);
+    merge_optional(
+        &mut stored.encryption_configuration,
+        &update.encryption_configuration,
+    );
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+}
+
+/// Merge an `S3DestinationUpdate` into an optional nested Amazon S3 configuration (an S3
+/// backup), building that configuration when the destination holds none yet.
+fn merge_optional_s3(
+    stored: &mut Option<S3DestinationConfiguration>,
+    update: &Option<S3DestinationUpdate>,
+    update_member: &str,
+) -> Result<(), UpdateDestinationError> {
+    let Some(update) = update.as_ref() else {
+        return Ok(());
+    };
+    match stored.as_mut() {
+        Some(stored) => merge_s3(stored, update),
+        None => *stored = Some(s3_from_update(update, update_member)?),
+    }
+    Ok(())
+}
+
+/// Merge the deprecated plain Amazon S3 update into an extended Amazon S3 destination:
+/// the plain shape's members are the extended shape's, so each one merges as it would on
+/// the plain configuration and the extended-only parameters are retained.
+fn merge_s3_into_extended(
+    stored: &mut ExtendedS3DestinationConfiguration,
+    update: &S3DestinationUpdate,
+) {
+    merge_required(&mut stored.role_arn, &update.role_arn);
+    merge_required(&mut stored.bucket_arn, &update.bucket_arn);
+    merge_optional(&mut stored.prefix, &update.prefix);
+    merge_optional(&mut stored.error_output_prefix, &update.error_output_prefix);
+    merge_optional(&mut stored.buffering_hints, &update.buffering_hints);
+    merge_optional(&mut stored.compression_format, &update.compression_format);
+    merge_optional(
+        &mut stored.encryption_configuration,
+        &update.encryption_configuration,
+    );
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+}
+
+fn merge_extended_s3(
+    stored: &mut ExtendedS3DestinationConfiguration,
+    update: &ExtendedS3DestinationUpdate,
+) -> Result<(), UpdateDestinationError> {
+    merge_required(&mut stored.role_arn, &update.role_arn);
+    merge_required(&mut stored.bucket_arn, &update.bucket_arn);
+    merge_optional(&mut stored.prefix, &update.prefix);
+    merge_optional(&mut stored.error_output_prefix, &update.error_output_prefix);
+    merge_optional(&mut stored.buffering_hints, &update.buffering_hints);
+    merge_optional(&mut stored.compression_format, &update.compression_format);
+    merge_optional(
+        &mut stored.encryption_configuration,
+        &update.encryption_configuration,
+    );
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+    merge_optional(
+        &mut stored.processing_configuration,
+        &update.processing_configuration,
+    );
+    merge_optional(&mut stored.s3_backup_mode, &update.s3_backup_mode);
+    merge_optional_s3(
+        &mut stored.s3_backup_configuration,
+        &update.s3_backup_update,
+        "ExtendedS3DestinationUpdate.S3BackupUpdate",
+    )?;
+    merge_optional(
+        &mut stored.data_format_conversion_configuration,
+        &update.data_format_conversion_configuration,
+    );
+    merge_optional(
+        &mut stored.dynamic_partitioning_configuration,
+        &update.dynamic_partitioning_configuration,
+    );
+    merge_optional(&mut stored.file_extension, &update.file_extension);
+    merge_optional(&mut stored.custom_time_zone, &update.custom_time_zone);
+    Ok(())
+}
+
+fn merge_redshift(
+    stored: &mut RedshiftDestinationConfiguration,
+    update: &RedshiftDestinationUpdate,
+) -> Result<(), UpdateDestinationError> {
+    merge_required(&mut stored.role_arn, &update.role_arn);
+    merge_required(&mut stored.cluster_jdbcurl, &update.cluster_jdbcurl);
+    merge_required(&mut stored.copy_command, &update.copy_command);
+    merge_optional(&mut stored.username, &update.username);
+    // `Password` is `@sensitive` and no description carries it back, so it is dropped
+    // rather than stored — as on the create path.
+    merge_optional(&mut stored.retry_options, &update.retry_options);
+    if let Some(s3_update) = update.s3_update.as_ref() {
+        merge_s3(&mut stored.s3_configuration, s3_update);
+    }
+    merge_optional(
+        &mut stored.processing_configuration,
+        &update.processing_configuration,
+    );
+    merge_optional(&mut stored.s3_backup_mode, &update.s3_backup_mode);
+    merge_optional_s3(
+        &mut stored.s3_backup_configuration,
+        &update.s3_backup_update,
+        "RedshiftDestinationUpdate.S3BackupUpdate",
+    )?;
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+    merge_optional(
+        &mut stored.secrets_manager_configuration,
+        &update.secrets_manager_configuration,
+    );
+    Ok(())
+}
+
+fn merge_elasticsearch(
+    stored: &mut ElasticsearchDestinationConfiguration,
+    update: &ElasticsearchDestinationUpdate,
+) -> Result<(), UpdateDestinationError> {
+    merge_required(&mut stored.role_arn, &update.role_arn);
+    merge_optional(&mut stored.domain_arn, &update.domain_arn);
+    merge_optional(&mut stored.cluster_endpoint, &update.cluster_endpoint);
+    merge_required(&mut stored.index_name, &update.index_name);
+    merge_optional(&mut stored.type_name, &update.type_name);
+    merge_optional(
+        &mut stored.index_rotation_period,
+        &update.index_rotation_period,
+    );
+    merge_optional(&mut stored.buffering_hints, &update.buffering_hints);
+    merge_optional(&mut stored.retry_options, &update.retry_options);
+    if let Some(s3_update) = update.s3_update.as_ref() {
+        merge_s3(&mut stored.s3_configuration, s3_update);
+    }
+    merge_optional(
+        &mut stored.processing_configuration,
+        &update.processing_configuration,
+    );
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+    merge_optional(&mut stored.document_id_options, &update.document_id_options);
+    Ok(())
+}
+
+fn merge_opensearch_service(
+    stored: &mut AmazonopensearchserviceDestinationConfiguration,
+    update: &AmazonopensearchserviceDestinationUpdate,
+) -> Result<(), UpdateDestinationError> {
+    merge_required(&mut stored.role_arn, &update.role_arn);
+    merge_optional(&mut stored.domain_arn, &update.domain_arn);
+    merge_optional(&mut stored.cluster_endpoint, &update.cluster_endpoint);
+    merge_required(&mut stored.index_name, &update.index_name);
+    merge_optional(&mut stored.type_name, &update.type_name);
+    merge_optional(
+        &mut stored.index_rotation_period,
+        &update.index_rotation_period,
+    );
+    merge_optional(&mut stored.buffering_hints, &update.buffering_hints);
+    merge_optional(&mut stored.retry_options, &update.retry_options);
+    if let Some(s3_update) = update.s3_update.as_ref() {
+        merge_s3(&mut stored.s3_configuration, s3_update);
+    }
+    merge_optional(
+        &mut stored.processing_configuration,
+        &update.processing_configuration,
+    );
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+    merge_optional(&mut stored.document_id_options, &update.document_id_options);
+    Ok(())
+}
+
+fn merge_splunk(
+    stored: &mut SplunkDestinationConfiguration,
+    update: &SplunkDestinationUpdate,
+) -> Result<(), UpdateDestinationError> {
+    merge_required(&mut stored.hec_endpoint, &update.hec_endpoint);
+    merge_required(&mut stored.hec_endpoint_type, &update.hec_endpoint_type);
+    merge_optional(&mut stored.hec_token, &update.hec_token);
+    merge_optional(
+        &mut stored.hec_acknowledgment_timeout_in_seconds,
+        &update.hec_acknowledgment_timeout_in_seconds,
+    );
+    merge_optional(&mut stored.retry_options, &update.retry_options);
+    merge_optional(&mut stored.s3_backup_mode, &update.s3_backup_mode);
+    if let Some(s3_update) = update.s3_update.as_ref() {
+        merge_s3(&mut stored.s3_configuration, s3_update);
+    }
+    merge_optional(
+        &mut stored.processing_configuration,
+        &update.processing_configuration,
+    );
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+    merge_optional(&mut stored.buffering_hints, &update.buffering_hints);
+    merge_optional(
+        &mut stored.secrets_manager_configuration,
+        &update.secrets_manager_configuration,
+    );
+    Ok(())
+}
+
+fn merge_http_endpoint(
+    stored: &mut HttpEndpointDestinationConfiguration,
+    update: &HttpEndpointDestinationUpdate,
+) -> Result<(), UpdateDestinationError> {
+    // The update's own `AccessKey` is already dropped by `sole_update`.
+    merge_required(
+        &mut stored.endpoint_configuration,
+        &update.endpoint_configuration,
+    );
+    merge_optional(&mut stored.buffering_hints, &update.buffering_hints);
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+    merge_optional(
+        &mut stored.request_configuration,
+        &update.request_configuration,
+    );
+    merge_optional(
+        &mut stored.processing_configuration,
+        &update.processing_configuration,
+    );
+    merge_optional(&mut stored.role_arn, &update.role_arn);
+    merge_optional(&mut stored.retry_options, &update.retry_options);
+    merge_optional(&mut stored.s3_backup_mode, &update.s3_backup_mode);
+    if let Some(s3_update) = update.s3_update.as_ref() {
+        merge_s3(&mut stored.s3_configuration, s3_update);
+    }
+    merge_optional(
+        &mut stored.secrets_manager_configuration,
+        &update.secrets_manager_configuration,
+    );
+    Ok(())
+}
+
+fn merge_snowflake(
+    stored: &mut SnowflakeDestinationConfiguration,
+    update: &SnowflakeDestinationUpdate,
+) -> Result<(), UpdateDestinationError> {
+    merge_required(&mut stored.account_url, &update.account_url);
+    // `PrivateKey` and `KeyPassphrase` are `@sensitive`: already dropped by `sole_update`.
+    merge_optional(&mut stored.user, &update.user);
+    merge_required(&mut stored.database, &update.database);
+    merge_required(&mut stored.schema, &update.schema);
+    merge_required(&mut stored.table, &update.table);
+    merge_optional(
+        &mut stored.snowflake_role_configuration,
+        &update.snowflake_role_configuration,
+    );
+    merge_optional(&mut stored.data_loading_option, &update.data_loading_option);
+    merge_optional(
+        &mut stored.meta_data_column_name,
+        &update.meta_data_column_name,
+    );
+    merge_optional(&mut stored.content_column_name, &update.content_column_name);
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+    merge_optional(
+        &mut stored.processing_configuration,
+        &update.processing_configuration,
+    );
+    merge_required(&mut stored.role_arn, &update.role_arn);
+    merge_optional(&mut stored.retry_options, &update.retry_options);
+    merge_optional(&mut stored.s3_backup_mode, &update.s3_backup_mode);
+    if let Some(s3_update) = update.s3_update.as_ref() {
+        merge_s3(&mut stored.s3_configuration, s3_update);
+    }
+    merge_optional(
+        &mut stored.secrets_manager_configuration,
+        &update.secrets_manager_configuration,
+    );
+    merge_optional(&mut stored.buffering_hints, &update.buffering_hints);
+    Ok(())
+}
+
+fn merge_opensearch_serverless(
+    stored: &mut AmazonOpenSearchServerlessDestinationConfiguration,
+    update: &AmazonOpenSearchServerlessDestinationUpdate,
+) -> Result<(), UpdateDestinationError> {
+    merge_required(&mut stored.role_arn, &update.role_arn);
+    merge_optional(&mut stored.collection_endpoint, &update.collection_endpoint);
+    merge_required(&mut stored.index_name, &update.index_name);
+    merge_optional(&mut stored.buffering_hints, &update.buffering_hints);
+    merge_optional(&mut stored.retry_options, &update.retry_options);
+    if let Some(s3_update) = update.s3_update.as_ref() {
+        merge_s3(&mut stored.s3_configuration, s3_update);
+    }
+    merge_optional(
+        &mut stored.processing_configuration,
+        &update.processing_configuration,
+    );
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+    Ok(())
+}
+
+fn merge_iceberg(
+    stored: &mut IcebergDestinationConfiguration,
+    update: &IcebergDestinationUpdate,
+) {
+    merge_optional(
+        &mut stored.destination_table_configuration_list,
+        &update.destination_table_configuration_list,
+    );
+    merge_optional(
+        &mut stored.schema_evolution_configuration,
+        &update.schema_evolution_configuration,
+    );
+    merge_optional(
+        &mut stored.table_creation_configuration,
+        &update.table_creation_configuration,
+    );
+    merge_optional(&mut stored.buffering_hints, &update.buffering_hints);
+    merge_optional(
+        &mut stored.cloud_watch_logging_options,
+        &update.cloud_watch_logging_options,
+    );
+    merge_optional(
+        &mut stored.processing_configuration,
+        &update.processing_configuration,
+    );
+    merge_optional(&mut stored.s3_backup_mode, &update.s3_backup_mode);
+    merge_optional(&mut stored.retry_options, &update.retry_options);
+    merge_required(&mut stored.role_arn, &update.role_arn);
+    merge_optional(&mut stored.append_only, &update.append_only);
+    merge_required(
+        &mut stored.catalog_configuration,
+        &update.catalog_configuration,
+    );
+    // `IcebergDestinationUpdate` carries a whole `S3DestinationConfiguration`, not an
+    // update, so a supplied one replaces what the destination held.
+    merge_required(&mut stored.s3_configuration, &update.s3_configuration);
 }

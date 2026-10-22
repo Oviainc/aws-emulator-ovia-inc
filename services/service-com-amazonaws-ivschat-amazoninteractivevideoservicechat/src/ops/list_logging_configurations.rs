@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLoggingConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLoggingConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the logging configurations held in [`crate::state`], capped at
+//! `maxResults` and resumable through an opaque `nextToken` that names where the previous
+//! page stopped. `loggingConfigurations` is always present, empty when the store holds
+//! none.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLoggingConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A 501 from this operation would mean "nobody has written it yet"; it no longer
+//! answers one.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +72,19 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Render a page position — the `LoggingConfigurationID` the page ended on — as the
+/// opaque `nextToken` the response carries, through the codec in [`crate::state`] that
+/// every paginator in this crate shares.
+fn encode_page_token(id: &str) -> String {
+    crate::state::encode_pagination_token(id)
+}
+
+/// The page position an opaque `nextToken` names, or `None` when the value is not a token
+/// this service issued.
+fn decode_page_token(token: &str) -> Option<String> {
+    crate::state::decode_pagination_token(token)
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -144,18 +155,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLoggingConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLoggingConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLoggingConfigurations"))
+        let _ = ctx;
+        // Modeled constraints are already refused BEFORE this handler runs, so reaching
+        // here means `maxResults` satisfies the modelled `MaxLoggingConfigurationResults`
+        // range and `nextToken` its length.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service. An engine this service cannot read its state
+            // from means the operation cannot be served at all, which is what 501 says.
+            crate::scaffolded::Scaffolded::not_implemented("ListLoggingConfigurations")
+        })?;
+
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match decode_page_token(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(ListLoggingConfigurationsErrorModeled::ValidationException(
+                        crate::state::field_validation_failed(
+                            "nextToken",
+                            "nextToken is not a pagination token this service issued.",
+                        ),
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_MAX_LOGGING_CONFIGURATION_RESULTS)
+                .clamp(1, crate::state::MAX_LOGGING_CONFIGURATION_RESULTS),
+        )
+        .unwrap_or(1);
+
+        // A reporting operation: the store is read, never written.
+        let store = state.lock();
+        // The model documents no order for this list, so the page order is the store's own
+        // total order on `LoggingConfigurationID` — reproducible across calls, which is
+        // what a resumable token needs.
+        let mut remaining = store
+            .logging_configurations
+            .iter()
+            .filter(|(id, _)| {
+                // Resume strictly after the id the previous page ended on. Comparing ids
+                // rather than counting means a configuration deleted between pages drops
+                // out without shifting or repeating the ones around it.
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| id.as_str() > after)
+            })
+            .map(|(_, configuration)| configuration);
+
+        let taken: Vec<&crate::state::LoggingConfiguration> =
+            remaining.by_ref().take(page_size).collect();
+        // A token only when configurations remain after this page, so a caller that
+        // follows tokens to the end sees every configuration exactly once.
+        let next_token = match (remaining.next(), taken.last()) {
+            (Some(_), Some(last)) => Some(encode_page_token(&last.id)),
+            _ => None,
+        };
+
+        let logging_configurations = taken
+            .into_iter()
+            .map(|configuration| LoggingConfigurationSummary {
+                arn: Some(configuration.arn.clone()),
+                id: Some(configuration.id.clone()),
+                name: configuration.name.clone(),
+                create_time: Some(crate::state::as_date_time(configuration.create_time)),
+                update_time: Some(crate::state::as_date_time(configuration.update_time)),
+                destination_configuration: Some(configuration.destination_configuration.clone()),
+                state: Some(configuration.state.clone()),
+                tags: Some(
+                    configuration
+                        .tags
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ),
+            })
+            .collect();
+
+        Ok(ListLoggingConfigurationsOutput {
+            logging_configurations,
+            next_token,
+        })
     }
 }

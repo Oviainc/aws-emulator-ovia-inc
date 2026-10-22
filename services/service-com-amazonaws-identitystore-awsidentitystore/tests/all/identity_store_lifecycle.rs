@@ -26,10 +26,10 @@ const TARGET_PREFIX: &str = "AWSIdentityStore";
 
 /// The identity store the issue's reproduction uses. Any id the modelled
 /// `IdentityStoreId` pattern admits works; this is one row's worth of that.
-const STORE: &str = "d-1234567890";
+pub(crate) const STORE: &str = "d-1234567890";
 
 /// A second store, so the per-store scope of a uniqueness claim is observable.
-const OTHER_STORE: &str = "d-abcdef0123";
+pub(crate) const OTHER_STORE: &str = "d-abcdef0123";
 
 /// The bounds of the modelled `MaxResults` range on `ListGroupMemberships`
 /// (`smithy_query(query="operation",operation="ListGroupMemberships")`: range 1..100,
@@ -65,7 +65,10 @@ const PROFILE_MEMBERS: &[&str] = &[
 ];
 
 /// A router with just this service mounted on a fresh engine.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because the wire harness below is shared with this crate's other
+/// suites (`tests/all/get_group_id.rs`) rather than copied into each of them.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the request still carries a SigV4
@@ -78,7 +81,11 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One `awsJson1_1` call: the HTTP status, the wire error code and the parsed body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, String, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, String, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -123,7 +130,12 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// A call that must answer 200, returning its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &str) -> Value {
+pub(crate) async fn ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) -> Value {
     let (status, code, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -133,7 +145,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &st
 }
 
 /// A call that must be refused with `status` and an error code naming `error`.
-async fn refused(
+pub(crate) async fn refused(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
@@ -155,7 +167,7 @@ async fn refused(
 }
 
 /// A required string member of a response body.
-fn string(body: &Value, member: &str, case: &str) -> String {
+pub(crate) fn string(body: &Value, member: &str, case: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a string {member}, got {body}"))
@@ -165,7 +177,7 @@ fn string(body: &Value, member: &str, case: &str) -> String {
 /// Assert `id` is a lower-case hexadecimal UUID, the form the modelled `ResourceId`
 /// pattern demands (`[0-9a-f]{8}-…-[0-9a-f]{12}`, from
 /// `smithy_query(query="shape",shape="ResourceId")`).
-fn assert_uuid(id: &str, member: &str, case: &str) {
+pub(crate) fn assert_uuid(id: &str, member: &str, case: &str) {
     let groups: Vec<&str> = id.split('-').collect();
     let shaped = groups.len() == 5
         && [8usize, 4, 4, 4, 12]
@@ -184,7 +196,7 @@ fn assert_uuid(id: &str, member: &str, case: &str) {
 
 /// Assert `arn` is the ARN of `kind`/`id`: `arn:aws:identitystore:::<kind>/<id>`, the
 /// form the modelled `ResourceArn` pattern demands, within its 60..100 length.
-fn assert_resource_arn(arn: &str, kind: &str, id: &str, case: &str) {
+pub(crate) fn assert_resource_arn(arn: &str, kind: &str, id: &str, case: &str) {
     assert_eq!(
         arn,
         format!("arn:aws:identitystore:::{kind}/{id}"),

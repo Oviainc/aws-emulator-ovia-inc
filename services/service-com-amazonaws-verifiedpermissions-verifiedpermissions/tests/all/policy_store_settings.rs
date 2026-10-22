@@ -595,15 +595,19 @@ async fn update_policy_store_resolves_aliases_and_refuses_unknown_references() {
         &json!({ "policyStoreId": deleted_id }),
     )
     .await;
-    let references: &[(&str, String)] = &[
-        ("never existed", "PSneverexisted".to_string()),
-        ("a deleted store", deleted_id.clone()),
+    // (case, the reference, the `ResourceType` the error must name: a bare id
+    // names a POLICY_STORE, a `policy-store-alias/<name>` reference names the
+    // ALIAS, which is the resource the request referenced.)
+    let references: &[(&str, String, &str)] = &[
+        ("never existed", "PSneverexisted".to_string(), "POLICY_STORE"),
+        ("a deleted store", deleted_id.clone(), "POLICY_STORE"),
         (
             "an alias no store carries",
             "policy-store-alias/nosuchalias".to_string(),
+            "POLICY_STORE_ALIAS",
         ),
     ];
-    for (case, reference) in references {
+    for (case, reference, resource_type) in references {
         let (status, body) = call(
             &router,
             "UpdatePolicyStore",
@@ -624,8 +628,8 @@ async fn update_policy_store_resolves_aliases_and_refuses_unknown_references() {
         );
         assert_eq!(
             body["resourceType"].as_str().unwrap_or_default(),
-            "POLICY_STORE",
-            "case {case:?}: the missing resource is a policy store, got {body}"
+            *resource_type,
+            "case {case:?}: the error must name the referenced resource, got {body}"
         );
     }
 }

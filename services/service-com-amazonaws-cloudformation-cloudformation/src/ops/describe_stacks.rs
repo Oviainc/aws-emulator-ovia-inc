@@ -77,20 +77,25 @@ use crate::state::{StoredStack, DRIFT_STATUS_NOT_CHECKED};
 
 /// One stored stack as the modelled `Stack` shape.
 ///
-/// Every member is read back from what `CreateStack`/`UpdateStack`/`DeleteStack`
-/// persisted. The members this emulator has nothing to report for are absent rather
-/// than invented:
+/// Every member is read back from what `CreateStack`/`UpdateStack`/`DeleteStack`/
+/// `UpdateTerminationProtection` persisted.
+///
+/// The members CloudFormation reports on EVERY stack are always present, as an empty
+/// element where the stack carries nothing: `NotificationARNs`, `Tags`,
+/// `RollbackConfiguration`, `DeploymentConfig` (with its documented defaults filled in)
+/// and `LastOperations`. The members that report a stack's OWN declarations —
+/// `Parameters`, `Outputs`, `Capabilities` — appear only when the stack has some, since a
+/// stack that declares none has no list to report.
+///
+/// The members this emulator has nothing to report for are absent rather than invented:
 ///
 /// * `ChangeSetId`, `ParentId`, `RootId` — change sets and nested stacks are not
 ///   implemented, so no stack here has any.
-/// * `DetailedStatus`, `LastOperations` — nothing in this slice produces them.
+/// * `DetailedStatus` — nothing in this slice produces one.
 ///
-/// `Outputs` is the stack's evaluated outputs: one entry per output the template that
-/// last finished deploying declares. A template declaring no outputs — and a stack whose
-/// create has not completed yet — reports the member absent rather than an empty list.
-///
-/// `DriftInformation` is `NOT_CHECKED`, which is what it is for a stack drift detection
-/// has never run against.
+/// `DriftInformation` is `NOT_CHECKED`: drift detection compares a stack's resources
+/// against its template, and `DetectStackDrift` answers 501 here rather than reporting a
+/// check nothing ran, so no stack of this emulator has ever been checked.
 fn stack_view(stored: &StoredStack) -> Stack {
     Stack {
         stack_id: Some(stored.stack_id.clone()),
@@ -107,8 +112,11 @@ fn stack_view(stored: &StoredStack) -> Stack {
         stack_status: stored.status.clone(),
         stack_status_reason: stored.status_reason.clone(),
         disable_rollback: Some(stored.disable_rollback),
-        deployment_config: crate::state::deployment_config_view(stored.deployment_config.as_ref()),
-        notification_ar_ns: crate::state::non_empty(stored.notification_arns.clone()),
+        deployment_config: crate::state::deployment_config_view(
+            stored.deployment_config.as_ref(),
+            stored.disable_rollback,
+        ),
+        notification_ar_ns: Some(stored.notification_arns.clone()),
         timeout_in_minutes: stored.timeout_in_minutes,
         capabilities: crate::state::non_empty(stored.capabilities.clone()),
         outputs: crate::state::output_views(&stored.outputs),
@@ -124,7 +132,7 @@ fn stack_view(stored: &StoredStack) -> Stack {
         retain_except_on_create: stored.retain_except_on_create,
         deletion_mode: stored.deletion_mode.clone(),
         detailed_status: None,
-        last_operations: None,
+        last_operations: crate::state::last_operation_views(stored.last_operation.as_ref()),
     }
 }
 

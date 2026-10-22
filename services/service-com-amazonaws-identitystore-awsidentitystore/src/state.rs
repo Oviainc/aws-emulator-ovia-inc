@@ -383,6 +383,35 @@ impl IdentityStoreData {
             .map_or(0, Vec::len)
     }
 
+    /// The group whose `DisplayName` is `display_name`, or `None` when this store
+    /// holds no such group.
+    ///
+    /// Resolved through [`Self::group_display_name_index`] — the same index
+    /// `CreateGroup` enforces its uniqueness claim with — so a name resolves to the
+    /// one group that currently holds it and never to a stale one.
+    pub fn group_by_display_name(&self, display_name: &str) -> Option<&Group> {
+        let group_id = self.group_display_name_index.get(display_name)?;
+        self.groups.get(group_id)
+    }
+
+    /// The group carrying the external id `issuer`/`id`, or `None` when this store
+    /// holds no such group.
+    ///
+    /// An external id pair identifies at most one resource, so the scan's answer does
+    /// not depend on the order the groups are walked in. No modelled operation of this
+    /// slice writes a group's external ids (they come from an identity provider's
+    /// provisioning — see [`Group::external_ids`]), so today this resolves nothing;
+    /// it is the lookup, not a hard-coded refusal, so it starts answering the moment
+    /// a provisioning path stores one.
+    pub fn group_by_external_id(&self, issuer: &str, id: &str) -> Option<&Group> {
+        self.groups.values().find(|group| {
+            group
+                .external_ids
+                .iter()
+                .any(|external| external.issuer == issuer && external.id == id)
+        })
+    }
+
     /// The membership of `group_id` by `member_user_id`, or `None` when that user is
     /// not a member of that group.
     pub fn membership_of(&self, group_id: &str, member_user_id: &str) -> Option<&GroupMembershipRecord> {
@@ -487,6 +516,31 @@ pub fn not_found(kind: ResourceKind, resource_id: &str) -> ResourceNotFoundExcep
         reason: None,
         message: Some(format!(
             "{} {resource_id} not found in this identity store",
+            kind.as_str()
+        )),
+        request_id: None,
+    }
+}
+
+/// The `ResourceNotFoundException` for a resource an ALTERNATE identifier names and
+/// this store does not hold.
+///
+/// `ResourceId` is left unset rather than carrying what the caller sent: the modelled
+/// member is a `ResourceId` (pattern
+/// `^(arn:…)?([0-9a-f]{10}-|)[A-Fa-f0-9]{8}-…$`, from
+/// `smithy_query(query="shape",shape="ResourceId")`), which an external id or a unique
+/// attribute value is not. `subject` names the identifier that failed to resolve, not
+/// its value — a `DisplayName` is `@sensitive`.
+pub fn not_found_by_alternate_identifier(
+    kind: ResourceKind,
+    subject: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        resource_type: Some(kind.resource_type().to_string()),
+        resource_id: None,
+        reason: None,
+        message: Some(format!(
+            "no {} in this identity store matches the given {subject}",
             kind.as_str()
         )),
         request_id: None,

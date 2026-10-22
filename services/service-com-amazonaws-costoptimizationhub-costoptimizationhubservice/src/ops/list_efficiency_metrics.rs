@@ -193,7 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
         // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
         // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        // handler runs, so reaching here means the input satisfies every one of them —
+        // every one but `maxResults`', which the check above owns.
         Err(crate::scaffolded::Scaffolded::not_implemented("ListEfficiencyMetrics"))
     }
 }

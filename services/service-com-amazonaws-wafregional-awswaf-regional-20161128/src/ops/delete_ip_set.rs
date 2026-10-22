@@ -4,8 +4,10 @@
 //!
 //! Permanently removes the stored `IPSet`, so `GetIPSet` answers
 //! `WAFNonexistentItemException` for it and `ListIPSets` no longer lists it. "You
-//! can't delete an `IPSet` … if it still includes any IP addresses", so a set that
-//! still holds descriptors answers `WAFNonEmptyEntityException`.
+//! can't delete an `IPSet` if it's still used in any Rules or if it still includes any
+//! IP addresses", so a set a `Rule`'s predicate points at answers
+//! `WAFReferencedItemException` and one that still holds descriptors answers
+//! `WAFNonEmptyEntityException`.
 //!
 //!
 //! ## Shape of an operation
@@ -184,8 +186,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            // "You can't delete an IPSet if it's still used in any Rules or if it
-            // still includes any IP addresses."
+            // "You can't delete an IPSet if it's still used in any Rules …" — a Rule
+            // uses it while one of its predicates points at this id, which is what
+            // `UpdateRule` writes.
+            Some(_) if state.is_referenced_by_a_rule(&input.ip_set_id) => {
+                return Err(DeleteIPSetErrorModeled::WAFReferencedItemException(
+                    WAFReferencedItemException {
+                        message: Some(crate::state::MESSAGE_REFERENCED_ITEM.to_string()),
+                    },
+                )
+                .into())
+            }
+            // "… or if it still includes any IP addresses."
             Some(entry) if !entry.descriptors.is_empty() => {
                 return Err(DeleteIPSetErrorModeled::WAFNonEmptyEntityException(
                     WAFNonEmptyEntityException {

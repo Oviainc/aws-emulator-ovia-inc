@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a logging configuration and PERSISTS it in [`crate::state`] — the
+//! system-generated id and ARN, the create/update timestamps, the destination the request
+//! named and its tags. Every member of the response is read back out of the stored
+//! record, so a later `GetLoggingConfiguration` answers exactly what this call returned.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A 501 from this operation would mean "nobody has written it yet"; it no longer
+//! answers one.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +171,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLoggingConfiguration"))
+        // Modeled constraints are already refused BEFORE this handler runs, so reaching
+        // here means `destinationConfiguration` carries exactly one destination and every
+        // member satisfies its modelled length and pattern.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service. An engine this service cannot read its state
+            // from means the operation cannot be served at all, which is what 501 says.
+            crate::scaffolded::Scaffolded::not_implemented("CreateLoggingConfiguration")
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The store is bounded, so a repeated create cannot grow it without limit: past
+        // this Region's bound the modelled refusal is `ServiceQuotaExceededException`.
+        if store.logging_configurations_at_quota() {
+            return Err(
+                CreateLoggingConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "an account may hold at most {} logging configurations in a Region.",
+                            crate::state::LOGGING_CONFIGURATIONS_PER_REGION
+                        ),
+                        resource_id: ::engine::emulator_account_id().to_string(),
+                        // The modelled `ResourceType` enum carries exactly one member, so
+                        // it is the only value this required field admits.
+                        resource_type: RESOURCE_TYPE_VALUES
+                            .first()
+                            .copied()
+                            .unwrap_or("ROOM")
+                            .to_string(),
+                        limit: i32::try_from(crate::state::LOGGING_CONFIGURATIONS_PER_REGION)
+                            .unwrap_or(i32::MAX),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_logging_configuration_id();
+        let configuration = crate::state::LoggingConfiguration {
+            arn: ::engine::emulator_arn(
+                "ivschat",
+                &region,
+                &format!("logging-configuration/{id}"),
+            ),
+            id: id.clone(),
+            name: input.name,
+            create_time: now,
+            update_time: now,
+            destination_configuration: input.destination_configuration,
+            // `CreateLoggingConfigurationState` carries exactly one value: a configuration
+            // this call answers is already ready to log chat content.
+            state: crate::state::created_logging_configuration_state().to_string(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        // Insert, then render the response out of the INSERTED record rather than out of
+        // the request: what this call answers is what a later read of the configuration
+        // answers.
+        store.logging_configurations.insert(id.clone(), configuration);
+        let Some(stored) = store.logging_configurations.get(&id) else {
+            // Unreachable: the insert above put this id in the map while the lock is held.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateLoggingConfiguration",
+            ));
+        };
+        Ok(CreateLoggingConfigurationOutput {
+            arn: Some(stored.arn.clone()),
+            id: Some(stored.id.clone()),
+            name: stored.name.clone(),
+            create_time: Some(crate::state::as_date_time(stored.create_time)),
+            update_time: Some(crate::state::as_date_time(stored.update_time)),
+            destination_configuration: Some(stored.destination_configuration.clone()),
+            state: Some(stored.state.clone()),
+            tags: Some(stored.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        })
     }
 }

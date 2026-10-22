@@ -467,7 +467,7 @@ struct DestinationCase {
 }
 
 /// A 256-character base64 body, the shortest `SnowflakePrivateKey` the model accepts.
-fn snowflake_private_key() -> String {
+pub(crate) fn snowflake_private_key() -> String {
     "A".repeat(256)
 }
 
