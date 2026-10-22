@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The IoT job-execution store, shared with the IoT control plane that creates an
+# execution when a job targets a thing (`services/common`).
+service-common = { path = "../common" }
 # Digest behind the minted executionId and the clientToken idempotency fingerprint.
 sha2 = { workspace = true }
 # Renders those digests as the hex an executionId's pattern allows.

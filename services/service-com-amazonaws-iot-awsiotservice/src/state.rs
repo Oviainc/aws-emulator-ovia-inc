@@ -16,7 +16,10 @@
 //!
 //! Beside the registry it holds the THING GROUP registry, keyed by `thingGroupName`
 //! for the same reason — the name is the group's identity and the `@httpLabel` of
-//! `/thing-groups/{thingGroupName}` — and the account's IoT ENDPOINT IDENTIFIERS — the
+//! `/thing-groups/{thingGroupName}` — the account's JOBS (`CreateJob` keys them by
+//! the `jobId` it documents as unique for the account), whose per-thing EXECUTIONS
+//! live in the shared store the IoT Jobs data plane serves (see
+//! [`job_execution_store`]), and the account's IoT ENDPOINT IDENTIFIERS — the
 //! `<identifier>` of `<identifier>.iot.<region>.amazonaws.com`, the account-specific
 //! prefix every IoT endpoint address is built from. `DescribeEndpoint` is documented
 //! as "returns or creates a unique endpoint specific to the Amazon Web Services
@@ -28,6 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
+use service_common::iot_job_executions::{is_modeled_thing_name, JobExecutionStore};
 use sha2::{Digest, Sha256};
 
 /// The configuration of a thing: the members of a `CreateThing` request that
@@ -270,10 +274,18 @@ pub fn derive_endpoint_identifier(account_id: &str, region: &str) -> String {
 /// the request that created it, but any later call reaches every thing in the store
 /// whatever region it is signed for. Partitioning the control plane by region is a
 /// separate change; nothing here claims it.
+///
+/// The JOB EXECUTIONS a job creates do not live here: they are the device-facing
+/// records the IoT Jobs data plane serves, so both services reach the one shared
+/// store ([`job_execution_store`]) instead of each keeping a copy.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotAwsiotserviceState {
     /// Every thing that exists, keyed by `thingName`.
     pub things: BTreeMap<String, RegisteredThing>,
+    /// Every job that exists, keyed by `jobId` — "A job identifier which must be
+    /// unique for your account" (`CreateJob$jobId`), which is what makes the id the
+    /// key and a repeat create a conflict.
+    pub jobs: BTreeMap<String, RegisteredJob>,
     /// Every thing group that exists, keyed by `thingGroupName`.
     ///
     /// The name is the group's identity — the model binds it as the `@httpLabel` of
@@ -421,6 +433,128 @@ pub fn thing_arn(region: &str, thing_name: &str) -> String {
     ::emulator_server::emulator_arn("iot", region, &format!("thing/{thing_name}"))
 }
 
+/// The ARN of a job: `arn:aws:iot:<region>:<account>:job/<jobId>`, the `jobArn`
+/// `CreateJob` answers with.
+pub fn job_arn(region: &str, job_id: &str) -> String {
+    ::emulator_server::emulator_arn("iot", region, &format!("job/{job_id}"))
+}
+
+/// The resource type an IoT target ARN names, and the name it gives it.
+///
+/// `CreateJob$targets` is "A list of things and thing groups to which the job should
+/// be sent", and both are named by ARN
+/// (`arn:<partition>:iot:<region>:<account>:thing/<name>` /
+/// `…:thinggroup/<name>`). The ACCOUNT and REGION segments are deliberately not
+/// compared: a caller may legitimately name a resource by an ARN minted elsewhere,
+/// and this registry is keyed by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobTarget {
+    /// `thing/<name>`: one device.
+    Thing(String),
+    /// `thinggroup/<name>`: every device in that group.
+    ThingGroup(String),
+}
+
+/// Why a `targets` entry is not a job target.
+///
+/// Each variant is a DIFFERENT refusal, so the caller's message can state the
+/// constraint that was violated rather than one fixed ARN-format template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobTargetRejection {
+    /// Not an `arn:<partition>:iot:<region>:<account>:<type>/<name>` at all.
+    NotAnIotResourceArn,
+    /// A well-formed IoT ARN naming a resource type a job cannot be sent to; it
+    /// carries that type, which the request supplied.
+    UnsupportedResourceType(String),
+    /// A `thing/` or `thinggroup/` ARN whose NAME violates the model's `ThingName`
+    /// (len 1..128, `^[a-zA-Z0-9:_-]+$`); it carries the name, so the refusal can
+    /// say which target could never be addressed.
+    UnaddressableName(String),
+}
+
+/// Parse a `targets` entry, naming the reason it is not a job target.
+///
+/// The NAME is checked against the model's `ThingName`
+/// ([`service_common::iot_job_executions::is_modeled_thing_name`], the same rule the
+/// Jobs data plane parses `StartCommandExecution$targetArn` with): a name outside it
+/// can never be addressed by a `/things/{thingName}/jobs` request, so an execution
+/// stored under it would exist and be unreachable. A thing GROUP's name is checked
+/// the same way — `ThingGroupName` carries the same length and character class.
+pub fn parse_job_target(target_arn: &str) -> Result<JobTarget, JobTargetRejection> {
+    // 6 fields: arn:<partition>:<service>:<region>:<account-id>:<resource>. The
+    // resource keeps any colon of its own, so the split is bounded at 6.
+    let fields: Vec<&str> = target_arn.splitn(6, ':').collect();
+    let ["arn", _partition, "iot", _region, _account, resource] = fields.as_slice() else {
+        return Err(JobTargetRejection::NotAnIotResourceArn);
+    };
+    let Some((resource_type, name)) = resource.split_once('/') else {
+        return Err(JobTargetRejection::NotAnIotResourceArn);
+    };
+    match resource_type {
+        "thing" | "thinggroup" if !is_modeled_thing_name(name) => {
+            Err(JobTargetRejection::UnaddressableName(name.to_string()))
+        }
+        "thing" => Ok(JobTarget::Thing(name.to_string())),
+        "thinggroup" => Ok(JobTarget::ThingGroup(name.to_string())),
+        other => Err(JobTargetRejection::UnsupportedResourceType(
+            other.to_string(),
+        )),
+    }
+}
+
+/// How many jobs this emulator keeps for the account.
+///
+/// AWS publishes a service quota on an account's jobs; the exact figure is not in
+/// the model, so this is the emulator's own ceiling on a store a caller can grow,
+/// and `CreateJob` past it answers the modelled `LimitExceededException` rather than
+/// growing without bound.
+pub const MAX_JOBS: usize = 10_000;
+
+/// How many `targets` ONE `CreateJob` may name.
+///
+/// `JobTargets` is modelled `len 1..` — a minimum and NO maximum — so without a
+/// ceiling the request chooses how much work the handler does and how many execution
+/// records (each carrying a copy of the job document, up to 32 KiB) it creates. The
+/// figure is the emulator's own; what matters is that the fan-out of one request is
+/// bounded BEFORE any work proportional to it, and `CreateJob` past it answers the
+/// modelled `LimitExceededException`.
+pub const MAX_JOB_TARGETS: usize = 100;
+
+/// One job in the control plane, as this service persists it.
+///
+/// It holds what a job NEEDS to be reconstructed by a reader and to create its
+/// executions. The members that shape a ROLLOUT rather than the executions
+/// themselves (`jobExecutionsRolloutConfig`, `abortConfig`,
+/// `jobExecutionsRetryConfig`, `presignedUrlConfig`, `tags`, …) are NOT kept: nothing
+/// stages a rollout here, so storing them would promise a later reader data this
+/// record does not carry. `targets` IS kept verbatim, so a reader still reports what
+/// the job was pointed at.
+#[derive(Debug, Clone)]
+pub struct RegisteredJob {
+    /// The id the job was created under; also its key in the store.
+    pub job_id: String,
+    /// `arn:aws:iot:<region>:<account>:job/<jobId>`, minted on create.
+    pub job_arn: String,
+    /// The description the job was created with, when it has one.
+    pub description: Option<String>,
+    /// The job document, when the request carried one. `None` for a job created
+    /// from `documentSource`: that names an S3 object this emulator does not fetch,
+    /// so it reports no document rather than inventing one.
+    pub document: Option<String>,
+    /// The `documentSource` the job was created with, when it has one.
+    pub document_source: Option<String>,
+    /// The targets the job was created with, verbatim.
+    pub targets: Vec<String>,
+    /// `targetSelection` as supplied (`CONTINUOUS` / `SNAPSHOT`), or `None` when the
+    /// request left it out.
+    pub target_selection: Option<String>,
+    /// `timeoutConfig.inProgressTimeoutInMinutes`, carried onto every execution the
+    /// job creates.
+    pub in_progress_timeout_minutes: Option<i64>,
+    /// When the job was created, in epoch seconds.
+    pub created_at: i64,
+}
+
 /// The ARN of a thing group: `arn:aws:iot:<region>:<account>:thinggroup/<thingGroupName>`.
 ///
 /// `thinggroup` (one word, lowercase) is the resource type AWS IoT's thing-group
@@ -439,4 +573,27 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsIotAwsiotserviceState>)
+}
+
+/// The SHARED IoT job-execution store in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A job execution is created here (a job targets a thing) and served by the IoT Jobs
+/// data plane (the device polls, starts and reports it), so it is one store under one
+/// shared type — `service_common::iot_job_executions::JobExecutionStore` — and not a
+/// second copy inside [`ComAmazonawsIotAwsiotserviceState`]: the engine keys state by
+/// TYPE, so a copy of its own here would be invisible to the device.
+///
+/// LOCK ORDER, for an operation that writes BOTH stores: take
+/// [`service_state`] first and this one second (`CreateJob` and `DeleteJob` both do).
+/// The data-plane handlers take only this one, so that order has no inversion — keep
+/// it if another writer of both is added.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn job_execution_store<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<JobExecutionStore>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<JobExecutionStore>)
 }

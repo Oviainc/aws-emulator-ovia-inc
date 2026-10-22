@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/describe_endpoint.rs"]
 mod describe_endpoint;
+#[path = "all/job_targeting.rs"]
+mod job_targeting;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/thing_group_hierarchy.rs"]
