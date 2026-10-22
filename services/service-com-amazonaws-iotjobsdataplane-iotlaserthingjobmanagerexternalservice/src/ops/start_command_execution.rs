@@ -197,16 +197,24 @@ fn parameter_value_json(value: &CommandParameterValue) -> serde_json::Value {
     serde_json::Value::Object(object)
 }
 
-/// The parameters as a JSON object, in name order (so one request always yields
-/// one document, whatever order the map arrived in).
+/// The parameters as a JSON object, in SORTED name order — so one request always
+/// yields one document and one fingerprint, whatever order the map arrived in.
+/// `HashMap` iteration order differs between two instances holding the same keys,
+/// and `serde_json::Map` preserves insertion order whenever anything in the
+/// workspace enables `serde_json/preserve_order`, so the sort is what makes this
+/// canonical rather than merely usually-equal.
 fn parameters_json(
     parameters: Option<&std::collections::HashMap<String, CommandParameterValue>>,
 ) -> serde_json::Value {
-    let mut object = serde_json::Map::new();
-    for (name, value) in parameters.into_iter().flatten() {
-        object.insert(name.clone(), parameter_value_json(value));
-    }
-    serde_json::Value::Object(object)
+    let mut pairs: Vec<(&String, &CommandParameterValue)> =
+        parameters.into_iter().flatten().collect();
+    pairs.sort_unstable_by_key(|(name, _)| *name);
+    serde_json::Value::Object(
+        pairs
+            .into_iter()
+            .map(|(name, value)| (name.clone(), parameter_value_json(value)))
+            .collect(),
+    )
 }
 
 /// The job document the device fetches: the command it must run and the
