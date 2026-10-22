@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRawMessageContent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRawMessageContent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRawMessageContent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the MIME bytes currently stored for an in-transit message. A pure read:
+//! it returns `messages[messageId].content` verbatim as the HTTP payload and writes
+//! nothing, so a later caller sees exactly what this one saw. A message that is
+//! frozen (no longer eligible for update) is still readable — only
+//! `PutRawMessageContent` refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +133,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRawMessageContent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRawMessageContentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRawMessageContent"))
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let state = state.lock();
+
+        // The bytes come out of the store and nowhere else: no canned MIME blob, and
+        // nothing derived from the request beyond the id used to look the message up.
+        let message = state.messages.get(&input.message_id).ok_or_else(|| {
+            ::tracing::info!(
+                operation = "GetRawMessageContent",
+                akid = %akid,
+                message_id = %input.message_id,
+                outcome = "ResourceNotFoundException",
+                "no in-transit message is stored under this id"
+            );
+            GetRawMessageContentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "The in-transit message {} was not found.",
+                    input.message_id
+                )),
+            })
+        })?;
+
+        // The read itself is recorded (who asked, which message, how much content),
+        // so access to message content is observable. Never the content itself.
+        ::tracing::info!(
+            operation = "GetRawMessageContent",
+            akid = %akid,
+            message_id = %input.message_id,
+            content_octets = message.content.len(),
+            outcome = "success",
+            "reported the raw content of an in-transit message"
+        );
+
+        Ok(GetRawMessageContentOutput {
+            message_content: message.content.clone(),
+        })
     }
+}
+
+/// The answer when this service's store is not reachable at all.
+///
+/// Not a modeled failure: `GetRawMessageContent` declares only
+/// `ResourceNotFoundException`, and "the emulator cannot reach its own state" is
+/// not "the message does not exist". It can only happen when the service is
+/// mounted on an engine that is not the shared in-memory one, so it is reported as
+/// 501 with wording that says exactly that rather than as a missing resource.
+fn store_unavailable() -> GetRawMessageContentError {
+    crate::scaffolded::Scaffolded::NotImplemented(crate::scaffolded::NotImplemented {
+        message: "the WorkMail Message Flow in-transit message store is unavailable: this \
+                  service is mounted on an engine that holds no state for it"
+            .to_string(),
+    })
 }
