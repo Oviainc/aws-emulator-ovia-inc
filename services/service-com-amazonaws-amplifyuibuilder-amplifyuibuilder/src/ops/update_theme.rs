@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTheme
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTheme`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTheme::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the `updatedTheme` patch into the stored theme the request names and reports the
+//! record that results. Every `UpdateThemeData` member the request leaves out keeps the
+//! value it was stored with, `modifiedAt` moves to this call's instant, and an id that
+//! names no theme in that app environment answers the modelled `ResourceNotFoundException`
+//! (HTTP 404) — the same miss `GetTheme` and `DeleteTheme` report. An update is never an
+//! upsert.
 //!
 //! ## Shape of an operation
 //!
@@ -87,12 +84,25 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplifyuibuilder-amplif
 // here — hence the `UpdateThemeError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplifyuibuilder#UpdateTheme")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`, exactly as
+// `UpdateComponent` widens it: `id` is an `@httpLabel` naming a theme that may
+// not exist, every sibling operation addressed the same way (`GetTheme`,
+// `DeleteTheme`) declares that shape for exactly this case, and this operation's
+// own `errors` list omits it. So an id that names no theme is reported missing
+// rather than dressed up as an invalid parameter. The shape is this service's own
+// (`com.amazonaws.amplifyuibuilder#ResourceNotFoundException`, HTTP 404),
+// declared in `types/shared_types.rs`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplifyuibuilder#UpdateTheme",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateThemeErrorModeled {
     InternalServerException(InternalServerException),
     InvalidParameterException(InvalidParameterException),
     ResourceConflictException(ResourceConflictException),
+    ResourceNotFoundException(ResourceNotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -146,18 +156,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTheme` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateThemeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTheme"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateThemeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the amplifyuibuilder theme store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let patch = input.updated_theme;
+
+        // `UpdateThemeData$id` is documented as "The unique ID of the theme to
+        // update" — it names the same theme the `@httpLabel` does, so a payload
+        // naming a different one is a contradictory request rather than an
+        // instruction to renumber the theme. The same rule `UpdateComponent`
+        // applies to `UpdateComponentData$id`.
+        if let Some(named) = patch.id.as_deref() {
+            if named != input.id {
+                return Err(UpdateThemeErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "updatedTheme.id {named:?} does not name the theme being updated \
+                             ({:?})",
+                            input.id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The target is resolved before anything is merged: an id that names no
+        // theme in the app environment the request addressed is absent (the
+        // widened-in `ResourceNotFoundException`, 404), and nothing is created —
+        // an update is not an upsert. A theme is addressed by
+        // (appId, environmentName, id), so an id another app environment owns is
+        // absent here too, which is how `GetTheme` and `DeleteTheme` report it; see
+        // the note in `delete_theme.rs` for why the theme operations keep that
+        // classification where a component or a form is refused as wrong-scope.
+        let Some(theme) = store.theme_mut(&input.app_id, &input.environment_name, &input.id) else {
+            return Err(UpdateThemeErrorModeled::ResourceNotFoundException(
+                crate::state::item_not_found(),
+            )
+            .into());
+        };
+
+        // `UpdateThemeData$values` is `@required`, so every update carries the list
+        // the theme is to hold and it replaces what was stored. `name` and
+        // `overrides` are optional: one the request carries replaces what was
+        // stored, one it leaves out keeps it. `appId`, `environmentName`, `id`,
+        // `tags` and `createdAt` are not `UpdateThemeData` members at all, so they
+        // never move.
+        theme.values = patch.values;
+        if let Some(name) = patch.name {
+            theme.name = name;
+        }
+        if let Some(overrides) = patch.overrides {
+            theme.overrides = Some(overrides);
+        }
+        theme.modified_at = now;
+
+        Ok(UpdateThemeOutput {
+            entity: Some(theme.to_theme()),
+        })
     }
 }

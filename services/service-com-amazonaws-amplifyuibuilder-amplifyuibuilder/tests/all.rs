@@ -44,5 +44,11 @@ mod resource_error_messages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/theme_deletion.rs"]
+mod theme_deletion;
+
 #[path = "all/theme_lifecycle.rs"]
 mod theme_lifecycle;
+
+#[path = "all/theme_update.rs"]
+mod theme_update;
