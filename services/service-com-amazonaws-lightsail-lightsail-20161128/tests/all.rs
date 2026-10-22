@@ -15,6 +15,8 @@
 mod blueprint_catalog;
 #[path = "all/bucket_bundles.rs"]
 mod bucket_bundles;
+#[path = "all/bucket_lifecycle.rs"]
+mod bucket_lifecycle;
 #[path = "all/container_image_registry.rs"]
 mod container_image_registry;
 #[path = "all/container_service_lifecycle.rs"]

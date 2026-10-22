@@ -55,11 +55,54 @@ impl Emulator {
 
     /// Call `operation` with `body`, answering its HTTP status and parsed body.
     pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
-        let request = ::http::Request::builder()
+        self.call_in(None, operation, body).await
+    }
+
+    /// Call `operation` with `body`, in `region` when one is given, answering its
+    /// HTTP status and parsed body.
+    ///
+    /// The suite signs nothing, so the `Authorization` header carries only the
+    /// credential SCOPE — which is what names the region a request is made in.
+    pub(crate) async fn call_in(
+        &self,
+        region: Option<&str>,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        self.call_at(None, region, operation, body).await
+    }
+
+    /// Call `operation` with `body`, announcing `host` as the endpoint the
+    /// request arrived at and `region` as its credential scope, each when one is
+    /// given.
+    ///
+    /// `host` is what an operation that announces a reachable address builds it
+    /// from, so a case about such an address names one.
+    pub(crate) async fn call_at(
+        &self,
+        host: Option<&str>,
+        region: Option<&str>,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let mut builder = ::http::Request::builder()
             .method("POST")
             .uri("/")
             .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-            .header("content-type", "application/x-amz-json-1.1")
+            .header("content-type", "application/x-amz-json-1.1");
+        if let Some(host) = host {
+            builder = builder.header("host", host);
+        }
+        if let Some(region) = region {
+            builder = builder.header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261022/{region}/lightsail/\
+                     aws4_request, SignedHeaders=host, Signature=not-verified"
+                ),
+            );
+        }
+        let request = builder
             .body(bytes::Bytes::from(body.to_string()))
             .expect("the request is well formed");
         let response = self.router.dispatch(request).await;
@@ -76,6 +119,23 @@ impl Emulator {
     pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(status, 200, "{operation} must succeed, got {parsed:?}");
+        parsed
+    }
+
+    /// Call `operation` at `host` in `region` and require success, answering the
+    /// response body.
+    pub(crate) async fn ok_at(
+        &self,
+        host: Option<&str>,
+        region: Option<&str>,
+        operation: &str,
+        body: Value,
+    ) -> Value {
+        let (status, parsed) = self.call_at(host, region, operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation} at {host:?} in {region:?} must succeed, got {parsed:?}"
+        );
         parsed
     }
 
