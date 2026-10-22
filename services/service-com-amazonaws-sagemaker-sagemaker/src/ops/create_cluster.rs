@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a HyperPod cluster in `crate::state` and answers its `ClusterArn`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +188,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // "If you specify the Orchestrator field, you must provide exactly one
+        // orchestrator configuration: either Eks or Slurm. Specifying both or providing
+        // an empty configuration returns a validation error" (the member's model doc).
+        if let Some(orchestrator) = input.orchestrator.as_ref() {
+            let configured = usize::from(orchestrator.eks.is_some())
+                + usize::from(orchestrator.slurm.is_some());
+            if configured != 1 {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Orchestrator must carry exactly one configuration: either Eks or Slurm.",
+                ));
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller varying `ClusterName` cannot grow it without
+        // end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.clusters_below_quota() {
+            return Err(CreateClusterErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for HyperPod clusters is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::CLUSTER_QUOTA,
+                        store.clusters.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        // A name already in use is refused, never overwritten: otherwise the caller
+        // reads a 200 for a cluster it did not create, and the one it did create is gone.
+        // `ResourceInUse` is the conflict this operation models.
+        if let Some(existing) = store.clusters.get(&input.cluster_name) {
+            let arn = existing.arn.clone();
+            return Err(CreateClusterErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "Cannot create already existing cluster \"{arn}\"."
+                )),
+            })
+            .into());
+        }
+
+        // The id is 48 random bits, so a collision is vanishingly unlikely — but it is
+        // the ARN's identity, so a clash is re-minted rather than assumed away.
+        let mut id = crate::state::mint_cluster_id();
+        while store.clusters.values().any(|cluster| cluster.id == id) {
+            id = crate::state::mint_cluster_id();
+        }
+        let arn = crate::state::resource_arn(&region, "cluster", &id);
+
+        store.clusters.insert(
+            input.cluster_name.clone(),
+            crate::state::Cluster {
+                name: input.cluster_name.clone(),
+                id,
+                arn: arn.clone(),
+                // A freshly created cluster is provisioning: the clock owes it the move
+                // to `InService` at `in_service_at`, which the reporting operations
+                // materialise.
+                status: crate::state::STATUS_CREATING.to_string(),
+                instance_groups: input.instance_groups.unwrap_or_default(),
+                restricted_instance_groups: input.restricted_instance_groups.unwrap_or_default(),
+                restricted_instance_groups_config: input.restricted_instance_groups_config,
+                vpc_config: input.vpc_config,
+                orchestrator: input.orchestrator,
+                node_recovery: input.node_recovery,
+                tiered_storage_config: input.tiered_storage_config,
+                node_provisioning_mode: input.node_provisioning_mode,
+                cluster_role: input.cluster_role,
+                auto_scaling: input.auto_scaling,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                in_service_at: now + crate::state::CLUSTER_IN_SERVICE_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateClusterOutput { cluster_arn: arn })
     }
 }

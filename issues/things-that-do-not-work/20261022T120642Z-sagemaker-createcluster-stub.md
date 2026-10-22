@@ -34,3 +34,16 @@ AssertionError: this account/region rejects a minimal one-instance-group HyperPo
 Boot the sagemaker emulator
 Call CreateCluster and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Status note (added by the `ListClusters` fix)
+
+`CreateCluster` has since been implemented, in the same change that implemented
+`ListClusters` (`issues/things-that-now-work/20261022T120642Z-sagemaker-listclusters-stub.md`):
+a listing that no operation can ever put a cluster into would have had nothing to
+report. `src/ops/create_cluster.rs` now persists the cluster in `crate::state`, mints
+its `ClusterArn`, refuses a name already in use with the modelled `ResourceInUse`, a
+full store with the modelled `ResourceLimitExceeded` and a malformed `Orchestrator`
+with a `ValidationException`, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line is
+deleted. The report is left here rather than moved because the move belongs to whoever
+is dispatched for this issue; anyone picking it up should verify the handler and the
+`tests/all/hyperpod_cluster_listing.rs` coverage and then close it.

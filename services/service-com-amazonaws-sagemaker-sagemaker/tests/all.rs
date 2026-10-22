@@ -27,6 +27,8 @@ mod custom_images;
 mod endpoint_config_deletion;
 #[path = "all/hub_contents_listing.rs"]
 mod hub_contents_listing;
+#[path = "all/hyperpod_cluster_listing.rs"]
+mod hyperpod_cluster_listing;
 #[path = "all/inference_deployment_lifecycle.rs"]
 mod inference_deployment_lifecycle;
 #[path = "all/lineage_action_lifecycle.rs"]

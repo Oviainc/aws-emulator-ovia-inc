@@ -267,9 +267,10 @@ pub const MLFLOW_APP_CREATED: &str = "Created";
 /// defaults to AutoModelRegistrationDisabled".
 pub const AUTO_MODEL_REGISTRATION_DISABLED: &str = "AutoModelRegistrationDisabled";
 
-/// `EndpointStatus`'s members this emulator moves an endpoint through (the modelled
-/// enum also carries the update, rollback and delete states, which this slice does not
-/// reach). Named once here so no handler compares a bare string literal.
+/// `EndpointStatus`'s and `ClusterStatus`'s members this emulator moves a resource
+/// through (both modelled enums also carry the update, rollback and delete states,
+/// which this slice does not reach). Named once here so no handler compares a bare
+/// string literal.
 pub const STATUS_CREATING: &str = "Creating";
 /// See [`STATUS_CREATING`].
 pub const STATUS_IN_SERVICE: &str = "InService";
@@ -1163,6 +1164,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// one image sit together in ascending version order and the latest one is the last
     /// of that range. See [`ImageVersion`].
     pub image_versions: BTreeMap<(String, i32), ImageVersion>,
+    /// Keyed by `ClusterName`. See [`Cluster`], at the end of this module with the rest
+    /// of the HyperPod cluster slice.
+    pub clusters: BTreeMap<String, Cluster>,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -2173,6 +2177,130 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// own types rather than in the one above.
     pub fn ai_workload_configs_below_quota(&self) -> bool {
         self.ai_workload_configs.len() < AI_WORKLOAD_CONFIG_QUOTA
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The SageMaker HyperPod cluster slice: everything `CreateCluster` writes and
+// `ListClusters` reports, kept together at the end of this module the way the
+// lineage-action and AI-workload slices above are, with its own quota, its own
+// clock-owed span and its own inherent `impl` block on the state struct.
+// ---------------------------------------------------------------------------
+
+/// How long after `CreateCluster` the clock owes the `Creating` -> `InService`
+/// transition of a HyperPod cluster. Same compressed, never-zero span as
+/// [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that lists clusters straight after creating
+/// one still observes `Creating`, one that waits observes `InService`. Real HyperPod
+/// provisioning takes many minutes; the span is the emulator's own choice.
+pub const CLUSTER_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
+
+/// See [`MODEL_QUOTA`]; bounds the cluster store, and is released by `DeleteCluster`.
+pub const CLUSTER_QUOTA: usize = 1_000;
+
+/// `ClusterSortBy`'s documented default ("The field by which to sort results. The
+/// default value is `CREATION_TIME`." — `ListClusters`' member doc). `ListClusters` has
+/// its own default and its own enum tokens, which is why it does not share
+/// [`DEFAULT_SORT_BY`].
+pub const CLUSTER_SORT_BY_CREATION_TIME: &str = "CREATION_TIME";
+/// `ClusterSortBy`'s other member.
+pub const CLUSTER_SORT_BY_NAME: &str = "NAME";
+/// `SortOrder`'s documented default for `ListClusters` ("The sort order for results. The
+/// default value is `Ascending`.") — the opposite of [`DEFAULT_SORT_ORDER`], which is
+/// what `ListModels` documents. The descending token is [`ORDER_DESCENDING`].
+pub const CLUSTER_DEFAULT_SORT_ORDER: &str = "Ascending";
+
+/// A SageMaker HyperPod cluster created by `CreateCluster`, as `ListClusters`
+/// summarises it and `DescribeCluster` replays it.
+///
+/// The whole creation spec is stored, not only the members `ListClusters` reports: the
+/// record is the resource, so the readers of the rest (`DescribeCluster`,
+/// `ListClusterNodes`) read it from here rather than re-deriving it.
+///
+/// `in_service_at` is the instant the clock owes the `Creating` -> `InService`
+/// transition; it is stored, never slept on, and materialised by whichever reporting
+/// call first runs at or after it.
+#[derive(Debug, Clone)]
+pub struct Cluster {
+    pub name: String,
+    /// The 12-character id the `ClusterArn` pattern carries
+    /// (`…:cluster/[a-z0-9]{12}`), minted once at create time.
+    pub id: String,
+    pub arn: String,
+    pub status: String,
+    pub instance_groups: Vec<crate::ops::types::ClusterInstanceGroupSpecification>,
+    pub restricted_instance_groups:
+        Vec<crate::ops::types::ClusterRestrictedInstanceGroupSpecification>,
+    pub restricted_instance_groups_config:
+        Option<crate::ops::types::ClusterRestrictedInstanceGroupsConfig>,
+    pub vpc_config: Option<VpcConfig>,
+    pub orchestrator: Option<crate::ops::types::ClusterOrchestrator>,
+    pub node_recovery: Option<String>,
+    pub tiered_storage_config: Option<crate::ops::types::ClusterTieredStorageConfig>,
+    pub node_provisioning_mode: Option<String>,
+    pub cluster_role: Option<String>,
+    pub auto_scaling: Option<crate::ops::types::ClusterAutoScalingConfig>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub in_service_at: SystemTime,
+}
+
+impl Cluster {
+    /// Materialise the `Creating` -> `InService` transition the clock already owes.
+    ///
+    /// The one write a reporting operation may make: the transition was due at
+    /// `in_service_at` whether or not anybody listed the cluster, so the observer makes
+    /// no difference to the result. Answers whether it happened on this call.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == STATUS_CREATING && now >= self.in_service_at {
+            self.status = STATUS_IN_SERVICE.to_string();
+            return true;
+        }
+        false
+    }
+
+    /// The training plans this cluster's capacity is reserved against, in first-seen
+    /// order with duplicates dropped.
+    ///
+    /// `ClusterSummary::TrainingPlanArns` is "a list of ARNs of the training plans
+    /// associated with this cluster", and a cluster is associated with a plan through
+    /// the `TrainingPlanArn` of an instance group it was created with — so the list is
+    /// computed from the stored groups rather than stored a second time.
+    pub fn training_plan_arns(&self) -> Vec<String> {
+        let mut arns: Vec<String> = Vec::new();
+        let from_groups = self
+            .instance_groups
+            .iter()
+            .map(|group| group.training_plan_arn.as_ref())
+            .chain(
+                self.restricted_instance_groups
+                    .iter()
+                    .map(|group| group.training_plan_arn.as_ref()),
+            );
+        for arn in from_groups.flatten() {
+            if !arns.iter().any(|seen| seen == arn) {
+                arns.push(arn.clone());
+            }
+        }
+        arns
+    }
+}
+
+/// Mint the id a `ClusterArn` carries: the first 12 of the 32 lowercase hex digits
+/// [`mint_opaque_resource_id`] produces, which is exactly the `[a-z0-9]{12}` the
+/// modelled `ClusterArn` pattern admits.
+///
+/// One minter for the service: the entropy, its bounds and the reasons it is not a
+/// secret are stated once, on [`mint_opaque_resource_id`]. `CreateCluster` still
+/// re-mints on a collision rather than assuming uniqueness.
+pub fn mint_cluster_id() -> String {
+    mint_opaque_resource_id().chars().take(12).collect()
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another cluster fits, i.e. the store is below [`CLUSTER_QUOTA`]. A second
+    /// inherent `impl` block, beside this slice's own types rather than in the one above.
+    pub fn clusters_below_quota(&self) -> bool {
+        self.clusters.len() < CLUSTER_QUOTA
     }
 }
 

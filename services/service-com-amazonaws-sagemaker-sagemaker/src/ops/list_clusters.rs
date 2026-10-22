@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the HyperPod clusters stored in
+//! `crate::state`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,6 +140,12 @@ impl<Eng> ListClusters<Eng> {
     }
 }
 
+/// `SortBy`'s documented default ("The field by which to sort results. The default
+/// value is `CREATION_TIME`."), as `crate::state` names it. Named `CLUSTER_`-first so it
+/// cannot be read as `crate::state::DEFAULT_SORT_BY`, which is `ListModels`' different
+/// default.
+const CLUSTER_DEFAULT_SORT_BY: &str = crate::state::CLUSTER_SORT_BY_CREATION_TIME;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListClusters<Eng>
 {
@@ -164,18 +163,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClusters"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let sort_by = input.sort_by.as_deref().unwrap_or(CLUSTER_DEFAULT_SORT_BY);
+        if !matches!(
+            sort_by,
+            crate::state::CLUSTER_SORT_BY_CREATION_TIME | crate::state::CLUSTER_SORT_BY_NAME
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}, {}; got \"{sort_by}\".",
+                crate::state::CLUSTER_SORT_BY_CREATION_TIME,
+                crate::state::CLUSTER_SORT_BY_NAME
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::CLUSTER_DEFAULT_SORT_ORDER);
+        let descending = if sort_order == crate::state::ORDER_DESCENDING {
+            true
+        } else if sort_order == crate::state::CLUSTER_DEFAULT_SORT_ORDER {
+            false
+        } else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}, {}; got \"{sort_order}\".",
+                crate::state::CLUSTER_DEFAULT_SORT_ORDER,
+                crate::state::ORDER_DESCENDING
+            )));
+        };
+
+        let after = input.creation_time_after.map(crate::state::timestamp_key);
+        let before = input.creation_time_before.map(crate::state::timestamp_key);
+
+        let mut store = state.lock();
+
+        // The only write this reporting call makes: the `Creating` -> `InService`
+        // transition the clock already owed each cluster. It was due at the stored
+        // instant whether or not anybody listed the clusters, so listing them changes
+        // nothing a later caller sees that the clock had not already changed.
+        let now = ::std::time::SystemTime::now();
+        let settled: Vec<String> = store
+            .clusters
+            .values_mut()
+            .filter_map(|cluster| cluster.settle_status(now).then(|| cluster.arn.clone()))
+            .collect();
+
+        let mut matching: Vec<&crate::state::Cluster> = store
+            .clusters
+            .values()
+            .filter(|cluster| {
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| cluster.name.contains(needle))
+            })
+            .filter(|cluster| {
+                // Both bounds are inclusive, so a timestamp copied straight out of a
+                // prior response's `CreationTime` still selects that cluster.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(cluster.creation_time));
+                after.is_none_or(|bound| created >= bound)
+                    && before.is_none_or(|bound| created <= bound)
+            })
+            .filter(|cluster| {
+                // `TrainingPlanArn` selects the clusters whose reserved capacity comes
+                // from that plan, i.e. those carrying it on an instance group.
+                input.training_plan_arn.as_deref().is_none_or(|wanted| {
+                    cluster
+                        .training_plan_arns()
+                        .iter()
+                        .any(|arn| arn == wanted)
+                })
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `ClusterName`
+        // ascending in both directions, so two clusters created in the same instant keep
+        // one order whichever way the page is sorted — and a `NextToken` resolved against
+        // a freshly computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = if sort_by == crate::state::CLUSTER_SORT_BY_NAME {
+                left.name.cmp(&right.name)
+            } else {
+                crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                )
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| matching.iter().position(|cluster| cluster.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "NextToken does not name a page boundary of this result set; \
+                             restart the listing without it.",
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page, and so does the service's own ceiling: an absent or
+        // larger `MaxResults` still cannot make one call serialise the whole store. The
+        // token below is emitted whenever anything is left, so a paginating client walks
+        // the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => {
+                Some(crate::state::encode_page_token(&last.name))
+            }
+            _ => None,
+        };
+
+        let output = ListClustersOutput {
+            cluster_summaries: page
+                .iter()
+                .map(|cluster| ClusterSummary {
+                    cluster_arn: cluster.arn.clone(),
+                    cluster_name: cluster.name.clone(),
+                    creation_time: crate::state::timestamp(cluster.creation_time),
+                    cluster_status: cluster.status.clone(),
+                    // `len 1..`, so a cluster reserved against no training plan omits
+                    // the member rather than reporting an empty list.
+                    training_plan_arns: Some(cluster.training_plan_arns())
+                        .filter(|arns| !arns.is_empty()),
+                    // The aggregate image-version status across the instance groups:
+                    // this emulator runs no AMI update (`UpdateClusterSoftware` is still
+                    // a scaffold), so there is no version state to aggregate and the
+                    // optional member is omitted.
+                    image_version_status: None,
+                })
+                .collect(),
+            next_token,
+        };
+        drop(store);
+
+        for arn in &settled {
+            // Each transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+        Ok(output)
     }
 }
