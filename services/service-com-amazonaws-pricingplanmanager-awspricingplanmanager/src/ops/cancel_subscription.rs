@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels a subscription under `If-Match`. An active subscription keeps its status and
+//! gains a pending `CANCELLATION` change effective at the end of the billing period; a
+//! subscription still awaiting approval is deleted outright.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelSubscription"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CancelSubscriptionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let CancelSubscriptionInput {
+            arn,
+            if_match,
+            client_token: _,
+        } = input;
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        store.apply_due_changes(now);
+        let record = match store.resolve_for_mutation(&arn, &if_match) {
+            Ok(record) => record,
+            Err(crate::state::PreconditionFailure::NotFound) => {
+                return Err(CancelSubscriptionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("no subscription with ARN {arn}"),
+                        resource_id: arn,
+                    },
+                )
+                .into());
+            }
+            Err(crate::state::PreconditionFailure::ETagMismatch) => {
+                return Err(CancelSubscriptionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::IF_MATCH_CONFLICT_MESSAGE.to_string(),
+                        resource_id: arn,
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "For subscriptions in PENDING_APPROVAL status, the subscription is deleted
+        // immediately without scheduling." Nothing is scheduled and nothing is left to
+        // read back, so the response reports the record as it stood when it went away.
+        if record.status == crate::state::Status::PendingApproval {
+            let removed = record.clone();
+            store.remove_subscription(&arn);
+            return Ok(CancelSubscriptionOutput {
+                subscription: removed.to_subscription(),
+                e_tag: removed.etag(),
+            });
+        }
+
+        // "For active subscriptions, the cancellation is scheduled to take effect at the
+        // end of the current billing period. The subscription remains active until that
+        // date." So the status is left alone and the pending change carries the date.
+        record.scheduled_change = Some(crate::state::ScheduledChangeRecord {
+            change_type: crate::state::ChangeType::Cancellation,
+            effective_date: Some(crate::state::end_of_billing_period(now)),
+            // "Not present for cancellations." — ScheduledChange$planTier.
+            plan_tier: None,
+            usage_level: None,
+        });
+        record.touch(now);
+
+        Ok(CancelSubscriptionOutput {
+            subscription: record.to_subscription(),
+            e_tag: record.etag(),
+        })
     }
 }

@@ -155,8 +155,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Authorization is not emulated: the emulator verifies request signatures
         // centrally but holds no principals or policies, so the modelled
         // `ForbiddenException` is deliberately unreachable here and a success says
-        // nothing about the caller's permissions.
-        let _ = ctx;
+        // nothing about the caller's permissions. `ctx` is read for the audit record
+        // this operation emits.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteGroupErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -190,6 +190,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Removing the record removes the group's memberships and tags with it:
         // both are held on the record itself.
         let removed = store.groups.remove(&name).ok_or_else(not_found)?;
+        // Everything below is owned, so the store lock is released before the record
+        // is formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a destructive operation: who, where, what, and the
+        // outcome. Metadata only — the memberships and tags that went with the group
+        // are counted, not listed — and request-derived values are `Debug`-escaped
+        // so none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?crate::state::request_region(ctx.parts()),
+            group = ?removed.name,
+            resources = removed.members.len(),
+            tags = removed.tags.len(),
+            outcome = "deleted",
+            "resource group deleted",
+        );
         Ok(DeleteGroupOutput {
             group: Some(removed.to_group()),
         })

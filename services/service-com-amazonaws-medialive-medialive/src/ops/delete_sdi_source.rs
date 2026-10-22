@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSdiSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSdiSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSdiSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +143,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSdiSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSdiSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSdiSource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let mut state = state.lock();
+        if !state.sdi_sources.contains_key(&input.sdi_source_id) {
+            return Err(DeleteSdiSourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("SdiSource not found: {}", input.sdi_source_id)),
+            })
+            .into());
+        }
+
+        // "The SdiSource must not be part of any SdiSourceMapping and must not be
+        // attached to any input": a source an input is using is a conflict, not a
+        // deletion.
+        if state.sdi_source_is_in_use(&input.sdi_source_id) {
+            return Err(DeleteSdiSourceErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "SdiSource {} is attached to an input and cannot be deleted",
+                    input.sdi_source_id
+                )),
+            })
+            .into());
+        }
+
+        // `DELETED` is terminal and the source keeps it: the record stays in the
+        // account, so `DescribeSdiSource` and `ListSdiSources` go on reporting it
+        // in that state instead of losing it. A repeated delete is idempotent:
+        // the state the caller asked for is already the stored one, and nothing
+        // in the model or the contract says a second delete is refused.
+        let source = state
+            .sdi_sources
+            .get_mut(&input.sdi_source_id)
+            .ok_or_else(unavailable)?;
+        crate::state::delete_sdi_source(source);
+
+        // Read back out of the store, so the response reports the state that was
+        // written rather than one this handler assembled.
+        let sdi_source = state
+            .sdi_source_description(&input.sdi_source_id)
+            .ok_or_else(unavailable)?;
+
+        Ok(DeleteSdiSourceOutput {
+            sdi_source: Some(sdi_source),
+        })
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to delete the SdiSource from. A modelled server error,
+/// never a fresh engine (which would drop the deletion on return).
+fn unavailable() -> DeleteSdiSourceError {
+    DeleteSdiSourceErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

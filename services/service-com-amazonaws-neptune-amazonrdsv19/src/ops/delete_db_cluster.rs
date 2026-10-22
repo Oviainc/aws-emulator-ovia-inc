@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the persisted cluster record and answers with that record's
+//! `DBCluster` view in status `deleting`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +156,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBCluster"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state as st;
+
+        let _ = ctx;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(Scaffolded::not_implemented("DeleteDBCluster"));
+        };
+        let mut state = state.lock();
+        state.settle();
+
+        let not_found = || {
+            DeleteDBClusterErrorModeled::DBClusterNotFoundFault(DBClusterNotFoundFault {
+                message: Some(format!(
+                    "DBCluster {} not found.",
+                    input.db_cluster_identifier
+                )),
+            })
+        };
+        // The resource is resolved FIRST, so a request naming a cluster that does not
+        // exist always reports the modelled not-found fault rather than a parameter
+        // complaint about a cluster the caller cannot have.
+        let Some(key) = state.resolve_cluster_key(&input.db_cluster_identifier) else {
+            return Err(not_found().into());
+        };
+
+        // The resource and its STATE come first, so a cluster that cannot be deleted at
+        // all reports the modelled state fault rather than a parameter complaint about a
+        // snapshot the delete was never going to reach.
+        if let Some(cluster) = state.clusters.get(&key) {
+            // "You can only delete a DB cluster if its DeletionProtection field is set to
+            // false."
+            if cluster.deletion_protection {
+                return Err(DeleteDBClusterErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(format!(
+                            "Cannot delete protected DB Cluster {key}, please disable deletion protection and try again."
+                        )),
+                    },
+                )
+                .into());
+            }
+            // A cluster is the container of its instances: deleting it while it still
+            // has members would orphan them.
+            if !cluster.members.is_empty() {
+                return Err(DeleteDBClusterErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(format!(
+                            "Cluster {key} cannot be deleted, it still contains DB instances in non-deleting state."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "You must specify a FinalDBSnapshotIdentifier parameter if SkipFinalSnapshot is
+        // false", whose documented default is false.
+        if !input.skip_final_snapshot.unwrap_or(false) {
+            match input.final_db_snapshot_identifier.as_deref() {
+                None => {
+                    return Err(Scaffolded::validation(
+                        "FinalDBSnapshotIdentifier is required unless SkipFinalSnapshot is set to true",
+                    ))
+                }
+                Some(_) => {
+                    // Taking the final DB cluster snapshot is this service's snapshot
+                    // surface, which is not implemented: say so rather than delete the
+                    // cluster and report a snapshot nothing created.
+                    return Err(Scaffolded::NotImplemented(crate::scaffolded::NotImplemented {
+                        message: "DeleteDBCluster cannot take the final DB cluster snapshot \
+                                  this request asks for: DB cluster snapshot operations are \
+                                  not implemented in this emulator. Retry with \
+                                  SkipFinalSnapshot=true."
+                            .to_string(),
+                    }));
+                }
+            }
+        }
+
+        let Some(record) = state.clusters.remove(&key) else {
+            return Err(not_found().into());
+        };
+        Ok(DeleteDBClusterOutput {
+            db_cluster: Some(st::cluster_view(&record, st::STATUS_DELETING)),
+        })
     }
 }

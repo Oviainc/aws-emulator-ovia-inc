@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination cursors are hex-encoded, so a NextToken carries no readable offset.
+hex = { workspace = true }
+# SHA-256 for the derived UUID-shaped segment of index and view ARNs.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` for the test-side wait past the index settle span (tokio::time::sleep).
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

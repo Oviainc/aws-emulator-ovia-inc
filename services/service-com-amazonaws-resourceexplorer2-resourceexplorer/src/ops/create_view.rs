@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateView
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateView`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateView::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a view in the request's Region in `crate::state` and answers
+//! with the stored structure, which `GetView` reads back unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +181,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateView` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateViewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateView"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateViewErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut guard = store.lock();
+        guard.settle(now);
+
+        // A view is queried through the Region's index, so the Region must have one.
+        // This operation models no ResourceNotFoundException, so the refusal is the
+        // modelled 400 ValidationException naming the condition.
+        if guard.live_index(&region).is_none() {
+            return Err(CreateViewErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Resource Explorer is not turned on in Region {region}: create an index \
+                     in this Region with CreateIndex before creating a view."
+                ),
+                field_list: None,
+            })
+            .into());
+        }
+
+        let scope = input
+            .scope
+            .clone()
+            // "If not specified, the value defaults to the Amazon Web Services account
+            // used to call this operation."
+            .unwrap_or_else(|| ::engine::emulator_arn("iam", "", "root"));
+        let filter_string = input
+            .filters
+            .as_ref()
+            .map(|filters| filters.filter_string.clone());
+        let included_properties: Vec<String> = input
+            .included_properties
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|property| property.name)
+            .collect();
+        let tags = input.tags.clone().unwrap_or_default();
+
+        // `ClientToken` is an @idempotencyToken. Replaying it with the same parameters
+        // returns the view it created; replaying it with different parameters is the
+        // ConflictException case the model documents ("you specified parameters that
+        // didn't match the original request").
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = guard.views.values().find(|view| {
+                view.region == region && view.client_token.as_deref() == Some(token)
+            }) {
+                let same_request = existing.view_name == input.view_name
+                    && existing.scope == scope
+                    && existing.filter_string == filter_string
+                    && existing.included_properties == included_properties
+                    && existing.tags == tags;
+                if !same_request {
+                    return Err(CreateViewErrorModeled::ConflictException(ConflictException {
+                        message: format!(
+                            "The ClientToken {token} was already used to create view \
+                             {} with different parameters.",
+                            existing.view_arn
+                        ),
+                    })
+                    .into());
+                }
+                return Ok(CreateViewOutput {
+                    view: Some(existing.to_wire()),
+                });
+            }
+        }
+
+        // "The name must be unique within its Amazon Web Services Region."
+        if let Some(existing) = guard.view_by_name(&region, &input.view_name) {
+            return Err(CreateViewErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "A view named {} already exists in Region {region}: {}",
+                    input.view_name, existing.view_arn
+                ),
+            })
+            .into());
+        }
+
+        // Resource Explorer's "Views per Region" quota, which also bounds the stored
+        // view map against a caller that only ever creates.
+        let held = guard.views_in_region(&region).len();
+        if held >= crate::state::VIEWS_PER_REGION_QUOTA {
+            return Err(CreateViewErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Region {region} already holds the maximum number of views ({held})."
+                    ),
+                    name: "Views per Region".to_string(),
+                    value: crate::state::VIEWS_PER_REGION_QUOTA.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let resource_id = guard.mint_resource_id("view", now);
+        let entry = crate::state::ViewEntry {
+            view_arn: ::engine::emulator_arn(
+                crate::state::SERVICE_NAMESPACE,
+                &region,
+                &format!("view/{}/{resource_id}", input.view_name),
+            ),
+            view_name: input.view_name,
+            region,
+            owner: ::engine::emulator_account_id().to_string(),
+            scope,
+            filter_string,
+            included_properties,
+            created_at: now,
+            last_updated_at: now,
+            tags,
+            client_token: input.client_token,
+        };
+        let output = CreateViewOutput {
+            view: Some(entry.to_wire()),
+        };
+        guard.views.insert(entry.view_arn.clone(), entry);
+        Ok(output)
     }
 }

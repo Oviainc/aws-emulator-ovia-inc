@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the stored index into `DELETING`; when the clock settles it the
+//! index and its Region's views are gone from `crate::state`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +152,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIndex"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteIndexErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut guard = store.lock();
+        guard.settle(now);
+
+        let Some(index) = guard
+            .indexes
+            .values_mut()
+            .find(|index| index.arn == input.arn)
+        else {
+            return Err(DeleteIndexErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Index not found: {}", input.arn)),
+                },
+            )
+            .into());
+        };
+        // "These actions occur as asynchronous background tasks": the index is reported
+        // DELETING, and the clock owes its removal — along with the Region's views.
+        // @idempotent, so deleting an index that is ALREADY deleting reports the same
+        // state without moving the instant its removal is due: a caller that keeps
+        // calling must not be able to postpone it.
+        if index.state != crate::state::IndexLifecycle::Deleting {
+            index.state = crate::state::IndexLifecycle::Deleting;
+            index.settles_at = Some(now + crate::state::INDEX_SETTLE_DELAY);
+            index.last_updated_at = now;
+        }
+        Ok(DeleteIndexOutput {
+            arn: Some(index.arn.clone()),
+            state: Some(index.state.as_wire().to_string()),
+            last_updated_at: Some(::aws_smithy_types::DateTime::from(index.last_updated_at)),
+        })
     }
 }

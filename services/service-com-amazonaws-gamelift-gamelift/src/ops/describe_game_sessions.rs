@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeGameSessions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeGameSessions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeGameSessions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored game sessions a request's selector picks out — a fleet, or one
+//! game session by id — optionally narrowed to a location and a status, a page at a
+//! time.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -196,20 +191,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeGameSessions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeGameSessionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeGameSessions"))
+        let not_found = |message: String| -> Self::Error {
+            DescribeGameSessionsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeGameSessionsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // Each documented use of this operation names exactly one selector: a fleet (or
+        // an alias for one), or a single game session id.
+        let selectors = usize::from(input.fleet_id.is_some())
+            + usize::from(input.alias_id.is_some())
+            + usize::from(input.game_session_id.is_some());
+        if selectors != 1 {
+            return Err(DescribeGameSessionsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "Specify exactly one of FleetId, AliasId or GameSessionId.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // An alias is a separate slice that still answers 501, so no alias can have been
+        // created: no stored alias resolves to a fleet.
+        if let Some(alias_id) = &input.alias_id {
+            return Err(not_found(format!("The alias {alias_id} was not found.")));
+        }
+
+        let mut selected: Vec<GameSession> = if let Some(fleet_reference) = &input.fleet_id {
+            let Some(fleet_id) = state.resolve_fleet_id(fleet_reference) else {
+                return Err(not_found(format!(
+                    "The fleet {fleet_reference} was not found."
+                )));
+            };
+            state
+                .game_sessions_in_order()
+                .into_iter()
+                .filter(|session| session.fleet_id == fleet_id)
+                .map(crate::state::GameSessionRecord::to_modelled)
+                .collect()
+        } else {
+            let game_session_id = input.game_session_id.clone().unwrap_or_default();
+            let Some(session) = state.game_sessions.get(&game_session_id) else {
+                return Err(not_found(format!(
+                    "The game session {game_session_id} was not found."
+                )));
+            };
+            vec![session.to_modelled()]
+        };
+
+        // "provide a fleet or alias ID and a location name" narrows the set to one of the
+        // fleet's locations; "You can optionally filter the results by current game
+        // session status."
+        if let Some(location) = &input.location {
+            selected.retain(|session| session.location.as_deref() == Some(location.as_str()));
+        }
+        if let Some(status) = &input.status_filter {
+            // "You can filter on the following states: ACTIVE, TERMINATED, ACTIVATING,
+            // and TERMINATING." Anything else is a bad request, not an empty page.
+            if !crate::state::STATUS_FILTER_VALUES.contains(&status.as_str()) {
+                return Err(DescribeGameSessionsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "StatusFilter must be one of {}; got {status}.",
+                            crate::state::STATUS_FILTER_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+            selected.retain(|session| session.status.as_deref() == Some(status.as_str()));
+        }
+
+        let Some((page, next_token)) =
+            crate::state::paginate(
+                crate::state::PageKind::GameSessions,
+                &selected,
+                input.limit,
+                input.next_token.as_deref(),
+            )
+        else {
+            return Err(DescribeGameSessionsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "NextToken is not a pagination token this service issued.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeGameSessionsOutput {
+            game_sessions: Some(page),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation looks its cluster up in state, stores the instance record
+//! keyed by the lowercased `DBInstanceIdentifier`, and appends the instance to that
+//! cluster's `DBClusterMembers` (the cluster's first member is its writer). A new
+//! instance is born `creating`; the clock owes it `available`, which the next call that
+//! reports the instance materialises (see `crate::state::PROVISIONING_DELAY`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -217,18 +215,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBInstance"))
+        use crate::state as docdb;
+
+        // The model constrains none of these members, so the rules their own
+        // documentation states are enforced here; each helper cites the member doc.
+        docdb::validate_identifier("DBInstanceIdentifier", &input.db_instance_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        docdb::validate_identifier("DBClusterIdentifier", &input.db_cluster_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        docdb::validate_engine(&input.engine).map_err(crate::scaffolded::Scaffolded::validation)?;
+        if let Some(tier) = input.promotion_tier {
+            docdb::validate_promotion_tier(tier)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        // Nothing caller-sized reaches the store unchecked; see the "Store bounds" block
+        // in `src/state.rs` for where each cap comes from.
+        docdb::bound_tags(input.tags.as_ref()).map_err(crate::scaffolded::Scaffolded::validation)?;
+        docdb::bound_chars(
+            "DBInstanceClass",
+            &input.db_instance_class,
+            docdb::MAX_STRING_CHARS,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+        for (member, value) in [
+            ("AvailabilityZone", input.availability_zone.as_ref()),
+            (
+                "PreferredMaintenanceWindow",
+                input.preferred_maintenance_window.as_ref(),
+            ),
+            (
+                "PerformanceInsightsKMSKeyId",
+                input.performance_insights_kms_key_id.as_ref(),
+            ),
+            (
+                "CACertificateIdentifier",
+                input.ca_certificate_identifier.as_ref(),
+            ),
+        ] {
+            docdb::bound_optional_string(member, value)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        let region = docdb::request_region(ctx);
+        // Both identifiers are "stored as a lowercase string".
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+        let cluster_key = input.db_cluster_identifier.to_ascii_lowercase();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+        store.settle_clock();
+
+        if store.instances.contains_key(&identifier) {
+            return Err(CreateDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
+                DBInstanceAlreadyExistsFault {
+                    message: Some(format!("DB instance already exists: {identifier}")),
+                },
+            )
+            .into());
+        }
+
+        let Some(cluster) = store.clusters.get(&cluster_key) else {
+            return Err(CreateDBInstanceErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(format!("DBCluster not found: {cluster_key}")),
+                },
+            )
+            .into());
+        };
+
+        // The store's own caps: an over-quota create is refused, never stored.
+        if cluster.members.len() >= docdb::MAX_DB_INSTANCES_PER_CLUSTER {
+            return Err(CreateDBInstanceErrorModeled::InstanceQuotaExceededFault(
+                InstanceQuotaExceededFault {
+                    message: Some(format!(
+                        "Cannot create more than {} instances in cluster {cluster_key}",
+                        docdb::MAX_DB_INSTANCES_PER_CLUSTER
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.instances.len() >= docdb::MAX_DB_INSTANCES {
+            return Err(CreateDBInstanceErrorModeled::InstanceQuotaExceededFault(
+                InstanceQuotaExceededFault {
+                    message: Some(format!(
+                        "Cannot create more than {} instances in this Region",
+                        docdb::MAX_DB_INSTANCES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A cluster's first member is its writer; every later member is a replica.
+        let is_cluster_writer = cluster.members.is_empty();
+        // `AvailabilityZone` is optional, and DocumentDB then places the instance itself:
+        // members are spread over the cluster's own zones in the order they join.
+        let availability_zone = input.availability_zone.unwrap_or_else(|| {
+            let zones = &cluster.availability_zones;
+            zones
+                .get(cluster.members.len() % zones.len().max(1))
+                .cloned()
+                .unwrap_or_else(|| format!("{region}a"))
+        });
+        // An instance endpoint shares its cluster's DNS suffix.
+        let endpoint_address = format!("{identifier}.{}", cluster.endpoint_suffix);
+        let preferred_maintenance_window = input
+            .preferred_maintenance_window
+            .unwrap_or_else(|| cluster.preferred_maintenance_window.clone());
+        let promotion_tier = input
+            .promotion_tier
+            .unwrap_or(docdb::DEFAULT_PROMOTION_TIER);
+
+        let ordinal = store.next_resource_ordinal();
+        let token = docdb::resource_token(ordinal);
+
+        let record = docdb::DbInstanceRecord {
+            identifier: identifier.clone(),
+            dbi_resource_id: format!("db-{token}"),
+            region,
+            instance_class: input.db_instance_class,
+            engine: input.engine.to_ascii_lowercase(),
+            status: docdb::STATUS_CREATING.to_string(),
+            available_at: Some(::std::time::Instant::now() + docdb::PROVISIONING_DELAY),
+            cluster_identifier: cluster_key.clone(),
+            availability_zone,
+            promotion_tier,
+            endpoint_address,
+            instance_create_time: docdb::now(),
+            preferred_maintenance_window,
+            // `AutoMinorVersionUpgrade`: "Default: false".
+            auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or(false),
+            copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+            performance_insights_enabled: input.enable_performance_insights.unwrap_or(false),
+            performance_insights_kms_key_id: input.performance_insights_kms_key_id,
+            ca_certificate_identifier: input.ca_certificate_identifier,
+            tags: docdb::tag_pairs(input.tags),
+        };
+
+        store.instances.insert(identifier.clone(), record);
+        if let Some(cluster) = store.clusters.get_mut(&cluster_key) {
+            cluster.members.push(docdb::ClusterMember {
+                db_instance_identifier: identifier.clone(),
+                is_cluster_writer,
+                promotion_tier,
+            });
+        }
+
+        let stored = store
+            .instances
+            .get(&identifier)
+            .expect("the instance was inserted on the line above");
+        Ok(CreateDBInstanceOutput {
+            db_instance: Some(docdb::instance_to_shape(
+                stored,
+                store.clusters.get(&cluster_key),
+            )),
+        })
     }
 }

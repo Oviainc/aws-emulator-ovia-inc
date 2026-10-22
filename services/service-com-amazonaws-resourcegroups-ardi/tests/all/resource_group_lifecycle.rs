@@ -1259,6 +1259,294 @@ async fn an_absent_max_results_pages_at_the_modelled_maximum() {
     );
 }
 
+/// Every state-changing operation emits one structured audit record naming the
+/// operation, the caller's presented access key id, the region, the resource and
+/// the outcome — and no request content. A reporting operation emits none.
+#[tokio::test]
+async fn state_changing_operations_emit_one_audit_record_each() {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    /// One captured event: its target and its fields as strings.
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl CapturedEvent {
+        /// A field's value with the quotes a `Debug`-recorded string carries
+        /// removed: the handlers record request-derived values `Debug`-escaped so
+        /// none can split a record.
+        fn field(&self, name: &str) -> Option<&str> {
+            self.fields
+                .get(name)
+                .map(|value| value.trim_matches('"'))
+        }
+    }
+
+    /// Collects an event's fields into strings, whatever type they were recorded as.
+    struct FieldCollector<'a>(&'a mut BTreeMap<String, String>);
+
+    impl Visit for FieldCollector<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    /// A `tracing` subscriber that keeps every event it is handed, so the records
+    /// are read as FIELDS rather than scraped out of formatted text. Scoped to this
+    /// thread, so no global subscriber is installed.
+    #[derive(Clone, Default)]
+    struct Capture {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl Capture {
+        /// Every audit record captured for `operation` on `group`, oldest first. The
+        /// group is part of the filter because this capture is installed once for
+        /// the whole test binary, so records of the tests running beside this one
+        /// land in it too.
+        fn records_for(&self, operation: &str, group: &str) -> Vec<CapturedEvent> {
+            self.audit_records()
+                .into_iter()
+                .filter(|event| {
+                    event.field("operation") == Some(operation)
+                        && event.field("group") == Some(group)
+                })
+                .collect()
+        }
+
+        /// Every audit record captured for `operation`, whatever the resource.
+        fn records_of(&self, operation: &str) -> Vec<CapturedEvent> {
+            self.audit_records()
+                .into_iter()
+                .filter(|event| event.field("operation") == Some(operation))
+                .collect()
+        }
+
+        /// Every record on this service's audit target.
+        fn audit_records(&self) -> Vec<CapturedEvent> {
+            self.events
+                .lock()
+                .expect("the capture buffer")
+                .iter()
+                .filter(|event| {
+                    event.target == service_com_amazonaws_resourcegroups_ardi::state::AUDIT_TARGET
+                })
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl Subscriber for Capture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            // This test asserts on events, not spans; one id for every span is enough.
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut FieldCollector(&mut fields));
+            self.events
+                .lock()
+                .expect("the capture buffer")
+                .push(CapturedEvent {
+                    target: event.metadata().target().to_string(),
+                    fields,
+                });
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    // Installed ONCE for the whole test binary, and global rather than
+    // thread-local: tracing caches a callsite's interest the first time it is
+    // reached, and a test running beside this one reaches the handlers' callsites
+    // with no subscriber of its own, which would cache them as "never" and suppress
+    // the records this test is about.
+    static CAPTURE: std::sync::OnceLock<Capture> = std::sync::OnceLock::new();
+    let capture = CAPTURE
+        .get_or_init(|| {
+            let capture = Capture::default();
+            assert!(
+                tracing::subscriber::set_global_default(capture.clone()).is_ok(),
+                "a subscriber was already installed, so audit records cannot be captured",
+            );
+            tracing::callsite::rebuild_interest_cache();
+            capture
+        })
+        .clone();
+
+    let emulator = Emulator::new();
+    let arn = format!("arn:aws:ec2:eu-west-1:{ACCOUNT}:instance/i-000000000000000a");
+    // Each setup call must SUCCEED, or the assertions below would fail as "no record
+    // emitted" when the real cause was a refused request.
+    for (path, body) in [
+        ("/groups", json!({ "Name": "audited" })),
+        (
+            "/group-resources",
+            json!({ "Group": "audited", "ResourceArns": [arn] }),
+        ),
+        // A read emits no access record, so the negative assertion below cannot pass
+        // on one.
+        ("/get-group", json!({ "Group": "audited" })),
+        ("/delete-group", json!({ "Group": "audited" })),
+    ] {
+        let (status, answered) = emulator.call_in("eu-west-1", path, &body).await;
+        assert_eq!(
+            status, 200,
+            "setup {path}: expected 200 before asserting on audit records, got {status} {answered}",
+        );
+    }
+
+    // (label, the operation that must have recorded, the outcome it must name)
+    let cases = [
+        ("the create", "CreateGroup", "created"),
+        ("the membership add", "GroupResources", "grouped"),
+        ("the delete", "DeleteGroup", "deleted"),
+    ];
+    for (label, operation, outcome) in cases {
+        let matching = capture.records_for(operation, "audited");
+        assert_eq!(
+            matching.len(),
+            1,
+            "case {label:?}: expected exactly one audit record for {operation}, \
+             captured {matching:?}",
+        );
+        let record = &matching[0];
+        // who, where, what, and how it came out.
+        for (field, expected) in [
+            ("caller", "AKIDEXAMPLE"),
+            ("region", "eu-west-1"),
+            ("group", "audited"),
+            ("outcome", outcome),
+        ] {
+            assert_eq!(
+                record.field(field),
+                Some(expected),
+                "case {label:?}: expected {field}={expected:?}, got {record:?}",
+            );
+        }
+    }
+    for reporting in ["GetGroup", "ListGroups", "ListGroupResources"] {
+        assert!(
+            capture.records_of(reporting).is_empty(),
+            "case {reporting:?}: a read is not a state change and must emit no access \
+             record, captured {:?}",
+            capture.records_of(reporting),
+        );
+    }
+}
+
+/// A membership ARN is accepted when its partition matches the production the
+/// modelled `ResourceArn` names — `aws(-[a-z]+)*` — and refused otherwise.
+#[tokio::test]
+async fn the_arn_partition_production_decides_which_resource_arns_are_accepted() {
+    let emulator = Emulator::new();
+    emulator.ok("/groups", &json!({ "Name": "partitions" })).await;
+
+    // (label, ARN, the status the partition must produce)
+    let cases = [
+        (
+            "the commercial partition",
+            format!("arn:aws:ec2:us-east-1:{ACCOUNT}:instance/i-000000000000000a"),
+            200,
+        ),
+        (
+            "a two-segment partition",
+            format!("arn:aws-cn:ec2:cn-north-1:{ACCOUNT}:instance/i-000000000000000b"),
+            200,
+        ),
+        (
+            "a three-segment partition",
+            format!("arn:aws-us-gov:ec2:us-gov-west-1:{ACCOUNT}:instance/i-000000000000000c"),
+            200,
+        ),
+        (
+            "a partition that merely starts with aws",
+            format!("arn:awsfoo:ec2:us-east-1:{ACCOUNT}:instance/i-000000000000000d"),
+            400,
+        ),
+        (
+            "a partition with an empty segment",
+            format!("arn:aws-:ec2:us-east-1:{ACCOUNT}:instance/i-000000000000000e"),
+            400,
+        ),
+        (
+            "a partition segment that is not lowercase",
+            format!("arn:aws-US:ec2:us-east-1:{ACCOUNT}:instance/i-000000000000000f"),
+            400,
+        ),
+        (
+            "no partition at all",
+            format!("arn::ec2:us-east-1:{ACCOUNT}:instance/i-0000000000000010"),
+            400,
+        ),
+    ];
+    for (label, arn, expected) in cases {
+        let (status, body) = emulator
+            .call(
+                "/group-resources",
+                &json!({ "Group": "partitions", "ResourceArns": [arn] }),
+            )
+            .await;
+        assert_eq!(
+            status, expected,
+            "case {label:?} ({arn}): expected {expected}, got {status} {body}",
+        );
+        if expected == 400 {
+            assert_eq!(
+                error_code(&body),
+                "BadRequestException",
+                "case {label:?} ({arn}): expected BadRequestException, got {body}",
+            );
+        } else {
+            let listed = emulator
+                .ok("/list-group-resources", &json!({ "Group": "partitions" }))
+                .await;
+            assert!(
+                listed["ResourceIdentifiers"]
+                    .as_array()
+                    .expect("ResourceIdentifiers is a list")
+                    .iter()
+                    .any(|id| id["ResourceArn"].as_str() == Some(arn.as_str())),
+                "case {label:?} ({arn}): expected the membership to be recorded, got {listed}",
+            );
+        }
+    }
+}
+
 /// Two groups do not share membership: each record holds its own.
 #[tokio::test]
 async fn memberships_belong_to_the_group_they_were_added_to() {

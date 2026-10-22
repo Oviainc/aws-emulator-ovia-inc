@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCredentialsForIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCredentialsForIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Issues session credentials for a stored identity, from the emulator's own credential
+//! store, and holds them for the identity until they expire.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCredentialsForIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this slice does not resolve yet: roles
+//!
+//! The credentials a real identity pool vends are the pool's authenticated or
+//! unauthenticated ROLE, chosen through `SetIdentityPoolRoles` and its role mappings,
+//! and `CustomRoleArn` picks one of those mapped roles. `Set`/`GetIdentityPoolRoles`
+//! are still scaffolded (HTTP 501), so this service holds no roles to resolve: a request
+//! naming a `CustomRoleArn` is answered with the modelled
+//! `InvalidIdentityPoolConfigurationException` (HTTP 400) — the error the real service
+//! raises when the pool has no role for the request — rather than silently vending a
+//! session the caller did not ask for.
+//!
+//! `Logins` selects WHICH provider token is exchanged for the session. This emulator
+//! verifies no provider token (it issues none), so the session it vends is the
+//! identity's own and does not vary with `Logins`.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +110,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How long the credentials this operation issues stay valid. The Amazon Cognito
+/// Developer Guide's "Authentication flow" section states the credentials an identity
+/// pool vends "are valid for one hour"
+/// (<https://docs.aws.amazon.com/cognito/latest/developerguide/authentication-flow.html>).
+const CREDENTIAL_VALIDITY: ::std::time::Duration = ::std::time::Duration::from_secs(3600);
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -177,18 +191,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCredentialsForIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCredentialsForIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCredentialsForIdentity"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetCredentialsForIdentityErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        if !store.identities.contains_key(&input.identity_id) {
+            return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Identity '{}' not found.", input.identity_id)),
+                },
+            )
+            .into());
+        }
+
+        // A custom role can only be honoured against the pool's role mappings, and this
+        // slice stores none (`SetIdentityPoolRoles` is not implemented), so the request is
+        // refused with the error the real service raises for a pool that has no role for
+        // it rather than answered with a session that ignores the member.
+        if input.custom_role_arn.is_some() {
+            return Err(
+                GetCredentialsForIdentityErrorModeled::InvalidIdentityPoolConfigurationException(
+                    InvalidIdentityPoolConfigurationException {
+                        message: Some(
+                            "A CustomRoleArn cannot be resolved: the identity pool has no role \
+                             mappings configured."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every session whose window the clock has closed is forgotten here — by this
+        // service and by the emulator's credential store, so a request still presenting
+        // one is refused and neither store holds an expired session for the life of the
+        // process.
+        for access_key_id in store.purge_expired_credentials(now) {
+            let _ = ctx.credential_store().delete(&access_key_id);
+        }
+
+        // What survives the sweep is still valid, so a caller that asks twice inside the
+        // window gets one session.
+        let issued = match store.credentials.get(&input.identity_id).cloned() {
+            Some(issued) => issued,
+            None => {
+                // The emulator's credential store mints every id and secret: this
+                // operation chooses neither.
+                let minted = ctx
+                    .credential_store()
+                    .create(&::emulator_server::aws_credentials::AWS_SESSION);
+                let secrets = (
+                    minted.secret(::emulator_server::aws_credentials::SECRET_ACCESS_KEY),
+                    minted.secret(::emulator_server::aws_credentials::SESSION_TOKEN),
+                );
+                // A session without both secrets is unusable, so it is a server error
+                // rather than a 200 carrying an empty secret.
+                let (Some(secret_key), Some(session_token)) = secrets else {
+                    let _ = ctx.credential_store().delete(&minted.id);
+                    return Err(GetCredentialsForIdentityErrorModeled::InternalErrorException(
+                        InternalErrorException {
+                            message: Some(
+                                "the credential store minted a session without its secrets"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                let issued = crate::state::IssuedCredentials {
+                    access_key_id: minted.id.clone(),
+                    secret_key: secret_key.to_string(),
+                    session_token: session_token.to_string(),
+                    expiration: now + CREDENTIAL_VALIDITY,
+                };
+                store
+                    .credentials
+                    .insert(input.identity_id.clone(), issued.clone());
+                issued
+            }
+        };
+
+        Ok(GetCredentialsForIdentityOutput {
+            identity_id: Some(input.identity_id),
+            credentials: Some(Credentials {
+                access_key_id: Some(issued.access_key_id),
+                secret_key: Some(issued.secret_key),
+                session_token: Some(issued.session_token),
+                expiration: Some(::aws_smithy_types::DateTime::from(issued.expiration)),
+            }),
+        })
     }
 }

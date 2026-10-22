@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: turns Resource Explorer on in the request's Region by storing that
+//! Region's one index in `crate::state`, and answers from the stored entry.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +186,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIndex"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateIndexErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut guard = store.lock();
+        guard.settle(now);
+
+        // The Region keys the index map and is read from the caller's credential scope,
+        // so only a Region this emulator actually serves can get an index.
+        if !crate::state::is_servable_region(&region) {
+            return Err(CreateIndexErrorModeled::ValidationException(ValidationException {
+                message: format!("{region} is not an Amazon Web Services Region."),
+                field_list: None,
+            })
+            .into());
+        }
+
+        // `ClientToken` is an @idempotencyToken: replaying the token that created this
+        // Region's index returns that index instead of creating a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = guard
+                .indexes
+                .get(&region)
+                .filter(|index| index.client_token.as_deref() == Some(token))
+            {
+                return Ok(CreateIndexOutput {
+                    arn: Some(existing.arn.clone()),
+                    state: Some(existing.state.as_wire().to_string()),
+                    created_at: Some(::aws_smithy_types::DateTime::from(existing.created_at)),
+                });
+            }
+        }
+
+        // "You can create only one index in a Region."
+        if guard.indexes.contains_key(&region) {
+            return Err(CreateIndexErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "An index already exists in Region {region}. You can create only one \
+                     index per Region."
+                ),
+            })
+            .into());
+        }
+
+        let resource_id = guard.mint_resource_id("index", now);
+        let entry = crate::state::IndexEntry {
+            arn: ::engine::emulator_arn(
+                crate::state::SERVICE_NAMESPACE,
+                &region,
+                &format!("index/{resource_id}"),
+            ),
+            region: region.clone(),
+            // "This operation creates only a local index" — UpdateIndexType is what
+            // promotes one to AGGREGATOR.
+            index_type: crate::state::INDEX_TYPE_LOCAL.to_string(),
+            // Indexing is an asynchronous background task, so the index is reported
+            // CREATING and the clock owes it ACTIVE.
+            state: crate::state::IndexLifecycle::Creating,
+            settles_at: Some(now + crate::state::INDEX_SETTLE_DELAY),
+            created_at: now,
+            last_updated_at: now,
+            tags: input.tags.unwrap_or_default(),
+            client_token: input.client_token,
+        };
+        let output = CreateIndexOutput {
+            arn: Some(entry.arn.clone()),
+            state: Some(entry.state.as_wire().to_string()),
+            created_at: Some(::aws_smithy_types::DateTime::from(entry.created_at)),
+        };
+        guard.indexes.insert(region, entry);
+        Ok(output)
     }
 }

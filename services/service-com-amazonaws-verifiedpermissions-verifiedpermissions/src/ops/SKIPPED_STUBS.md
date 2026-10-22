@@ -18,5 +18,11 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: CreatePolicyStore — shape missing from model: smithy.api#Unit
-// SKIPPED: GetPolicyStore — shape missing from model: smithy.api#Unit
+Nothing is currently skipped.
+
+`CreatePolicyStore` and `GetPolicyStore` were declined here
+("shape missing from model: smithy.api#Unit": their `encryptionSettings` /
+`encryptionState` members target a union with a `smithy.api#Unit` arm). Both are
+now hand-authored in `ops/create_policy_store.rs` and `ops/get_policy_store.rs`,
+with that one member declared `unsupported` on the hand-written input/output
+type, so both are wired into the service's `operations(...)` allow-list.

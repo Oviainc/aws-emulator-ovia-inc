@@ -21,13 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Encodes/decodes the opaque `nextToken` ListMicrovms pages with.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
+# `tokio::time::sleep` for the clock-owed transitions the tests wait out.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

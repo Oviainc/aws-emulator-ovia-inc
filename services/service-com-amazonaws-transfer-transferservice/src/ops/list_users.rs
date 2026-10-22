@@ -179,14 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let guard = state.lock();
 
         if !guard.servers.contains_key(&input.server_id) {
-            return Err(ListUsersErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Unknown server {}", input.server_id),
-                    resource: input.server_id.clone(),
-                    resource_type: "server".to_string(),
-                },
-            )
-            .into());
+            return Err(st::not_found(
+                ListUsersErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
         }
 
         // ONE range scan over this server's run of the user map: the records to render

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds tags to the Savings Plan the ARN names, so a later
+//! `ListTagsForResource` and `DescribeSavingsPlans` both report them.
 //!
 //! ## Shape of an operation
 //!
@@ -138,20 +132,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The model's `@pattern` already refused anything that is not a
+        // Savings Plan ARN; what is left to refuse is an ARN of some other
+        // service or resource type.
+        if crate::state::savings_plan_id_from_arn(&input.resource_arn).is_none() {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "resourceArn '{}' is not the ARN of a {} savingsplan resource",
+                    input.resource_arn,
+                    crate::state::SERVICE_NAMESPACE
+                ),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the savingsplans store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let plan = store.plan_by_arn_mut(&input.resource_arn).ok_or_else(|| {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "no Savings Plan found with ARN '{}'",
+                    input.resource_arn
+                ),
+            })
+        })?;
+        // All or nothing: a write that would take the plan past the service's
+        // tag limit is refused without storing any of it.
+        plan.merge_tags(input.tags).map_err(|message| {
+            TagResourceErrorModeled::ValidationException(ValidationException { message })
+        })?;
+
+        Ok(TagResourceOutput {})
     }
 }

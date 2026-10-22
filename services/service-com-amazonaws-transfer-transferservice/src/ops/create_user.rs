@@ -227,14 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
 
         if !guard.servers.contains_key(&input.server_id) {
-            return Err(CreateUserErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Unknown server {}", input.server_id),
-                    resource: input.server_id.clone(),
-                    resource_type: "server".to_string(),
-                },
-            )
-            .into());
+            return Err(st::not_found(
+                CreateUserErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
         }
 
         let key = (input.server_id.clone(), input.user_name.clone());

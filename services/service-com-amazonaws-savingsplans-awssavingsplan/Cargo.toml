@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hex codec for the opaque pagination tokens the describe paginators mint, and
+# SHA-256 to mint this service's ids from a per-store seed. Both are already
+# workspace-pinned, so this service adds no entry to Cargo.lock — which is what
+# lets the fix land in a tree where every other branch is editing that file.
+hex = { workspace = true }
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

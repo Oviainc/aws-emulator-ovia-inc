@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     EndpointDetails, HomeDirectoryMapEntry, IdentityProviderDetails, PosixProfile, ProtocolDetails,
-    S3StorageOptions, Tag, WorkflowDetails,
+    ResourceNotFoundException, S3StorageOptions, Tag, WorkflowDetails,
 };
 
 /// The region used for an ARN when the request carries no SigV4 credential scope to
@@ -96,6 +96,57 @@ pub const SERVER_STATE_STARTING: &str = "STARTING";
 
 /// A server's `State` once the start the create began has completed.
 pub const SERVER_STATE_ONLINE: &str = "ONLINE";
+
+/// The HTTP status AWS Transfer Family answers `ResourceNotFoundException` with.
+///
+/// The model puts `@httpError(404)` on the shape, but the recorded Transfer wire
+/// answers an unknown server or user with HTTP **400** and `__type`
+/// `ResourceNotFoundException` — so the status on the wire is 400 and the shape's
+/// `httpError` does not describe the service. Handlers return it through
+/// [`not_found`], which keeps the body the model's own and changes only the status
+/// line.
+pub const RESOURCE_NOT_FOUND_HTTP_STATUS: u16 = 400;
+
+/// `ResourceType` for the server resource: the resource name capitalized, as the
+/// recorded Transfer error bodies carry it.
+pub const RESOURCE_TYPE_SERVER: &str = "Server";
+
+/// `ResourceType` for the user resource. Same convention as [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_USER: &str = "User";
+
+/// The not-found payload for the `resource_type` resource identified by `resource`.
+///
+/// The identifier travels in `Resource` ALONE: `Message` is a fixed generic string
+/// derived from the resource type, so one caller's id never reaches the message a
+/// client logs or asserts on. Every operation in this service that cannot find a
+/// resource builds its error here, so the construction cannot drift between them.
+pub fn resource_not_found(resource_type: &str, resource: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("Unknown {}", resource_type.to_lowercase()),
+        resource: resource.to_string(),
+        resource_type: resource_type.to_string(),
+    }
+}
+
+/// The not-found payload for a `ServerId` the store does not hold — never created, or
+/// already deleted.
+pub fn unknown_server(server_id: &str) -> ResourceNotFoundException {
+    resource_not_found(RESOURCE_TYPE_SERVER, server_id)
+}
+
+/// The not-found payload for a `UserName` the named server does not hold.
+pub fn unknown_user(user_name: &str) -> ResourceNotFoundException {
+    resource_not_found(RESOURCE_TYPE_USER, user_name)
+}
+
+/// Lift an operation's modelled not-found variant into its error channel, answered
+/// with [`RESOURCE_NOT_FOUND_HTTP_STATUS`] rather than the model's `@httpError`.
+///
+/// Generic over the operation's own `*ErrorModeled` enum, so every handler reaches
+/// the one status decision through this function.
+pub fn not_found<E>(error: E) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::modeled_with_status(error, RESOURCE_NOT_FOUND_HTTP_STATUS)
+}
 
 /// One stored SSH public key of a user.
 #[derive(Debug, Clone)]

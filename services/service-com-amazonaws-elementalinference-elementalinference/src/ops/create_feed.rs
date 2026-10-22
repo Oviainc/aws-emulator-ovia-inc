@@ -4,7 +4,9 @@
 //! IMPLEMENTED: mints a feed, persists it in `crate::state` and builds the response
 //! from the stored record. The feed is accepted asynchronously (HTTP 202), so it is
 //! stored in the transient `CREATING` status with the instant its move to `AVAILABLE`
-//! falls due; the feed readers materialise that move.
+//! falls due; the feed readers materialise that move. A supplied `accessRoleArn` is a
+//! role this service is asked to PASS, so it is evaluated first: a role that names
+//! another account is denied (`AccessDeniedException`, HTTP 403).
 //!
 //! The scaffold's own notes on the operation shape and on reaching state are kept
 //! below, minus the line that recorded this operation as a stub.
@@ -202,6 +204,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let now = std::time::Instant::now();
+
+        // The access role is evaluated by attempting to PASS it, which is an
+        // authorization decision and so is taken first: a role ARN that names another
+        // account is denied (HTTP 403), never reported as a malformed request and
+        // never charged against the account's quota.
+        if input
+            .access_role_arn
+            .as_deref()
+            .is_some_and(crate::state::names_another_account)
+        {
+            return Err(CreateFeedErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
 
         let mut state = state.lock();
         state.settle_due_transitions(now);

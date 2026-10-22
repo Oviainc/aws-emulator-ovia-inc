@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation mutates the persisted cluster record (including re-keying
+//! it on `NewDBClusterIdentifier`) and answers with the updated record, so a following
+//! `DescribeDBClusters` shows the new values.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -266,18 +262,261 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBCluster"))
+        use crate::state as docdb;
+
+        let _ = ctx;
+        docdb::validate_identifier("DBClusterIdentifier", &input.db_cluster_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        if let Some(new_identifier) = &input.new_db_cluster_identifier {
+            docdb::validate_identifier("NewDBClusterIdentifier", new_identifier)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        if let Some(period) = input.backup_retention_period {
+            docdb::validate_backup_retention_period(period)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        // The new password is checked against its documented rule and then dropped: no
+        // operation reports it, so this service never stores it.
+        if let Some(password) = &input.master_user_password {
+            docdb::validate_master_user_password(password)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        // Both of these hand the master password to Amazon Web Services Secrets Manager
+        // and report a `MasterUserSecret` back. This emulator has no Secrets Manager
+        // integration, and must not invent an ARN for a secret that does not exist.
+        if input.manage_master_user_password == Some(true)
+            || input.rotate_master_user_password == Some(true)
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ModifyDBCluster with ManageMasterUserPassword or RotateMasterUserPassword",
+            ));
+        }
+
+        // Nothing caller-sized reaches the store unchecked; see the "Store bounds" block
+        // in `src/state.rs` for where each cap comes from.
+        docdb::bound_string_list("VpcSecurityGroupIds", input.vpc_security_group_ids.as_ref())
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        if let Some(config) = &input.cloudwatch_logs_export_configuration {
+            docdb::bound_string_list(
+                "CloudwatchLogsExportConfiguration.EnableLogTypes",
+                config.enable_log_types.as_ref(),
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+            docdb::bound_string_list(
+                "CloudwatchLogsExportConfiguration.DisableLogTypes",
+                config.disable_log_types.as_ref(),
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        for (member, value) in [
+            ("EngineVersion", input.engine_version.as_ref()),
+            ("NetworkType", input.network_type.as_ref()),
+            ("StorageType", input.storage_type.as_ref()),
+            (
+                "DBClusterParameterGroupName",
+                input.db_cluster_parameter_group_name.as_ref(),
+            ),
+            (
+                "PreferredBackupWindow",
+                input.preferred_backup_window.as_ref(),
+            ),
+            (
+                "PreferredMaintenanceWindow",
+                input.preferred_maintenance_window.as_ref(),
+            ),
+            (
+                "MasterUserSecretKmsKeyId",
+                input.master_user_secret_kms_key_id.as_ref(),
+            ),
+        ] {
+            docdb::bound_optional_string(member, value)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+        store.settle_clock();
+
+        let Some(key) = store.resolve_cluster_key(&input.db_cluster_identifier) else {
+            return Err(ModifyDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(format!(
+                        "DBCluster not found: {}",
+                        input.db_cluster_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A cluster can only be modified once it has finished provisioning.
+        let status = store
+            .clusters
+            .get(&key)
+            .map(|record| record.status.clone())
+            .unwrap_or_default();
+        if status != docdb::STATUS_AVAILABLE {
+            return Err(ModifyDBClusterErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "Cluster {key} is in {status} state but must be {} to be modified",
+                        docdb::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `NewDBClusterIdentifier` is "stored as a lowercase string" too, and renaming
+        // onto a name already in use is the already-exists fault.
+        let new_key = match &input.new_db_cluster_identifier {
+            Some(new_identifier) => {
+                let candidate = new_identifier.to_ascii_lowercase();
+                if candidate != key && store.clusters.contains_key(&candidate) {
+                    return Err(ModifyDBClusterErrorModeled::DBClusterAlreadyExistsFault(
+                        DBClusterAlreadyExistsFault {
+                            message: Some(format!("DB cluster already exists: {candidate}")),
+                        },
+                    )
+                    .into());
+                }
+                candidate
+            }
+            None => key.clone(),
+        };
+
+        // The log-export list is the one stored collection a repeated modify can grow, so
+        // the cap is checked against the list the record ALREADY holds, before anything on
+        // the record is touched — a refusal must never leave a half-applied change.
+        if let Some(config) = &input.cloudwatch_logs_export_configuration {
+            let stored = store
+                .clusters
+                .get(&key)
+                .map_or(0, |record| record.enabled_cloudwatch_logs_exports.len());
+            let added = config.enable_log_types.as_ref().map_or(0, Vec::len);
+            docdb::bound_entries(
+                "EnabledCloudwatchLogsExports",
+                stored + added,
+                docdb::MAX_COLLECTION_ENTRIES,
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        // `AllowMajorVersionUpgrade`: "You must allow major version upgrades when
+        // specifying a value for the EngineVersion parameter that is a different major
+        // version than the cluster's current version." Checked here, before any field is
+        // written, for the same reason as the cap above.
+        if let Some(requested) = &input.engine_version {
+            let current = store
+                .clusters
+                .get(&key)
+                .map(|record| record.engine_version.clone())
+                .unwrap_or_default();
+            let changes_major =
+                docdb::engine_major_version(requested) != docdb::engine_major_version(&current);
+            if changes_major && input.allow_major_version_upgrade != Some(true) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value '{requested}' for EngineVersion: it is a different major \
+                     version than the cluster's current version '{current}', which requires \
+                     AllowMajorVersionUpgrade"
+                )));
+            }
+        }
+
+        {
+            let record = store
+                .clusters
+                .get_mut(&key)
+                .expect("the cluster key was resolved from this same map above");
+
+            // `ApplyImmediately` chooses between applying now and applying in the
+            // maintenance window, but `DBCluster` models no `PendingModifiedValues`
+            // member, so a deferred change has nowhere to be reported: every change the
+            // caller asked for is applied to the record now.
+            if let Some(period) = input.backup_retention_period {
+                record.backup_retention_period = period;
+            }
+            if let Some(window) = input.preferred_backup_window {
+                record.preferred_backup_window = window;
+            }
+            if let Some(window) = input.preferred_maintenance_window {
+                record.preferred_maintenance_window = window;
+            }
+            if let Some(port) = input.port {
+                record.port = port;
+            }
+            if let Some(protection) = input.deletion_protection {
+                record.deletion_protection = protection;
+            }
+            if let Some(group) = input.db_cluster_parameter_group_name {
+                record.db_cluster_parameter_group = Some(group);
+            }
+            if let Some(groups) = input.vpc_security_group_ids {
+                record.vpc_security_group_ids = groups;
+            }
+            if let Some(version) = input.engine_version {
+                record.engine_version = version;
+            }
+            if let Some(storage_type) = input.storage_type {
+                // `StorageType`: "The storage type isn't returned when you set it to
+                // standard."
+                record.storage_type = (!storage_type
+                    .eq_ignore_ascii_case(docdb::DEFAULT_STORAGE_TYPE))
+                .then_some(storage_type);
+            }
+            if let Some(network_type) = input.network_type {
+                record.network_type = Some(network_type);
+            }
+            if let Some(copy_tags) = input.copy_tags_to_snapshot {
+                record.copy_tags_to_snapshot = copy_tags;
+            }
+            if let Some(config) = input.serverless_v2_scaling_configuration {
+                if let (Some(min), Some(max)) = (config.min_capacity, config.max_capacity) {
+                    record.serverless_v2_scaling = Some((min, max));
+                }
+            }
+            if let Some(config) = input.cloudwatch_logs_export_configuration {
+                for log_type in config.enable_log_types.into_iter().flatten() {
+                    if !record.enabled_cloudwatch_logs_exports.contains(&log_type) {
+                        record.enabled_cloudwatch_logs_exports.push(log_type);
+                    }
+                }
+                let disabled = config.disable_log_types.unwrap_or_default();
+                record
+                    .enabled_cloudwatch_logs_exports
+                    .retain(|log_type| !disabled.contains(log_type));
+            }
+        }
+
+        if new_key != key {
+            let mut record = store
+                .clusters
+                .remove(&key)
+                .expect("the cluster key was resolved from this same map above");
+            record.identifier = new_key.clone();
+            store.clusters.insert(new_key.clone(), record);
+            // The members' back-reference has to follow the rename, or a later
+            // `DescribeDBInstances` would report a cluster that no longer exists.
+            for instance in store.instances.values_mut() {
+                if instance.cluster_identifier == key {
+                    instance.cluster_identifier = new_key.clone();
+                }
+            }
+        }
+
+        let stored = store
+            .clusters
+            .get(&new_key)
+            .expect("the renamed cluster was just re-inserted");
+        Ok(ModifyDBClusterOutput {
+            db_cluster: Some(docdb::cluster_to_shape(stored, &store.instances)),
+        })
     }
 }

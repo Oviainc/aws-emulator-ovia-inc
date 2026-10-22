@@ -3,10 +3,11 @@
 //! The dictionary lifecycle, end to end over the wire: `CreateDictionary` and
 //! `GetDictionary`.
 //!
-//! Every case here drives the real request path — the router picks the service from the
-//! SigV4 credential scope, the framework deserializes and validates the body, the
-//! handler runs, and the response is serialized as `restJson1` — so what these tests
-//! assert is what a client sees.
+//! Every case here drives the real request path through the shared harness
+//! (`tests/all/harness.rs`) — the router picks the service from the SigV4 credential
+//! scope, the framework deserializes and validates the body, the handler runs, and the
+//! response is serialized as `restJson1` — so what these tests assert is what a client
+//! sees.
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one recorded
 //! case:
@@ -23,21 +24,9 @@
 //! * the dictionary store is BOUNDED: past the quota `CreateDictionary` answers the
 //!   modelled `ServiceQuotaExceededException` (HTTP 402).
 
+use crate::harness::{call, past_the_transition_span, router, REGION, SIGNING_NAME};
 use serde_json::{json, Value};
-use service_com_amazonaws_elementalinference_elementalinference::state::{
-    MAX_DICTIONARIES, TRANSITION_SPAN,
-};
-use service_com_amazonaws_elementalinference_elementalinference::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
-use std::sync::Arc;
-
-/// The region every request below is signed for. The service reads it out of the SigV4
-/// credential scope, so the ARNs it mints must carry exactly this region.
-const REGION: &str = "eu-west-1";
-
-/// This service's SigV4 signing name (`OPERATIONS.md`, "Wire protocol"): the router
-/// resolves the claiming service from it.
-const SIGNING_NAME: &str = "elemental-inference";
+use service_com_amazonaws_elementalinference_elementalinference::state::MAX_DICTIONARIES;
 
 /// Every value the `DictionaryLanguage` enum admits, from
 /// `smithy_query(query="shape",shape="DictionaryLanguage")`: `eng`, `fra`, `ita`,
@@ -47,60 +36,6 @@ const LANGUAGES: &[&str] = &["eng", "fra", "ita", "deu", "spa", "por"];
 /// The modelled maximum length of `DictionaryEntriesPayload`
 /// (`smithy_query(query="shape",shape="DictionaryEntriesPayload")`: `length max 40960`).
 const MAX_ENTRIES_LEN: usize = 40960;
-
-/// Long enough for a clock-owed dictionary transition to have fallen due.
-fn past_the_transition_span() {
-    // A plain blocking sleep: the test's runtime has nothing else to run, and the
-    // service never sleeps for a transition — it stores the due instant.
-    std::thread::sleep(TRANSITION_SPAN + std::time::Duration::from_millis(250));
-}
-
-/// A router serving this service alone over one shared engine.
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // These requests carry an unsigned placeholder Authorization header, which is
-    // there only so the router can resolve the signing name.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Send one request and return its status and parsed body (`Value::Null` when empty).
-async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let payload = body.map_or_else(Vec::new, |body| serde_json::to_vec(&body).unwrap());
-    let request = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/{SIGNING_NAME}/aws4_request, \
-                 SignedHeaders=host, Signature=deadbeef"
-            ),
-        )
-        .body(bytes::Bytes::from(payload))
-        .unwrap();
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or_else(|e| {
-            panic!(
-                "{method} {uri}: body is not JSON ({e}): {}",
-                String::from_utf8_lossy(response.body())
-            )
-        })
-    };
-    (status, parsed)
-}
 
 /// Whether `id` satisfies the modelled `DictionaryId` constraints: `^[a-zA-Z0-9]+$`,
 /// between 1 and 19 characters.

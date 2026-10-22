@@ -31,3 +31,4 @@ hex = { workspace = true }
 
 [lints]
 workspace = true
+

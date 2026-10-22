@@ -161,14 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // unreachable second 404 branch.
         let user_count = guard.user_count(&input.server_id);
         let Some(stored) = guard.servers.get_mut(&input.server_id) else {
-            return Err(DescribeServerErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Unknown server {}", input.server_id),
-                    resource: input.server_id.clone(),
-                    resource_type: "server".to_string(),
-                },
-            )
-            .into());
+            return Err(st::not_found(
+                DescribeServerErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
         };
 
         // Settle ONLY the server being described — the single write this reporting

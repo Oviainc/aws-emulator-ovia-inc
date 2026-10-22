@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PublishSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PublishSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PublishSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Freezes an immutable PUBLISHED copy of a development schema's facets under a new
+//! versioned ARN. The published copy is a snapshot: later edits to the development
+//! schema do not reach it.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PublishSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PublishSchema"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PublishSchemaErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Cloud Directory state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The published copy is Region-scoped to the development schema it is made from,
+        // not to whatever Region the caller happened to sign for.
+        let region = crate::state::arn_region(&input.development_schema_arn)
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::state::request_region(ctx.parts()));
+        let mut store = state.lock();
+
+        let Some(development) = store.schemas.get(&input.development_schema_arn) else {
+            return Err(PublishSchemaErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no schema exists at {}",
+                        input.development_schema_arn
+                    )),
+                },
+            )
+            .into());
+        };
+        if development.stage != crate::state::SchemaStage::Development {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "{} is not a development schema; only a development schema can be published",
+                input.development_schema_arn
+            )));
+        }
+
+        // `Name` renames the published copy; absent, it keeps the development name.
+        let name = input
+            .name
+            .clone()
+            .unwrap_or_else(|| development.name.clone());
+        let facets = development.facets.clone();
+
+        let arn = crate::state::published_schema_arn(
+            &region,
+            &name,
+            &input.version,
+            input.minor_version.as_deref(),
+        );
+        if store.schemas.contains_key(&arn) {
+            return Err(PublishSchemaErrorModeled::SchemaAlreadyPublishedException(
+                SchemaAlreadyPublishedException {
+                    message: Some(format!("schema {name} is already published at {arn}")),
+                },
+            )
+            .into());
+        }
+        // The schema registry is bounded: it holds state for the life of the process
+        // and every request may add to it.
+        if store.schemas.len() >= crate::state::SCHEMA_QUOTA {
+            return Err(PublishSchemaErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} schemas; delete a \
+                         schema before publishing another",
+                        crate::state::SCHEMA_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.schemas.insert(
+            arn.clone(),
+            crate::state::SchemaRecord {
+                arn: arn.clone(),
+                name,
+                stage: crate::state::SchemaStage::Published,
+                version: Some(input.version.clone()),
+                minor_version: input.minor_version.clone(),
+                facets,
+            },
+        );
+
+        Ok(PublishSchemaOutput {
+            published_schema_arn: Some(arn),
+        })
     }
 }

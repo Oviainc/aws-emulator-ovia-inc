@@ -164,8 +164,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Authorization is not emulated: the emulator verifies request signatures
         // centrally but holds no principals or policies, so the modelled
         // `ForbiddenException` is deliberately unreachable here and a success says
-        // nothing about the caller's permissions.
-        let _ = ctx;
+        // nothing about the caller's permissions. `ctx` is read for the audit record
+        // this operation emits.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GroupResourcesErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -174,6 +174,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // `ResourceArns` is modelled `length 1..10` and the framework refuses a longer
+        // list before this handler runs. Checking it again here is what BOUNDS the work
+        // below: every scan over the request is at most this many entries.
+        if input.resource_arns.len() > MAX_RESOURCE_ARNS {
+            return Err(GroupResourcesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "ResourceArns carries {} entries, which is more than the {} this \
+                     operation accepts",
+                    input.resource_arns.len(),
+                    MAX_RESOURCE_ARNS,
+                )),
+            })
+            .into());
+        }
         // Every member must be an ARN: the modelled `ResourceArn` is
         // `arn:<partition>:<service>:<region>:<account>:<resource>`, and a string
         // that is not one names no resource to add.
@@ -207,18 +221,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group = store.groups.get_mut(&name).ok_or_else(not_found)?;
         // The emulator's own ceiling on stored state (see `MAX_MEMBERS_PER_GROUP`),
         // so a client looping on this operation is refused instead of growing one
-        // group's membership without end.
-        let incoming = input
+        // group's membership without end. Counted over a SET, because `add_member` is
+        // idempotent: an ARN repeated inside one request adds one membership, so
+        // counting it twice would refuse a request that stays under the ceiling.
+        //
+        // The work this does while holding the store lock is bounded by the two
+        // constants and nothing else: at most `MAX_RESOURCE_ARNS` request entries, each
+        // looked up by BINARY SEARCH over the group's memberships, which `add_member`
+        // keeps sorted by ARN.
+        let added: std::collections::BTreeSet<&str> = input
             .resource_arns
             .iter()
+            .map(String::as_str)
             .filter(|arn| {
-                !group
+                group
                     .members
-                    .iter()
-                    .any(|member| &&member.resource_arn == arn)
+                    .binary_search_by(|member| member.resource_arn.as_str().cmp(arn))
+                    .is_err()
             })
-            .count();
-        if group.members.len() + incoming > crate::state::MAX_MEMBERS_PER_GROUP {
+            .collect();
+        if group.members.len() + added.len() > crate::state::MAX_MEMBERS_PER_GROUP {
             return Err(GroupResourcesErrorModeled::BadRequestException(BadRequestException {
                 message: Some(format!(
                     "this emulator holds at most {} resources per group; ungroup some \
@@ -228,17 +250,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        let added_count = added.len();
         for arn in &input.resource_arns {
             group.add_member(arn);
         }
         // Reported from the memberships the group now holds, not from the request:
-        // an ARN appears in `Succeeded` because it IS a member.
-        let succeeded: Vec<String> = group
-            .members
+        // an ARN appears in `Succeeded` because it IS a member. Looked up by binary
+        // search over the sorted memberships, so this too is bounded by
+        // `MAX_RESOURCE_ARNS` lookups.
+        let succeeded: Vec<String> = input
+            .resource_arns
             .iter()
-            .filter(|member| input.resource_arns.contains(&member.resource_arn))
-            .map(|member| member.resource_arn.clone())
+            .filter(|arn| {
+                group
+                    .members
+                    .binary_search_by(|member| member.resource_arn.as_str().cmp(arn))
+                    .is_ok()
+            })
+            .cloned()
             .collect();
+        // Everything below is owned, so the store lock is released before the record
+        // is formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, where, what, and
+        // the outcome. Metadata only — the member ARNs are counted, not listed, and
+        // request-derived values are `Debug`-escaped so none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?crate::state::request_region(ctx.parts()),
+            group = ?name,
+            members_requested = input.resource_arns.len(),
+            members_added = added_count,
+            members_now_present = succeeded.len(),
+            outcome = "grouped",
+            "resources added to a resource group",
+        );
         Ok(GroupResourcesOutput {
             succeeded: Some(succeeded),
             // Nothing was refused, and a static membership this emulator accepts is
@@ -248,3 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The most `ResourceArns` entries one request carries: the maximum the modelled
+/// `ResourceArnList` declares (`length 1..10`). It is what bounds the per-request
+/// work this handler does while holding the store lock.
+const MAX_RESOURCE_ARNS: usize = 10;
+

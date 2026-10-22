@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation,
 };
 use std::sync::Arc;
 
@@ -96,17 +96,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Cognito Identity has no `ValidationException`: the error it declares on every
+        // operation for "missing or bad input parameter(s)" is `InvalidParameterException`
+        // (HTTP 400), so that is the code a caller branches on when a value fails a
+        // modelled constraint — an `IdentityPoolId` outside `^[\w-]+:[0-9a-f-]+$`, say,
+        // which the boundary refuses before any handler runs. The message keeps the
+        // framework's structural account of what failed, which names the member and the
+        // constraint it violated.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidParameterException".to_string(),
+                message: violations
+                    .iter()
+                    .map(Violation::message)
+                    .collect::<Vec<String>>()
+                    .join("; "),
+            }),
+            // Authentication is the emulator's to answer, not this service's.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
