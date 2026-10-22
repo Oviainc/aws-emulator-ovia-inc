@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Encodes/decodes the opaque `nextToken` ListRegistryRecords hands out.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
+# `time` is for the integration tests' wait past a clock-owed transition; the workspace
+# tokio feature set covers only `#[tokio::test]` itself.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
