@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchFixtures
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchFixtures`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the fixtures the data-source catalog holds for one sport in
+//! a date window, filtered and paginated. Reporting only (`@readonly`): it writes
+//! nothing at all.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchFixtures::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A fixture is not a resource of this service — nothing creates, updates or deletes
+//! one — so this handler reads [`crate::state`]'s fixture catalog, the emulator's
+//! single stand-in for the external sports data source, which `GetFixture` projects
+//! too. See that module's docs for why the catalog is derived rather than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +151,36 @@ impl From<SearchFixturesErrorModeled> for SearchFixturesError {
     }
 }
 
+/// The most fixtures one page may carry, whatever the request asks for: the `@range`
+/// maximum the model gives `maxResults`
+/// (`smithy_query(query="operation",operation="SearchFixtures")` gives it the range
+/// `{min: 1, max: 100}`). Clamping here rather than trusting the boundary keeps one
+/// request from serialising more than the modelled maximum.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The page size this operation uses when a request omits `maxResults`.
+///
+/// AWS documents no default for it (`SearchFixturesRequest$maxResults` only says the
+/// service "might return fewer fixtures than the maxResults value"), so it is
+/// [`MAX_PAGE_SIZE`], the model's own ceiling: a request that asks for no page size
+/// still cannot be answered with more than the modelled maximum. A window is at most
+/// [`crate::state::MAX_SEARCH_WINDOW_DAYS`] days of at most
+/// [`crate::state::MAX_FIXTURES_PER_DAY`] fixtures, so this is also more than a whole
+/// window.
+const DEFAULT_MAX_RESULTS: usize = MAX_PAGE_SIZE;
+
+/// The only `FilterName` the model declares
+/// (`smithy_query(query="shape",shape="FilterName")`).
+const FILTER_NAME_COMPETITOR: &str = "COMPETITOR";
+
+/// A 400 `ValidationException` refusing this request, as the model declares it for
+/// this operation: "The input fails to satisfy the constraints specified by the
+/// service. Check the error message for details about which parameter or field is
+/// invalid", so every message below names the member it refused and why.
+fn validation(message: String) -> SearchFixturesError {
+    SearchFixturesErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
 /// The `SearchFixtures` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -188,18 +217,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchFixtures` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchFixturesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchFixtures"))
+        // `ctx` carries request metadata only, and this operation needs none of it.
+        let _ = ctx;
+        // The fixtures come from the data-source catalog in `crate::state`, not from
+        // the engine's store: no operation of this service creates a fixture, and
+        // this one is `@readonly`, so there is nothing here to write and nothing
+        // per-account to read. The engine stays on `self` all the same, as every
+        // handler's constructor seam.
+        let _ = &self.engine;
+
+        // The modelled `DataSourceSport` enum has already refused any other value at
+        // the boundary; this is what turns it into the catalog's sport.
+        let Some(sport) = crate::state::DataSourceSport::from_wire(&input.sport) else {
+            return Err(validation(format!(
+                "sport '{}' is not a supported sport. Valid values: basketball, american-football.",
+                input.sport
+            )));
+        };
+
+        // The modelled pattern `^\d{4}-\d{2}-\d{2}$` admits text that is not a date
+        // (`2026-02-31`), so the calendar check belongs here.
+        let Some(start_day) = crate::state::parse_fixture_date(&input.start_date) else {
+            return Err(validation(format!(
+                "startDate '{}' is not a valid date. Specify the date in ISO 8601 format, as YYYY-MM-DD.",
+                input.start_date
+            )));
+        };
+        // "If you omit this parameter, Elemental Inference searches only the day that
+        // you specified in startDate" (`SearchFixturesRequest$endDate`).
+        let end_date = input.end_date.as_deref().unwrap_or(&input.start_date);
+        let Some(end_day) = crate::state::parse_fixture_date(end_date) else {
+            return Err(validation(format!(
+                "endDate '{end_date}' is not a valid date. Specify the date in ISO 8601 format, as YYYY-MM-DD."
+            )));
+        };
+        if end_day < start_day {
+            return Err(validation(format!(
+                "endDate '{end_date}' must not precede startDate '{}'.",
+                input.start_date
+            )));
+        }
+        // "The window from startDate through endDate must not exceed seven days"
+        // (`SearchFixturesRequest$endDate`), counting both ends.
+        let window_days = end_day - start_day + 1;
+        if window_days > crate::state::MAX_SEARCH_WINDOW_DAYS {
+            return Err(validation(format!(
+                "The window from startDate through endDate must not exceed {} days; this request covers {window_days} days.",
+                crate::state::MAX_SEARCH_WINDOW_DAYS
+            )));
+        }
+
+        // Every filter the model declares applies to the competitors; the enum has
+        // already refused any other name at the boundary.
+        let filters = input.filters.unwrap_or_default();
+        if let Some(unknown) = filters
+            .iter()
+            .find(|filter| filter.name != FILTER_NAME_COMPETITOR)
+        {
+            return Err(validation(format!(
+                "filters contains the unsupported name '{}'. Valid values: {FILTER_NAME_COMPETITOR}.",
+                unknown.name
+            )));
+        }
+
+        // A token that is not a pagination token at all cannot name a page, so it is
+        // refused rather than silently treated as the first page.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(validation(
+                        "nextToken is not a valid pagination token.".to_string(),
+                    ))
+                }
+            },
+        };
+        // `maxResults` is modelled with range 1..100, so the boundary has already
+        // refused anything outside it; the clamp is the server-side bound that does
+        // not depend on that.
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_MAX_RESULTS, |max| max.max(1) as usize)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        let now = crate::state::now_secs();
+        // The window's days in order, each day's fixtures in scheduled order — which
+        // is also ascending id order, so `nextToken` can name a position in it.
+        let mut matching = (start_day..=end_day)
+            .flat_map(|day| crate::state::fixtures_on_day(sport, day))
+            .filter(|fixture| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| fixture.id.as_str() > after)
+            })
+            // "A fixture must satisfy every filter in the array in order to appear in
+            // the results. Within one filter, a fixture must match at least one of
+            // the values."
+            .filter(|fixture| {
+                filters
+                    .iter()
+                    .all(|filter| fixture.matches_competitor(&filter.values))
+            });
+        let fixtures: Vec<FixtureSummary> = matching
+            .by_ref()
+            .take(page_size)
+            .map(|fixture| fixture.summary(now))
+            .collect();
+        // A token only when a further fixture is actually there to be fetched: it "is
+        // absent when there are no more results to return".
+        let next_token = match (matching.next(), fixtures.last()) {
+            (Some(_), Some(last)) => Some(crate::state::encode_page_token(&last.fixture_id)),
+            _ => None,
+        };
+
+        Ok(SearchFixturesOutput {
+            fixtures,
+            next_token,
+        })
     }
 }

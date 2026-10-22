@@ -17,5 +17,7 @@ mod dictionary_lifecycle;
 mod feed_association;
 #[path = "all/feed_lifecycle.rs"]
 mod feed_lifecycle;
+#[path = "all/fixture_catalog.rs"]
+mod fixture_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
