@@ -224,6 +224,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // window check above runs FIRST, so a request whose values do not hold
         // together is still answered as the argument error it is rather than
         // disappearing behind this gate.
+        // The `ServiceType` must be the service that OWNS the addressed data
+        // source: a resource id of one service's namespace, queried under the
+        // other's, names no data source, so there is no series to compute for it
+        // (see [`crate::state::service_type_refusal`]).
+        if let Some(message) = crate::state::service_type_refusal(
+            &*self.engine,
+            &input.service_type,
+            &input.identifier,
+        ) {
+            return Err(invalid_argument(message));
+        }
         if !crate::state::is_data_source_identifier(&input.identifier) {
             return Err(not_authorized());
         }

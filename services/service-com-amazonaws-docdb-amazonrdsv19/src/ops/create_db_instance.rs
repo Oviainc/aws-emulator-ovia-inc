@@ -374,11 +374,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .instances
             .get(&identifier)
             .expect("the instance was inserted on the line above");
+        let dbi_resource_id = stored.dbi_resource_id.clone();
+        let engine = stored.engine.clone();
+        let db_instance = docdb::instance_to_shape(stored, store.clusters.get(&cluster_key));
+        // The `DbiResourceId` just minted is recorded in the SHARED data-source
+        // directory, so a service that monitors this instance can tell that THIS
+        // service owns the id — Amazon RDS mints `db-<TOKEN>` ids too, so the form
+        // cannot say it. The DocumentDB store is already locked and the directory is
+        // taken second, the order its doc fixes.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            directory.lock().register(
+                &dbi_resource_id,
+                ::service_common::db_data_sources::SERVICE_TYPE_DOCDB,
+                &engine,
+            );
+        }
         Ok(CreateDBInstanceOutput {
-            db_instance: Some(docdb::instance_to_shape(
-                stored,
-                store.clusters.get(&cluster_key),
-            )),
+            db_instance: Some(db_instance),
         })
     }
 }

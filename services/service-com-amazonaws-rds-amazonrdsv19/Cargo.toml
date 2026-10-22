@@ -25,6 +25,9 @@ tracing = { workspace = true }
 # an awsQuery `<ErrorResponse>` envelope is shaped by library code rather than by hand.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `db_data_sources`: the shared directory a minted `DbiResourceId` is recorded in, so a
+# monitoring service (Performance Insights) can tell which service owns that id.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

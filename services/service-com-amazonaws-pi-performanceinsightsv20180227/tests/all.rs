@@ -25,5 +25,9 @@ mod pi_harness;
 mod resource_dimensions;
 #[path = "all/resource_metrics.rs"]
 mod resource_metrics;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
+#[path = "all/service_type_namespace.rs"]
+mod service_type_namespace;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

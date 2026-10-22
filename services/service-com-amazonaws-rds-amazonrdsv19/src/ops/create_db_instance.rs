@@ -642,7 +642,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let db_instance = record.to_wire();
+        let dbi_resource_id = record.dbi_resource_id.clone();
+        let engine = record.engine.clone();
         store.db_instances.insert(key, record);
+        // The id just minted is recorded in the SHARED data-source directory, so a
+        // service that monitors this instance (Performance Insights addresses a data
+        // source by its `DbiResourceId`) can tell that THIS service owns the id: the
+        // id's form cannot say so, because Amazon DocumentDB mints ids of the same
+        // form. The RDS store is already locked here and the directory is taken
+        // second, the order its doc fixes.
+        if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+            directory.lock().register(
+                &dbi_resource_id,
+                ::service_common::db_data_sources::SERVICE_TYPE_RDS,
+                &engine,
+            );
+        }
 
         Ok(CreateDBInstanceOutput {
             db_instance: Some(db_instance),
