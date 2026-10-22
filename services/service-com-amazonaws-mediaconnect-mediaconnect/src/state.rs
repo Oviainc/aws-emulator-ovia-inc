@@ -13,8 +13,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AddMediaStreamRequest, AddOutputRequest, EncodingConfig, Encryption, Entitlement,
-    FailoverConfig, Flow, Fmtp, ListedFlow, Maintenance, MediaStream, MediaStreamAttributes,
-    MonitoringConfig, NdiConfig, Output, Source, Transport, VpcInterface, VpcInterfaceAttachment,
+    FailoverConfig, Flow, Fmtp, GrantEntitlementRequest, ListedFlow, Maintenance, MediaStream,
+    MediaStreamAttributes, MonitoringConfig, NdiConfig, Output, Source, Transport, VpcInterface,
+    VpcInterfaceAttachment,
 };
 
 /// The `Status` enum the model declares for a flow
@@ -146,6 +147,15 @@ pub fn tag_pair_rejection(key: &str, value: &str) -> Option<String> {
 /// `AddFlowOutputs420Exception`, "raised by Elemental MediaConnect when adding the flow
 /// output".
 pub const MAX_FLOW_OUTPUTS: usize = 50;
+
+/// The ceiling on how many entitlements ONE FLOW holds, however many calls fill it: "the
+/// request optionally can include outputs (up to 50) and entitlements (up to 50)"
+/// (`smithy_query(query="operation",operation="CreateFlow")`), the one count AWS
+/// publishes for a flow's entitlements. Like [`MAX_FLOW_OUTPUTS`] it bounds the STORED
+/// flow, so a sequence of grants cannot grow one past it. GrantFlowEntitlements refuses
+/// past it with its own modelled `GrantFlowEntitlements420Exception`, "raised by Elemental
+/// MediaConnect when granting the entitlement".
+pub const MAX_FLOW_ENTITLEMENTS: usize = 50;
 
 /// The ceiling on how many media streams ONE FLOW holds, however many calls fill it.
 ///
@@ -517,6 +527,15 @@ impl StoredFlow {
             .collect()
     }
 
+    /// The names of the entitlements the flow already carries — what
+    /// [`resolve_entitlement_name`] checks a new entitlement's name against.
+    pub fn entitlement_names(&self) -> BTreeSet<String> {
+        self.entitlements
+            .iter()
+            .map(|entitlement| entitlement.name.clone())
+            .collect()
+    }
+
     /// `ListedFlow.SourceType`: `ENTITLED` when the flow ingests through an entitlement
     /// granted by another account, `OWNED` otherwise.
     pub fn source_type(&self) -> &'static str {
@@ -668,6 +687,82 @@ pub fn resolve_output_name(requested: Option<&str>, taken: &BTreeSet<String>) ->
         None => (1..)
             .map(|position| format!("output-{position}"))
             .find(|candidate| !taken.contains(candidate)),
+    }
+}
+
+/// The resource fragment of an entitlement ARN: `entitlement:<entitlement id>:<name>`.
+///
+/// The id is the ARN counter in zero-padded hex, like [`output_resource_fragment`]'s, so
+/// the fragment is unique per entitlement. `Entitlement$EntitlementArn` targets `String`,
+/// so the model constrains this fragment no further.
+pub fn entitlement_resource_fragment(suffix: u64, name: &str) -> String {
+    format!("entitlement:1-{suffix:08x}:{name}")
+}
+
+/// The name a `GrantEntitlementRequest` takes on a flow whose entitlement names are
+/// `taken`, resolved exactly as [`resolve_output_name`] resolves an output's.
+///
+/// `GrantEntitlementRequest$Name` "must be unique within the current flow"
+/// (`smithy_query(query="shape",shape="GrantEntitlementRequest",member="Name")`), and
+/// `Name` is optional on the request, so:
+///
+/// * a request that names the entitlement keeps that name, unless `taken` already holds
+///   it — then the answer is `None` and the caller refuses the request with its own
+///   modelled client error;
+/// * a request that names none is given the first `entitlement-<n>` (n counting from 1)
+///   that `taken` does not hold, so a generated name cannot collide either.
+///
+/// `taken` is every entitlement name the flow already carries PLUS the names resolved for
+/// earlier entitlements of the same request, so one request cannot grant two entitlements
+/// with one name.
+pub fn resolve_entitlement_name(
+    requested: Option<&str>,
+    taken: &BTreeSet<String>,
+) -> Option<String> {
+    match requested.filter(|name| !name.is_empty()) {
+        Some(name) if taken.contains(name) => None,
+        Some(name) => Some(name.to_string()),
+        None => (1..)
+            .map(|position| format!("entitlement-{position}"))
+            .find(|candidate| !taken.contains(candidate)),
+    }
+}
+
+/// Materialise one `GrantEntitlementRequest`, under the name `resolve_entitlement_name`
+/// gave it, into the `Entitlement` a flow carries.
+///
+/// This is the crate's ONE encoding of how an entitlement is granted: CreateFlow grants
+/// the entitlements named in the create request and GrantFlowEntitlements grants them on
+/// an existing flow, and both mint through here, so the two cannot drift. The minted
+/// record is what the flow stores and what every reader (DescribeFlow, and the grant's own
+/// response) reports.
+///
+/// `GrantEntitlementRequest$EntitlementTags` is not stored: `Entitlement` models no tag
+/// member, so no implemented operation can report it, exactly as the output and
+/// media-stream tags of a create request are not stored either.
+pub fn mint_entitlement(
+    request: &GrantEntitlementRequest,
+    name: String,
+    region: &str,
+    suffix: u64,
+) -> Entitlement {
+    Entitlement {
+        entitlement_arn: ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            region,
+            &entitlement_resource_fragment(suffix, &name),
+        ),
+        name,
+        description: request.description.clone(),
+        encryption: request.encryption.clone(),
+        entitlement_status: Some(
+            request
+                .entitlement_status
+                .clone()
+                .unwrap_or_else(|| STATUS_ENABLED.to_string()),
+        ),
+        data_transfer_subscriber_fee_percent: request.data_transfer_subscriber_fee_percent,
+        subscribers: request.subscribers.clone(),
     }
 }
 

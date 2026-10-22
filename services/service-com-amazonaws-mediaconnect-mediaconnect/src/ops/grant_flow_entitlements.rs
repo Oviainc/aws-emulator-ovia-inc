@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GrantFlowEntitlements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GrantFlowEntitlements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GrantFlowEntitlements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Grants entitlements on an EXISTING flow and PERSISTS them in [`crate::state`]: the
+//! response is read back out of the stored flow record, so DescribeFlow reports exactly
+//! what this operation wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +81,52 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeSet;
+
+use crate::state::MAX_FLOW_ENTITLEMENTS;
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error".
+fn bad_request(message: impl Into<String>) -> GrantFlowEntitlementsError {
+    GrantFlowEntitlementsErrorModeled::BadRequestException(BadRequestException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the flow this call addresses.
+fn not_found(message: impl Into<String>) -> GrantFlowEntitlementsError {
+    GrantFlowEntitlementsErrorModeled::NotFoundException(NotFoundException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// Refuse the request with `GrantFlowEntitlements420Exception` (HTTP 420), the error the
+/// model declares for an entitlement this service will not grant — here because the flow
+/// is at its documented entitlement ceiling (see
+/// [`crate::state::MAX_FLOW_ENTITLEMENTS`]). The 420 is declared on this operation alone,
+/// so the refusal belongs to the grant rather than being reported as a throttle or an
+/// outage.
+fn cannot_grant(message: impl Into<String>) -> GrantFlowEntitlementsError {
+    GrantFlowEntitlementsErrorModeled::GrantFlowEntitlements420Exception(
+        GrantFlowEntitlements420Exception {
+            message: message.into(),
+        },
+    )
+    .into()
+}
+
+/// The server-side failure for a store this handler cannot reach,
+/// `InternalServerErrorException` (HTTP 500).
+fn internal_error(message: impl Into<String>) -> GrantFlowEntitlementsError {
+    GrantFlowEntitlementsErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: message.into(),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +201,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GrantFlowEntitlements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GrantFlowEntitlementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GrantFlowEntitlements"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error("the mediaconnect flow store is unavailable"));
+        };
+
+        // "The list of entitlements that you want to grant": a request that grants none
+        // has nothing to do, which is a semantic error rather than a no-op.
+        if input.entitlements.is_empty() {
+            return Err(bad_request(
+                "A grant flow entitlements request must include at least one entitlement.",
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A status change the clock already made due was owed at that instant whether or
+        // not anybody called, so it is materialised before this call touches the flow.
+        store.settle_due_transitions(now);
+
+        // This operation grants entitlements on "an existing flow", addressed by its own
+        // ARN.
+        let Some(flow) = store.flows.get(&input.flow_arn) else {
+            return Err(not_found(format!(
+                "Flow with ARN {} was not found.",
+                input.flow_arn
+            )));
+        };
+
+        // A flow holds at most 50 entitlements, so the ceiling counts the entitlements
+        // already stored plus the ones this call would grant: nothing evicts an
+        // entitlement, so without it a sequence of grants would grow the stored record
+        // without limit.
+        let held = flow.entitlements.len();
+        if held + input.entitlements.len() > MAX_FLOW_ENTITLEMENTS {
+            return Err(cannot_grant(format!(
+                "A flow can hold at most {MAX_FLOW_ENTITLEMENTS} entitlements; flow {} \
+                 already has {held} and this request grants {}.",
+                input.flow_arn,
+                input.entitlements.len()
+            )));
+        }
+
+        // An entitlement's name is unique within its flow, so each new entitlement is
+        // named against the flow's existing entitlements AND against the ones earlier in
+        // this request.
+        let held_names: BTreeSet<String> = flow.entitlement_names();
+        let mut taken = held_names.clone();
+        let mut names = Vec::with_capacity(input.entitlements.len());
+        for request in &input.entitlements {
+            let Some(name) =
+                crate::state::resolve_entitlement_name(request.name.as_deref(), &taken)
+            else {
+                let requested = request.name.clone().unwrap_or_default();
+                return Err(bad_request(if held_names.contains(&requested) {
+                    format!(
+                        "Flow {} already has an entitlement named {requested:?}. An \
+                         entitlement name must be unique within its flow.",
+                        input.flow_arn
+                    )
+                } else {
+                    format!(
+                        "This request grants more than one entitlement named {requested:?}. \
+                         An entitlement name must be unique within its flow."
+                    )
+                }));
+            };
+            taken.insert(name.clone());
+            names.push(name);
+        }
+
+        // Nothing above wrote anything, so a refused request leaves the flow exactly as
+        // it was. From here the whole batch is stored: the checks above borrowed the flow
+        // to read it, and the append takes it again mutably, both under the one store
+        // lock this call holds.
+        let mut granted = Vec::with_capacity(input.entitlements.len());
+        for (request, name) in input.entitlements.iter().zip(names) {
+            let suffix = store.next_suffix();
+            granted.push(crate::state::mint_entitlement(
+                request, name, &region, suffix,
+            ));
+        }
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(internal_error(
+                "the flow could not be read back while its entitlements were granted",
+            ));
+        };
+        let first_granted = flow.entitlements.len();
+        flow.entitlements.extend(granted);
+
+        // "The entitlements that were just granted" — read back out of the STORED flow,
+        // not from the request, and only the entitlements this call appended.
+        Ok(GrantFlowEntitlementsOutput {
+            entitlements: Some(flow.entitlements[first_granted..].to_vec()),
+            flow_arn: Some(flow.flow_arn.clone()),
+        })
     }
 }
