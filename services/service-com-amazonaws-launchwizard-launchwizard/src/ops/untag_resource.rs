@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//!
+//! Removes tags from the deployment a `resourceArn` names. This is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken". This operation is implemented, so it answers no 501.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +136,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // 1. The resource ARN is READ first: an ARN that cannot name a deployment is a
+        //    malformed request, so there is no resource whose existence to decide.
+        let deployment_id = crate::state::deployment_id_in_arn(&input.resource_arn)
+            .ok_or_else(crate::state::tagging_invalid_resource_arn)?
+            .to_string();
+
+        // 2. The key list's own rules — the modelled `TagKeyList` `@length` and the
+        //    per-key `TagKey` length and pattern that the boundary walk skipped for this
+        //    member (see `types::UntagResourceInput`) — are JUDGED here, through the same
+        //    constraint walk and reported by the same renderer, so the refusal reads
+        //    exactly as a boundary refusal does.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        //    They are judged BEFORE the store is reached but REPORTED after the resource
+        //    is resolved (step 4), for the reason `tag_resource.rs` states: the caller
+        //    observes AWS's order — existence dominates the shape of the list — while the
+        //    work proportional to the caller's key count stays OFF this service's shared
+        //    lock, leaving only work bounded by the 200-key ceiling this walk has already
+        //    enforced to be done while that lock is held. The request's own list is MOVED
+        //    into the twin and moved back out, so nothing is copied to be validated.
+        let constrained = ConstrainedUntagResourceInput {
+            resource_arn: input.resource_arn,
+            tag_keys: input.tag_keys,
+        };
+        let refusal = crate::state::constraint_refusal(
+            &constrained,
+            super::types::CONSTRAINED_UNTAG_RESOURCE_INPUT_SCHEMA,
+        );
+        let tag_keys = constrained.tag_keys;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Launch Wizard state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // 3. Then the resource itself. Existence DOMINATES the shape of the key list:
+        //    keys that would be removed from nothing are never judged.
+        let Some(deployment) = store.deployments.get_mut(&deployment_id) else {
+            return Err(crate::state::tagging_resource_not_found());
+        };
+
+        // 4. Only now what step 2 found about the key list the caller sent.
+        if let Some(message) = refusal {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotent`: removing a key the resource does not carry is a no-op, so the
+        // same request twice leaves the same tag set and answers the same way.
+        for key in &tag_keys {
+            deployment.tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//!
+//! Writes tags onto the deployment a `resourceArn` names. This is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken". This operation is implemented, so it answers no 501.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +136,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // 1. The resource ARN is READ first: an ARN that cannot name a deployment is a
+        //    malformed request, so there is no resource whose existence to decide.
+        let deployment_id = crate::state::deployment_id_in_arn(&input.resource_arn)
+            .ok_or_else(crate::state::tagging_invalid_resource_arn)?
+            .to_string();
+
+        // 2. The tag map's own rules — the modelled `Tags` `@length` and the
+        //    `TagKey`/`TagValue` length and pattern that the boundary walk skipped for
+        //    this member (see `types::TagResourceInput`) — are JUDGED here, through the
+        //    same constraint walk and reported by the same renderer, so the refusal
+        //    reads exactly as a boundary refusal does.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        //    They are judged BEFORE the store is reached but REPORTED after the resource
+        //    is resolved (step 4): the ORDER the caller observes is AWS's — existence
+        //    dominates the shape of the map — while the work proportional to the
+        //    caller's entry count stays OFF this service's shared lock, so the only work
+        //    done while that lock is held is bounded by the 200-entry ceiling this walk
+        //    has already enforced. The request's own map is MOVED into the twin and
+        //    moved back out, so nothing is copied to be validated.
+        let constrained = ConstrainedTagResourceInput {
+            resource_arn: input.resource_arn,
+            tags: input.tags,
+        };
+        // A map's KEY constraints are the one part the generated schema does not carry
+        // (the walk judges a key against the map member's schema, which composes the
+        // VALUE shape's constraints), so the keys are judged first, by their own rules,
+        // through `state::tag_key_refusal` — otherwise an oversized key would be
+        // reported against the value shape's ceiling rather than `TagKey`'s.
+        let refusal = crate::state::tag_key_refusal(constrained.tags.keys().map(String::as_str))
+            .or_else(|| {
+                crate::state::constraint_refusal(
+                    &constrained,
+                    super::types::CONSTRAINED_TAG_RESOURCE_INPUT_SCHEMA,
+                )
+            });
+        let tags = constrained.tags;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Launch Wizard state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // 3. Then the resource itself. Existence DOMINATES the shape of the tag map:
+        //    tags that would be written nowhere are never judged. A record this
+        //    service still reports through `GetDeployment` exists, whatever status it
+        //    has reached.
+        let Some(deployment) = store.deployments.get_mut(&deployment_id) else {
+            return Err(crate::state::tagging_resource_not_found());
+        };
+
+        // 4. Only now what step 2 found about the map the caller sent.
+        if let Some(message) = refusal {
+            return Err(
+                TagResourceErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
+        // Tagging MERGES: a key the request names takes the request's value, and every
+        // other key the resource carries is left alone. The resulting set is itself a
+        // `Tags` map (it is what `ListTagsForResource` reports), so it keeps that
+        // shape's 200-entry ceiling — counted BEFORE anything is written, so a request
+        // that would break the ceiling writes none of its tags.
+        //
+        // No recording covers a request that would take a resource PAST that ceiling, so
+        // only the class and status of the refusal below are the contract: the modelled
+        // `ValidationException` the operation declares, at its modelled 400, because the
+        // bound being broken is the model's own `Tags` `@length`. Its wording is this
+        // emulator's, not a recorded message, and names the two counts so the caller can
+        // see how far over it is.
+        let added = tags
+            .keys()
+            .filter(|key| !deployment.tags.contains_key(*key))
+            .count();
+        let resulting = deployment.tags.len() + added;
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "{} tags would exceed the maximum of {} tags for a resource.",
+                        resulting,
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+        for (key, value) in tags {
+            deployment.tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

@@ -65,7 +65,13 @@ fn unknown_deployment_ids() -> Vec<(&'static str, String)> {
         ("minimum length 2", "ab".to_string()),
         ("maximum length 128", "d".repeat(128)),
         ("hyphens and mixed case", "Nope-NOT-Here-9".to_string()),
-        ("shaped like a minted id", "lwd-99999999".to_string()),
+        // A `deploymentId` is minted as a hyphenated UUID, so a well-formed id nobody
+        // minted is one of those too.
+        (
+            "shaped like a minted id",
+            "3f8e1c2d-5a6b-47c8-9d0e-1f2a3b4c5d6e".to_string(),
+        ),
+        ("hyphenated and sequential", "lwd-99999999".to_string()),
         ("all digits", "1234567890".to_string()),
     ]
 }

@@ -48,15 +48,22 @@ impl Harness {
         Self { router }
     }
 
+    /// `POST path` with a JSON body — the shape most of this service's operations
+    /// take.
     pub async fn call(&self, path: &str, body: &Value) -> Reply {
-        self.send("POST", path, body).await
+        self.send("POST", path, Some(body)).await
     }
 
     /// Dispatch one request with the given HTTP method and request target, so a suite
     /// can reach an operation whose model binds it to something other than a POST with
-    /// a JSON payload (a `DELETE` with `@httpQuery` members, say).
-    pub async fn send(&self, method: &str, target: &str, body: &Value) -> Reply {
-        let payload = serde_json::to_vec(body).expect("a test request body serializes");
+    /// a JSON payload (a `DELETE` with `@httpQuery` members, say). `body` is `None` for
+    /// an operation that carries no payload at all, which is what a `GET`/`DELETE`
+    /// binding sends.
+    pub async fn send(&self, method: &str, target: &str, body: Option<&Value>) -> Reply {
+        let payload = match body {
+            Some(body) => serde_json::to_vec(body).expect("a test request body serializes"),
+            None => Vec::new(),
+        };
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://launchwizard.{REGION}.amazonaws.com{target}"))
@@ -93,10 +100,21 @@ impl Harness {
 
     /// Call `path`, requiring HTTP 200, and hand back the response body.
     pub async fn ok(&self, case: &str, path: &str, body: Value) -> Value {
-        let reply = self.call(path, &body).await;
+        self.expect_ok(case, "POST", path, Some(&body)).await
+    }
+
+    /// [`Harness::ok`] for a call that names its own method and may carry no body.
+    pub async fn expect_ok(
+        &self,
+        case: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Value {
+        let reply = self.send(method, path, body).await;
         assert_eq!(
             reply.status, 200,
-            "case {case:?}: expected 200 from {path}, got {} with body {}",
+            "case {case:?}: expected 200 from {method} {path}, got {} with body {}",
             reply.status, reply.body
         );
         reply.body
@@ -111,10 +129,25 @@ impl Harness {
         status: u16,
         code: &str,
     ) -> Value {
-        let reply = self.call(path, &body).await;
+        self.expect_refused(case, "POST", path, Some(&body), status, code)
+            .await
+    }
+
+    /// [`Harness::refused`] for a call that names its own method and may carry no
+    /// body.
+    pub async fn expect_refused(
+        &self,
+        case: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        status: u16,
+        code: &str,
+    ) -> Value {
+        let reply = self.send(method, path, body).await;
         assert_eq!(
             reply.status, status,
-            "case {case:?}: expected HTTP {status} from {path}, got {} with body {}",
+            "case {case:?}: expected HTTP {status} from {method} {path}, got {} with body {}",
             reply.status, reply.body
         );
         assert_eq!(

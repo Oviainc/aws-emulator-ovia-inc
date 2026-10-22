@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//!
+//! Reports the tags stored on the deployment a `resourceArn` names. This is the ONLY
+//! file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken". This operation is implemented, so it answers no 501: the ARN-parse and
+//! not-found refusals below are the tagging layer's own, and the modelled errors are
+//! lifted through the `From` impl further down.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +141,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // The resource ARN is READ first: an ARN that cannot name a deployment is a
+        // malformed request, and nothing about the store can be decided from it.
+        let deployment_id = crate::state::deployment_id_in_arn(&input.resource_arn)
+            .ok_or_else(crate::state::tagging_invalid_resource_arn)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Launch Wizard state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a read makes: the status steps the clock already made due.
+        store.materialize_due(now);
+
+        let Some(deployment) = store.deployments.get(deployment_id) else {
+            return Err(crate::state::tagging_resource_not_found());
+        };
+
+        // The tags come from the stored deployment, which is where every tagging call
+        // writes them. A deployment carrying none reports an empty map rather than no
+        // map at all: the answer is "this resource has no tags", not "no answer".
+        Ok(ListTagsForResourceOutput {
+            tags: Some(crate::state::to_hash_map(&deployment.tags)),
+        })
     }
 }

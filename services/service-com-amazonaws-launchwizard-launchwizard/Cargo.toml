@@ -24,12 +24,14 @@ tracing = { workspace = true }
 # Opaque pagination tokens: the cursor is hex-encoded so a client cannot read a
 # position out of a `nextToken` or forge one.
 hex = { workspace = true }
+# The digest `state::fresh_uuid_v4` lays out as a deployment id, so minting one
+# pulls in no crate this workspace does not already build.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 # Tests forge a pagination token with the same encoding `state::encode_token` issues
 # one with, rather than hand-rolling hex beside it.
 hex = { workspace = true }

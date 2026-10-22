@@ -23,7 +23,7 @@ use service_com_amazonaws_launchwizard_launchwizard::ops::types::{
 use crate::harness::{catalogue, walk_pages, Harness, REGION};
 
 /// The canonical emulator account id every ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Long enough for every clock-owed status step a lifecycle call schedules to come
 /// due (two `TRANSITION_SPAN`s plus slack). The emulator never sleeps; this is the
@@ -809,16 +809,25 @@ async fn the_store_and_every_page_are_bounded() {
     let harness = Harness::new();
     // `maxResults` is capped at 100 by the model, so a caller that names none still
     // gets at most one page of 100 and a token for the rest, however many are stored.
+    // The first id is kept: a `deploymentId` is a minted UUID, so the oldest record is
+    // the one the first create handed back rather than a predictable name.
+    let mut created = Vec::new();
     for index in 0..101 {
-        create(
-            &harness,
-            "filling the store",
-            "SAP",
-            "SapHanaSingle",
-            &format!("bounded-{index:03}"),
-        )
-        .await;
+        created.push(
+            create(
+                &harness,
+                "filling the store",
+                "SAP",
+                "SapHanaSingle",
+                &format!("bounded-{index:03}"),
+            )
+            .await,
+        );
     }
+    let oldest = created
+        .first()
+        .cloned()
+        .expect("the store was filled with deployments");
     let unpaged = harness.ok("unpaged", "/listDeployments", json!({})).await;
     assert_eq!(
         unpaged["deployments"].as_array().map(Vec::len),
@@ -872,21 +881,21 @@ async fn the_store_and_every_page_are_bounded() {
         .ok(
             "free a slot",
             "/deleteDeployment",
-            json!({"deploymentId": "lwd-00000001"}),
+            json!({"deploymentId": oldest}),
         )
         .await;
     std::thread::sleep(SETTLE);
     let replacement =
         create(&harness, "after freeing a slot", "SAP", "SapHanaSingle", "room-made").await;
     assert_ne!(
-        replacement, "lwd-00000001",
+        replacement, oldest,
         "the replacement must be a new record, not the freed one"
     );
     harness
         .refused(
             "the evicted record",
             "/getDeployment",
-            json!({"deploymentId": "lwd-00000001"}),
+            json!({"deploymentId": oldest}),
             404,
             "ResourceNotFoundException",
         )

@@ -238,7 +238,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let id = store.mint_deployment_id();
+        let Some(id) = store.mint_deployment_id() else {
+            return Err(CreateDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "a deployment id could not be minted; retry your request".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let sequence = store.next_creation_sequence();
         let deployment_arn = crate::state::deployment_arn(&region, &id);
         let created = crate::state::DeploymentEvent::new(
             "DeploymentCreated",
@@ -289,6 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let deployment = crate::state::Deployment {
             id: id.clone(),
+            sequence,
             name: input.name,
             workload_name: input.workload_name,
             pattern_name: input.deployment_pattern_name,

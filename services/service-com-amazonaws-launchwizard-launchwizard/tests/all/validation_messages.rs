@@ -21,7 +21,12 @@
 
 use serde_json::{json, Value};
 
+use crate::deployment_lifecycle::create;
 use crate::harness::Harness;
+// The tagging suite owns the `/tags/{resourceArn}` request shape; reached from here
+// rather than rebuilt, so the two suites cannot disagree about how a tagging call is
+// addressed.
+use crate::resource_tagging::{deployment_arn, encode_component};
 
 /// The wire error code and HTTP status every one of these refusals carries
 /// (`ValidationException`, `errorKind: client`, `httpError: 400` —
@@ -221,6 +226,19 @@ fn composed_clause(collection: &str, constraints: &str) -> String {
     )
 }
 
+/// A stored deployment, so a tagging row names a resource that exists — a tagging call
+/// decides the resource before it judges the tags or keys it was given.
+async fn tagged_deployment(harness: &Harness) -> String {
+    create(
+        harness,
+        "a deployment to untag",
+        "SAP",
+        "SapHanaSingle",
+        "untag-message-subject",
+    )
+    .await
+}
+
 #[tokio::test]
 async fn a_list_element_is_reported_at_its_collection_with_the_composed_element_constraints() {
     let harness = Harness::new();
@@ -299,6 +317,13 @@ async fn the_composed_rendering_covers_every_constrained_list_the_model_declares
     let harness = Harness::new();
     // `UntagResource` binds `tagKeys` to the query string of a DELETE, so this list is
     // reached by a different protocol binding than `filters` — and the same rule holds.
+    //
+    // The resource has to EXIST for the rule to be reached at all: a tagging call reads
+    // its `resourceArn` and looks the resource up before it judges the shape of the keys
+    // it was given (an unparseable ARN is a `BadRequestException`, and an ARN naming
+    // nothing a `NotFoundException`, whatever the key list looks like). So these rows
+    // name a real deployment, and the refusal below is the key list's own.
+    let arn = deployment_arn(&tagged_deployment(&harness).await);
     let expected = composed_clause("tagKeys", TAG_KEY_CONSTRAINTS);
     for (case, query) in [
         ("a tag key breaks the element pattern", "bad%20key%21"),
@@ -307,8 +332,8 @@ async fn the_composed_rendering_covers_every_constrained_list_the_model_declares
         let reply = harness
             .send(
                 "DELETE",
-                &format!("/tags/a-resource?tagKeys={query}"),
-                &json!({}),
+                &format!("/tags/{}?tagKeys={query}", encode_component(&arn)),
+                None,
             )
             .await;
         assert_eq!(
@@ -332,7 +357,11 @@ async fn the_composed_rendering_covers_every_constrained_list_the_model_declares
     // A tag key inside the element bounds passes the validation layer: whatever the
     // handler then answers, it is not this refusal.
     let admitted = harness
-        .send("DELETE", "/tags/a-resource?tagKeys=Owner", &json!({}))
+        .send(
+            "DELETE",
+            &format!("/tags/{}?tagKeys=Owner", encode_component(&arn)),
+            None,
+        )
         .await;
     assert_ne!(
         admitted.status, STATUS,

@@ -11,9 +11,31 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-launchwizard-launchwizard.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.launchwizard#TagResourceInput")]
+// `skip_validation = ["tags"]` keeps the pre-handler constraint walk off `tags`, so
+// the handler decides the ORDER the refusals come in: AWS refuses a `TagResource`
+// against a resource that does not exist whatever the tag map looks like, so the
+// resource lookup has to run before the map's `@length` (and its key/value) rules.
+// Those rules are not dropped — the handler runs them, against
+// [`ConstrainedTagResourceInput`] below, once the resource is known to exist.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.launchwizard#TagResourceInput",
+    skip_validation = ["tags"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TagResourceInput {
+    pub resource_arn: String,
+    pub tags: std::collections::HashMap<String, String>,
+}
+
+/// `TagResourceInput` with its modelled constraints KEPT, so the handler can run the
+/// very checks the boundary walk skipped (`Tags` `@length` 1..200, `TagKey` /
+/// `TagValue` length and pattern) at the point AWS applies them — after the resource
+/// exists. Only its schema is used: the handler validates a copy of the request
+/// through `aws_smithy_schema_server::constraints`, which keeps the refusal's wording
+/// identical to the boundary's.
+#[smithy_macros::smithy(shape = "com.amazonaws.launchwizard#TagResourceInput")]
+#[derive(Debug, Clone, Default)]
+pub struct ConstrainedTagResourceInput {
     pub resource_arn: String,
     pub tags: std::collections::HashMap<String, String>,
 }

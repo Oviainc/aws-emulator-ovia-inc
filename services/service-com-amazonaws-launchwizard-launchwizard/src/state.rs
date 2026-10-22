@@ -134,6 +134,15 @@ pub const MAX_DEPLOYMENTS: usize = 200;
 /// rest is reached through `nextToken`.
 pub const DEFAULT_PAGE_SIZE: usize = 100;
 
+/// How many tags one resource can carry.
+///
+/// The model's `Tags` map is `@length(min: 1, max: 200)`, and a resource's tag set IS
+/// a `Tags` map — it is what `ListTagsForResource` reports — so the set a `TagResource`
+/// leaves behind keeps that ceiling, not just the one map a single request carries.
+/// AWS publishes no separate per-resource tag quota for Launch Wizard, so this is the
+/// MODELLED ceiling rather than a documented quota.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// The `ValidationException` message every unusable `nextToken` is refused with.
 ///
 /// A pagination token is OPAQUE — the caller may only hand back a token a previous
@@ -416,6 +425,14 @@ pub struct PendingTransition {
 pub struct Deployment {
     /// `DeploymentId`: len 2..128, `^[a-zA-Z0-9-]+$`.
     pub id: String,
+    /// The order this record was created in, from
+    /// [`ComAmazonawsLaunchwizardLaunchwizardState::next_creation_sequence`].
+    ///
+    /// `created_at` alone cannot order two deployments created within one clock tick,
+    /// and a minted id is a random UUID rather than a monotonic one, so the order
+    /// `ListDeployments` pages over is this counter — strictly increasing and never
+    /// reported on the wire.
+    pub sequence: u64,
     /// `DeploymentName` as submitted: len 1..50, `^[A-Za-z0-9_\.-]+$`.
     pub name: String,
     pub workload_name: String,
@@ -518,8 +535,9 @@ pub struct ComAmazonawsLaunchwizardLaunchwizardState {
     pub workloads: BTreeMap<String, Workload>,
     /// The authoritative deployment store, keyed by `deploymentId`.
     pub deployments: BTreeMap<String, Deployment>,
-    /// Sequence behind [`ComAmazonawsLaunchwizardLaunchwizardState::mint_deployment_id`].
-    pub next_id_seq: u64,
+    /// Sequence behind
+    /// [`ComAmazonawsLaunchwizardLaunchwizardState::next_creation_sequence`].
+    pub next_sequence: u64,
 }
 
 impl Default for ComAmazonawsLaunchwizardLaunchwizardState {
@@ -527,21 +545,39 @@ impl Default for ComAmazonawsLaunchwizardLaunchwizardState {
         Self {
             workloads: seeded_workloads(),
             deployments: BTreeMap::new(),
-            next_id_seq: 1,
+            next_sequence: 1,
         }
     }
 }
 
 impl ComAmazonawsLaunchwizardLaunchwizardState {
-    /// Mint the next `deploymentId`.
+    /// Mint a `deploymentId` no stored deployment already carries, or `None` when every
+    /// draw of a BOUNDED retry collided with a stored id.
     ///
-    /// The shape is `DeploymentId`: len 2..128, `^[a-zA-Z0-9-]+$`. The sequence makes
-    /// it unique within the process and keeps the lexical order of the ids the same as
-    /// the order the deployments were created in.
-    pub fn mint_deployment_id(&mut self) -> String {
-        let seq = self.next_id_seq;
-        self.next_id_seq += 1;
-        format!("lwd-{seq:08}")
+    /// A Launch Wizard deployment id is a UUID — the form every ARN that names a
+    /// deployment (`.../deployment/<deploymentId>`) carries, and the form the tagging
+    /// APIs parse a resource ARN against (see [`deployment_id_in_arn`]) — and it stays
+    /// inside the `DeploymentId` shape (len 2..128, `^[a-zA-Z0-9-]+$`). A fresh v4 is
+    /// random rather than guessable, and the retry keeps the store's keys unique even if
+    /// two draws ever collided.
+    ///
+    /// The retry is bounded by a ceiling of this service's own: the store holds at most
+    /// [`MAX_DEPLOYMENTS`] ids, so at most that many draws can collide with one and one
+    /// draw more than that cannot. Nothing a caller sends changes the count, and the
+    /// `None` an exhausted draw reports is answered with a server error rather than by
+    /// drawing again.
+    pub fn mint_deployment_id(&self) -> Option<String> {
+        (0..=MAX_DEPLOYMENTS)
+            .map(|_| fresh_uuid_v4())
+            .find(|id| !self.deployments.contains_key(id))
+    }
+
+    /// The next `Deployment::sequence`: the position a new record takes in creation
+    /// order, which is what [`Self::deployments_in_order`] pages over.
+    pub fn next_creation_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        sequence
     }
 
     /// Materialise the clock-owed steps of every stored deployment. Call this first in
@@ -565,9 +601,12 @@ impl ComAmazonawsLaunchwizardLaunchwizardState {
 
     /// Every stored deployment in creation order, oldest first — the order
     /// `ListDeployments` pages over.
+    ///
+    /// Ordered by `sequence` rather than by `created_at`, so two deployments created
+    /// within one clock tick still page in the order they were created in.
     pub fn deployments_in_order(&self) -> Vec<&Deployment> {
         let mut all: Vec<&Deployment> = self.deployments.values().collect();
-        all.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        all.sort_by_key(|deployment| deployment.sequence);
         all
     }
 
@@ -841,6 +880,239 @@ pub fn deployment_arn(region: &str, deployment_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("deployment/{deployment_id}"))
 }
 
+/// The resource-type segment of a deployment ARN, as [`deployment_arn`] builds it.
+const DEPLOYMENT_RESOURCE_PREFIX: &str = "deployment/";
+
+/// True when `id` has the form a Launch Wizard `deploymentId` takes: the canonical
+/// hyphenated UUID [`ComAmazonawsLaunchwizardLaunchwizardState::mint_deployment_id`]
+/// mints — five hex groups laid out 8-4-4-4-12. Only that hyphenated form is accepted;
+/// the bare 32-hex form a UUID parser also takes is not a deployment id.
+pub fn is_deployment_id(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == UUID_GROUP_LENGTHS.len()
+        && groups
+            .iter()
+            .zip(UUID_GROUP_LENGTHS)
+            .all(|(group, length)| {
+                group.len() == *length && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+}
+
+/// The 8-4-4-4-12 grouping of a UUID's canonical text form (RFC 4122 §3), which is both
+/// what [`fresh_uuid_v4`] writes and what [`is_deployment_id`] accepts.
+const UUID_GROUP_LENGTHS: &[usize] = &[8, 4, 4, 4, 12];
+
+/// A fresh identifier in the canonical text form of a version-4 UUID.
+///
+/// Derived from a digest rather than from a UUID crate, the way the sibling services
+/// mint their UUID-shaped ids (`service-com-amazonaws-kafka-kafka`'s
+/// `uuid_v4_shaped_from_digest`, `service-com-amazonaws-codestarnotifications-…`): the
+/// seed is this process's own draw counter and the wall clock, neither of them anything
+/// a caller sends, so the id is unique per draw and derived from no request value. A
+/// digest keeps `Cargo.lock` — the file every concurrent change also edits — untouched,
+/// which is why no new crate is pulled in for 16 bytes.
+fn fresh_uuid_v4() -> String {
+    use ::sha2::Digest as _;
+    use std::fmt::Write as _;
+
+    /// Draws so far in this process. Makes two draws within one clock tick distinct.
+    static DRAWS: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+
+    let draw = DRAWS.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    let since_epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut hasher = ::sha2::Sha256::new();
+    hasher.update(ARN_SERVICE.as_bytes());
+    hasher.update(draw.to_be_bytes());
+    hasher.update(since_epoch.as_nanos().to_be_bytes());
+    let digest = hasher.finalize();
+
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 4122 §4.4: the version goes in the high nibble of byte 6, the variant in the
+    // two high bits of byte 8, so the text form is a well-formed version-4 UUID.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let mut rendered = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        // The hyphens of the 8-4-4-4-12 grouping fall after bytes 4, 6, 8 and 10.
+        if matches!(index, 4 | 6 | 8 | 10) {
+            rendered.push('-');
+        }
+        // Infallible: writing to a `String` only fails if the formatter does, and
+        // `{:02x}` cannot.
+        let _ = write!(rendered, "{byte:02x}");
+    }
+    rendered
+}
+
+/// The `deploymentId` a tagging-API `resourceArn` names, or `None` when the ARN is
+/// not one that can name a Launch Wizard deployment at all.
+///
+/// The tagging operations take their resource as an ARN, so the ARN is READ before
+/// anything is looked up: it has to be `arn:<partition>:launchwizard:<region>:
+/// <account>:deployment/<deploymentId>` with every field present and the id in the
+/// deployment-id form ([`is_deployment_id`]). Anything else — a different service or
+/// resource type, a missing field, an id that is not a deployment id — is a resource
+/// ARN the service cannot parse, which is a malformed request rather than a resource
+/// that is merely absent. The deployment id is what identifies the deployment, so the
+/// partition, region and account the ARN carries are the scope this emulator serves
+/// and are not a second key.
+pub fn deployment_id_in_arn(arn: &str) -> Option<&str> {
+    // `splitn(6, ..)` keeps the resource field whole: only the first five colons are
+    // structural, and a resource field may contain more. The fields are destructured
+    // straight off the iterator, so this request-path parse allocates nothing.
+    let mut fields = arn.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(ARN_SERVICE),
+        Some(region),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    if partition.is_empty() || region.is_empty() || account.is_empty() {
+        return None;
+    }
+    let id = resource.strip_prefix(DEPLOYMENT_RESOURCE_PREFIX)?;
+    is_deployment_id(id).then_some(id)
+}
+
+/// The wire error code the tagging APIs answer for a resource that does not exist.
+///
+/// This is the shared tagging layer's own not-found code, which this service's model
+/// does not declare (it declares the operation-specific `ResourceNotFoundException`
+/// the deployment reads raise), so it is answered through
+/// [`crate::scaffolded::Scaffolded::unmodeled`].
+pub const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The wire error code the tagging APIs answer for a `resourceArn` they cannot parse.
+/// Unmodeled for the same reason as [`TAGGING_NOT_FOUND_CODE`].
+pub const TAGGING_BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// The tagging layer's "this resource does not exist" refusal: HTTP 404
+/// `NotFoundException`.
+///
+/// Every tagging operation answers it the same way, and it DOMINATES the shape of the
+/// tags the caller sent: a tag map or key list is only judged once the resource it
+/// would be written to is known to exist.
+pub fn tagging_resource_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::unmodeled(TAGGING_NOT_FOUND_CODE, 404, "Resource was not found")
+}
+
+/// The tagging layer's "this is not a resource ARN" refusal: HTTP 400
+/// `BadRequestException`. Answered BEFORE any lookup — an ARN that cannot be parsed
+/// names no resource whose existence could be decided.
+pub fn tagging_invalid_resource_arn<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::unmodeled(
+        TAGGING_BAD_REQUEST_CODE,
+        400,
+        "Invalid input resource arn",
+    )
+}
+
+/// The modelled `TagKey` rules, from
+/// `smithy_query(query="shape", shape="Tags,TagKeyList")`: a `Tags` key (and a
+/// `TagKeyList` member) targets `TagKey`, which is `@length(min: 1, max: 128)` with
+/// `@pattern("^[a-zA-Z0-9 _.:/=+@-]+$")`.
+///
+/// Restated here only because codegen captures a collection's element/value
+/// constraints but not a map's KEY constraints (see [`TAG_KEY_SCHEMA`]). The
+/// restatement is pinned to the model by
+/// `tests/all/resource_tagging.rs::the_tag_rules_the_handlers_enforce_are_the_models`,
+/// which reads these three values out of `smithy-model/` and fails if they drift.
+pub const TAG_KEY_MIN_LEN: i64 = 1;
+/// See [`TAG_KEY_MIN_LEN`].
+pub const TAG_KEY_MAX_LEN: i64 = 128;
+/// See [`TAG_KEY_MIN_LEN`].
+pub const TAG_KEY_PATTERN: &str = "^[a-zA-Z0-9 _.:/=+@-]+$";
+
+/// [`TAG_KEY_MIN_LEN`]/[`TAG_KEY_MAX_LEN`]/[`TAG_KEY_PATTERN`] as the trait map the
+/// framework's constraint walk reads.
+static TAG_KEY_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(Box::new(
+            ::aws_smithy_schema_server::constraints::LengthTrait::new(
+                Some(TAG_KEY_MIN_LEN),
+                Some(TAG_KEY_MAX_LEN),
+            ),
+        ));
+        traits.insert(Box::new(
+            ::aws_smithy_schema_server::constraints::PatternTrait::new(TAG_KEY_PATTERN),
+        ));
+        traits
+    });
+
+/// The key leaf of a `Tags` map, carrying [`TAG_KEY_TRAITS`].
+///
+/// A map's KEY constraints are the one part of a shape the generated schemas do not
+/// carry (codegen captures a collection's element/value constraints only), so a
+/// `Tags` key is the one thing the constraint walk over `TagResourceInput` cannot
+/// judge. This schema gives it back, so the rules a key is judged by are the model's
+/// and the refusal is worded by the same renderer as every other constraint. The
+/// member is named `tags` so the refusal names the member the caller sent.
+static TAG_KEY_SCHEMA: ::std::sync::LazyLock<::aws_smithy_schema::Schema> =
+    ::std::sync::LazyLock::new(|| {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.launchwizard#Tags$key",
+                "com.amazonaws.launchwizard",
+                "tags",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "tags",
+            0,
+        )
+        .with_traits(&TAG_KEY_TRAITS)
+    });
+
+/// The refusal message for the `Tags` keys that break their modelled shape, or `None`
+/// when every one of them is within it. See [`TAG_KEY_SCHEMA`].
+///
+/// Worded by [`validation_report`], the same renderer `src/service.rs` words a
+/// boundary refusal with, so a key refused inside a handler reads exactly like one
+/// refused at the boundary.
+pub fn tag_key_refusal<'a>(keys: impl Iterator<Item = &'a str>) -> Option<String> {
+    use ::aws_smithy_schema::serde::ShapeSerializer as _;
+
+    let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
+    for key in keys {
+        // Infallible: the validator accumulates violations instead of failing.
+        let _ = validator.write_string(&TAG_KEY_SCHEMA, key);
+    }
+    let violations = validator.into_violations();
+    (!violations.is_empty()).then(|| validation_report(&violations))
+}
+
+/// The refusal message for a request whose own modelled constraints a handler judges
+/// itself, or `None` when it satisfies every one of them.
+///
+/// The tagging operations keep their collection out of the boundary walk so the
+/// resource is decided first (see `ops/types/tag_resource_types.rs`), and then judge
+/// it HERE against a twin of the input shape that keeps the constraints. Both the
+/// rules and the wording are therefore the boundary's: same walk, same
+/// [`validation_report`].
+pub fn constraint_refusal(
+    value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+    schema: &::aws_smithy_schema::Schema,
+) -> Option<String> {
+    let violations = ::aws_smithy_schema_server::constraints::validate(value, schema);
+    (!violations.is_empty()).then(|| validation_report(&violations))
+}
+
 /// A `SystemTime` as the modelled `Timestamp` the wire carries.
 pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = time
@@ -850,7 +1122,7 @@ pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
 }
 
 /// A stored map as the `HashMap` the generated shapes carry.
-fn to_hash_map(map: &BTreeMap<String, String>) -> HashMap<String, String> {
+pub fn to_hash_map(map: &BTreeMap<String, String>) -> HashMap<String, String> {
     map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 

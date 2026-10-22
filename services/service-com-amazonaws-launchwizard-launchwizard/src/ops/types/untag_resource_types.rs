@@ -11,9 +11,28 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-launchwizard-launchwizard.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.launchwizard#UntagResourceInput")]
+// `skip_validation = ["tagKeys"]` keeps the pre-handler constraint walk off
+// `tagKeys`, for the same reason as `TagResourceInput`'s `tags`: AWS refuses an
+// `UntagResource` against a resource that does not exist whatever the key list looks
+// like, so the resource lookup has to run before the list's `@length` (and its
+// per-key) rules. The handler runs them against [`ConstrainedUntagResourceInput`]
+// below once the resource is known to exist.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.launchwizard#UntagResourceInput",
+    skip_validation = ["tagKeys"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UntagResourceInput {
+    pub resource_arn: String,
+    pub tag_keys: Vec<String>,
+}
+
+/// `UntagResourceInput` with its modelled constraints KEPT (`TagKeyList` `@length`
+/// 1..200, `TagKey` length and pattern), so the handler can run them at the point AWS
+/// applies them — after the resource exists. See [`ConstrainedTagResourceInput`].
+#[smithy_macros::smithy(shape = "com.amazonaws.launchwizard#UntagResourceInput")]
+#[derive(Debug, Clone, Default)]
+pub struct ConstrainedUntagResourceInput {
     pub resource_arn: String,
     pub tag_keys: Vec<String>,
 }
