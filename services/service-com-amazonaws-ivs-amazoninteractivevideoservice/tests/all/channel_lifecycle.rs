@@ -82,6 +82,18 @@ impl Ivs {
         read(&store)
     }
 
+    /// Write this service's store, for the state no operation can create yet: an
+    /// ingest session bringing a channel live (see `live_stream_reads.rs`) has no
+    /// control-plane operation behind it until the filed RTMPS listener lands.
+    pub(crate) fn with_store_mut<T>(
+        &self,
+        write: impl FnOnce(&mut ComAmazonawsIvsAmazoninteractivevideoserviceState) -> T,
+    ) -> T {
+        let state = service_state(&*self.engine).expect("the IVS store is reachable");
+        let mut store = state.lock();
+        write(&mut store)
+    }
+
     pub(crate) async fn call(&self, operation: &str, body: &Value) -> Reply {
         let request = http::Request::builder()
             .method("POST")

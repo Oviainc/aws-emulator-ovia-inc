@@ -59,8 +59,9 @@ pub const MAX_MEMBERSHIPS_PER_GROUP: usize = 200;
 
 /// The page size a list operation uses when the caller sends no `MaxResults`: the
 /// model's own declared default, shared by every `MaxResults` member of this service
-/// (`@default: 100`, range 1..100 — `smithy_query(query="operation",operation="ListGroupMemberships")`,
-/// `smithy_query(query="operation",operation="ListGroups")`).
+/// (`@default: 100`, range 1..100 — `smithy_query(query="operation",operation="ListUsers")`,
+/// `smithy_query(query="operation",operation="ListGroups")`,
+/// `smithy_query(query="operation",operation="ListGroupMemberships")`).
 pub const DEFAULT_MAX_RESULTS: i32 = 100;
 
 /// The largest page a list operation will answer with: the upper bound of the modelled
@@ -74,6 +75,14 @@ pub const MAX_MAX_RESULTS: i32 = 100;
 /// `ListGroups` API" (`smithy_query(query="doc",shape="Filter",member="AttributePath")`),
 /// so a filter naming any other attribute is a syntax error in the request.
 pub const GROUP_FILTER_ATTRIBUTE_PATH: &str = "DisplayName";
+
+/// The only attribute path `ListUsers`'s (deprecated) `Filters` member searches.
+///
+/// `Filter$AttributePath` is "the attribute path that is used to specify which
+/// attribute name to search … `UserName` is a valid attribute path for the `ListUsers`
+/// API" (`smithy_query(query="doc",shape="Filter",member="AttributePath")`), so a
+/// filter naming any other attribute is a syntax error in the request.
+pub const USER_FILTER_ATTRIBUTE_PATH: &str = "UserName";
 
 /// The `arnNamespace` / `endpointPrefix` of this service, from the model's
 /// `aws.api#service` trait (`smithy_query(query="service_info")`).
@@ -222,6 +231,62 @@ impl User {
     pub fn record_update(&mut self, at: SystemTime) {
         self.revision = self.revision.saturating_add(1);
         self.updated_at = at;
+    }
+
+    /// The value of the user attribute `attribute_path` names, for a `ListUsers`
+    /// filter. `None` when the user does not carry that attribute.
+    ///
+    /// Matched case-insensitively for the same reason as [`Group::attribute`]: SCIM
+    /// attribute names are case-insensitive (RFC 7643 §2.1).
+    pub fn attribute(&self, attribute_path: &str) -> Option<&str> {
+        if attribute_path.eq_ignore_ascii_case(USER_FILTER_ATTRIBUTE_PATH) {
+            return self.user_name.as_deref();
+        }
+        None
+    }
+
+    /// This record as the modelled `User` a list reports.
+    ///
+    /// Every optional member is reported only when the record holds one, so a user
+    /// stored without a profile member comes back without it rather than with an
+    /// invented or empty value. `requested_extensions` is why `Extensions` travels in:
+    /// the member is "a map of explicitly requested attribute extensions", so only the
+    /// names the request asked for are reported.
+    pub fn to_user(
+        &self,
+        identity_store_id: &str,
+        requested_extensions: Option<&[String]>,
+    ) -> crate::ops::types::User {
+        crate::ops::types::User {
+            identity_store_id: identity_store_id.to_string(),
+            user_id: self.user_id.clone(),
+            user_arn: self.user_arn.clone(),
+            revision: self.revision(),
+            user_name: self.user_name.clone(),
+            external_ids: modeled_list(&self.external_ids),
+            name: self.name.clone(),
+            display_name: self.display_name.clone(),
+            nick_name: self.nick_name.clone(),
+            profile_url: self.profile_url.clone(),
+            emails: modeled_list(&self.emails),
+            addresses: modeled_list(&self.addresses),
+            phone_numbers: modeled_list(&self.phone_numbers),
+            user_type: self.user_type.clone(),
+            title: self.title.clone(),
+            preferred_language: self.preferred_language.clone(),
+            locale: self.locale.clone(),
+            timezone: self.timezone.clone(),
+            user_status: self.user_status.clone(),
+            photos: modeled_list(&self.photos),
+            website: self.website.clone(),
+            birthdate: self.birthdate.clone(),
+            roles: modeled_list(&self.roles),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            created_by: self.created_by.clone(),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            updated_by: self.updated_by.clone(),
+            extensions: self.requested_extensions(requested_extensions),
+        }
     }
 
     /// The extensions a `DescribeUser` naming `requested` must report: the stored
@@ -507,6 +572,23 @@ impl IdentityStoreData {
             }
         }
         Some(membership)
+    }
+
+    /// This store's users in a deterministic order: when each was created, ties broken
+    /// by `UserId`.
+    ///
+    /// The order is DERIVED from the records rather than held as a second index, so it
+    /// cannot drift from `users`, and it is total — two users minted in the same clock
+    /// tick still have different ids — which is what makes a paginated walk of the list
+    /// stable across calls.
+    pub fn users_in_order(&self) -> Vec<&User> {
+        let mut users: Vec<&User> = self.users.values().collect();
+        users.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.user_id.cmp(&right.user_id))
+        });
+        users
     }
 
     /// This store's groups in a stable listing order.
