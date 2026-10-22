@@ -14,7 +14,8 @@
 //! 2. **The partner-entitlement gate**: a request from an account that holds no active
 //!    AWS partner benefit is refused 403 `AccessDeniedException`, on reads as well as
 //!    writes, after the modelled constraints are checked and before any resource is
-//!    looked up.
+//!    looked up — on every operation the gate fronts, which per the recorded answers is
+//!    every one except the tagging path (see [`UNGATED_OPERATIONS`]).
 //! 3. **A lookup that found nothing** is answered 404 `ResourceNotFoundException` whose
 //!    message names the resource and the identifier the request named it with,
 //!    backtick-quoted: ``<Resource> `<identifier>` not found``.
@@ -83,6 +84,18 @@ fn taggable_arn() -> String {
         "arn:aws:partnercentral:{REGION}:{ACCOUNT}:catalog/{CATALOG}/benefit-application/{UNKNOWN_APPLICATION}"
     )
 }
+
+/// The operations the entitlement gate does NOT front.
+///
+/// Recorded behaviour (corpus `simparity-behavioral-aws-v1`, units
+/// `partnercentral-benefits.tag-resource-malformed-arn-rejected` and
+/// `partnercentral-benefits.untag-resource-malformed-arn-rejected`): a well-formed
+/// tagging call naming a resource that does not exist is answered
+/// ``("ResourceNotFoundException", "Catalog `null` not found")`` — the resource lookup's
+/// own answer — from the same account whose `ListBenefits` and `CreateBenefitApplication`
+/// calls record the gate's 403 refusal. So the tagging path answers an un-entitled caller
+/// with its own logic, and the gate's table below spans every other operation.
+const UNGATED_OPERATIONS: &[&str] = &["ListTagsForResource", "TagResource", "UntagResource"];
 
 /// The envelope a single violation renders into.
 fn one(clause: &str) -> String {
@@ -756,13 +769,28 @@ fn violation(path: &str, kind: ViolationKind) -> Violation {
 // Rule 2: the partner-entitlement gate
 // ---------------------------------------------------------------------------
 
-/// Every operation the service declares refuses a well-formed request from an account
-/// with no active AWS partner benefit — reads exactly as writes — with 403
-/// `AccessDeniedException` and the entitlement message.
+/// Every operation the entitlement gate fronts refuses a well-formed request from an
+/// account with no active AWS partner benefit — reads exactly as writes — with 403
+/// `AccessDeniedException` and the entitlement message; the tagging path
+/// ([`UNGATED_OPERATIONS`]) answers such a caller with its own logic instead.
 #[tokio::test]
 async fn every_operation_refuses_a_caller_with_no_active_partner_benefit() {
     let harness = Harness::unentitled();
     for (operation, body) in well_formed_requests() {
+        if UNGATED_OPERATIONS.contains(&operation) {
+            let (status, response) = harness.call(operation, &body).await;
+            assert_ne!(
+                status, 403,
+                "case {operation:?}: the tagging path is not behind the gate, got {status} \
+                 with {response:?}"
+            );
+            assert!(
+                [404, 501].contains(&status),
+                "case {operation:?}: expected the resource lookup's own answer (404), or the \
+                 501 of a tagging operation not implemented yet, got {status} with {response:?}"
+            );
+            continue;
+        }
         let message = refusal(
             &harness,
             operation,
