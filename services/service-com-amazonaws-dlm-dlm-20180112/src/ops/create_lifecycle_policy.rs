@@ -290,7 +290,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution_role_arn: input.execution_role_arn,
             date_created: now,
             date_modified: now,
-            policy_details: input.policy_details,
+            // The configuration is stored with every member the service
+            // materializes already stamped onto it, so a read reports the
+            // stored record rather than synthesizing a default per call.
+            policy_details: input
+                .policy_details
+                .map(crate::state::materialized_policy_details),
             default_policy: is_default,
             default_policy_type,
             create_interval: input.create_interval,

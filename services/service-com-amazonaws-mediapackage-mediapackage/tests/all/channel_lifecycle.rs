@@ -24,14 +24,16 @@ use std::sync::Arc;
 /// The region every request below is signed for. Deliberately NOT the emulator's
 /// `us-east-1` default, so an ARN or hostname that ignored the request's credential
 /// scope would show up.
-const REGION: &str = "eu-west-1";
+///
+/// Shared with the sibling suites in this test target, which drive the same wire.
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The emulator's canonical placeholder account id (`emulator_account_id`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A fresh emulator holding only this service, with request authentication off (these
 /// tests exercise behaviour, not signing).
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -50,7 +52,7 @@ fn authorization() -> String {
 
 /// One request/response round trip: the HTTP status and the parsed JSON body (`Null` for
 /// an empty body).
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -72,7 +74,7 @@ async fn call(
 }
 
 /// The wire error code restJson1 carries in `__type`, stripped of any namespace prefix.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -485,7 +487,7 @@ fn packaging_cases() -> Vec<(&'static str, Value, &'static str)> {
 }
 
 /// Create `channel_id`, failing the test if that does not succeed.
-async fn create_channel(router: &MultiServiceRouter, channel_id: &str) {
+pub(crate) async fn create_channel(router: &MultiServiceRouter, channel_id: &str) {
     let (status, body) = call(
         router,
         "POST",

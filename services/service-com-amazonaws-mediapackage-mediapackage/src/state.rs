@@ -111,21 +111,77 @@ pub fn bound_chars(member: &str, value: &str, max: usize) -> Result<(), String> 
     Ok(())
 }
 
-/// Refuse a tag map that breaks AWS's tagging limits, by entry count and by the length of
+/// Refuse a tag set that breaks AWS's tagging limits, by entry count and by the length of
 /// each key and value.
+///
+/// This is the one place those limits are decided, so a create's request-shaped tag map
+/// and a `TagResource`'s merged result cannot be judged differently. Entries are sorted
+/// first, so the member named in the refusal does not depend on map ordering.
+pub fn bound_tag_entries<'a, I>(tags: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut entries: Vec<(&str, &str)> = tags.into_iter().collect();
+    entries.sort_unstable();
+    bound_entries("Tags", entries.len(), MAX_TAGS)?;
+    for (key, value) in entries {
+        bound_chars(&format!("the Tags key {key:?}"), key, MAX_TAG_KEY_CHARS)?;
+        bound_chars(&format!("the Tags value of {key:?}"), value, MAX_TAG_VALUE_CHARS)?;
+    }
+    Ok(())
+}
+
+/// Refuse a tag map on an input that breaks AWS's tagging limits; see
+/// [`bound_tag_entries`].
 pub fn bound_tags(tags: &Option<std::collections::HashMap<String, String>>) -> Result<(), String> {
     let Some(tags) = tags else { return Ok(()) };
-    bound_entries("Tags", tags.len(), MAX_TAGS)?;
-    // Sorted so the member named in the refusal does not depend on hash order.
-    let mut keys: Vec<&String> = tags.keys().collect();
-    keys.sort();
-    for key in keys {
-        bound_chars(&format!("the Tags key {key:?}"), key, MAX_TAG_KEY_CHARS)?;
-        bound_chars(
-            &format!("the Tags value of {key:?}"),
-            &tags[key],
-            MAX_TAG_VALUE_CHARS,
+    bound_tag_entries(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+}
+
+/// Refuse the caller-sized members an OriginEndpoint create and update share.
+///
+/// Both handlers call this, so the bounds one enforces cannot drift from the other's: an
+/// update must not be able to grow a record past what the create would have refused.
+pub fn bound_origin_endpoint_members(
+    description: Option<&str>,
+    manifest_name: Option<&str>,
+    whitelist: Option<&[String]>,
+    cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
+) -> Result<(), String> {
+    for (member, value) in [
+        ("Description", description),
+        ("ManifestName", manifest_name),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(whitelist) = whitelist {
+        bound_entries("Whitelist", whitelist.len(), MAX_WHITELIST_ENTRIES)?;
+        for entry in whitelist {
+            bound_chars("a Whitelist entry", entry, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(manifests) = cmaf_package.and_then(|package| package.hls_manifests.as_ref()) {
+        bound_entries(
+            "CmafPackage.HlsManifests",
+            manifests.len(),
+            MAX_CMAF_HLS_MANIFESTS,
         )?;
+        for manifest in manifests {
+            bound_chars(
+                "a CmafPackage.HlsManifests id",
+                &manifest.id,
+                MAX_STRING_CHARS,
+            )?;
+            if let Some(name) = &manifest.manifest_name {
+                bound_chars(
+                    "a CmafPackage.HlsManifests ManifestName",
+                    name,
+                    MAX_STRING_CHARS,
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -413,6 +469,25 @@ pub struct OriginEndpointRecord {
 }
 
 impl OriginEndpointRecord {
+    /// Which packaging configuration this endpoint is stored with, and so which manifest
+    /// its playback URL ends in.
+    ///
+    /// Exactly one of the four is stored (a create that names none or several is
+    /// refused), so this answers `Some` for every record this service holds.
+    pub fn packaging_kind(&self) -> Option<PackagingKind> {
+        if self.hls_package.is_some() {
+            Some(PackagingKind::Hls)
+        } else if self.dash_package.is_some() {
+            Some(PackagingKind::Dash)
+        } else if self.cmaf_package.is_some() {
+            Some(PackagingKind::Cmaf)
+        } else if self.mss_package.is_some() {
+            Some(PackagingKind::Mss)
+        } else {
+            None
+        }
+    }
+
     /// The modelled `OriginEndpoint` shape for this record.
     pub fn to_origin_endpoint(&self) -> OriginEndpoint {
         OriginEndpoint {
@@ -492,6 +567,22 @@ impl ComAmazonawsMediapackageMediapackageState {
             .collect()
     }
 
+    /// The stored tag set of the resource a tagging operation's `ResourceArn` named, for
+    /// that operation to change in place. `None` when this service holds no such
+    /// resource, which is what tells `TagResource`/`UntagResource` to report a 404
+    /// instead of writing.
+    pub fn tags_mut(&mut self, target: &TaggedResource) -> Option<&mut BTreeMap<String, String>> {
+        match target {
+            TaggedResource::Channel(id) => {
+                self.channels.get_mut(id).map(|record| &mut record.tags)
+            }
+            TaggedResource::OriginEndpoint(id) => self
+                .origin_endpoints
+                .get_mut(id)
+                .map(|record| &mut record.tags),
+        }
+    }
+
     /// How many stored origin endpoints package `channel_id`. `DeleteChannel` reads it:
     /// a channel that still has endpoints cannot be deleted, which is what keeps the two
     /// stores consistent (no endpoint ever names a channel this service no longer holds).
@@ -548,6 +639,73 @@ pub fn now_iso8601() -> String {
         .unwrap_or_default()
 }
 
+/// The resource a tagging operation's `ResourceArn` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    Channel(String),
+    OriginEndpoint(String),
+}
+
+impl TaggedResource {
+    /// The resource's id, as the ARN spelled it.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Channel(id) | Self::OriginEndpoint(id) => id,
+        }
+    }
+
+    /// What to call this resource in a message to the caller.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Channel(_) => "Channel",
+            Self::OriginEndpoint(_) => "OriginEndpoint",
+        }
+    }
+}
+
+/// The resource `arn` names, for a `ResourceArn` this service can tag.
+///
+/// A MediaPackage resource ARN is
+/// `arn:<partition>:mediapackage:<region>:<account>:<type>/<id>` with `<type>` either
+/// `channels` or `origin_endpoints` — the two forms [`channel_arn`] and
+/// [`origin_endpoint_arn`] mint, and the only resources this service holds. `None` for
+/// anything else: that is a malformed request, which is a different failure from an ARN
+/// naming a resource the service does not hold.
+///
+/// The partition, region and account fields are not matched: a resource is keyed by its
+/// id, so an ARN minted for this resource in the caller's own account and region names
+/// the same channel or endpoint this store holds.
+pub fn parse_tag_arn(arn: &str) -> Option<TaggedResource> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let _partition = fields.next()?;
+    if fields.next()? != SERVICE_NAME {
+        return None;
+    }
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let (resource_type, id) = fields.next()?.split_once('/')?;
+    if id.is_empty() {
+        return None;
+    }
+    match resource_type {
+        "channels" => Some(TaggedResource::Channel(id.to_string())),
+        "origin_endpoints" => Some(TaggedResource::OriginEndpoint(id.to_string())),
+        _ => None,
+    }
+}
+
+/// The region an ARN this service minted names (an ARN's fourth field).
+///
+/// A value derived for a stored resource — a playback URL — is re-derived from the
+/// resource's OWN region, not from the region the request that changed it happened to be
+/// signed for, so an update cannot move an existing endpoint's URL to another region.
+pub fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3).filter(|region| !region.is_empty())
+}
+
 /// `arn:aws:mediapackage:<region>:<account>:channels/<id>`.
 pub fn channel_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(SERVICE_NAME, region, &format!("channels/{id}"))
@@ -597,6 +755,48 @@ impl PackagingKind {
             Self::Mss => format!("{manifest_name}.ism/Manifest"),
         }
     }
+}
+
+/// The single packaging configuration a create or update request carries.
+///
+/// An OriginEndpoint packages its channel in exactly ONE format — its playback URL ends
+/// in that format's manifest — so a request naming several cannot be stored. `Ok(None)`
+/// means the request named none: a create must refuse that, an update leaves the stored
+/// packaging in place. `Err` carries the names supplied, for [`packaging_refusal`].
+pub fn sole_packaging_kind(
+    hls: bool,
+    dash: bool,
+    cmaf: bool,
+    mss: bool,
+) -> Result<Option<PackagingKind>, Vec<&'static str>> {
+    let supplied: Vec<(PackagingKind, &'static str)> = [
+        (PackagingKind::Hls, "HlsPackage", hls),
+        (PackagingKind::Dash, "DashPackage", dash),
+        (PackagingKind::Cmaf, "CmafPackage", cmaf),
+        (PackagingKind::Mss, "MssPackage", mss),
+    ]
+    .into_iter()
+    .filter_map(|(kind, name, present)| present.then_some((kind, name)))
+    .collect();
+    match supplied[..] {
+        [] => Ok(None),
+        [(kind, _)] => Ok(Some(kind)),
+        _ => Err(supplied.iter().map(|(_, name)| *name).collect()),
+    }
+}
+
+/// The refusal message for a request that does not name exactly one packaging
+/// configuration, naming the ones it did supply so the caller can fix the request from
+/// the text alone.
+pub fn packaging_refusal(supplied: &[&str]) -> String {
+    format!(
+        "Exactly one of HlsPackage, DashPackage, CmafPackage or MssPackage is required; got {}.",
+        if supplied.is_empty() {
+            "none".to_string()
+        } else {
+            supplied.join(", ")
+        }
+    )
 }
 
 /// The playback URL for an OriginEndpoint: the egress hostname for this account and

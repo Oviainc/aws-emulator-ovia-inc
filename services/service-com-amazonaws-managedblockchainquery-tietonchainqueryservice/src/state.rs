@@ -81,13 +81,22 @@ pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFail
 /// carries `@length(min: 0, max: 250)`.
 pub const MAX_PAGE_SIZE: i32 = 250;
 
+/// The networks this service calls Bitcoin networks.
+///
+/// Spelled out rather than derived from the `BITCOIN_` prefix because the model states
+/// the set in two places and both name exactly these two values:
+/// `QueryNetwork`'s value list (`BITCOIN_MAINNET | BITCOIN_TESTNET | ETHEREUM_MAINNET |
+/// ETHEREUM_SEPOLIA_TESTNET`) and `ListFilteredTransactionEventsInput$network`'s
+/// documentation ("Valid Values: BITCOIN_MAINNET | BITCOIN_TESTNET").
+pub const BITCOIN_NETWORKS: [&str; 2] = ["BITCOIN_MAINNET", "BITCOIN_TESTNET"];
+
 /// Whether `network` is one of the model's two Bitcoin networks.
 ///
 /// The Bitcoin and Ethereum networks differ in what a transaction carries — a Bitcoin
 /// transaction has a `transactionId` and no gas, an Ethereum one has gas and a
 /// signature — so the fixture builds the two kinds differently.
 pub fn is_bitcoin(network: &str) -> bool {
-    network.starts_with("BITCOIN_")
+    BITCOIN_NETWORKS.contains(&network)
 }
 
 // ---------------------------------------------------------------------------
@@ -645,28 +654,50 @@ impl TransactionSelector {
     /// one. And `transactionId` is a Bitcoin identifier — the member's own
     /// documentation: "transactionId is only supported on the Bitcoin networks" — so it
     /// is refused on any other network.
+    ///
+    /// A refusal carries one `fieldList` entry per rule the request broke, under the
+    /// generic top-level message every such refusal shares
+    /// ([`validation_exception`]): a request that breaks both rules at once (both
+    /// members, on a network that admits no `transactionId`) reports both.
     pub fn from_input(
         network: &str,
         hash: Option<&str>,
         id: Option<&str>,
     ) -> Result<Self, ValidationException> {
-        match (hash, id) {
-            (Some(_), Some(_)) => Err(field_validation_exception(
-                "transactionHash",
-                "Only one of transactionHash or transactionId may be specified",
-            )),
-            (None, None) => Err(field_validation_exception(
-                "transactionHash",
-                "One of transactionHash or transactionId must be specified",
-            )),
-            (Some(hash), None) => Ok(Self::Hash(hash.to_string())),
-            (None, Some(id)) if is_bitcoin(network) => Ok(Self::Id(id.to_string())),
-            (None, Some(_)) => Err(field_validation_exception(
+        // One entry per violated rule, in the order the rules are stated: which member
+        // names the transaction first, then whether this network admits the member that
+        // was used. A request can break both at once (both members on an EVM network),
+        // and `fieldList` is the half of the error a client switches on, so each
+        // violation contributes its own entry rather than being collapsed into prose.
+        let mut fields = Vec::new();
+        let selector = match (hash, id) {
+            (Some(hash), None) => Some(Self::Hash(hash.to_string())),
+            (None, Some(id)) => Some(Self::Id(id.to_string())),
+            (Some(_), Some(_)) => {
+                fields.push(validation_field(
+                    "transactionHash",
+                    "The request must include either a transactionId or transactionHash \
+                     but not both.",
+                ));
+                None
+            }
+            (None, None) => {
+                fields.push(validation_field(
+                    "transactionHash",
+                    "The request must include a transactionHash.",
+                ));
+                None
+            }
+        };
+        if id.is_some() && !is_bitcoin(network) {
+            fields.push(validation_field(
                 "transactionId",
-                format!(
-                    "transactionId is only supported on the Bitcoin networks, not {network}"
-                ),
-            )),
+                "transactionId can only be specified for Bitcoin networks.",
+            ));
+        }
+        match selector {
+            Some(selector) if fields.is_empty() => Ok(selector),
+            _ => Err(validation_exception(fields)),
         }
     }
 
@@ -678,7 +709,7 @@ impl TransactionSelector {
         }
     }
 
-    /// Which member the identifier came from, for an error message.
+    /// Which member the identifier came from, for a `fieldList` entry about it.
     pub fn member(&self) -> &'static str {
         match self {
             Self::Hash(_) => "transactionHash",
@@ -750,23 +781,50 @@ fn decode_page_token(token: &str) -> Option<String> {
     decoded.strip_prefix(PAGE_TOKEN_PREFIX).map(str::to_string)
 }
 
-/// This service's modelled `ValidationException` for a request member it refuses.
+/// The top-level `message` every `ValidationException` this service raises for a request
+/// it refuses on its own rules.
 ///
-/// `fieldList` names the member that was wrong, which is how a client learns what to
-/// fix, and `reason` is the model's own `fieldValidationFailed`.
-pub fn field_validation_exception(name: &str, message: impl Into<String>) -> ValidationException {
-    let message = message.into();
-    ValidationException {
-        message: message.clone(),
-        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: name.to_string(),
-            message,
-        }]),
+/// It is GENERIC on purpose: the exception models a `fieldList` of
+/// `ValidationExceptionField{name, message}` as "the container for the `fieldList` of the
+/// exception", so the per-rule detail belongs there, where a client can branch on it,
+/// and the top-level message stays the one sentence that is true of every such refusal.
+/// Request detail is therefore never interpolated into it.
+pub const INVALID_PARAMETER_VALUES_MESSAGE: &str = "One or more parameter values were invalid.";
+
+/// One `fieldList` entry: the member a rule was violated on, and what that rule says.
+///
+/// `ValidationExceptionField$name` carries `@required` in the model, so every entry
+/// names a member — the member the rule is stated about when the rule spans a pair of
+/// them (`transactionHash`/`transactionId`).
+pub fn validation_field(name: &str, message: impl Into<String>) -> ValidationExceptionField {
+    ValidationExceptionField {
+        name: name.to_string(),
+        message: message.into(),
     }
 }
 
+/// This service's modelled `ValidationException` over one entry per violated rule.
+///
+/// `message` is [`INVALID_PARAMETER_VALUES_MESSAGE`] and `reason` is the model's own
+/// `fieldValidationFailed`; `fields` is what a client reads to learn what to fix.
+pub fn validation_exception(fields: Vec<ValidationExceptionField>) -> ValidationException {
+    ValidationException {
+        message: INVALID_PARAMETER_VALUES_MESSAGE.to_string(),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(fields),
+    }
+}
+
+/// This service's modelled `ValidationException` for ONE request member it refuses.
+pub fn field_validation_exception(name: &str, message: impl Into<String>) -> ValidationException {
+    validation_exception(vec![validation_field(name, message)])
+}
+
 /// Render a refused `nextToken` as this service's modelled `ValidationException`.
+///
+/// The token appears in the `fieldList` entry, never in the top-level message: the entry
+/// is the per-member detail a client reads to fix the request, which is exactly where
+/// request-derived text belongs.
 pub fn invalid_page_token(error: &InvalidPageToken) -> ValidationException {
     field_validation_exception(
         "nextToken",
@@ -774,17 +832,22 @@ pub fn invalid_page_token(error: &InvalidPageToken) -> ValidationException {
     )
 }
 
+/// The fixed `message` every `ResourceNotFoundException` this service raises carries.
+///
+/// Request-independent for the same reason as [`INVALID_PARAMETER_VALUES_MESSAGE`]: the
+/// exception models `resourceId` and `resourceType` as the containers for "the resource
+/// that caused the exception", so the identity travels in those members and not in the
+/// message.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource was not found.";
+
 /// This service's modelled `ResourceNotFoundException` for a resource the ledger does
 /// not hold.
 ///
 /// `resourceType` is [`RESOURCE_TYPE`] because that is the only value the model's
 /// `ResourceType` enum declares.
-pub fn not_found(
-    resource_id: impl Into<String>,
-    message: impl Into<String>,
-) -> crate::ops::types::ResourceNotFoundException {
+pub fn not_found(resource_id: impl Into<String>) -> crate::ops::types::ResourceNotFoundException {
     crate::ops::types::ResourceNotFoundException {
-        message: message.into(),
+        message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
         resource_id: resource_id.into(),
         resource_type: RESOURCE_TYPE.to_string(),
     }

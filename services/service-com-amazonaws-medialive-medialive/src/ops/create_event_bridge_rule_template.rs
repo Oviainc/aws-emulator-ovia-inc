@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventBridgeRuleTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventBridgeRuleTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventBridgeRuleTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +170,216 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventBridgeRuleTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventBridgeRuleTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventBridgeRuleTemplate"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // The bounds the input members' target shapes carry in their names
+        // (`__stringMin1Max255PatternS`, `__stringMin0Max1024`,
+        // `__stringMin1Max256PatternS`). The modelled constraints are refused
+        // before this handler runs where the model declares them; this check is
+        // what makes the bound hold either way, and names the member and the
+        // bound it broke.
+        bounded(
+            "name",
+            Some(input.name.as_str()),
+            1,
+            crate::state::MAX_RESOURCE_NAME_LEN,
+        )?;
+        bounded(
+            "description",
+            input.description.as_deref(),
+            0,
+            crate::state::MAX_RESOURCE_DESCRIPTION_LEN,
+        )?;
+        bounded(
+            "requestId",
+            input.request_id.as_deref(),
+            1,
+            crate::state::MAX_REQUEST_ID_LEN,
+        )?;
+
+        // `EventType` is a closed enum ("The type of event to match with the
+        // rule"), so a value it does not declare names no event the service can
+        // match.
+        if !crate::state::is_event_type(&input.event_type) {
+            return Err(bad_request(format!(
+                "eventType must be one of {}, but was {}",
+                crate::state::EVENT_BRIDGE_RULE_TEMPLATE_EVENT_TYPES.join(", "),
+                input.event_type
+            )));
+        }
+
+        let event_targets = event_targets(input.event_targets.as_deref())?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+
+        // A retried create (same `@idempotencyToken` `RequestId`) must return
+        // the template the first one created, not a second template: "This ID
+        // ensures idempotency when creating resources".
+        if let Some(existing) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| state.event_bridge_rule_template_for_token(&region, token))
+        {
+            return Ok(crate::state::event_bridge_rule_template_output!(
+                CreateEventBridgeRuleTemplateOutput,
+                existing
+            ));
+        }
+
+        // The group resolution, the name-uniqueness rule, the store's cap and
+        // the mint are one step in the store, so nothing can pass one check and
+        // write past another; what is left here is turning each refusal into
+        // this operation's own modelled error.
+        let id = state
+            .insert_event_bridge_rule_template(
+                &region,
+                &input.group_identifier,
+                crate::state::NewEventBridgeRuleTemplate {
+                    name: input.name,
+                    event_type: input.event_type,
+                    event_targets,
+                    description: input.description,
+                    tags: input.tags.unwrap_or_default(),
+                },
+                now,
+            )
+            .map_err(|refusal| refused(refusal, &region))?;
+
+        if let Some(token) = input.request_id.as_deref() {
+            // Bounded, evicting write, keyed by the region the token was
+            // presented in: a caller-chosen token can neither accumulate past
+            // the cap nor outlive the template it created, and two regions using
+            // one token do not overwrite each other.
+            state.record_event_bridge_rule_template_token(&region, token, &id);
+        }
+
+        // The response is read back out of the stored record, never built from
+        // `input`.
+        let template = state
+            .event_bridge_rule_template(&region, &id)
+            .ok_or_else(unavailable)?;
+        Ok(crate::state::event_bridge_rule_template_output!(
+            CreateEventBridgeRuleTemplateOutput,
+            template
+        ))
     }
+}
+
+/// The target ARNs of the request's `EventTargets`, in the order it listed them.
+///
+/// A template carries at most
+/// [`crate::state::MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS`] targets (the count
+/// the model can report is `__integerMax5`), each one an ARN of the two kinds the
+/// member documents ("Target ARNs must be either an SNS topic or CloudWatch log
+/// group") and within the length its target shape names.
+fn event_targets(
+    targets: Option<&[EventBridgeRuleTemplateTarget]>,
+) -> Result<Vec<String>, CreateEventBridgeRuleTemplateError> {
+    let targets = targets.unwrap_or_default();
+    if targets.len() > crate::state::MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS {
+        return Err(bad_request(format!(
+            "eventTargets must carry at most {} targets, but carried {}",
+            crate::state::MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS,
+            targets.len()
+        )));
+    }
+    for target in targets {
+        bounded(
+            "eventTargets.arn",
+            Some(target.arn.as_str()),
+            1,
+            crate::state::MAX_EVENT_TARGET_ARN_LEN,
+        )?;
+        if !crate::state::is_event_target_arn(&target.arn) {
+            return Err(bad_request(format!(
+                "eventTargets.arn must be the ARN of an SNS topic or a CloudWatch log group, but was {}",
+                target.arn
+            )));
+        }
+    }
+    Ok(targets.iter().map(|target| target.arn.clone()).collect())
+}
+
+/// Turn a store refusal into this operation's own modelled error: a group the
+/// region does not hold is its 404, a name the region already uses its 409, and a
+/// full store its 429.
+fn refused(
+    refusal: crate::state::EventBridgeRuleTemplateRefusal,
+    region: &str,
+) -> CreateEventBridgeRuleTemplateError {
+    match refusal {
+        crate::state::EventBridgeRuleTemplateRefusal::GroupNotFound { identifier } => {
+            CreateEventBridgeRuleTemplateErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "eventbridge rule template group",
+                    &identifier,
+                )),
+            })
+            .into()
+        }
+        crate::state::EventBridgeRuleTemplateRefusal::NameTaken { id, name } => {
+            CreateEventBridgeRuleTemplateErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "An eventbridge rule template named {name} already exists in {region} (id {id})"
+                )),
+            })
+            .into()
+        }
+        crate::state::EventBridgeRuleTemplateRefusal::StoreFull => {
+            CreateEventBridgeRuleTemplateErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This emulator stores at most {} eventbridge rule templates; delete one before creating another",
+                        crate::state::MAX_EVENT_BRIDGE_RULE_TEMPLATES
+                    )),
+                },
+            )
+            .into()
+        }
+    }
+}
+
+/// Refuse a member whose length is outside the bounds its target shape names,
+/// with the operation's own modelled client error and a message built from the
+/// request: the member, the bound and the length that broke it.
+fn bounded(
+    member: &str,
+    value: Option<&str>,
+    min: usize,
+    max: usize,
+) -> Result<(), CreateEventBridgeRuleTemplateError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let len = value.chars().count();
+    if len >= min && len <= max {
+        return Ok(());
+    }
+    Err(bad_request(format!(
+        "{member} must be between {min} and {max} characters long, but was {len}"
+    )))
+}
+
+/// This operation's modelled 400, for a request the model's own constraints do
+/// not already refuse.
+fn bad_request(message: String) -> CreateEventBridgeRuleTemplateError {
+    CreateEventBridgeRuleTemplateErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the template in. A modelled server error, never
+/// a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateEventBridgeRuleTemplateError {
+    CreateEventBridgeRuleTemplateErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

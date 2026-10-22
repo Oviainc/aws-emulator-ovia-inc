@@ -4,11 +4,16 @@
 //! for, over the whole class of ARNs that name nothing.
 //!
 //! The rule under test: EVERY operation of this service that resolves a
-//! caller-supplied resource ARN answers an ARN naming no stored deployment
-//! parameter with HTTP 404 and the wire error code `NotFoundException` — the code
-//! this service's recorded responses carry, which is NOT its modelled
-//! `ResourceNotFoundException` shape name — and never with a success carrying an
-//! empty tag map, which would mask a bad ARN as "no tags yet".
+//! caller-supplied resource ARN answers an ARN OF THIS SERVICE'S VENDOR that names
+//! no stored deployment parameter with HTTP 404 and the wire error code
+//! `NotFoundException` — the code this service's recorded responses carry, which is
+//! NOT its modelled `ResourceNotFoundException` shape name — and never with a
+//! success carrying an empty tag map, which would mask a bad ARN as "no tags yet".
+//!
+//! A value that is NOT a resource ARN of this service's vendor never reaches this
+//! refusal at all: it is refused on the input with a 400 `ValidationException`,
+//! which the `resource_arn_validation` suite owns. The two suites partition the
+//! space of caller-supplied ARNs between them.
 //!
 //! The three operations that bind `resourceArn` as an `@httpLabel`
 //! (`smithy_query(query="digest")`: `GET /tags/{resourceArn}`,
@@ -140,10 +145,12 @@ async fn every_tag_operation_answers_an_unknown_resource_arn_with_not_found_exce
     // empty store, and so rows can be derived from a live ARN.
     let (router, live) = emulator_with_one_parameter().await;
 
-    // The class the rule generalises over: every form of ARN (or ARN-shaped string)
-    // that names no stored deployment parameter. The rows differ along the ARN's
-    // partition, region, account, namespace, resource template and length — not
-    // merely along the resource id.
+    // The class the rule generalises over: every form of ARN OF THIS SERVICE'S
+    // VENDOR that names no stored deployment parameter. The rows differ along the
+    // ARN's partition, region, account, resource template and length — not merely
+    // along the resource id. A value of ANOTHER vendor, or one that is no ARN at
+    // all, belongs to the input-validation rule instead (the
+    // `resource_arn_validation` suite).
     let unknown: Vec<(&str, String)> = vec![
         (
             // The resource template of the model's own `DeploymentParameter`
@@ -172,7 +179,7 @@ async fn every_tag_operation_answers_an_unknown_resource_arn_with_not_found_exce
             live.replace("arn:aws:", "arn:aws-cn:"),
         ),
         (
-            "the live ARN with its resource segment truncated",
+            "the live ARN with its resource segment truncated to its prefix",
             live.trim_end_matches(|c: char| c != '/').to_string(),
         ),
         (
@@ -180,15 +187,16 @@ async fn every_tag_operation_answers_an_unknown_resource_arn_with_not_found_exce
             format!("{live}0"),
         ),
         (
-            "an ARN in another service's namespace",
-            format!("arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret/dp-0000000000000001"),
+            "a 512-character resource segment of this vendor",
+            format!(
+                "arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:deployment-parameter/{}",
+                "a".repeat(512)
+            ),
         ),
         (
-            "an identifier that is not an ARN at all",
-            "dp-0000000000000001".to_string(),
+            "this vendor's ARN with an empty region and account",
+            format!("arn:aws:{SIGNING_NAME}:::deployment-parameter/dp-0000000000000001"),
         ),
-        ("a single-character resource arn", "-".to_string()),
-        ("a 512-character resource arn", "a".repeat(512)),
     ];
 
     for (case, resource_arn) in unknown {

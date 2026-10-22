@@ -6,8 +6,13 @@
 //! stored record projected for the calling account. The creator is NOT given a
 //! membership here: `Collaboration$membershipId`/`membershipArn` are the only
 //! optional members of an otherwise all-required shape, and `CreateMembership` is the
-//! documented way to join a collaboration, so those two members stay absent until the
-//! caller creates its membership.
+//! documented way to join a collaboration, so those two members stay absent — and
+//! `memberStatus` stays INVITED — until the caller creates its membership.
+//!
+//! An optional member whose value the SERVICE decides is materialized at creation, so a
+//! later read reports the setting in force rather than an absent member: see
+//! `crate::state::effective_analytics_engine` and
+//! `crate::state::effective_is_metrics_enabled`.
 //!
 //! ## Shape of an operation
 //!
@@ -286,12 +291,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             data_encryption_metadata: input.data_encryption_metadata,
             query_log_status: input.query_log_status,
             job_log_status: input.job_log_status,
-            analytics_engine: input.analytics_engine,
+            analytics_engine: st::effective_analytics_engine(input.analytics_engine),
             // The input member is `autoApprovedChangeRequestTypes`; the output member
             // on `Collaboration` is `autoApprovedChangeTypes`.
             auto_approved_change_types: input.auto_approved_change_request_types,
             allowed_result_regions: input.allowed_result_regions,
-            is_metrics_enabled: input.is_metrics_enabled,
+            is_metrics_enabled: st::effective_is_metrics_enabled(input.is_metrics_enabled),
             members: input.members,
         };
 

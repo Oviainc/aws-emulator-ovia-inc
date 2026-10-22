@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation inserts a subnet-group record into this service's state,
+//! keyed by the lowercased `DBSubnetGroupName`, and answers with the stored record. The
+//! group is what `CreateDBCluster`'s `DBSubnetGroupName` must name, what
+//! `DescribeDBSubnetGroups` reports, and what `DeleteDBSubnetGroup` reclaims.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +152,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBSubnetGroup"))
+        use crate::state as docdb;
+
+        // The model constrains neither member, so the rules their own documentation states
+        // are enforced here; each helper cites the member doc.
+        docdb::validate_subnet_group_name("DBSubnetGroupName", &input.db_subnet_group_name)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // Nothing caller-sized reaches the store unchecked, and nothing caller-sized is
+        // WALKED before it is bounded; see the "Store bounds" block in `src/state.rs` for
+        // where each cap comes from.
+        docdb::bound_chars(
+            "DBSubnetGroupDescription",
+            &input.db_subnet_group_description,
+            docdb::MAX_STRING_CHARS,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+        docdb::bound_tags(input.tags.as_ref()).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // "The request would cause you to exceed the allowed number of subnets in a subnet
+        // group": the published per-group quota, checked on the COUNT the request carries —
+        // before the list is walked at all, so the work this handler does is bounded by the
+        // quota rather than by the request's length, and every over-quota request is
+        // answered with this one modelled fault rather than two codes either side of a
+        // store bound.
+        if input.subnet_ids.len() > docdb::MAX_SUBNETS_PER_SUBNET_GROUP {
+            return Err(
+                CreateDBSubnetGroupErrorModeled::DBSubnetQuotaExceededFault(
+                    DBSubnetQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} subnets in a subnet group, got {}",
+                            docdb::MAX_SUBNETS_PER_SUBNET_GROUP,
+                            input.subnet_ids.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        for subnet in &input.subnet_ids {
+            docdb::bound_chars("SubnetIds", subnet, docdb::MAX_STRING_CHARS)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+
+        // The subnets, in request order and without repeats: a subnet named twice is one
+        // subnet, and the Availability Zone rule below counts subnets, not mentions. The
+        // `seen` set keeps the de-duplication linear in the (already bounded) count.
+        let mut seen: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+        let mut subnet_ids: Vec<String> = Vec::with_capacity(input.subnet_ids.len());
+        for subnet in input.subnet_ids {
+            if seen.insert(subnet.clone()) {
+                subnet_ids.push(subnet);
+            }
+        }
+
+        // "subnet groups must contain at least one subnet in at least two Availability
+        // Zones"; see `docdb::MIN_SUBNETS_PER_SUBNET_GROUP` for why the count of distinct
+        // subnets is what this emulator can hold the rule to. `InvalidSubnet` — a subnet
+        // that does not exist, or subnets spread over two VPCs — is EC2 inventory this
+        // emulator does not have, so it is never answered rather than guessed at.
+        if subnet_ids.len() < docdb::MIN_SUBNETS_PER_SUBNET_GROUP {
+            return Err(
+                CreateDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
+                    DBSubnetGroupDoesNotCoverEnoughAZs {
+                        message: Some(format!(
+                            "DB subnet group '{}' must contain at least \
+                             {} subnets covering at least two Availability Zones, got {}",
+                            input.db_subnet_group_name,
+                            docdb::MIN_SUBNETS_PER_SUBNET_GROUP,
+                            subnet_ids.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = docdb::request_region(ctx);
+        // `DBSubnetGroupName`: "This value is stored as a lowercase string."
+        let name = input.db_subnet_group_name.to_ascii_lowercase();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+
+        if store.subnet_groups.contains_key(&name) {
+            return Err(
+                CreateDBSubnetGroupErrorModeled::DBSubnetGroupAlreadyExistsFault(
+                    DBSubnetGroupAlreadyExistsFault {
+                        message: Some(format!("DB subnet group already exists: {name}")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store's own cap: an over-quota create is refused, never stored.
+        if store.subnet_groups.len() >= docdb::MAX_DB_SUBNET_GROUPS {
+            return Err(
+                CreateDBSubnetGroupErrorModeled::DBSubnetGroupQuotaExceededFault(
+                    DBSubnetGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} subnet groups in this Region",
+                            docdb::MAX_DB_SUBNET_GROUPS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = docdb::DbSubnetGroupRecord {
+            name: name.clone(),
+            description: input.db_subnet_group_description,
+            region,
+            subnet_ids,
+            tags: docdb::tag_pairs(input.tags),
+        };
+        store.subnet_groups.insert(name.clone(), record);
+
+        let stored = store
+            .subnet_groups
+            .get(&name)
+            .expect("the subnet group was inserted on the line above");
+        Ok(CreateDBSubnetGroupOutput {
+            db_subnet_group: Some(stored.to_shape()),
+        })
     }
 }

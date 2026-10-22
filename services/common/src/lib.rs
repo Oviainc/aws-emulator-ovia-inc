@@ -3,10 +3,12 @@
 #![forbid(unsafe_code)]
 //! Code more than one emulated service needs, as a path dependency.
 //!
-//! Today that is five things:
+//! Today that is six things:
 //!
 //! * [`claims_request`], the request-claim rule a service whose SigV4 signing name is
 //!   SHARED with other services uses for its `Service::can_handle`;
+//! * [`arn`], the one parse of a caller-supplied resource ARN, so no two services
+//!   disagree about which vendor an ARN names;
 //! * [`nth_path_segment`], for the rarer case of two such services publishing the SAME
 //!   path space;
 //! * [`front_door`], the body-rejection layer an AWS REST service puts in front of its
@@ -78,6 +80,7 @@
 //! each is covered by its own routing suite under `core/router/tests/all/`. Nothing new
 //! should inline the rule again — call this crate.
 
+pub mod arn;
 pub mod front_door;
 pub mod iot_job_executions;
 pub mod network;

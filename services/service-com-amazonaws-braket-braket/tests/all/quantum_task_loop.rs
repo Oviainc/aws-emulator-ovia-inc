@@ -1742,7 +1742,7 @@ fn the_store_drops_only_the_oldest_finished_records_over_capacity() {
             format!("token-{index}"),
             IdempotencyRecord {
                 fingerprint: String::new(),
-                quantum_task_arn: arn.clone(),
+                resource_arn: arn.clone(),
                 recorded_at: created_at,
             },
         );
@@ -1833,7 +1833,7 @@ fn the_token_index_drops_only_the_entries_that_cannot_replay() {
             token.to_string(),
             IdempotencyRecord {
                 fingerprint: "digest".to_string(),
-                quantum_task_arn: arn.to_string(),
+                resource_arn: arn.to_string(),
                 recorded_at,
             },
         );

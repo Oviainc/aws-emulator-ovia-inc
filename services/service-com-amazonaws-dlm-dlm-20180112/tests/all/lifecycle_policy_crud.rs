@@ -399,6 +399,17 @@ async fn a_created_policy_is_read_back_from_what_was_stored() {
                 continue;
             };
             let observed = at(read.policy(), pointer);
+            // `PolicyDetails` is reported with the members the service
+            // MATERIALIZES stamped onto it beside the submitted ones, so what it
+            // owes the client is that nothing submitted was lost; which members
+            // the service fills in is pinned by `policy_read_projection.rs`.
+            if member == "PolicyDetails" {
+                use crate::policy_read_projection::reports_everything_sent;
+                if let Err(problem) = reports_everything_sent(expected, &observed, pointer) {
+                    panic!("case {case:?}: {problem}");
+                }
+                continue;
+            }
             assert_eq!(
                 &observed, expected,
                 "case {case:?}: member {member:?} was stored as {expected:?} but {pointer} \
@@ -406,13 +417,14 @@ async fn a_created_policy_is_read_back_from_what_was_stored() {
             );
         }
 
-        // An untagged policy reports no `Tags` member at all: `TagMap` is
-        // `@length(min: 1, max: 200)`, so the empty map is not one of its values.
+        // A policy with no tags reports the EMPTY map: the read path reports the
+        // tag set the policy holds, so "no tags" is distinguishable from "not
+        // reported" without a second call.
         if request.get("Tags").is_none() {
             assert_eq!(
                 at(read.policy(), "/Tags"),
-                Value::Null,
-                "case {case:?}: a policy created with no tags must report no Tags member"
+                json!({}),
+                "case {case:?}: a policy created with no tags must report an empty Tags map"
             );
         }
 
@@ -481,12 +493,14 @@ async fn a_created_policy_is_read_back_from_what_was_stored() {
             timestamp_key(&at(read.policy(), "/DateCreated")),
             "case {case:?}: an unmodified policy's DateModified is its DateCreated"
         );
-        // The emulator never runs a policy, so none of them carries a status
-        // message and none of them is in ERROR.
+        // "The description of the status" describes the policy's CURRENT status;
+        // the emulator never runs a policy, so none of them is in ERROR and each
+        // reports its activation state.
         assert_eq!(
             at(read.policy(), "/StatusMessage"),
-            Value::Null,
-            "case {case:?}: nothing has put this policy into a state with a status message"
+            at(read.policy(), "/State"),
+            "case {case:?}: StatusMessage must describe the policy's status, got {:?}",
+            at(read.policy(), "/StatusMessage")
         );
     }
 
@@ -779,21 +793,21 @@ async fn a_summary_reports_the_stored_policys_type_state_and_tags() {
             &fixture.disabled_instance,
             "IMAGE_MANAGEMENT",
             "DISABLED",
-            Value::Null,
+            json!({}),
         ),
         (
             "a default VOLUME policy",
             &fixture.default_volume,
             "EBS_SNAPSHOT_MANAGEMENT",
             "ENABLED",
-            Value::Null,
+            json!({}),
         ),
         (
             "a default INSTANCE policy",
             &fixture.default_instance,
             "IMAGE_MANAGEMENT",
             "ENABLED",
-            Value::Null,
+            json!({}),
         ),
     ];
 
@@ -906,7 +920,21 @@ async fn update_overwrites_only_the_members_the_request_carries() {
             case: "PolicyDetails replaced wholesale",
             create: custom.clone(),
             patch: json!({"PolicyDetails": custom_image_details()}),
-            changed: vec![("/PolicyDetails", custom_image_details())],
+            // The replacement configuration, with the members the service
+            // materializes stamped onto it as at create.
+            changed: vec![
+                ("/PolicyDetails/PolicyType", json!("IMAGE_MANAGEMENT")),
+                ("/PolicyDetails/ResourceTypes", json!(["INSTANCE"])),
+                ("/PolicyDetails/Schedules/0/Name", json!("weekly")),
+                (
+                    // `CreateRule$Location` is `[Custom snapshot policies only]`,
+                    // so replacing a snapshot configuration with an AMI one drops
+                    // the location the snapshot policy carried.
+                    "/PolicyDetails/Schedules/0/CreateRule/Location",
+                    Value::Null,
+                ),
+                ("/PolicyDetails/Schedules/0/CopyTags", json!(false)),
+            ],
             preserved: vec![
                 "/State",
                 "/Description",
@@ -1257,12 +1285,13 @@ async fn tag_operations_read_and_write_the_stored_tags() {
         at(&listed.body, "/Tags")
     );
 
-    // An untagged policy carries no `Tags` member: `TagMap` is `@length(min: 1)`.
+    // An untagged policy reports the EMPTY map, by the same rule the policy read
+    // follows: the tag set it holds, which is empty.
     let bare = call(&router, "GET", &tags_uri(&bare_arn), None).await;
     assert_eq!(
         at(&bare.body, "/Tags"),
-        Value::Null,
-        "an untagged policy reports no Tags member, got {:?}",
+        json!({}),
+        "an untagged policy reports an empty Tags map, got {:?}",
         at(&bare.body, "/Tags")
     );
 

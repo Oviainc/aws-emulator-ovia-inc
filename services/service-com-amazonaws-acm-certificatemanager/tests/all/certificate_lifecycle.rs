@@ -23,7 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 pub(crate) const REGION: &str = "us-west-2";
 
 /// The canonical emulator account id every ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// Every `ValidationMethod` the model declares
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#ValidationMethod")`).
@@ -132,6 +132,17 @@ pub(crate) fn error_code(body: &Value) -> String {
         .split('#')
         .next_back()
         .unwrap_or(rendered)
+        .to_string()
+}
+
+/// The `message` of a failure body. This service speaks awsJson1_1, so the member
+/// serializes as `message`; the `Message` fallback only guards against a renderer
+/// that capitalises it, so a message assertion can never pass vacuously.
+pub(crate) fn error_message(body: &Value) -> String {
+    body["message"]
+        .as_str()
+        .or_else(|| body["Message"].as_str())
+        .unwrap_or_default()
         .to_string()
 }
 

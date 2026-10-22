@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a Channel's updated configuration to the stored record, so every later read
+//! renders the update rather than the create.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannel"))
+        // Nothing about an update depends on the request beyond its deserialized input:
+        // the channel's ARN, region and CreatedAt were decided when it was created.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateChannelErrorModeled::InternalServerErrorException(InternalServerErrorException {
+                message: Some("the mediapackage state store is unavailable".into()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // An update changes a channel this service holds; there is nothing to update for
+        // an id it does not, so the target is resolved before the request is judged.
+        let Some(record) = state.channels.get_mut(&input.id) else {
+            return Err(UpdateChannelErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("Channel with ID \"{}\" not found.", input.id)),
+            })
+            .into());
+        };
+
+        // Bound the caller-supplied string before it is stored, exactly as the create
+        // bounds it: an update must not be able to grow a record past what a create of
+        // the same record would have refused.
+        let refuse = |message: String| {
+            UpdateChannelError::from(UpdateChannelErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(message),
+                },
+            ))
+        };
+        if let Some(description) = &input.description {
+            crate::state::bound_chars("Description", description, crate::state::MAX_STRING_CHARS)
+                .map_err(refuse)?;
+        }
+
+        // `PUT /channels/{Id}` carries the channel's updatable configuration, and
+        // `Description` is the only member it binds: the stored description becomes the
+        // one sent, and a request that sends none leaves the channel without one.
+        // Everything else on the record — the id, the ARN, `CreatedAt`, the ingest
+        // endpoints, the log subscriptions and the tags — is not this operation's input,
+        // so the update leaves it exactly as stored.
+        record.description = input.description;
+
+        // Rendered from the STORED record, so this response and every later
+        // DescribeChannel/ListChannels are the same bytes.
+        let channel = record.to_channel();
+        Ok(UpdateChannelOutput {
+            arn: channel.arn,
+            created_at: channel.created_at,
+            description: channel.description,
+            egress_access_logs: channel.egress_access_logs,
+            hls_ingest: channel.hls_ingest,
+            id: channel.id,
+            ingress_access_logs: channel.ingress_access_logs,
+            tags: channel.tags,
+        })
     }
 }
+

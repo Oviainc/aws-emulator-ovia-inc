@@ -919,12 +919,13 @@ async fn a_payment_request_needs_an_active_agreement_with_that_variable_term() {
                 "name": "Payment for nothing",
                 "chargeAmount": "10",
             }),
-            // This service answers a lookup that found nothing with the modelled
-            // `ResourceNotFoundException` body at HTTP 400, for every resource
-            // it holds — see `crate::state::NOT_FOUND_STATUS`.
+            // This operation validates the agreement it is asked to charge
+            // under as INPUT, so an `agreementId` it cannot charge under is the
+            // modelled input fault naming that member — see
+            // `tests/all/error_bodies.rs` for the rule over the whole class.
             status: 400,
-            code: "ResourceNotFoundException",
-            reason: None,
+            code: "ValidationException",
+            reason: Some("INVALID_AGREEMENT_ID"),
         },
         Refusal {
             case: "an agreement that is no longer active",

@@ -19,5 +19,7 @@ mod device_capabilities;
 mod quantum_task_loop;
 #[path = "all/request_body_rejection.rs"]
 mod request_body_rejection;
+#[path = "all/spending_limits.rs"]
+mod spending_limits;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

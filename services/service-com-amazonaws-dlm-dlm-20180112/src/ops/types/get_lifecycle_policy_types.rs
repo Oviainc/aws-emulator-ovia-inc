@@ -23,7 +23,12 @@ pub struct GetLifecyclePolicyOutput {
     pub policy: Option<LifecyclePolicy>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dlm#LifecyclePolicy")]
+/// `LifecyclePolicy`, the shape `GetLifecyclePolicy` reports.
+///
+/// Its schema and codec are written out below instead of being derived by
+/// `#[smithy_macros::smithy(shape = ...)]`, because two of its members need one
+/// chain call the vendored codegen does not emit — see the note on
+/// [`LifecyclePolicy::M_DATE_CREATED`].
 #[derive(Debug, Clone, Default)]
 pub struct LifecyclePolicy {
     pub policy_id: Option<String>,
@@ -37,5 +42,180 @@ pub struct LifecyclePolicy {
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub policy_arn: Option<String>,
     pub default_policy: Option<bool>,
+}
+
+/// One member schema of [`LifecyclePolicy`], named and indexed as the model
+/// orders its members.
+macro_rules! lifecycle_policy_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.dlm#LifecyclePolicy$", $name),
+                LifecyclePolicy::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+#[allow(non_upper_case_globals)]
+impl LifecyclePolicy {
+    const SHAPE_ID: &'static str = "com.amazonaws.dlm#LifecyclePolicy";
+    const NAMESPACE: &'static str = "com.amazonaws.dlm";
+
+    pub const M_POLICY_ID: ::aws_smithy_schema::Schema =
+        lifecycle_policy_member!("PolicyId", String, 0);
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+        lifecycle_policy_member!("Description", String, 1);
+    pub const M_STATE: ::aws_smithy_schema::Schema = lifecycle_policy_member!("State", String, 2);
+    pub const M_STATUS_MESSAGE: ::aws_smithy_schema::Schema =
+        lifecycle_policy_member!("StatusMessage", String, 3);
+    pub const M_EXECUTION_ROLE_ARN: ::aws_smithy_schema::Schema =
+        lifecycle_policy_member!("ExecutionRoleArn", String, 4);
+    /// `DateCreated` targets `com.amazonaws.dlm#Timestamp`, a `timestamp` shape
+    /// carrying `@timestampFormat("date-time")`
+    /// (`smithy_query(query="shape", shape="Timestamp")` reports
+    /// `"timestampFormat": "date-time"`), so on this service's restJson1 wire the
+    /// ISO-8601 STRING form is part of the contract.
+    ///
+    /// The JSON codec picks the rendering per member from the member schema's own
+    /// format (`vendor/smithy-schema-server/src/json.rs::write_timestamp` ->
+    /// `Schema::timestamp_format()`) and falls back to the protocol default —
+    /// epoch seconds, a JSON NUMBER — when the member schema reports none.
+    /// `vendor/smithy-macros` never emits `.with_timestamp_format(..)` (grep the
+    /// tree: every call site is hand-written service code), so the derived schema
+    /// reported no format and this member went onto the wire as a bare number.
+    /// `vendor/` is read-only here, so the call lives on this member schema, as it
+    /// does for the same defect in `detective`, `accessanalyzer`,
+    /// `verifiedpermissions` and the other services listed in
+    /// `services/service-com-amazonaws-verifiedpermissions-verifiedpermissions/src/ops/types/date_time_wire.rs`.
+    pub const M_DATE_CREATED: ::aws_smithy_schema::Schema =
+        lifecycle_policy_member!("DateCreated", Timestamp, 5)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as for `DateCreated`.
+    pub const M_DATE_MODIFIED: ::aws_smithy_schema::Schema =
+        lifecycle_policy_member!("DateModified", Timestamp, 6)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_POLICY_DETAILS: ::aws_smithy_schema::Schema =
+        lifecycle_policy_member!("PolicyDetails", Structure, 7);
+    pub const M_TAGS: ::aws_smithy_schema::Schema = lifecycle_policy_member!("Tags", Map, 8);
+    pub const M_POLICY_ARN: ::aws_smithy_schema::Schema =
+        lifecycle_policy_member!("PolicyArn", String, 9);
+    pub const M_DEFAULT_POLICY: ::aws_smithy_schema::Schema =
+        lifecycle_policy_member!("DefaultPolicy", Boolean, 10);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "LifecyclePolicy",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_POLICY_ID,
+            &Self::M_DESCRIPTION,
+            &Self::M_STATE,
+            &Self::M_STATUS_MESSAGE,
+            &Self::M_EXECUTION_ROLE_ARN,
+            &Self::M_DATE_CREATED,
+            &Self::M_DATE_MODIFIED,
+            &Self::M_POLICY_DETAILS,
+            &Self::M_TAGS,
+            &Self::M_POLICY_ARN,
+            &Self::M_DEFAULT_POLICY,
+        ],
+    );
+}
+
+pub static LIFECYCLE_POLICY_SCHEMA: &::aws_smithy_schema::Schema = &LifecyclePolicy::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for LifecyclePolicy {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.policy_id.as_ref() {
+            s.write_string(&Self::M_POLICY_ID, v.as_str())?;
+        }
+        if let Some(v) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, v.as_str())?;
+        }
+        if let Some(v) = self.state.as_ref() {
+            s.write_string(&Self::M_STATE, v.as_str())?;
+        }
+        if let Some(v) = self.status_message.as_ref() {
+            s.write_string(&Self::M_STATUS_MESSAGE, v.as_str())?;
+        }
+        if let Some(v) = self.execution_role_arn.as_ref() {
+            s.write_string(&Self::M_EXECUTION_ROLE_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.date_created.as_ref() {
+            s.write_timestamp(&Self::M_DATE_CREATED, v)?;
+        }
+        if let Some(v) = self.date_modified.as_ref() {
+            s.write_timestamp(&Self::M_DATE_MODIFIED, v)?;
+        }
+        if let Some(v) = self.policy_details.as_ref() {
+            s.write_struct(&Self::M_POLICY_DETAILS, v)?;
+        }
+        if let Some(v) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|sm| {
+                for (key, value) in v.iter() {
+                    sm.write_string(&Self::M_TAGS, key.as_str())?;
+                    sm.write_string(&Self::M_TAGS, value.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.policy_arn.as_ref() {
+            s.write_string(&Self::M_POLICY_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.default_policy.as_ref() {
+            s.write_boolean(&Self::M_DEFAULT_POLICY, *v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for LifecyclePolicy {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.policy_id = Some(d.read_string(&Self::M_POLICY_ID)?),
+                Some(1) => out.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(2) => out.state = Some(d.read_string(&Self::M_STATE)?),
+                Some(3) => out.status_message = Some(d.read_string(&Self::M_STATUS_MESSAGE)?),
+                Some(4) => {
+                    out.execution_role_arn = Some(d.read_string(&Self::M_EXECUTION_ROLE_ARN)?)
+                }
+                Some(5) => out.date_created = Some(d.read_timestamp(&Self::M_DATE_CREATED)?),
+                Some(6) => out.date_modified = Some(d.read_timestamp(&Self::M_DATE_MODIFIED)?),
+                Some(7) => {
+                    out.policy_details = Some(<PolicyDetails as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?)
+                }
+                Some(8) => {
+                    let mut entries: ::std::collections::HashMap<String, String> =
+                        ::std::default::Default::default();
+                    d.read_map(&Self::M_TAGS, &mut |key, dm| {
+                        let value = dm.read_string(&Self::M_TAGS)?;
+                        entries.insert(key, value);
+                        Ok(())
+                    })?;
+                    out.tags = Some(entries);
+                }
+                Some(9) => out.policy_arn = Some(d.read_string(&Self::M_POLICY_ARN)?),
+                Some(10) => out.default_policy = Some(d.read_boolean(&Self::M_DEFAULT_POLICY)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 

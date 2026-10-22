@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConfigureLogs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConfigureLogs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConfigureLogs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes a Channel's log subscription into the stored record, so every later read
+//! reports the configured ingress and egress log groups.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +149,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConfigureLogs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConfigureLogsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConfigureLogs"))
+        // Nothing about a log subscription depends on the request beyond its deserialized
+        // input: the channel it names was created by an earlier call.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ConfigureLogsErrorModeled::InternalServerErrorException(InternalServerErrorException {
+                message: Some("the mediapackage state store is unavailable".into()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Log subscription is a property OF a channel, so there is nothing to configure
+        // for an id this service does not hold; the target is resolved before the request
+        // is judged.
+        if !state.channels.contains_key(&input.id) {
+            return Err(ConfigureLogsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("Channel with ID \"{}\" not found.", input.id)),
+            })
+            .into());
+        }
+
+        // The two log-group names are the only caller-supplied strings this operation
+        // stores, and they are bounded before anything is written.
+        let refuse = |message: String| {
+            ConfigureLogsError::from(ConfigureLogsErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(message),
+                },
+            ))
+        };
+        let ingress_log_group_name = input
+            .ingress_access_logs
+            .and_then(|logs| logs.log_group_name);
+        let egress_log_group_name = input.egress_access_logs.and_then(|logs| logs.log_group_name);
+        for (member, value) in [
+            ("IngressAccessLogs.LogGroupName", &ingress_log_group_name),
+            ("EgressAccessLogs.LogGroupName", &egress_log_group_name),
+        ] {
+            if let Some(value) = value {
+                crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)
+                    .map_err(refuse)?;
+            }
+        }
+
+        let record = state
+            .channels
+            .get_mut(&input.id)
+            .expect("the channel resolved above, under this one hold of the lock");
+
+        // `PUT /channels/{Id}/configure_logs` carries the channel's whole log
+        // subscription: each of the two members it binds becomes the log group sent, and
+        // one the request omits (or sends without a LogGroupName) leaves that direction
+        // unsubscribed. The channel's description and tags are not this operation's
+        // input, so they stay exactly as stored.
+        record.ingress_log_group_name = ingress_log_group_name;
+        record.egress_log_group_name = egress_log_group_name;
+
+        // Rendered from the STORED record, so this response and every later
+        // DescribeChannel/ListChannels are the same bytes.
+        let channel = record.to_channel();
+        Ok(ConfigureLogsOutput {
+            arn: channel.arn,
+            created_at: channel.created_at,
+            description: channel.description,
+            egress_access_logs: channel.egress_access_logs,
+            hls_ingest: channel.hls_ingest,
+            id: channel.id,
+            ingress_access_logs: channel.ingress_access_logs,
+            tags: channel.tags,
+        })
     }
 }

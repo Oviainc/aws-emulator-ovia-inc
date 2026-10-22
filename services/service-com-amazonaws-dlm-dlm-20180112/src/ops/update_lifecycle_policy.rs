@@ -217,7 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy.description = description;
         }
         if let Some(policy_details) = input.policy_details {
-            policy.policy_details = Some(policy_details);
+            // As at create: the replacement configuration is stored with the
+            // service-materialized members stamped onto it.
+            policy.policy_details = Some(crate::state::materialized_policy_details(policy_details));
         }
         if let Some(create_interval) = input.create_interval {
             policy.create_interval = Some(create_interval);

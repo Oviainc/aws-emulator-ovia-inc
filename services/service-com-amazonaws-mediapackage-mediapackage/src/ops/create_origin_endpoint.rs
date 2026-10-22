@@ -216,62 +216,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         };
-        for (member, value) in [
-            ("Id", Some(&input.id)),
-            ("ChannelId", Some(&input.channel_id)),
-            ("Description", input.description.as_ref()),
-            ("ManifestName", input.manifest_name.as_ref()),
-        ] {
-            if let Some(value) = value {
-                crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)
-                    .map_err(refuse)?;
-            }
+        for (member, value) in [("Id", &input.id), ("ChannelId", &input.channel_id)] {
+            crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)
+                .map_err(refuse)?;
         }
         crate::state::bound_tags(&input.tags).map_err(refuse)?;
-        if let Some(whitelist) = &input.whitelist {
-            crate::state::bound_entries(
-                "Whitelist",
-                whitelist.len(),
-                crate::state::MAX_WHITELIST_ENTRIES,
-            )
-            .map_err(refuse)?;
-            for entry in whitelist {
-                crate::state::bound_chars(
-                    "a Whitelist entry",
-                    entry,
-                    crate::state::MAX_STRING_CHARS,
-                )
-                .map_err(refuse)?;
-            }
-        }
-        if let Some(manifests) = input
-            .cmaf_package
-            .as_ref()
-            .and_then(|package| package.hls_manifests.as_ref())
-        {
-            crate::state::bound_entries(
-                "CmafPackage.HlsManifests",
-                manifests.len(),
-                crate::state::MAX_CMAF_HLS_MANIFESTS,
-            )
-            .map_err(refuse)?;
-            for manifest in manifests {
-                crate::state::bound_chars(
-                    "a CmafPackage.HlsManifests id",
-                    &manifest.id,
-                    crate::state::MAX_STRING_CHARS,
-                )
-                .map_err(refuse)?;
-                if let Some(name) = &manifest.manifest_name {
-                    crate::state::bound_chars(
-                        "a CmafPackage.HlsManifests ManifestName",
-                        name,
-                        crate::state::MAX_STRING_CHARS,
-                    )
-                    .map_err(refuse)?;
-                }
-            }
-        }
+        // The members a create shares with an update are bounded by the one function both
+        // handlers call, so neither can store more than the other would have refused.
+        crate::state::bound_origin_endpoint_members(
+            input.description.as_deref(),
+            input.manifest_name.as_deref(),
+            input.whitelist.as_deref(),
+            input.cmaf_package.as_ref(),
+        )
+        .map_err(refuse)?;
 
         // An OriginEndpoint packages ONE Channel: a ChannelId naming no stored channel
         // has nothing to package, so the endpoint is not created.
@@ -315,32 +273,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An endpoint packages its channel in exactly one format, and its playback URL
         // ends in that format's manifest, so exactly one packaging configuration must be
-        // supplied. Neither none nor several can be packaged.
-        let supplied: Vec<(crate::state::PackagingKind, &str)> = [
-            (crate::state::PackagingKind::Hls, "HlsPackage", input.hls_package.is_some()),
-            (crate::state::PackagingKind::Dash, "DashPackage", input.dash_package.is_some()),
-            (crate::state::PackagingKind::Cmaf, "CmafPackage", input.cmaf_package.is_some()),
-            (crate::state::PackagingKind::Mss, "MssPackage", input.mss_package.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(kind, name, present)| present.then_some((kind, name)))
-        .collect();
-        let [(kind, _)] = supplied[..] else {
-            let names: Vec<&str> = supplied.iter().map(|(_, name)| *name).collect();
-            return Err(CreateOriginEndpointErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(format!(
-                        "Exactly one of HlsPackage, DashPackage, CmafPackage or MssPackage is \
-                         required; got {}.",
-                        if names.is_empty() {
-                            "none".to_string()
-                        } else {
-                            names.join(", ")
-                        }
-                    )),
-                },
-            )
-            .into());
+        // supplied. Neither none nor several can be packaged. `UpdateOriginEndpoint`
+        // decides which packaging a request names with the same function.
+        let kind = match crate::state::sole_packaging_kind(
+            input.hls_package.is_some(),
+            input.dash_package.is_some(),
+            input.cmaf_package.is_some(),
+            input.mss_package.is_some(),
+        ) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => return Err(refuse(crate::state::packaging_refusal(&[]))),
+            Err(supplied) => return Err(refuse(crate::state::packaging_refusal(&supplied))),
         };
 
         let region = crate::state::request_region(ctx.parts());

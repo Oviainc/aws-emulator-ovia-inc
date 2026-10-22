@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{Association, ExperimentalCapabilities};
+use crate::ops::types::{Association, ExperimentalCapabilities, TimePeriod};
 
 // ---------------------------------------------------------------------------
 // Modelled enum values this service stores and emits.
@@ -47,6 +47,12 @@ pub const DEVICE_RETIRED: &str = "RETIRED";
 /// `DeviceType` values.
 pub const DEVICE_TYPE_QPU: &str = "QPU";
 pub const DEVICE_TYPE_SIMULATOR: &str = "SIMULATOR";
+
+/// The unit a device's published `deviceCost` is charged per: a QPU bills each SHOT a
+/// quantum task asks for, a simulator each MINUTE it simulates for.
+pub const PRICE_UNIT_SHOT: &str = "shot";
+/// See [`PRICE_UNIT_SHOT`].
+pub const PRICE_UNIT_MINUTE: &str = "minute";
 
 /// `QueueName` values.
 pub const QUEUE_QUANTUM_TASKS: &str = "QUANTUM_TASKS_QUEUE";
@@ -120,6 +126,24 @@ pub const MAX_QUANTUM_TASKS: usize = 1_000;
 /// [`ComAmazonawsBraketBraketState::prune_idempotency`]).
 pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_QUANTUM_TASKS;
 
+/// The most spending-limit records this emulator keeps at once.
+///
+/// A spending limit has no terminal state to age out of — it lives until
+/// `DeleteSpendingLimit` removes it — so the store cannot make room by evicting
+/// finished records the way the quantum-task store does. It is bounded by COUNT
+/// instead, and a create past this many is refused as invalid input: Amazon Braket
+/// publishes a service quota on spending limits, and `CreateSpendingLimit` models no
+/// `ServiceQuotaExceededException`, so `ValidationException` is the refusal it has.
+pub const MAX_SPENDING_LIMITS: usize = 1_000;
+
+/// The period a spending limit covers when the caller sends no `timePeriod`.
+///
+/// `timePeriod` is optional on the way IN and required on the way OUT, so a limit
+/// created without one still has a period to report. AWS documents no default window,
+/// so this span is the emulator's own choice; a `timePeriod` the caller DOES send is
+/// stored and reported exactly as sent.
+pub const DEFAULT_SPENDING_LIMIT_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// How long a `clientToken` is remembered for.
 ///
 /// AWS does not document the window Braket honours an idempotency token for, so this
@@ -150,6 +174,14 @@ pub struct Device {
     /// `service.shotsRange`. `CreateQuantumTask` refuses a `shots` value outside
     /// it, so the catalog a caller reads and the rule it is held to agree.
     pub shots_range: (i64, i64),
+    /// What one charged unit of this device costs in USD, as its capability document
+    /// publishes it (`service.deviceCost.price`). Spending on a device is computed
+    /// from this figure, so the price a caller reads and the spend reported against a
+    /// spending limit are the same data.
+    pub cost_price: f64,
+    /// The unit [`Device::cost_price`] is charged per (`service.deviceCost.unit`):
+    /// [`PRICE_UNIT_SHOT`] or [`PRICE_UNIT_MINUTE`].
+    pub cost_unit: String,
 }
 
 /// A quantum task created through `CreateQuantumTask`.
@@ -213,12 +245,35 @@ impl QuantumTask {
 #[derive(Debug, Clone)]
 pub struct IdempotencyRecord {
     /// The digest of the request the token was first used with, so a token reused for
-    /// a different request is refused rather than answered with the first ARN.
+    /// a different request is refused rather than answered with the first ARN. The
+    /// operation's own name takes part, so one token used for two different creates is
+    /// a reuse rather than a replay.
     pub fingerprint: String,
-    /// The ARN that first use minted.
-    pub quantum_task_arn: String,
+    /// The ARN that first use minted — a quantum task's or a spending limit's.
+    pub resource_arn: String,
     /// When the token was first seen — what [`IDEMPOTENCY_TTL`] is measured from.
     pub recorded_at: SystemTime,
+}
+
+/// A spending limit created through `CreateSpendingLimit`.
+///
+/// Every member `SearchSpendingLimits` reports is either held here or computed from
+/// the quantum tasks the device has (see
+/// [`ComAmazonawsBraketBraketState::spend_on_device`]).
+#[derive(Debug, Clone)]
+pub struct SpendingLimit {
+    pub spending_limit_arn: String,
+    pub device_arn: String,
+    /// The maximum that may be spent, in USD — the caller's own `spendingLimit`
+    /// string, kept verbatim so the value read back is the value written.
+    pub spending_limit: String,
+    /// The period the limit is active over: exactly the `TimePeriod` the caller sent,
+    /// or the [`DEFAULT_SPENDING_LIMIT_WINDOW`] when it sent none.
+    pub time_period: TimePeriod,
+    pub created_at: SystemTime,
+    /// When the limit was last changed; equal to `created_at` until an update moves it.
+    pub updated_at: SystemTime,
+    pub tags: BTreeMap<String, String>,
 }
 
 /// Per-service state for com-amazonaws-braket-braket. A handler reaches it through [`service_state`].
@@ -228,8 +283,11 @@ pub struct ComAmazonawsBraketBraketState {
     pub devices: BTreeMap<String, Device>,
     /// Every quantum task created in this emulator, keyed by its ARN.
     pub quantum_tasks: BTreeMap<String, QuantumTask>,
+    /// Every spending limit created in this emulator, keyed by its ARN and bounded by
+    /// [`MAX_SPENDING_LIMITS`].
+    pub spending_limits: BTreeMap<String, SpendingLimit>,
     /// `clientToken` -> what that token minted, so replaying an `@idempotencyToken`
-    /// returns the first ARN instead of creating a second task. Bounded: see
+    /// returns the first ARN instead of creating a second resource. Bounded: see
     /// [`ComAmazonawsBraketBraketState::prune_idempotency`].
     pub idempotency: BTreeMap<String, IdempotencyRecord>,
 }
@@ -239,6 +297,7 @@ impl Default for ComAmazonawsBraketBraketState {
         Self {
             devices: seeded_devices(),
             quantum_tasks: BTreeMap::new(),
+            spending_limits: BTreeMap::new(),
             idempotency: BTreeMap::new(),
         }
     }
@@ -309,7 +368,7 @@ impl ComAmazonawsBraketBraketState {
             }
             self.quantum_tasks.remove(&arn);
             self.idempotency
-                .retain(|_, record| record.quantum_task_arn != arn);
+                .retain(|_, record| record.resource_arn != arn);
         }
     }
 
@@ -318,13 +377,17 @@ impl ComAmazonawsBraketBraketState {
     /// `MAX_IDEMPOTENCY_TOKENS - 1` — so after the insert that follows it holds at most
     /// [`MAX_IDEMPOTENCY_TOKENS`].
     ///
-    /// An entry is of no further use once the task it names has been evicted, or once
-    /// it is older than [`IDEMPOTENCY_TTL`] — so an endless stream of fresh tokens
-    /// cannot grow this index without limit even though every create stores one.
+    /// An entry is of no further use once the resource it names has been evicted or
+    /// deleted, or once it is older than [`IDEMPOTENCY_TTL`] — so an endless stream of
+    /// fresh tokens cannot grow this index without limit even though every create
+    /// stores one.
     pub fn prune_idempotency(&mut self, now: SystemTime) {
         let tasks = &self.quantum_tasks;
+        let spending_limits = &self.spending_limits;
         self.idempotency.retain(|_, record| {
-            if !tasks.contains_key(&record.quantum_task_arn) {
+            if !tasks.contains_key(&record.resource_arn)
+                && !spending_limits.contains_key(&record.resource_arn)
+            {
                 return false;
             }
             match now.duration_since(record.recorded_at) {
@@ -350,6 +413,64 @@ impl ComAmazonawsBraketBraketState {
             self.idempotency.remove(&token);
         }
     }
+
+    /// What one device's quantum tasks add up to over `period`, in USD: the amount
+    /// still queued for spending, and the amount already spent.
+    ///
+    /// A quantum task is charged at the price the device's own capability document
+    /// publishes ([`Device::cost_price`]), for the shots the task asked for, and only
+    /// tasks created inside `period` count towards that period's figures:
+    ///
+    /// * a task that has not reached a terminal status is money COMMITTED but not yet
+    ///   charged, so it counts towards the queued amount;
+    /// * a task that COMPLETED has been charged, so it counts towards the total.
+    ///
+    /// A `CANCELLED` or `FAILED` task is charged for nothing, which is why this
+    /// emulator's totals are empty sums: it executes no program, so every task it
+    /// accepts ends in [`STATUS_FAILED`] (see [`NOT_EXECUTED_FAILURE_REASON`]) and
+    /// nothing is ever billed. The figures are computed from the records all the same,
+    /// so a device with queued work reports what that work has committed.
+    ///
+    /// A device charged per [`PRICE_UNIT_MINUTE`] contributes nothing: the emulator
+    /// runs no simulation, so there is no duration to charge. Only a per-shot device
+    /// can carry a spending limit at all (`CreateSpendingLimit` refuses a simulator).
+    ///
+    /// Call [`apply_due_transitions`](Self::apply_due_transitions) first, so the
+    /// statuses these sums read are the ones every other call reports at this instant.
+    pub fn spend_on_device(&self, device_arn: &str, period: &TimePeriod) -> (f64, f64) {
+        let per_shot = self
+            .devices
+            .get(device_arn)
+            .filter(|device| device.cost_unit == PRICE_UNIT_SHOT)
+            .map_or(0.0, |device| device.cost_price);
+        let from = date_time_as_nanos(&period.start_at);
+        let to = date_time_as_nanos(&period.end_at);
+        let mut queued = 0.0;
+        let mut total = 0.0;
+        for task in self.quantum_tasks.values() {
+            if task.device_arn != device_arn {
+                continue;
+            }
+            let created = date_time_as_nanos(&to_date_time(task.created_at));
+            if created < from || created > to {
+                continue;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let charge = per_shot * task.shots as f64;
+            if task.is_queued() {
+                queued += charge;
+            } else if task.status == STATUS_COMPLETED {
+                total += charge;
+            }
+        }
+        (queued, total)
+    }
+}
+
+/// An amount in USD, as the `^\d+(\.\d{1,2})?$` form every Braket spending member
+/// carries: whole cents, never an exponent.
+pub fn usd(amount: f64) -> String {
+    format!("{amount:.2}")
 }
 
 /// Apply the transitions `now` has made due to one task.
@@ -813,6 +934,8 @@ fn seeded_devices() -> BTreeMap<String, Device> {
                 device_status: seed.device_status.to_string(),
                 device_capabilities: capabilities_document(seed, published_at),
                 shots_range: seed.shots_range,
+                cost_price: seed.cost.0,
+                cost_unit: seed.cost.1.to_string(),
             };
             (device.device_arn.clone(), device)
         })
@@ -1158,6 +1281,10 @@ pub const ARN_RESOURCE_QUANTUM_TASK: &str = "quantum-task";
 /// The resource type a device ARN names (`DeviceResource`).
 pub const ARN_RESOURCE_DEVICE: &str = "device";
 
+/// The resource type a spending-limit ARN names (`SpendingLimitResource`), and the
+/// resource prefix `CreateSpendingLimit` mints its ARNs with.
+pub const ARN_RESOURCE_SPENDING_LIMIT: &str = "spending-limit";
+
 /// Whether `value` is syntactically an Amazon Braket ARN naming `resource_type`.
 ///
 /// The form required is the ARN grammar
@@ -1256,12 +1383,26 @@ pub fn digest(parts: &[&str]) -> String {
 ///
 /// Built here rather than with the `uuid` crate for one reason: adding a dependency
 /// adds this crate's `Cargo.lock` entry to the change, and that one line is what the
-/// serialized merge into the shared mainline kept refusing to squash. The bytes come
-/// from a SHA-256 over values unique to this call — a per-process counter and the wall
-/// clock — so no two tasks share an id and the id is not derived from the request; the
-/// version and variant nibbles are then set, so the result is a well-formed v4 UUID
-/// (RFC 9562 section 5.4: 122 random bits, version 0b0100, variant 0b10).
+/// serialized merge into the shared mainline kept refusing to squash. See
+/// [`new_resource_id`] for how the bytes are produced.
 pub fn new_task_id() -> String {
+    new_resource_id("braket-quantum-task")
+}
+
+/// Mint the identifier of a new spending limit: a version-4 UUID, as the resource part
+/// of a Braket spending-limit ARN carries. See [`new_resource_id`].
+pub fn new_spending_limit_id() -> String {
+    new_resource_id("braket-spending-limit")
+}
+
+/// Mint a version-4 UUID for a new resource of kind `domain`.
+///
+/// The bytes come from a SHA-256 over values unique to this call — the resource kind,
+/// a per-process counter and the wall clock — so no two resources share an id and the
+/// id is not derived from the request; the version and variant nibbles are then set,
+/// so the result is a well-formed v4 UUID (RFC 9562 section 5.4: 122 random bits,
+/// version 0b0100, variant 0b10).
+fn new_resource_id(domain: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1271,7 +1412,7 @@ pub fn new_task_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     let mut hasher = Sha256::new();
-    hasher.update(b"braket-quantum-task");
+    hasher.update(domain.as_bytes());
     hasher.update(seq.to_le_bytes());
     hasher.update(nanos.to_le_bytes());
     let digest = hasher.finalize();

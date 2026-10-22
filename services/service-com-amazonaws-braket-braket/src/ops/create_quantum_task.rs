@@ -145,6 +145,9 @@ fn request_digest(input: &CreateQuantumTaskInput) -> String {
         .as_ref()
         .map_or_else(String::new, |caps| format!("{caps:?}"));
     crate::state::digest(&[
+        // The operation takes part, so one token presented to two different creates is
+        // a reuse of the token rather than a replay of this request.
+        "CreateQuantumTask",
         &input.device_arn,
         &shots,
         &input.output_s3_bucket,
@@ -232,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
             return Ok(CreateQuantumTaskOutput {
-                quantum_task_arn: seen.quantum_task_arn.clone(),
+                quantum_task_arn: seen.resource_arn.clone(),
             });
         }
 
@@ -338,7 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.client_token.clone(),
             crate::state::IdempotencyRecord {
                 fingerprint,
-                quantum_task_arn: quantum_task_arn.clone(),
+                resource_arn: quantum_task_arn.clone(),
                 recorded_at: now,
             },
         );
