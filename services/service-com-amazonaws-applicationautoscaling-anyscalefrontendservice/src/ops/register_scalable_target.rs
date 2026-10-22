@@ -290,6 +290,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A capacity window also has to be one the owning service can provision: a
+        // dimension whose unit has a documented floor cannot be scaled below it.
+        let floor = crate::state::min_capacity_floor(&input.scalable_dimension);
+        for (member, capacity) in [
+            ("minCapacity", input.min_capacity),
+            ("maxCapacity", input.max_capacity),
+        ] {
+            if let Some(value) = capacity {
+                if value < floor {
+                    return Err(validation(format!(
+                        "Value '{value}' at '{member}' failed to satisfy constraint: \
+                         Member must have value greater than or equal to {floor} for scalable \
+                         dimension {}",
+                        input.scalable_dimension
+                    )));
+                }
+            }
+        }
+
         let key = TargetKey {
             service_namespace: input.service_namespace.clone(),
             resource_id: input.resource_id.clone(),
@@ -302,6 +321,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store lock — the capacity it answers is also what the alarm thresholds are
         // computed from below.
         let region = crate::state::request_region(ctx.parts());
+
+        // This registration's read-modify-write of the target is IN FLIGHT from here: a
+        // second registration of the SAME target that overlaps it is the modelled
+        // `ConcurrentUpdateException` — "Concurrent updates caused an exception, for
+        // example, if you request an update to an Application Auto Scaling resource that
+        // already has a pending update" — rather than a silent overwrite of whichever of
+        // the two landed first. Updates of DIFFERENT targets never collide, and the marker
+        // is released however this request ends.
+        if !state.lock().begin_target_update(&key) {
+            return Err(RegisterScalableTargetErrorModeled::ConcurrentUpdateException(
+                ConcurrentUpdateException {
+                    message: Some(format!(
+                        "An update to the scalable target for service namespace: {}, resource \
+                         ID: {}, scalable dimension: {} is already in progress",
+                        key.service_namespace, key.resource_id, key.scalable_dimension
+                    )),
+                },
+            )
+            .into());
+        }
+        let _in_flight = UpdateInFlight {
+            state: self_state.clone(),
+            key: key.clone(),
+        };
+        // The update is pending until this request publishes it below, so it yields once
+        // here: the point at which another in-flight update of the same target observes
+        // it. A yield, not a wait — no wall-clock time passes, so a caller that makes two
+        // calls in a row never sees the span, while two that genuinely overlap do.
+        ::tokio::task::yield_now().await;
+
         let resolved_capacity =
             crate::state::resolve_target_resource(&*self.engine, &region, &key)
                 .map_err(validation)?;
@@ -460,6 +509,22 @@ fn validation(message: impl Into<String>) -> RegisterScalableTargetError {
         message: Some(message.into()),
     })
     .into()
+}
+
+/// Holds the in-flight marker for ONE target's update for as long as this request is
+/// updating it, and releases it however the request ends — so a refused or a panicking
+/// registration cannot leave a target that no later update may touch.
+struct UpdateInFlight {
+    state: ::engine::ServiceState<
+        crate::state::ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    >,
+    key: crate::state::TargetKey,
+}
+
+impl Drop for UpdateInFlight {
+    fn drop(&mut self) {
+        self.state.lock().end_target_update(&self.key);
+    }
 }
 
 /// Refuse a capacity window whose minimum is above its maximum: scaling "will not scale

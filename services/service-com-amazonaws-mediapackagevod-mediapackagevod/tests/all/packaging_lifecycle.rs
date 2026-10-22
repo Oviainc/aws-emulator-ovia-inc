@@ -14,7 +14,9 @@
 //! * the playback URL's manifest file name follows the packaging format the
 //!   configuration was created with;
 //! * paging with any page size yields every asset exactly once, in one stable order;
-//! * `MaxResults` is accepted on each modelled bound and refused one past it.
+//! * `MaxResults` is accepted on each modelled bound and refused one past it;
+//! * a packaging group is removed only while no packaging configuration references
+//!   it, and a refused delete removes nothing.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -924,6 +926,136 @@ async fn egress_domain_names_are_stable_and_distinct_per_group() {
         assert!(
             domains.insert(domain.clone()),
             "group {id:?}: the domain name {domain:?} collided with another group's"
+        );
+    }
+}
+
+/// A packaging group is removed only while nothing references it.
+///
+/// A PackagingConfiguration names the group it packages for by `PackagingGroupId`
+/// (`CreatePackagingConfiguration` refuses one that resolves to no stored group), so
+/// deleting the group would leave that reference dangling: the delete is refused with
+/// `UnprocessableEntityException` (HTTP 422 — "The parameters sent in the request are
+/// not valid"), attributed to the `Id` member the request addressed the group by, and
+/// removes nothing. With no such child the delete answers the modelled 202, the group
+/// reads back the modelled `NotFoundException` (404), and its tags are gone with it.
+///
+/// The rows span the dependency count (none, one, several), the packaging format each
+/// dependent was created with, and whether the group also holds assets. An Asset is
+/// NOT a blocking dependent: neither the model nor the recorded behaviour makes it
+/// one, so a group holding only assets is still deletable.
+#[tokio::test]
+async fn a_packaging_group_is_deletable_only_while_no_configuration_references_it() {
+    // (case, the package blocks of the configurations created in the group, how many
+    // assets the group holds)
+    let cases: Vec<(&str, Vec<Value>, usize)> = vec![
+        ("no dependents, no assets", vec![], 0),
+        ("no dependents, two assets", vec![], 2),
+        (
+            "one hls dependent",
+            vec![json!({ "hlsPackage": { "hlsManifests": [{}] } })],
+            0,
+        ),
+        (
+            "one dash dependent, one asset",
+            vec![json!({ "dashPackage": { "dashManifests": [{}] } })],
+            1,
+        ),
+        (
+            "three dependents, mixed formats",
+            vec![
+                json!({ "hlsPackage": { "hlsManifests": [{ "manifestName": "primary" }] } }),
+                json!({ "cmafPackage": { "hlsManifests": [{}] } }),
+                json!({ "mssPackage": { "mssManifests": [{}] } }),
+            ],
+            0,
+        ),
+    ];
+
+    for (case, packages, assets) in cases {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let router = router_over(engine.clone());
+        create_group(&router, "del-group", Some(json!({ "case": case }))).await;
+        for (index, package) in packages.iter().enumerate() {
+            create_config(&router, &format!("cfg-{index}"), "del-group", package.clone()).await;
+        }
+        for index in 0..assets {
+            create_asset(&router, &format!("asset-{index}"), "del-group").await;
+        }
+
+        let (status, body) = call(&router, "DELETE", "/packaging_groups/del-group", None).await;
+        if packages.is_empty() {
+            assert_eq!(
+                status, 202,
+                "case {case:?}: expected the modelled 202 for a group no configuration \
+                 references, got {status} and body {body}"
+            );
+        } else {
+            assert_eq!(
+                status,
+                422,
+                "case {case:?}: expected 422 while {} configuration(s) reference the group, \
+                 got {status} and body {body}",
+                packages.len()
+            );
+            let message = body["message"].as_str().unwrap_or_default().to_string();
+            assert_eq!(
+                message, "id cannot be deleted because it has attached packaging configurations",
+                "case {case:?}: the refusal must be this service's member-attributed 422 \
+                 wording, got {message:?}"
+            );
+            assert_eq!(
+                body["errors"],
+                json!({
+                    "id": ["cannot be deleted because it has attached packaging configurations"]
+                }),
+                "case {case:?}: the violation must be attributed to the addressed member, got {}",
+                body["errors"]
+            );
+            // Refused, so nothing was removed: the group still reads back.
+            let (status, described) =
+                call(&router, "GET", "/packaging_groups/del-group", None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a refused delete must leave the group readable, got {status} \
+                 and body {described}"
+            );
+
+            // The refusal counts the configurations stored NOW rather than a stored
+            // dependency flag, so with the dependents gone the same delete succeeds.
+            {
+                let store = engine.state::<vod::ComAmazonawsMediapackagevodMediapackagevodState>();
+                store.lock().packaging_configurations.clear();
+            }
+            let (status, body) = call(&router, "DELETE", "/packaging_groups/del-group", None).await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: expected the modelled 202 once no configuration references \
+                 the group, got {status} and body {body}"
+            );
+        }
+
+        // Deleted by now in every row: the group is gone from state, so a read answers
+        // the modelled 404 and so does deleting the same id again.
+        let (status, body) = call(&router, "GET", "/packaging_groups/del-group", None).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: DescribePackagingGroup after the delete, got {status} and body {body}"
+        );
+        let (status, body) = call(&router, "DELETE", "/packaging_groups/del-group", None).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a second delete of the same id, got {status} and body {body}"
+        );
+
+        // The tag store is keyed by ARN, so the deleted group must leave no tags behind
+        // for a group later created with the same id.
+        let recreated = create_group(&router, "del-group", None).await;
+        assert_eq!(
+            recreated["tags"],
+            json!({}),
+            "case {case:?}: a re-created group must not inherit the deleted group's tags, got {}",
+            recreated["tags"]
         );
     }
 }
