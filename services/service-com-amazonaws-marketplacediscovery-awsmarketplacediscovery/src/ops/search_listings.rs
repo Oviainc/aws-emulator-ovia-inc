@@ -285,8 +285,8 @@ fn matches_every_filter(
                 .iter()
                 .any(|category| values.contains(&category.category_id)),
             "PUBLISHER" => values.contains(&listing.publisher.seller_profile_id),
-            "FULFILLMENT_OPTION_TYPE" => listing
-                .fulfillment_option_summaries
+            "FULFILLMENT_OPTION_TYPE" => state
+                .listing_fulfillment_option_summaries(listing)
                 .iter()
                 .any(|option| values.contains(&option.fulfillment_option_type)),
             "PRICING_MODEL" => listing

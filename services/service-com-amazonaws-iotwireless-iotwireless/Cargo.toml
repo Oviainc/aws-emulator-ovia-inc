@@ -21,13 +21,19 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination tokens: hex-encodes a list's resume key so a client cannot read
+# a resource name out of a `NextToken`.
+hex = { workspace = true }
+# Mints the uuid `Id` CreateWirelessDevice returns for a new device. Already in the
+# lockfile as a dependency of the vendored framework crates, so declaring it adds no
+# new entry.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

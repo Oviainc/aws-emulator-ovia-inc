@@ -4,6 +4,11 @@
 //! Exchanges the calling IAM principal's credentials for an OAuth 2.0 access token
 //! scoped to the requested resource.
 //!
+//! Input rejection is this operation's own, not the generic constraint walk's: a
+//! `grantType` other than `client_credentials`, or a `resource` outside its modelled
+//! length, is answered with the OAuth 2.0 `invalid_request` description the model
+//! documents for `INVALID_REQUEST`.
+//!
 //! ## What a call does
 //!
 //! The grant mints ONE token per call: a fresh opaque token value, and a record in
@@ -179,11 +184,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // `grantType` is modelled `^client_credentials$` and `resource` is
-        // `@required` with `@length(min: 1, max: 2048)`, so the boundary
-        // validator has already refused every request this operation could
-        // refuse on its input alone: the exchange is the client-credentials
-        // grant, scoped to the resource named.
+        // This operation's own acceptance rules, each answered with the one description
+        // the model gives `INVALID_REQUEST` rather than the generic constraint walk's
+        // report (its `grantType`/`resource` constraints carry `skip_validation`, so
+        // this handler is what judges them): `grantType` is `^client_credentials$` —
+        // the only grant this operation implements — and `resource` is a non-empty
+        // value within `@length(min: 1, max: 2048)`, counted in CHARACTERS, which is
+        // what Smithy's `@length` bounds on a string.
+        let grant_type_accepted = input.grant_type == crate::state::GRANT_TYPE_CLIENT_CREDENTIALS;
+        let resource_accepted = !input.resource.is_empty()
+            && input.resource.chars().count() <= crate::state::MAX_RESOURCE_LENGTH;
+        if !grant_type_accepted || !resource_accepted {
+            return Err(CreateOAuth2TokenWithIAMErrorModeled::ValidationException(
+                crate::state::validation_failed(crate::state::INVALID_REQUEST_MESSAGE),
+            )
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();

@@ -1065,13 +1065,15 @@ async fn unknown_resources_and_tokens_get_the_modelled_errors() {
 #[tokio::test]
 async fn the_clock_retires_iterators_and_trims_records() {
     // Each row: how long ago the iterator was issued, and whether it still works.
-    // The published lifetime is 15 minutes, so the rows straddle that bound as
-    // tightly as a live clock allows (the handler stamps `now` itself, so the exact
-    // boundary instant cannot be hit from outside).
+    // The published lifetime is 15 minutes, so the rows straddle that bound as tightly
+    // as a live clock allows: `seconds_ago` FLOORS the clock to a whole second, so the
+    // instant it returns is up to one second older than the row names, and the handler
+    // stamps its own `now` after the call. An "inside" row therefore keeps a margin
+    // wider than that drift; an "outside" row can only drift further outside.
     let cases: [(u64, bool); 4] = [
         (0, true),
         (14 * 60, true),
-        (15 * 60 - 1, true),
+        (15 * 60 - 10, true),
         (15 * 60 + 1, false),
     ];
 
@@ -1114,11 +1116,13 @@ async fn the_clock_retires_iterators_and_trims_records() {
     }
 
     // A record older than the 24 hour retention limit is trimmed, so an iterator
-    // standing at the old trim horizon reads past the oldest retained record. The
-    // rows straddle the published 24 hour bound as tightly as a live clock allows.
+    // standing at the old trim horizon reads past the oldest retained record. The rows
+    // straddle the published 24 hour bound as tightly as a live clock allows — with the
+    // same margin the iterator rows above explain, since `seconds_ago` floors the clock
+    // and the handler stamps `now` after the write.
     for (case, record_age_seconds, expect_trimmed) in [
         ("23h old record", 23 * 60 * 60, false),
-        ("just inside 24h", 24 * 60 * 60 - 1, false),
+        ("just inside 24h", 24 * 60 * 60 - 10, false),
         ("just past 24h", 24 * 60 * 60 + 1, true),
         ("25h old record", 25 * 60 * 60, true),
     ] {

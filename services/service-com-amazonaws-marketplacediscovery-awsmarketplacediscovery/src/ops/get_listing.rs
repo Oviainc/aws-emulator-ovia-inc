@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             badges: listing.badges.clone(),
             catalog: state.catalog.clone(),
             categories: listing.categories.clone(),
-            fulfillment_option_summaries: listing.fulfillment_option_summaries.clone(),
+            fulfillment_option_summaries: state.listing_fulfillment_option_summaries(listing),
             highlights: listing.highlights.clone(),
             integration_guide: listing.integration_guide.clone(),
             listing_id: listing.listing_id.clone(),

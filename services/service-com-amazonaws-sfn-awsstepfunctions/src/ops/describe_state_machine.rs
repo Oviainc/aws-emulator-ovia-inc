@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStateMachine
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStateMachine`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a REPORTING operation. It answers from the state machine record
+//! `CreateStateMachine` stored — never from this request and never from a canned
+//! value — and the only write it makes is materialising a deletion the clock has
+//! already made due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStateMachine::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +209,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStateMachine` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStateMachineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStateMachine"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        if crate::state::parse_state_machine_arn(&input.state_machine_arn).is_none() {
+            return Err(DescribeStateMachineErrorModeled::InvalidArn(InvalidArn {
+                message: Some(format!(
+                    "'{}' is not a state machine ARN of this service",
+                    input.state_machine_arn
+                )),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        // Materialising a deletion the clock already owes is the one write a report
+        // may make: it was due at the same instant whether or not anybody called.
+        store.settle(crate::state::now());
+
+        let Some(machine) = store.state_machines.get(&input.state_machine_arn) else {
+            return Err(DescribeStateMachineErrorModeled::StateMachineDoesNotExist(
+                StateMachineDoesNotExist {
+                    message: Some(format!(
+                        "state machine {} does not exist",
+                        input.state_machine_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `includedData` only changes what a KMS-ENCRYPTED definition reports ("you
+        // can call the API with includedData = METADATA_ONLY to get a successful
+        // response without the encrypted definition"). This emulator stores no
+        // encrypted definition, so the stored definition is reported either way.
+        Ok(DescribeStateMachineOutput {
+            state_machine_arn: machine.arn.clone(),
+            name: machine.name.clone(),
+            status: Some(machine.status.clone()),
+            definition: machine.definition.clone(),
+            role_arn: machine.role_arn.clone(),
+            r#type: machine.sm_type.clone(),
+            creation_date: crate::state::to_date_time(machine.creation_date),
+            logging_configuration: machine.logging_configuration.clone(),
+            tracing_configuration: machine.tracing_configuration.clone(),
+            label: None,
+            revision_id: machine.revision_id.clone(),
+            description: machine.description.clone(),
+            encryption_configuration: machine.encryption_configuration.clone(),
+            variable_references: None,
+        })
     }
 }

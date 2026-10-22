@@ -39,6 +39,16 @@ pub fn emulator() -> MultiServiceRouter {
     router
 }
 
+/// The same emulator as [`emulator`], plus the engine its handlers read and write — for
+/// a case that has to arrange state no reasonable number of wire calls would.
+pub fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
 /// What the emulator answered: the HTTP status and the JSON body.
 pub struct Answer {
     pub status: u16,

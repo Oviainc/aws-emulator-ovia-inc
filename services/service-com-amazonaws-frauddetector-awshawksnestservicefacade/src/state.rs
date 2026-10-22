@@ -156,20 +156,38 @@ pub fn rule_arn(region: &str, detector_id: &str, rule_id: &str, rule_version: &s
 
 /// Now, as the ISO-8601 string the model's `time` shape carries (length 11..30).
 ///
-/// Truncated to milliseconds so the rendering stays well inside that bound while keeping
-/// sub-second resolution, and formatted through `aws_smithy_types`' own RFC-3339 writer
-/// rather than a hand-rolled one.
+/// Rendered at FIXED WIDTH, always with exactly three fractional digits
+/// (`1970-01-01T00:00:00.000Z`), through `aws_smithy_types`' own RFC-3339 writer rather
+/// than a hand-rolled one. The width matters: that writer omits the fractional part
+/// when the instant lands on a whole second, and these strings are what the service
+/// stores and returns for `createdTime`/`lastUpdatedTime`, so a variable-width rendering
+/// would make two timestamps of the same record order differently as strings than in
+/// time (`...:52Z` sorts AFTER `...:52.100Z`). Fixed width keeps lexicographic order and
+/// chronological order the same, which is what a client sorting these strings relies on.
 pub fn now_timestamp() -> String {
     let epoch_millis = ::std::time::SystemTime::now()
         .duration_since(::std::time::UNIX_EPOCH)
         .map_or(0_i64, |elapsed| {
             i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
         });
-    ::aws_smithy_types::DateTime::from_millis(epoch_millis)
+    timestamp_of_millis(epoch_millis)
+}
+
+/// The fixed-width ISO-8601 rendering of an epoch-millisecond instant. See
+/// [`now_timestamp`]; split out so the rendering can be exercised across the instants a
+/// clock produces, including the whole seconds the conditional writer renders short.
+pub fn timestamp_of_millis(epoch_millis: i64) -> String {
+    let whole_seconds = epoch_millis.div_euclid(1_000);
+    let millis = epoch_millis.rem_euclid(1_000);
+    let rendered = ::aws_smithy_types::DateTime::from_secs(whole_seconds)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        // An epoch-millisecond instant always renders; the fallback keeps the handler
-        // path infallible rather than turning a clock oddity into a 500.
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+        // A whole-second instant always renders; the fallback keeps the handler path
+        // infallible rather than turning a clock oddity into a 500.
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+    match rendered.strip_suffix('Z') {
+        Some(seconds) => format!("{seconds}.{millis:03}Z"),
+        None => rendered,
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

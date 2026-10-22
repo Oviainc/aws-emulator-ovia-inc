@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a REPORTING operation. It pages the Execution records
+//! `StartExecution` stored for one state machine, most recent first.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +191,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExecutions"))
+        let _ = ctx;
+        // `maxResults` (0..1000), `nextToken` (1..3096), `statusFilter`'s and
+        // `redriveFilter`'s enum membership and every ARN length are modelled, so the
+        // centralized walk has already refused anything outside them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // "You can list all executions related to a state machine by specifying a
+        // state machine Amazon Resource Name (ARN), or those related to a Map Run by
+        // specifying a Map Run ARN" — one of the two, never both and never neither.
+        let (state_machine_arn, map_run_arn) = (
+            input.state_machine_arn.as_deref(),
+            input.map_run_arn.as_deref(),
+        );
+        let state_machine_arn = match (state_machine_arn, map_run_arn) {
+            (Some(arn), None) => arn,
+            (None, Some(map_run)) => {
+                // Map runs are not implemented in this emulator (`DescribeMapRun`,
+                // `ListMapRuns` and `UpdateMapRun` all still answer 501) and no state
+                // this emulator executes starts one, so an ARN naming one names
+                // nothing that exists.
+                return Err(ListExecutionsErrorModeled::ResourceNotFound(ResourceNotFound {
+                    message: Some(format!("map run {map_run} does not exist")),
+                    resource_name: Some(map_run.to_string()),
+                })
+                .into());
+            }
+            (None, None) => {
+                return Err(ListExecutionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "one of stateMachineArn or mapRunArn must be supplied".to_string(),
+                        ),
+                        reason: Some("MISSING_REQUIRED_PARAMETER".to_string()),
+                    },
+                )
+                .into());
+            }
+            (Some(_), Some(_)) => {
+                return Err(ListExecutionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "stateMachineArn and mapRunArn must not both be supplied".to_string(),
+                        ),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+        };
+
+        if crate::state::parse_state_machine_arn(state_machine_arn).is_none() {
+            return Err(ListExecutionsErrorModeled::InvalidArn(InvalidArn {
+                message: Some(format!(
+                    "'{state_machine_arn}' is not a state machine ARN of this service"
+                )),
+            })
+            .into());
+        }
+
+        let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
+            return Err(ListExecutionsErrorModeled::InvalidToken(InvalidToken {
+                message: Some("nextToken is not a token this service issued".to_string()),
+            })
+            .into());
+        };
+        let page = crate::state::page_size(input.max_results);
+
+        let mut store = state.lock();
+        // The one write a report may make: every execution whose terminal status the
+        // clock already owed is reported terminal here.
+        store.settle(crate::state::now());
+
+        let Some(machine) = store.state_machines.get(state_machine_arn) else {
+            return Err(ListExecutionsErrorModeled::StateMachineDoesNotExist(
+                StateMachineDoesNotExist {
+                    message: Some(format!("state machine {state_machine_arn} does not exist")),
+                },
+            )
+            .into());
+        };
+        // "This API action is not supported by EXPRESS state machines."
+        if machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS {
+            return Err(ListExecutionsErrorModeled::StateMachineTypeNotSupported(
+                StateMachineTypeNotSupported {
+                    message: Some(format!(
+                        "ListExecutions does not support the EXPRESS state machine \
+                         {state_machine_arn}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `redriveFilter` selects by whether an execution was redriven.
+        // `RedriveExecution` is not implemented in this emulator, so no stored
+        // execution has been redriven and `REDRIVEN` selects none of them.
+        let redrive_filter = input.redrive_filter.as_deref();
+        let matching: Vec<&crate::state::Execution> = store
+            .executions_newest_first(state_machine_arn)
+            .into_iter()
+            .filter(|execution| {
+                input
+                    .status_filter
+                    .as_deref()
+                    .is_none_or(|status| execution.status == status)
+                    && match redrive_filter {
+                        Some("REDRIVEN") => execution.redrive_count > 0,
+                        Some("NOT_REDRIVEN") => execution.redrive_count == 0,
+                        _ => true,
+                    }
+            })
+            .collect();
+
+        let executions: Vec<ExecutionListItem> = matching
+            .iter()
+            .skip(offset)
+            .take(page)
+            .map(|execution| ExecutionListItem {
+                execution_arn: execution.arn.clone(),
+                state_machine_arn: execution.state_machine_arn.clone(),
+                name: execution.name.clone(),
+                status: execution.status.clone(),
+                start_date: crate::state::to_date_time(execution.start_date),
+                stop_date: execution.stop_date.map(crate::state::to_date_time),
+                map_run_arn: None,
+                item_count: None,
+                state_machine_version_arn: None,
+                state_machine_alias_arn: None,
+                redrive_count: Some(execution.redrive_count),
+                redrive_date: None,
+            })
+            .collect();
+
+        let next_token =
+            crate::state::next_page_token(offset, executions.len(), matching.len());
+        Ok(ListExecutionsOutput {
+            executions,
+            next_token,
+        })
     }
 }
