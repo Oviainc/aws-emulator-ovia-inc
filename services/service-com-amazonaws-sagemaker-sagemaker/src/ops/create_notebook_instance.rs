@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNotebookInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNotebookInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNotebookInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the notebook instance in `crate::state` as `Pending`, with every
+//! member the request left out at the default the model documents for it, and mints its
+//! ARN, its Jupyter URL and its network-interface id. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,6 +157,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The one `DirectInternetAccess` value that needs a `SubnetId` beside it.
+const DIRECT_INTERNET_ACCESS_DISABLED: &str = "Disabled";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -230,18 +228,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNotebookInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNotebookInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNotebookInstance"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::NOTEBOOK_INSTANCE_ARN_KIND,
+            &input.notebook_instance_name,
+        );
+
+        // `DirectInternetAccess`'s doc: "You can set the value of this parameter to
+        // Disabled only if you set a value for the SubnetId parameter." The operation
+        // models no error for a bad request, so this is a 400 `ValidationException`.
+        if input.direct_internet_access.as_deref() == Some(DIRECT_INTERNET_ACCESS_DISABLED)
+            && input.subnet_id.is_none()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "DirectInternetAccess can only be set to Disabled when a SubnetId is provided.",
+            ));
+        }
+
+        let mut store = state.lock();
+        // The name is resolved first: a create naming an instance that already exists
+        // adds no record, so it is a duplicate rather than a request for more capacity.
+        if store
+            .notebook_instances
+            .contains_key(&input.notebook_instance_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Cannot create already existing notebook instance \"{arn}\"."
+            )));
+        }
+        // The store is bounded, so a caller varying `NotebookInstanceName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.notebook_instances_below_quota() {
+            return Err(CreateNotebookInstanceErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for notebook instances is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::NOTEBOOK_INSTANCE_QUOTA,
+                        store.notebook_instances.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Server-generated, so it is minted here and stored: every later read of this
+        // instance reports the same network interface.
+        let network_interface_id = crate::state::mint_network_interface_id();
+        let now = ::std::time::SystemTime::now();
+        store.notebook_instances.insert(
+            input.notebook_instance_name.clone(),
+            crate::state::NotebookInstance {
+                name: input.notebook_instance_name.clone(),
+                arn: arn.clone(),
+                // A fresh instance is still provisioning; the clock owes the move to
+                // `InService`, which the reader materialises once it comes due.
+                status: crate::state::NOTEBOOK_INSTANCE_STATUS_PENDING.to_string(),
+                failure_reason: None,
+                url: crate::state::notebook_instance_url(&region, &input.notebook_instance_name),
+                instance_type: input.instance_type.clone(),
+                ip_address_type: input
+                    .ip_address_type
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string()),
+                subnet_id: input.subnet_id.clone(),
+                security_groups: input.security_group_ids.clone().unwrap_or_default(),
+                role_arn: input.role_arn.clone(),
+                kms_key_id: input.kms_key_id.clone(),
+                network_interface_id,
+                lifecycle_config_name: input.lifecycle_config_name.clone(),
+                direct_internet_access: input
+                    .direct_internet_access
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_DIRECT_INTERNET_ACCESS.to_string()),
+                volume_size_in_gb: input
+                    .volume_size_in_gb
+                    .unwrap_or(crate::state::DEFAULT_VOLUME_SIZE_IN_GB),
+                accelerator_types: input.accelerator_types.clone().unwrap_or_default(),
+                default_code_repository: input.default_code_repository.clone(),
+                additional_code_repositories: input
+                    .additional_code_repositories
+                    .clone()
+                    .unwrap_or_default(),
+                root_access: input
+                    .root_access
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_ROOT_ACCESS.to_string()),
+                platform_identifier: input
+                    .platform_identifier
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_PLATFORM_IDENTIFIER.to_string()),
+                // `MinimumInstanceMetadataServiceVersion`'s doc: on a create that names
+                // no value, "it defaults to IMDSv1".
+                instance_metadata_service_configuration: input
+                    .instance_metadata_service_configuration
+                    .clone()
+                    .unwrap_or_else(|| InstanceMetadataServiceConfiguration {
+                        minimum_instance_metadata_service_version:
+                            crate::state::DEFAULT_IMDS_VERSION.to_string(),
+                    }),
+                tags: input.tags.clone().unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+                in_service_at: now + crate::state::NOTEBOOK_INSTANCE_IN_SERVICE_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateNotebookInstanceOutput {
+            notebook_instance_arn: Some(arn),
+        })
     }
 }

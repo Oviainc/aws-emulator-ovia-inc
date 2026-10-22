@@ -1025,6 +1025,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Lineage artifacts, keyed by `ArtifactArn` — the only identifier `DescribeArtifact`
     /// resolves one by, and the one `CreateArtifact` mints.
     pub artifacts: BTreeMap<String, Artifact>,
+    /// Keyed by `NotebookInstanceName`. See [`NotebookInstance`], at the end of this
+    /// module with the rest of the notebook-instance slice.
+    pub notebook_instances: BTreeMap<String, NotebookInstance>,
     /// Lineage actions, keyed by `ActionArn` — the identifier that carries both the
     /// Region and the name, which is what `ActionName` is documented unique within, so a
     /// name taken in one Region leaves it free in another. See [`Action`], at the end of
@@ -1708,6 +1711,166 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// order against each other without going through a lossy float.
 pub fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
+}
+
+// ---------------------------------------------------------------------------
+// Notebook instances
+//
+// Everything `CreateNotebookInstance` and `DescribeNotebookInstance` need, kept in one
+// block: the record the store holds, the spans and defaults those two operations apply,
+// and the two values the create derives (the Jupyter host and the network-interface id).
+// ---------------------------------------------------------------------------
+
+/// How long after `CreateNotebookInstance` the clock owes the `Pending` -> `InService`
+/// transition. Same shape as [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that describes the
+/// notebook instance straight after creating it still observes `Pending`, one that waits
+/// (as `aws sagemaker wait notebook-instance-in-service` does) observes `InService`.
+/// Real SageMaker takes minutes; the span is compressed, never zero.
+pub const NOTEBOOK_INSTANCE_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
+
+/// See [`MODEL_QUOTA`]: the same emulator-owned bound, for the notebook-instance store.
+pub const NOTEBOOK_INSTANCE_QUOTA: usize = 1_000;
+
+/// The `NotebookInstanceStatus` member a fresh instance carries. The modelled enum also
+/// carries the stop, update, delete and maintenance states, which this slice does not
+/// reach; `InService` is spelled the same as an endpoint's, so [`STATUS_IN_SERVICE`]
+/// stands for both.
+pub const NOTEBOOK_INSTANCE_STATUS_PENDING: &str = "Pending";
+
+/// The IMDS version a notebook instance reports when the create named none:
+/// `MinimumInstanceMetadataServiceVersion`'s doc says that "when passed as part of
+/// `CreateNotebookInstance`, if no value is selected, then it defaults to IMDSv1".
+pub const DEFAULT_IMDS_VERSION: &str = "1";
+
+/// `DirectInternetAccess`'s default. Its `CreateNotebookInstance` doc points at
+/// "Notebook Instances Are Internet-Enabled by Default" and allows `Disabled` only
+/// alongside a `SubnetId`.
+pub const DEFAULT_DIRECT_INTERNET_ACCESS: &str = "Enabled";
+
+/// `RootAccess`'s default: its `CreateNotebookInstance` doc says "the default value is
+/// Enabled".
+pub const DEFAULT_ROOT_ACCESS: &str = "Enabled";
+
+/// `IpAddressType`'s default. AWS's `CreateNotebookInstance` API reference documents the
+/// member as defaulting to IPv4-only connectivity when the request names no value.
+pub const DEFAULT_IP_ADDRESS_TYPE: &str = "ipv4";
+
+/// `PlatformIdentifier`'s default: its `CreateNotebookInstance` doc says "the default
+/// value is notebook-al2023-v1".
+pub const DEFAULT_PLATFORM_IDENTIFIER: &str = "notebook-al2023-v1";
+
+/// `VolumeSizeInGB`'s default: its `CreateNotebookInstance` doc says "the default value
+/// is 5 GB".
+pub const DEFAULT_VOLUME_SIZE_IN_GB: i32 = 5;
+
+/// The resource kind a notebook instance's ARN carries, as `NotebookInstanceArn`'s
+/// documented `arn:aws:sagemaker:<region>:<account>:notebook-instance/<name>` form
+/// spells it. Named once so the create and the reader agree; both pass it to
+/// [`resource_arn`].
+pub const NOTEBOOK_INSTANCE_ARN_KIND: &str = "notebook-instance";
+
+/// The Jupyter host a notebook instance serves on:
+/// `<name>.notebook.<region>.sagemaker.aws`, the host `DescribeNotebookInstance`'s
+/// `Url` carries and `CreatePresignedNotebookInstanceUrl` signs against.
+///
+/// Derived from the instance name and the region the caller signed for, so it is stable
+/// across reads and distinct per instance.
+pub fn notebook_instance_url(region: &str, name: &str) -> String {
+    format!("{name}.notebook.{region}.sagemaker.aws")
+}
+
+/// The id of the network interface `CreateNotebookInstance` reports it created:
+/// `eni-` plus 17 lowercase hex digits, the form EC2 network-interface ids take.
+///
+/// The digits come from this module's one id mint, [`mint_opaque_resource_id`], so an ENI
+/// id is server-generated and derived from nothing in the request, with the same
+/// emulator-grade, non-cryptographic caveats that mint documents: it identifies a record
+/// in this store and is never a secret. `CreateNotebookInstance` mints it ONCE and stores
+/// it, so every later read of the same instance reports the same id.
+pub fn mint_network_interface_id() -> String {
+    let digits = mint_opaque_resource_id();
+    // The mint renders a 32-digit hex id, but the slice is taken defensively so this
+    // helper does not depend on that width: a shorter id is used whole.
+    format!("eni-{}", digits.get(..17).unwrap_or(&digits))
+}
+
+/// A notebook instance created by `CreateNotebookInstance`, as
+/// `DescribeNotebookInstance` replays it.
+///
+/// Every member the create carried is kept as given, so the reader replays the request
+/// rather than re-deriving it; the members the create left out are kept at the default
+/// the model documents for them (the `DEFAULT_*` constants above). `in_service_at` is the
+/// instant the clock owes the `Pending` -> `InService` transition; it is stored, never
+/// slept on, and materialised by whichever reporting call first runs at or after it.
+#[derive(Debug, Clone)]
+pub struct NotebookInstance {
+    pub name: String,
+    pub arn: String,
+    pub status: String,
+    /// Why the instance failed, for the `Failed` status. No implemented operation moves
+    /// an instance there yet (the stop, start and update operations are still stubs), so
+    /// it is stored `None` and reported absent.
+    pub failure_reason: Option<String>,
+    /// The Jupyter host the instance serves on, minted at create from the name and the
+    /// signed region (see [`notebook_instance_url`]).
+    pub url: String,
+    pub instance_type: String,
+    pub ip_address_type: String,
+    pub subnet_id: Option<String>,
+    pub security_groups: Vec<String>,
+    pub role_arn: String,
+    pub kms_key_id: Option<String>,
+    /// The id of the network interface the create minted for the instance.
+    pub network_interface_id: String,
+    pub lifecycle_config_name: Option<String>,
+    pub direct_internet_access: String,
+    pub volume_size_in_gb: i32,
+    pub accelerator_types: Vec<String>,
+    pub default_code_repository: Option<String>,
+    pub additional_code_repositories: Vec<String>,
+    pub root_access: String,
+    pub platform_identifier: String,
+    pub instance_metadata_service_configuration:
+        crate::ops::types::InstanceMetadataServiceConfiguration,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub in_service_at: SystemTime,
+}
+
+impl NotebookInstance {
+    /// Materialise the `Pending` -> `InService` transition the clock already owes, the
+    /// way [`Endpoint::settle_status`] does for an endpoint: it was due at
+    /// `in_service_at` whether or not anybody called, and `LastModifiedTime` moves to
+    /// the instant it was due rather than to "now", so the value is stable across later
+    /// reads.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == NOTEBOOK_INSTANCE_STATUS_PENDING && now >= self.in_service_at {
+            self.status = STATUS_IN_SERVICE.to_string();
+            self.last_modified_time = self.in_service_at;
+            return true;
+        }
+        false
+    }
+
+    /// Whether the instance has finished provisioning, i.e. it is past `Pending`.
+    ///
+    /// A `Pending` instance has no Jupyter endpoint and no network interface to report
+    /// yet, so `DescribeNotebookInstance` omits `Url` and `NetworkInterfaceId` until it
+    /// is provisioned.
+    pub fn is_provisioned(&self) -> bool {
+        self.status != NOTEBOOK_INSTANCE_STATUS_PENDING
+    }
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another notebook instance fits, i.e. the store is below
+    /// [`NOTEBOOK_INSTANCE_QUOTA`].
+    pub fn notebook_instances_below_quota(&self) -> bool {
+        self.notebook_instances.len() < NOTEBOOK_INSTANCE_QUOTA
+    }
 }
 
 // ---------------------------------------------------------------------------
