@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddPermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddPermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Grants a principal permission to use a function, by appending one statement to the
+//! function's resource-based policy — the slice `crate::state::PolicyRecord` holds and
+//! `GetPolicy` reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddPermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this handler writes is exactly what the request described: the statement's
+//! `Sid`, `Action`, `Principal` and `Resource` come from the request and the resolved
+//! record, and every optional member becomes the condition key that expresses it (see
+//! [`crate::state::PolicyStatement`]). The policy is attached to the ARN the permission
+//! names, so an unqualified call writes the function-level policy and a qualified one
+//! writes that version's or alias's.
+//!
+//! Refusals, each from the state the store holds rather than from the shape of the
+//! request: an unknown function or version is a `ResourceNotFoundException`; a
+//! `StatementId` the policy already holds is a `ResourceConflictException`; a
+//! `RevisionId` that does not match the policy's current revision is a
+//! `PreconditionFailedException`; a call that would push the document past the published
+//! 20 KB quota is a `PolicyLengthExceededException`; and `$LATEST` named as the
+//! qualifier is an `InvalidParameterValueException`, because "Lambda does not support
+//! adding policies to version $LATEST".
+//!
+//! `PublicPolicyException` is not answered here: whether a grant counts as public access
+//! depends on the account's block-public-access setting, which this emulator does not
+//! model, so no call is refused for a setting nothing holds.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +229,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddPermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddPermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddPermission"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddPermissionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // The qualifier the request named, as opposed to the `$LATEST` an unqualified
+        // request resolves to: it may come from the `FunctionName` or from the
+        // `Qualifier` parameter, and `resolve_function` below refuses a pair that names
+        // two different ones.
+        let named_qualifier = crate::state::parse_function_reference(&input.function_name)
+            .and_then(|reference| reference.qualifier);
+        let requested_qualifier = input
+            .qualifier
+            .clone()
+            .or(named_qualifier)
+            .filter(|qualifier| !qualifier.is_empty());
+
+        let mut store = state.lock();
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                AddPermissionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                AddPermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(message),
+                })
+            }
+        })?;
+
+        // "Lambda does not support adding policies to version $LATEST", so a request
+        // that names the unpublished version as its qualifier is refused rather than
+        // silently attached to the function.
+        if requested_qualifier.as_deref() == Some(crate::state::VERSION_LATEST) {
+            return Err(AddPermissionErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(format!(
+                        "We currently do not support adding policies for {}.",
+                        crate::state::VERSION_LATEST
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The ARN the permission is granted on, which is the statement's `Resource`.
+        let resource = record.versioned_arn(&version);
+
+        // Worked on a copy of the stored policy, so a refused call leaves the policy
+        // exactly as it was — including the revision a later precondition is checked
+        // against.
+        let mut policy = record.policies.get(&version).cloned().unwrap_or_default();
+
+        if policy.holds(&input.statement_id) {
+            return Err(AddPermissionErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    r#type: None,
+                    message: Some(format!(
+                        "The statement id ({}) provided already exists. Please provide a new \
+                         statement id, or remove the existing statement.",
+                        input.statement_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Update the policy only if the revision ID matches the ID that's specified."
+        // The id to match is the policy's own, which is the one `GetPolicy` reports; a
+        // function with no policy yet is at no revision, so any expectation fails.
+        if let Some(expected) = &input.revision_id {
+            let current = record
+                .policies
+                .get(&version)
+                .map(|stored| stored.revision_id.clone());
+            if current.as_deref() != Some(expected.as_str()) {
+                return Err(AddPermissionErrorModeled::PreconditionFailedException(
+                    PreconditionFailedException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The RevisionId ({expected}) provided does not match the latest \
+                             RevisionId for the resource {resource}. Call GetPolicy to retrieve \
+                             the latest RevisionId for your resource."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let statement = crate::state::PolicyStatement {
+            sid: input.statement_id.clone(),
+            action: input.action.clone(),
+            principal: input.principal.clone(),
+            resource: resource.clone(),
+            source_arn: input.source_arn.clone(),
+            source_account: input.source_account.clone(),
+            principal_org_id: input.principal_org_id.clone(),
+            event_source_token: input.event_source_token.clone(),
+            function_url_auth_type: input.function_url_auth_type.clone(),
+            invoked_via_function_url: input.invoked_via_function_url,
+        };
+        // "The permission statement that's added to the function policy" is what this
+        // call answers with, so it is rendered once and both stored and reported.
+        let added = statement.to_json();
+        policy.statements.push(statement);
+
+        let size = policy.to_json().len();
+        if size > crate::state::MAX_POLICY_SIZE_BYTES {
+            return Err(AddPermissionErrorModeled::PolicyLengthExceededException(
+                PolicyLengthExceededException {
+                    r#type: None,
+                    message: Some(format!(
+                        "The resource policy of {resource} would be {size} bytes, past the \
+                         maximum of {} bytes.",
+                        crate::state::MAX_POLICY_SIZE_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The policy changed, so it is at a new revision.
+        policy.revision_id = crate::state::mint_revision_id();
+        record.policies.insert(version, policy);
+
+        Ok(AddPermissionOutput {
+            statement: Some(added),
+        })
     }
 }
