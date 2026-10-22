@@ -73,6 +73,101 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// `Filters` key, whatever a particular forecast's series carry.
 pub const ITEM_KEY: &str = "item_id";
 
+/// The ARN namespace every Amazon Forecast resource lives in — the 3rd field of its ARN.
+///
+/// Both this runtime service and the Forecast control plane declare `arnNamespace:
+/// forecast` (Smithy `service_info`), so it is the only namespace an ARN either query
+/// operation can resolve, whatever the request's partition, region or account.
+pub const ARN_NAMESPACE: &str = "forecast";
+
+/// What an ARN must NAME for one of this service's operations to resolve it.
+///
+/// An Amazon Forecast ARN is
+/// `arn:<partition>:forecast:<region>:<account>:<type>/<name…>`, and the resource TYPE
+/// plus the number of name segments after it is what tells one Forecast resource from
+/// another — the model's `^arn:([a-z\d-]+):forecast:.*:.*:.+$` pattern admits them all
+/// equally, so the boundary validator cannot:
+///
+/// * a forecast is `forecast/<forecastName>` — ONE name, which is why `ForecastArn`
+///   targets the model's `Arn` (max 256);
+/// * a what-if forecast is `what-if-forecast/<whatIfAnalysisName>/<whatIfForecastName>`
+///   — TWO names, because a what-if forecast's name is "unique within each what-if
+///   analysis" (the control plane's `CreateWhatIfForecast.WhatIfForecastName` doc), so
+///   its ARN carries the analysis it belongs to as well. That nesting is why
+///   `WhatIfForecastArn` is the one Forecast ARN that targets the longer `LongArn`
+///   (max 300) while even the what-if ANALYSIS's own ARN is an `Arn` (max 256).
+///
+/// An ARN that does not name a resource of the kind an operation queries cannot identify
+/// one, however the store is filled, so it is invalid input (400) rather than a resource
+/// that happens to be absent (404). The store's answer — does a resource of that kind
+/// exist under this ARN — is what separates the 404 from a 200.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceKind {
+    /// The request member the ARN arrives in, named in the rejection message.
+    pub member: &'static str,
+    /// The ARN's resource type: the segment before the first `/` of its resource field.
+    pub resource_type: &'static str,
+    /// How many non-empty `/`-separated name segments follow that type.
+    pub name_segments: usize,
+    /// The whole ARN form, quoted back in the rejection message so a caller can see what
+    /// the member expects.
+    pub form: &'static str,
+}
+
+/// The resource `QueryForecast`'s `ForecastArn` must name.
+pub const FORECAST: ResourceKind = ResourceKind {
+    member: "ForecastArn",
+    resource_type: "forecast",
+    name_segments: 1,
+    form: "arn:<partition>:forecast:<region>:<account>:forecast/<forecastName>",
+};
+
+/// The resource `QueryWhatIfForecast`'s `WhatIfForecastArn` must name.
+pub const WHAT_IF_FORECAST: ResourceKind = ResourceKind {
+    member: "WhatIfForecastArn",
+    resource_type: "what-if-forecast",
+    name_segments: 2,
+    form: "arn:<partition>:forecast:<region>:<account>:\
+           what-if-forecast/<whatIfAnalysisName>/<whatIfForecastName>",
+};
+
+impl ResourceKind {
+    /// Whether `arn` NAMES a resource of this kind: the Forecast ARN namespace, this
+    /// resource type, and this type's name depth with no empty name.
+    ///
+    /// Says nothing about whether such a resource exists — that is the store's answer.
+    /// Nothing here judges a partition, a region, an account or a name's spelling: those
+    /// are values the control plane chose, and an ARN carrying ones this emulator never
+    /// minted is simply a resource it does not hold.
+    pub fn names(&self, arn: &str) -> bool {
+        // `splitn(6, ..)` so a `:` inside the resource field stays part of it, exactly as
+        // an ARN is read.
+        let fields: Vec<&str> = arn.splitn(6, ':').collect();
+        let [prefix, partition, namespace, _region, _account, resource] = fields.as_slice()
+        else {
+            return false;
+        };
+        if *prefix != "arn" || partition.is_empty() || *namespace != ARN_NAMESPACE {
+            return false;
+        }
+        let mut segments = resource.split('/');
+        if segments.next() != Some(self.resource_type) {
+            return false;
+        }
+        let names: Vec<&str> = segments.collect();
+        names.len() == self.name_segments && names.iter().all(|name| !name.is_empty())
+    }
+
+    /// The `Message` for an ARN that names no resource of this kind, built from the
+    /// request so a caller can fix it.
+    pub fn rejection_message(&self, arn: &str) -> String {
+        format!(
+            "The value is invalid: {} '{}' does not name a {}. A {} ARN has the form {}.",
+            self.member, arn, self.resource_type, self.resource_type, self.form
+        )
+    }
+}
+
 /// One `{Timestamp, Value}` of a stored time series.
 ///
 /// `timestamp` uses the format the model documents for every date in this service:

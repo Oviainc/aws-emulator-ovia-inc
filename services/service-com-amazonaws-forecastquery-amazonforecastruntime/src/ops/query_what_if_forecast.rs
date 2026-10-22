@@ -30,6 +30,18 @@
 //! pattern or length never reaches a lookup and is refused with `InvalidInputException`
 //! (see `crate::service::override_refusal`).
 //!
+//! ## The ARN must NAME a what-if forecast
+//!
+//! That syntax check is the modelled pattern, which admits every Amazon Forecast ARN
+//! equally — so it cannot tell a what-if forecast from a plain forecast or a what-if
+//! analysis. This handler therefore also requires the ARN to NAME a what-if forecast:
+//! `what-if-forecast/<whatIfAnalysisName>/<whatIfForecastName>` in the `forecast` ARN
+//! namespace (see [`crate::state::WHAT_IF_FORECAST`]). An ARN that does not identifies no
+//! what-if forecast however the store is filled, so it is answered with the same modelled
+//! `InvalidInputException` (400) as an unreadable one, BEFORE resource resolution;
+//! `ResourceNotFoundException` (404) stays reserved for an ARN that does name a what-if
+//! forecast and that the store holds nothing under.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
@@ -164,6 +176,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+
+        // `WhatIfForecastArn` must NAME a what-if forecast — type `what-if-forecast` and
+        // the analysis/forecast name pair its ARNs carry (see
+        // [`crate::state::WHAT_IF_FORECAST`]). The modelled pattern admits every Amazon
+        // Forecast ARN equally, so an ARN that names a plain forecast, or a what-if
+        // forecast ARN missing its analysis, identifies no what-if forecast at all,
+        // whatever the store holds: invalid input rather than an absent resource.
+        if !crate::state::WHAT_IF_FORECAST.names(&input.what_if_forecast_arn) {
+            return Err(QueryWhatIfForecastErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::WHAT_IF_FORECAST
+                            .rejection_message(&input.what_if_forecast_arn),
+                    ),
+                },
+            )
+            .into());
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is keyed on the shared `InMemoryEngine`; mounted on any other

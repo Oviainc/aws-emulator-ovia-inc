@@ -726,8 +726,11 @@ async fn filters_select_the_stored_series_by_its_dimensions() {
 // ---------------------------------------------------------------------------
 
 /// An ARN this service holds no forecast for is `ResourceNotFoundException` (404) in the
-/// awsJson1_1 error shape — including an ARN that only the OTHER operation's store knows,
-/// and one whose forecast was removed.
+/// awsJson1_1 error shape — including one whose forecast was removed.
+///
+/// An ARN that names a resource of the OTHER kind is a different answer: it identifies no
+/// resource this operation can resolve at all, so it is `InvalidInputException` (400) —
+/// see `arn_resource_kinds.rs`, which is where that rule is pinned.
 #[tokio::test]
 async fn an_arn_no_forecast_is_stored_under_is_not_found() {
     let (engine, router) = harness();
@@ -750,17 +753,6 @@ async fn an_arn_no_forecast_is_stored_under_is_not_found() {
             "unknown what-if forecast",
             "QueryWhatIfForecast",
             arn("what-if-forecast/never-created/variant"),
-        ),
-        // A what-if ARN is not a forecast ARN, and the reverse.
-        (
-            "what-if ARN through QueryForecast",
-            "QueryForecast",
-            what_if_arn.clone(),
-        ),
-        (
-            "forecast ARN through QueryWhatIfForecast",
-            "QueryWhatIfForecast",
-            forecast_arn.clone(),
         ),
         // A different partition and region: still not an ARN this store holds.
         (
@@ -1114,16 +1106,19 @@ async fn a_what_if_forecast_answers_its_own_transformed_series() {
 // ---------------------------------------------------------------------------
 
 /// A resource ARN is READ before it is RESOLVED: an ARN outside its modelled pattern or
-/// length is the modelled `InvalidInputException` (400), while an ARN that is well-formed
-/// but names nothing is `ResourceNotFoundException` (404). Both operations, over a set of
-/// malformed forms.
+/// length, or one that names no resource of the kind the operation queries, is the
+/// modelled `InvalidInputException` (400), while an ARN that does name one and happens to
+/// name nothing stored is `ResourceNotFoundException` (404). Both operations, over a set
+/// of malformed forms.
 ///
 /// The malformed rows are forms the pattern `^arn:([a-z\d-]+):forecast:.*:.*:.+$` and the
 /// length bound (`Arn` 0..256, `LongArn` 0..300) reject — the constraint source is
 /// `smithy_query(query="closure",operation="QueryForecast,QueryWhatIfForecast")` — and
 /// each is a DIFFERENT way of being outside them: not an ARN at all, another service's
 /// ARN, an empty resource part, a partition outside the character class, and one past the
-/// member's own maximum length. The well-formed rows differ only in naming nothing.
+/// member's own maximum length. The well-formed rows differ only in naming nothing; each
+/// one names a resource of the KIND its operation queries, which `arn_resource_kinds.rs`
+/// pins separately (an ARN of any other kind is the 400, not the 404).
 #[tokio::test]
 async fn an_arn_outside_its_modelled_syntax_is_invalid_input_before_any_lookup() {
     let (engine, router) = harness();
@@ -1140,6 +1135,13 @@ async fn an_arn_outside_its_modelled_syntax_is_invalid_input_before_any_lookup()
         name: &'static str,
         arn_member: &'static str,
         max_length: usize,
+        /// The resource prefix an ARN of the kind this operation queries carries, up to
+        /// and including the `/` the resource NAME follows: `forecast/<forecastName>` for
+        /// a forecast, `what-if-forecast/<whatIfAnalysisName>/<whatIfForecastName>` for a
+        /// what-if forecast (see `crate::state::ResourceKind`). A well-formed row must
+        /// start from its own operation's prefix, or it names no resource this operation
+        /// could resolve and is the 400 instead.
+        resource_prefix: &'static str,
     }
 
     let operations: [Operation; 2] = [
@@ -1147,11 +1149,13 @@ async fn an_arn_outside_its_modelled_syntax_is_invalid_input_before_any_lookup()
             name: "QueryForecast",
             arn_member: "ForecastArn",
             max_length: 256,
+            resource_prefix: "forecast/",
         },
         Operation {
             name: "QueryWhatIfForecast",
             arn_member: "WhatIfForecastArn",
             max_length: 300,
+            resource_prefix: "what-if-forecast/absent/",
         },
     ];
 
@@ -1160,6 +1164,7 @@ async fn an_arn_outside_its_modelled_syntax_is_invalid_input_before_any_lookup()
             name,
             arn_member,
             max_length,
+            resource_prefix,
         } = operation;
         // (case, the ARN sent, expected status, expected code)
         let mut rows: Vec<(String, String, u16, &str)> = vec![
@@ -1188,18 +1193,23 @@ async fn an_arn_outside_its_modelled_syntax_is_invalid_input_before_any_lookup()
                 "InvalidInputException",
             ),
             (
-                // Well-formed, and nothing is stored under it: resolution, not syntax.
+                // Well-formed, of this operation's own resource kind, and nothing is
+                // stored under it: resolution, not syntax.
                 "well-formed but absent".to_string(),
-                arn("forecast/absent-everywhere"),
+                arn(&format!("{resource_prefix}absent-everywhere")),
                 404,
                 "ResourceNotFoundException",
             ),
         ];
         // One character past this member's own maximum length — a bound, so it is tested
         // at the bound (which must be accepted as syntax and resolve to a 404) and one
-        // past it (refused as invalid input).
-        let resource = "x".repeat(max_length);
-        let at_bound = format!("arn:aws:forecast:us-east-1:000000000000:{resource}");
+        // past it (refused as invalid input). The name is padded out from this
+        // operation's own resource prefix, so the row tests the LENGTH bound and nothing
+        // else.
+        let at_bound = arn(&format!(
+            "{resource_prefix}{}",
+            "x".repeat(max_length)
+        ));
         let at_bound = at_bound[..max_length].to_string();
         rows.push((
             "exactly at the maximum length".to_string(),

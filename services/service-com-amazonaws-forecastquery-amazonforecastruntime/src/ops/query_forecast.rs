@@ -26,6 +26,18 @@
 //! pattern or length never reaches a lookup and is refused with `InvalidInputException`
 //! (see `crate::service::override_refusal`).
 //!
+//! ## The ARN must NAME a forecast
+//!
+//! That syntax check is the modelled pattern, which admits every Amazon Forecast ARN
+//! equally — so it cannot tell a forecast from a predictor, a dataset or a what-if
+//! forecast. This handler therefore also requires the ARN to NAME a forecast:
+//! `forecast/<forecastName>` in the `forecast` ARN namespace (see
+//! [`crate::state::FORECAST`]). An ARN that does not identifies no forecast however the
+//! store is filled, so it is answered with the same modelled `InvalidInputException`
+//! (400) as an unreadable one, BEFORE resource resolution; `ResourceNotFoundException`
+//! (404) stays reserved for an ARN that does name a forecast and that the store holds
+//! nothing under.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
@@ -166,6 +178,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+
+        // `ForecastArn` must NAME a forecast: the modelled pattern admits every Amazon
+        // Forecast ARN equally, so the resource type and depth are checked here. An ARN
+        // that names some other Forecast resource identifies no forecast at all, whatever
+        // the store holds, so it is invalid input rather than an absent resource.
+        if !crate::state::FORECAST.names(&input.forecast_arn) {
+            return Err(QueryForecastErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::FORECAST.rejection_message(&input.forecast_arn),
+                    ),
+                },
+            )
+            .into());
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is keyed on the shared `InMemoryEngine`; mounted on any other
