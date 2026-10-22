@@ -31,14 +31,15 @@
 //! Nothing here is derived from a digest, echoed from the request, or randomised: a
 //! block only ever describes text that was actually read out of the document.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Block, BoundingBox, Document, DocumentLocation, DocumentMetadata, Geometry,
-    NotificationChannel, OutputConfig, Point, Relationship, Warning, FEATURE_TYPE_VALUES,
+    NotificationChannel, OutputConfig, Point, Relationship, Warning, AUTO_UPDATE_VALUES,
+    FEATURE_TYPE_VALUES,
 };
 
 /// The value Textract reports as `DetectDocumentTextModelVersion`.
@@ -85,6 +86,29 @@ pub const MAX_STORED_DOCUMENTS: usize = 256;
 /// The oldest job (and the idempotency entry that named it) is evicted.
 pub const MAX_STORED_JOBS: usize = 256;
 
+/// How many adapters this service keeps.
+///
+/// NOT an AWS value: an emulator-side ceiling so a caller cannot grow the heap without
+/// end. Unlike the document and job stores, nothing here is evicted — an adapter is a
+/// control-plane resource a later call must still be able to read — so a create that
+/// would exceed the ceiling is refused with the modelled `ServiceQuotaExceededException`.
+pub const MAX_STORED_ADAPTERS: usize = 1000;
+
+/// The `AutoUpdate` an adapter carries when the caller names none.
+///
+/// AWS, on `CreateAdapter`: "You can choose whether or not the adapter should be
+/// AutoUpdated with the AutoUpdate argument. By default, AutoUpdate is set to DISABLED."
+pub const DEFAULT_AUTO_UPDATE: &str = "DISABLED";
+
+/// The only `FeatureType` an adapter can be trained on.
+///
+/// AWS, on `CreateAdapterRequest$FeatureTypes`: "The type of feature that the adapter is
+/// being trained on. Currrenly, supported feature types are: QUERIES".
+pub const ADAPTER_FEATURE_TYPE: &str = "QUERIES";
+
+/// Characters in a minted `AdapterId`, inside `AdapterId`'s modelled `12..1011` length.
+const ADAPTER_ID_LEN: usize = 32;
+
 /// The `Confidence` every block reports.
 ///
 /// This emulator READS a document's text rather than recognising it, so there is no
@@ -116,6 +140,17 @@ pub struct ComAmazonawsTextractTextractState {
     /// Monotonic counter mixed into a minted `JobId` so two starts of the same
     /// document never collide.
     pub next_job_seq: u64,
+    /// Every adapter `CreateAdapter` has minted, keyed by its `AdapterId`. Bounded by
+    /// [`MAX_STORED_ADAPTERS`]; nothing is evicted from it.
+    pub adapters: HashMap<String, AdapterRecord>,
+    /// `ClientRequestToken` -> `AdapterId`, backing `CreateAdapter` idempotency.
+    ///
+    /// Separate from [`Self::idempotency`], which names JOBS and is pruned when a job is
+    /// evicted: an adapter token must keep resolving for as long as its adapter exists.
+    pub adapter_idempotency: HashMap<String, String>,
+    /// Monotonic counter mixed into a minted `AdapterId` so two creates of the same
+    /// adapter name never collide.
+    pub next_adapter_seq: u64,
 }
 
 impl ComAmazonawsTextractTextractState {
@@ -208,6 +243,46 @@ impl ComAmazonawsTextractTextractState {
         self.jobs.insert(job.job_id.clone(), job);
     }
 
+    /// The adapter a `ClientRequestToken` already names, if that token has been used.
+    ///
+    /// A token whose adapter is gone resolves to `None`, so the token can be used again
+    /// rather than answering with an `AdapterId` that no longer reads back.
+    pub fn adapter_for_token(&self, token: &str) -> Option<&AdapterRecord> {
+        self.adapter_idempotency
+            .get(token)
+            .and_then(|adapter_id| self.adapters.get(adapter_id))
+    }
+
+    /// Mint an `AdapterId`: [`ADAPTER_ID_LEN`] hex characters, inside `AdapterId`'s
+    /// modelled `12..1011` length. Re-mints on the (practically impossible) collision
+    /// rather than overwriting a live adapter.
+    pub fn mint_adapter_id(&mut self, adapter_name: &str) -> String {
+        loop {
+            self.next_adapter_seq = self.next_adapter_seq.wrapping_add(1);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let digest = hex::encode(Sha256::digest(
+                format!("{adapter_name}|{}|{nanos}", self.next_adapter_seq).as_bytes(),
+            ));
+            let adapter_id: String = digest.chars().take(ADAPTER_ID_LEN).collect();
+            if !self.adapters.contains_key(&adapter_id) {
+                return adapter_id;
+            }
+        }
+    }
+
+    /// Store `adapter` under its own id, and under its `ClientRequestToken` when it
+    /// carried one, so a replay of that token answers with this adapter.
+    pub fn insert_adapter(&mut self, adapter: AdapterRecord) {
+        if let Some(token) = adapter.client_request_token.clone() {
+            self.adapter_idempotency
+                .insert(token, adapter.adapter_id.clone());
+        }
+        self.adapters.insert(adapter.adapter_id.clone(), adapter);
+    }
+
     /// Mint a `JobId`: 64 hex characters, within `JobId`'s `1..64` length and its
     /// `^[a-zA-Z0-9-_]+$` pattern.
     pub fn mint_job_id(&mut self, document_key: &str) -> String {
@@ -220,6 +295,46 @@ impl ComAmazonawsTextractTextractState {
             format!("{document_key}|{}|{nanos}", self.next_job_seq).as_bytes(),
         ))
     }
+}
+
+/// An adapter created by `CreateAdapter`, as `GetAdapter` reports it back.
+#[derive(Debug, Clone)]
+pub struct AdapterRecord {
+    /// The id this service minted for the adapter. Its identity.
+    pub adapter_id: String,
+    pub adapter_name: String,
+    pub description: Option<String>,
+    /// The feature types the adapter is trained on, as the create request listed them.
+    pub feature_types: Vec<String>,
+    /// `ENABLED` or `DISABLED`; [`DEFAULT_AUTO_UPDATE`] when the request named none.
+    pub auto_update: String,
+    pub tags: HashMap<String, String>,
+    /// When this service created the adapter, reported as `CreationTime`.
+    pub created_at: SystemTime,
+    /// The `ClientRequestToken` the create carried, if any.
+    pub client_request_token: Option<String>,
+}
+
+impl AdapterRecord {
+    /// Whether `other` describes the SAME create request as this adapter was made from.
+    ///
+    /// This is the comparison `IdempotentParameterMismatchException` is about: a reused
+    /// token is idempotent only when every member that shapes the adapter agrees.
+    /// `FeatureTypes` is compared as a SET, because the list is which features the
+    /// adapter is trained on and not an ordering the resource keeps.
+    pub fn same_request_as(&self, other: &AdapterRecord) -> bool {
+        self.adapter_name == other.adapter_name
+            && self.description == other.description
+            && self.auto_update == other.auto_update
+            && self.tags == other.tags
+            && feature_type_set(&self.feature_types) == feature_type_set(&other.feature_types)
+    }
+}
+
+/// A `FeatureTypes` list as the set it denotes, so order and repetition do not make two
+/// otherwise identical requests look different.
+fn feature_type_set(feature_types: &[String]) -> BTreeSet<&str> {
+    feature_types.iter().map(String::as_str).collect()
 }
 
 /// A document this service has read, and the text it holds.
@@ -468,6 +583,51 @@ pub fn parse_features(values: &[String]) -> Result<FeatureSet, FeatureError> {
         }
     }
     Ok(features)
+}
+
+// ---------------------------------------------------------------------------
+// Adapter inputs
+// ---------------------------------------------------------------------------
+
+/// Read a `FeatureTypes` list as an ADAPTER's feature set.
+///
+/// A narrower rule than [`parse_features`], which reads the list an analysis request
+/// carries: an adapter can only be trained on the feature types the service supports for
+/// adapters, which is [`ADAPTER_FEATURE_TYPE`] alone. `Err` carries the reason, which the
+/// caller answers with the modelled `InvalidParameterException`.
+pub fn validate_adapter_features(feature_types: &[String]) -> Result<(), String> {
+    if feature_types.is_empty() {
+        return Err(
+            "FeatureTypes must name at least one feature type for the adapter to be trained on"
+                .to_string(),
+        );
+    }
+    for value in feature_types {
+        if value != ADAPTER_FEATURE_TYPE {
+            return Err(format!(
+                "FeatureTypes value '{value}' cannot be used to train an adapter; the only \
+                 supported feature type is {ADAPTER_FEATURE_TYPE}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `AutoUpdate` an adapter carries for `value`, defaulting per
+/// [`DEFAULT_AUTO_UPDATE`] when the request named none.
+///
+/// `Err` carries the reason for a value outside the modelled `AutoUpdate` enum, which the
+/// caller answers with the modelled `InvalidParameterException`.
+pub fn adapter_auto_update(value: Option<&str>) -> Result<String, String> {
+    match value {
+        None => Ok(DEFAULT_AUTO_UPDATE.to_string()),
+        // `AUTO_UPDATE_VALUES` is the AutoUpdate enum from the Smithy model.
+        Some(value) if AUTO_UPDATE_VALUES.contains(&value) => Ok(value.to_string()),
+        Some(value) => Err(format!(
+            "AutoUpdate value '{value}' is not one of {}",
+            AUTO_UPDATE_VALUES.join(" | ")
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
