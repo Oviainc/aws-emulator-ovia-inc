@@ -456,6 +456,29 @@ pub fn certificate_id_from_arn(arn: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
+/// The `InvalidArnException` message for an ARN that is not an ACM certificate ARN,
+/// built from the ARN the request asked for.
+///
+/// `InvalidArnException` carries one modelled member (`message: String`) and the model
+/// documents no text for it, so the sentence comes from ACM's recorded behaviour: the
+/// requested ARN followed by `is not a valid ARN`. Rendered here so every
+/// certificate-lookup path reports the same sentence.
+pub fn invalid_arn_message(certificate_arn: &str) -> String {
+    format!("{certificate_arn} is not a valid ARN")
+}
+
+/// The `ResourceNotFoundException` message for an ACM certificate ARN that no stored
+/// record answers to, built from the ARN the request asked for.
+///
+/// `ResourceNotFoundException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence comes from ACM's recorded
+/// behaviour: one complete sentence naming the requested ARN and terminated by a
+/// period. Every operation that resolves a certificate ARN renders it here, so the
+/// template cannot drift between the lookup paths.
+pub fn certificate_not_found_message(certificate_arn: &str) -> String {
+    format!("Could not find certificate {certificate_arn}.")
+}
+
 /// A wall-clock instant as the modelled `TStamp`.
 pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at

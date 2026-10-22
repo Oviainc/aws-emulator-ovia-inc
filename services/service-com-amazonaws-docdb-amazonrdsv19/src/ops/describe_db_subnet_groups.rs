@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBSubnetGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBSubnetGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the subnet groups in this service's state — all of
+//! them, or the one `DBSubnetGroupName` names, which is the modelled 404 when state holds
+//! no such group.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBSubnetGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBSubnetGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBSubnetGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBSubnetGroups"))
+        use crate::state as docdb;
+
+        let _ = ctx;
+        let page_size =
+            docdb::page_size(input.max_records).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // `Filters`: "This parameter is not currently supported", so a request that carries
+        // one is refused rather than served as though the filter had been applied. Checked
+        // before anything else is resolved, so a request that is wrong in two ways is
+        // answered on the parameter this service cannot honour at all — the same order
+        // `describe_db_cluster_parameter_groups.rs` uses.
+        if input.filters.iter().flatten().next().is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Filters is not currently supported by DescribeDBSubnetGroups",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let store = state.lock();
+
+        // "If a DBSubnetGroupName is specified, the list will contain only the descriptions
+        // of the specified DBSubnetGroup" — and a name that names nothing in state is the
+        // modelled 404 rather than an empty page.
+        let selected: Vec<String> = match &input.db_subnet_group_name {
+            Some(requested) => {
+                let Some(key) = store.resolve_subnet_group_key(requested) else {
+                    return Err(
+                        DescribeDBSubnetGroupsErrorModeled::DBSubnetGroupNotFoundFault(
+                            DBSubnetGroupNotFoundFault {
+                                message: Some(format!(
+                                    "DBSubnetGroup not found: {requested}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                vec![key]
+            }
+            None => store.subnet_groups.keys().cloned().collect(),
+        };
+
+        let (page, marker) = docdb::paginate(&selected, input.marker.as_deref(), page_size);
+        let db_subnet_groups = page
+            .iter()
+            .filter_map(|key| store.subnet_groups.get(key))
+            .map(docdb::DbSubnetGroupRecord::to_shape)
+            .collect();
+
+        Ok(DescribeDBSubnetGroupsOutput {
+            marker,
+            db_subnet_groups: Some(db_subnet_groups),
+        })
     }
 }

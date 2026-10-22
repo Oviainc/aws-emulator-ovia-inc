@@ -12,6 +12,10 @@
 //! the rule generalises over, with each published bound and one step past it. Every rule's
 //! source is the Smithy model member documentation, cited on the constant it feeds in
 //! `src/state.rs`.
+//!
+//! The wire harness below ([`Docdb`], [`texts`] and the readers around them) is shared with
+//! the other suites in this target — see `tests/all/subnet_and_parameter_groups.rs` — so
+//! every suite drives the service exactly the same way.
 
 use std::sync::Arc;
 
@@ -21,26 +25,37 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below signs for; the ARNs and endpoint host names the service
 /// reports must sit in it.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The awsQuery API version an SDK sends with every DocumentDB request.
-const API_VERSION: &str = "2014-10-31";
+pub(crate) const API_VERSION: &str = "2014-10-31";
 
 /// One emulated DocumentDB behind a router, driven over the wire.
-struct Docdb {
+///
+/// This router carries ONLY the DocumentDB service, so a request reaches it by naming
+/// DocumentDB itself ([`ROUTE_KEY`]) — the shared `rds` signing name resolves to Amazon RDS
+/// (see `src/service.rs`). The shared front door's own path — an `rds`-signed request whose
+/// resource this model serves — cannot be mounted from this crate (the RDS crate depends on
+/// this one), so it is pinned in
+/// `core/router/tests/all/rds_shared_query_front_door_routing.rs` instead.
+pub(crate) struct Docdb {
     router: MultiServiceRouter,
 }
 
+/// The route key a request that addresses Amazon DocumentDB by its own name resolves to —
+/// its sdkId, lowercased — and the one key this service claims; see `src/service.rs`.
+pub(crate) const ROUTE_KEY: &str = "docdb";
+
 /// What the service answered: the HTTP status and the XML body.
-struct Reply {
-    status: u16,
-    xml: String,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) xml: String,
 }
 
 impl Docdb {
     /// A router carrying only this service, over one shared engine — exactly what
     /// `core/router` builds, minus the other services.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not SigV4 verification.
@@ -50,7 +65,7 @@ impl Docdb {
     }
 
     /// Call `action` with the given query parameters and return the raw reply.
-    async fn call(&self, action: &str, params: &[(&str, &str)]) -> Reply {
+    pub(crate) async fn call(&self, action: &str, params: &[(&str, &str)]) -> Reply {
         let mut body = format!("Action={action}&Version={API_VERSION}");
         for (name, value) in params {
             body.push('&');
@@ -60,20 +75,20 @@ impl Docdb {
         }
         let request = http::Request::builder()
             .method(http::Method::POST)
-            .uri("https://docdb.us-east-1.amazonaws.com/")
+            .uri(format!("https://{ROUTE_KEY}.{REGION}.amazonaws.com/"))
             .header(
                 http::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
             )
             // The routing key every front door reads: the SigV4 credential scope, which
             // names the service and the region. DocumentDB SHARES the `rds` signing name
-            // with Amazon RDS and Amazon Neptune, and that shared name resolves to
-            // Amazon RDS, so a request for THIS service names it: `docdb` (see
-            // `ROUTE_KEY` in `src/service.rs`).
+            // with Amazon RDS and Amazon Neptune, and that shared name resolves to Amazon
+            // RDS, so a request for THIS service names it: `docdb` (see `ROUTE_KEY` in
+            // `src/service.rs`).
             .header(
                 http::header::AUTHORIZATION,
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDDOCDBTESTKEY/20260101/{REGION}/docdb/\
+                    "AWS4-HMAC-SHA256 Credential=AKIDDOCDBTESTKEY/20260101/{REGION}/{ROUTE_KEY}/\
                      aws4_request, SignedHeaders=host, Signature=00"
                 ),
             )
@@ -87,7 +102,7 @@ impl Docdb {
     }
 
     /// Call `action` and require a 200.
-    async fn ok(&self, case: &str, action: &str, params: &[(&str, &str)]) -> String {
+    pub(crate) async fn ok(&self, case: &str, action: &str, params: &[(&str, &str)]) -> String {
         let reply = self.call(action, params).await;
         assert_eq!(
             reply.status, 200,
@@ -124,7 +139,7 @@ fn form_encode(value: &str) -> String {
 /// `std::thread::sleep` rather than `tokio::time::sleep` because the workspace's tokio
 /// does not enable the `time` feature and enabling it here would change `Cargo.lock`; see
 /// [`form_encode`]. Each test runs on its own thread, so blocking it is harmless.
-fn let_the_clock_catch_up() {
+pub(crate) fn let_the_clock_catch_up() {
     std::thread::sleep(state::PROVISIONING_DELAY * 2);
 }
 
@@ -146,7 +161,7 @@ fn unescape(text: &str) -> String {
 /// of the same name — and it matches the element's FULL name (the character after it must
 /// end the start tag or separate an attribute), so `<Status>` never matches
 /// `<StatusInfos>` while `<DBCluster xmlns="...">` still does match `DBCluster`.
-fn texts(xml: &str, tag: &str) -> Vec<String> {
+pub(crate) fn texts(xml: &str, tag: &str) -> Vec<String> {
     let needle = format!("<{tag}");
     let close = format!("</{tag}>");
     let mut out = Vec::new();
@@ -181,22 +196,22 @@ fn texts(xml: &str, tag: &str) -> Vec<String> {
 }
 
 /// The first `tag`'s text, or `None` when the response carries no such element.
-fn opt_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn opt_text(xml: &str, tag: &str) -> Option<String> {
     texts(xml, tag).into_iter().next()
 }
 
 /// The first `tag`'s text; panics when absent, quoting the response.
-fn text(xml: &str, tag: &str) -> String {
+pub(crate) fn text(xml: &str, tag: &str) -> String {
     opt_text(xml, tag).unwrap_or_else(|| panic!("no <{tag}> in {xml}"))
 }
 
 /// How many `tag` elements the response carries.
-fn count(xml: &str, tag: &str) -> usize {
+pub(crate) fn count(xml: &str, tag: &str) -> usize {
     texts(xml, tag).len()
 }
 
 /// The awsQuery error envelope's `<Code>`.
-fn error_code(xml: &str) -> String {
+pub(crate) fn error_code(xml: &str) -> String {
     text(xml, "Code")
 }
 
@@ -1472,32 +1487,45 @@ async fn renaming_a_cluster_rekeys_it_and_moves_its_arn_and_endpoints() {
     // a value for the EngineVersion parameter that is a different major version than the
     // cluster's current version." Same major, different major without the flag, and
     // different major with it.
-    let current_major = state::DEFAULT_ENGINE_VERSION
-        .split('.')
-        .next()
-        .expect("the default engine version carries a major component")
-        .parse::<u32>()
-        .expect("the default engine version's major component is numeric");
-    let same_major = format!("{current_major}.0.9");
-    let other_major = format!("{}.0.0", current_major - 1);
-    let back_again = format!("{current_major}.0.0");
+    //
+    // Every version named here is one the engine PUBLISHES
+    // (`state::DOCDB_ENGINE_VERSIONS`): a version outside that catalogue is refused by its
+    // own rule, which `tests/all/subnet_and_parameter_groups.rs` covers.
+    let current = state::DEFAULT_ENGINE_VERSION;
+    let same_major = current
+        .rsplit_once('.')
+        .map(|(line, _)| line.to_string())
+        .expect("the default engine version carries a major.minor line");
+    let other_major = state::DOCDB_ENGINE_VERSIONS
+        .iter()
+        .rev()
+        .find(|published| {
+            state::engine_major_version(published) != state::engine_major_version(current)
+        })
+        .copied()
+        .expect("the engine publishes more than one major version");
     for (case, version, allow, expected) in [
-        ("the same major version", same_major.as_str(), None, 200),
+        (
+            "the same major version, named as a line",
+            same_major.as_str(),
+            None,
+            200,
+        ),
         (
             "a different major version without the flag",
-            other_major.as_str(),
+            other_major,
             None,
             400,
         ),
         (
             "a different major version with the flag",
-            other_major.as_str(),
+            other_major,
             Some("true"),
             200,
         ),
         (
             "back to the original major, with the flag",
-            back_again.as_str(),
+            current,
             Some("true"),
             200,
         ),
@@ -1516,9 +1544,11 @@ async fn renaming_a_cluster_rekeys_it_and_moves_its_arn_and_endpoints() {
             reply.status, reply.xml
         );
         if expected == 200 {
+            let resolved = state::resolve_engine_version(version)
+                .expect("every version named here is a published one");
             assert_eq!(
                 text(&reply.xml, "EngineVersion"),
-                version,
+                resolved,
                 "case {case:?}: the new version must be persisted, got {}",
                 reply.xml
             );
