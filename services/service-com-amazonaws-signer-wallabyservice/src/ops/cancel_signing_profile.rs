@@ -5,6 +5,10 @@
 //! Implemented: moves the stored profile to `Canceled`. Signer does not delete a
 //! canceled profile — it stays viewable, and stops signing.
 //!
+//! The success answer is `204 No Content` with no body: the output is `Unit`, and
+//! the recorded AWS answer to this `DELETE` is 204, not the 200 the model's
+//! `@http` code states (the two disagree; the wire is what a client reads).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -85,11 +89,19 @@ impl CancelSigningProfileOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "DELETE",
         "/signing-profiles/{profileName}",
-        Some(200u16),
+        Some(CANCEL_SIGNING_PROFILE_SUCCESS_STATUS),
     ));
 }
 
 pub static CANCEL_SIGNING_PROFILE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &CancelSigningProfileOutput::SCHEMA;
+
+/// The status a successful cancel answers with.
+///
+/// The model gives this `DELETE` an `@http` code of 200 with a `Unit` output, but
+/// the RECORDED AWS answer is `204 No Content` — and the wire is what an SDK or a
+/// client reads, so 204 is what this operation returns. A `Unit` output carries
+/// no body either way, so 204 loses nothing.
+pub const CANCEL_SIGNING_PROFILE_SUCCESS_STATUS: u16 = 204;
 
 impl ::aws_smithy_schema::serde::SerializableStruct for CancelSigningProfileOutput {
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
@@ -153,7 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CancelSigningProfile";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CANCEL_SIGNING_PROFILE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = CANCEL_SIGNING_PROFILE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The response status the protocol actually uses (the schema's `@http` code
+    // is the route's, not the answer's).
+    const SUCCESS_STATUS: u16 = CANCEL_SIGNING_PROFILE_SUCCESS_STATUS;
 
     async fn handle(
         &self,

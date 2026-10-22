@@ -5,9 +5,10 @@
 //! AWS Signer has two resources, and both live here:
 //!
 //! * a **signing profile** — the code-signing template `PutSigningProfile` mints a
-//!   version of, `GetSigningProfile` / `ListSigningProfiles` report, and
-//!   `CancelSigningProfile` moves to `Canceled` (Signer never hard-deletes a
-//!   profile, so there is no removal path);
+//!   version of, `GetSigningProfile` / `ListSigningProfiles` report,
+//!   `CancelSigningProfile` moves to `Canceled` and `RevokeSigningProfile` moves
+//!   to `Revoked` (Signer never hard-deletes a profile, so there is no removal
+//!   path);
 //! * a **signing job** — started by `StartSigningJob` against a profile whose
 //!   platform, version and signing material it SNAPSHOTS, and reported by
 //!   `DescribeSigningJob`.
@@ -20,7 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Destination, S3SignedObject, SignatureValidityPeriod, SignedObject, SigningMaterial,
-    SigningPlatformOverrides, SigningProfile, Source,
+    SigningPlatformOverrides, SigningProfile, SigningProfileRevocationRecord, Source,
 };
 
 /// The region an ARN is built for when the request carries no SigV4 credential
@@ -32,7 +33,7 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub const PROFILE_STATUS_ACTIVE: &str = "Active";
 /// The status `CancelSigningProfile` moves a profile to.
 pub const PROFILE_STATUS_CANCELED: &str = "Canceled";
-/// The status `RevokeSigningProfile` (still a stub) moves a profile to.
+/// The status `RevokeSigningProfile` moves a profile to.
 pub const PROFILE_STATUS_REVOKED: &str = "Revoked";
 
 /// `SigningStatus`'s values, spelled as the model spells them (see
@@ -45,6 +46,32 @@ pub const JOB_STATUS_SUCCEEDED: &str = "Succeeded";
 /// the request names no `maxResults`: `ListSigningProfilesRequest$maxResults` is
 /// modelled `@range(min: 1, max: 25)`.
 pub const PROFILE_PAGE_LIMIT: i32 = 25;
+
+/// The `ValidityType` unit the default signature validity period is counted in,
+/// spelled as the model spells it (see
+/// [`crate::ops::types::VALIDITY_TYPE_VALUES`]).
+pub const VALIDITY_TYPE_MONTHS: &str = "MONTHS";
+
+/// How many [`VALIDITY_TYPE_MONTHS`] a profile's signatures stay valid for when
+/// the `PutSigningProfile` that created it named no period.
+///
+/// Not a chosen number: the model documents
+/// `PutSigningProfileRequest$signatureValidityPeriod` as "The default validity
+/// period override for any signature generated using this signing profile. If
+/// unspecified, the default is 135 months."
+/// (`smithy_query(query="doc", shape="PutSigningProfileRequest",
+/// member="signatureValidityPeriod")`), so a profile created without one still
+/// HAS a validity period and every read of it reports that period.
+pub const DEFAULT_SIGNATURE_VALIDITY_MONTHS: i32 = 135;
+
+/// The validity period a profile gets when its `PutSigningProfile` named none —
+/// [`DEFAULT_SIGNATURE_VALIDITY_MONTHS`] months, the documented default.
+pub fn default_signature_validity_period() -> SignatureValidityPeriod {
+    SignatureValidityPeriod {
+        value: DEFAULT_SIGNATURE_VALIDITY_MONTHS,
+        r#type: Some(VALIDITY_TYPE_MONTHS.to_string()),
+    }
+}
 
 /// How long a signing job stays `InProgress` — the status `StartSigningJob`
 /// returns it in — before the clock owes it `Succeeded`.
@@ -68,6 +95,13 @@ pub struct SigningProfileRecord {
     pub arn: String,
     /// `<arn>/<profile_version>`.
     pub profile_version_arn: String,
+    /// The opaque, server-generated id of this profile, minted when the profile
+    /// was first created and kept across every later version of it.
+    ///
+    /// `GetSigningProfile` reports it as `profileToken` and `PutSigningProfile`
+    /// as its answer's `tags.internalId`: ONE id per profile, so the two reports
+    /// can never drift apart.
+    pub profile_token: String,
     pub platform_id: String,
     pub platform_display_name: Option<String>,
     pub signing_material: Option<SigningMaterial>,
@@ -77,6 +111,9 @@ pub struct SigningProfileRecord {
     /// One of `SigningProfileStatus`'s values.
     pub status: String,
     pub status_reason: Option<String>,
+    /// What `RevokeSigningProfile` recorded, for a profile that has been revoked;
+    /// `None` for one that has not.
+    pub revocation_record: Option<SigningProfileRevocationRecord>,
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
     /// Every version this profile has had, oldest first; the last is
@@ -96,10 +133,49 @@ impl SigningProfileRecord {
 
     /// The stored tags, as the wire map — absent when there are none.
     ///
-    /// `TagMap` is modelled `@length(min: 1, max: 200)`, so an untagged profile
-    /// reports NO map rather than an empty one, which would violate that bound.
+    /// `TagMap` is modelled `@length(min: 1, max: 200)`, so a member that only
+    /// LISTS profiles reports no map at all for an untagged one rather than an
+    /// empty one, which would violate that bound. An operation that reports ONE
+    /// profile reports the map itself — see [`Self::reported_tag_map`].
     pub fn tag_map(&self) -> Option<HashMap<String, String>> {
         non_empty_map(&self.tags)
+    }
+
+    /// This profile's tags, as the wire map `GetSigningProfile` reports — ALWAYS
+    /// present, and empty for a profile carrying no tags.
+    ///
+    /// A reader of one profile has to be able to tell "this profile has no tags"
+    /// from "this answer does not report tags", which an absent member cannot
+    /// say; the recorded `GetSigningProfile` answer for an untagged profile
+    /// carries `tags` as a present, empty object.
+    pub fn reported_tag_map(&self) -> HashMap<String, String> {
+        self.tags
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Record a revocation of this profile: it moves to `Revoked`, reports the
+    /// caller's `reason` as its `statusReason`, and carries the revocation record
+    /// every later read reports.
+    ///
+    /// `revocation_effective_from` is the caller's `effectiveTime` — the instant
+    /// signatures stop being trusted — while `revoked_at` is when this call
+    /// happened, which is why the two are stored separately.
+    pub fn revoke(
+        &mut self,
+        reason: &str,
+        effective_time: ::aws_smithy_types::DateTime,
+        revoked_by: Option<String>,
+        now: SystemTime,
+    ) {
+        self.status = PROFILE_STATUS_REVOKED.to_string();
+        self.status_reason = Some(reason.to_string());
+        self.revocation_record = Some(SigningProfileRevocationRecord {
+            revocation_effective_from: Some(effective_time),
+            revoked_at: Some(to_timestamp(now)),
+            revoked_by,
+        });
     }
 
     /// The stored signing parameters, as the wire map — absent when there are none.
@@ -199,6 +275,8 @@ pub struct ComAmazonawsSignerWallabyserviceState {
     pub job_tokens: HashMap<String, String>,
     /// The counter profile versions are minted from.
     pub profile_version_seq: u64,
+    /// The counter profile tokens are minted from.
+    pub profile_token_seq: u64,
     /// The counter job ids are minted from.
     pub job_id_seq: u64,
 }
@@ -223,19 +301,24 @@ impl ComAmazonawsSignerWallabyserviceState {
     pub fn mint_job_id(&mut self) -> String {
         loop {
             self.job_id_seq = self.job_id_seq.wrapping_add(1);
-            let hex = format!("{:032x}", self.job_id_seq);
-            let id = format!(
-                "{}-{}-{}-{}-{}",
-                &hex[0..8],
-                &hex[8..12],
-                &hex[12..16],
-                &hex[16..20],
-                &hex[20..32]
-            );
+            let id = uuid_shaped(JOB_ID_NAMESPACE, self.job_id_seq);
             if !self.jobs.contains_key(&id) {
                 return id;
             }
         }
+    }
+
+    /// Mint an opaque profile token — the server-generated id a profile keeps for
+    /// its whole life.
+    ///
+    /// Opaque means a client may only carry it around: nothing in this service
+    /// resolves a profile BY token, so the only requirements are that it is
+    /// unique and that it looks like what AWS mints, a UUID. Its namespace
+    /// differs from [`Self::mint_job_id`]'s, so a token can never be mistaken for
+    /// a job id.
+    pub fn mint_profile_token(&mut self) -> String {
+        self.profile_token_seq = self.profile_token_seq.wrapping_add(1);
+        uuid_shaped(PROFILE_TOKEN_NAMESPACE, self.profile_token_seq)
     }
 
     /// The job `job_id` names, with any completion the clock owes it already
@@ -245,6 +328,29 @@ impl ComAmazonawsSignerWallabyserviceState {
         job.settle(now);
         Some(job)
     }
+}
+
+/// The id namespace signing-job ids are minted in.
+const JOB_ID_NAMESPACE: u64 = 0;
+
+/// The id namespace profile tokens are minted in, so no token ever collides with
+/// a job id.
+const PROFILE_TOKEN_NAMESPACE: u64 = 1;
+
+/// `(namespace, counter)` rendered as the 32 hex digits of a UUID, in UUID form.
+///
+/// AWS mints both job ids and profile tokens as UUIDs, and a client is entitled
+/// to parse them as one; the counter is what makes each unique.
+fn uuid_shaped(namespace: u64, counter: u64) -> String {
+    let hex = format!("{namespace:016x}{counter:016x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// Ten base-62 digits of `value`, the fixed-width form `ProfileVersion`'s
@@ -353,6 +459,18 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// one.
 pub fn request_principal(parts: &::http::request::Parts) -> Option<String> {
     ::emulator_server::sigv4_credential_scope(&parts.headers).map(|scope| scope.access_key_id)
+}
+
+/// The caller as an IAM principal ARN — the form AWS reports a revoker in.
+///
+/// The identity is still the one [`request_principal`] reads off the request (no
+/// IAM directory exists to resolve a friendly name against), rendered as the
+/// `arn:aws:iam::<account>:user/<identity>` an AWS caller is named by, so a
+/// client that parses the revoker as an ARN still works. `None` for an unsigned
+/// request, which carries no identity at all.
+pub fn request_principal_arn(parts: &::http::request::Parts) -> Option<String> {
+    request_principal(parts)
+        .map(|identity| ::engine::emulator_arn("iam", "", &format!("user/{identity}")))
 }
 
 /// `time` as the wire timestamp.

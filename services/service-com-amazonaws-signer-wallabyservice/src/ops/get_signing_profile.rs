@@ -6,6 +6,10 @@
 //! modelled `ResourceNotFoundException` when this account holds none. Reporting
 //! only — it writes nothing.
 //!
+//! Beside the modelled members the answer carries `profileToken` and `platform`,
+//! which AWS returns and the model does not declare — see
+//! [`GetSigningProfileOutput`] for why they are declared by hand.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -205,9 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             profile_name: Some(profile.profile_name.clone()),
             profile_version: Some(profile.profile_version.clone()),
             profile_version_arn: Some(profile.profile_version_arn.clone()),
-            // A revocation record is written by `RevokeSigningProfile`, which is
-            // still a stub with its own gap issue; no profile carries one yet.
-            revocation_record: None,
+            // Written by `RevokeSigningProfile`; `None` for a profile nobody has
+            // revoked.
+            revocation_record: profile.revocation_record.clone(),
             signing_material: profile.signing_material.clone(),
             platform_id: Some(profile.platform_id.clone()),
             platform_display_name: profile.platform_display_name.clone(),
@@ -217,7 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: Some(profile.status.clone()),
             status_reason: profile.status_reason.clone(),
             arn: Some(profile.arn.clone()),
-            tags: profile.tag_map(),
+            // Present even when empty: a reader of ONE profile has to be able to
+            // tell "no tags" from "tags not reported".
+            tags: Some(profile.reported_tag_map()),
+            // The two members AWS answers with that the model does not declare.
+            profile_token: Some(profile.profile_token.clone()),
+            platform: Some(profile.platform_id.clone()),
         })
     }
 }

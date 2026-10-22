@@ -18,7 +18,30 @@ pub struct GetSigningProfileInput {
     pub profile_owner: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.signer#GetSigningProfileResponse")]
+/// `GetSigningProfileResponse`, with its schema written out instead of derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the shapes beside
+/// it: AWS Signer answers `GetSigningProfile` with TWO members this service's
+/// Smithy model does not declare — `profileToken`, the profile's opaque
+/// server-generated id, and `platform`, the legacy spelling of `platformId` —
+/// and the derive accepts only fields the model's member list names ("Field '…'
+/// does not correspond to any Smithy member"). The model is the shipped AWS
+/// spec and is left exactly as shipped, so the two recorded members are declared
+/// here instead, beside the fourteen modelled ones.
+///
+/// The fourteen modelled member schemas below are the model's, member for
+/// member: same shape ids, same order, same types
+/// (`smithy_query(query="shape", shape="GetSigningProfileResponse",
+/// model_path="services/service-com-amazonaws-signer-wallabyservice/smithy-model/com-amazonaws-signer-wallabyservice.json")`).
+/// The model declares no `@jsonName` on any of them, so each member's own name is
+/// its JSON key. A member added to the shape upstream has to be added here by
+/// hand — which is the cost of reporting the two the model omits.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this
+/// shape is an operation OUTPUT, which the server only ever serializes
+/// (`Operation::Output` requires `SerializableStruct`; only `Input` is
+/// deserialized), so a hand-written read path would be untested code with no
+/// caller.
 #[derive(Debug, Clone, Default)]
 pub struct GetSigningProfileOutput {
     pub profile_name: Option<String>,
@@ -35,6 +58,298 @@ pub struct GetSigningProfileOutput {
     pub status_reason: Option<String>,
     pub arn: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
+    /// The profile's opaque server-generated id. Recorded wire behaviour: AWS
+    /// returns it, this service's model does not declare it.
+    pub profile_token: Option<String>,
+    /// The id of the platform the profile uses — the legacy spelling AWS still
+    /// answers with beside the modelled `platformId`. Recorded wire behaviour:
+    /// the model does not declare it.
+    pub platform: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl GetSigningProfileOutput {
+    const M_PROFILE_NAME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$profileName",
+            "com.amazonaws.signer",
+            "profileName",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "profileName",
+        0,
+    );
+
+    const M_PROFILE_VERSION: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$profileVersion",
+            "com.amazonaws.signer",
+            "profileVersion",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "profileVersion",
+        1,
+    );
+
+    const M_PROFILE_VERSION_ARN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.signer#GetSigningProfileResponse$profileVersionArn",
+                "com.amazonaws.signer",
+                "profileVersionArn",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "profileVersionArn",
+            2,
+        );
+
+    const M_REVOCATION_RECORD: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.signer#GetSigningProfileResponse$revocationRecord",
+                "com.amazonaws.signer",
+                "revocationRecord",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "revocationRecord",
+            3,
+        );
+
+    const M_SIGNING_MATERIAL: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$signingMaterial",
+            "com.amazonaws.signer",
+            "signingMaterial",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        "signingMaterial",
+        4,
+    );
+
+    const M_PLATFORM_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$platformId",
+            "com.amazonaws.signer",
+            "platformId",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "platformId",
+        5,
+    );
+
+    const M_PLATFORM_DISPLAY_NAME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.signer#GetSigningProfileResponse$platformDisplayName",
+                "com.amazonaws.signer",
+                "platformDisplayName",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "platformDisplayName",
+            6,
+        );
+
+    const M_SIGNATURE_VALIDITY_PERIOD: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.signer#GetSigningProfileResponse$signatureValidityPeriod",
+                "com.amazonaws.signer",
+                "signatureValidityPeriod",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "signatureValidityPeriod",
+            7,
+        );
+
+    const M_OVERRIDES: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$overrides",
+            "com.amazonaws.signer",
+            "overrides",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        "overrides",
+        8,
+    );
+
+    const M_SIGNING_PARAMETERS: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.signer#GetSigningProfileResponse$signingParameters",
+                "com.amazonaws.signer",
+                "signingParameters",
+            ),
+            ::aws_smithy_schema::ShapeType::Map,
+            "signingParameters",
+            9,
+        );
+
+    const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$status",
+            "com.amazonaws.signer",
+            "status",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "status",
+        10,
+    );
+
+    const M_STATUS_REASON: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$statusReason",
+            "com.amazonaws.signer",
+            "statusReason",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "statusReason",
+        11,
+    );
+
+    const M_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$arn",
+            "com.amazonaws.signer",
+            "arn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "arn",
+        12,
+    );
+
+    const M_TAGS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$tags",
+            "com.amazonaws.signer",
+            "tags",
+        ),
+        ::aws_smithy_schema::ShapeType::Map,
+        "tags",
+        13,
+    );
+
+    /// Recorded wire behaviour, not in the model — see the type's own docs.
+    const M_PROFILE_TOKEN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$profileToken",
+            "com.amazonaws.signer",
+            "profileToken",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "profileToken",
+        14,
+    );
+
+    /// Recorded wire behaviour, not in the model — see the type's own docs.
+    const M_PLATFORM: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse$platform",
+            "com.amazonaws.signer",
+            "platform",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "platform",
+        15,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#GetSigningProfileResponse",
+            "com.amazonaws.signer",
+            "GetSigningProfileResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_PROFILE_NAME,
+            &Self::M_PROFILE_VERSION,
+            &Self::M_PROFILE_VERSION_ARN,
+            &Self::M_REVOCATION_RECORD,
+            &Self::M_SIGNING_MATERIAL,
+            &Self::M_PLATFORM_ID,
+            &Self::M_PLATFORM_DISPLAY_NAME,
+            &Self::M_SIGNATURE_VALIDITY_PERIOD,
+            &Self::M_OVERRIDES,
+            &Self::M_SIGNING_PARAMETERS,
+            &Self::M_STATUS,
+            &Self::M_STATUS_REASON,
+            &Self::M_ARN,
+            &Self::M_TAGS,
+            &Self::M_PROFILE_TOKEN,
+            &Self::M_PLATFORM,
+        ],
+    );
+}
+
+pub static GET_SIGNING_PROFILE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetSigningProfileOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetSigningProfileOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.profile_name.as_ref() {
+            serializer.write_string(&Self::M_PROFILE_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.profile_version.as_ref() {
+            serializer.write_string(&Self::M_PROFILE_VERSION, value.as_str())?;
+        }
+        if let Some(value) = self.profile_version_arn.as_ref() {
+            serializer.write_string(&Self::M_PROFILE_VERSION_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.revocation_record.as_ref() {
+            serializer.write_struct(&Self::M_REVOCATION_RECORD, value)?;
+        }
+        if let Some(value) = self.signing_material.as_ref() {
+            serializer.write_struct(&Self::M_SIGNING_MATERIAL, value)?;
+        }
+        if let Some(value) = self.platform_id.as_ref() {
+            serializer.write_string(&Self::M_PLATFORM_ID, value.as_str())?;
+        }
+        if let Some(value) = self.platform_display_name.as_ref() {
+            serializer.write_string(&Self::M_PLATFORM_DISPLAY_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.signature_validity_period.as_ref() {
+            serializer.write_struct(&Self::M_SIGNATURE_VALIDITY_PERIOD, value)?;
+        }
+        if let Some(value) = self.overrides.as_ref() {
+            serializer.write_struct(&Self::M_OVERRIDES, value)?;
+        }
+        if let Some(value) = self.signing_parameters.as_ref() {
+            serializer.write_map(&Self::M_SIGNING_PARAMETERS, &|entries| {
+                for (key, entry) in value.iter() {
+                    entries.write_string(&Self::M_SIGNING_PARAMETERS, key.as_str())?;
+                    entries.write_string(&Self::M_SIGNING_PARAMETERS, entry.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.status.as_ref() {
+            serializer.write_string(&Self::M_STATUS, value.as_str())?;
+        }
+        if let Some(value) = self.status_reason.as_ref() {
+            serializer.write_string(&Self::M_STATUS_REASON, value.as_str())?;
+        }
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.tags.as_ref() {
+            serializer.write_map(&Self::M_TAGS, &|entries| {
+                for (key, entry) in value.iter() {
+                    entries.write_string(&Self::M_TAGS, key.as_str())?;
+                    entries.write_string(&Self::M_TAGS, entry.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.profile_token.as_ref() {
+            serializer.write_string(&Self::M_PROFILE_TOKEN, value.as_str())?;
+        }
+        if let Some(value) = self.platform.as_ref() {
+            serializer.write_string(&Self::M_PLATFORM, value.as_str())?;
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.signer#SigningProfileRevocationRecord")]
@@ -44,4 +359,3 @@ pub struct SigningProfileRevocationRecord {
     pub revoked_at: Option<::aws_smithy_types::DateTime>,
     pub revoked_by: Option<String>,
 }
-

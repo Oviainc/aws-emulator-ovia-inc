@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeSigningProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeSigningProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeSigningProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: records the revocation of the stored profile `profileName` names
+//! — it moves to `Revoked`, reports the request's `reason` as its `statusReason`,
+//! and carries the revocation record every later `GetSigningProfile` reports.
+//!
+//! The success answer is `204 No Content` with no body: the output is `Unit`, and
+//! the recorded AWS answer to this `PUT` is 204, not the 200 the model's `@http`
+//! code states (the two disagree; the wire is what a client reads).
 //!
 //! ## Shape of an operation
 //!
@@ -100,11 +99,19 @@ impl RevokeSigningProfileOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/signing-profiles/{profileName}/revoke",
-        Some(200u16),
+        Some(REVOKE_SIGNING_PROFILE_SUCCESS_STATUS),
     ));
 }
 
 pub static REVOKE_SIGNING_PROFILE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &RevokeSigningProfileOutput::SCHEMA;
+
+/// The status a successful revoke answers with.
+///
+/// The model gives this operation an `@http` code of 200 with a `Unit` output,
+/// but the RECORDED AWS answer is `204 No Content` — and the wire is what an SDK
+/// or a client reads, so 204 is what this operation returns. A `Unit` output
+/// carries no body either way, so 204 loses nothing.
+pub const REVOKE_SIGNING_PROFILE_SUCCESS_STATUS: u16 = 204;
 
 impl ::aws_smithy_schema::serde::SerializableStruct for RevokeSigningProfileOutput {
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
@@ -140,6 +147,16 @@ impl From<RevokeSigningProfileErrorModeled> for RevokeSigningProfileError {
     }
 }
 
+/// The modelled 404 for a profile, or a profile version, this account holds none
+/// of.
+fn not_found(message: String) -> RevokeSigningProfileError {
+    RevokeSigningProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        code: None,
+    })
+    .into()
+}
+
 /// The `RevokeSigningProfile` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,25 +186,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "RevokeSigningProfile";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::REVOKE_SIGNING_PROFILE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = REVOKE_SIGNING_PROFILE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // The response status the protocol actually uses (the schema's `@http` code
+    // is the route's, not the answer's).
+    const SUCCESS_STATUS: u16 = REVOKE_SIGNING_PROFILE_SUCCESS_STATUS;
 
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeSigningProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeSigningProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeSigningProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RevokeSigningProfileErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the signer profile store is unavailable".to_string()),
+                        code: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // AWS reports the IAM principal that revoked the profile; the identity
+        // this request carried is the SigV4 access key id it was signed with,
+        // reported in the IAM principal ARN form AWS names a caller by (`None`
+        // for an unsigned request).
+        let revoked_by = crate::state::request_principal_arn(ctx.parts());
+        let mut store = state.lock();
+
+        let Some(profile) = store.profiles.get_mut(&input.profile_name) else {
+            return Err(not_found(format!(
+                "Signing profile {} not found",
+                input.profile_name
+            )));
+        };
+        // `profileVersion` names WHICH version of the profile is revoked, so a
+        // version this profile has never had names no revocable resource.
+        if !profile.versions.contains(&input.profile_version) {
+            return Err(not_found(format!(
+                "Signing profile {} has no version {}",
+                input.profile_name, input.profile_version
+            )));
+        }
+
+        profile.revoke(&input.reason, input.effective_time, revoked_by, now);
+
+        Ok(RevokeSigningProfileOutput)
     }
 }

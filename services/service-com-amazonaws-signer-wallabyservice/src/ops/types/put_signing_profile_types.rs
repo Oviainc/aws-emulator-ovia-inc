@@ -23,11 +23,128 @@ pub struct PutSigningProfileInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.signer#PutSigningProfileResponse")]
+/// `PutSigningProfileResponse`, with its schema written out instead of derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the shapes beside
+/// it: AWS Signer answers `PutSigningProfile` with a `tags` member this service's
+/// Smithy model does not declare — the created profile's resource identity — and
+/// the derive accepts only fields the model's member list names ("Field '…' does
+/// not correspond to any Smithy member"). The model is the shipped AWS spec and
+/// is left exactly as shipped, so the recorded member is declared here instead,
+/// beside the three modelled ones.
+///
+/// The three modelled member schemas below are the model's, member for member:
+/// same shape ids, same order, same types
+/// (`smithy_query(query="shape", shape="PutSigningProfileResponse",
+/// model_path="services/service-com-amazonaws-signer-wallabyservice/smithy-model/com-amazonaws-signer-wallabyservice.json")`).
+/// The model declares no `@jsonName` on any of them, so each member's own name is
+/// its JSON key.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this
+/// shape is an operation OUTPUT, which the server only ever serializes
+/// (`Operation::Output` requires `SerializableStruct`; only `Input` is
+/// deserialized), so a hand-written read path would be untested code with no
+/// caller.
 #[derive(Debug, Clone, Default)]
 pub struct PutSigningProfileOutput {
     pub arn: Option<String>,
     pub profile_version: Option<String>,
     pub profile_version_arn: Option<String>,
+    /// The created profile's resource identity. Recorded wire behaviour: AWS
+    /// returns it, this service's model does not declare it.
+    pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
+#[allow(non_upper_case_globals)]
+impl PutSigningProfileOutput {
+    const M_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#PutSigningProfileResponse$arn",
+            "com.amazonaws.signer",
+            "arn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "arn",
+        0,
+    );
+
+    const M_PROFILE_VERSION: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#PutSigningProfileResponse$profileVersion",
+            "com.amazonaws.signer",
+            "profileVersion",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "profileVersion",
+        1,
+    );
+
+    const M_PROFILE_VERSION_ARN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.signer#PutSigningProfileResponse$profileVersionArn",
+                "com.amazonaws.signer",
+                "profileVersionArn",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "profileVersionArn",
+            2,
+        );
+
+    /// Recorded wire behaviour, not in the model — see the type's own docs.
+    const M_TAGS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#PutSigningProfileResponse$tags",
+            "com.amazonaws.signer",
+            "tags",
+        ),
+        ::aws_smithy_schema::ShapeType::Map,
+        "tags",
+        3,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.signer#PutSigningProfileResponse",
+            "com.amazonaws.signer",
+            "PutSigningProfileResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_PROFILE_VERSION,
+            &Self::M_PROFILE_VERSION_ARN,
+            &Self::M_TAGS,
+        ],
+    );
+}
+
+pub static PUT_SIGNING_PROFILE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &PutSigningProfileOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for PutSigningProfileOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.profile_version.as_ref() {
+            serializer.write_string(&Self::M_PROFILE_VERSION, value.as_str())?;
+        }
+        if let Some(value) = self.profile_version_arn.as_ref() {
+            serializer.write_string(&Self::M_PROFILE_VERSION_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.tags.as_ref() {
+            serializer.write_map(&Self::M_TAGS, &|entries| {
+                for (key, entry) in value.iter() {
+                    entries.write_string(&Self::M_TAGS, key.as_str())?;
+                    entries.write_string(&Self::M_TAGS, entry.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}

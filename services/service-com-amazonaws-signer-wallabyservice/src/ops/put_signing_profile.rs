@@ -6,6 +6,10 @@
 //! in [`crate::state::ComAmazonawsSignerWallabyserviceState::profiles`]. Every
 //! member of the answer is read back out of the stored record.
 //!
+//! The answer also carries a `tags` member the model does not declare, holding
+//! the created profile's resource identity (`resourceArn`, `internalId`) — see
+//! [`PutSigningProfileOutput`] for why it is declared by hand.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -122,6 +126,13 @@ impl From<PutSigningProfileErrorModeled> for PutSigningProfileError {
     }
 }
 
+/// The key the created profile's ARN travels under in the create answer's
+/// identity map (`tags.resourceArn`).
+pub const PROFILE_IDENTITY_RESOURCE_ARN: &str = "resourceArn";
+/// The key the profile's opaque server-generated id travels under in the create
+/// answer's identity map.
+pub const PROFILE_IDENTITY_INTERNAL_ID: &str = "internalId";
+
 /// The `PutSigningProfile` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -180,8 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut versions = existing
             .map(|profile| profile.versions.clone())
             .unwrap_or_default();
+        // The opaque profile token is the profile's identity, not the version's:
+        // a name already in the store keeps the token it was created with, and a
+        // name that is new gets one minted now.
+        let existing_token = existing.map(|profile| profile.profile_token.clone());
         let profile_version = store.mint_profile_version();
         versions.push(profile_version.clone());
+        let profile_token = match existing_token {
+            Some(token) => token,
+            None => store.mint_profile_token(),
+        };
 
         let arn = crate::state::profile_arn(&input.profile_name, &region);
         let profile_version_arn = format!("{arn}/{profile_version}");
@@ -190,10 +209,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             profile_version,
             arn,
             profile_version_arn,
+            profile_token,
             platform_display_name: crate::state::platform_display_name(&input.platform_id),
             platform_id: input.platform_id,
             signing_material: input.signing_material,
-            signature_validity_period: input.signature_validity_period,
+            // A request that names no validity period does not leave the profile
+            // without one: the member documents a default of 135 months, so the
+            // profile is stored with it and every later read reports it.
+            signature_validity_period: Some(
+                input
+                    .signature_validity_period
+                    .unwrap_or_else(crate::state::default_signature_validity_period),
+            ),
             overrides: input.overrides,
             signing_parameters: input
                 .signing_parameters
@@ -205,8 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `RevokeSigningProfile` move it off `Active`.
             status: crate::state::PROFILE_STATUS_ACTIVE.to_string(),
             // `statusReason` reports why a profile is not active, so an active
-            // one carries none.
+            // one carries none — and an active one has not been revoked, so it
+            // carries no revocation record either.
             status_reason: None,
+            revocation_record: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             created_at,
             versions,
@@ -224,6 +253,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(stored.arn.clone()),
             profile_version: Some(stored.profile_version.clone()),
             profile_version_arn: Some(stored.profile_version_arn.clone()),
+            // The created profile's resource identity, as AWS answers it: the
+            // profile ARN this call built, and the profile's opaque
+            // server-generated id — the same id `GetSigningProfile` reports as
+            // `profileToken`, because the store holds ONE id per profile rather
+            // than a second one to keep in step.
+            tags: Some(::std::collections::HashMap::from([
+                (
+                    PROFILE_IDENTITY_RESOURCE_ARN.to_string(),
+                    stored.arn.clone(),
+                ),
+                (
+                    PROFILE_IDENTITY_INTERNAL_ID.to_string(),
+                    stored.profile_token.clone(),
+                ),
+            ])),
         })
     }
 }

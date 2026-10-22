@@ -350,10 +350,8 @@ async fn put_then_get_round_trips_every_profile_shape() {
         for member in [
             "platformId",
             "signingMaterial",
-            "signatureValidityPeriod",
             "signingParameters",
             "overrides",
-            "tags",
         ] {
             assert_eq!(
                 got.body[member], case.request[member],
@@ -361,6 +359,32 @@ async fn put_then_get_round_trips_every_profile_shape() {
                 case.name, case.request[member], got.body[member]
             );
         }
+        // `signatureValidityPeriod` round-trips when the request carried one, and
+        // otherwise reports the default the model documents for
+        // `PutSigningProfileRequest$signatureValidityPeriod` ("If unspecified,
+        // the default is 135 months"), spelled out here rather than imported so a
+        // wrong default in the handler fails. `tags` is always reported, empty for
+        // a profile the request gave none.
+        let expected_period = if case.request["signatureValidityPeriod"].is_null() {
+            json!({ "value": 135, "type": "MONTHS" })
+        } else {
+            case.request["signatureValidityPeriod"].clone()
+        };
+        assert_eq!(
+            got.body["signatureValidityPeriod"], expected_period,
+            "case {}: expected signatureValidityPeriod {expected_period:?}, got {:?}",
+            case.name, got.body["signatureValidityPeriod"]
+        );
+        let expected_tags = if case.request["tags"].is_null() {
+            json!({})
+        } else {
+            case.request["tags"].clone()
+        };
+        assert_eq!(
+            got.body["tags"], expected_tags,
+            "case {}: expected tags {expected_tags:?}, got {:?}",
+            case.name, got.body["tags"]
+        );
         match case.platform_display_name {
             Some(display) => assert_eq!(
                 got.str_member("platformDisplayName"),
@@ -556,8 +580,8 @@ async fn list_pages_through_profiles_and_honours_the_filters() {
     let canceled = &all_names[0];
     assert_eq!(
         cancel_profile(&router, canceled).await.status,
-        200,
-        "expected CancelSigningProfile 200 for {canceled}"
+        204,
+        "expected CancelSigningProfile 204 for {canceled}"
     );
     let remaining: Vec<String> = all_names
         .iter()
@@ -834,8 +858,8 @@ async fn cancel_is_a_soft_cancel_that_stops_new_jobs() {
 
     let canceled = cancel_profile(&router, "Canceled_Profile").await;
     assert_eq!(
-        canceled.status, 200,
-        "expected CancelSigningProfile 200, got {} {:?}",
+        canceled.status, 204,
+        "expected CancelSigningProfile 204, got {} {:?}",
         canceled.status, canceled.body
     );
 
