@@ -137,6 +137,11 @@ impl Emulator {
         self.call("GET", &format!("/scopes/{scope_id}"), None).await
     }
 
+    async fn delete_scope(&self, scope_id: &str) -> Answer {
+        self.call("DELETE", &format!("/scopes/{scope_id}"), None)
+            .await
+    }
+
     async fn create_monitor(&self, body: Value) -> Answer {
         self.call("POST", "/monitors", Some(body)).await
     }
@@ -1358,4 +1363,263 @@ async fn a_create_past_the_store_s_ceiling_is_refused() {
         "a freed slot takes a new monitor, got {} with body {}",
         accepted.status, accepted.body
     );
+}
+
+/// `DeleteScope` removes the scope the id names from the store, so every later
+/// reader of that id is answered the modelled `ResourceNotFoundException` and no
+/// other scope is touched.
+///
+/// The table is the create table (`scope_rows`) — scopes differing in target
+/// count, tags and `clientToken` — plus the status dimension: the first row is
+/// deleted while the clock still has it `IN_PROGRESS`, the rest once the clock owes
+/// them `SUCCEEDED`.
+#[tokio::test]
+async fn a_deleted_scope_is_gone_for_every_later_reader() {
+    let emulator = Emulator::new();
+    let rows = scope_rows();
+    let mut live: Vec<(String, String)> = Vec::new();
+    for row in &rows {
+        let created = emulator.create_scope(row.body.clone()).await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: the scope must be created, got {} with body {}",
+            row.case, created.status, created.body
+        );
+        live.push((created.text("scopeId"), row.case.to_string()));
+    }
+
+    for (index, (scope_id, case)) in live.clone().into_iter().enumerate() {
+        // Row 0 is deleted inside the provisioning span, so a scope is deletable in
+        // the transient status too; from row 1 on the clock has settled every
+        // remaining scope into its terminal status.
+        if index == 1 {
+            tokio::time::sleep(PAST_PROVISIONING).await;
+        }
+        let before = emulator.get_scope(&scope_id).await;
+        let expected_status = if index == 0 {
+            "IN_PROGRESS"
+        } else {
+            "SUCCEEDED"
+        };
+        assert_eq!(
+            before.text("status"),
+            expected_status,
+            "case {case:?}: expected the scope to be {expected_status} before the delete, got {:?}",
+            before.text("status")
+        );
+
+        let deleted = emulator.delete_scope(&scope_id).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected 200 from the delete, got {} with body {}",
+            deleted.status, deleted.body
+        );
+        assert!(
+            deleted
+                .body
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "case {case:?}: DeleteScopeOutput models no members, got body {}",
+            deleted.body
+        );
+
+        let read = emulator.get_scope(&scope_id).await;
+        assert_eq!(
+            read.status, 404,
+            "case {case:?}: a deleted scope is gone for the next reader, got {} with body {}",
+            read.status, read.body
+        );
+        assert!(
+            read.error_type.contains("ResourceNotFoundException")
+                || read.text("__type").contains("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {:?} / body {}",
+            read.error_type,
+            read.body
+        );
+
+        // Deleting it again names nothing: the same modelled 404.
+        let twice = emulator.delete_scope(&scope_id).await;
+        assert_eq!(
+            twice.status, 404,
+            "case {case:?}: a second delete names nothing, got {} with body {}",
+            twice.status, twice.body
+        );
+
+        // Only the named scope went: every scope still live reads back as itself.
+        live.retain(|(held, _)| held != &scope_id);
+        for (held, held_case) in &live {
+            let still = emulator.get_scope(held).await;
+            assert_eq!(
+                still.status, 200,
+                "case {case:?}: {held_case:?} must survive the delete, got {} with body {}",
+                still.status, still.body
+            );
+            assert_eq!(
+                still.text("scopeId"),
+                *held,
+                "case {case:?}: {held_case:?} must read back as itself, got {:?}",
+                still.text("scopeId")
+            );
+        }
+    }
+}
+
+/// Deleting an id the store does not hold is the modelled 404, whatever form the id
+/// takes, and the delete leaves the store alone.
+#[tokio::test]
+async fn delete_scope_on_an_id_the_store_does_not_hold_is_404() {
+    let emulator = Emulator::new();
+    // One real scope exists, so a 404 is about the id and not about an empty store.
+    let created = emulator
+        .create_scope(json!({ "targets": targets(&[("123456789012", "us-east-1")]) }))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the anchor scope must be created, got {} with body {}",
+        created.status, created.body
+    );
+    let live_id = created.text("scopeId");
+
+    // A scope this store did mint and that is already gone, so the table covers
+    // both "never existed" and "deleted earlier".
+    let deleted_once = emulator
+        .create_scope(json!({ "targets": targets(&[("210987654321", "eu-west-1")]) }))
+        .await;
+    let deleted_id = deleted_once.text("scopeId");
+    assert_eq!(
+        emulator.delete_scope(&deleted_id).await.status,
+        200,
+        "the scope deleted up front must delete cleanly"
+    );
+
+    let rows = [
+        (
+            "a UUID-shaped id this store never minted",
+            "11111111-2222-4333-8444-555555555555".to_string(),
+        ),
+        (
+            "the id of a scope deleted earlier in this test",
+            deleted_id.clone(),
+        ),
+        ("an id that is not UUID-shaped", "not-a-scope".to_string()),
+        (
+            "a monitor-style name in the scope id position",
+            "scope_1.live-2".to_string(),
+        ),
+    ];
+
+    for (case, scope_id) in &rows {
+        let answer = emulator.delete_scope(scope_id).await;
+        assert_eq!(
+            answer.status, 404,
+            "case {case:?}: expected 404, got {} with body {}",
+            answer.status, answer.body
+        );
+        assert!(
+            answer.error_type.contains("ResourceNotFoundException")
+                || answer.text("__type").contains("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {:?} / body {}",
+            answer.error_type,
+            answer.body
+        );
+        let still = emulator.get_scope(&live_id).await;
+        assert_eq!(
+            still.status, 200,
+            "case {case:?}: the live scope must be untouched, got {} with body {}",
+            still.status, still.body
+        );
+    }
+}
+
+/// What a deleted scope's records are worth afterwards: its ARN resolves to no
+/// scope (so `CreateMonitor` refuses it, exactly as it refuses an ARN that never
+/// named one), and its `clientToken` mints a NEW scope rather than answering with
+/// the deleted one.
+#[tokio::test]
+async fn deleting_a_scope_retires_its_arn_and_frees_its_client_token() {
+    let emulator = Emulator::new();
+
+    for (index, pairs) in [
+        vec![("123456789012", "us-east-1")],
+        vec![("111111111111", "eu-west-1"), ("222222222222", "us-east-2")],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case = format!("{} target(s)", pairs.len());
+        let token = client_token(900 + index as u32);
+        let body = json!({ "targets": targets(&pairs), "clientToken": token });
+
+        let created = emulator.create_scope(body.clone()).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: the scope must be created, got {} with body {}",
+            created.status, created.body
+        );
+        let scope_id = created.text("scopeId");
+        let scope_arn = created.text("scopeArn");
+
+        // A monitor under the scope, so the ARN is live before the delete.
+        let monitor_name = format!("orphan-{index}");
+        let monitor = emulator
+            .create_monitor(json!({
+                "monitorName": monitor_name,
+                "scopeArn": scope_arn,
+                "localResources": [{ "type": "AWS::EC2::VPC", "identifier": "vpc-1" }]
+            }))
+            .await;
+        assert_eq!(
+            monitor.status, 200,
+            "case {case:?}: the monitor under the live scope must be created, got {} with body {}",
+            monitor.status, monitor.body
+        );
+
+        assert_eq!(
+            emulator.delete_scope(&scope_id).await.status,
+            200,
+            "case {case:?}: the delete must succeed"
+        );
+
+        // The ARN now names no scope, so a create that needs a scope is refused
+        // just as it is for an ARN this store never minted.
+        let refused = emulator
+            .create_monitor(json!({
+                "monitorName": format!("after-{index}"),
+                "scopeArn": scope_arn,
+                "localResources": [{ "type": "AWS::EC2::VPC", "identifier": "vpc-1" }]
+            }))
+            .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: a retired scopeArn is refused, got {} with body {}",
+            refused.status, refused.body
+        );
+
+        // The same `clientToken` is no longer a replay of the deleted scope: it
+        // mints a new one, with a new id.
+        let recreated = emulator.create_scope(body.clone()).await;
+        assert_eq!(
+            recreated.status, 200,
+            "case {case:?}: the token must create a new scope, got {} with body {}",
+            recreated.status, recreated.body
+        );
+        assert_ne!(
+            recreated.text("scopeId"),
+            scope_id,
+            "case {case:?}: the new scope must not be the deleted one, got {:?}",
+            recreated.text("scopeId")
+        );
+        let read = emulator.get_scope(&recreated.text("scopeId")).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: the new scope must be readable, got {} with body {}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.member("targets"),
+            &body["targets"],
+            "case {case:?}: the new scope holds the request's targets, got {:?}",
+            read.member("targets")
+        );
+    }
 }

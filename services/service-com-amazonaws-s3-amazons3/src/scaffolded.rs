@@ -52,6 +52,19 @@
 //! case. Anything the model DOES model goes through the modeled channel — widen an
 //! operation that omits a shape the service declares with
 //! `#[operation_error(.., extra_errors = [".."])]` instead.
+//!
+//! ## Every error carries a `<Message>`
+//!
+//! S3's XML error document always carries a `<Message>` beside its `<Code>` — every SDK
+//! error parser reads `Error/Message` (botocore reports `None`, or the literal string
+//! `"Unknown"`, when it is absent). The three synthetic channels above each serialize
+//! their own message member, but EVERY error shape in this service's Smithy model
+//! declares no `message` member at all
+//! (`smithy_query(query="shape",shape="NoSuchBucket,BucketAlreadyOwnedByYou,…")`), so a
+//! modeled error serialized from its members alone would go out code-only. The
+//! [`SerializableStruct`] impl for [`Scaffolded`] therefore writes the error code's
+//! documented message from [`DOCUMENTED_ERROR_MESSAGES`] before the shape's own members,
+//! for every modeled error of every operation — the one place the rule lives.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -254,6 +267,154 @@ impl SerializableStruct for Unmodeled {
     }
 }
 
+/// The `message` member written for a MODELED error whose own shape declares none.
+///
+/// Same shape as the three synthetic members above — the member name Smithy uses
+/// (`message`) with the `Message` element name S3's XML error document carries — so the
+/// one value renders as `<Message>` on this service's restXml wire.
+static DOCUMENTED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#DocumentedErrorMessage$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// The `<Message>` S3 sends for each error code this service's model declares.
+///
+/// Every error shape in `com.amazonaws.s3` declares no `message` member, yet S3's error
+/// document always carries one, and for these codes the text is a fixed, documented
+/// constant rather than anything derived from the request — so it belongs here, once,
+/// instead of in each handler.
+///
+/// Sources, per row:
+///
+/// * the code's entry in AWS's S3 *Error responses* `ErrorCodeList`
+///   (<https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html#ErrorCodeList>),
+///   which publishes the exact text, for the six rows marked `[ErrorCodeList]`; and
+/// * otherwise the error shape's own `@documentation` in this service's Smithy model
+///   (`smithy_query(query="shape",shape="<Code>",
+///   model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`),
+///   HTML stripped — the sentence the model states for that condition.
+///
+/// `tests/all/error_message_envelope.rs` re-derives the key set from the model and fails
+/// if a row is stale or an error shape the model declares has no row, so a model update
+/// that adds an error code cannot silently go out message-less.
+pub const DOCUMENTED_ERROR_MESSAGES: &[(&str, &str)] = &[
+    // [ErrorCodeList]
+    ("AccessDenied", "Access Denied"),
+    (
+        "AnnotationLimitExceeded",
+        "The request would exceed the maximum number of annotations allowed per object.",
+    ),
+    ("AnnotationNameTooLong", "The annotation name exceeds 512 bytes."),
+    // [ErrorCodeList]
+    (
+        "BucketAlreadyExists",
+        "The requested bucket name is not available. The bucket namespace is shared by all \
+         users of the system. Please select a different name and try again.",
+    ),
+    // [ErrorCodeList]
+    (
+        "BucketAlreadyOwnedByYou",
+        "Your previous request to create the named bucket succeeded and you already own it.",
+    ),
+    (
+        "EncryptionTypeMismatch",
+        "The existing object was created with a different encryption type. Subsequent write \
+         requests must include the appropriate encryption parameters in the request or while \
+         creating the session.",
+    ),
+    (
+        "IdempotencyParameterMismatch",
+        "Parameters on this idempotent request are inconsistent with parameters used in \
+         previous request(s).",
+    ),
+    ("InvalidAnnotationName", "The annotation name you provided is invalid."),
+    (
+        "InvalidObjectState",
+        "Object is archived and inaccessible until restored.",
+    ),
+    ("InvalidPrefix", "The annotation prefix you provided is invalid."),
+    (
+        "InvalidRequest",
+        "A parameter or header in your request isn't valid. For details, see the description \
+         of this API operation.",
+    ),
+    (
+        "InvalidWriteOffset",
+        "The write offset value that you specified does not match the current object size.",
+    ),
+    (
+        "NoSuchAnnotation",
+        "The specified annotation does not exist on this object.",
+    ),
+    // [ErrorCodeList], and the same text the unmodeled channel already sends for these
+    // two codes on the subresource operations whose model declares no error shape —
+    // reused from `state` so one code cannot answer two different messages.
+    (
+        crate::state::NO_SUCH_BUCKET_CODE,
+        crate::state::NO_SUCH_BUCKET_MESSAGE,
+    ),
+    // [ErrorCodeList]
+    (
+        crate::state::NO_SUCH_KEY_CODE,
+        crate::state::NO_SUCH_KEY_MESSAGE,
+    ),
+    // [ErrorCodeList]
+    (
+        "NoSuchUpload",
+        "The specified multipart upload does not exist. The upload ID might be invalid, or \
+         the multipart upload might have been aborted or completed.",
+    ),
+    ("NotFound", "The specified content does not exist."),
+    (
+        "ObjectAlreadyInActiveTierError",
+        "This action is not allowed against this storage tier.",
+    ),
+    (
+        "ObjectNotInActiveTierError",
+        "The source object of the COPY action is not in the active tier and is only stored in \
+         Amazon S3 Glacier.",
+    ),
+    (
+        "TooManyParts",
+        "You have attempted to add more parts than the maximum of 10000 that are allowed for \
+         this object. You can use the CopyObject operation to copy this object to another and \
+         then add more data to the newly copied object.",
+    ),
+    (
+        "UnsupportedMediaType",
+        "The annotation payload is not valid UTF-8 encoded text.",
+    ),
+];
+
+/// The documented `<Message>` for a wire error code, or `None` for a code
+/// [`DOCUMENTED_ERROR_MESSAGES`] does not name.
+pub fn documented_error_message(code: &str) -> Option<&'static str> {
+    DOCUMENTED_ERROR_MESSAGES
+        .iter()
+        .find(|(candidate, _)| *candidate == code)
+        .map(|(_, message)| *message)
+}
+
+/// Whether an error shape declares its OWN message member, in which case the handler's
+/// value is what goes on the wire and nothing is written for it here.
+///
+/// No S3 error shape does today; this is what keeps the documented text from being
+/// emitted beside a modeled one if the model ever gains it.
+fn models_its_own_message(schema: &Schema) -> bool {
+    schema.members().iter().any(|member| {
+        member
+            .member_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("message"))
+    })
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -343,18 +504,42 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
     }
 }
 
+/// Every error this service puts on the wire is serialized through here, which is what
+/// makes "an S3 error document always carries a `<Message>`" one rule rather than one per
+/// operation.
+///
+/// The three synthetic channels serialize their own message member unchanged. A MODELED
+/// error gets the documented message for its wire code written first — `<Code>` then
+/// `<Message>`, the order S3's document uses — followed by whatever members its own shape
+/// declares (`InvalidObjectState`'s `StorageClass`, say).
+impl<E: OperationError> SerializableStruct for Scaffolded<E> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        match self {
+            Self::NotImplemented(e) => e.serialize_members(s),
+            Self::ValidationException(e) => e.serialize_members(s),
+            Self::Unmodeled(e) => e.serialize_members(s),
+            Self::Modeled(e) => {
+                if !models_its_own_message(e.variant_schema()) {
+                    if let Some(message) = documented_error_message(e.shape_name()) {
+                        s.write_string(&DOCUMENTED_MESSAGE, message)?;
+                    }
+                }
+                e.as_serializable().serialize_members(s)
+            }
+        }
+    }
+}
+
 /// Every `OperationError` method delegates to the modeled error, so wrapping an
 /// implemented operation's error channel changes NOTHING about how that error is
 /// rendered. Only the synthetic variant behaves differently — and it is the one that
 /// must answer 501.
 impl<E: OperationError> OperationError for Scaffolded<E> {
+    /// The wrapper ITSELF is the serializable view, so the `<Message>` the impl above
+    /// writes reaches the wire for a modeled error too. Each variant's own members are
+    /// serialized by that impl, by delegation.
     fn as_serializable(&self) -> &dyn SerializableStruct {
-        match self {
-            Self::NotImplemented(e) => e,
-            Self::Modeled(e) => e.as_serializable(),
-            Self::ValidationException(e) => e,
-            Self::Unmodeled(e) => e,
-        }
+        self
     }
 
     fn variant_schema(&self) -> &'static Schema {
