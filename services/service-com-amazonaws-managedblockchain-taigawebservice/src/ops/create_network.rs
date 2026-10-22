@@ -293,6 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 network_id: Some(network_id.clone()),
                 member_id: Some(member_id.clone()),
                 node_id: None,
+                accessor_id: None,
             },
         );
 

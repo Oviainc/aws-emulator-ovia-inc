@@ -23,7 +23,26 @@ pub struct GetAccessorOutput {
     pub accessor: Option<Accessor>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchain#Accessor")]
+// `Accessor` is one of the shapes in this service whose schema is written out by hand
+// rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason is a
+// single trait the macro does not read: `@timestampFormat`.
+//
+// The model targets `CreationDate` at `com.amazonaws.managedblockchain#Timestamp`, which
+// carries `@timestampFormat("date-time")` (`smithy_query(query="shape",
+// shape="Timestamp")` reports `"timestampFormat": "date-time"`). The vendored codegen
+// never emits `with_timestamp_format`, so a macro-built member schema reports no format
+// and the restJson1 JSON codec falls back to its protocol default, epoch seconds — a
+// NUMBER where the model (and every AWS SDK's generated deserializer for a `date-time`
+// member) requires an ISO-8601 string. The hand-written member schemas below differ from
+// the macro's output in exactly that one chain call, exactly as `Network`, `Member`,
+// `Node` and the summaries do.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
+// schema per member (index = position in the member list), a `SCHEMA` naming them in
+// order, the `<SHAPE>_SCHEMA` alias, and the serialize/deserialize pair. Constraint
+// traits are deliberately absent: the validating walk runs on operation INPUTS only, and
+// `Accessor` is an output shape, so the macro's captured constraints would be inert here
+// too.
 #[derive(Debug, Clone, Default)]
 pub struct Accessor {
     pub id: Option<String>,
@@ -34,5 +53,186 @@ pub struct Accessor {
     pub arn: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub network_type: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl Accessor {
+    const SHAPE_ID: &'static str = "com.amazonaws.managedblockchain#Accessor";
+    const NAMESPACE: &'static str = "com.amazonaws.managedblockchain";
+
+    pub const M_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Accessor$Id",
+            Self::NAMESPACE,
+            "Id",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Id",
+        0,
+    );
+    pub const M_TYPE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Accessor$Type",
+            Self::NAMESPACE,
+            "Type",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Type",
+        1,
+    );
+    pub const M_BILLING_TOKEN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Accessor$BillingToken",
+                Self::NAMESPACE,
+                "BillingToken",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "BillingToken",
+            2,
+        );
+    pub const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Accessor$Status",
+            Self::NAMESPACE,
+            "Status",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Status",
+        3,
+    );
+    /// `@timestampFormat("date-time")` from `Timestamp` — the chain the macro cannot
+    /// emit.
+    pub const M_CREATION_DATE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Accessor$CreationDate",
+                Self::NAMESPACE,
+                "CreationDate",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "CreationDate",
+            4,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Accessor$Arn",
+            Self::NAMESPACE,
+            "Arn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Arn",
+        5,
+    );
+    pub const M_TAGS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Accessor$Tags",
+            Self::NAMESPACE,
+            "Tags",
+        ),
+        ::aws_smithy_schema::ShapeType::Map,
+        "Tags",
+        6,
+    );
+    pub const M_NETWORK_TYPE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Accessor$NetworkType",
+                Self::NAMESPACE,
+                "NetworkType",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "NetworkType",
+            7,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "Accessor"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_TYPE,
+            &Self::M_BILLING_TOKEN,
+            &Self::M_STATUS,
+            &Self::M_CREATION_DATE,
+            &Self::M_ARN,
+            &Self::M_TAGS,
+            &Self::M_NETWORK_TYPE,
+        ],
+    );
+}
+
+pub static ACCESSOR_SCHEMA: &::aws_smithy_schema::Schema = &Accessor::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for Accessor {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.id.as_ref() {
+            s.write_string(&Self::M_ID, v.as_str())?;
+        }
+        if let Some(v) = self.r#type.as_ref() {
+            s.write_string(&Self::M_TYPE, v.as_str())?;
+        }
+        if let Some(v) = self.billing_token.as_ref() {
+            s.write_string(&Self::M_BILLING_TOKEN, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.creation_date.as_ref() {
+            s.write_timestamp(&Self::M_CREATION_DATE, v)?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|__sm| {
+                for (__k, __v) in v.iter() {
+                    __sm.write_string(&Self::M_TAGS, __k.as_str())?;
+                    __sm.write_string(&Self::M_TAGS, __v.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.network_type.as_ref() {
+            s.write_string(&Self::M_NETWORK_TYPE, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for Accessor {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.id = Some(d.read_string(&Self::M_ID)?),
+                Some(1) => out.r#type = Some(d.read_string(&Self::M_TYPE)?),
+                Some(2) => out.billing_token = Some(d.read_string(&Self::M_BILLING_TOKEN)?),
+                Some(3) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(4) => out.creation_date = Some(d.read_timestamp(&Self::M_CREATION_DATE)?),
+                Some(5) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                Some(6) => {
+                    let mut __out: std::collections::HashMap<String, String> =
+                        ::std::default::Default::default();
+                    d.read_map(&Self::M_TAGS, &mut |__k, __dm| {
+                        let __value = __dm.read_string(&Self::M_TAGS)?;
+                        __out.insert(__k, __value);
+                        Ok(())
+                    })?;
+                    out.tags = Some(__out);
+                }
+                Some(7) => out.network_type = Some(d.read_string(&Self::M_NETWORK_TYPE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 

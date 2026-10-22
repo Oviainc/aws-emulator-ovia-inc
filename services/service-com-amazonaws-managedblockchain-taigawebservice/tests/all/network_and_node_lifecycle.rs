@@ -13,6 +13,10 @@
 //! can take (and its omission), page sizes from one to past the item count plus both
 //! published `MaxResults` bounds and one past each, and every id-shaped lookup that names
 //! nothing stored.
+//!
+//! The harness at the top (the router, the signed call and the answer it returns) is
+//! `pub(crate)` so the other suites in this target reuse it rather than growing a second
+//! copy of it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,7 +58,7 @@ impl Answer {
 }
 
 /// A router with only this service mounted, over a fresh engine.
-fn new_router() -> MultiServiceRouter {
+pub(crate) fn new_router() -> MultiServiceRouter {
     router_over(Arc::new(engine::InMemoryEngine::new()))
 }
 
@@ -70,7 +74,12 @@ pub(crate) fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRo
 }
 
 /// Send one request and return what the emulator answered.
-pub(crate) async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Answer {
     let payload = body.map_or_else(Bytes::new, |value| {
         Bytes::from(serde_json::to_vec(&value).expect("the request body serializes"))
     });

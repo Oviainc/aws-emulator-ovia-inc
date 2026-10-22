@@ -5,15 +5,17 @@
 //! The service's primary resource is the blockchain **network**, which owns the
 //! **members** that joined it and the **nodes** that run on it. Beside the networks sit
 //! the **invitations** this account holds — one per approved `InviteAction`, each naming
-//! the network its invitee may join. Every implemented operation answers from the records
-//! below: ids, ARNs, endpoints and creation dates are minted once by the call that
-//! creates the record and stored, never recomputed on a read.
+//! the network its invitee may join — and the account's **accessors**: the token-based
+//! access objects `CreateAccessor` mints, which belong to the account rather than to any
+//! one network. Every implemented operation answers from the records below: ids, ARNs,
+//! endpoints, billing tokens and creation dates are minted once by the call that creates
+//! the record and stored, never recomputed on a read.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Invitation, Member, MemberFabricAttributes, MemberFrameworkAttributes,
+    Accessor, Invitation, Member, MemberFabricAttributes, MemberFrameworkAttributes,
     MemberLogPublishingConfiguration, Network, NetworkFabricAttributes,
     NetworkFrameworkAttributes, NetworkSummary, Node, NodeFabricAttributes,
     NodeFrameworkAttributes, NodeLogPublishingConfiguration, NodeSummary, VotingPolicy,
@@ -86,6 +88,32 @@ pub const DEFAULT_STATE_DB: &str = "CouchDB";
 /// behalf", which `Member$KmsKeyArn` reports as this sentinel value.
 pub const AWS_OWNED_KMS_KEY: &str = "AWS Owned KMS Key";
 
+/// The status a created accessor is reported in.
+///
+/// `AccessorStatus` declares only `AVAILABLE | PENDING_DELETION | DELETED` (no creating
+/// state at all), so an accessor is ready the moment it is created and the clock owes it
+/// no transition — unlike a network, member or node. The literal is the same text
+/// [`STATUS_AVAILABLE`] carries, which is why it is defined in terms of it.
+pub const ACCESSOR_STATUS_AVAILABLE: &str = STATUS_AVAILABLE;
+
+/// The `AccessorNetworkType` an accessor takes when the create names none.
+///
+/// `CreateAccessor$NetworkType` is optional, and AWS's `CreateAccessor` reference states
+/// that the default value of `ETHEREUM_MAINNET_AND_GOERLI` is applied when the
+/// `CreateAccessor` action does not set a `networkType`. It is a member of
+/// `AccessorNetworkType`, so a stored accessor reports a modelled value either way.
+pub const DEFAULT_ACCESSOR_NETWORK_TYPE: &str = "ETHEREUM_MAINNET_AND_GOERLI";
+
+/// How many characters an `AccessorBillingTokenString` has: its `@length(42, 42)` fixes
+/// the length exactly.
+pub const BILLING_TOKEN_LEN: usize = 42;
+
+/// How many accessors this emulator will hold, for the same reason as [`MAX_NETWORKS`];
+/// `CreateAccessor` models `ResourceLimitExceededException` for exceeding the account's
+/// quota. The number is the emulator's own ceiling, not a fidelity claim about the
+/// published quota.
+pub const MAX_ACCESSORS: usize = 1_000;
+
 /// `ListNetworks`'s `MaxResults` upper bound, from its `@range(1, 10)`. Also the page
 /// size used when a caller names none.
 pub const NETWORK_MAX_RESULTS: i32 = 10;
@@ -132,6 +160,7 @@ pub struct CreatedIds {
     pub network_id: Option<String>,
     pub member_id: Option<String>,
     pub node_id: Option<String>,
+    pub accessor_id: Option<String>,
 }
 
 /// The idempotency key of one `@idempotencyToken` call: the token is scoped to the
@@ -351,6 +380,44 @@ impl StoredNode {
     }
 }
 
+/// One stored accessor: the token-based access object `CreateAccessor` mints.
+///
+/// An accessor belongs to the account rather than to a network — `Accessor` names no
+/// network id — so the records live beside [`StoredNetwork`], not inside one.
+#[derive(Debug, Clone)]
+pub struct StoredAccessor {
+    pub id: String,
+    /// An `AccessorType` value, as the create named it.
+    pub accessor_type: String,
+    /// `Accessor$BillingToken`, minted at create time and stored, so every read of the
+    /// accessor reports the same token.
+    pub billing_token: String,
+    /// An `AccessorStatus` value.
+    pub status: String,
+    pub creation_date: SystemTime,
+    pub tags: BTreeMap<String, String>,
+    pub arn: String,
+    /// An `AccessorNetworkType` value: what the create named, or
+    /// [`DEFAULT_ACCESSOR_NETWORK_TYPE`] when it named none.
+    pub network_type: String,
+}
+
+impl StoredAccessor {
+    /// The modelled `Accessor` for this record, as `GetAccessor` returns it.
+    pub fn to_accessor(&self) -> Accessor {
+        Accessor {
+            id: Some(self.id.clone()),
+            r#type: Some(self.accessor_type.clone()),
+            billing_token: Some(self.billing_token.clone()),
+            status: Some(self.status.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            arn: Some(self.arn.clone()),
+            tags: Some(map_out(&self.tags)),
+            network_type: Some(self.network_type.clone()),
+        }
+    }
+}
+
 /// One invitation an approved `InviteAction` minted: "An invitation to an Amazon Web
 /// Services account to create a member and join the network."
 #[derive(Debug, Clone)]
@@ -398,6 +465,9 @@ pub struct ComAmazonawsManagedblockchainTaigawebserviceState {
     /// Every created network, keyed by its minted id — which also orders the listings,
     /// so a page cursor keys on the ordering itself.
     pub networks: BTreeMap<String, StoredNetwork>,
+    /// Every created accessor, keyed by its minted id — which also orders the listings,
+    /// so a page cursor keys on the ordering itself.
+    pub accessors: BTreeMap<String, StoredAccessor>,
     /// Every invitation this account holds, keyed by its minted id — which, as for the
     /// networks above, is also the listing order a page cursor keys on.
     pub invitations: BTreeMap<String, StoredInvitation>,
@@ -492,14 +562,11 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
     /// Drawn from a counter the state advances (seeded from the clock on first use),
     /// never from the request, so two identical creates mint two different ids.
     pub fn mint_id(&mut self, prefix: &str) -> String {
-        if self.id_seed == 0 {
-            self.id_seed = now_nanos();
-        }
-        self.id_seed = splitmix64(self.id_seed);
-        let low = splitmix64(self.id_seed);
+        let high = self.advance();
+        let low = self.advance();
         let mut id = String::from(prefix);
         id.push('-');
-        id.push_str(&base32_13(self.id_seed));
+        id.push_str(&base32_13(high));
         id.push_str(&base32_13(low));
         id
     }
@@ -509,6 +576,17 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         loop {
             let id = self.mint_id("n");
             if !self.networks.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Mint an accessor id no stored accessor holds (`ac-` is the prefix Managed
+    /// Blockchain writes an accessor id with).
+    pub fn mint_accessor_id(&mut self) -> String {
+        loop {
+            let id = self.mint_id("ac");
+            if !self.accessors.contains_key(&id) {
                 return id;
             }
         }
@@ -524,6 +602,39 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         }
     }
 
+    /// Mint a billing token no stored accessor holds: exactly [`BILLING_TOKEN_LEN`]
+    /// characters, as `AccessorBillingTokenString`'s `@length(42, 42)` requires.
+    ///
+    /// Drawn from the same counter the ids come from, never from the request, so two
+    /// accessors never share a token and no token is a function of the caller's input.
+    pub fn mint_billing_token(&mut self) -> String {
+        loop {
+            let mut token = String::with_capacity(BILLING_TOKEN_LEN);
+            while token.len() < BILLING_TOKEN_LEN {
+                token.push_str(&base32_13(self.advance()));
+            }
+            // Every character is one ASCII byte of the base-32 alphabet, so this cuts
+            // the token to exactly `BILLING_TOKEN_LEN` characters.
+            token.truncate(BILLING_TOKEN_LEN);
+            if !self
+                .accessors
+                .values()
+                .any(|accessor| accessor.billing_token == token)
+            {
+                return token;
+            }
+        }
+    }
+
+    /// Advance the id counter and hand back its new value. Seeded from the clock on
+    /// first use, so no minted value is ever a function of the request.
+    fn advance(&mut self) -> u64 {
+        if self.id_seed == 0 {
+            self.id_seed = now_nanos();
+        }
+        self.id_seed = splitmix64(self.id_seed);
+        self.id_seed
+    }
     /// Record the invitation an `InviteAction` owes `principal` once its proposal is
     /// approved: "The `InviteAction` is carried out when a `Proposal` is `APPROVED`"
     /// (`InviteAction`). This is where an invitation enters the store, and the only
@@ -600,6 +711,12 @@ pub fn network_arn(region: &str, network_id: &str) -> String {
 /// The ARN of a member: `arn:aws:managedblockchain:<region>:<account>:members/<id>`.
 pub fn member_arn(region: &str, member_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("members/{member_id}"))
+}
+
+/// The ARN of an accessor:
+/// `arn:aws:managedblockchain:<region>:<account>:accessors/<id>`.
+pub fn accessor_arn(region: &str, accessor_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("accessors/{accessor_id}"))
 }
 
 /// The ARN of a node: `arn:aws:managedblockchain:<region>:<account>:nodes/<id>`.

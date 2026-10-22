@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccessor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccessor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccessor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints an accessor id and a billing token, persists the accessor in
+//! [`crate::state`] and answers from that record; `GetAccessor` projects the same one.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +176,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccessor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccessorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccessor"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAccessorErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        guard.settle(now);
+
+        // "An idempotent operation completes no more than once" (`ClientRequestToken`):
+        // a token already used answers from the accessor its first call created, so a
+        // retry — or a second call with the same token — mints nothing new.
+        let token = crate::state::idempotency_key(Self::NAME, &input.client_request_token);
+        let replayed = guard
+            .replay_idempotent(&token)
+            .and_then(|created| created.accessor_id)
+            .and_then(|accessor_id| guard.accessors.get(&accessor_id).cloned());
+        if let Some(accessor) = replayed {
+            // Answered from the STORED record, so a replay carries the very id, billing
+            // token and network type the first call returned. A ledger record whose
+            // accessor is no longer stored is NOT replayed: it could only hand back a
+            // token nothing holds, so such a token creates a new accessor below.
+            return Ok(CreateAccessorOutput {
+                accessor_id: Some(accessor.id.clone()),
+                billing_token: Some(accessor.billing_token.clone()),
+                network_type: Some(accessor.network_type.clone()),
+            });
+        }
+
+        if guard.accessors.len() >= crate::state::MAX_ACCESSORS {
+            return Err(CreateAccessorErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} accessors",
+                        crate::state::MAX_ACCESSORS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let accessor_id = guard.mint_accessor_id();
+        let billing_token = guard.mint_billing_token();
+        let accessor = crate::state::StoredAccessor {
+            id: accessor_id.clone(),
+            accessor_type: input.accessor_type,
+            billing_token,
+            // `AccessorStatus` declares no creating state at all, so an accessor is
+            // ready as soon as it exists and the clock owes it no transition.
+            status: crate::state::ACCESSOR_STATUS_AVAILABLE.to_string(),
+            creation_date: now,
+            tags: crate::state::map_in(input.tags),
+            // The blockchain network the token is created for, as the request named it;
+            // an absent `NetworkType` takes its documented default. Every
+            // `AccessorNetworkType` value is stored as given — the model lists all of
+            // them, and "your existing Accessor tokens with these networkType values
+            // will remain unchanged".
+            network_type: input
+                .network_type
+                .unwrap_or_else(|| crate::state::DEFAULT_ACCESSOR_NETWORK_TYPE.to_string()),
+            arn: crate::state::accessor_arn(&region, &accessor_id),
+        };
+
+        guard.accessors.insert(accessor_id.clone(), accessor);
+        guard.remember_idempotent(
+            token,
+            crate::state::CreatedIds {
+                network_id: None,
+                member_id: None,
+                node_id: None,
+                accessor_id: Some(accessor_id.clone()),
+            },
+        );
+
+        // Answer from the STORED record, so this is the id, token and network type every
+        // later read of the accessor answers with.
+        let Some(stored) = guard.accessors.get(&accessor_id) else {
+            return Err(CreateAccessorErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+        Ok(CreateAccessorOutput {
+            accessor_id: Some(stored.id.clone()),
+            billing_token: Some(stored.billing_token.clone()),
+            network_type: Some(stored.network_type.clone()),
+        })
     }
 }
