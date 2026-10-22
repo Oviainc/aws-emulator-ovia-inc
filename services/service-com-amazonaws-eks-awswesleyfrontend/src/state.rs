@@ -6,6 +6,15 @@
 //! [`ClusterRecord`] here, and `DescribeCluster`, `ListClusters`, `TagResource`,
 //! `ListTagsForResource` and `DeleteCluster` all compute their responses from it.
 //! Nothing in `src/ops/` keeps a second copy of a cluster.
+//!
+//! It also holds the Kubernetes version calendar `DescribeClusterVersions`
+//! reports ([`ClusterVersionRecord`]), which is seeded once because it is what
+//! Amazon EKS publishes rather than per-account data.
+//!
+//! An asynchronous cluster update lives ON the cluster it updates
+//! ([`ClusterRecord::updates`]), so `AssociateEncryptionConfig` writes one there
+//! and `DescribeUpdate` reads it back; deleting the cluster drops its updates
+//! with it rather than leaving them behind in a second map.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -13,10 +22,11 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AccessConfigResponse, Certificate, Cluster, ComputeConfigResponse, ControlPlaneScalingConfig,
-    EncryptionConfig, Identity, KubeApiServerConfigResponse, KubeControllerManagerConfigResponse,
-    KubeSchedulerConfigResponse, KubernetesNetworkConfigResponse, Logging, OutpostConfigResponse,
-    RemoteNetworkConfigResponse, StorageConfigResponse, UpgradePolicyResponse, VpcConfigResponse,
+    AccessConfigResponse, Certificate, Cluster, ClusterVersionInformation, ComputeConfigResponse,
+    ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
+    KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
+    KubernetesNetworkConfigResponse, Logging, OutpostConfigResponse, RemoteNetworkConfigResponse,
+    StorageConfigResponse, Update, UpdateParam, UpgradePolicyResponse, VpcConfigResponse,
     ZonalShiftConfigResponse,
 };
 
@@ -29,6 +39,36 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETING: &str = "DELETING";
+/// See [`STATUS_CREATING`] — the status a cluster reports while one of its
+/// asynchronous updates is in flight.
+pub const STATUS_UPDATING: &str = "UPDATING";
+
+/// The `UpdateStatus` members this slice uses. The model's enum
+/// (`smithy_query query="shape" shape="UpdateStatus"`) is
+/// `InProgress | Failed | Cancelled | Successful`; `Update$status` deserialises
+/// to a plain string, so the status is stored as the wire token.
+pub const UPDATE_IN_PROGRESS: &str = "InProgress";
+/// See [`UPDATE_IN_PROGRESS`].
+pub const UPDATE_SUCCESSFUL: &str = "Successful";
+
+/// The `UpdateType` member an encryption association reports
+/// (`smithy_query query="shape" shape="UpdateType"`).
+pub const UPDATE_TYPE_ASSOCIATE_ENCRYPTION_CONFIG: &str = "AssociateEncryptionConfig";
+
+/// The `UpdateParamType` key an encryption association reports its requested
+/// configuration under (`smithy_query query="shape" shape="UpdateParamType"`).
+pub const UPDATE_PARAM_ENCRYPTION_CONFIG: &str = "EncryptionConfig";
+
+/// How long an asynchronous cluster update reports `InProgress` before the clock
+/// owes it `Successful` and the change it carries is applied to the cluster.
+///
+/// No duration is published for an EKS update — `DescribeUpdate` says only "When
+/// the status of the update is `Successful`, the update is complete" — so this
+/// span is CHOSEN rather than cited: non-zero, so a caller that describes the
+/// update straight after starting it still observes `InProgress` (and the
+/// `UPDATING` cluster it goes with), and short enough to be worth waiting for.
+/// The due instant is stored on the update record; nothing sleeps for it.
+pub const UPDATE_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 
 /// How long a newly created cluster reports `CREATING` before the clock owes it
 /// `ACTIVE`.
@@ -206,19 +246,115 @@ pub struct ClusterRecord {
     pub kube_api_server_config: Option<KubeApiServerConfigResponse>,
     pub kube_scheduler_config: Option<KubeSchedulerConfigResponse>,
     pub kube_controller_manager_config: Option<KubeControllerManagerConfigResponse>,
+    /// The asynchronous updates started against this cluster, by update id.
+    ///
+    /// They live on the cluster because that is what scopes them: `DescribeUpdate`
+    /// and `ListUpdates` both name a cluster, and deleting the cluster must drop
+    /// its updates. A `BTreeMap` so a listing walks a stable, sorted order. Each
+    /// operation that mints an update refuses to start a second one while one is
+    /// in flight, and `AssociateEncryptionConfig` — the only writer in this slice
+    /// — is refused once encryption is enabled, so this map holds at most one
+    /// entry per cluster and [`MAX_STORED_CLUSTERS`] bounds it.
+    pub updates: BTreeMap<String, UpdateRecord>,
+}
+
+/// One asynchronous update of a cluster, as this service stores it.
+///
+/// Everything the modelled `Update` reports is held here, so `DescribeUpdate`
+/// returns what the call that started the update wrote rather than recomputing
+/// it. The two extra fields are not reported: `succeeds_at` is the instant the
+/// clock owes this update its `Successful` status, and
+/// `pending_encryption_config` is the change applied to the cluster at that same
+/// instant.
+#[derive(Debug, Clone)]
+pub struct UpdateRecord {
+    pub id: String,
+    pub r#type: String,
+    pub status: String,
+    pub created_at: SystemTime,
+    pub params: Vec<UpdateParam>,
+    pub client_request_token: Option<String>,
+    /// When set, the instant at which the clock owes this update the move from
+    /// `InProgress` to `Successful`. Cleared once the move is materialised.
+    pub succeeds_at: Option<SystemTime>,
+    /// The `encryptionConfig` this update puts on its cluster when it completes,
+    /// for an `AssociateEncryptionConfig` update. Taken when applied.
+    pub pending_encryption_config: Option<Vec<EncryptionConfig>>,
+}
+
+impl UpdateRecord {
+    /// This record as the modelled `Update` shape.
+    pub fn to_update(&self) -> Update {
+        Update {
+            id: Some(self.id.clone()),
+            status: Some(self.status.clone()),
+            r#type: Some(self.r#type.clone()),
+            params: Some(self.params.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            // `errors` carries "any errors associated with a `Failed` update" and
+            // `cancellation` "is present only if any cancellation is attempted",
+            // so neither is reported for an update that is running or succeeded.
+            // The slices that can fail or cancel an update (`CancelUpdate` and
+            // friends) fill them in; each is still 501 with its own gap issue.
+            errors: None,
+            cancellation: None,
+        }
+    }
 }
 
 impl ClusterRecord {
-    /// Materialise the status move the clock already owes at `now`.
+    /// Materialise the status moves the clock already owes at `now`.
     ///
-    /// This is the only write a reporting operation may make: the transition was
-    /// due at `active_at` whether or not anybody called, so applying it on read
-    /// does not change what a later caller sees.
+    /// This is the only write a reporting operation may make: each transition was
+    /// due at its stored instant whether or not anybody called, so applying it on
+    /// read does not change what a later caller sees. Two are owed here — a new
+    /// cluster's `CREATING` -> `ACTIVE` move, and the completion of an
+    /// asynchronous update, which flips the update to `Successful`, applies the
+    /// change it carries and hands the cluster back to `ACTIVE`.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
         if self.active_at.is_some_and(|due| now >= due) {
             self.status = STATUS_ACTIVE.to_string();
             self.active_at = None;
         }
+
+        let due: Vec<String> = self
+            .updates
+            .iter()
+            .filter(|(_, update)| update.succeeds_at.is_some_and(|due| now >= due))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            let Some(update) = self.updates.get_mut(&id) else {
+                continue;
+            };
+            update.status = UPDATE_SUCCESSFUL.to_string();
+            update.succeeds_at = None;
+            let encryption_config = update.pending_encryption_config.take();
+            if let Some(encryption_config) = encryption_config {
+                self.encryption_config = encryption_config;
+            }
+            // An update only starts from an `ACTIVE` cluster, so completing one
+            // hands the cluster back to the status it was taken from.
+            self.status = STATUS_ACTIVE.to_string();
+        }
+    }
+
+    /// The update this cluster is still running, if any.
+    ///
+    /// A cluster runs at most one update at a time, so this is what a mutating
+    /// operation checks before starting another.
+    pub fn in_flight_update(&self) -> Option<&UpdateRecord> {
+        self.updates
+            .values()
+            .find(|update| update.status == UPDATE_IN_PROGRESS)
+    }
+
+    /// The update this cluster already recorded for `client_request_token`, if
+    /// any — what makes a retry of the call that started it idempotent.
+    pub fn update_for_token(&self, token: &str) -> Option<&UpdateRecord> {
+        self.updates
+            .values()
+            .find(|update| update.client_request_token.as_deref() == Some(token))
     }
 
     /// This record as the modelled `Cluster` shape.
@@ -268,8 +404,227 @@ impl ClusterRecord {
     }
 }
 
+/// The cluster type the Kubernetes version calendar publishes versions for.
+///
+/// `DescribeClusterVersionsRequest$clusterType` is a free-form string ("The type
+/// of cluster to filter versions by"), and the only kind of cluster this service
+/// stands up is an Amazon EKS cluster, which EKS names `eks` — the value its own
+/// CLI examples pass to `--cluster-type`.
+pub const CLUSTER_TYPE_EKS: &str = "eks";
+
+/// Where a Kubernetes version sits in the Amazon EKS support lifecycle at one
+/// instant.
+///
+/// EKS publishes the same state under two modelled enums
+/// (`smithy_query query="shape" shape="ClusterVersionStatus,VersionStatus"`): the
+/// deprecated `ClusterVersionStatus` (`unsupported | standard-support |
+/// extended-support`) and `VersionStatus` (`UNSUPPORTED | STANDARD_SUPPORT |
+/// EXTENDED_SUPPORT`). Both spellings are reported for every version, and both
+/// input filters are matched against this one state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportStatus {
+    /// The version is inside its standard-support window.
+    StandardSupport,
+    /// Standard support has ended, extended support has not.
+    ExtendedSupport,
+    /// Extended support has ended too.
+    Unsupported,
+}
+
+impl SupportStatus {
+    /// This state as a `VersionStatus` member.
+    pub fn version_status(self) -> &'static str {
+        match self {
+            Self::StandardSupport => "STANDARD_SUPPORT",
+            Self::ExtendedSupport => "EXTENDED_SUPPORT",
+            Self::Unsupported => "UNSUPPORTED",
+        }
+    }
+
+    /// This state as a (deprecated) `ClusterVersionStatus` member.
+    pub fn cluster_version_status(self) -> &'static str {
+        match self {
+            Self::StandardSupport => "standard-support",
+            Self::ExtendedSupport => "extended-support",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    /// The state a `VersionStatus` member names, or `None` for a token that enum
+    /// does not declare.
+    pub fn from_version_status(token: &str) -> Option<Self> {
+        [Self::StandardSupport, Self::ExtendedSupport, Self::Unsupported]
+            .into_iter()
+            .find(|status| status.version_status() == token)
+    }
+
+    /// The state a `ClusterVersionStatus` member names, or `None` for a token that
+    /// enum does not declare.
+    pub fn from_cluster_version_status(token: &str) -> Option<Self> {
+        [Self::StandardSupport, Self::ExtendedSupport, Self::Unsupported]
+            .into_iter()
+            .find(|status| status.cluster_version_status() == token)
+    }
+
+    /// Every member of either enum, in the order this type declares them — used to
+    /// word the refusal of a token neither enum declares.
+    pub fn all() -> [Self; 3] {
+        [Self::StandardSupport, Self::ExtendedSupport, Self::Unsupported]
+    }
+}
+
+/// One row of the Kubernetes version calendar Amazon EKS publishes, as this
+/// service stores it.
+///
+/// The calendar is a PUBLICATION, not per-account data: `DescribeClusterVersions`
+/// "Lists available Kubernetes versions for Amazon EKS clusters", so every row is
+/// seeded once (see [`VERSION_CALENDAR`]) and no operation writes one. The
+/// support status is NOT stored: it is a function of the clock and the two
+/// end-of-support dates, so it is derived per request by
+/// [`ClusterVersionRecord::support_status`] and cannot go stale.
+#[derive(Debug, Clone)]
+pub struct ClusterVersionRecord {
+    /// The Kubernetes minor version, e.g. `1.31`.
+    pub cluster_version: String,
+    /// The cluster type this row is for ([`CLUSTER_TYPE_EKS`]).
+    pub cluster_type: String,
+    /// Whether `CreateCluster` without a `version` creates this version — the row
+    /// that matches [`DEFAULT_KUBERNETES_VERSION`].
+    pub default_version: bool,
+    /// The day Amazon EKS released this version.
+    pub release_date: SystemTime,
+    /// The day standard support for it ends.
+    pub end_of_standard_support: SystemTime,
+    /// The day extended support for it ends.
+    pub end_of_extended_support: SystemTime,
+}
+
+impl ClusterVersionRecord {
+    /// The key a `DescribeClusterVersions` page token names, so the next page
+    /// resumes after this row. A calendar row is identified by its cluster type
+    /// and version together, which is what makes the key unique.
+    pub fn page_key(&self) -> String {
+        format!("{}/{}", self.cluster_type, self.cluster_version)
+    }
+
+    /// Whether this version has been released at `now`. A version the calendar
+    /// lists but has not released yet is not an available one.
+    pub fn is_released(&self, now: SystemTime) -> bool {
+        now >= self.release_date
+    }
+
+    /// Where this version sits in the support lifecycle at `now`: standard support
+    /// until its end-of-standard-support day, extended support until its
+    /// end-of-extended-support day, unsupported after that.
+    pub fn support_status(&self, now: SystemTime) -> SupportStatus {
+        if now < self.end_of_standard_support {
+            SupportStatus::StandardSupport
+        } else if now < self.end_of_extended_support {
+            SupportStatus::ExtendedSupport
+        } else {
+            SupportStatus::Unsupported
+        }
+    }
+
+    /// This row as the modelled `ClusterVersionInformation` shape, as of `now`.
+    pub fn to_cluster_version_information(&self, now: SystemTime) -> ClusterVersionInformation {
+        let status = self.support_status(now);
+        ClusterVersionInformation {
+            cluster_version: Some(self.cluster_version.clone()),
+            cluster_type: Some(self.cluster_type.clone()),
+            // The platform version a cluster of this Kubernetes version is created
+            // at — the same constant `CreateCluster` writes onto a new record, so
+            // the catalog and the cluster slice cannot disagree.
+            default_platform_version: Some(INITIAL_PLATFORM_VERSION.to_string()),
+            default_version: self.default_version,
+            release_date: Some(::aws_smithy_types::DateTime::from(self.release_date)),
+            end_of_standard_support_date: Some(::aws_smithy_types::DateTime::from(
+                self.end_of_standard_support,
+            )),
+            end_of_extended_support_date: Some(::aws_smithy_types::DateTime::from(
+                self.end_of_extended_support,
+            )),
+            // The deprecated spelling and the current one, from the same state.
+            status: Some(status.cluster_version_status().to_string()),
+            version_status: Some(status.version_status().to_string()),
+            // Left unset, each because this emulator holds nothing to compute it
+            // from rather than because the member is uninteresting:
+            // `kubernetesPatchVersion` is the patch level of the control-plane
+            // build actually running a version, and this emulator runs no
+            // Kubernetes control plane; `controlPlaneScalingTiers` and
+            // `controlPlaneComponentConfig` are the provisioned control-plane
+            // tier and component-default catalogs, which belong to the
+            // provisioned-control-plane slice (no operation here publishes them).
+            kubernetes_patch_version: None,
+            control_plane_scaling_tiers: None,
+            control_plane_component_config: None,
+        }
+    }
+}
+
+/// The Amazon EKS Kubernetes version calendar, as
+/// `(version, EKS release, end of standard support, end of extended support)`.
+///
+/// These are the dates the "Amazon EKS Kubernetes release calendar" in the Amazon
+/// EKS User Guide publishes, one row per Kubernetes minor version, each date a UTC
+/// day. They follow the support policy the same guide states — a version enters
+/// standard support on its Amazon EKS release date, standard support runs for 14
+/// months, and extended support runs for a further 12 months — but every row
+/// below is the PUBLISHED date rather than one computed from that policy.
+///
+/// Rows are in ascending Kubernetes version order, which is the order
+/// `DescribeClusterVersions` reports and pages them in. The calendar is a fixed
+/// table, so it also bounds this part of the store.
+const VERSION_CALENDAR: &[(&str, &str, &str, &str)] = &[
+    ("1.26", "2023-04-11", "2024-06-11", "2025-06-11"),
+    ("1.27", "2023-05-24", "2024-07-24", "2025-07-24"),
+    ("1.28", "2023-09-26", "2024-11-26", "2025-11-26"),
+    ("1.29", "2024-01-23", "2025-03-23", "2026-03-23"),
+    ("1.30", "2024-05-23", "2025-07-23", "2026-07-23"),
+    ("1.31", "2024-09-26", "2025-11-26", "2026-11-26"),
+    ("1.32", "2025-01-23", "2026-03-23", "2027-03-23"),
+    ("1.33", "2025-05-28", "2026-07-28", "2027-07-28"),
+];
+
+/// The first instant (UTC) of a `YYYY-MM-DD` day in [`VERSION_CALENDAR`].
+///
+/// The day is widened to an RFC-3339 instant and parsed by `aws-smithy-types`,
+/// which is the same parser the wire layer uses, rather than by hand-rolled
+/// calendar arithmetic. Every calendar day is after the epoch, so the parsed
+/// seconds are non-negative. A row that does not parse is a typo in the constant
+/// table above, which `calendar_rows_are_well_formed` pins.
+fn calendar_instant(day: &str) -> SystemTime {
+    let text = format!("{day}T00:00:00Z");
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        &text,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| panic!("{text} is not an RFC-3339 instant: {error}"));
+    SystemTime::UNIX_EPOCH + Duration::from_secs(parsed.secs().unsigned_abs())
+}
+
+/// Build the version calendar this service publishes from [`VERSION_CALENDAR`].
+fn seed_cluster_versions() -> Vec<ClusterVersionRecord> {
+    VERSION_CALENDAR
+        .iter()
+        .map(
+            |(version, release, standard_end, extended_end)| ClusterVersionRecord {
+                cluster_version: (*version).to_string(),
+                cluster_type: CLUSTER_TYPE_EKS.to_string(),
+                // The one row a `CreateCluster` without `version` lands on, so a
+                // caller that asks this catalog for the default version and a
+                // caller that omits the version get the same Kubernetes version.
+                default_version: *version == DEFAULT_KUBERNETES_VERSION,
+                release_date: calendar_instant(release),
+                end_of_standard_support: calendar_instant(standard_end),
+                end_of_extended_support: calendar_instant(extended_end),
+            },
+        )
+        .collect()
+}
+
 /// Per-service state for com-amazonaws-eks-awswesleyfrontend. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// Clusters by `(region, name)`.
     ///
@@ -289,19 +644,61 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// call name a cluster in any region. It holds exactly one entry per stored
     /// cluster, so [`MAX_STORED_CLUSTERS`] bounds it too.
     pub arn_index: BTreeMap<String, (String, String)>,
-    // The nodegroup and update maps the next slices need are deliberately NOT
-    // declared yet: a field no operation reads is dead weight that every
-    // `Debug`/`Default` and every reviewer has to account for. Each is added by
-    // the slice that first writes it (`CreateNodegroup`, `UpdateClusterConfig`
-    // and friends, still 501 with their own gap issues).
+    /// The Kubernetes version calendar `DescribeClusterVersions` reports, seeded
+    /// once from [`VERSION_CALENDAR`] (see [`ClusterVersionRecord`]) and never
+    /// written by a request: it is what Amazon EKS publishes, not per-account
+    /// data. A `Vec` because the calendar has a publication ORDER (ascending
+    /// Kubernetes version) that the listing and its page tokens follow.
+    pub cluster_versions: Vec<ClusterVersionRecord>,
+    /// How many update ids this store has minted. Mixed into the next one (see
+    /// [`new_update_id`]) so two updates minted in the same nanosecond cannot
+    /// collide.
+    pub minted_updates: u64,
+    // The nodegroup map the next slice needs is deliberately NOT declared yet: a
+    // field no operation reads is dead weight that every `Debug`/`Default` and
+    // every reviewer has to account for. It is added by the slice that first
+    // writes it (`CreateNodegroup`, still 501 with its own gap issue). An
+    // asynchronous update is not here either — it lives on the cluster it
+    // updates ([`ClusterRecord::updates`]).
+}
+
+impl Default for ComAmazonawsEksAwswesleyfrontendState {
+    /// A fresh store holds no clusters and the whole published version calendar:
+    /// `DescribeClusterVersions` answers before anything has been created.
+    fn default() -> Self {
+        Self {
+            clusters: BTreeMap::new(),
+            arn_index: BTreeMap::new(),
+            cluster_versions: seed_cluster_versions(),
+            minted_updates: 0,
+        }
+    }
 }
 
 impl ComAmazonawsEksAwswesleyfrontendState {
+    /// The calendar rows that are released at `now`, in the calendar's own
+    /// ascending-version order.
+    pub fn released_cluster_versions(
+        &self,
+        now: SystemTime,
+    ) -> impl Iterator<Item = &ClusterVersionRecord> + '_ {
+        self.cluster_versions
+            .iter()
+            .filter(move |entry| entry.is_released(now))
+    }
+
     /// Materialise every clock-owed status move across the store.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
         for cluster in self.clusters.values_mut() {
             cluster.materialize_due_transitions(now);
         }
+    }
+
+    /// The next value to mix into a minted update id, counted from this store's
+    /// own total rather than from any one cluster's.
+    pub fn next_update_sequence(&mut self) -> u64 {
+        self.minted_updates = self.minted_updates.wrapping_add(1);
+        self.minted_updates
     }
 
     /// The `(region, name)` key of the cluster `arn` identifies, if this store
@@ -332,6 +729,44 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// A fresh identifier in the shape EKS gives an `Update$id`: "a UUID that is
+/// used to track the update" — a version-4 UUID, `8-4-4-4-12` lowercase hex with
+/// the version and variant bits RFC 4122 §4.4 fixes.
+///
+/// The 128 bits come from three sources hashed together with SHA-256 (the `sha2`
+/// crate) and hex-encoded (the `hex` crate): the OS-seeded randomness a
+/// `RandomState` draws, the system clock in nanoseconds, and `sequence` — a
+/// counter the store hands out ([`ComAmazonawsEksAwswesleyfrontendState::next_update_sequence`]),
+/// so two ids minted in the same nanosecond cannot collide. An update id names a
+/// resource for correlation, never a credential.
+pub fn new_update_id(sequence: u64) -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(RandomState::new().hash_one(sequence).to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 4122 §4.4: the version nibble is 4, and the variant's two top bits are `10`.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// The 32-hex-character resource identifier EKS gives a cluster, which appears in
@@ -412,6 +847,9 @@ pub const PAGE_TOKEN_TAG_LEN: usize = 4;
 pub const CLUSTERS_LISTING: &str = "";
 /// The scope `ListAccessPolicies`'s tokens carry. See [`CLUSTERS_LISTING`].
 pub const ACCESS_POLICIES_LISTING: &str = "access-policies";
+/// The scope `DescribeClusterVersions`'s tokens carry, over the calendar rows'
+/// [`ClusterVersionRecord::page_key`]s. See [`CLUSTERS_LISTING`].
+pub const CLUSTER_VERSIONS_LISTING: &str = "cluster-versions";
 
 /// Encode a page token for `listing` that resumes AFTER `last_returned`.
 ///
@@ -478,4 +916,136 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsEksAwswesleyfrontendState>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seeded calendar's own invariants: every published date parses, the rows
+    /// are ordered and unique, and each row's dates run release -> end of standard
+    /// support -> end of extended support. A typo in [`VERSION_CALENDAR`] shows up
+    /// here rather than as a mis-sorted page or a status nobody can explain.
+    #[test]
+    fn calendar_rows_are_well_formed() {
+        let calendar = seed_cluster_versions();
+        assert_eq!(
+            calendar.len(),
+            VERSION_CALENDAR.len(),
+            "case row count: expected every published row to be seeded, got {}",
+            calendar.len()
+        );
+        let mut seen: Vec<&str> = Vec::new();
+        for row in &calendar {
+            let case = row.page_key();
+            assert!(
+                row.release_date < row.end_of_standard_support,
+                "case {case}: standard support must end after the release, got {:?} and {:?}",
+                row.release_date,
+                row.end_of_standard_support
+            );
+            assert!(
+                row.end_of_standard_support < row.end_of_extended_support,
+                "case {case}: extended support must end after standard support, got {:?} and \
+                 {:?}",
+                row.end_of_standard_support,
+                row.end_of_extended_support
+            );
+            assert!(
+                !seen.contains(&row.cluster_version.as_str()),
+                "case {case}: the calendar lists this version twice, rows so far {seen:?}"
+            );
+            seen.push(row.cluster_version.as_str());
+        }
+        assert!(
+            seen.windows(2).all(|pair| pair[0] < pair[1]),
+            "case ordering: calendar rows must ascend by version, got {seen:?}"
+        );
+    }
+
+    /// Exactly one row is the default version, and it is the version
+    /// `CreateCluster` creates when the caller names none — so the catalog and the
+    /// cluster slice cannot disagree about the default.
+    #[test]
+    fn exactly_one_row_is_the_default_version() {
+        let calendar = seed_cluster_versions();
+        let defaults: Vec<&str> = calendar
+            .iter()
+            .filter(|row| row.default_version)
+            .map(|row| row.cluster_version.as_str())
+            .collect();
+        assert_eq!(
+            defaults,
+            vec![DEFAULT_KUBERNETES_VERSION],
+            "case default row: expected exactly [{DEFAULT_KUBERNETES_VERSION}], got {defaults:?}"
+        );
+    }
+
+    /// The support status is a function of the clock and the row's two
+    /// end-of-support dates, in both modelled spellings.
+    #[test]
+    fn support_status_follows_the_clock() {
+        let row = ClusterVersionRecord {
+            cluster_version: "9.99".to_string(),
+            cluster_type: CLUSTER_TYPE_EKS.to_string(),
+            default_version: false,
+            release_date: calendar_instant("2030-01-01"),
+            end_of_standard_support: calendar_instant("2031-03-01"),
+            end_of_extended_support: calendar_instant("2032-03-01"),
+        };
+        let day = Duration::from_secs(24 * 60 * 60);
+        let cases = [
+            ("the day before release", row.release_date - day, false, SupportStatus::StandardSupport),
+            ("the release day", row.release_date, true, SupportStatus::StandardSupport),
+            (
+                "the day standard support ends",
+                row.end_of_standard_support,
+                true,
+                SupportStatus::ExtendedSupport,
+            ),
+            (
+                "the day before standard support ends",
+                row.end_of_standard_support - day,
+                true,
+                SupportStatus::StandardSupport,
+            ),
+            (
+                "the day extended support ends",
+                row.end_of_extended_support,
+                true,
+                SupportStatus::Unsupported,
+            ),
+            (
+                "a year after extended support ends",
+                row.end_of_extended_support + 365 * day,
+                true,
+                SupportStatus::Unsupported,
+            ),
+        ];
+        for (case, now, released, expected) in cases {
+            assert_eq!(
+                row.is_released(now),
+                released,
+                "case {case}: expected is_released {released}, got {}",
+                row.is_released(now)
+            );
+            let actual = row.support_status(now);
+            assert_eq!(
+                actual, expected,
+                "case {case}: expected {expected:?}, got {actual:?}"
+            );
+            assert_eq!(
+                SupportStatus::from_version_status(actual.version_status()),
+                Some(actual),
+                "case {case}: the VersionStatus token must round-trip, got {}",
+                actual.version_status()
+            );
+            assert_eq!(
+                SupportStatus::from_cluster_version_status(actual.cluster_version_status()),
+                Some(actual),
+                "case {case}: the ClusterVersionStatus token must round-trip, got {}",
+                actual.cluster_version_status()
+            );
+        }
+    }
 }

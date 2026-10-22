@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !guard.clusters.contains_key(&cluster_name) {
             return Err(DeleteClusterErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
-                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -202,10 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if guard.cluster_has_active_services(&cluster_name) {
             return Err(DeleteClusterErrorModeled::ClusterContainsServicesException(
                 ClusterContainsServicesException {
-                    message: Some(format!(
-                        "cluster {cluster_name:?} still contains services that have not \
-                         been deleted"
-                    )),
+                    message: Some(crate::state::CLUSTER_CONTAINS_SERVICES_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -214,10 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if guard.cluster_has_active_tasks(&cluster_name) {
             return Err(DeleteClusterErrorModeled::ClusterContainsTasksException(
                 ClusterContainsTasksException {
-                    message: Some(format!(
-                        "cluster {cluster_name:?} still contains tasks that have not \
-                         stopped"
-                    )),
+                    message: Some(crate::state::CLUSTER_CONTAINS_TASKS_MESSAGE.to_string()),
                 },
             )
             .into());

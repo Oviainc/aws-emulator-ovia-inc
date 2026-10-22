@@ -37,12 +37,15 @@ const ACTION_ON_FAILURE: [&str; 4] = [
 static NULL: Value = Value::Null;
 
 /// One emulator: a router carrying only this service, over one shared engine.
-struct Emr {
+///
+/// `pub(crate)` so every suite in this test target drives the emulator through the
+/// same wire harness rather than growing its own copy.
+pub(crate) struct Emr {
     router: MultiServiceRouter,
 }
 
 impl Emr {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -50,7 +53,7 @@ impl Emr {
         Self { router }
     }
 
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -71,7 +74,7 @@ impl Emr {
         (status, payload)
     }
 
-    async fn ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let (status, payload) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -101,7 +104,7 @@ impl Emr {
 }
 
 /// Walk a JSON path, answering `null` for anything absent.
-fn at<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
+pub(crate) fn at<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
     let mut cursor = value;
     for key in path {
         cursor = cursor.get(*key).unwrap_or(&NULL);
@@ -115,7 +118,7 @@ fn epoch_secs(at: SystemTime) -> f64 {
         .as_secs_f64()
 }
 
-fn assert_refused(case: &str, status: u16, payload: &Value, expected_code: &str) {
+pub(crate) fn assert_refused(case: &str, status: u16, payload: &Value, expected_code: &str) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} with {payload}"
@@ -152,7 +155,7 @@ fn step_config(name: &str, jar: &str, args: Value, extra: Value) -> Value {
 }
 
 /// The smallest request that satisfies `RunJobFlow`'s required members.
-fn minimal_request(name: &str) -> Value {
+pub(crate) fn minimal_request(name: &str) -> Value {
     json!({
         "Name": name,
         "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge" },

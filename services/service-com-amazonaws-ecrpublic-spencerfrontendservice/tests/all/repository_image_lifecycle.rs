@@ -25,7 +25,7 @@ const TARGET_PREFIX: &str = "SpencerFrontendService";
 
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`),
 /// which is also this registry's `registryId`.
-const REGISTRY_ID: &str = "000000000000";
+pub(crate) const REGISTRY_ID: &str = "000000000000";
 
 /// The ARN prefix of every repository in this partition-wide (region-less) registry.
 const ARN_PREFIX: &str = "arn:aws:ecr-public::000000000000:repository/";
@@ -35,7 +35,7 @@ const ARN_PREFIX: &str = "arn:aws:ecr-public::000000000000:repository/";
 const URI_PREFIX: &str = "public.ecr.aws/emulator/";
 
 /// A router with just this service mounted on a fresh engine.
-fn service() -> MultiServiceRouter {
+pub(crate) fn service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The signature itself is not what these cases are about; the credential scope
@@ -48,7 +48,11 @@ fn service() -> MultiServiceRouter {
 }
 
 /// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -77,7 +81,12 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// A call that must succeed, returning its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &str) -> Value {
+pub(crate) async fn ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -87,7 +96,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &st
 }
 
 /// A call that must be refused with HTTP 400 and the named modelled error code.
-async fn refused(
+pub(crate) async fn refused(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
@@ -121,7 +130,7 @@ fn text(body: &Value, path: &[&str], case: &str) -> String {
 }
 
 /// The `sha256:<hex>` digest of a manifest, computed independently of the emulator.
-fn digest_of(manifest: &str) -> String {
+pub(crate) fn digest_of(manifest: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(manifest.as_bytes()))
 }
 
@@ -1442,7 +1451,6 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
     for (operation, body) in [
         ("GetAuthorizationToken", json!({})),
         ("DescribeRegistries", json!({})),
-        ("GetRegistryCatalogData", json!({})),
         (
             "GetRepositoryCatalogData",
             json!({"repositoryName": "team/app"}),

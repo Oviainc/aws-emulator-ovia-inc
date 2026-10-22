@@ -43,19 +43,14 @@ async fn list_tags(emulator: &Emulator, arn: &str) -> (u16, Value) {
 
 /// The URI the tagging operations bind. `ResourceArn` is a NON-greedy `@httpLabel`, so an
 /// SDK percent-encodes the ARN's reserved characters into one path segment and its `:` and
-/// `/` never split the path. Escaped the same way as `encoded` in
-/// `tests/all/rejection_rule_and_negative_paths.rs`, so this crate's tests address the
-/// tagging URIs identically.
+/// `/` never split the path. Escaped by the one label escaper this crate's tests share,
+/// `rejection_rule_and_negative_paths::encoded`, so every suite addresses the same URI for
+/// the same ARN.
 fn tags_path(arn: &str) -> String {
-    let label: String = arn
-        .chars()
-        .map(|character| match character {
-            ':' => "%3A".to_string(),
-            '/' => "%2F".to_string(),
-            other => other.to_string(),
-        })
-        .collect();
-    format!("/tags/{label}")
+    format!(
+        "/tags/{}",
+        crate::rejection_rule_and_negative_paths::encoded(arn)
+    )
 }
 
 /// A pair list as a JSON object, the way a `TagMap` renders on the wire.

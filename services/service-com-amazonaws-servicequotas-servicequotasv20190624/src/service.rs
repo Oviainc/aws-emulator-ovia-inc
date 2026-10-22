@@ -65,14 +65,19 @@
 //! generated operation in the routing table, so each handler, its state and its 501
 //! are exactly as before.
 //!
-//! ## Two validators, two error codes
+//! ## Three validators, three wordings
 //!
-//! Service Quotas does not answer every constraint violation with one code, and which
-//! code a member gets is RECORDED behaviour rather than anything the model states —
-//! `ValidationException` is not in this service's model at all. The refusal a member
-//! gets is chosen in [`FRONT_END_VALIDATED_MEMBERS`], where the two recordings behind
-//! the split are cited; the message form of each recording is what tells the
-//! request-validation front end apart from the service's own application layer.
+//! Service Quotas does not answer every constraint violation with one code or one
+//! sentence, and which refusal a member gets is RECORDED behaviour rather than anything
+//! the model states — `ValidationException` is not in this service's model at all. The
+//! refusal a member gets is chosen in [`FRONT_END_VALIDATED_MEMBERS`] (the
+//! request-validation front end, which answers `ValidationException` and names the
+//! member as the wire spells it) and [`SERVICE_OWN_VALIDATED_MEMBERS`] (this service's
+//! own application layer, which answers the modelled `IllegalArgumentException` with
+//! one fixed illegal-value sentence), where the recordings behind each split are cited;
+//! every other member keeps the modelled `IllegalArgumentException` with the
+//! member-and-rule clause. The message FORM of each recording is what tells the three
+//! apart.
 //! A refusal a HANDLER makes after reading a request the model accepts — a quota that
 //! is not adjustable, a desired value that is not an increase — is a semantic refusal
 //! and stays the modelled `IllegalArgumentException` wherever it is raised.
@@ -136,6 +141,33 @@ const FRONT_END_VALIDATED_MEMBERS: &[&str] = &["RequestId"];
 /// expression pattern: …`. Shared by the message builder and the reader that lifts
 /// the requirement half out of the framework's own sentence, so the two cannot drift.
 const CONSTRAINT_CLAUSE: &str = " failed to satisfy constraint: ";
+
+/// The input members Service Quotas checks in its OWN application layer, which states
+/// one sentence for an illegal value ([`ILLEGAL_VALUE_MESSAGE`]) and names
+/// neither the member nor the rule — the third validator in the split above.
+///
+/// RECORDED behaviour (the corpus unit
+/// `service-quotas.list-tags-for-resource-invalid-arn-pattern-rejected`): a tagging
+/// call carrying a `ResourceARN` outside its constraints is answered HTTP 400
+/// `IllegalArgumentException` with that sentence rather than with the member-and-rule
+/// clause every other modelled member is refused by.
+///
+/// Listed the way [`FRONT_END_VALIDATED_MEMBERS`] is — by the member name the MODEL
+/// spells — so the split follows that member wherever this service declares it
+/// (`ListTagsForResource`, `TagResource` and `UntagResource` all take a `ResourceARN`)
+/// instead of being keyed to one operation or to one recorded request. Matched by
+/// member NAME because that is the model fact a violation gives access to: a member
+/// `Schema` carries its own name, its index and the TYPE of its target, not the
+/// target's shape id, so the `AmazonResourceName` these members target is not
+/// something the walk's output can be compared against.
+const SERVICE_OWN_VALIDATED_MEMBERS: &[&str] = &["ResourceARN"];
+
+/// How Service Quotas words the refusal of a value its own application layer will not
+/// accept — one sentence for an illegal value, naming neither the member nor the rule.
+/// Recorded for the resource ARN; it covers every member in
+/// [`SERVICE_OWN_VALIDATED_MEMBERS`].
+const ILLEGAL_VALUE_MESSAGE: &str =
+    "The request failed because you provided an illegal value for a parameter.";
 
 /// The `com-amazonaws-servicequotas-servicequotasv20190624` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -540,6 +572,20 @@ fn front_end_owned(violation: &Violation) -> bool {
         .any(|member| constraints::path::member(member) == violation.path)
 }
 
+/// Whether `violation` is an illegal VALUE of a member this service checks in its own
+/// application layer.
+///
+/// The member is identified the way [`ConstraintRefusal::of`] identifies the front
+/// end's — through [`modelled_member_name`], so the model's own spelling is what the
+/// list is matched against — and one more layer does not mean one more matching style.
+/// A `MissingRequiredMember` violation is not one: there was no value for that layer to
+/// check, so an absent member keeps the member-and-rule clause.
+fn service_own_owned(violation: &Violation, input_schema: &Schema) -> bool {
+    !matches!(violation.kind, ViolationKind::MissingRequiredMember)
+        && modelled_member_name(&violation.path, input_schema)
+            .is_some_and(|member| SERVICE_OWN_VALIDATED_MEMBERS.contains(&member.as_str()))
+}
+
 /// How the request-validation front end words a value that broke a rule the model
 /// declares: the member path as the WIRE spells it (the validating walk's lowerCamel,
 /// which is the spelling the recorded message carries) and the rule it broke —
@@ -589,7 +635,18 @@ fn illegal_argument(message: String) -> crate::ops::types::IllegalArgumentExcept
 /// A violation whose member this cannot name — a path into a nested shape — keeps the
 /// framework's own sentence, which already names both the path and the rule, rather
 /// than being reworded into half of one.
+///
+/// The ONE group of members this does not hold for is the one this service checks in
+/// its own application layer, whose illegal VALUES it refuses in its own fixed
+/// sentence; see [`SERVICE_OWN_VALIDATED_MEMBERS`].
 fn refusal_message(violation: &Violation, input_schema: &Schema) -> String {
+    // A member this service checks itself is refused in its own words, for every
+    // constraint that member carries — a pattern or either length bound — because what
+    // the sentence states is that the VALUE is not a legal one rather than which rule
+    // it broke.
+    if service_own_owned(violation, input_schema) {
+        return ILLEGAL_VALUE_MESSAGE.to_string();
+    }
     match (
         modelled_member_name(&violation.path, input_schema),
         requirement(violation),

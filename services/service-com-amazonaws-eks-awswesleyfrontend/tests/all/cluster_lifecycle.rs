@@ -22,7 +22,8 @@ use smithy_server_runtime::MultiServiceRouter;
 /// One answer from the emulator, reduced to what a client branches on.
 ///
 /// `pub(crate)` because every suite in this test binary branches on the same three
-/// things; a second suite reuses this one rather than restating it.
+/// things (including the `cluster_versions` suite); a second suite reuses this one
+/// rather than restating it.
 #[derive(Debug)]
 pub(crate) struct Answer {
     pub(crate) status: u16,
@@ -116,7 +117,7 @@ pub(crate) async fn call(
     }
 }
 
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 async fn create(router: &MultiServiceRouter, body: &serde_json::Value) -> Answer {
     call(router, REGION, "POST", "/clusters", &body.to_string()).await

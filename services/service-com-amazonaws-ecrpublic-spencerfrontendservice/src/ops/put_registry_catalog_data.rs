@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRegistryCatalogData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRegistryCatalogData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRegistryCatalogData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates the ONE `RegistryCatalogData` this registry carries, stored in
+//! [`crate::state::ComAmazonawsEcrpublicSpencerfrontendserviceState::registry_display_name`]
+//! and read back by `GetRegistryCatalogData`. A PUT of the whole catalog: the registry
+//! ends up with exactly the `displayName` the request carried, so a request that names
+//! none leaves the registry with no display name.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +140,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRegistryCatalogData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRegistryCatalogDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRegistryCatalogData"))
+        // Request metadata is used for the audit record only: the catalog this call
+        // replaces is the one of the single registry this emulator serves.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+
+        // One catalog per registry, replaced wholesale by this call: the modelled
+        // `RegistryCatalogData` carries `displayName` alone, so the registry ends up
+        // with the name this request carried — and with none when the request named
+        // none. The modelled `RegistryDisplayName` length (0..100) is refused before
+        // this handler runs, so whatever arrives here is storable verbatim: the stored
+        // text is the caller's bytes, never a normalised form of them.
+        let mut store = state.lock();
+        store.registry_display_name = input.display_name;
+        let registry_catalog_data = store.registry_catalog_data();
+        let registry_id = store.registry_id.clone();
+        let outcome = match registry_catalog_data.display_name {
+            Some(_) => "replaced",
+            None => "cleared",
+        };
+        drop(store);
+
+        // Audit record for a state-changing operation: who asked, what changed, how it
+        // ended. Only wire metadata and the registry identifier — the display name
+        // itself is caller content, so it is not copied into the log.
+        ::tracing::info!(
+            target: "emulator::audit",
+            audit = true,
+            operation = "PutRegistryCatalogData",
+            outcome = outcome,
+            caller_akid = %caller_akid,
+            registry_id = %registry_id,
+            "registry catalog data written"
+        );
+
+        Ok(PutRegistryCatalogDataOutput {
+            registry_catalog_data,
+        })
     }
+}
+
+/// The modelled server fault for a state store this service could not reach.
+fn server_error() -> PutRegistryCatalogDataError {
+    PutRegistryCatalogDataErrorModeled::ServerException(ServerException {
+        message: Some("The ECR Public emulator could not reach its state store.".to_string()),
+    })
+    .into()
 }

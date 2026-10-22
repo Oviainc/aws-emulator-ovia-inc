@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ListContainerInstancesErrorModeled::ClusterNotFoundException(
                     ClusterNotFoundException {
-                        message: Some(format!("cluster {cluster_name:?} was not found")),
+                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into(),

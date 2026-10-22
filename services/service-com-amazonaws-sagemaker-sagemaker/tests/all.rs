@@ -17,6 +17,8 @@ mod ai_workload_config_lifecycle;
 mod app_image_config_registry;
 #[path = "all/artifact_lineage.rs"]
 mod artifact_lineage;
+#[path = "all/batch_transform_jobs.rs"]
+mod batch_transform_jobs;
 #[path = "all/code_repositories.rs"]
 mod code_repositories;
 #[path = "all/endpoint_config_deletion.rs"]
@@ -27,6 +29,8 @@ mod inference_deployment_lifecycle;
 mod lineage_action_lifecycle;
 #[path = "all/mlflow_app_lifecycle.rs"]
 mod mlflow_app_lifecycle;
+#[path = "all/model_card_governance.rs"]
+mod model_card_governance;
 #[path = "all/model_package_group_lifecycle.rs"]
 mod model_package_group_lifecycle;
 #[path = "all/model_package_registry.rs"]

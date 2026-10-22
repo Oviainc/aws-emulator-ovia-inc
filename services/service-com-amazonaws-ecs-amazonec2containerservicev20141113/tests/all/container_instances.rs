@@ -21,7 +21,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    count, create_cluster, list, ok, refused, service, string, ACCOUNT, SIGNED_REGION,
+    count, create_cluster, identity_document, list, ok, refused, service, string, ACCOUNT,
+    SIGNED_REGION,
 };
 
 /// Every value `ContainerInstanceStatus` takes, from the model's enum (smithy_query
@@ -45,18 +46,6 @@ type RegistrationRow = (&'static str, Option<&'static str>, Value, Value, Value)
 /// One row of the describe table: the case name, the ids the request names, the ARNs
 /// expected back and the ARNs expected as `MISSING` failures.
 type DescribeRow = (&'static str, Vec<String>, Vec<String>, Vec<String>);
-
-/// An EC2 instance identity document, as the agent reads it from
-/// `http://169.254.169.254/latest/dynamic/instance-identity/document/`.
-fn identity_document(instance_id: &str) -> String {
-    json!({
-        "instanceId": instance_id,
-        "region": SIGNED_REGION,
-        "instanceType": "m5.large",
-        "availabilityZone": format!("{SIGNED_REGION}a"),
-    })
-    .to_string()
-}
 
 /// Register one container instance into `cluster` and return its ARN.
 async fn register_instance(
@@ -601,12 +590,27 @@ async fn registering_an_instance_again_updates_the_one_already_stored() {
         .await;
     }
 
-    // An identity document that names no instance cannot identify one.
+    // An identity document that leaves a required member blank cannot identify an
+    // instance; each row is refused on the first such member (see the member table in
+    // [`crate::error_messages`]).
     for (case, bad_document) in [
         ("not json", "not-a-document".to_string()),
-        ("no instanceId", json!({ "region": SIGNED_REGION }).to_string()),
-        ("empty instanceId", json!({ "instanceId": "  " }).to_string()),
-        ("instanceId not a string", json!({ "instanceId": 7 }).to_string()),
+        (
+            "no instanceId",
+            json!({ "accountId": ACCOUNT, "region": SIGNED_REGION }).to_string(),
+        ),
+        (
+            "empty instanceId",
+            json!({ "accountId": ACCOUNT, "instanceId": "  " }).to_string(),
+        ),
+        (
+            "instanceId not a string",
+            json!({ "accountId": ACCOUNT, "instanceId": 7 }).to_string(),
+        ),
+        (
+            "no accountId",
+            json!({ "instanceId": "i-0a0a0a0a0a0a0a0a0" }).to_string(),
+        ),
     ] {
         refused(
             &router,

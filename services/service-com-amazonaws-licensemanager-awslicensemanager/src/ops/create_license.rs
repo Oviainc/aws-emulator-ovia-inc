@@ -217,13 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             license_name: input.license_name,
             product_name: input.product_name,
             product_sku: input.product_sku,
-            issuer: IssuerDetails {
-                name: Some(input.issuer.name),
-                sign_key: input.issuer.sign_key,
-                // This emulator holds no KMS key material and signs no license, so
-                // there is no issuer key fingerprint to report.
-                key_fingerprint: None,
-            },
+            // `KeyFingerprint` is on the READ shape (`IssuerDetails`) and not on
+            // the `Issuer` a create carries, so the service derives it from the
+            // issuer identity and persists it with the license.
+            issuer: crate::state::issuer_details(input.issuer),
             home_region: input.home_region,
             // AWS hands back a license that can be checked out at once, so it is
             // minted in the terminal `AVAILABLE` status and owes the clock no

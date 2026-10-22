@@ -202,7 +202,10 @@ fn flatten_xml(xml: &str) -> Vec<(String, String)> {
 // ---------------------------------------------------------------------------
 
 /// A `CreateHostedZone` body.
-fn create_zone_body(name: &str, caller_reference: &str, config: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite builds its creates through the SAME body
+/// rather than growing a second copy of the request shape.
+pub(crate) fn create_zone_body(name: &str, caller_reference: &str, config: &str) -> String {
     format!(
         "<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">\
          <Name>{name}</Name><CallerReference>{caller_reference}</CallerReference>{config}\
@@ -250,16 +253,19 @@ fn bare_zone_id(reply: &Reply) -> String {
 }
 
 /// One row of a record-set table.
+///
+/// `pub(crate)` so a sibling suite drives the same change bodies rather than
+/// growing a second builder for them.
 #[derive(Debug, Clone, Copy)]
-struct RecordRow {
-    name: &'static str,
-    rr_type: &'static str,
-    ttl: i64,
-    values: &'static [&'static str],
+pub(crate) struct RecordRow {
+    pub(crate) name: &'static str,
+    pub(crate) rr_type: &'static str,
+    pub(crate) ttl: i64,
+    pub(crate) values: &'static [&'static str],
 }
 
 /// A `<Change>` element for one action over one row.
-fn change_element(action: &str, row: &RecordRow) -> String {
+pub(crate) fn change_element(action: &str, row: &RecordRow) -> String {
     let records: String = row
         .values
         .iter()
@@ -273,7 +279,7 @@ fn change_element(action: &str, row: &RecordRow) -> String {
 }
 
 /// A `ChangeResourceRecordSets` body wrapping already-rendered `<Change>` elements.
-fn change_batch_body(changes: &str, comment: Option<&str>) -> String {
+pub(crate) fn change_batch_body(changes: &str, comment: Option<&str>) -> String {
     let comment = comment.map_or_else(String::new, |text| format!("<Comment>{text}</Comment>"));
     format!(
         "<ChangeResourceRecordSetsRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">\

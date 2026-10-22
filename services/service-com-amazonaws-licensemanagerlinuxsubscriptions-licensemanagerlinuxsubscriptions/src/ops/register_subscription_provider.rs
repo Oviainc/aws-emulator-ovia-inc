@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterSubscriptionProvider
-//! Registers a third-party Linux subscription provider: the registration is STORED in
-//! this service's state (source, secret ARN, status, tags) under a minted
-//! `SubscriptionProviderArn`, and the response is read back off that record.
-//! Registering a provider that is already registered resolves the record already in
-//! state (the operation is `@idempotent`), so the same ARN comes back and no second
-//! record appears.
+//! Registers a third-party Linux subscription provider — which the real service only
+//! does once it has VALIDATED the access token held in the referenced Secrets Manager
+//! secret against that provider. A token that is not a genuine, unexpired Red Hat
+//! offline token is refused with `ValidationException` and no subscription-provider
+//! resource is left registered.
 //!
-//! The store has a maximum entry count ([`crate::state::MAX_PROVIDERS`]): nothing evicts
-//! a registration, so a registration that would grow it past that cap is refused with the
-//! operation's modelled `ValidationException`.
+//! This emulator holds no Red Hat SSO trust material and makes no outbound call, so no
+//! token can be established as genuine here: every registration takes that refusal, and
+//! nothing is written to the provider store. Minting an ARN and reporting
+//! `SubscriptionProviderStatus: ACTIVE` would report a BYOL registration that cannot
+//! exist and a validation nothing performed; storing it `PENDING` instead would still
+//! report a registration nothing validated. The operation is therefore DECLINED as
+//! unsupported rather than emulated — the issue report
+//! `issues/things-that-now-work/20261022T050930Z-license-manager-linux-subscriptions-…`
+//! states that under "Resolution", with what a client should expect.
+//!
+//! The registrations a store holds are therefore only what an in-process test seeded
+//! (`crate::state::SubscriptionProviderRecord`); `GetRegisteredSubscriptionProvider`,
+//! `ListRegisteredSubscriptionProviders`, `DeregisterSubscriptionProvider`,
+//! `UntagResource` and `ListTagsForResource` all answer from that same store.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -157,98 +167,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            RegisterSubscriptionProviderErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("the service state is unavailable".to_string()),
-                },
-            )
-        })?;
+        // Nothing about this request can be served: there is no state to read and none
+        // is written. The engine and the context are bound so the refusal below is the
+        // only reason this handler answers an error.
+        let _ = (&input, ctx, &self.engine);
 
-        let region = crate::state::request_region(&ctx.parts().headers);
-        let signing_name = ctx.identity().signing_name().to_string();
-        let key = (
-            input.subscription_provider_source.clone(),
-            input.secret_arn.clone(),
-        );
-
-        let mut state = state.lock();
-
-        // `@idempotent`: one registration per (source, secret ARN). A repeat names the
-        // registration already in state, so it answers from that record rather than
-        // minting a second ARN for the same provider.
-        let arn = match state.provider_index.get(&key) {
-            Some(existing) => existing.clone(),
-            None => {
-                // The store has a maximum entry count because nothing evicts from it:
-                // a later Get or List must still report what was registered. Refuse the
-                // registration that would take it past the cap rather than growing the
-                // emulator's heap for as long as a caller keeps minting secret ARNs.
-                if state.providers.len() >= crate::state::MAX_PROVIDERS {
-                    return Err(into_error(crate::state::StateError::Validation(format!(
-                        "this account already has the maximum of {} registered subscription \
-                         providers; deregister one before registering another",
-                        crate::state::MAX_PROVIDERS
-                    ))));
-                }
-                let id = state.mint_provider_id();
-                let arn = crate::state::resource_arn(
-                    &signing_name,
-                    &region,
-                    "subscription-provider",
-                    &id,
-                );
-                let record = crate::state::SubscriptionProviderRecord {
-                    arn: arn.clone(),
-                    source: input.subscription_provider_source.clone(),
-                    secret_arn: input.secret_arn.clone(),
-                    // The access token in the secret is accepted when the provider is
-                    // registered, so the registration is returned in a terminal status
-                    // and no later transition is owed on it.
-                    status: crate::state::PROVIDER_STATUS_ACTIVE.to_string(),
-                    // Nothing to report about the token, and no third-party data
-                    // retrieval has happened: neither value is invented.
-                    status_message: None,
-                    last_successful_data_retrieval_time: None,
-                    tags: input.tags.clone().unwrap_or_default(),
-                };
-                state.providers.insert(arn.clone(), record);
-                state.provider_order.push(arn.clone());
-                state.provider_index.insert(key, arn.clone());
-                arn
-            }
-        };
-
-        // Read the response back off the stored record, so what this call answered and
-        // what a later Get or List reports cannot disagree.
-        let record = state.resolve_provider(&arn).map_err(into_error)?;
-        Ok(RegisterSubscriptionProviderOutput {
-            subscription_provider_source: Some(record.source.clone()),
-            subscription_provider_arn: Some(record.arn.clone()),
-            subscription_provider_status: Some(record.status.clone()),
+        // Registering a BYOL subscription provider means handing License Manager an
+        // access token and having it VALIDATED against the provider before the
+        // registration exists: the recorded service answers a secret whose token is not
+        // a genuine, unexpired Red Hat offline token with `ValidationException` and
+        // leaves no subscription-provider resource behind.
+        //
+        // This emulator holds no Red Hat SSO trust material and makes no outbound call,
+        // so it cannot establish that ANY token is genuine — and a token it cannot
+        // validate is exactly the case the recorded service refuses. Answering 200 with
+        // a minted ARN and `SubscriptionProviderStatus: ACTIVE` would report a BYOL
+        // registration that does not exist and a validation nothing performed, so the
+        // registration is refused with the operation's own modelled client error
+        // instead, and the provider store is left untouched. The message says what is
+        // unsupported rather than passing a verdict on the caller's token, which nothing
+        // here inspected.
+        Err(RegisterSubscriptionProviderErrorModeled::ValidationException(ValidationException {
+            message: Some(TOKEN_NOT_VALIDATED_MESSAGE.to_string()),
         })
+        .into())
     }
 }
 
-/// Map a state-layer refusal onto this operation's own modelled error enum.
+/// Why a registration is refused: the access token in the referenced secret cannot be
+/// validated here at all, so no registration can be accepted.
 ///
-/// This operation models no `ResourceNotFoundException`, and the only record it looks up
-/// is the one it just stored, so a lookup failure here is a server-side inconsistency.
-fn into_error(error: crate::state::StateError) -> RegisterSubscriptionProviderError {
-    match error {
-        crate::state::StateError::NotFound(message) => {
-            RegisterSubscriptionProviderErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some(message),
-                },
-            )
-            .into()
-        }
-        crate::state::StateError::Validation(message) => {
-            RegisterSubscriptionProviderErrorModeled::ValidationException(ValidationException {
-                message: Some(message),
-            })
-            .into()
-        }
-    }
-}
+/// The CODE is the recorded one (`ValidationException`, HTTP 400). The text is not: the
+/// recorded message ("The subscription provider token is invalid or expired") is a
+/// verdict on one token, and this emulator reaches no verdict — it cannot validate any
+/// token — so the message states what is unsupported instead of diagnosing the caller's
+/// secret. Nothing of the request is interpolated into it.
+const TOKEN_NOT_VALIDATED_MESSAGE: &str =
+    "The subscription provider token cannot be validated: this emulator holds no \
+     subscription-provider trust material and makes no call to the provider, so no \
+     registration is accepted";

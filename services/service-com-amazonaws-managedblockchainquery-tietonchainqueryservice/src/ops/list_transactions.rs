@@ -6,6 +6,10 @@
 //! STORED transaction by `crate::state::StoredTransaction::output_item`, and
 //! `nextToken` is a real resumable cursor into the matched, ordered listing.
 //!
+//! The address is looked up by the spelling the ledger keys it under
+//! (`crate::state::derived::normalize_address`), so the two spellings of one Ethereum
+//! account read one history.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

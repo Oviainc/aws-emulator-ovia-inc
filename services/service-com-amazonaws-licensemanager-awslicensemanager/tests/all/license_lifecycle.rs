@@ -13,6 +13,9 @@
 //! * the minted identity is a license ARN in the Region the request named as the
 //!   license's home, the license is `AVAILABLE` at once, and its version is the
 //!   first one.
+//! * `Issuer.KeyFingerprint` is on the READ shape only, so the service derives it
+//!   from the issuer identity and every read of every license of one issuer reports
+//!   the same value, while any other issuer identity reports another.
 //! * `ClientToken` is an idempotency key: the repeat of an accepted create reports
 //!   the license that create minted and mints nothing new.
 //! * a license body this store will not hold is refused with a modelled 400 and
@@ -22,7 +25,7 @@
 //! earlier, different call persisted, never against a value this file hands the
 //! service and reads straight back out of the same response.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aws_smithy_types::date_time::Format;
@@ -237,8 +240,8 @@ fn assert_round_trip(case: &str, stored: &Value, body: &Value, arn: &str) {
         "case {case:?}: expected the stored Version 1, got {stored}"
     );
     // The issuer is reported as `IssuerDetails`: the name and sign key the create
-    // carried. The emulator holds no KMS key material and signs no license, so it
-    // reports no key fingerprint rather than inventing one.
+    // carried, plus the `KeyFingerprint` that shape adds and no create can supply,
+    // which the service therefore derives for the issuer.
     assert_eq!(
         stored["Issuer"]["Name"], body["Issuer"]["Name"],
         "case {case:?}: GetLicense reported another Issuer.Name: {stored}"
@@ -248,10 +251,7 @@ fn assert_round_trip(case: &str, stored: &Value, body: &Value, arn: &str) {
         body["Issuer"].get("SignKey"),
         "case {case:?}: GetLicense reported another Issuer.SignKey: {stored}"
     );
-    assert!(
-        stored["Issuer"].get("KeyFingerprint").is_none(),
-        "case {case:?}: no license is signed here, so no KeyFingerprint may be reported: {stored}"
-    );
+    assert_derived_key_fingerprint(case, stored);
     let create_time = stored["CreateTime"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: the stored license carries no CreateTime: {stored}"));
@@ -259,6 +259,36 @@ fn assert_round_trip(case: &str, stored: &Value, body: &Value, arn: &str) {
         DateTime::from_str(create_time, Format::DateTime).is_ok(),
         "case {case:?}: CreateTime {create_time:?} is not an ISO8601-UTC instant"
     );
+}
+
+/// Assert that the license `stored` carries a DERIVED issuer key fingerprint — a
+/// non-empty value scoped to this emulator's account whose last segment is a
+/// digest, so it is computed from the issuer identity and not echoed from one member
+/// of the request — and return it.
+fn assert_derived_key_fingerprint(case: &str, stored: &Value) -> String {
+    let fingerprint = stored["Issuer"]["KeyFingerprint"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: GetLicense reported an Issuer with no KeyFingerprint: {stored}")
+        })
+        .to_string();
+    assert!(
+        !fingerprint.is_empty(),
+        "case {case:?}: GetLicense reported an empty KeyFingerprint: {stored}"
+    );
+    assert!(
+        fingerprint.starts_with(&format!("aws:{ACCOUNT_ID}:")),
+        "case {case:?}: expected a KeyFingerprint scoped to account {ACCOUNT_ID}, got {fingerprint:?}"
+    );
+    let digest = fingerprint.split(':').next_back().unwrap_or_default();
+    assert!(
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "case {case:?}: expected the KeyFingerprint to end in a SHA-256 digest, got {fingerprint:?}"
+    );
+    fingerprint
 }
 
 /// One entitlement, with only the members the row sets.
@@ -505,6 +535,161 @@ fn next(state: &mut u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// Every issuer identity a create can carry, one per row: the rows differ in the
+/// name's value, its length and its character set, in whether a `SignKey` names a
+/// key at all, and in the key's value — and the last two re-spell the same
+/// characters across the name/key boundary, which is still a different identity.
+///
+/// `Issuer` carries exactly `Name` (required) and `SignKey`
+/// (`smithy_query(query="shape",shape="Issuer")`), so these rows span the whole
+/// identity a create can state.
+fn issuer_rows() -> Vec<(&'static str, Value)> {
+    vec![
+        ("a name alone", json!({"Name": "base-issuer"})),
+        ("another name alone", json!({"Name": "other-issuer"})),
+        (
+            "a name that is a prefix of another row's",
+            json!({"Name": "base"}),
+        ),
+        ("an empty name", json!({"Name": ""})),
+        (
+            "a non-ASCII name",
+            json!({"Name": "Ünïcödé Issuer ✓"}),
+        ),
+        (
+            "a name at the stored text bound",
+            json!({"Name": "n".repeat(2048)}),
+        ),
+        (
+            "a name with a KMS sign key",
+            json!({
+                "Name": "base-issuer",
+                "SignKey": "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555",
+            }),
+        ),
+        (
+            "the same name with another sign key",
+            json!({
+                "Name": "base-issuer",
+                "SignKey": "arn:aws:kms:us-east-1:000000000000:key/99999999-8888-7777-6666-555555555555",
+            }),
+        ),
+        (
+            "a two-character name and a one-character key",
+            json!({"Name": "ab", "SignKey": "c"}),
+        ),
+        (
+            "those same characters split one place earlier",
+            json!({"Name": "a", "SignKey": "bc"}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn an_issuer_key_fingerprint_is_derived_from_the_issuer_identity_alone() {
+    let router = emulator();
+    // Each fingerprint the service derived, against the rows that produced it, so a
+    // collision names both rows.
+    let mut by_fingerprint: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+
+    for (n, (case, issuer)) in issuer_rows().into_iter().enumerate() {
+        // Two licenses of ONE issuer, alike in nothing else: different license name,
+        // SKU, home Region, entitlements and metadata. The fingerprint belongs to
+        // the issuer, so both licenses must report the same one.
+        let mut first = base_body(&format!("token-issuer-{n}-first"));
+        first["Issuer"] = issuer.clone();
+        first["LicenseName"] = json!(format!("issuer-{n}-first"));
+        first["ProductSKU"] = json!(format!("sku-issuer-{n}-first"));
+
+        let mut second = base_body(&format!("token-issuer-{n}-second"));
+        second["Issuer"] = issuer.clone();
+        second["LicenseName"] = json!(format!("issuer-{n}-second"));
+        second["ProductSKU"] = json!(format!("sku-issuer-{n}-second"));
+        second["HomeRegion"] = json!("eu-west-1");
+        second["Entitlements"] = json!([entitlement("other", "Seconds", &[("MaxCount", json!(5))])]);
+        second["LicenseMetadata"] = json!([{"Name": "tier", "Value": "silver"}]);
+
+        let first_arn = create_ok(&router, case, &first).await;
+        let second_arn = create_ok(&router, case, &second).await;
+
+        let stored = get_ok(&router, case, &first_arn).await;
+        let fingerprint = assert_derived_key_fingerprint(case, &stored);
+
+        // The read is a report: reading the license again reports the same value.
+        let again = get_ok(&router, case, &first_arn).await;
+        assert_eq!(
+            again["Issuer"]["KeyFingerprint"].as_str(),
+            Some(fingerprint.as_str()),
+            "case {case:?}: a second read reported another KeyFingerprint: {again}"
+        );
+
+        let second_stored = get_ok(&router, case, &second_arn).await;
+        assert_eq!(
+            second_stored["Issuer"]["KeyFingerprint"].as_str(),
+            Some(fingerprint.as_str()),
+            "case {case:?}: two licenses of one issuer must carry one fingerprint, got {second_stored}"
+        );
+
+        by_fingerprint.entry(fingerprint).or_default().push(case);
+    }
+
+    // Every row states a DIFFERENT issuer identity, so every row has a fingerprint
+    // of its own — that is what lets (ProductSKU, KeyFingerprint) discriminate one
+    // issuer's license from another's.
+    for (fingerprint, rows) in &by_fingerprint {
+        assert_eq!(
+            rows.len(),
+            1,
+            "cases {rows:?}: different issuers must not share the fingerprint {fingerprint:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_caller_cannot_choose_an_issuer_key_fingerprint() {
+    let router = emulator();
+    let issuer = json!({
+        "Name": "chosen-issuer",
+        "SignKey": "arn:aws:kms:us-east-1:000000000000:key/abcdabcd-1111-2222-3333-444444444444",
+    });
+
+    let case = "the issuer as the create shape states it";
+    let mut plain = base_body("token-fingerprint-derived");
+    plain["Issuer"] = issuer.clone();
+    let plain_arn = create_ok(&router, case, &plain).await;
+    let derived = assert_derived_key_fingerprint(case, &get_ok(&router, case, &plain_arn).await);
+
+    // `KeyFingerprint` is not a member of the `Issuer` a create carries, so a request
+    // that smuggles one is either refused or answered with the fingerprint the
+    // service derives — never with the caller's text.
+    let case = "an Issuer carrying a KeyFingerprint of its own";
+    let supplied = format!("aws:999999999999:chosen-issuer:{}", "0".repeat(64));
+    let mut smuggled = base_body("token-fingerprint-smuggled");
+    smuggled["Issuer"] = issuer;
+    smuggled["Issuer"]["KeyFingerprint"] = json!(supplied);
+
+    let (status, response) = call(&router, "CreateLicense", &smuggled).await;
+    if status == 200 {
+        let arn = response["LicenseArn"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the create answered no LicenseArn: {response}")
+            })
+            .to_string();
+        let stored = get_ok(&router, case, &arn).await;
+        assert_eq!(
+            stored["Issuer"]["KeyFingerprint"].as_str(),
+            Some(derived.as_str()),
+            "case {case:?}: expected the derived fingerprint {derived:?}, got {stored}"
+        );
+    } else {
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the create to answer 200 or a modelled 400, got {status} {response}"
+        );
+    }
 }
 
 #[tokio::test]

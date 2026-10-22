@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RebuildEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RebuildEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RebuildEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: puts the stored environment back through its deployment — `Launching`,
+//! with the move back to `Ready` due shortly after — and answers empty. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RebuildEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RebuildEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RebuildEnvironment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RebuildEnvironmentError::internal_failure("the Elastic Beanstalk store is unavailable")
+        })?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        let environment_id = store
+            .environment_id_for(
+                input.environment_id.as_deref(),
+                input.environment_name.as_deref(),
+            )
+            .map_err(|refusal| match refusal {
+                // "If you do not specify either, Elastic Beanstalk returns
+                // MissingRequiredParameter error."
+                crate::state::EnvironmentRefusal::NoIdentifier => {
+                    RebuildEnvironmentError::missing_required_parameter(
+                        "Must specify either EnvironmentId or EnvironmentName.",
+                    )
+                }
+                crate::state::EnvironmentRefusal::NotFound(message) => {
+                    RebuildEnvironmentError::invalid_parameter_value(message)
+                }
+            })?;
+
+        let environment = store.environments.get_mut(&environment_id).ok_or_else(|| {
+            RebuildEnvironmentError::invalid_parameter_value(
+                crate::state::missing_environment_message(Some(environment_id.as_str()), None),
+            )
+        })?;
+        // "Ready: Environment is available to have an action performed on it" —
+        // one already launching, updating or shutting down has nothing to
+        // rebuild from.
+        if !environment.is_ready() {
+            return Err(RebuildEnvironmentError::invalid_parameter_value(format!(
+                "Environment {} is not in a state from which it can be rebuilt. Current status: {}.",
+                environment.environment_name, environment.status
+            )));
+        }
+
+        // "Deletes and recreates all of the Amazon Web Services resources … for
+        // a specified environment and forces a restart": the environment
+        // re-enters its deployment and the clock owes the move back to `Ready`.
+        environment.begin_rebuild();
+        Ok(RebuildEnvironmentOutput)
     }
 }

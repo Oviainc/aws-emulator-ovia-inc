@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UnlockRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UnlockRule`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: starts the unlock delay of the stored locked retention rule the request
+//! addresses — persisting the `pending_unlock` lock state and the instant that delay
+//! expires in [`crate::state`] — and answers with the STORED record (HTTP 200). This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UnlockRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +171,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UnlockRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UnlockRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UnlockRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UnlockRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the rbin retention-rule store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(rule) = store.rules.get_mut(&input.identifier) else {
+            return Err(UnlockRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Retention rule with ID {} not found",
+                        input.identifier
+                    )),
+                    reason: Some("RULE_NOT_FOUND".to_string()),
+                },
+            )
+            .into());
+        };
+        // An unlock delay that has already run out leaves the rule `unlocked` whether or
+        // not anybody called, so materialise that before the guard below reads the lock
+        // state: a rule whose delay has expired is no longer unlockable either.
+        rule.settle_lock_state(now);
+
+        // Only a `locked` rule can be unlocked: a rule that has never been locked, one
+        // already `unlocked`, and one already serving its unlock delay have no lock to
+        // release, so the request can't be completed.
+        if rule.lock_state.as_deref() != Some(crate::state::LOCK_STATE_LOCKED) {
+            return Err(UnlockRuleErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Retention rule with ID {} is not locked (lock state {})",
+                    rule.identifier,
+                    rule.lock_state.as_deref().unwrap_or("null")
+                )),
+                reason: Some("INVALID_RULE_STATE".to_string()),
+            })
+            .into());
+        }
+
+        // "After a retention rule is unlocked, it can be modified or deleted only after
+        // the unlock delay period expires": the rule enters `pending_unlock` now and
+        // leaves it when the delay its lock configuration carries has run, which the
+        // clock — not a later call — makes due.
+        let lock_end_time = crate::state::unlock_delay_end(now, rule.lock_configuration.as_ref());
+        rule.lock_state = Some(crate::state::LOCK_STATE_PENDING_UNLOCK.to_string());
+        rule.lock_end_time = lock_end_time;
+        // A delay that is already over at the instant it starts is over for every later
+        // reader too, so settle it here rather than reporting a state the clock has
+        // already left.
+        rule.settle_lock_state(now);
+
+        // Answer out of the STORED record, so the caller sees what a later GetRule sees.
+        Ok(UnlockRuleOutput {
+            identifier: Some(rule.identifier.clone()),
+            description: rule.description.clone(),
+            resource_type: Some(rule.resource_type.clone()),
+            retention_period: Some(rule.retention_period.clone()),
+            resource_tags: Some(rule.resource_tags.clone()),
+            status: Some(rule.status.clone()),
+            lock_configuration: rule.lock_configuration.clone(),
+            lock_state: rule.lock_state.clone(),
+            lock_end_time: rule.lock_end_time.map(::aws_smithy_types::DateTime::from),
+            rule_arn: Some(rule.rule_arn.clone()),
+            exclude_resource_tags: Some(rule.exclude_resource_tags.clone()),
+        })
     }
 }

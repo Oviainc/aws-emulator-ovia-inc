@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{LockConfiguration, ResourceTag, RetentionPeriod, RuleSummary, Tag};
 
@@ -40,6 +40,17 @@ pub const MAX_PAGE_SIZE: usize = 1000;
 /// cap. It also keeps the store from growing for the process's whole lifetime on
 /// nothing but repeated `CreateRule` calls.
 pub const MAX_RULES: usize = 1000;
+
+/// Seconds in one day. `UnlockDelayUnit` models exactly one unit — "The unit of
+/// time in which to measure the unlock delay. Currently, the unlock delay can be
+/// measured only in days" — so an unlock delay is this many seconds per unit.
+pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// The lock states `LockState` models, plus the absent state a never-locked rule
+/// reports. Kept here so every lock-aware operation names one spelling.
+pub const LOCK_STATE_LOCKED: &str = "locked";
+pub const LOCK_STATE_PENDING_UNLOCK: &str = "pending_unlock";
+pub const LOCK_STATE_UNLOCKED: &str = "unlocked";
 
 /// One persisted Recycle Bin retention rule — the single record every operation of
 /// this service reads its response out of.
@@ -92,12 +103,27 @@ impl Rule {
     /// not a caller, makes due.
     pub fn is_lock_protected(&self, now: SystemTime) -> bool {
         match self.lock_state.as_deref() {
-            Some("locked") => true,
-            Some("pending_unlock") => self.lock_end_time.is_none_or(|end| now < end),
+            Some(LOCK_STATE_LOCKED) => true,
+            Some(LOCK_STATE_PENDING_UNLOCK) => self.lock_end_time.is_none_or(|end| now < end),
             _ => false,
         }
     }
 
+    /// Materialise the lock transition the CLOCK has already made due: a
+    /// `pending_unlock` rule whose unlock delay has expired is `unlocked`, and it
+    /// no longer reports a lock end time ("Only returned for retention rules that
+    /// have been unlocked and that are still within the unlock delay period").
+    ///
+    /// Nothing else about a lock moves on its own, so a rule in any other state is
+    /// left exactly as it is.
+    pub fn settle_lock_state(&mut self, now: SystemTime) {
+        if self.lock_state.as_deref() == Some(LOCK_STATE_PENDING_UNLOCK)
+            && self.lock_end_time.is_some_and(|end| now >= end)
+        {
+            self.lock_state = Some(LOCK_STATE_UNLOCKED.to_string());
+            self.lock_end_time = None;
+        }
+    }
     /// Whether every tag in `filter` appears among the rule's resource tags. An
     /// empty filter selects every rule.
     pub fn has_resource_tags(&self, filter: &[ResourceTag]) -> bool {
@@ -113,6 +139,30 @@ impl Rule {
             .iter()
             .all(|wanted| contains_resource_tag(&self.exclude_resource_tags, wanted))
     }
+}
+
+/// The instant an unlock requested at `now` leaves its unlock delay.
+///
+/// The delay is the one the rule's lock configuration carries, so it keeps the value
+/// the lock request asked for: `UnlockDelayValue` units of `UnlockDelayUnit`, which
+/// the model bounds at 7..=30 and measures only in `DAYS`. A rule with no lock
+/// configuration has no delay to serve.
+pub fn unlock_delay_end(
+    now: SystemTime,
+    lock_configuration: Option<&LockConfiguration>,
+) -> Option<SystemTime> {
+    let delay = &lock_configuration?.unlock_delay;
+    // The model bounds the value at 7..=30, so a value outside `u64` cannot reach a
+    // handler; treat one as no delay rather than panicking if it ever does.
+    let value = u64::try_from(delay.unlock_delay_value).unwrap_or(0);
+    let seconds = match delay.unlock_delay_unit.as_str() {
+        "DAYS" => value.saturating_mul(SECONDS_PER_DAY),
+        // `UnlockDelayUnit` models only `DAYS`, and the boundary validator refuses an
+        // unmodelled value before a handler runs, so this arm serves no delay rather
+        // than guessing a scale for a unit the model does not define.
+        _ => return None,
+    };
+    now.checked_add(Duration::from_secs(seconds))
 }
 
 /// A tag matches when the keys are equal and, where the filter names a value, the

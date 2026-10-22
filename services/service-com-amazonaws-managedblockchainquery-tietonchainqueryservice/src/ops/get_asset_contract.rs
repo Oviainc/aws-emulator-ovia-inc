@@ -9,7 +9,10 @@
 //! a `ResourceNotFoundException`.
 //!
 //! The service is read-only, so the contract comes out of the seeded ledger and this
-//! handler writes nothing.
+//! handler writes nothing. Unlike a balance or a transaction history, which every
+//! address on a chain has (see `crate::state::derived`), a contract is CODE deployed at
+//! an address, which most addresses hold none of — so this operation stays an index
+//! lookup and an address the index holds no contract at is the modelled 404.
 //!
 //! ## Shape of an operation
 //!

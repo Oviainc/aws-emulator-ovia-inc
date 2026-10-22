@@ -14,8 +14,9 @@
 //! identifiers.
 //!
 //! The `Dsql` harness in `tests/all/harness.rs` is this crate's ONE test client:
-//! the sibling suites (`tests/all/resource_tags.rs`, `tests/all/error_contract.rs`)
-//! drive the same `dispatch` path through it rather than building a second one.
+//! the sibling suites (`tests/all/resource_tags.rs`, `tests/all/error_contract.rs`,
+//! `tests/all/stream_lifecycle.rs`) drive the same `dispatch` path through it
+//! rather than building a second one.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};

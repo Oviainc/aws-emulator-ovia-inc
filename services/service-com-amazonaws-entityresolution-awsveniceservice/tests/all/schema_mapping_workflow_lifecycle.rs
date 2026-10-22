@@ -29,13 +29,17 @@ use service_com_amazonaws_entityresolution_awsveniceservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A SigV4 `Authorization` header whose credential scope names the `entityresolution`
-/// signing name and the `us-east-1` region: the scope is how the router picks the
-/// claiming service, and how the service picks the region its ARNs are scoped to.
-/// The signature itself is never checked here — the harness turns request
-/// authentication off, exactly as an unauthenticated emulator runs.
-const SIGNED_FOR_ENTITY_RESOLUTION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDTESTER/20260101/us-east-1/entityresolution/aws4_request, \
-     SignedHeaders=host;x-amz-date, Signature=0000";
+/// signing name and `region`: the scope is how the router picks the claiming service,
+/// and how the service picks the region its ARNs are scoped to. The signature itself
+/// is never checked here — the harness turns request authentication off, exactly as an
+/// unauthenticated emulator runs.
+pub(crate) fn signed_for(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 \
+         Credential=AKIDTESTER/20260101/{region}/entityresolution/aws4_request, \
+         SignedHeaders=host;x-amz-date, Signature=0000"
+    )
+}
 
 /// The account id every emulated ARN carries, and the region the harness signs for.
 const ACCOUNT_ID: &str = "000000000000";
@@ -79,15 +83,28 @@ impl Emulator {
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+        self.call_in_region(REGION, method, path, body).await
+    }
+
+    /// The same call, signed for `region` and addressed to that region's endpoint:
+    /// what a client configured for another Region sends. A region-scoped ARN is read
+    /// from this scope, so this is how a suite covers more than one of them.
+    pub(crate) async fn call_in_region(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Reply {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(value).expect("a request body serializes")
         });
         let request = http::Request::builder()
             .method(method)
             .uri(format!(
-                "https://entityresolution.{REGION}.amazonaws.com{path}"
+                "https://entityresolution.{region}.amazonaws.com{path}"
             ))
-            .header("authorization", SIGNED_FOR_ENTITY_RESOLUTION)
+            .header("authorization", signed_for(region))
             .header("content-type", "application/json")
             .body(bytes::Bytes::from(payload))
             .expect("a well-formed request");
@@ -139,6 +156,21 @@ impl Emulator {
             .await
     }
 
+    /// `UpdateMatchingWorkflow` — `PUT /matchingworkflows/{workflowName}`, with the
+    /// name as the `@httpLabel` and the new configuration as the body.
+    pub(crate) async fn update_matching_workflow(
+        &self,
+        workflow_name: &str,
+        request: &Value,
+    ) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/matchingworkflows/{workflow_name}"),
+            Some(request),
+        )
+        .await
+    }
+
     pub(crate) async fn delete_matching_workflow(&self, workflow_name: &str) -> Reply {
         self.call(
             "DELETE",
@@ -162,14 +194,14 @@ pub(crate) fn string_member(record: &Value, member: &str) -> String {
         .to_string()
 }
 
-fn bool_member(record: &Value, member: &str) -> bool {
+pub(crate) fn bool_member(record: &Value, member: &str) -> bool {
     record
         .get(member)
         .and_then(Value::as_bool)
         .unwrap_or_else(|| panic!("member `{member}` is not a boolean in {record:?}"))
 }
 
-fn list_member<'a>(record: &'a Value, member: &str) -> &'a Vec<Value> {
+pub(crate) fn list_member<'a>(record: &'a Value, member: &str) -> &'a Vec<Value> {
     record
         .get(member)
         .and_then(Value::as_array)

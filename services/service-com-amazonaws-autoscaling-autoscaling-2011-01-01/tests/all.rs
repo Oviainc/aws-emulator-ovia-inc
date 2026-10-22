@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/auto_scaling_group_lifecycle.rs"]
 mod auto_scaling_group_lifecycle;
+#[path = "all/error_envelope.rs"]
+mod error_envelope;
 #[path = "all/launch_configurations_are_unavailable.rs"]
 mod launch_configurations_are_unavailable;
 #[path = "all/reference_data_catalogs.rs"]

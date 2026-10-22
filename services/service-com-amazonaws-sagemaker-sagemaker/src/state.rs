@@ -3,10 +3,11 @@
 //! Engine state for the com-amazonaws-sagemaker-sagemaker service.
 //!
 //! The inference-deployment lifecycle (model -> endpoint config -> endpoint) and the
-//! AI benchmarking control plane's workload configurations are kept here, in
-//! `BTreeMap`s keyed by the resource name AWS keys them by, so
-//! `ListModels` has one stable order to sort and paginate over and every
-//! `Describe*` replays exactly what the matching `Create*` stored. The Studio
+//! model-card governance resources, batch-transform jobs and the AI benchmarking
+//! control plane's workload configurations are kept here, in `BTreeMap`s keyed by the
+//! resource name AWS keys them by, so `ListModels` has one stable order to sort and
+//! paginate over and every `Describe*` replays exactly what the matching `Create*`
+//! stored. The Studio
 //! AppImageConfig registry and the Git repositories `CreateCodeRepository` registers
 //! are kept the same way, keyed by `AppImageConfigName` and `CodeRepositoryName`.
 //!
@@ -19,13 +20,15 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AdditionalInferenceSpecificationDefinition, ArtifactSource, AsyncInferenceConfig,
-    CodeEditorAppImageConfig, ContainerDefinition, DataCaptureConfig, DriftCheckBaselines,
-    ExplainerConfig, GitConfig, IamIdentity, InferenceExecutionConfig, InferenceSpecification,
-    JupyterLabAppImageConfig, KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties,
-    MetricsConfig, ModelLifeCycle, ModelMetrics, ModelPackageModelCard, ModelPackageSecurityConfig,
-    ModelPackageStatusDetails, ModelPackageStatusItem, ModelPackageValidationSpecification,
-    ProductionVariant, ProductionVariantSummary, ResourceSpec, SourceAlgorithmSpecification, Tag,
-    UserContext, VpcConfig,
+    BatchDataCaptureConfig, CodeEditorAppImageConfig, ContainerDefinition, DataCaptureConfig,
+    DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig, GitConfig, IamIdentity,
+    InferenceExecutionConfig, InferenceSpecification, JupyterLabAppImageConfig,
+    KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
+    ModelCardSecurityConfig, ModelClientConfig, ModelLifeCycle, ModelMetrics,
+    ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
+    ModelPackageStatusItem, ModelPackageValidationSpecification, ProductionVariant,
+    ProductionVariantSummary, ResourceSpec, SourceAlgorithmSpecification, Tag, TransformInput,
+    TransformOutput, TransformResources, UserContext, VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -75,6 +78,9 @@ pub const MODEL_QUOTA: usize = 1_000;
 pub const ENDPOINT_CONFIG_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const ENDPOINT_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. A transform job is terminal and has no delete, so this is the
+/// most transform jobs one emulator run holds.
+pub const TRANSFORM_JOB_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`]. `CreateMlflowApp` models `ResourceLimitExceeded` for exactly
 /// this refusal.
 pub const MLFLOW_APP_QUOTA: usize = 1_000;
@@ -93,6 +99,9 @@ pub const MODEL_PACKAGE_GROUP_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`]. Bounds the lineage-artifact store the same way, and is what
 /// `CreateArtifact` answers `ResourceLimitExceeded` past.
 pub const ARTIFACT_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. Bounds the model-card store, and is what `CreateModelCard`
+/// answers `ResourceLimitExceeded` past.
+pub const MODEL_CARD_QUOTA: usize = 1_000;
 
 /// The lineage group every lineage entity this account creates belongs to.
 ///
@@ -129,6 +138,56 @@ pub const AUTO_MODEL_REGISTRATION_DISABLED: &str = "AutoModelRegistrationDisable
 pub const STATUS_CREATING: &str = "Creating";
 /// See [`STATUS_CREATING`].
 pub const STATUS_IN_SERVICE: &str = "InService";
+
+/// `TransformJobStatus`'s members this emulator moves a transform job through (the
+/// modelled enum also carries `Completed`, `Stopping` and `Stopped`, which this slice
+/// does not reach). Named once here so no handler compares a bare string literal.
+pub const TRANSFORM_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`TRANSFORM_STATUS_IN_PROGRESS`].
+pub const TRANSFORM_STATUS_FAILED: &str = "Failed";
+
+/// How long after `CreateTransformJob` the clock owes the job's terminal status.
+///
+/// A caller that describes the job straight after creating it still observes
+/// `InProgress`; one that waits (as `aws sagemaker wait transform-job-completed-or-stopped`
+/// does) observes the terminal status. Real SageMaker takes minutes to provision the ML
+/// instances; the span is compressed, never zero.
+pub const TRANSFORM_JOB_SETTLES_AFTER: Duration = Duration::from_millis(300);
+
+/// Why a batch transform job this emulator accepted ends in the modelled `Failed`
+/// status.
+///
+/// A batch transform runs the model's inference container against every record of the
+/// input dataset; this emulator runs no container, so no inference is performed and no
+/// transformed object is written. Reporting `Completed` — with an `S3OutputPath` nothing
+/// wrote — would claim work that never ran, so the job ends in the status the model
+/// carries for a job that did not produce its output, with this reason saying why.
+pub const TRANSFORM_NOT_RUN_FAILURE: &str =
+    "This emulator runs no model inference container, so no records were transformed and \
+     no output object was written to the job's S3OutputPath.";
+
+/// `MaxPayloadInMB`'s documented ceiling: "The value of MaxPayloadInMB cannot be greater
+/// than 100 MB" and "the value of (MaxConcurrentTransforms * MaxPayloadInMB) also cannot
+/// exceed 100 MB" (`CreateTransformJob$MaxPayloadInMB`'s model doc). The model constrains
+/// the member only from below (`range 0..`), so the ceiling is enforced in the handler.
+pub const MAX_PAYLOAD_IN_MB_CEILING: i32 = 100;
+
+/// `MaxPayloadInMB` when the request leaves it unset: "The default value is 6 MB"
+/// (`CreateTransformJob$MaxPayloadInMB`'s model doc).
+pub const DEFAULT_MAX_PAYLOAD_IN_MB: i32 = 6;
+
+/// `MaxConcurrentTransforms` when the request leaves it unset or zero: "If
+/// MaxConcurrentTransforms is set to 0 or left unset, Amazon SageMaker checks the optional
+/// execution-parameters to determine the settings for your chosen algorithm. If the
+/// execution-parameters endpoint is not enabled, the default value is 1"
+/// (`CreateTransformJob$MaxConcurrentTransforms`'s model doc). This emulator serves no
+/// execution-parameters endpoint, so the documented fallback of 1 is what it resolves.
+pub const DEFAULT_MAX_CONCURRENT_TRANSFORMS: i32 = 1;
+
+/// `CompressionType` and `SplitType` when the request leaves them unset: "The default
+/// value is `None`" (`TransformInput$CompressionType`) and "The default value for
+/// SplitType is `None`" (`TransformInput$SplitType`).
+pub const DEFAULT_NONE: &str = "None";
 
 /// How long after `CreateModelPackage` the clock owes the `Pending` -> `Completed`
 /// transition of `ModelPackageStatus`.
@@ -249,6 +308,59 @@ impl Endpoint {
         if self.status == STATUS_CREATING && now >= self.in_service_at {
             self.status = STATUS_IN_SERVICE.to_string();
             self.last_modified_time = self.in_service_at;
+            return true;
+        }
+        false
+    }
+}
+
+/// A batch transform job created by `CreateTransformJob`, as `DescribeTransformJob`
+/// replays it.
+///
+/// `ends_at` is the instant the clock owes the job's terminal status; it is stored,
+/// never slept on, and materialised by whichever reporting call first runs at or after
+/// it.
+#[derive(Debug, Clone)]
+pub struct TransformJob {
+    pub name: String,
+    pub arn: String,
+    pub model_name: String,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub max_concurrent_transforms: i32,
+    pub model_client_config: Option<ModelClientConfig>,
+    pub max_payload_in_mb: i32,
+    pub batch_strategy: Option<String>,
+    pub environment: Option<::std::collections::HashMap<String, String>>,
+    pub transform_input: TransformInput,
+    pub transform_output: TransformOutput,
+    pub data_capture_config: Option<BatchDataCaptureConfig>,
+    pub transform_resources: TransformResources,
+    pub data_processing: Option<DataProcessing>,
+    pub experiment_config: Option<ExperimentConfig>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub transform_end_time: Option<SystemTime>,
+    pub ends_at: SystemTime,
+}
+
+impl TransformJob {
+    /// Materialise the terminal status the clock already owes.
+    ///
+    /// This is the one write a reporting operation may make: the job was due to end at
+    /// `ends_at` whether or not anybody called, so the observer makes no difference to
+    /// the result. `TransformEndTime` is the instant the end was due, not "now", so the
+    /// value is stable across later reads.
+    ///
+    /// The status is [`TRANSFORM_STATUS_FAILED`] with [`TRANSFORM_NOT_RUN_FAILURE`]: see
+    /// that constant for why a job this emulator accepted cannot end `Completed`.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == TRANSFORM_STATUS_IN_PROGRESS && now >= self.ends_at {
+            self.status = TRANSFORM_STATUS_FAILED.to_string();
+            self.failure_reason = Some(TRANSFORM_NOT_RUN_FAILURE.to_string());
+            self.transform_end_time = Some(self.ends_at);
             return true;
         }
         false
@@ -646,6 +758,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Keyed by `TransformJobName`.
+    pub transform_jobs: BTreeMap<String, TransformJob>,
     /// Keyed by `MlflowAppArn` — the app's ARN is its identity, since the model
     /// documents that an MLflow app's NAME is not part of its ARN.
     pub mlflow_apps: BTreeMap<String, MlflowApp>,
@@ -668,6 +782,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// name taken in one Region leaves it free in another. See [`Action`], at the end of
     /// this module with the rest of the lineage-action slice.
     pub actions: BTreeMap<String, Action>,
+    /// Keyed by `ModelCardName`. See [`ModelCard`], at the end of this module with the
+    /// rest of the model-card slice.
+    pub model_cards: BTreeMap<String, ModelCard>,
     /// Keyed by `AIWorkloadConfigName`. See [`AIWorkloadConfig`], at the end of this
     /// module with the rest of the AI-benchmarking workload-configuration slice.
     pub ai_workload_configs: BTreeMap<String, AIWorkloadConfig>,
@@ -688,6 +805,12 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// Whether another transform job fits, i.e. the store is below
+    /// [`TRANSFORM_JOB_QUOTA`].
+    pub fn transform_jobs_below_quota(&self) -> bool {
+        self.transform_jobs.len() < TRANSFORM_JOB_QUOTA
     }
 
     /// Whether another MLflow app fits, i.e. the store is below [`MLFLOW_APP_QUOTA`].
@@ -775,6 +898,11 @@ impl ComAmazonawsSagemakerSagemakerState {
                 && package.name == name
                 && package.group_name.as_deref() == group
         })
+    }
+
+    /// Whether another model card fits, i.e. the store is below [`MODEL_CARD_QUOTA`].
+    pub fn model_cards_below_quota(&self) -> bool {
+        self.model_cards.len() < MODEL_CARD_QUOTA
     }
 }
 
@@ -1020,6 +1148,84 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// order against each other without going through a lossy float.
 pub fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
+}
+
+// ---------------------------------------------------------------------------
+// Model cards. `CreateModelCard` stores one here and `DescribeModelCard` replays it;
+// the store itself is `ComAmazonawsSagemakerSagemakerState::model_cards` above. Kept
+// together at the end of the file so a model-card change touches one span of it.
+// ---------------------------------------------------------------------------
+
+/// The version number a model card's FIRST version carries. `DescribeModelCard`'s
+/// `ModelCardVersion` is modelled as an `Integer` and the API's version history starts
+/// at one, so `CreateModelCard` stores version 1 and each `UpdateModelCard` appends the
+/// next integer.
+pub const FIRST_MODEL_CARD_VERSION: i32 = 1;
+
+/// One version of a model card, as `CreateModelCard` stores the first one and
+/// `DescribeModelCard` replays it.
+///
+/// A model card is versioned: `Content`, `ModelCardStatus` and `SecurityConfig` belong
+/// to a version, while the name, the ARN and the tags belong to the card.
+///
+/// `created_by` is stored when the version is created rather than rebuilt per read, so
+/// every later read reports the identity that actually created it; `last_modified_by`
+/// stays absent until a call modifies the version.
+#[derive(Debug, Clone)]
+pub struct ModelCardVersion {
+    pub version: i32,
+    pub content: String,
+    pub status: String,
+    pub security_config: Option<ModelCardSecurityConfig>,
+    pub creation_time: SystemTime,
+    pub created_by: UserContext,
+    pub last_modified_time: SystemTime,
+    pub last_modified_by: Option<UserContext>,
+}
+
+/// A model card created by `CreateModelCard`, with every version it has had.
+///
+/// `versions` is ordered by `version` ascending and is never empty: a card exists only
+/// once its first version does.
+#[derive(Debug, Clone)]
+pub struct ModelCard {
+    pub name: String,
+    pub arn: String,
+    pub tags: Vec<Tag>,
+    pub versions: Vec<ModelCardVersion>,
+}
+
+impl ModelCard {
+    /// A card holding exactly `first`, the version `CreateModelCard` minted.
+    pub fn new(name: String, arn: String, tags: Vec<Tag>, first: ModelCardVersion) -> Self {
+        Self {
+            name,
+            arn,
+            tags,
+            versions: vec![first],
+        }
+    }
+
+    /// The highest-numbered version — what a reader that names no version describes.
+    pub fn latest_version(&self) -> Option<&ModelCardVersion> {
+        self.versions.last()
+    }
+
+    /// The version numbered `version`, or `None` when the card never had it.
+    pub fn version(&self, version: i32) -> Option<&ModelCardVersion> {
+        self.versions.iter().find(|held| held.version == version)
+    }
+}
+
+/// Whether `content` can be a model card's `Content`.
+///
+/// `Content`'s own documentation says it "must be in model card JSON schema and provided
+/// as a string", so a value that is not even a JSON object is not a model card. The
+/// model constrains only the member's length, so the boundary validator passes such a
+/// value and the service refuses it. The schema's own required members are NOT checked
+/// here: this is the one structural claim the model's documentation makes.
+pub fn is_model_card_content(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content).is_ok_and(|parsed| parsed.is_object())
 }
 
 // ---------------------------------------------------------------------------

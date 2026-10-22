@@ -154,6 +154,10 @@ impl Emulator {
             .await
     }
 
+    pub(crate) async fn execute_query(&self, body: Value) -> Resp {
+        self.call("POST", "/queries/execution", Some(body)).await
+    }
+
     pub(crate) async fn create_component_type(
         &self,
         workspace_id: &str,

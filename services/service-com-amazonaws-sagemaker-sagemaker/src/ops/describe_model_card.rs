@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeModelCard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeModelCard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeModelCard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replays the model card `CreateModelCard` stored — the version asked for,
+//! or the latest one — accepting either the card's name or its ARN, and sanitising
+//! `Content` down to the documented metadata paths when `IncludedData` is
+//! `MetadataOnly`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +115,58 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// `IncludedData`'s member that asks for the full `Content` (smithy_query
+/// shape="IncludedData": `AllData | MetadataOnly`). It is also what SageMaker returns
+/// when the request names no value, so this handler needs no separate default.
+const INCLUDED_DATA_ALL_DATA: &str = "AllData";
+
+/// `IncludedData`'s member that asks for metadata only.
+const INCLUDED_DATA_METADATA_ONLY: &str = "MetadataOnly";
+
+/// The `Content` paths `IncludedData: MetadataOnly` preserves, as
+/// `DescribeModelCardResponse$Content` documents them (`<section>, <field>`):
+/// `model_overview.model_id`, `model_overview.model_name`,
+/// `intended_uses.risk_rating`, `model_package_details.model_package_group_name` and
+/// `model_package_details.model_package_arn`. Every other field is removed.
+const METADATA_ONLY_PATHS: &[(&str, &str)] = &[
+    ("model_overview", "model_id"),
+    ("model_overview", "model_name"),
+    ("intended_uses", "risk_rating"),
+    ("model_package_details", "model_package_group_name"),
+    ("model_package_details", "model_package_arn"),
+];
+
+/// `content` with only the [`METADATA_ONLY_PATHS`] it actually carries, as a JSON
+/// object — the sanitised `Content` `IncludedData: MetadataOnly` answers with.
+///
+/// Reads the stored content; stores nothing, so one caller asking for metadata only
+/// changes nothing a later caller reading `AllData` sees.
+fn metadata_only_content(content: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(content);
+    let Ok(serde_json::Value::Object(full)) = parsed else {
+        // Unreachable for stored content: a model card is created only with a JSON
+        // object (`state::is_model_card_content`). `Content` is modelled `@sensitive`
+        // and this branch cannot tell which of it is metadata, so it answers with the
+        // empty document rather than the whole value — fail closed, the way the
+        // unreachable `IncludedData` arm below does.
+        return serde_json::Value::Object(serde_json::Map::new()).to_string();
+    };
+
+    let mut sanitized = serde_json::Map::new();
+    for (section, field) in METADATA_ONLY_PATHS {
+        let Some(value) = full.get(*section).and_then(|held| held.get(*field)) else {
+            continue;
+        };
+        let slot = sanitized
+            .entry((*section).to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(object) = slot.as_object_mut() {
+            object.insert((*field).to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(sanitized).to_string()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -186,20 +233,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeModelCard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeModelCardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeModelCard"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ModelCardName` is a `ModelCardNameOrArn`: both forms name one stored card.
+        let name = crate::state::name_from_arn_or_name(&input.model_card_name);
+
+        let store = state.lock();
+        let Some(card) = store.model_cards.get(name) else {
+            // Never a 200 with empty fields: a caller cannot tell that from a card that
+            // exists and carries nothing.
+            return Err(DescribeModelCardErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Could not find model card '{name}'.")),
+            })
+            .into());
+        };
+
+        // "If a version is not provided, then the latest version of the model card is
+        // described" (`ModelCardVersion`'s documentation).
+        let held = match input.model_card_version {
+            Some(requested) => card.version(requested),
+            None => card.latest_version(),
+        };
+        let Some(held) = held else {
+            return Err(DescribeModelCardErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(match input.model_card_version {
+                    Some(requested) => format!(
+                        "Could not find version {requested} of model card '{name}'."
+                    ),
+                    None => format!("Could not find model card '{name}'."),
+                }),
+            })
+            .into());
+        };
+
+        let content = match input.included_data.as_deref() {
+            // "If you don't specify a value, SageMaker returns AllData" — so absent and
+            // `AllData` both answer with the content as stored.
+            None | Some(INCLUDED_DATA_ALL_DATA) => held.content.clone(),
+            Some(INCLUDED_DATA_METADATA_ONLY) => metadata_only_content(&held.content),
+            // Unreachable: `IncludedData` is a modelled enum, so the boundary validator
+            // has already refused anything outside it. `Content` is modelled
+            // `@sensitive`, so the arm that cannot be reached answers with the sanitised
+            // form rather than the full one.
+            Some(_) => metadata_only_content(&held.content),
+        };
+
+        Ok(DescribeModelCardOutput {
+            model_card_arn: card.arn.clone(),
+            model_card_name: card.name.clone(),
+            model_card_version: held.version,
+            content,
+            model_card_status: held.status.clone(),
+            security_config: held.security_config.clone(),
+            creation_time: crate::state::timestamp(held.creation_time),
+            // The identity the create recorded, replayed rather than rebuilt per read.
+            // The emulator serves no Studio domain, so a card's `UserContext` carries
+            // the IAM identity the request signed with and none of the Studio members.
+            created_by: held.created_by.clone(),
+            last_modified_time: Some(crate::state::timestamp(held.last_modified_time)),
+            last_modified_by: held.last_modified_by.clone(),
+            // `ModelCardProcessingStatus` reports the progress of model card DELETION;
+            // a card nobody has asked to delete is in none of those states, so the
+            // optional member is absent.
+            model_card_processing_status: None,
+        })
     }
 }

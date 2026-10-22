@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEnvironmentHealth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEnvironmentHealth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEnvironmentHealth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the stored environment's health, carrying only the attributes the
+//! request asked for. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -99,6 +92,101 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `EnvironmentHealthAttribute` values this operation's response members are
+/// selected by (the full set is
+/// [`crate::ops::types::ENVIRONMENT_HEALTH_ATTRIBUTE_VALUES`]).
+const ALL: &str = "All";
+/// See [`ALL`].
+const STATUS: &str = "Status";
+/// See [`ALL`].
+const COLOR: &str = "Color";
+/// See [`ALL`].
+const CAUSES: &str = "Causes";
+/// See [`ALL`].
+const APPLICATION_METRICS: &str = "ApplicationMetrics";
+/// See [`ALL`].
+const INSTANCES_HEALTH: &str = "InstancesHealth";
+/// See [`ALL`].
+const HEALTH_STATUS: &str = "HealthStatus";
+/// See [`ALL`].
+const REFRESHED_AT: &str = "RefreshedAt";
+
+/// The window `ApplicationMetrics` covers, in seconds: "The amount of time that
+/// the metrics cover (usually 10 seconds)."
+const METRICS_DURATION_SECONDS: i32 = 10;
+
+/// Which response attributes a request asked for.
+///
+/// "Specify the response elements to return. To retrieve all attributes, set to
+/// `All`. If no attribute names are specified, returns the name of the
+/// environment." The boundary validator has already refused any value outside
+/// the modelled enum, so an attribute reaching here is one of the names above.
+struct Requested<'a> {
+    names: &'a [String],
+}
+
+impl<'a> Requested<'a> {
+    fn of(attribute_names: Option<&'a [String]>) -> Self {
+        Self {
+            names: attribute_names.unwrap_or(&[]),
+        }
+    }
+
+    fn wants(&self, attribute: &str) -> bool {
+        self.names
+            .iter()
+            .any(|name| name == attribute || name == ALL)
+    }
+}
+
+/// "Descriptions of the data that contributed to the environment's current
+/// health status": a healthy environment has none, and an environment whose
+/// health checks are suspended or not yet started reports the deployment state
+/// that suspended them.
+fn causes(environment: &crate::state::Environment) -> Vec<String> {
+    if environment.health == crate::state::HEALTH_GREEN {
+        return Vec::new();
+    }
+    vec![format!(
+        "Environment health is {}: the environment's status is {}.",
+        environment.health, environment.status
+    )]
+}
+
+/// The request metrics for this environment over the last
+/// [`METRICS_DURATION_SECONDS`]. This emulator serves no application traffic, so
+/// the window holds no request: the counts are zero and there are no latency
+/// percentiles to report over zero requests.
+fn application_metrics() -> ApplicationMetrics {
+    ApplicationMetrics {
+        duration: Some(METRICS_DURATION_SECONDS),
+        request_count: 0,
+        status_codes: Some(StatusCodes {
+            status2xx: Some(0),
+            status3xx: Some(0),
+            status4xx: Some(0),
+            status5xx: Some(0),
+        }),
+        latency: None,
+    }
+}
+
+/// The health summary over this environment's instances. This emulator
+/// provisions no EC2 instance, so every bucket of the summary is zero rather
+/// than a count nothing produced.
+fn instance_health_summary() -> InstanceHealthSummary {
+    InstanceHealthSummary {
+        no_data: Some(0),
+        unknown: Some(0),
+        pending: Some(0),
+        ok: Some(0),
+        info: Some(0),
+        warning: Some(0),
+        degraded: Some(0),
+        severe: Some(0),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +256,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEnvironmentHealth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEnvironmentHealthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEnvironmentHealth"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeEnvironmentHealthError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // The only write a report performs: a status change the clock already
+        // made due is owed whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "Specify the environment by ID. You must specify either this or an
+        // EnvironmentName, or both." This operation's model documents no code
+        // for naming neither; the recorded refusal is the generic query
+        // `MissingParameter`.
+        let environment_id = store
+            .environment_id_for(
+                input.environment_id.as_deref(),
+                input.environment_name.as_deref(),
+            )
+            .map_err(|refusal| match refusal {
+                crate::state::EnvironmentRefusal::NoIdentifier => {
+                    DescribeEnvironmentHealthError::missing_parameter(
+                        "Either EnvironmentName or EnvironmentId must be specified.",
+                    )
+                }
+                crate::state::EnvironmentRefusal::NotFound(message) => {
+                    DescribeEnvironmentHealthError::invalid_parameter_value(message)
+                }
+            })?;
+        let environment = store.environments.get(&environment_id).ok_or_else(|| {
+            DescribeEnvironmentHealthError::invalid_parameter_value(
+                crate::state::missing_environment_message(Some(environment_id.as_str()), None),
+            )
+        })?;
+
+        let requested = Requested::of(input.attribute_names.as_deref());
+        Ok(DescribeEnvironmentHealthOutput {
+            // "If no attribute names are specified, returns the name of the
+            // environment" — so the name is always reported.
+            environment_name: Some(environment.environment_name.clone()),
+            // "The health status of the environment. For example, Ok."
+            health_status: requested
+                .wants(HEALTH_STATUS)
+                .then(|| environment.health_status.clone())
+                .flatten(),
+            // "The environment's operational status. Ready, Launching,
+            // Updating, Terminating, or Terminated." The member's shape is the
+            // `EnvironmentHealth` enum, which its own documentation contradicts:
+            // the health colour is reported in `Color` below, and this member
+            // carries the environment's status.
+            status: requested.wants(STATUS).then(|| environment.status.clone()),
+            // "The health color of the environment" — the stored
+            // `EnvironmentHealth` value.
+            color: requested.wants(COLOR).then(|| environment.health.clone()),
+            // "Descriptions of the data that contributed to the environment's
+            // current health status."
+            causes: requested.wants(CAUSES).then(|| causes(environment)),
+            // Request metrics over "the most recent time slice of 10 seconds".
+            // This emulator serves no application traffic, so the slice is
+            // empty: no requests, and no latency percentiles over zero requests.
+            application_metrics: requested.wants(APPLICATION_METRICS).then(application_metrics),
+            // "Summary health information for the instances in the environment."
+            instances_health: requested
+                .wants(INSTANCES_HEALTH)
+                .then(instance_health_summary),
+            // "The date and time that the health information was retrieved."
+            refreshed_at: requested.wants(REFRESHED_AT).then(crate::state::now),
+        })
     }
 }

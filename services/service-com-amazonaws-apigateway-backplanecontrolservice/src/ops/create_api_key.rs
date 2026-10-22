@@ -348,15 +348,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Every stage key must name a stored API; an unknown id is the modelled
-        // `NotFoundException` rather than a silently dropped association. A stage's own
-        // existence cannot be checked here: this service stores no stage records yet,
-        // because the stage operations are still scaffolded.
+        // Every stage key must name a stored stage of a stored API: the key is
+        // associated with that stage, so an entry naming no stage associates it with
+        // nothing. Either identifier missing is the modelled `NotFoundException` rather
+        // than a dangling association no later read could justify.
         let mut stage_keys = Vec::with_capacity(requested_stages.len());
         for (rest_api_id, stage_name) in requested_stages {
-            if !store.rest_apis.contains_key(&rest_api_id) {
-                return Err(CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
+            let api = store.rest_apis.get(&rest_api_id).ok_or_else(|| {
+                CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::NO_SUCH_REST_API.to_string()),
+                })
+            })?;
+            if !api.stages.contains_key(&stage_name) {
+                return Err(CreateApiKeyErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_STAGE.to_string()),
                 })
                 .into());
             }

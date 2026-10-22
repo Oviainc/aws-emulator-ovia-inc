@@ -100,21 +100,31 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The member of an EC2 instance identity document that carries the instance id. The
+/// The member of an EC2 instance identity document that carries the account id. The
 /// `instanceIdentityDocument` doc points at
 /// `http://169.254.169.254/latest/dynamic/instance-identity/document/`, whose JSON
-/// document names the instance in `instanceId`.
+/// document names the account in `accountId`.
+const IDENTITY_DOCUMENT_ACCOUNT_ID: &str = "accountId";
+
+/// The member of the same document that carries the instance id.
 const IDENTITY_DOCUMENT_INSTANCE_ID: &str = "instanceId";
 
-/// The EC2 instance id an identity document names, or `None` when the document is not a
-/// JSON object carrying a non-empty `instanceId`.
-fn instance_id_from_identity_document(document: &str) -> Option<String> {
-    ::serde_json::from_str::<::serde_json::Value>(document)
-        .ok()?
-        .get(IDENTITY_DOCUMENT_INSTANCE_ID)?
+/// The members of an identity document a registration must carry, IN THE ORDER they are
+/// validated: a document that leaves more than one blank is reported on the first of
+/// them. `accountId` comes first, which is the member Amazon ECS names for a document it
+/// cannot read at all.
+const IDENTITY_DOCUMENT_REQUIRED_MEMBERS: [&str; 2] =
+    [IDENTITY_DOCUMENT_ACCOUNT_ID, IDENTITY_DOCUMENT_INSTANCE_ID];
+
+/// The value a member of an identity document carries, or `None` when the document is
+/// not a JSON object, does not carry that member, or leaves it blank. A member that is
+/// not a string carries no value: it names nothing, just as a blank one does.
+fn identity_document_member(document: &::serde_json::Value, member: &str) -> Option<String> {
+    document
+        .get(member)?
         .as_str()
         .map(str::trim)
-        .filter(|instance_id| !instance_id.is_empty())
+        .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
 
@@ -200,19 +210,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
 
         // "The instance identity document for the EC2 instance to register." When the
-        // agent sends one it is what names the instance, so a document that names no
-        // instance is a parameter this operation cannot act on.
+        // agent sends one, that document is what identifies the machine, so every member
+        // it has to carry is validated before anything is stored. The refusal names the
+        // MEMBER OF THE DOCUMENT that is blank — the first one in
+        // [`IDENTITY_DOCUMENT_REQUIRED_MEMBERS`] — and nothing else about the request; a
+        // document that is not JSON at all leaves every member blank, so it is reported
+        // on the first one too.
         let documented_instance_id = match input.instance_identity_document.as_deref() {
-            Some(document) => Some(instance_id_from_identity_document(document).ok_or_else(|| {
-                RegisterContainerInstanceErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(format!(
-                            "instanceIdentityDocument must be a JSON document carrying a \
-                             non-empty {IDENTITY_DOCUMENT_INSTANCE_ID}"
-                        )),
-                    },
-                )
-            })?),
+            Some(document) => {
+                let parsed = ::serde_json::from_str::<::serde_json::Value>(document)
+                    .unwrap_or(::serde_json::Value::Null);
+                for member in IDENTITY_DOCUMENT_REQUIRED_MEMBERS {
+                    if identity_document_member(&parsed, member).is_none() {
+                        return Err(
+                            RegisterContainerInstanceErrorModeled::InvalidParameterException(
+                                InvalidParameterException {
+                                    message: Some(format!("{member} cannot be blank.")),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                }
+                identity_document_member(&parsed, IDENTITY_DOCUMENT_INSTANCE_ID)
+            }
             None => None,
         };
 
@@ -223,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RegisterContainerInstanceErrorModeled::ClusterNotFoundException(
                     ClusterNotFoundException {
-                        message: Some(format!("cluster {cluster_name:?} was not found")),
+                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into(),
@@ -251,10 +272,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         RegisterContainerInstanceErrorModeled::InvalidParameterException(
                             InvalidParameterException {
-                                message: Some(format!(
-                                    "containerInstanceArn {reference:?} names no container \
-                                     instance registered in cluster {cluster_name:?}"
-                                )),
+                                message: Some(
+                                    crate::state::CONTAINER_INSTANCE_NOT_FOUND_MESSAGE
+                                        .to_string(),
+                                ),
                             },
                         )
                         .into(),

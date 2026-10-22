@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_configuration.rs"]
 mod account_configuration;
+#[path = "all/acme_endpoint_lifecycle.rs"]
+mod acme_endpoint_lifecycle;
 #[path = "all/certificate_domain_validations.rs"]
 mod certificate_domain_validations;
 #[path = "all/certificate_lifecycle.rs"]
@@ -23,6 +25,8 @@ mod certificate_list_filters;
 mod certificate_not_found_message;
 #[path = "all/certificate_revocation.rs"]
 mod certificate_revocation;
+#[path = "all/certificate_search.rs"]
+mod certificate_search;
 #[path = "all/certificate_tag_removal.rs"]
 mod certificate_tag_removal;
 #[path = "all/certificate_validation_state_machine.rs"]

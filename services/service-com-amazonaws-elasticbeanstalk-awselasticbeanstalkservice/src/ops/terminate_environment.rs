@@ -204,12 +204,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due_transitions();
 
-        // "You must specify either this or an EnvironmentId, or both."
-        if input.environment_id.is_none() && input.environment_name.is_none() {
-            return Err(TerminateEnvironmentError::missing_required_parameter(
-                "Must specify either EnvironmentId or EnvironmentName.",
-            ));
-        }
         // `TerminateResources` selects whether the environment's AWS resources
         // are deleted and `ForceTerminate` forces termination of an environment
         // whose resources are already gone. This emulator provisions no
@@ -217,17 +211,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = (input.terminate_resources, input.force_terminate);
 
         let environment_id = store
-            .resolve_environment_id(
+            .environment_id_for(
                 input.environment_id.as_deref(),
                 input.environment_name.as_deref(),
             )
-            .ok_or_else(|| {
-                TerminateEnvironmentError::invalid_parameter_value(
-                    crate::state::missing_environment_message(
-                        input.environment_id.as_deref(),
-                        input.environment_name.as_deref(),
-                    ),
-                )
+            .map_err(|refusal| match refusal {
+                // "You must specify either this or an EnvironmentId, or both.
+                // If you do not specify either, Elastic Beanstalk returns
+                // MissingRequiredParameter error."
+                crate::state::EnvironmentRefusal::NoIdentifier => {
+                    TerminateEnvironmentError::missing_required_parameter(
+                        "Must specify either EnvironmentId or EnvironmentName.",
+                    )
+                }
+                crate::state::EnvironmentRefusal::NotFound(message) => {
+                    TerminateEnvironmentError::invalid_parameter_value(message)
+                }
             })?;
 
         let environment = store.environments.get_mut(&environment_id).ok_or_else(|| {
