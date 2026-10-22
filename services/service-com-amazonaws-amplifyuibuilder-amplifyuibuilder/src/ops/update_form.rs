@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // applied, so no token bookkeeping is needed to make a retry idempotent.
         let Some(form) = store.form_mut(&input.app_id, &input.environment_name, &input.id) else {
             return Err(UpdateFormErrorModeled::ResourceNotFoundException(
-                crate::state::form_not_found(&input.app_id, &input.environment_name, &input.id),
+                crate::state::item_not_found(),
             )
             .into());
         };
