@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBootstrapBrokers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBootstrapBrokers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Renders the cluster's bootstrap-broker strings from its persisted brokers and
+//! access settings: one `<host>:<port>` entry per stored broker node, and one
+//! string per access path the cluster actually enables. A path the cluster does
+//! not enable has no string at all.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBootstrapBrokers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
 //!
 //! ## Shape of an operation
 //!
@@ -101,6 +101,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -174,18 +175,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBootstrapBrokers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBootstrapBrokersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBootstrapBrokers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetBootstrapBrokersErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // This operation models no `NotFoundException`, so both ways a
+        // `ClusterArn` can fail to resolve are the same bad request — but the
+        // message distinguishes them, so the three readers say the same thing
+        // about the same input. The shape check depends on the request alone, so
+        // it runs before the state lock is taken.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(GetBootstrapBrokersErrorModeled::BadRequestException(
+                BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = state.lock();
+        // An ARN this endpoint's region holds no cluster for — absent, or
+        // belonging to another region — is refused the same way. Resolved
+        // WITHOUT settling, unlike Describe and List: this reader reports no
+        // `State`, so no clock-owed transition is due to it.
+        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
+            return Err(GetBootstrapBrokersErrorModeled::BadRequestException(
+                BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "No cluster exists in {region} with the ARN {}",
+                        input.cluster_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // One string per access path the cluster enables, each listing every
+        // broker on that path's port. `when` keeps a path's member absent rather
+        // than empty when the cluster does not offer it.
+        let when = |enabled: bool, port: u16| {
+            enabled.then(|| cluster.broker_endpoints(port))
+        };
+        let plaintext = cluster.plaintext_enabled();
+        let tls = cluster.tls_enabled();
+        let scram = cluster.sasl_scram_enabled();
+        let iam = cluster.sasl_iam_enabled();
+        let public = cluster.public_access_enabled();
+        let dual_stack = cluster.dual_stack();
+
+        Ok(GetBootstrapBrokersOutput {
+            bootstrap_broker_string: when(plaintext, state::PORT_PLAINTEXT),
+            bootstrap_broker_string_tls: when(tls, state::PORT_TLS),
+            bootstrap_broker_string_sasl_scram: when(scram, state::PORT_SASL_SCRAM),
+            bootstrap_broker_string_sasl_iam: when(iam, state::PORT_SASL_IAM),
+            // Public access carries no plaintext port: a public endpoint is
+            // reachable only over TLS or SASL.
+            bootstrap_broker_string_public_tls: when(public && tls, state::PORT_PUBLIC_TLS),
+            bootstrap_broker_string_public_sasl_scram: when(
+                public && scram,
+                state::PORT_PUBLIC_SASL_SCRAM,
+            ),
+            bootstrap_broker_string_public_sasl_iam: when(
+                public && iam,
+                state::PORT_PUBLIC_SASL_IAM,
+            ),
+            bootstrap_broker_string_vpc_connectivity_tls: when(
+                cluster.vpc_connectivity_tls_enabled(),
+                state::PORT_VPC_TLS,
+            ),
+            bootstrap_broker_string_vpc_connectivity_sasl_scram: when(
+                cluster.vpc_connectivity_sasl_scram_enabled(),
+                state::PORT_VPC_SASL_SCRAM,
+            ),
+            bootstrap_broker_string_vpc_connectivity_sasl_iam: when(
+                cluster.vpc_connectivity_sasl_iam_enabled(),
+                state::PORT_VPC_SASL_IAM,
+            ),
+            // A dual-stack cluster answers on the same ports over IPv6, through
+            // the SAME broker hostnames: an MSK broker endpoint is one DNS name
+            // whose record set gains AAAA entries on a `DUAL` cluster, so these
+            // members repeat the IPv4 strings by design. Minting a different host
+            // label for the IPv6 path would be invented — neither the model nor
+            // the published endpoint format gives one. An IPv4-only cluster (the
+            // model's default `NetworkType`) has no IPv6 path at all.
+            bootstrap_broker_string_ipv6: when(dual_stack && plaintext, state::PORT_PLAINTEXT),
+            bootstrap_broker_string_tls_ipv6: when(dual_stack && tls, state::PORT_TLS),
+            bootstrap_broker_string_sasl_scram_ipv6: when(
+                dual_stack && scram,
+                state::PORT_SASL_SCRAM,
+            ),
+            bootstrap_broker_string_sasl_iam_ipv6: when(dual_stack && iam, state::PORT_SASL_IAM),
+        })
     }
 }

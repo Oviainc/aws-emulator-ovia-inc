@@ -17,6 +17,8 @@ mod asset_lifecycle;
 mod asset_model_properties;
 #[path = "all/asset_property_update.rs"]
 mod asset_property_update;
+#[path = "all/batch_get_latest_values.rs"]
+mod batch_get_latest_values;
 #[path = "all/property_value_history.rs"]
 mod property_value_history;
 #[path = "all/state_roundtrip.rs"]

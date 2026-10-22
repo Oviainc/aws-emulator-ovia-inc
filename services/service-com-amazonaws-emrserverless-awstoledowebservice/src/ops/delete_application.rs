@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.terminate(now);
         store
             .create_application_tokens
-            .retain(|_, id| id != &input.application_id);
+            .retain(|_, replay| replay.application_id != input.application_id);
 
         Ok(DeleteApplicationOutput {})
     }

@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.application.state = "STOPPING".to_string();
         record.application.updated_at = crate::state::now_timestamp(now);
         record.pending = Some(crate::state::PendingState {
-            due: now + crate::state::LIFECYCLE_TRANSITION,
+            due: crate::state::due_at(now, crate::state::LIFECYCLE_TRANSITION),
             state: "STOPPED".to_string(),
             state_details: None,
         });

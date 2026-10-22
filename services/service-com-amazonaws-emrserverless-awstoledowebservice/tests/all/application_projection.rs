@@ -74,68 +74,125 @@ fn is_state_details(value: &Value) -> bool {
         .is_some_and(|text| (1..=256).contains(&text.chars().count()) && text.trim() != "")
 }
 
+/// Which member of a create a refusal must point the caller at.
+#[derive(Debug, Clone, Copy)]
+enum Member {
+    /// The create is accepted, so no member failed.
+    None,
+    /// `type` names no engine this service serves.
+    Type,
+    /// `releaseLabel` names no release that offers the engine asked for.
+    ReleaseLabel,
+}
+
 /// `CreateApplication` refuses an engine type the named release does not support, and
 /// mints nothing when it does; an engine the release serves is accepted whatever casing
-/// the request used.
+/// the request used. A refusal names the MEMBER that failed: the engine type when it
+/// names no engine this service serves, the release label when the engine is real but
+/// the release named offers it — or does not exist at all.
 #[tokio::test]
 async fn create_application_refuses_an_engine_type_the_release_does_not_support() {
     let long_type = "a".repeat(64);
-    // (case, type, releaseLabel, expected status). The rows differ along the value, its
-    // casing, its length and the release it is asked for.
-    let cases: Vec<(&str, &str, &str, u16)> = vec![
-        ("the first engine, canonical casing", "Spark", "emr-7.1.0", 200),
-        ("the first engine, upper case", "SPARK", "emr-7.1.0", 200),
-        ("the first engine, lower case", "spark", "emr-6.9.0", 200),
-        ("the second engine, canonical casing", "Hive", "emr-7.1.0", 200),
-        ("the second engine, mixed case", "hIvE", EARLIEST_RELEASE, 200),
+    // (case, type, releaseLabel, expected status, the member the refusal must name).
+    // The rows differ along the value, its casing, its length and the release it is
+    // asked for.
+    let cases: Vec<(&str, &str, &str, u16, Member)> = vec![
+        (
+            "the first engine, canonical casing",
+            "Spark",
+            "emr-7.1.0",
+            200,
+            Member::None,
+        ),
+        (
+            "the first engine, upper case",
+            "SPARK",
+            "emr-7.1.0",
+            200,
+            Member::None,
+        ),
+        (
+            "the first engine, lower case",
+            "spark",
+            "emr-6.9.0",
+            200,
+            Member::None,
+        ),
+        (
+            "the second engine, canonical casing",
+            "Hive",
+            "emr-7.1.0",
+            200,
+            Member::None,
+        ),
+        (
+            "the second engine, mixed case",
+            "hIvE",
+            EARLIEST_RELEASE,
+            200,
+            Member::None,
+        ),
         (
             "a release label carrying a build suffix",
             "Spark",
             "emr-6.6.0-20220101",
             200,
+            Member::None,
         ),
         (
-            "a release label with no readable version, judged on the engine alone",
+            "a release label with no readable version, which names no release",
             "Spark",
             "latest",
-            200,
+            400,
+            Member::ReleaseLabel,
         ),
         (
             "an engine no release serves",
             "NOT_A_REAL_ENGINE",
             "emr-7.1.0",
             400,
+            Member::Type,
         ),
-        ("an engine named by a near miss", "Sparks", "emr-7.1.0", 400),
+        (
+            "an engine named by a near miss",
+            "Sparks",
+            "emr-7.1.0",
+            400,
+            Member::Type,
+        ),
         (
             "a one-character type (EngineType's minimum length)",
             "X",
             "emr-7.1.0",
             400,
+            Member::Type,
         ),
         (
             "a 64-character type (EngineType's maximum length)",
             &long_type,
             "emr-7.1.0",
             400,
+            Member::Type,
         ),
         (
             "a supported engine one release below the earliest that serves it",
             "Spark",
             BEFORE_EARLIEST_RELEASE,
             400,
+            Member::ReleaseLabel,
         ),
         (
             "a supported engine at a much older release",
             "Hive",
             "emr-5.36.0",
             400,
+            Member::ReleaseLabel,
         ),
     ];
 
     let router = emulator();
     let mut expected_applications = 0usize;
-    for (index, (case, engine_type, release_label, expected_status)) in
+    for (index, (case, engine_type, release_label, expected_status, member)) in
         cases.into_iter().enumerate()
     {
         let token = format!("tok-engine-{index}");
@@ -166,10 +223,29 @@ async fn create_application_refuses_an_engine_type_the_release_does_not_support(
             );
             let message = answer.at("/message");
             let text = message.as_str().unwrap_or_default();
+            match member {
+                Member::Type => assert!(
+                    text.contains(engine_type) && text.contains("not supported for release label"),
+                    "case {case:?}: the refusal must name the rejected type \
+                     {engine_type:?}, got {message:?}"
+                ),
+                Member::ReleaseLabel => {
+                    assert!(
+                        text.contains("release label"),
+                        "case {case:?}: the refusal must name the release label, got {message:?}"
+                    );
+                    assert!(
+                        !text.contains(engine_type),
+                        "case {case:?}: the engine type {engine_type:?} is valid, so the \
+                         refusal must not blame it, got {message:?}"
+                    );
+                }
+                Member::None => unreachable!("a refused create names a member"),
+            }
             assert!(
-                text.contains(engine_type) && text.contains("not supported for release label"),
-                "case {case:?}: the refusal must name the rejected type \
-                 {engine_type:?}, got {message:?}"
+                !text.contains(release_label),
+                "case {case:?}: a refusal states the condition, never the submitted \
+                 release label, got {message:?}"
             );
         }
 

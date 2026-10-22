@@ -179,13 +179,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => ::std::ops::Bound::Unbounded,
         };
         // `states`, when present, keeps only the applications in one of the named
-        // `ApplicationState` values; an absent filter keeps them all.
+        // `ApplicationState` values. With no filter the listing is the account's
+        // INVENTORY: `DeleteApplication` is a soft delete, so a terminated application
+        // stays readable by id but drops out of the list — naming `TERMINATED`
+        // explicitly is how a caller asks for the deleted ones.
         let states = input.states.unwrap_or_default();
         let mut matching = store
             .applications
             .range::<str, _>((start, ::std::ops::Bound::Unbounded))
             .filter(|(_, record)| {
-                states.is_empty() || states.contains(&record.application.state)
+                let state = record.application.state.as_str();
+                if states.is_empty() {
+                    crate::state::is_live_application_state(state)
+                } else {
+                    states.iter().any(|named| named == state)
+                }
             });
 
         let mut applications = Vec::new();

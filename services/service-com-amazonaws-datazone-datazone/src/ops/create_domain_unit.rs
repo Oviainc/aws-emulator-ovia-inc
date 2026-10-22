@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomainUnit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomainUnit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomainUnit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one node of a domain's domain-unit hierarchy: the unit is stored under the
+//! parent the request names, inside the domain the URI names, and the response reports
+//! the chain of ancestors that parent sits on.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +129,26 @@ impl From<CreateDomainUnitErrorModeled> for CreateDomainUnitError {
     }
 }
 
+/// This operation's view of a stored domain unit: every member the model declares on
+/// `CreateDomainUnitOutput`, read from the persisted record and from the hierarchy the
+/// domain holds rather than from the request.
+fn domain_unit_output(
+    domain: &crate::state::Domain,
+    unit: &crate::state::DomainUnit,
+) -> CreateDomainUnitOutput {
+    CreateDomainUnitOutput {
+        id: unit.id.clone(),
+        domain_id: unit.domain_id.clone(),
+        name: unit.name.clone(),
+        parent_domain_unit_id: unit.parent_domain_unit_id.clone(),
+        description: unit.description.clone(),
+        owners: unit.owners.iter().map(crate::state::owner_properties).collect(),
+        ancestor_domain_unit_ids: crate::state::ancestor_domain_unit_ids(domain, &unit.id),
+        created_at: Some(crate::state::date_time(unit.created_at_ms)),
+        created_by: Some(unit.created_by.clone()),
+    }
+}
+
 /// The `CreateDomainUnit` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -170,18 +185,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomainUnit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainUnitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomainUnit"))
+        use crate::state::{
+            caller_principal, now_ms, DomainUnit, DomainUnitOwner, IdempotencyKey,
+            DOMAIN_STATUS_AVAILABLE,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDomainUnitErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // The `@idempotencyToken`: a repeat of the SAME request answers with the unit
+        // the first one created, so a retry never leaves two units behind. Answered
+        // BEFORE the domain-state check below, deliberately: the retried request
+        // already succeeded, so it replays that success even if the domain has since
+        // started being deleted — a retry must not turn an accepted create into a
+        // refusal.
+        if let Some(replay) = input.client_token.as_deref().and_then(|token| {
+            let unit = store.idempotent_domain_unit(&input.domain_identifier, token)?;
+            let domain = store.domains.get(&unit.domain_id)?;
+            Some(domain_unit_output(domain, unit))
+        }) {
+            return Ok(replay);
+        }
+
+        let created_by = caller_principal(ctx);
+        // `CreateDomainUnit` models no `ResourceNotFoundException`, so a request whose
+        // `domainIdentifier` or `parentDomainUnitIdentifier` names nothing stored is
+        // refused as invalid input, naming the member the caller has to fix. A domain
+        // that IS stored but is not available is a conflict, not invalid input, so the
+        // lookup takes every stored domain and the status check below decides.
+        let (domain_status, parent_is_stored, unit_count) = store
+            .domains
+            .get(&input.domain_identifier)
+            .map(|domain| {
+                (
+                    domain.status.clone(),
+                    domain
+                        .domain_units
+                        .contains_key(&input.parent_domain_unit_identifier),
+                    domain.domain_units.len(),
+                )
+            })
+            .ok_or_else(|| {
+                CreateDomainUnitErrorModeled::ValidationException(ValidationException {
+                    message: "domainIdentifier does not name a domain in this account"
+                        .to_string(),
+                })
+            })?;
+        // A domain still being created, or already being deleted, cannot take a new
+        // domain unit: the request conflicts with the domain's current state.
+        if domain_status != DOMAIN_STATUS_AVAILABLE {
+            return Err(CreateDomainUnitErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Domain {} is {domain_status}, so it cannot accept a domain unit",
+                    input.domain_identifier
+                ),
+            })
+            .into());
+        }
+        if !parent_is_stored {
+            return Err(CreateDomainUnitErrorModeled::ValidationException(ValidationException {
+                message: "parentDomainUnitIdentifier does not name a domain unit in this domain"
+                    .to_string(),
+            })
+            .into());
+        }
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit; the refusal is the error the operation already models.
+        if unit_count >= crate::state::MAX_DOMAIN_UNITS_PER_DOMAIN {
+            return Err(CreateDomainUnitErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {} domain units in one domain",
+                        crate::state::MAX_DOMAIN_UNITS_PER_DOMAIN
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_id(now);
+        let unit = DomainUnit {
+            id: id.clone(),
+            domain_id: input.domain_identifier.clone(),
+            name: input.name,
+            description: input.description,
+            parent_domain_unit_id: Some(input.parent_domain_unit_identifier),
+            // The principal that creates a domain unit owns it: `owners` is required
+            // on the response, and the creator is the one owner there is until
+            // `AddEntityOwner` adds another.
+            owners: vec![DomainUnitOwner::User(created_by.clone())],
+            created_by,
+            created_at_ms: now,
+            last_updated_by: None,
+            last_updated_at_ms: None,
+        };
+
+        // Stored FIRST, so the ancestors this response reports are read from the
+        // hierarchy the next caller sees rather than from the request. The lookup above
+        // proved the domain is there, under this same lock, so a miss here is a broken
+        // invariant rather than a caller error.
+        let Some(stored) = store.domains.get_mut(&input.domain_identifier) else {
+            return Err(CreateDomainUnitErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "Domain {} is no longer stored, so domain unit {id} could not be created",
+                        input.domain_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+        stored.domain_units.insert(id.clone(), unit);
+        let output = store
+            .domains
+            .get(&input.domain_identifier)
+            .and_then(|domain| {
+                let unit = domain.domain_units.get(&id)?;
+                Some(domain_unit_output(domain, unit))
+            })
+            .ok_or_else(|| {
+                CreateDomainUnitErrorModeled::InternalServerException(InternalServerException {
+                    message: format!("domain unit {id} could not be stored"),
+                })
+            })?;
+        // Recorded AFTER the unit is stored: the bound this applies releases a token
+        // whose resource is not in the store.
+        if let Some(token) = input.client_token {
+            store.record_idempotency(
+                IdempotencyKey::domain_unit(&input.domain_identifier, &token),
+                id,
+                now,
+            );
+        }
+        Ok(output)
     }
 }

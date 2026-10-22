@@ -226,8 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            caller_region, now_ms, Domain, StoredSingleSignOn, DEFAULT_DOMAIN_VERSION,
-            DOMAIN_STATUS_CREATING, LIFECYCLE_SETTLE_MS,
+            caller_principal, caller_region, now_ms, root_domain_unit, Domain,
+            StoredSingleSignOn, DEFAULT_DOMAIN_VERSION, DOMAIN_STATUS_CREATING,
+            LIFECYCLE_SETTLE_MS,
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -276,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let id = format!("dzd_{}", store.mint_id(now));
-        let domain = Domain {
+        let mut domain = Domain {
             arn: ::engine::emulator_arn("datazone", &region, &format!("domain/{id}")),
             // The data portal the real service stands up for the domain is addressed
             // by the domain id, in the region the domain lives in.
@@ -316,8 +317,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy_grants: std::collections::BTreeMap::new(),
             glossaries: std::collections::BTreeMap::new(),
             asset_types: std::collections::BTreeMap::new(),
+            domain_units: std::collections::BTreeMap::new(),
             id: id.clone(),
         };
+        // The `rootDomainUnitId` this response reports names a unit that exists from
+        // the moment the domain does: the real service creates the domain's root
+        // domain unit as part of creating the domain, owned by the caller that
+        // created it, and every other unit in the domain hangs under it.
+        let root_unit = root_domain_unit(&domain, &caller_principal(ctx), now);
+        domain.domain_units.insert(root_unit.id.clone(), root_unit);
 
         let output = domain_output(&domain);
         store.domains.insert(id.clone(), domain);

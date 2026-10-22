@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_emrserverless_awstoledowebservice::state::{
-    DEFAULT_EXECUTION_TIMEOUT_MINUTES, LIFECYCLE_TRANSITION, PAGE_LIMIT,
+    DEFAULT_EXECUTION_TIMEOUT_MINUTES, JOB_RUN_STAGES, JOB_RUN_STAGE_TRANSITION,
+    LIFECYCLE_TRANSITION, PAGE_LIMIT,
 };
 use service_com_amazonaws_emrserverless_awstoledowebservice::EmulatedService;
 
@@ -41,13 +42,27 @@ pub(crate) fn wait_for_transition() {
     std::thread::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(250));
 }
 
-/// One emulator: a router carrying only this service, over one shared engine.
-pub(crate) fn emulator() -> MultiServiceRouter {
+/// Long enough for EVERY stage the clock owes a submitted job run
+/// (`JOB_RUN_STAGES`, one `JOB_RUN_STAGE_TRANSITION` apart) to have fallen due, so the
+/// run has reached the terminal state the last of them names.
+pub(crate) fn wait_for_job_run_to_settle() {
+    let stages = u32::try_from(JOB_RUN_STAGES.len()).unwrap_or(1);
+    std::thread::sleep(JOB_RUN_STAGE_TRANSITION * stages + Duration::from_millis(250));
+}
+
+/// One emulator: a router carrying only this service, over one shared engine, with the
+/// engine handed back so a test can read or rewind the state the handlers share.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
+/// One emulator: a router carrying only this service, over one shared engine.
+pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
@@ -117,11 +132,11 @@ pub(crate) async fn list_applications(router: &MultiServiceRouter, query: &str) 
     call(router, "GET", &format!("/applications{query}"), None).await
 }
 
-async fn start_application(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn start_application(router: &MultiServiceRouter, id: &str) -> Answer {
     call(router, "POST", &format!("/applications/{id}/start"), None).await
 }
 
-async fn stop_application(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn stop_application(router: &MultiServiceRouter, id: &str) -> Answer {
     call(router, "POST", &format!("/applications/{id}/stop"), None).await
 }
 
@@ -157,7 +172,11 @@ pub(crate) async fn get_job_run(
     .await
 }
 
-async fn list_job_runs(router: &MultiServiceRouter, id: &str, query: &str) -> Answer {
+pub(crate) async fn list_job_runs(
+    router: &MultiServiceRouter,
+    id: &str,
+    query: &str,
+) -> Answer {
     call(
         router,
         "GET",
@@ -167,7 +186,7 @@ async fn list_job_runs(router: &MultiServiceRouter, id: &str, query: &str) -> An
     .await
 }
 
-async fn cancel_job_run(
+pub(crate) async fn cancel_job_run(
     router: &MultiServiceRouter,
     id: &str,
     job_run_id: &str,
@@ -264,7 +283,7 @@ fn spark_submit_driver(entry_point: &str) -> Value {
 }
 
 /// An execution role ARN satisfying `IAMRoleArn`'s pattern.
-const EXECUTION_ROLE: &str = "arn:aws:iam::000000000000:role/EMRServerlessRole";
+pub(crate) const EXECUTION_ROLE: &str = "arn:aws:iam::000000000000:role/EMRServerlessRole";
 
 /// A minimal `StartJobRun` body.
 pub(crate) fn minimal_job_run(token: &str) -> Value {
@@ -277,7 +296,7 @@ pub(crate) fn minimal_job_run(token: &str) -> Value {
 
 /// Create an application and return its id, waiting out the create transition so the
 /// application is `CREATED`.
-async fn created_application(router: &MultiServiceRouter, token: &str) -> String {
+pub(crate) async fn created_application(router: &MultiServiceRouter, token: &str) -> String {
     let answer = create_application(router, minimal_create(token)).await;
     assert_eq!(
         answer.status, 200,
@@ -1159,7 +1178,7 @@ async fn stop_application_requires_its_job_runs_to_have_finished() {
     );
 
     // Once the job run has finished, the stop is accepted.
-    wait_for_transition();
+    wait_for_job_run_to_settle();
     let accepted = stop_application(&router, &application_id).await;
     assert_eq!(
         accepted.status, 200,
@@ -1202,7 +1221,7 @@ async fn a_submitted_job_run_ends_in_the_modelled_failure_state() {
         immediately.at("/jobRun/totalResourceUtilization")
     );
 
-    wait_for_transition();
+    wait_for_job_run_to_settle();
     let settled = get_job_run(&router, &application_id, &job_run_id).await;
     assert_eq!(
         settled.at("/jobRun/state"),
@@ -1393,8 +1412,10 @@ async fn a_job_submission_starts_the_application_only_when_auto_start_is_enabled
 }
 
 /// `CancelJobRun` moves a running job run to `CANCELLING` and the clock owes it
-/// `CANCELLED`; a job run that has already finished cannot be cancelled. The
-/// `shutdownGracePeriodInSeconds` the caller asks for is the wait that applies.
+/// `CANCELLED`; a repeat cancel of a run that is already `CANCELLED` is the idempotent
+/// success (the refusal of a run that finished some other way is asserted in
+/// `idempotency_and_idle_lifecycle`). The `shutdownGracePeriodInSeconds` the caller asks
+/// for is the wait that applies.
 #[tokio::test]
 async fn cancel_job_run_moves_a_live_run_and_refuses_a_finished_one() {
     let router = emulator();
@@ -1428,17 +1449,18 @@ async fn cancel_job_run_moves_a_live_run_and_refuses_a_finished_one() {
         "case a live run: the clock owes the run CANCELLED"
     );
 
-    // A run that has already finished keeps its terminal state.
+    // `@idempotent`: cancelling a run that is ALREADY cancelled is the success the
+    // operation promises, so the repeat answers 200 with the same ids and moves nothing.
     let again = cancel_job_run(&router, &application_id, &job_run_id, "").await;
     assert_eq!(
-        again.status, 400,
-        "case a finished run: CancelJobRun expected 400, got {} with {:?}",
+        again.status, 200,
+        "case an already-cancelled run: CancelJobRun expected 200, got {} with {:?}",
         again.status, again.body
     );
     assert_eq!(
-        again.error_code(),
-        "ValidationException",
-        "case a finished run: expected ValidationException, got {:?}",
+        (again.at("/applicationId"), again.at("/jobRunId")),
+        (json!(application_id), json!(job_run_id)),
+        "case an already-cancelled run: the repeat must echo the same ids, got {:?}",
         again.body
     );
     assert_eq!(
@@ -1446,7 +1468,7 @@ async fn cancel_job_run_moves_a_live_run_and_refuses_a_finished_one() {
             .await
             .at("/jobRun/state"),
         json!("CANCELLED"),
-        "case a finished run: the refused cancel must not move the state"
+        "case an already-cancelled run: the repeat must not move the state"
     );
 
     // `shutdownGracePeriodInSeconds` is "the duration in seconds to wait before
@@ -1731,7 +1753,7 @@ async fn a_list_reports_only_the_records_its_filters_admit() {
     // separate them without depending on when this test runs: the streaming run is
     // cancelled, the batch run is left to the clock.
     cancel_job_run(&router, &running, &streaming, "").await;
-    wait_for_transition();
+    wait_for_job_run_to_settle();
 
     // Rows spanning the `mode` filter (the whole `JobRunMode` enum: `BATCH`,
     // `STREAMING`) and the `states` filter (values from the `JobRunState` enum).

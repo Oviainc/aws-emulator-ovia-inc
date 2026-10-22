@@ -222,16 +222,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A release label the application's engine type is not served at is refused on
         // the same rule `CreateApplication` applies to that pair: the engine the
-        // application carries has to exist at the release the update moves it to.
+        // application carries has to exist at the release the update moves it to. The
+        // stored engine type is this service's own canonical value, so the member that
+        // can fail here is the release label — including a label that names no Amazon
+        // EMR release at all — and the refusal names it rather than the engine.
         if let Some(release_label) = input.release_label.as_deref() {
-            if crate::state::supported_engine_type(&record.application.r#type, release_label)
-                .is_none()
+            if crate::state::resolve_engine_type(&record.application.r#type, release_label)
+                .is_err()
             {
                 return Err(UpdateApplicationErrorModeled::ValidationException(
                     ValidationException {
-                        message: crate::state::unsupported_engine_type_message(
-                            &record.application.r#type,
-                        ),
+                        message: crate::state::UNSUPPORTED_RELEASE_LABEL_MESSAGE.to_string(),
                     },
                 )
                 .into());

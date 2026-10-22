@@ -24,6 +24,9 @@ use service_com_amazonaws_iotsitewise_awsiotsitewise::EmulatedService;
 const REGION: &str = "us-west-2";
 
 /// A router with just this service mounted on a fresh shared engine.
+///
+/// This module is the crate's test harness: the sibling suites under `tests/all/`
+/// reach the helpers below rather than growing a second copy of them.
 pub(crate) fn router() -> MultiServiceRouter {
     router_with_engine().0
 }

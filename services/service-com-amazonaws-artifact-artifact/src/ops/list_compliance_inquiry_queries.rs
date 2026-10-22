@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComplianceInquiryQueries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComplianceInquiryQueries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the queries ONE compliance inquiry owns, as the `QuerySummary` projection of the
+//! records `CreateComplianceInquiry` persisted in [`crate::state`] — so a query this
+//! operation reports can never disagree with the inquiry a metadata read returns: both
+//! read the one stored resource.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComplianceInquiryQueries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules shape the handler:
+//!
+//! * It is a REPORTING operation (`@readonly`): the one write it makes is
+//!   [`crate::state::ComplianceInquiry::materialise`], which applies the transition the
+//!   CLOCK already owed the inquiry — the same transition every other reader of it
+//!   materialises, owed at the same instant whether or not anybody called.
+//! * The queries are reported in `queryIdentifier` order ("[s]equential identifier of the
+//!   query within the inquiry"), which is the stable total order the pagination token
+//!   indexes into: a page of at most `maxResults` records, and a `nextToken` naming the
+//!   identifier the next page resumes at, present only when records remain.
+//! * The token is SCOPED to the inquiry it was cut for
+//!   ([`crate::state::inquiry_queries_token`]), so a token issued for one inquiry cannot
+//!   be spent as a resume point on another and a number a client made up is not mistaken
+//!   for a token this service issued — it is refused with the service's one fixed
+//!   invalid-token `ValidationException`, exactly as `ListReportVersions` refuses its own.
+//!
+//! The stored inquiry set IS the account's entitlement: AWS Artifact is served through a
+//! gateway that authorizes the resource the request targets BEFORE the service is reached,
+//! so a `complianceInquiryId` this account holds no inquiry for is answered with the front
+//! door's 401 `UnauthorizedException` (`crate::scaffolded::Scaffolded::unauthorized`) and
+//! never with the modelled 404 — the same answer `GetComplianceInquiryMetadata` gives for
+//! the same id. Existence is not confirmed for a resource the caller may not read.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +168,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComplianceInquiryQueries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComplianceInquiryQueriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComplianceInquiryQueries"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListComplianceInquiryQueriesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the artifact compliance inquiry store is unavailable"
+                            .to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The token names the inquiry it was cut for and the query identifier to resume
+        // at, so a token issued for another inquiry, and a number a client made up, are
+        // both refused rather than honoured as an offset — with the service's one fixed
+        // invalid-token text, which does not say which of the two it was. Judged ahead of
+        // the store lookup, as `ListReportVersions` judges its own: a malformed request
+        // parameter is refused whatever the state holds.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                match crate::state::parse_inquiry_queries_token(
+                    token,
+                    &input.compliance_inquiry_id,
+                ) {
+                    Some(identifier) => Some(identifier),
+                    None => {
+                        return Err(
+                            ListComplianceInquiryQueriesErrorModeled::ValidationException(
+                                crate::state::invalid_token(),
+                            )
+                            .into(),
+                        )
+                    }
+                }
+            }
+        };
+
+        let page_size = crate::state::page_size(input.max_results);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let Some(inquiry) = store.inquiries.get_mut(&input.compliance_inquiry_id) else {
+            // Authorization of the targeted inquiry precedes the state lookup as far as a
+            // caller can tell: a well-formed id this account holds no inquiry for names no
+            // inquiry it may read, so the front door's refusal is what it sees — not the
+            // modelled 404, which would confirm the resource's absence. The same answer
+            // `GetComplianceInquiryMetadata` gives for the same id.
+            return Err(crate::scaffolded::Scaffolded::unauthorized());
+        };
+
+        // The only write a read may make: the transition the clock had already made due.
+        // It is what moves this inquiry's queries out of their non-terminal status, so a
+        // listing after the due instant reports the same terminal records every other
+        // reader of the inquiry sees.
+        inquiry.materialise(now);
+
+        let mut queries = Vec::with_capacity(page_size.min(inquiry.queries.len()));
+        let mut next_token = None;
+        for query in &inquiry.queries {
+            // Resume at the first identifier at or after the token, so a page is still
+            // served when the query the token named is no longer the next one.
+            if resume_at.is_some_and(|resume| query.identifier < resume) {
+                continue;
+            }
+            if queries.len() >= page_size {
+                next_token = Some(crate::state::inquiry_queries_token(
+                    &input.compliance_inquiry_id,
+                    query.identifier,
+                ));
+                break;
+            }
+            queries.push(query.to_summary());
+        }
+
+        Ok(ListComplianceInquiryQueriesOutput {
+            queries: Some(queries),
+            next_token,
+        })
     }
 }

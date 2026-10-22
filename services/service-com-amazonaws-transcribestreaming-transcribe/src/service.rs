@@ -47,6 +47,36 @@ use crate::ops::types::EventStreamRoute;
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
+/// Whether this service serves the request these `parts` came from.
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
+/// owner of this rule, and it is CALLED here rather than re-implemented: the request's
+/// route key must match this service's signing name AND its first URI path segment must
+/// be one the generated, model-derived `ROUTE_PATH_SEGMENTS` declares, by exact segment
+/// equality. It is the same rule `service_common::claims_request` applies for a REST
+/// service; this crate reaches the framework helper directly, as
+/// `service-com-amazonaws-appconfig-amazonappconfig`, `-appconfigdata-appconfigdata`,
+/// `-ivs-*` and `-ivsrealtime-*` do.
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed only
+/// the request's parts, so the two things it reads — the URI and the headers — are
+/// re-presented to it as a bodiless request. It reads neither the body nor the method,
+/// so nothing it decides on is missing.
+fn can_handle_parts(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The path of a request URI, without its query string.
 fn request_path(uri: &str) -> &str {
     let path = uri.split('?').next().unwrap_or_default();
@@ -108,13 +138,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `transcribe` — a signing name it SHARES with the Amazon
+        // Transcribe control plane
+        // (`services/service-com-amazonaws-transcribe-transcribe`, `sdkId`
+        // `Transcribe`, endpoint prefix `transcribe`, protocol `awsJson1_1`, 44
+        // operations), a DIFFERENT service that AWS separates by endpoint host. The
+        // router's routing key comes from the SigV4 credential scope first (then
+        // `X-Amz-Target`), so both services resolve to `transcribe` and matching on the
+        // signing name ALONE makes both claim every such request — which the router
+        // answers `500 AmbiguousService`, leaving BOTH services unreachable.
+        //
+        // So the claim adds the framework's path conjunct over this service's own
+        // model-derived path space — see [`can_handle_parts`]. This model is
+        // `restJson1`: each of its five operations is bound to its own URI, and those
+        // literal first segments are what the generated `ROUTE_PATH_SEGMENTS` carries.
+        // The control plane's path space (the root path its `POST /` traffic arrives on,
+        // plus the literal segments of its inert `@http` bindings) is disjoint from this
+        // one, so each service answers only its own traffic.
+        can_handle_parts(parts)
     }
 
     fn override_operation(

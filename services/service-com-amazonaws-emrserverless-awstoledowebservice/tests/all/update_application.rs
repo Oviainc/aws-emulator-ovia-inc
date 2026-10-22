@@ -592,18 +592,25 @@ async fn assert_update_precondition(
 }
 
 /// Rule 2, continued: a release label the application's engine type is not served at is
-/// refused, and the record keeps the label it had.
+/// refused, and the record keeps the label it had. The refusal names the RELEASE LABEL:
+/// the engine type the application carries is this service's own canonical value, so it
+/// is never the member at fault.
 ///
 /// Source: "EMR Serverless is available with Amazon EMR releases 6.6.0 and later", so
 /// `emr-6.6.0` is the published bound and `emr-6.5.0` is one past it.
 #[tokio::test]
 async fn an_update_refuses_a_release_label_the_applications_engine_is_not_served_at() {
+    /// The phrase a refusal of the release label carries, written out here rather than
+    /// read from `crate::state` so a wrong constant in `src/` cannot make this pass.
+    const UNSUPPORTED_RELEASE_LABEL: &str =
+        "Type is not supported for the release label or release label does not exist";
+
     // (case, the release label the update asks for, the expected status)
     let cases: &[(&str, &str, u16)] = &[
         ("the earliest release that serves the engine", "emr-6.6.0", 200),
         ("a later release", "emr-7.2.0", 200),
         ("a release carrying a build suffix", "emr-6.6.0-20220101", 200),
-        ("a label with no readable version", "latest", 200),
+        ("a label with no readable version, which names no release", "latest", 400),
         ("one release below the earliest", "emr-6.5.0", 400),
         ("a much older release", "emr-5.36.0", 400),
     ];
@@ -645,6 +652,12 @@ async fn an_update_refuses_a_release_label_the_applications_engine_is_not_served
                 answered.error_code(),
                 "ValidationException",
                 "case {case:?}: expected ValidationException, got {:?}",
+                answered.body
+            );
+            assert_eq!(
+                answered.body["message"].as_str().unwrap_or_default(),
+                UNSUPPORTED_RELEASE_LABEL,
+                "case {case:?}: the refusal must name the release label, got {:?}",
                 answered.body
             );
             assert_eq!(

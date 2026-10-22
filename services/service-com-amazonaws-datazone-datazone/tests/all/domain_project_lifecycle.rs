@@ -45,7 +45,7 @@ fn is_project_id(id: &str) -> bool {
 
 /// `DomainUnitId`'s modelled pattern, `^[a-z0-9_\-]+$` with length 1..256
 /// (smithy_query shape="DomainUnitId").
-fn is_domain_unit_id(id: &str) -> bool {
+pub(crate) fn is_domain_unit_id(id: &str) -> bool {
     (1..=256).contains(&id.len())
         && id
             .chars()

@@ -166,15 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
             // Otherwise the start is accepted: the application reports `STARTING` to a
-            // caller acting straight away, and the clock owes it `STARTED`.
+            // caller acting straight away, and the clock owes it `STARTED`. The idle
+            // span its `autoStopConfiguration` bounds runs from this call: an
+            // application only holds capacity once it is running.
             _ => {
                 record.application.state = "STARTING".to_string();
                 record.application.updated_at = crate::state::now_timestamp(now);
                 record.pending = Some(crate::state::PendingState {
-                    due: now + crate::state::LIFECYCLE_TRANSITION,
+                    due: crate::state::due_at(now, crate::state::LIFECYCLE_TRANSITION),
                     state: "STARTED".to_string(),
                     state_details: None,
                 });
+                record.mark_activity(now);
             }
         }
 

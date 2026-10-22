@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDomainUnit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDomainUnit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDomainUnit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored domain unit: the record `CreateDomainUnit` persisted — or, for a
+//! domain's root unit, the one created with the domain — read back from state.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDomainUnit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDomainUnitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDomainUnit"))
+        let _ = ctx;
+        use crate::state::{date_time, now_ms, owner_properties};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDomainUnitErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a reporting operation makes: materialise the domain lifecycle
+        // steps the clock already owed at this instant.
+        store.settle_clock(now_ms());
+
+        let unit = store
+            .domain_unit(&input.domain_identifier, &input.identifier)
+            .ok_or_else(|| {
+                GetDomainUnitErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::ResourceKind::DomainUnit.not_found_message(),
+                })
+            })?;
+
+        Ok(GetDomainUnitOutput {
+            id: unit.id.clone(),
+            domain_id: unit.domain_id.clone(),
+            name: unit.name.clone(),
+            parent_domain_unit_id: unit.parent_domain_unit_id.clone(),
+            description: unit.description.clone(),
+            owners: unit.owners.iter().map(owner_properties).collect(),
+            created_at: Some(date_time(unit.created_at_ms)),
+            created_by: Some(unit.created_by.clone()),
+            // Both absent until something updates the unit.
+            last_updated_at: unit.last_updated_at_ms.map(date_time),
+            last_updated_by: unit.last_updated_by.clone(),
+        })
     }
 }
