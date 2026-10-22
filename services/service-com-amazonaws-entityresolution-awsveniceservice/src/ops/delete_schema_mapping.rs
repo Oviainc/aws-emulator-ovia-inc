@@ -167,9 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.schema_mappings.contains_key(&input.schema_name) {
             return Err(DeleteSchemaMappingErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Schema mapping {} not found",
-                        input.schema_name
+                    message: Some(crate::state::messages::delete_schema_mapping_not_found(
+                        &input.schema_name,
                     )),
                 },
             )
@@ -182,11 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.schema_has_workflows(&input.schema_name) {
             return Err(DeleteSchemaMappingErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "Schema mapping {} is referenced by the inputSourceConfig of a \
-                         matching workflow",
-                        input.schema_name
-                    )),
+                    message: Some(
+                        crate::state::messages::DELETE_SCHEMA_MAPPING_IN_USE.to_string(),
+                    ),
                 },
             )
             .into());
@@ -194,8 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store.schema_mappings.remove(&input.schema_name);
 
+        // `message` is a modelled @required output member whose value is this
+        // service's own constant success text — NOT a sentence about the record that
+        // was removed, which no AWS caller would ever see.
         Ok(DeleteSchemaMappingOutput {
-            message: format!("Successfully deleted {}", input.schema_name),
+            message: crate::state::messages::DELETE_SCHEMA_MAPPING_SUCCESS.to_string(),
         })
     }
 }
