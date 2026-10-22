@@ -16,3 +16,6 @@ mod state_roundtrip;
 
 #[path = "all/user_lifecycle.rs"]
 mod user_lifecycle;
+
+#[path = "all/validation_envelope.rs"]
+mod validation_envelope;
