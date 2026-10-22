@@ -39,7 +39,7 @@
 //! [`event_bridge_rule_template_group_output`]) - no operation builds a response
 //! out of its own request.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -179,10 +179,13 @@ pub mod input_security_group_state {
 /// input that is already `DETACHED` (the recorded create carries
 /// `State=DETACHED`), so an input is returned ready and owes the clock no
 /// transition. `DELETING` and `DELETED` are the deletion half of the lifecycle,
-/// which `DeleteInput` owns (still a scaffold stub).
+/// which `DeleteInput` owns: it starts `DELETING` and the clock settles it into
+/// the terminal `DELETED` ([`InputRecord::settle`]).
 pub mod input_state {
     pub const DETACHED: &str = "DETACHED";
     pub const ATTACHED: &str = "ATTACHED";
+    pub const DELETING: &str = "DELETING";
+    pub const DELETED: &str = "DELETED";
 }
 
 /// The `InputClass` enum values (`smithy_query(query="shape",
@@ -298,6 +301,16 @@ pub const MAX_INPUT_SECURITY_GROUPS: usize = 100;
 /// so they are minted from a counter at a fixed seven-digit width, which keeps
 /// the `BTreeMap` key order equal to the mint order.
 const FIRST_INPUT_ID: u64 = 1_000_000;
+
+/// The most `InputAttachments` entries this emulator accepts on one channel.
+///
+/// A ceiling, not a guess at AWS's published quota: the list is caller-chosen
+/// and every read that walks it (an input's `AttachedChannels`, a signal map's
+/// discovery) costs work per entry, so it is bounded here for the same reason
+/// [`MAX_CHANNELS`] bounds the store. `CreateChannel` refuses a longer list with
+/// its own modelled `BadRequestException`, because the request is what is out of
+/// bounds.
+pub const MAX_INPUT_ATTACHMENTS: usize = 32;
 
 /// The most inputs this emulator stores for one account.
 ///
@@ -753,6 +766,9 @@ impl ComAmazonawsMedialiveMedialiveState {
         for id in removed {
             self.channel_tokens.forget(&id);
         }
+        for input in self.inputs.values_mut() {
+            input.settle(now);
+        }
         for signal_map in self.signal_maps.values_mut() {
             signal_map.settle(now);
         }
@@ -817,6 +833,10 @@ impl ComAmazonawsMedialiveMedialiveState {
     pub fn inputs_using_security_group(&self, group_id: &str) -> Vec<String> {
         self.inputs
             .values()
+            // A deleted input is not using anything any more, which is the same
+            // reading of "currently using" that `inputs_using_sdi_source`
+            // applies to a deleted source.
+            .filter(|input| !input.is_deleted())
             .filter(|input| {
                 input
                     .security_groups
@@ -912,6 +932,9 @@ impl ComAmazonawsMedialiveMedialiveState {
         }
         self.inputs
             .values()
+            // A deleted input has stopped using the source, exactly as a deleted
+            // source has nothing using it.
+            .filter(|input| !input.is_deleted())
             .filter(|input| input.sdi_sources.iter().any(|source| source == id))
             .map(|input| input.id.clone())
             .collect()
@@ -1179,10 +1202,16 @@ impl ComAmazonawsMedialiveMedialiveState {
         partners
     }
 
-    /// The `InputState` of one stored input: `ATTACHED` exactly while some
-    /// channel attaches it, and `DETACHED` while none does.
+    /// The `InputState` of one stored input: the deletion `DeleteInput` started
+    /// first — `DELETING` until the clock makes it due and the terminal
+    /// `DELETED` afterwards — and otherwise `ATTACHED` exactly while some
+    /// channel attaches it and `DETACHED` while none does.
     pub fn input_state(&self, input: &InputRecord) -> &'static str {
-        if self.attached_channels(&input.id).is_empty() {
+        if input.is_deleted() {
+            input_state::DELETED
+        } else if input.is_deleting() {
+            input_state::DELETING
+        } else if self.attached_channels(&input.id).is_empty() {
             input_state::DETACHED
         } else {
             input_state::ATTACHED
@@ -1327,32 +1356,153 @@ impl ComAmazonawsMedialiveMedialiveState {
             .map(|map| map.id.as_str())
     }
 
+    /// The input whose ARN is exactly `arn`, if this store holds one — the same
+    /// global-identity reading of an ARN as [`Self::channel_by_arn`].
+    fn input_by_arn(&self, arn: &str) -> Option<&InputRecord> {
+        self.inputs.values().find(|input| input.arn == arn)
+    }
+
+    /// Both directions of every channel-to-input attachment this store holds.
+    ///
+    /// Built once per discovery and then read by every node the walk visits, so
+    /// a discovery costs one pass over the store's attachments rather than a
+    /// re-derivation per node; the de-duplication of a channel's
+    /// `InputAttachments` goes through a set, so one channel's pass is linear in
+    /// the attachments it carries ([`MAX_INPUT_ATTACHMENTS`] of them at most).
+    fn attachment_edges(&self) -> AttachmentEdges<'_> {
+        let mut edges = AttachmentEdges::default();
+        for channel in self.channels.values() {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            for id in channel
+                .input_attachments
+                .iter()
+                .filter_map(|attachment| attachment.input_id.as_deref())
+            {
+                if !seen.insert(id) {
+                    continue;
+                }
+                if let Some(input) = self.inputs.get(id).filter(|input| !input.is_deleted()) {
+                    edges
+                        .inputs_of
+                        .entry(channel.arn.as_str())
+                        .or_default()
+                        .push(input);
+                    edges
+                        .channels_of
+                        .entry(input.arn.as_str())
+                        .or_default()
+                        .push(channel);
+                }
+            }
+        }
+        edges
+    }
+
+    /// One discovered channel as a graph node: upstream (`Sources`) the channel
+    /// it follows and the inputs attached to it, downstream (`Destinations`) the
+    /// channels that follow it.
+    fn channel_media_resource(
+        &self,
+        channel: &ChannelRecord,
+        edges: &AttachmentEdges<'_>,
+    ) -> MediaResource {
+        let mut sources: Vec<MediaResourceNeighbor> = channel
+            .linked_channel_settings
+            .as_ref()
+            .and_then(|linked| linked.follower_channel_settings.as_ref())
+            .and_then(|follower| follower.primary_channel_arn.as_deref())
+            .and_then(|primary| self.channel_by_arn(primary))
+            .map(|primary| vec![neighbor(&primary.arn, primary.name.as_deref())])
+            .unwrap_or_default();
+        // An attached input FEEDS the channel, so it is one of the channel's
+        // sources, read out of the channel's stored `InputAttachments`.
+        sources.extend(
+            edges
+                .inputs_of
+                .get(channel.arn.as_str())
+                .into_iter()
+                .flatten()
+                .map(|input| neighbor(&input.arn, input.name.as_deref())),
+        );
+        MediaResource {
+            name: channel.name.clone(),
+            sources: Some(sources),
+            destinations: Some(
+                self.following_channel_arns(&channel.arn)
+                    .iter()
+                    .filter_map(|follower| self.channel_by_arn(follower))
+                    .map(|follower| neighbor(&follower.arn, follower.name.as_deref()))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// One discovered input as a graph node: downstream (`Destinations`) the
+    /// channels whose `InputAttachments` name it, which is the same edge the
+    /// channel reports as a source, read from the other end.
+    ///
+    /// `Sources` is empty: what feeds an input is a pull URL, a push endpoint,
+    /// a MediaConnect flow or a device — none of them a resource this store
+    /// holds, so none of them is claimed as a neighbour.
+    fn input_media_resource(
+        &self,
+        input: &InputRecord,
+        edges: &AttachmentEdges<'_>,
+    ) -> MediaResource {
+        MediaResource {
+            name: input.name.clone(),
+            sources: Some(Vec::new()),
+            destinations: Some(
+                edges
+                    .channels_of
+                    .get(input.arn.as_str())
+                    .into_iter()
+                    .flatten()
+                    .map(|channel| neighbor(&channel.arn, channel.name.as_deref()))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The graph node the resource `arn` names, if this store holds one: a
+    /// channel, or an input that has not been deleted.
+    fn media_resource_at(&self, arn: &str, edges: &AttachmentEdges<'_>) -> Option<MediaResource> {
+        if let Some(channel) = self.channel_by_arn(arn) {
+            return Some(self.channel_media_resource(channel, edges));
+        }
+        self.input_by_arn(arn)
+            .filter(|input| !input.is_deleted())
+            .map(|input| self.input_media_resource(input, edges))
+    }
+
     /// Discover the media workflow graph reachable from the resource
     /// `entry_point` names, keyed by each discovered resource's ARN.
     ///
-    /// The graph's resources are CHANNELS: a channel is the only resource kind
-    /// this store holds that carries links to other media resources, so an ARN
-    /// naming anything else (another resource type of this service, another
-    /// service, another account or region) resolves to no graph resource and
-    /// answers `None` — which the caller renders as the operation's modelled
-    /// `NotFoundException`. An input or an input security group this store does
-    /// hold is a member of no workflow graph here: nothing records which inputs
-    /// a signal map's workflow reaches, so claiming one would be fabrication.
+    /// The ENTRY POINT is a channel: `DiscoveryEntryPointArn` is "A top-level
+    /// supported AWS resource ARN to discovery a signal map from", and a channel
+    /// is the top-level resource this store holds; an ARN naming anything else
+    /// (another resource type of this service, another service, another account
+    /// or region) resolves to no entry point and answers `None` — which the
+    /// caller renders as the operation's modelled `NotFoundException`.
     ///
-    /// The walk is breadth-first over the links the discovered resources
-    /// themselves declare (a follower channel's primary, and the followers that
-    /// name it), so the graph is read out of persisted state. It is the SNAPSHOT
-    /// of that state at the instant discovery runs: the real service rediscovers
-    /// a signal map's graph only when a discovery is asked for
-    /// (`StartUpdateSignalMap`, still a scaffold here), so a channel created or
-    /// deleted afterwards does not change a stored signal map's
-    /// `MediaResourceMap`.
+    /// The NODES are every media resource the walk reaches from there: channels
+    /// and the inputs those channels attach, each keyed by its own ARN. The walk
+    /// is breadth-first over the links the discovered resources themselves
+    /// declare (a follower channel's primary, the followers that name it, and
+    /// the inputs a channel's `InputAttachments` name), so the graph is read out
+    /// of persisted state. It is the SNAPSHOT of that state at the instant
+    /// discovery runs: the real service rediscovers a signal map's graph only
+    /// when a discovery is asked for (`StartUpdateSignalMap`, still a scaffold
+    /// here), so a resource created or deleted afterwards does not change a
+    /// stored signal map's `MediaResourceMap`.
     pub fn discover_media_resource_map(
         &self,
         entry_point: &str,
     ) -> Option<BTreeMap<String, MediaResource>> {
         self.channel_by_arn(entry_point)?;
 
+        // One pass over the store's attachments, read by every node below.
+        let edges = self.attachment_edges();
         let mut discovered: BTreeMap<String, MediaResource> = BTreeMap::new();
         let mut pending: VecDeque<String> = VecDeque::new();
         pending.push_back(entry_point.to_string());
@@ -1361,39 +1511,18 @@ impl ComAmazonawsMedialiveMedialiveState {
             if discovered.contains_key(&arn) {
                 continue;
             }
-            let Some(channel) = self.channel_by_arn(&arn) else {
+            let Some(resource) = self.media_resource_at(&arn, &edges) else {
                 continue;
             };
-            // Upstream: the primary this channel follows, reported only when
-            // that channel exists here — discovery never claims a resource the
-            // store does not hold.
-            let sources: Vec<MediaResourceNeighbor> = channel
-                .linked_channel_settings
-                .as_ref()
-                .and_then(|linked| linked.follower_channel_settings.as_ref())
-                .and_then(|follower| follower.primary_channel_arn.as_deref())
-                .and_then(|primary| self.channel_by_arn(primary))
-                .map(|primary| vec![neighbor(primary)])
-                .unwrap_or_default();
-            // Downstream: the channels that follow this one.
-            let destinations: Vec<MediaResourceNeighbor> = self
-                .following_channel_arns(&arn)
+            for next in resource
+                .sources
                 .iter()
-                .filter_map(|follower| self.channel_by_arn(follower))
-                .map(neighbor)
-                .collect();
-
-            for next in sources.iter().chain(destinations.iter()) {
+                .chain(resource.destinations.iter())
+                .flatten()
+            {
                 pending.push_back(next.arn.clone());
             }
-            discovered.insert(
-                arn,
-                MediaResource {
-                    name: channel.name.clone(),
-                    sources: Some(sources),
-                    destinations: Some(destinations),
-                },
-            );
+            discovered.insert(arn, resource);
         }
         Some(discovered)
     }
@@ -1616,11 +1745,30 @@ pub fn new_signal_map(
     }
 }
 
-/// One channel as a neighbour in a discovered media workflow graph.
-fn neighbor(channel: &ChannelRecord) -> MediaResourceNeighbor {
+/// The channel-to-input attachment edges of a whole store, in both directions:
+/// each channel's attached inputs and, as the inverse, each input's attaching
+/// channels.
+///
+/// Built by [`ComAmazonawsMedialiveMedialiveState::attachment_edges`] once per
+/// discovery, so the walk reads the edges instead of re-deriving them per node.
+#[derive(Debug, Default)]
+struct AttachmentEdges<'state> {
+    /// A channel's ARN -> the inputs it attaches, in attachment order, once
+    /// each, restricted to the ones the store still holds and has not deleted —
+    /// discovery never claims a resource the store does not hold.
+    inputs_of: BTreeMap<&'state str, Vec<&'state InputRecord>>,
+    /// An input's ARN -> the channels that attach it, in channel-id order.
+    channels_of: BTreeMap<&'state str, Vec<&'state ChannelRecord>>,
+}
+
+/// One media resource as a neighbour in a discovered media workflow graph: the
+/// `Arn` the model requires of a `MediaResourceNeighbor`, plus the resource's
+/// own name when it has one. One helper for every resource kind the graph holds,
+/// so a channel neighbour and an input neighbour cannot be built two ways.
+fn neighbor(arn: &str, name: Option<&str>) -> MediaResourceNeighbor {
     MediaResourceNeighbor {
-        arn: channel.arn.clone(),
-        name: channel.name.clone(),
+        arn: arn.to_string(),
+        name: name.map(ToString::to_string),
     }
 }
 
@@ -1693,6 +1841,22 @@ pub struct InputRecord {
     /// The input this one was created as a partner of (`CreatePartnerInput`),
     /// which is what makes the pair name each other in `InputPartnerIds`.
     pub partner_of: Option<String>,
+    /// The instant the deletion `DeleteInput` started becomes due, so
+    /// `DELETING` settles into the terminal `DELETED`. `None` while no delete
+    /// has been accepted for this input. Stored, never slept on.
+    ///
+    /// PRIVATE, so the only way in is [`begin_delete_input`] and
+    /// [`InputRecord::settle`], and the only way to read it is
+    /// [`InputRecord::is_deleting`].
+    deletion_due: Option<SystemTime>,
+    /// Whether the deletion has come due, which puts the input in the terminal
+    /// `DELETED` state.
+    ///
+    /// A deleted input is NOT dropped from the account: `DELETED` is one of the
+    /// states the model gives it (`smithy_query(query="shape",
+    /// shape="InputState")`) and it is terminal, so the record stays readable in
+    /// that state rather than vanishing, exactly as a deleted SdiSource does.
+    deleted: bool,
 }
 
 impl InputRecord {
@@ -1739,6 +1903,36 @@ impl InputRecord {
             input_class::SINGLE_PIPELINE
         } else {
             input_class::STANDARD
+        }
+    }
+
+    /// Whether `DeleteInput` has started deleting this input and the clock has
+    /// not made that deletion due yet.
+    pub fn is_deleting(&self) -> bool {
+        self.deletion_due.is_some()
+    }
+
+    /// Whether this input's deletion has come due, which is what puts it in the
+    /// terminal `DELETED` state.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted
+    }
+
+    /// Whether a delete has been accepted for this input, in either half of the
+    /// deletion lifecycle — so a repeated `DeleteInput` is idempotent rather
+    /// than restarting the clock. PRIVATE: only [`begin_delete_input`] needs it,
+    /// which keeps the deletion flags' "only way in" invariant tight.
+    fn is_delete_accepted(&self) -> bool {
+        self.is_deleting() || self.is_deleted()
+    }
+
+    /// Materialise the deletion the clock has already made due. Owed at the
+    /// stored instant whether or not anybody called, so applying it in a
+    /// reporting operation changes nothing a later caller would have seen.
+    fn settle(&mut self, now: SystemTime) {
+        if self.deletion_due.is_some_and(|due| now >= due) {
+            self.deletion_due = None;
+            self.deleted = true;
         }
     }
 
@@ -1792,7 +1986,24 @@ pub fn new_input(id: String, arn: String) -> InputRecord {
         vpc: None,
         tags: HashMap::new(),
         partner_of: None,
+        deletion_due: None,
+        deleted: false,
     }
+}
+
+/// Delete an input: it moves into `DELETING` and owes the terminal `DELETED`
+/// once [`TRANSIENT_STATE_SPAN`] has passed, which is the lifecycle the real
+/// service runs (a caller waits on `State`, which is what the `input_deleted`
+/// waiter polls for). The record then stays in the account in that terminal
+/// state, so `DescribeInput` keeps reporting it rather than losing it.
+///
+/// Idempotent: a delete already accepted keeps the instant it was accepted at,
+/// so a repeated call neither restarts the clock nor revives a deleted input.
+pub fn begin_delete_input(input: &mut InputRecord, now: SystemTime) {
+    if input.is_delete_accepted() {
+        return;
+    }
+    input.deletion_due = Some(now + TRANSIENT_STATE_SPAN);
 }
 
 /// `InputSourceRequest` -> `InputSource`: the same three members, so a pull
@@ -2120,8 +2331,9 @@ macro_rules! channel_description_output {
 pub(crate) use channel_description_output;
 
 /// Project an `Input` onto one of the structurally identical per-operation
-/// input-description output shapes (`DescribeInputOutput` today;
-/// `DeleteInputOutput` and the rest when their own issues land).
+/// input-description output shapes (`DescribeInputOutput` today; the others when
+/// their own issues land — `DeleteInputResponse` is not one of them, since the
+/// model gives `DeleteInput` an output with no members at all).
 ///
 /// One macro rather than a hand-written copy of the same 22-member move per
 /// operation, so those operations cannot drift from each other.

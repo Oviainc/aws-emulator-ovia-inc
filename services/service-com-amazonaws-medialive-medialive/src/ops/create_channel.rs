@@ -192,6 +192,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `InputAttachments` is a caller-chosen list, and every later read that
+        // walks it (an input's `AttachedChannels`, a signal map's discovery)
+        // costs work per entry, so its length is bounded here: a longer list is
+        // out of bounds for this emulator and gets the operation's own modelled
+        // client error rather than a channel nothing can read cheaply.
+        let attachment_count = input.input_attachments.as_ref().map_or(0, Vec::len);
+        if attachment_count > crate::state::MAX_INPUT_ATTACHMENTS {
+            return Err(CreateChannelErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "inputAttachments carries {attachment_count} attachments; this emulator accepts at most {}",
+                    crate::state::MAX_INPUT_ATTACHMENTS
+                )),
+            })
+            .into());
+        }
+
         // The model gives `ChannelClass` no default, and MediaLive's own default
         // is STANDARD — the two-pipeline class the `ChannelClass` doc describes.
         let channel_class = input
