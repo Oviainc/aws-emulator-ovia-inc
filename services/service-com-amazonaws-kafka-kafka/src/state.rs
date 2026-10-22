@@ -11,6 +11,14 @@
 //! next to the record is what makes the readers agree: they render the same stored
 //! cluster the same way.
 //!
+//! The topic registry lives beside it, keyed by (cluster ARN, topic name): a topic
+//! belongs to exactly one cluster, so `CreateTopic`, `DescribeTopic` and
+//! `DeleteTopic` all resolve the cluster first and then the topic, through
+//! [`ComAmazonawsKafkaKafkaState::settled_topic_in`] — the one accessor, so every
+//! caller sees the transitions the clock already owed that topic. A cluster
+//! leaving the registry takes its topics with it, so no topic can outlive the
+//! cluster that holds it.
+//!
 //! A cluster's configuration also changes after creation: an update operation
 //! (`UpdateConnectivity`) records a [`PendingUpdate`] on the cluster, and
 //! [`Cluster::settle`] folds it into the record once the clock owes its
@@ -87,6 +95,44 @@ pub const MAX_CLUSTERS_PER_REGION: usize = 90;
 /// regions than AWS publishes, so it can only ever be reached by a caller trying
 /// to exhaust the emulator, never by a realistic client script.
 pub const MAX_CLUSTERS_IN_REGISTRY: usize = MAX_CLUSTERS_PER_REGION * 64;
+
+/// How long after `CreateTopic` a new topic becomes `ACTIVE`.
+///
+/// CHOSEN, not documented: the real service creates the topic on the cluster's
+/// brokers, which takes as long as it takes. The project fixes an emulated
+/// clock-owed transition at 250–750 ms, so a caller that describes the topic
+/// immediately still observes `CREATING` while one that waits sees `ACTIVE`.
+pub const TOPIC_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after `DeleteTopic` a topic marked `DELETING` is actually gone.
+///
+/// CHOSEN, not documented, for the same reason: `DeleteTopic` answers the
+/// non-terminal `DELETING` status, so the record must remain readable for a span
+/// before it leaves the registry.
+pub const TOPIC_DELETION_DELAY: Duration = Duration::from_millis(500);
+
+/// The longest legal Apache Kafka topic name: 249 characters
+/// (`org.apache.kafka.common.internals.Topic.MAX_NAME_LENGTH`, which reserves
+/// room for the `-<partition>` suffix a log directory name adds).
+pub const MAX_TOPIC_NAME_LENGTH: usize = 249;
+
+/// Topics one cluster may hold in this emulator.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota: Amazon MSK bounds a
+/// cluster by partitions per broker rather than by topic count, and the topic
+/// name comes from the request, so without a ceiling a caller could grow the
+/// registry one topic at a time. Sized well above any realistic client script.
+pub const MAX_TOPICS_PER_CLUSTER: usize = 1_000;
+
+/// The `TopicState` values this emulator reports, spelled as the model's enum
+/// declares them. Named here so every topic operation reports the same
+/// spellings. (`UPDATING`, the model's fourth value, belongs to `UpdateTopic`,
+/// which is still a scaffold.)
+pub const TOPIC_STATE_CREATING: &str = "CREATING";
+/// The state of a topic the cluster has finished creating.
+pub const TOPIC_STATE_ACTIVE: &str = "ACTIVE";
+/// The state of a topic whose deletion has been accepted but not completed.
+pub const TOPIC_STATE_DELETING: &str = "DELETING";
 
 /// How long after `CreateChannel` a new channel becomes `ACTIVE`.
 ///
@@ -877,6 +923,80 @@ pub enum RegisterRejected {
     DuplicateArn,
 }
 
+/// Why [`ComAmazonawsKafkaKafkaState::register_topic`] refused to register a
+/// topic. Every variant leaves the registry exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicRejected {
+    /// The cluster already holds a topic with this name — including one that is
+    /// `DELETING` but still in the registry.
+    DuplicateName,
+    /// The cluster already holds [`MAX_TOPICS_PER_CLUSTER`] topics.
+    ClusterCeiling,
+}
+
+/// One topic of a provisioned cluster, holding everything a reader reports so
+/// `DescribeTopic` computes its answer from the record rather than echoing a
+/// request.
+#[derive(Debug, Clone)]
+pub struct Topic {
+    /// The topic's own name, unique within its cluster.
+    pub name: String,
+    /// The ARN of the cluster that holds the topic — half of the registry key.
+    pub cluster_arn: String,
+    /// `arn:<partition>:kafka:<region>:<account>:topic/<cluster>/<cluster-id>/<topic>`,
+    /// the form Amazon MSK uses for a topic in an IAM policy.
+    pub arn: String,
+    pub partition_count: i32,
+    pub replication_factor: i32,
+    /// The topic-level Apache Kafka configuration the request supplied, stored
+    /// verbatim because the service hands it back the same way.
+    pub configs: Option<String>,
+    /// A `TopicState` value.
+    pub state: String,
+    /// The instant the clock owes this topic its `CREATING` -> `ACTIVE`
+    /// transition. Stored, never slept on.
+    pub active_due: SystemTime,
+    /// Set by `DeleteTopic`: the instant the clock owes this topic's removal from
+    /// the registry. `None` for a topic nobody has deleted.
+    pub removal_due: Option<SystemTime>,
+}
+
+impl Topic {
+    /// Mint a topic of `cluster` from an accepted `CreateTopic` request. The ARN
+    /// is derived from the cluster's identity, so a topic's ARN belongs to the
+    /// cluster that holds it and to that cluster's region.
+    pub fn created(
+        cluster: &Cluster,
+        name: String,
+        partition_count: i32,
+        replication_factor: i32,
+        configs: Option<String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            arn: cluster.topic_arn(&name),
+            name,
+            cluster_arn: cluster.arn.clone(),
+            partition_count,
+            replication_factor,
+            configs,
+            state: TOPIC_STATE_CREATING.to_string(),
+            active_due: now + TOPIC_ACTIVATION_DELAY,
+            removal_due: None,
+        }
+    }
+
+    /// Apply the `CREATING` -> `ACTIVE` transition once `now` has reached
+    /// [`Self::active_due`]. Idempotent, and a no-op for every other state: only a
+    /// transition the clock already owed is materialised here. A topic that is
+    /// `DELETING` never goes back to `ACTIVE`.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.state == TOPIC_STATE_CREATING && now >= self.active_due {
+            self.state = TOPIC_STATE_ACTIVE.to_string();
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-kafka-kafka. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKafkaKafkaState {
@@ -894,6 +1014,10 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// Monotonic counter feeding the ARN and DNS suffixes, so each cluster gets a
     /// distinct identity and a rebuilt emulator reproduces the same ones.
     pub next_cluster_suffix: u64,
+    /// Every live topic, keyed by (cluster ARN, topic name). A topic name is
+    /// unique within its cluster, and the `BTreeMap` groups one cluster's topics
+    /// contiguously in name order — the order `ListTopics` pages through.
+    pub topics: BTreeMap<(String, String), Topic>,
     /// Every live channel, keyed by ARN. `BTreeMap` so `ListChannels` has one
     /// total order to page through.
     pub channels: BTreeMap<String, Channel>,
@@ -971,6 +1095,9 @@ impl ComAmazonawsKafkaKafkaState {
     /// Remove the cluster `arn` names from every index, handing it back. The one
     /// removal path, for the same reason.
     ///
+    /// A topic belongs to the cluster whose brokers hold it, so the cluster's
+    /// topics leave with it: nothing in the registry can outlive its cluster.
+    ///
     /// A channel reads from a cluster, so a cluster that is gone holds no
     /// channels: every channel registered under `arn` is dropped here too, which
     /// is why this is also the one place that can orphan a channel — and does
@@ -979,6 +1106,7 @@ impl ComAmazonawsKafkaKafkaState {
         let cluster = self.clusters.remove(arn)?;
         self.cluster_arn_by_name
             .remove(&(cluster.region.clone(), cluster.name.clone()));
+        self.topics.retain(|(topic_cluster, _), _| topic_cluster != arn);
         if let Some(count) = self.clusters_per_region.get_mut(&cluster.region) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -1044,6 +1172,128 @@ impl ComAmazonawsKafkaKafkaState {
         }
         cluster.settle(now);
         Some(cluster)
+    }
+
+    /// How many topics the cluster `cluster_arn` names holds as a reader at
+    /// `now` sees it — what the per-cluster ceiling is checked against. A topic
+    /// whose removal the clock already owes is NOT counted, so the ceiling
+    /// agrees with what every reader reports rather than reserving room for
+    /// records that are gone. The registry key leads with the cluster ARN, so
+    /// one cluster's topics are a contiguous range.
+    pub fn topic_count_in(&self, cluster_arn: &str, now: SystemTime) -> usize {
+        self.topics_in(cluster_arn)
+            .filter(|topic| topic.removal_due.is_none_or(|due| now < due))
+            .count()
+    }
+
+    /// Every topic of the cluster `cluster_arn` names, in topic-name order.
+    pub fn topics_in<'a>(&'a self, cluster_arn: &'a str) -> impl Iterator<Item = &'a Topic> + 'a {
+        self.topics
+            .range((cluster_arn.to_string(), String::new())..)
+            .take_while(move |((arn, _), _)| arn == cluster_arn)
+            .map(|(_, topic)| topic)
+    }
+
+    /// Add `topic` to the registry. The one insertion path, and the one place the
+    /// per-cluster ceiling is enforced, so it holds for every caller of this
+    /// module rather than only for a handler that remembers to check first.
+    ///
+    /// `now` is the instant the create is served: the removals this cluster's
+    /// topics are already owed are materialised FIRST, so a name whose topic is
+    /// gone as far as every reader is concerned is free here too (whether or not
+    /// anybody read it in between) and the ceiling bounds what the registry
+    /// actually holds.
+    ///
+    /// Refuses, changing nothing, when the cluster still holds a topic of that
+    /// name (a `DELETING` one whose removal is not yet due still counts: it is
+    /// still there) or already holds [`MAX_TOPICS_PER_CLUSTER`] topics.
+    pub fn register_topic(
+        &mut self,
+        topic: Topic,
+        now: SystemTime,
+    ) -> Result<(), TopicRejected> {
+        // Materialise every removal THIS CLUSTER's topics are already owed, not
+        // only the addressed name: the ceiling below has to bound the records the
+        // registry holds, so a caller looping create-and-delete under fresh names
+        // cannot grow it past the ceiling. Each removal was due at the same
+        // instant whether or not anybody addressed that topic.
+        self.prune_removed_topics(&topic.cluster_arn, now);
+        let key = (topic.cluster_arn.clone(), topic.name.clone());
+        if self.topics.contains_key(&key) {
+            return Err(TopicRejected::DuplicateName);
+        }
+        if self.topic_count_in(&topic.cluster_arn, now) >= MAX_TOPICS_PER_CLUSTER {
+            return Err(TopicRejected::ClusterCeiling);
+        }
+        self.topics.insert(key, topic);
+        Ok(())
+    }
+
+    /// Drop the topics of `cluster_arn` whose removal the clock owed by `now`.
+    /// Scoped to the one cluster, which the registry key makes a contiguous
+    /// range, so this never walks the whole registry.
+    fn prune_removed_topics(&mut self, cluster_arn: &str, now: SystemTime) {
+        let removed: Vec<(String, String)> = self
+            .topics_in(cluster_arn)
+            .filter(|topic| topic.removal_due.is_some_and(|due| now >= due))
+            .map(|topic| (topic.cluster_arn.clone(), topic.name.clone()))
+            .collect();
+        for key in removed {
+            self.topics.remove(&key);
+        }
+    }
+
+    /// The same lookup, with the transitions the clock already owed THIS topic
+    /// materialised: a topic whose removal is due is gone (so this answers
+    /// `None`), and one whose activation is due is `ACTIVE`.
+    ///
+    /// Scoped to the one topic being addressed: a read must not do work
+    /// proportional to the registry, and no other topic's status is this
+    /// request's business.
+    pub fn settled_topic_in(
+        &mut self,
+        cluster_arn: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&Topic> {
+        let key = (cluster_arn.to_string(), name.to_string());
+        if self
+            .topics
+            .get(&key)
+            .and_then(|topic| topic.removal_due)
+            .is_some_and(|due| now >= due)
+        {
+            self.topics.remove(&key);
+            return None;
+        }
+        let topic = self.topics.get_mut(&key)?;
+        topic.settle(now);
+        Some(topic)
+    }
+
+    /// Accept the deletion of the topic `name` in `cluster_arn`, handing back the
+    /// record as the caller must now see it: `DELETING`, with the instant the
+    /// clock owes its removal set.
+    ///
+    /// Answers `None` when the cluster holds no such topic — including one whose
+    /// removal the clock already owed, which this materialises first so a topic
+    /// is never deleted twice. A topic already `DELETING` keeps the removal
+    /// instant it was given, so repeating the call cannot postpone it.
+    pub fn begin_topic_deletion(
+        &mut self,
+        cluster_arn: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&Topic> {
+        self.settled_topic_in(cluster_arn, name, now)?;
+        let topic = self
+            .topics
+            .get_mut(&(cluster_arn.to_string(), name.to_string()))?;
+        if topic.removal_due.is_none() {
+            topic.state = TOPIC_STATE_DELETING.to_string();
+            topic.removal_due = Some(now + TOPIC_DELETION_DELAY);
+        }
+        Some(topic)
     }
 
     /// The ARN registered for the replicator `name` in `region`, if any. This is
@@ -1728,6 +1978,29 @@ impl Cluster {
         )
     }
 
+    /// The ARN of the topic `topic_name` on this cluster.
+    ///
+    /// Amazon MSK names a topic as
+    /// `arn:<partition>:kafka:<region>:<account>:topic/<cluster-name>/<cluster-uuid>/<topic-name>`
+    /// (the resource an MSK IAM policy grants topic actions on), so the topic ARN
+    /// is this cluster's own identity under the `topic` resource type. Derived
+    /// from the stored cluster ARN, which keeps a topic's ARN in the same
+    /// partition, region and account as the cluster that holds it.
+    pub fn topic_arn(&self, topic_name: &str) -> String {
+        match self.arn.split_once(":cluster/") {
+            Some((prefix, identity)) => format!("{prefix}:topic/{identity}/{topic_name}"),
+            // Unreachable for a registered cluster: `provisioned` mints every ARN
+            // with a `cluster/<name>/<id>` resource. Rebuilt from the cluster's
+            // own region and name rather than guessed, so the fallback is still a
+            // well-formed topic ARN of this cluster.
+            None => ::engine::emulator_arn(
+                "kafka",
+                &self.region,
+                &format!("topic/{}/{topic_name}", self.name),
+            ),
+        }
+    }
+
     /// The effective `EncryptionInTransit$ClientBroker` setting.
     pub fn client_broker(&self) -> &str {
         self.encryption_info
@@ -2116,4 +2389,35 @@ fn kafka_arn_resource(value: &str) -> Option<&str> {
         return None;
     }
     Some(resource)
+}
+
+/// Why `name` is not a legal Apache Kafka topic name, or `None` when it is.
+///
+/// Apache Kafka's own rule (`org.apache.kafka.common.internals.Topic.validate`),
+/// which the MSK topic operations sit in front of: a name is at most
+/// [`MAX_TOPIC_NAME_LENGTH`] characters, is neither `.` nor `..`, and is made up
+/// only of `[a-zA-Z0-9._-]`. The returned sentence names the member and the
+/// constraint it broke, so a refusal says which part of the request was wrong.
+pub fn topic_name_error(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("A topic name must not be empty.".to_string());
+    }
+    if name == "." || name == ".." {
+        return Some(format!("The topic name {name} is reserved and cannot be used."));
+    }
+    let length = name.chars().count();
+    if length > MAX_TOPIC_NAME_LENGTH {
+        return Some(format!(
+            "A topic name is at most {MAX_TOPIC_NAME_LENGTH} characters long, but this one is {length}."
+        ));
+    }
+    if let Some(illegal) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    {
+        return Some(format!(
+            "A topic name may contain only ASCII alphanumerics, '.', '_' and '-', but this one contains {illegal:?}."
+        ));
+    }
+    None
 }
