@@ -10,6 +10,11 @@
 //! [`AnalysisJob::settle`] is the ONE place a job's clock-owed status change is
 //! materialised.
 //!
+//! A custom model is the other kind of record: [`DocumentClassifier`] is what
+//! `CreateDocumentClassifier` persists, keyed by the ARN it mints, and
+//! [`DocumentClassifier::settle`] is the ONE place its clock-owed `ModelStatus`
+//! change is materialised, exactly as [`AnalysisJob::settle`] is for a job.
+//!
 //! ## What a job's terminal status says
 //!
 //! A job's terminal status is never assumed: [`AnalysisJob::terminal_outcome`] holds
@@ -36,6 +41,8 @@
 //!   ONE insertion path,
 //!   [`ComAmazonawsComprehendComprehend20171127State::insert_document_classifier`],
 //!   with oldest-first eviction.
+//! * `classifier_idempotency_tokens` — an entry is dropped together with the
+//!   classifier it points at, so this index cannot outgrow `document_classifiers`.
 //!
 //! `ops::list_sentiment_detection_jobs` and `ops::list_document_classifiers` bound
 //! the RESPONSE the same way, with their `DEFAULT_MAX_RESULTS` and the modelled
@@ -58,8 +65,8 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     ClassifierMetadata, DocumentClassifierInputDataConfig, DocumentClassifierOutputDataConfig,
     DocumentClassifierProperties, DominantLanguageDetectionJobProperties, InputDataConfig,
-    KeyPhrasesDetectionJobProperties, OutputDataConfig, SentimentDetectionJobProperties, Tag,
-    VpcConfig,
+    KeyPhrasesDetectionJobProperties, OutputDataConfig, PiiEntitiesDetectionJobProperties,
+    PiiOutputDataConfig, RedactionConfig, SentimentDetectionJobProperties, Tag, VpcConfig,
 };
 
 /// How long a freshly submitted job stays `SUBMITTED` before the clock owes it
@@ -83,15 +90,16 @@ pub const STOPPING_SPAN: Duration = Duration::from_millis(300);
 /// The most tags a Comprehend resource can carry.
 ///
 /// From the modelled documentation of the `TooManyTagsException` every
-/// `Start*DetectionJob` declares: "The request contains more tags than can be
-/// associated with a resource (50 tags per resource)."
+/// `Start*DetectionJob` and every resource-creating operation declares: "The request
+/// contains more tags than can be associated with a resource (50 tags per
+/// resource)."
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
-/// The refusal message for a submission carrying more tags than a resource can
-/// hold, or `None` when `tags` is within [`MAX_TAGS_PER_RESOURCE`].
+/// The refusal message for a request carrying more tags than a resource can hold,
+/// or `None` when `tags` is within [`MAX_TAGS_PER_RESOURCE`].
 ///
 /// The bound and its wording live here rather than in one operation, so every
-/// family's `Start*DetectionJob` refuses the same count the same way; each handler
+/// operation that accepts `Tags` refuses the same count the same way; each handler
 /// wraps the message in the `TooManyTagsException` its own error channel names.
 pub fn too_many_tags_message(tags: &[Tag]) -> Option<String> {
     (tags.len() > MAX_TAGS_PER_RESOURCE).then(|| {
@@ -186,16 +194,23 @@ pub enum JobFamily {
     DominantLanguageDetection,
     /// `StartKeyPhrasesDetectionJob` and its Describe/List/Stop operations.
     KeyPhrasesDetection,
+    /// `StartPiiEntitiesDetectionJob` and its Describe/List/Stop operations.
+    PiiEntitiesDetection,
 }
 
 impl JobFamily {
     /// The resource type segment this family's `JobArn` carries, e.g.
     /// `arn:aws:comprehend:<region>:<account>:sentiment-detection-job/<JobId>`.
+    ///
+    /// Each value is the one the family's own `JobArn` documentation states — the
+    /// PII family's says
+    /// `arn:<partition>:comprehend:<region>:<account-id>:pii-entities-detection-job/<job-id>`.
     pub fn arn_resource_type(self) -> &'static str {
         match self {
             Self::SentimentDetection => "sentiment-detection-job",
             Self::DominantLanguageDetection => "dominant-language-detection-job",
             Self::KeyPhrasesDetection => "key-phrases-detection-job",
+            Self::PiiEntitiesDetection => "pii-entities-detection-job",
         }
     }
 
@@ -211,6 +226,9 @@ impl JobFamily {
             Self::SentimentDetection => "SENTIMENT",
             Self::DominantLanguageDetection => "LANGUAGE",
             Self::KeyPhrasesDetection => "KEY_PHRASES",
+            // AWS names a PII job's output directory
+            // `<account-id>-PII-<JobId>`.
+            Self::PiiEntitiesDetection => "PII",
         }
     }
 }
@@ -278,6 +296,12 @@ pub struct JobSubmission<'a> {
     pub volume_kms_key_id: Option<&'a str>,
     pub vpc_config: Option<&'a VpcConfig>,
     pub tags: &'a [Tag],
+    /// The family's own analysis mode, for a family whose input models one (the PII
+    /// family's `Mode`); `None` for a family whose input models none.
+    pub mode: Option<&'a str>,
+    /// The `RedactionConfig` the submission carried, for the family whose input
+    /// models one; `None` otherwise.
+    pub redaction_config: Option<&'a RedactionConfig>,
 }
 
 impl JobSubmission<'_> {
@@ -342,6 +366,20 @@ impl JobSubmission<'_> {
                 )
             },
         );
+        let redaction_config = self.redaction_config.map_or_else(
+            || "absent".to_string(),
+            |redaction| {
+                format!(
+                    "{}|{}|{}",
+                    redaction
+                        .pii_entity_types
+                        .as_ref()
+                        .map_or_else(|| "absent".to_string(), |types| types.join("+")),
+                    rendered(redaction.mask_mode.as_deref()),
+                    rendered(redaction.mask_character.as_deref()),
+                )
+            },
+        );
         let parts: Vec<String> = vec![
             self.family.arn_resource_type().to_string(),
             rendered(self.job_name),
@@ -352,6 +390,10 @@ impl JobSubmission<'_> {
             rendered(self.volume_kms_key_id),
             vpc_config,
             tags.join(","),
+            // The members only one family's input models, rendered for every family
+            // so no part can shift position between families.
+            rendered(self.mode),
+            redaction_config,
         ];
         let mut hasher = Sha256::new();
         for part in &parts {
@@ -447,6 +489,13 @@ pub struct AnalysisJob {
     /// The `ClientRequestToken` this job was submitted under, if any. Held so the
     /// idempotency-index entry can be dropped with the record it points at.
     pub client_request_token: Option<String>,
+    /// The family's own analysis mode, for a family that models one: the PII
+    /// family's `Mode` (`ONLY_OFFSETS` | `ONLY_REDACTION`). `None` for a family
+    /// whose input models no mode.
+    pub mode: Option<String>,
+    /// The `RedactionConfig` a PII job was submitted with, if any; `None` for every
+    /// other family, whose input models none.
+    pub redaction_config: Option<RedactionConfig>,
     /// [`JobSubmission::digest`] of the request that created this job — the other
     /// half of its idempotency-index key. Held for the same reason as
     /// `client_request_token`: together they identify the submission, so a retried
@@ -587,6 +636,38 @@ job_properties_projections! {
 }
 
 impl AnalysisJob {
+    /// Project this record into the PII family's modelled properties shape.
+    ///
+    /// Hand-written rather than an instantiation of `job_properties_projections!`
+    /// above: this family's shape declares members the others do not — `Mode` and
+    /// `RedactionConfig` — reports its output location as the family's own
+    /// `PiiOutputDataConfig`, and models neither a volume key nor a VPC
+    /// configuration.
+    ///
+    /// `OutputDataConfig` carries the location the submission supplied — the member
+    /// documents exactly that: "The output data configuration that you supplied when
+    /// you created the PII entities detection job."
+    pub fn pii_entities_detection_job_properties(&self) -> PiiEntitiesDetectionJobProperties {
+        PiiEntitiesDetectionJobProperties {
+            job_id: Some(self.job_id.clone()),
+            job_arn: Some(self.job_arn.clone()),
+            job_name: self.job_name.clone(),
+            job_status: Some(self.job_status.clone()),
+            message: self.message.clone(),
+            submit_time: Some(::aws_smithy_types::DateTime::from(self.submit_time)),
+            end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
+            input_data_config: Some(self.input_data_config.clone()),
+            output_data_config: Some(PiiOutputDataConfig {
+                s3_uri: self.output_data_config.s3_uri.clone(),
+                kms_key_id: self.output_data_config.kms_key_id.clone(),
+            }),
+            redaction_config: self.redaction_config.clone(),
+            language_code: self.language_code.clone(),
+            data_access_role_arn: Some(self.data_access_role_arn.clone()),
+            mode: self.mode.clone(),
+        }
+    }
+
     /// Project this record into the dominant-language family's modelled properties
     /// shape, which models no `LanguageCode`: the language is what the job detects.
     /// Every other member is the one the macro above projects.
@@ -609,6 +690,51 @@ impl AnalysisJob {
         }
     }
 }
+
+/// How long a freshly created document classifier stays `SUBMITTED` before the
+/// clock owes it `TRAINING`.
+///
+/// The emulator's own span, not a documented AWS duration: training a real custom
+/// model takes tens of minutes, which no test can wait for. It is deliberately
+/// non-zero, so a caller that describes a classifier straight back still observes
+/// `SUBMITTED`.
+pub const CLASSIFIER_SUBMITTED_SPAN: Duration = Duration::from_millis(300);
+
+/// How long a classifier stays `TRAINING` before the clock owes it its terminal
+/// `ModelStatus`.
+///
+/// The emulator's own span, chosen for the same reason as
+/// [`CLASSIFIER_SUBMITTED_SPAN`] and deliberately at the top of the band the project
+/// allows, so an out-of-process client that provisions a classifier and then stops
+/// its training can still catch it `TRAINING`.
+pub const CLASSIFIER_TRAINING_SPAN: Duration = Duration::from_millis(450);
+
+/// How long a classifier stays `STOP_REQUESTED` before the clock owes it `STOPPED`.
+/// The emulator's own span, chosen for the same reason as
+/// [`CLASSIFIER_SUBMITTED_SPAN`].
+pub const CLASSIFIER_STOPPING_SPAN: Duration = Duration::from_millis(300);
+
+/// How long a classifier stays `DELETING` before the clock owes its removal.
+///
+/// `DeleteDocumentClassifier` documents the asynchrony this span stands for: "This
+/// is an asynchronous action that puts the classifier into a DELETING state, and it
+/// is then removed by a background job." The span is the emulator's own, chosen for
+/// the same reason as [`CLASSIFIER_SUBMITTED_SPAN`], and non-zero so a caller that
+/// describes the classifier straight after the delete still observes `DELETING`.
+pub const CLASSIFIER_DELETING_SPAN: Duration = Duration::from_millis(300);
+
+/// The `DocumentClassifierMode` a creation that names none is trained in.
+///
+/// `CreateDocumentClassifier`'s `Mode` member is optional and the service documents
+/// `MULTI_CLASS` as what it defaults to.
+pub const DEFAULT_CLASSIFIER_MODE: &str = "MULTI_CLASS";
+
+/// The `DocumentClassifierDataFormat` an `InputDataConfig` that names none uses.
+///
+/// From the modelled member documentation of
+/// `DocumentClassifierInputDataConfig$DataFormat`: "If you don't specify a value,
+/// Amazon Comprehend uses `COMPREHEND_CSV` as the default."
+pub const DEFAULT_CLASSIFIER_DATA_FORMAT: &str = "COMPREHEND_CSV";
 
 /// One persisted custom document classifier.
 ///
@@ -639,6 +765,16 @@ pub struct DocumentClassifier {
     pub end_time: Option<SystemTime>,
     pub training_start_time: Option<SystemTime>,
     pub training_end_time: Option<SystemTime>,
+    /// When the clock owes `SUBMITTED` -> `TRAINING`.
+    pub training_due_at: SystemTime,
+    /// When the clock owes `TRAINING` -> its terminal status.
+    pub terminal_due_at: SystemTime,
+    /// When the clock owes `STOP_REQUESTED` -> `STOPPED`; `None` until a stop is
+    /// requested.
+    pub stopped_due_at: Option<SystemTime>,
+    /// When the clock owes this record's removal; `None` until a delete is
+    /// requested.
+    pub removal_due_at: Option<SystemTime>,
     pub input_data_config: Option<DocumentClassifierInputDataConfig>,
     pub output_data_config: Option<DocumentClassifierOutputDataConfig>,
     /// The metrics of a finished training run; `None` while nothing has been
@@ -652,19 +788,124 @@ pub struct DocumentClassifier {
     pub mode: String,
     pub source_model_arn: Option<String>,
     pub flywheel_arn: Option<String>,
+    /// The `ModelPolicy` the creation attached, if any. Held on the record so
+    /// `DescribeResourcePolicy` has one place to read it from when it is
+    /// implemented.
+    pub model_policy: Option<String>,
     pub tags: Vec<Tag>,
-    /// The `ClientRequestToken` the classifier was created under, if any.
+    /// The `ClientRequestToken` the classifier was created under, if any. Held so
+    /// the idempotency-index entry can be dropped with the record it points at.
     pub client_request_token: Option<String>,
 }
 
 impl DocumentClassifier {
-    /// A classifier record as it stands the instant it was submitted: the identity
-    /// and the configuration it was created with, nothing trained yet.
+    /// Materialise every status change the clock already owed at `now`.
     ///
-    /// `MULTI_CLASS` is the mode `CreateDocumentClassifier` documents as its
-    /// default ("the default is `MULTI_CLASS`" on
-    /// `CreateDocumentClassifierRequest$Mode`); a caller that named a mode
-    /// overwrites the field.
+    /// Called by the reporting operations as well as the mutating ones: the
+    /// transition was due at `now` whether or not anybody called, so applying it on
+    /// read reports the status the classifier already had rather than advancing it.
+    ///
+    /// The terminal status of a started training is `IN_ERROR`, never `TRAINED`:
+    /// training means reading the labelled documents from the Amazon S3 location
+    /// `InputDataConfig` names and fitting a model on them, and this emulator serves
+    /// no object storage and runs no training, so no document is ever read and no
+    /// model is ever fitted. The classifier therefore ends in the modelled failure
+    /// state with a `Message` that says exactly that, rather than reporting a
+    /// `TRAINED` model that nothing trained and that no inference could use.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == "SUBMITTED" && now >= self.training_due_at {
+            self.status = "TRAINING".to_string();
+            self.training_start_time = Some(self.training_due_at);
+        }
+        if self.status == "TRAINING" && now >= self.terminal_due_at {
+            self.status = "IN_ERROR".to_string();
+            self.training_end_time = Some(self.terminal_due_at);
+            self.end_time = Some(self.terminal_due_at);
+            self.message = Some(self.untrained_model_message());
+        }
+        if self.status == "STOP_REQUESTED" && self.stopped_due_at.is_some_and(|due| now >= due) {
+            self.status = "STOPPED".to_string();
+            self.training_end_time = self.stopped_due_at;
+            self.end_time = self.stopped_due_at;
+        }
+    }
+
+    /// Record that a caller asked for this classifier's training to stop.
+    ///
+    /// `StopTrainingDocumentClassifier` documents the two outcomes: a classifier
+    /// whose state is `TRAINING` "is marked for termination and put into the
+    /// `STOP_REQUESTED` state", and one whose training already finished keeps the
+    /// status it reached. A classifier still `SUBMITTED` has no training to wind
+    /// down, so it stops outright.
+    pub fn request_stop(&mut self, now: SystemTime) {
+        match self.status.as_str() {
+            "SUBMITTED" => {
+                self.status = "STOPPED".to_string();
+                self.end_time = Some(now);
+            }
+            "TRAINING" => {
+                self.status = "STOP_REQUESTED".to_string();
+                self.stopped_due_at = Some(now + CLASSIFIER_STOPPING_SPAN);
+            }
+            // Already stopping, stopped, deleting or terminal: nothing to wind down.
+            _ => return,
+        }
+        self.message = Some("Training was stopped at the request of the caller.".to_string());
+    }
+
+    /// Record that a caller asked for this classifier to be deleted: it goes
+    /// `DELETING` now and the record is removed once the clock owes it, which
+    /// [`ComAmazonawsComprehendComprehend20171127State::settle_document_classifiers`]
+    /// materialises.
+    pub fn request_deletion(&mut self, now: SystemTime) {
+        self.status = "DELETING".to_string();
+        self.removal_due_at = Some(now + CLASSIFIER_DELETING_SPAN);
+    }
+
+    /// Whether this classifier's training has finished, for good or ill \u2014 the
+    /// states `DeleteDocumentClassifier` calls terminated.
+    ///
+    /// The operation documents "Only those classifiers that are in terminated states
+    /// (IN_ERROR, TRAINED) will be deleted"; `STOPPED` and `TRAINED_WITH_WARNING`
+    /// belong to the same set, because training has ended there too and no status
+    /// change can ever leave them.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "TRAINED" | "TRAINED_WITH_WARNING" | "IN_ERROR" | "STOPPED"
+        )
+    }
+
+    /// Why a started training fails: the labelled documents it was pointed at were
+    /// never read, so no model was ever fitted.
+    fn untrained_model_message(&self) -> String {
+        let input = self.input_data_config.as_ref();
+        let source = input
+            .and_then(|config| config.s3_uri.clone())
+            .or_else(|| {
+                input
+                    .and_then(|config| config.augmented_manifests.as_ref())
+                    .and_then(|manifests| manifests.first().map(|item| item.s3_uri.clone()))
+            })
+            .or_else(|| {
+                input
+                    .and_then(|config| config.documents.as_ref())
+                    .map(|documents| documents.s3_uri.clone())
+            })
+            .unwrap_or_else(|| "the configured input location".to_string());
+        format!(
+            "Could not read the training documents from {source}: this emulator serves no \
+             object storage and runs no model training, so no document was read and no \
+             classifier was trained."
+        )
+    }
+
+    /// A classifier record as it stands the instant it was submitted: the identity
+    /// and the configuration it was created with, nothing trained yet, and the two
+    /// instants the clock owes its next status changes at.
+    ///
+    /// [`DEFAULT_CLASSIFIER_MODE`] is the mode `CreateDocumentClassifier` documents
+    /// as its default; a caller that named a mode overwrites the field.
     pub fn submitted(
         seq: u64,
         classifier_arn: String,
@@ -684,6 +925,10 @@ impl DocumentClassifier {
             end_time: None,
             training_start_time: None,
             training_end_time: None,
+            training_due_at: submit_time + CLASSIFIER_SUBMITTED_SPAN,
+            terminal_due_at: submit_time + CLASSIFIER_SUBMITTED_SPAN + CLASSIFIER_TRAINING_SPAN,
+            stopped_due_at: None,
+            removal_due_at: None,
             input_data_config: None,
             output_data_config: None,
             classifier_metadata: None,
@@ -691,15 +936,20 @@ impl DocumentClassifier {
             volume_kms_key_id: None,
             model_kms_key_id: None,
             vpc_config: None,
-            mode: "MULTI_CLASS".to_string(),
+            mode: DEFAULT_CLASSIFIER_MODE.to_string(),
             source_model_arn: None,
             flywheel_arn: None,
+            model_policy: None,
             tags: Vec::new(),
             client_request_token: None,
         }
     }
 
     /// Project this record into the modelled `DocumentClassifierProperties` shape.
+    ///
+    /// `ClassifierMetadata` is whatever the record carries: the metrics of a fitted
+    /// model are reported only for a classifier that has them, never invented for one
+    /// that trained nothing.
     pub fn document_classifier_properties(&self) -> DocumentClassifierProperties {
         DocumentClassifierProperties {
             document_classifier_arn: Some(self.classifier_arn.clone()),
@@ -763,6 +1013,10 @@ pub struct ComAmazonawsComprehendComprehend20171127State {
     /// `DocumentClassifierArn`. Bounded by [`MAX_DOCUMENT_CLASSIFIER_RECORDS`]:
     /// insert through [`Self::insert_document_classifier`], never directly.
     pub document_classifiers: BTreeMap<String, DocumentClassifier>,
+    /// The first classifier ARN minted for a `ClientRequestToken`, so a retried
+    /// `CreateDocumentClassifier` resolves to the classifier it already created. An
+    /// entry is dropped with the classifier it points at.
+    pub classifier_idempotency_tokens: HashMap<String, String>,
     /// Monotonic creation counter, the source of a classifier's `seq` — the stable
     /// order `ListDocumentClassifiers` pages on.
     pub document_classifier_seq: u64,
@@ -786,6 +1040,48 @@ impl ComAmazonawsComprehendComprehend20171127State {
         hasher.update(nanos.to_be_bytes());
         let digest = hasher.finalize();
         (self.job_id_seq, hex::encode(&digest[..16]))
+    }
+
+    /// Materialise every document-classifier change the clock already owed at `now`:
+    /// each record's own status transitions, and the removal of a record whose
+    /// `DELETING` span has elapsed.
+    ///
+    /// The ONE place a classifier's clock-owed change is applied to the STORE, so
+    /// every reporting and mutating operation calls it first and none of them has to
+    /// know about the other's transitions. The sweep is bounded by
+    /// [`MAX_DOCUMENT_CLASSIFIER_RECORDS`].
+    pub fn settle_document_classifiers(&mut self, now: SystemTime) {
+        for classifier in self.document_classifiers.values_mut() {
+            classifier.settle(now);
+        }
+        let removed: Vec<String> = self
+            .document_classifiers
+            .iter()
+            .filter(|(_, classifier)| classifier.removal_due_at.is_some_and(|due| now >= due))
+            .map(|(arn, _)| arn.clone())
+            .collect();
+        for arn in removed {
+            let dropped = self.document_classifiers.remove(&arn);
+            self.forget_classifier_token(&arn, dropped);
+        }
+    }
+
+    /// Drop the idempotency-index entry of a classifier record that has just left
+    /// the store — but only while it still points at that record, because a later
+    /// creation may have taken the same token over.
+    ///
+    /// The ONE place that invariant is written, for both ways a record leaves:
+    /// a completed deletion and an eviction at the bound.
+    fn forget_classifier_token(&mut self, arn: &str, record: Option<DocumentClassifier>) {
+        if let Some(token) = record.and_then(|classifier| classifier.client_request_token) {
+            if self
+                .classifier_idempotency_tokens
+                .get(&token)
+                .is_some_and(|indexed| indexed == arn)
+            {
+                self.classifier_idempotency_tokens.remove(&token);
+            }
+        }
     }
 
     /// The `JobId` an earlier submission under exactly this key minted, if the job
@@ -849,12 +1145,16 @@ impl ComAmazonawsComprehendComprehend20171127State {
         self.document_classifier_seq
     }
 
-    /// Persist a classifier record and evict the oldest once the store passes
-    /// [`MAX_DOCUMENT_CLASSIFIER_RECORDS`].
+    /// Persist a classifier record, index it under its `ClientRequestToken`, and
+    /// evict the oldest once the store passes [`MAX_DOCUMENT_CLASSIFIER_RECORDS`].
     ///
     /// The ONE insertion path for [`Self::document_classifiers`], so the bound
     /// cannot be bypassed by a handler.
     pub fn insert_document_classifier(&mut self, classifier: DocumentClassifier) {
+        if let Some(token) = classifier.client_request_token.clone() {
+            self.classifier_idempotency_tokens
+                .insert(token, classifier.classifier_arn.clone());
+        }
         self.document_classifiers
             .insert(classifier.classifier_arn.clone(), classifier);
         while self.document_classifiers.len() > MAX_DOCUMENT_CLASSIFIER_RECORDS {
@@ -866,7 +1166,8 @@ impl ComAmazonawsComprehendComprehend20171127State {
                 })
                 .map(|(arn, _)| arn.clone());
             let Some(oldest) = oldest else { break };
-            self.document_classifiers.remove(&oldest);
+            let evicted = self.document_classifiers.remove(&oldest);
+            self.forget_classifier_token(&oldest, evicted);
         }
     }
 }
