@@ -14,5 +14,8 @@
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/subscription_pending_confirmation.rs"]
+mod subscription_pending_confirmation;
+
 #[path = "all/topics_subscriptions_publish.rs"]
 mod topics_subscriptions_publish;

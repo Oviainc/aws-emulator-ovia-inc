@@ -142,10 +142,121 @@ const PROTOCOLS: &[&str] = &[
 /// addresses an AWS resource the caller already owns, so it is confirmed at once.
 const PROTOCOLS_NEEDING_CONFIRMATION: &[&str] = &["http", "https", "email", "email-json"];
 
-/// What SNS answers instead of the ARN for a subscription that is not confirmed yet,
-/// unless `ReturnSubscriptionArn` asks for the ARN in all cases
-/// (`SubscribeResponse$SubscriptionArn` doc).
-const PENDING_CONFIRMATION: &str = "pending confirmation";
+/// The prefix the resource part of a platform endpoint's ARN carries
+/// (`arn:aws:sns:<region>:<account>:endpoint/<platform>/<application>/<id>`, from the
+/// `CreatePlatformEndpointResponse$EndpointArn` doc) — what tells an `application`
+/// protocol's endpoint from a topic or platform-application ARN of the same service.
+const PLATFORM_ENDPOINT_PREFIX: &str = "endpoint/";
+
+/// The prefix the resource part of a Lambda function's ARN carries
+/// (`arn:aws:lambda:<region>:<account>:function:<name>[:<qualifier>]`).
+const LAMBDA_FUNCTION_PREFIX: &str = "function:";
+
+/// The prefix the resource part of a Firehose delivery stream's ARN carries
+/// (`arn:aws:firehose:<region>:<account>:deliverystream/<name>`).
+const FIREHOSE_STREAM_PREFIX: &str = "deliverystream/";
+
+/// The fewest digits a phone number of an SMS-enabled device may hold: an E.164
+/// subscriber number is never shorter than a country code plus a handful of digits,
+/// and the point of the floor is only to refuse a string that is not a phone number
+/// at all.
+const MIN_PHONE_DIGITS: usize = 7;
+
+/// The most digits an E.164 phone number holds — "the maximum length of an E.164
+/// number is 15 digits", the form SNS documents for an SMS destination.
+const MAX_PHONE_DIGITS: usize = 15;
+
+/// Whether `endpoint` is a URL under `scheme`: the scheme (case-insensitively, as
+/// URL schemes compare) followed by a host.
+fn is_url(endpoint: &str, scheme: &str) -> bool {
+    let Some(prefix) = endpoint.get(..scheme.len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case(scheme) {
+        return false;
+    }
+    // `get(..n)` succeeded, so `n` is a character boundary.
+    let rest = &endpoint[scheme.len()..];
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !host.is_empty() && !host.chars().any(char::is_whitespace)
+}
+
+/// Whether `endpoint` is an email address: one `@`, a non-empty local part, and a
+/// domain of at least two non-empty dot-separated labels.
+fn is_email_address(endpoint: &str) -> bool {
+    fn well_formed(part: &str) -> bool {
+        !part.is_empty() && !part.chars().any(|c| c.is_whitespace() || c == ',' || c == '@')
+    }
+
+    let parts: Vec<&str> = endpoint.split('@').collect();
+    let [local, domain] = parts[..] else {
+        return false;
+    };
+    let labels: Vec<&str> = domain.split('.').collect();
+    well_formed(local) && labels.len() >= 2 && labels.iter().all(|label| well_formed(label))
+}
+
+/// Whether `endpoint` is a phone number of an SMS-enabled device: [`MIN_PHONE_DIGITS`]
+/// to [`MAX_PHONE_DIGITS`] digits, optionally written with a leading `+` and the usual
+/// separators.
+fn is_phone_number(endpoint: &str) -> bool {
+    let body = endpoint.strip_prefix('+').unwrap_or(endpoint);
+    let digits = body.chars().filter(char::is_ascii_digit).count();
+    body.chars()
+        .all(|c| c.is_ascii_digit() || " -.()".contains(c))
+        && (MIN_PHONE_DIGITS..=MAX_PHONE_DIGITS).contains(&digits)
+}
+
+/// Whether `endpoint` has the form the `SubscribeInput$Endpoint` doc gives for
+/// `protocol` — a URL under the protocol's own scheme for `http`/`https`, an email
+/// address for `email`/`email-json`, a phone number for `sms`, and the ARN of the
+/// named resource for `sqs`, `application`, `lambda` and `firehose`.
+///
+/// `protocol` is already one of [`PROTOCOLS`] when this runs, so the fallthrough is
+/// unreachable; it refuses rather than accepts, because a protocol with no endpoint
+/// rule is one nobody has written a rule for yet.
+fn endpoint_matches_protocol(protocol: &str, endpoint: &str) -> bool {
+    /// The resource part of an ARN of `service` whose resource starts with `prefix`
+    /// and names something after it.
+    fn names(endpoint: &str, service: &str, prefix: &str) -> bool {
+        state::arn_resource(endpoint, service).is_some_and(|resource| {
+            resource
+                .strip_prefix(prefix)
+                .is_some_and(|name| !name.is_empty())
+        })
+    }
+
+    match protocol {
+        "http" => is_url(endpoint, "http://"),
+        "https" => is_url(endpoint, "https://"),
+        "email" | "email-json" => is_email_address(endpoint),
+        "sms" => is_phone_number(endpoint),
+        "sqs" => state::arn_resource(endpoint, "sqs").is_some(),
+        "application" => names(endpoint, "sns", PLATFORM_ENDPOINT_PREFIX),
+        "lambda" => names(endpoint, "lambda", LAMBDA_FUNCTION_PREFIX),
+        "firehose" => names(endpoint, "firehose", FIREHOSE_STREAM_PREFIX),
+        _ => false,
+    }
+}
+
+/// How the refusal of a bad endpoint names what the protocol wanted.
+///
+/// Only the `lambda` wording is pinned by a recorded AWS response ("Invalid
+/// parameter: Lambda endpoint ARN"); the other entries say the same thing about the
+/// same kind of endpoint. The REQUIREMENT this refusal carries is its HTTP 400 and
+/// its `InvalidParameter` code — the text is an example of SNS's wording.
+fn endpoint_requirement(protocol: &str) -> &'static str {
+    match protocol {
+        "http" | "https" => "Endpoint must match the specified protocol",
+        "email" | "email-json" => "Email address",
+        "sms" => "PhoneNumber",
+        "sqs" => "SQS endpoint ARN",
+        "application" => "Application endpoint ARN",
+        "lambda" => "Lambda endpoint ARN",
+        "firehose" => "Firehose endpoint ARN",
+        _ => "Endpoint",
+    }
+}
 
 /// The refusal for a subscription record whose attribute map would cross the
 /// per-record byte ceiling, or `None` when it fits.
@@ -246,6 +357,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "Invalid parameter: Protocol - must be one of {}: {}",
                         PROTOCOLS.join(", "),
                         input.protocol
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every protocol addresses its endpoint in a form of its own, and SNS refuses
+        // an endpoint that is not in that form BEFORE any state is written: a
+        // subscription to an endpoint that cannot exist is never created. The endpoint
+        // is also required — there is no protocol SNS delivers to without one.
+        let valid_endpoint = input
+            .endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint_matches_protocol(&protocol, endpoint));
+        if !valid_endpoint {
+            return Err(SubscribeErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid parameter: {}",
+                        endpoint_requirement(&protocol)
                     )),
                 },
             )
@@ -358,7 +489,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An unconfirmed subscription's ARN is withheld unless the caller asked for it.
         let reported = if pending_confirmation && !input.return_subscription_arn {
-            PENDING_CONFIRMATION.to_string()
+            state::PENDING_CONFIRMATION_REPORTED.to_string()
         } else {
             arn
         };

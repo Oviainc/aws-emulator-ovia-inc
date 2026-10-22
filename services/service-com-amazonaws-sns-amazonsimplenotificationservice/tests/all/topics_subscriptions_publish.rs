@@ -472,7 +472,11 @@ async fn subscribe_reports_an_unconfirmed_subscription_as_pending() {
         ("email-json", "ops@example.test", true),
         ("sms", "+15550100", false),
         ("sqs", "arn:aws:sqs:us-east-1:000000000000:q", false),
-        ("application", "arn:aws:sns:us-east-1:000000000000:app/GCM/x", false),
+        (
+            "application",
+            "arn:aws:sns:us-east-1:000000000000:endpoint/GCM/app/00000000-0000-4000-8000-000000000000",
+            false,
+        ),
         ("lambda", "arn:aws:lambda:us-east-1:000000000000:function:f", false),
         ("firehose", "arn:aws:firehose:us-east-1:000000000000:deliverystream/s", false),
     ];
@@ -530,9 +534,16 @@ async fn subscribe_reports_an_unconfirmed_subscription_as_pending() {
         let listed = sns
             .call("ListSubscriptionsByTopic", &[("TopicArn", &topic)])
             .await;
+        // The listing publishes the ARN only once the subscription is confirmed; while
+        // it is pending it carries the sentinel in the ARN's place.
+        let expected_in_listing = if *needs_confirmation {
+            "PendingConfirmation".to_string()
+        } else {
+            arn.clone()
+        };
         assert_eq!(
             listed.elements("SubscriptionArn"),
-            vec![arn.clone()],
+            vec![expected_in_listing],
             "case {protocol:?}: the topic must hold exactly the one subscription, got {}",
             listed.body
         );
@@ -1252,8 +1263,8 @@ async fn get_topic_attributes_derives_its_subscription_counts() {
     assert_eq!(absent.code(), "NotFound", "got {}", absent.body);
 }
 
-/// Unsubscribe removes the subscription from the listing, and refuses an ARN that is
-/// not in the store.
+/// Unsubscribe removes the subscription from the listing, is idempotent in a
+/// well-formed ARN, and refuses a `SubscriptionArn` that is not one.
 #[tokio::test]
 async fn unsubscribe_removes_the_subscription_from_the_listing() {
     let sns = Sns::new();
@@ -1300,27 +1311,50 @@ async fn unsubscribe_removes_the_subscription_from_the_listing() {
             "case {arn:?}: the unsubscribed subscription must be gone, got {remaining:?}"
         );
 
-        // Unsubscribing the same ARN again finds nothing.
+        // Deleting a subscription is idempotent in its ARN: the second call has
+        // nothing left to do and is answered the same way.
         let repeat = sns.call("Unsubscribe", &[("SubscriptionArn", arn)]).await;
         assert_eq!(
-            repeat.status, 404,
-            "case {arn:?}: a second Unsubscribe must be 404, got {} / {}",
+            repeat.status, 200,
+            "case {arn:?}: a second Unsubscribe must be 200, got {} / {}",
             repeat.status, repeat.body
         );
-        assert_eq!(repeat.code(), "NotFound", "got {}", repeat.body);
     }
 
-    for unknown in [
-        "pending confirmation",
-        "arn:aws:sns:us-east-1:000000000000:unsubscribe-topic:00000000-0000-4000-8000-000000000000",
+    // A well-formed ARN no subscription carries is the idempotent case too; a value
+    // that is not a subscription ARN at all is refused as bad input.
+    let unknown = sns
+        .call(
+            "Unsubscribe",
+            &[(
+                "SubscriptionArn",
+                "arn:aws:sns:us-east-1:000000000000:unsubscribe-topic:\
+                 00000000-0000-4000-8000-000000000000",
+            )],
+        )
+        .await;
+    assert_eq!(
+        unknown.status, 200,
+        "an unknown but well-formed ARN must be 200, got {} / {}",
+        unknown.status, unknown.body
+    );
+    for malformed in [
+        "not-an-arn-at-all",
+        "arn:aws:sns:us-east-1:000000000000:unsubscribe-topic",
     ] {
         let answer = sns
-            .call("Unsubscribe", &[("SubscriptionArn", unknown)])
+            .call("Unsubscribe", &[("SubscriptionArn", malformed)])
             .await;
         assert_eq!(
-            answer.status, 404,
-            "case {unknown:?}: expected 404, got {} / {}",
+            answer.status, 400,
+            "case {malformed:?}: expected 400, got {} / {}",
             answer.status, answer.body
+        );
+        assert_eq!(
+            answer.code(),
+            "InvalidParameter",
+            "case {malformed:?}: expected the InvalidParameter code, got {}",
+            answer.body
         );
     }
 }

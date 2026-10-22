@@ -66,6 +66,55 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
+
+/// The fields every ARN holds: `arn:<partition>:<service>:<region>:<account>:<resource>`.
+const ARN_FIELDS: usize = 6;
+
+/// The fields a SUBSCRIPTION's ARN holds: an ARN whose resource is a topic name
+/// followed by the subscription's own id segment
+/// (`arn:aws:sns:<region>:<account>:<topic>:<id>`, as `Subscribe` mints it).
+const SUBSCRIPTION_ARN_FIELDS: usize = ARN_FIELDS + 1;
+
+/// Why `arn` is not a subscription ARN, or `None` when it is one.
+///
+/// The reason names the member's constraint and is built from the request, the way
+/// SNS's own argument validation reports one ("An ARN must have at least 6 elements,
+/// not 1"); nothing of the recorded wire text is required beyond that.
+fn malformed_subscription_arn(arn: &str) -> Option<String> {
+    let fields: Vec<&str> = arn.split(':').collect();
+    if fields.len() < ARN_FIELDS {
+        return Some(format!(
+            "An ARN must have at least {ARN_FIELDS} elements, not {}",
+            fields.len()
+        ));
+    }
+    let well_formed = fields.len() == SUBSCRIPTION_ARN_FIELDS
+        && fields[0] == "arn"
+        && fields[2] == "sns"
+        && fields[1..].iter().all(|field| !field.is_empty())
+        && state::topic_name_is_valid(fields[5]);
+    (!well_formed).then(|| {
+        format!(
+            "A subscription ARN names a topic and the subscription's id, so it has \
+             {SUBSCRIPTION_ARN_FIELDS} elements: {arn}"
+        )
+    })
+}
+
+/// The refusal of a subscription that is still awaiting confirmation. The HTTP 400 and
+/// the `InvalidParameter` code are the requirement; the sentence is SNS's own wording
+/// for this reason.
+fn pending_confirmation_refusal() -> UnsubscribeError {
+    UnsubscribeErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(
+            "Invalid parameter: SubscriptionArn Reason: Cannot unsubscribe a subscription \
+             that is pending confirmation"
+                .to_string(),
+        ),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -168,14 +217,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = store.lock();
 
-        let Some(removed) = store.subscriptions.remove(&input.subscription_arn) else {
-            return Err(UnsubscribeErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Subscription does not exist: {}",
-                    input.subscription_arn
-                )),
-            })
+        // The sentinel SNS publishes in place of an unconfirmed subscription's ARN is
+        // not an ARN: a caller that read it out of a `Subscribe` or a listing response
+        // and handed it back has named a subscription that is still awaiting
+        // confirmation, so that is what the refusal says.
+        if crate::state::is_pending_confirmation_sentinel(&input.subscription_arn) {
+            return Err(pending_confirmation_refusal());
+        }
+
+        // A `SubscriptionArn` that is not a subscription ARN fails argument validation
+        // BEFORE any lookup, so garbage is refused as bad input rather than reported as
+        // a subscription that is merely absent.
+        if let Some(reason) = malformed_subscription_arn(&input.subscription_arn) {
+            return Err(UnsubscribeErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid parameter: SubscriptionArn Reason: {reason}"
+                    )),
+                },
+            )
             .into());
+        }
+
+        // A subscription still awaiting confirmation cannot be deleted through the API:
+        // SNS refuses the call and leaves the subscription in place, so a caller that
+        // holds its ARN (from `ReturnSubscriptionArn`) still has to wait for the
+        // subscriber to confirm.
+        if store
+            .subscriptions
+            .get(&input.subscription_arn)
+            .is_some_and(|held| held.pending_confirmation)
+        {
+            return Err(pending_confirmation_refusal());
+        }
+
+        // Deleting a subscription is IDEMPOTENT in its ARN: a well-formed ARN whose
+        // subscription is already gone — a repeated teardown, or one whose topic was
+        // deleted with its subscriptions — leaves nothing to do and is answered the
+        // same way as the delete that did the work.
+        let Some(removed) = store.subscriptions.remove(&input.subscription_arn) else {
+            return Ok(UnsubscribeOutput);
         };
         // The messages delivered to a subscription go with it, but the topic keeps
         // counting the deletion: that is its `SubscriptionsDeleted` attribute.

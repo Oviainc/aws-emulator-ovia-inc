@@ -80,6 +80,32 @@ pub const TOPIC_ATTRIBUTE_NAMES: &[&str] = &[
     "TracingConfig",
 ];
 
+/// What `Subscribe` answers in place of the ARN of a subscription that is not
+/// confirmed yet: "the string \"pending confirmation\" if the subscription requires
+/// confirmation" (`SubscribeResponse$SubscriptionArn` doc), unless
+/// `ReturnSubscriptionArn` asks for the ARN in all cases.
+pub const PENDING_CONFIRMATION_REPORTED: &str = "pending confirmation";
+
+/// What a subscription LISTING carries in `Subscription$SubscriptionArn` while the
+/// subscription is not confirmed yet.
+///
+/// "A subscription becomes confirmed when the subscriber calls the
+/// ConfirmSubscription action" (`SubscribeInput$ReturnSubscriptionArn` doc), and until
+/// then SNS publishes no ARN for it: a listing carries this sentinel in the ARN's
+/// place. It is the same state as [`PENDING_CONFIRMATION_REPORTED`] but not the same
+/// spelling — `Subscribe`'s own doc fixes the wording of its response, and the
+/// recorded wire responses of `ListSubscriptionsByTopic` fix this one.
+pub const PENDING_CONFIRMATION_LISTED: &str = "PendingConfirmation";
+
+/// Whether `value` is one of the sentinels SNS publishes in place of an unconfirmed
+/// subscription's ARN ([`PENDING_CONFIRMATION_REPORTED`],
+/// [`PENDING_CONFIRMATION_LISTED`]) rather than an ARN — so a caller that read one out
+/// of a `Subscribe` or a listing response and handed it back names a subscription that
+/// is still pending, not a subscription that does not exist.
+pub fn is_pending_confirmation_sentinel(value: &str) -> bool {
+    value == PENDING_CONFIRMATION_REPORTED || value == PENDING_CONFIRMATION_LISTED
+}
+
 /// The attribute names SNS defines for a subscription, from the `Subscribe` /
 /// `SetSubscriptionAttributes` docs. Closed for the same two reasons as
 /// [`TOPIC_ATTRIBUTE_NAMES`].
@@ -500,6 +526,30 @@ pub fn topic_name_from_arn(arn: &str) -> Option<&str> {
     match fields[..] {
         ["arn", _partition, "sns", _region, _account, name] if topic_name_is_valid(name) => {
             Some(name)
+        }
+        _ => None,
+    }
+}
+
+/// The resource part of `arn` when `arn` is an ARN of `service`, or `None` when it is
+/// not an ARN at all or names another service.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account-id>:<resource>`, and the
+/// resource is the ONLY field that may itself hold `:` separators (a Lambda
+/// function's `function:<name>:<qualifier>`, say) — hence the split bounded at six
+/// fields. Shared, because "is this string an ARN of that service?" is the question
+/// every per-protocol endpoint rule asks.
+pub fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    match fields[..] {
+        ["arn", partition, found, region, account, resource]
+            if found == service
+                && !partition.is_empty()
+                && !region.is_empty()
+                && !account.is_empty()
+                && !resource.is_empty() =>
+        {
+            Some(resource)
         }
         _ => None,
     }
