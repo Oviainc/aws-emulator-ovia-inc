@@ -27,25 +27,25 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
                              SignedHeaders=host;x-amz-date, Signature=deadbeef";
 
 /// The region of [`AUTHORIZATION`]'s credential scope.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The account id every generated emulator presents.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Long enough that a transition the clock owed at `SETTLE_AFTER` has come due.
-fn wait_for_the_clock() {
+pub(crate) fn wait_for_the_clock() {
     // A test may wait for a due instant; a handler may not. `tokio`'s timer is not in
     // this workspace's feature set, so the current-thread test runtime parks instead.
     std::thread::sleep(SETTLE_AFTER + Duration::from_millis(250));
 }
 
 /// One emulator with this service mounted.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -54,7 +54,7 @@ impl Emulator {
     }
 
     /// Call `operation` and return the HTTP status with the parsed JSON body.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("https://acm-pca.eu-west-1.amazonaws.com/")
@@ -77,7 +77,7 @@ impl Emulator {
     }
 
     /// Call `operation`, requiring success.
-    async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -87,7 +87,13 @@ impl Emulator {
     }
 
     /// Call `operation`, requiring the modelled error `code` with HTTP 400.
-    async fn refused(&self, case: &str, operation: &str, body: &Value, code: &str) -> Value {
+    pub(crate) async fn refused(
+        &self,
+        case: &str,
+        operation: &str,
+        body: &Value,
+        code: &str,
+    ) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 400,
@@ -108,7 +114,7 @@ impl Emulator {
 
 /// The smallest configuration `CreateCertificateAuthority` accepts, with `common_name`
 /// as the subject.
-fn root_ca_request(common_name: &str) -> Value {
+pub(crate) fn root_ca_request(common_name: &str) -> Value {
     json!({
         "CertificateAuthorityConfiguration": {
             "KeyAlgorithm": "RSA_2048",
@@ -235,7 +241,7 @@ fn blob(text: &str) -> Value {
 }
 
 /// `Value` member as a `&str`, or a panic naming the case.
-fn string(value: &Value, member: &str, case: &str) -> String {
+pub(crate) fn string(value: &Value, member: &str, case: &str) -> String {
     value
         .get(member)
         .and_then(Value::as_str)

@@ -292,6 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             next_serial: 1,
             certificates: ::std::collections::HashMap::new(),
+            permissions: ::std::vec::Vec::new(),
             issue_idempotency: ::std::collections::HashMap::new(),
             arn: arn.clone(),
         };

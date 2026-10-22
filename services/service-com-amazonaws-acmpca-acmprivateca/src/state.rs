@@ -23,8 +23,8 @@ use x509_cert::time::{Time, Validity as CertificateValidity};
 use x509_cert::{Certificate, TbsCertificate, Version};
 
 use crate::ops::types::{
-    ASN1Subject, CertificateAuthority, CertificateAuthorityConfiguration, RevocationConfiguration,
-    Tag, Validity,
+    ASN1Subject, CertificateAuthority, CertificateAuthorityConfiguration, Permission,
+    RevocationConfiguration, Tag, Validity,
 };
 
 /// A PKCS#10 certification request, as this service reads and writes one.
@@ -148,6 +148,15 @@ pub const MAX_CERTIFICATE_AUTHORITIES: usize = 200;
 /// Most certificates one CA holds at once, bounded for the same reason.
 pub const MAX_CERTIFICATES_PER_CA: usize = 1_000;
 
+/// Most permissions one CA holds at once.
+///
+/// A BOUND, in the shape of the quota Amazon Web Services Private CA publishes for the
+/// permissions attached to one private CA: a permission is held in memory for the life of
+/// the process, so without a ceiling a caller naming a fresh principal per call could grow
+/// the store without limit. A grant past it answers the modelled `LimitExceededException`,
+/// which names the quota.
+pub const MAX_PERMISSIONS_PER_CA: usize = 100;
+
 /// Most live idempotency tokens one map holds. Expired entries are swept on every
 /// record, and the oldest live entry is evicted at the ceiling, so a caller sending a
 /// fresh token per request cannot grow the map without limit.
@@ -183,6 +192,48 @@ impl IssuedCertificate {
     /// Whether issuance has completed as of `now`.
     pub fn is_available(&self, now: SystemTime) -> bool {
         now >= self.available_at
+    }
+}
+
+/// One permission granted on a private CA to a service principal.
+///
+/// Identified, as Amazon Web Services Private CA identifies it, by the CA it was granted
+/// on together with the principal that holds it and the account that assigned it: those
+/// three are what `CreatePermission` keys a grant by and what `DeletePermission` names to
+/// revoke one.
+#[derive(Debug, Clone)]
+pub struct PermissionRecord {
+    /// The service or identity that holds the permission.
+    pub principal: String,
+    /// "The ID of the account that assigned the permission." (`Permission$SourceAccount`).
+    pub source_account: String,
+    /// The `ActionType` members the principal may call on the CA, in the order granted.
+    pub actions: Vec<String>,
+    /// When `CreatePermission` accepted the grant.
+    pub created_at: SystemTime,
+}
+
+impl PermissionRecord {
+    /// What identifies this grant among the ones its CA holds.
+    pub fn key(&self) -> (&str, &str) {
+        (self.principal.as_str(), self.source_account.as_str())
+    }
+
+    /// The modelled `Permission` structure, read straight off this record.
+    ///
+    /// `Policy` is left out: it reports "the name of the policy that is associated with
+    /// the permission" (`Permission$Policy`), which a grant made through
+    /// `CreatePermission` does not carry — only a resource-based policy put through
+    /// `PutPolicy` names one.
+    pub fn to_wire(&self, certificate_authority_arn: &str) -> Permission {
+        Permission {
+            certificate_authority_arn: Some(certificate_authority_arn.to_string()),
+            created_at: Some(to_date_time(self.created_at)),
+            principal: Some(self.principal.clone()),
+            source_account: Some(self.source_account.clone()),
+            actions: Some(self.actions.clone()),
+            policy: None,
+        }
     }
 }
 
@@ -233,6 +284,8 @@ pub struct CertificateAuthorityRecord {
     pub next_serial: u64,
     /// Certificates issued by this CA, keyed by certificate ARN.
     pub certificates: HashMap<String, IssuedCertificate>,
+    /// Permissions granted on this CA, one per (principal, source account) pair.
+    pub permissions: Vec<PermissionRecord>,
     /// `IssueCertificate` idempotency tokens -> the certificate ARN they minted.
     pub issue_idempotency: HashMap<String, IdempotencyEntry>,
 }
@@ -248,6 +301,30 @@ impl CertificateAuthorityRecord {
             self.status = STATUS_PENDING_CERTIFICATE.to_string();
             self.last_state_change_at = self.settles_at;
         }
+    }
+
+    /// The permission this CA holds for `principal` and `source_account`, when it holds
+    /// one: the grant those two name is unique among the CA's permissions.
+    pub fn permission(
+        &self,
+        principal: &str,
+        source_account: &str,
+    ) -> Option<&PermissionRecord> {
+        self.permissions
+            .iter()
+            .find(|permission| permission.key() == (principal, source_account))
+    }
+
+    /// Every permission this CA holds, ordered by the pair that identifies a grant.
+    ///
+    /// A total order over that pair is what lets one `ListPermissions` page resume where
+    /// the previous one stopped: the position a `NextToken` names is the same on every
+    /// call, whatever order the grants were made in and whether or not the grant the
+    /// token names is still there.
+    pub fn permissions_in_order(&self) -> Vec<&PermissionRecord> {
+        let mut ordered: Vec<&PermissionRecord> = self.permissions.iter().collect();
+        ordered.sort_by_key(|permission| permission.key());
+        ordered
     }
 
     /// The modelled `CertificateAuthority` structure, read straight off this record.
