@@ -17,3 +17,5 @@ mod keyspace_table_lifecycle;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_table.rs"]
+mod update_table;

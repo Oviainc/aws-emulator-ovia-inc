@@ -39,7 +39,7 @@ pub(crate) const REGION: &str = "us-west-2";
 
 /// How long a test waits before expecting a transient status to have settled: the span
 /// the service stores, plus a margin for a loaded test machine.
-fn settle_wait() -> Duration {
+pub(crate) fn settle_wait() -> Duration {
     keyspaces::TRANSIENT_STATUS_SPAN + Duration::from_millis(250)
 }
 
@@ -112,7 +112,12 @@ pub(crate) fn error_code(body: &Value) -> String {
 }
 
 /// Assert a call failed with `expected_status` and `expected_code`, naming the case.
-pub(crate) fn assert_failure(case: &str, got: (u16, Value), expected_status: u16, expected_code: &str) {
+pub(crate) fn assert_failure(
+    case: &str,
+    got: (u16, Value),
+    expected_status: u16,
+    expected_code: &str,
+) {
     let (status, body) = got;
     assert_eq!(
         (status, error_code(&body).as_str()),

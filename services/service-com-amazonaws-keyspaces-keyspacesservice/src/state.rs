@@ -42,10 +42,18 @@ pub const TABLE_STATUS_ACTIVE: &str = "ACTIVE";
 /// `TableStatus` = `DELETING`: what `DeleteTable` puts a table in until the
 /// deletion completes.
 pub const TABLE_STATUS_DELETING: &str = "DELETING";
+/// `TableStatus` = `UPDATING`: what `UpdateTable` puts a table in until the
+/// setting change completes.
+///
+/// That `UpdateTable` is asynchronous and leaves the table in this status is what
+/// `DeleteTable` documents from the other side: "If a table is either in the
+/// `CREATING` or `UPDATING` states, then Amazon Keyspaces returns a
+/// `ResourceInUseException`" — only an update can put a table in `UPDATING`.
+pub const TABLE_STATUS_UPDATING: &str = "UPDATING";
 
 /// How long a table stays in a transient status before the clock owes it the
-/// next one: `CREATING` -> `ACTIVE` after `CreateTable`, and `DELETING` -> gone
-/// after `DeleteTable`.
+/// next one: `CREATING` -> `ACTIVE` after `CreateTable`, `UPDATING` -> `ACTIVE`
+/// after `UpdateTable`, and `DELETING` -> gone after `DeleteTable`.
 ///
 /// CHOSEN, not documented: Amazon Keyspaces publishes no duration for either
 /// transition, only that they happen (`CreateTable`: "the status of the table is
@@ -56,10 +64,14 @@ pub const TABLE_STATUS_DELETING: &str = "DELETING";
 /// model documents, and short enough that a test can wait it out.
 pub const TRANSIENT_STATUS_SPAN: Duration = Duration::from_millis(500);
 
+/// `ThroughputMode` = `PAY_PER_REQUEST`: the on-demand mode, which takes no capacity
+/// units.
+pub const PAY_PER_REQUEST_THROUGHPUT_MODE: &str = "PAY_PER_REQUEST";
+
 /// The throughput mode a table gets when `CreateTable` carries no
 /// `capacitySpecification` ("The default is `throughput_mode:PAY_PER_REQUEST`",
 /// `CapacitySpecification$throughputMode`).
-pub const DEFAULT_THROUGHPUT_MODE: &str = "PAY_PER_REQUEST";
+pub const DEFAULT_THROUGHPUT_MODE: &str = PAY_PER_REQUEST_THROUGHPUT_MODE;
 
 /// The throughput mode that requires both capacity units as input.
 pub const PROVISIONED_THROUGHPUT_MODE: &str = "PROVISIONED";
@@ -92,19 +104,30 @@ pub const MULTI_REGION_STRATEGY: &str = "MULTI_REGION";
 /// A generated emulator keeps its resources in memory for the life of the process and a
 /// create is the only thing that adds one, so the store needs a maximum entry count:
 /// neither a TTL nor an eviction policy is available to it, because `GetTable` must still
-/// answer what `CreateTable` created. The two operations that grow the store refuse past
+/// answer what `CreateTable` created. Every operation that grows the store refuses past
 /// these caps with the service's own modelled `ServiceQuotaExceededException` (HTTP 402),
-/// which this model declares on exactly the two create operations and on no read. The
-/// caps also bound the work [`ComAmazonawsKeyspacesKeyspacesserviceState::settle`] can do
-/// while holding the state lock.
+/// which this model declares on the two create operations, on `UpdateTable` and on no
+/// read. The caps also bound the work
+/// [`ComAmazonawsKeyspacesKeyspacesserviceState::settle`] can do while holding the state
+/// lock.
 ///
 /// The numbers are the emulator's own bound, not a contract: Amazon Keyspaces publishes
-/// both quotas as adjustable, so no single value is the published one; these are the
+/// these quotas as adjustable, so no single value is the published one; these are the
 /// order of magnitude of the defaults and are far above any ordinary workflow.
 pub const MAX_KEYSPACES: usize = 256;
 
 /// The most tables one keyspace holds. See [`MAX_KEYSPACES`].
 pub const MAX_TABLES_PER_KEYSPACE: usize = 256;
+
+/// The most columns one table's schema holds. See [`MAX_KEYSPACES`].
+///
+/// This is the third caller-driven growth dimension of the store, and the only one a
+/// table can grow along after it exists: `addColumns` is modelled `len 1..`, with no
+/// maximum, and `UpdateTable` appends to a schema that never shrinks. Both the create
+/// and the update refuse past this cap, so neither one oversized request nor a run of
+/// updates can grow a stored schema without bound. It also caps the duplicate-name scan
+/// an `addColumns` update runs while holding the state lock.
+pub const MAX_COLUMNS_PER_TABLE: usize = 1024;
 
 /// The most tags one Amazon Keyspaces resource holds.
 ///
@@ -285,7 +308,8 @@ pub fn arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKeyspacesKeyspacesserviceState {
     /// Every keyspace in this account, keyed by `keyspaceName`. Bounded by
-    /// [`MAX_KEYSPACES`], and each keyspace's tables by [`MAX_TABLES_PER_KEYSPACE`].
+    /// [`MAX_KEYSPACES`], each keyspace's tables by [`MAX_TABLES_PER_KEYSPACE`], and
+    /// each table's schema by [`MAX_COLUMNS_PER_TABLE`].
     pub keyspaces: BTreeMap<String, Keyspace>,
     /// The earliest instant at which any stored table has a status transition due, or
     /// `None` when none has. [`Self::settle`] returns without looking at a single table
@@ -331,8 +355,15 @@ pub struct Table {
     pub status_due_at: Option<SystemTime>,
     /// The schema exactly as supplied.
     pub schema_definition: SchemaDefinition,
-    /// The supplied capacity specification, or the modelled default.
+    /// The supplied capacity specification, or the modelled default, as last set by
+    /// `CreateTable` or `UpdateTable`.
     pub capacity_specification: CapacitySpecification,
+    /// When an `UpdateTable` last moved this table's throughput mode to
+    /// `PAY_PER_REQUEST`, or `None` while no update ever has
+    /// (`CapacitySpecificationSummary$lastUpdateToPayPerRequestTimestamp`). An update
+    /// that re-sets the mode the table is already in changed no throughput capacity, so
+    /// it leaves this where it is.
+    pub last_update_to_pay_per_request: Option<SystemTime>,
     /// The supplied encryption specification, or the modelled default.
     pub encryption_specification: EncryptionSpecification,
     /// The supplied point-in-time-recovery setting, or the modelled default.
@@ -361,8 +392,8 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
     }
 
     /// Materialise every status transition the clock already owes at `now`: a table whose
-    /// `CREATING` span has elapsed becomes `ACTIVE`, and a table whose `DELETING` span
-    /// has elapsed is gone.
+    /// `CREATING` or `UPDATING` span has elapsed becomes `ACTIVE`, and a table whose
+    /// `DELETING` span has elapsed is gone.
     ///
     /// Every handler calls this first, including the reporting ones. That is the one write
     /// a report is allowed: the transition was due at `now` whether or not anybody called,
@@ -390,7 +421,9 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                 }
                 table.status_due_at = None;
                 match table.status.as_str() {
-                    TABLE_STATUS_CREATING => {
+                    // The creation, or the setting change, the clock owed has
+                    // completed, so the table is usable again.
+                    TABLE_STATUS_CREATING | TABLE_STATUS_UPDATING => {
                         table.status = TABLE_STATUS_ACTIVE.to_string();
                         true
                     }
@@ -507,8 +540,8 @@ pub fn table_not_found(
     }
 }
 
-/// The capacity specification a table is created with: the caller's, or the
-/// modelled default (`PAY_PER_REQUEST`).
+/// The capacity specification a table is created or updated with: the caller's,
+/// or the modelled default (`PAY_PER_REQUEST`) when a create omits it.
 ///
 /// The capacity units belong to `PROVISIONED` and to nothing else: that mode
 /// "requires `readCapacityUnits` and `writeCapacityUnits` as input"
@@ -558,8 +591,9 @@ pub fn resolve_capacity(
     Ok(capacity)
 }
 
-/// The encryption specification a table is created with: the caller's, or the
-/// modelled default (`AWS_OWNED_KMS_KEY`).
+/// The encryption specification a table is created or updated with: the
+/// caller's, or the modelled default (`AWS_OWNED_KMS_KEY`) when a create omits
+/// it.
 ///
 /// `CUSTOMER_MANAGED_KMS_KEY` "requires the `kms_key_identifier` of the KMS key
 /// in Amazon Resource Name (ARN) format as input"
