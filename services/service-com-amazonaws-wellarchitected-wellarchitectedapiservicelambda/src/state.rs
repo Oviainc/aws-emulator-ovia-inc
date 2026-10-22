@@ -3,12 +3,17 @@
 //! Engine state for the com-amazonaws-wellarchitected-wellarchitectedapiservicelambda service.
 //!
 //! The workload lifecycle (`CreateWorkload`, `GetWorkload`, `ListWorkloads`,
-//! `UpdateWorkload`, `DeleteWorkload`) and the milestones recorded against a workload
-//! (`CreateMilestone`, `GetMilestone`) are backed entirely by the maps below, so a
-//! create is visible to the next request on the same engine. The custom lenses
-//! `ImportLens` imports and `ExportLens` reads back are backed the same way. The record
-//! types and their projections live here rather than in a handler because several
-//! operations reach them.
+//! `UpdateWorkload`, `DeleteWorkload`), the milestones recorded against a workload
+//! (`CreateMilestone`, `GetMilestone`) and the answers of a workload's lens reviews
+//! (`ListAnswers`) are backed entirely by the maps below, so a create is visible to the
+//! next request on the same engine. The custom lenses `ImportLens` imports and
+//! `ExportLens` reads back are backed the same way. The record types and their
+//! projections live here rather than in a handler because several operations reach them.
+//!
+//! The one lens definition this emulator ships itself — the AWS-official Well-Architected
+//! Framework lens's question set — lives here too, for the same reason: the risk roll-up
+//! of a workload and the answer list of a lens review must agree about which questions
+//! a lens asks.
 //!
 //! The modelled `ResourceNotFoundException` / `ConflictException` constructors live
 //! here for the same reason: every operation that resolves an identifier or enforces a
@@ -36,6 +41,22 @@ pub const DEFAULT_IMPROVEMENT_STATUS: &str = "NOT_APPLICABLE";
 /// question set rather than from an answer.
 pub const RISK_UNANSWERED: &str = "UNANSWERED";
 
+/// The four `Risk` members an ANSWERED question can carry
+/// (`smithy_query(query="shape", shape="Risk")`), named here because
+/// [`AnswerRecord::risk`] derives one of them from every stored answer.
+pub const RISK_HIGH: &str = "HIGH";
+/// See [`RISK_HIGH`].
+pub const RISK_MEDIUM: &str = "MEDIUM";
+/// See [`RISK_HIGH`].
+pub const RISK_NONE: &str = "NONE";
+/// See [`RISK_HIGH`].
+pub const RISK_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
+
+/// The `ChoiceStatus` member that says a best practice is NOT in place
+/// (`smithy_query(query="shape", shape="ChoiceStatus")`): what keeps a question's risk
+/// off `NONE`.
+pub const CHOICE_STATUS_UNSELECTED: &str = "UNSELECTED";
+
 /// `TrustedAdvisorIntegrationStatus$DISABLED`: what a workload's discovery
 /// configuration reports while no Trusted Advisor integration has been configured for
 /// it. The enum publishes exactly `ENABLED` and `DISABLED`
@@ -49,18 +70,18 @@ pub const DEFAULT_TRUSTED_ADVISOR_INTEGRATION_STATUS: &str = "DISABLED";
 /// (`smithy_query(query="shape", shape="LensAlias")`).
 pub const FRAMEWORK_LENS_ALIAS: &str = "wellarchitected";
 
-/// The AWS Well-Architected Framework lens, as content: its pillars in the order the
-/// framework presents them, each with the number of questions that pillar asks.
+/// The AWS Well-Architected Framework lens's pillars, in the order the framework
+/// presents them, each with the number of questions that pillar asks.
 ///
 /// `PillarId` is how a pillar is named on the wire (`smithy_query(query="shape",
 /// shape="PillarId")`: "The ID used to identify a pillar, for example, `security`").
 /// The question counts are the framework's published question numbering —
 /// operational excellence OPS 1-11, security SEC 1-11, reliability REL 1-13,
 /// performance efficiency PERF 1-5, cost optimization COST 1-11 and sustainability
-/// SUS 1-6 — 57 questions in all. Lens content is service-owned data; this emulator
-/// ships only this lens's shape, so the questions themselves (which the still-stubbed
-/// `GetLens` / `ListAnswers` would return) are not modelled here, only how many each
-/// pillar asks.
+/// SUS 1-6 — 57 questions in all. This table is the pillar ORDER (it is what a workload
+/// without priorities is reviewed in); the questions themselves are
+/// [`FRAMEWORK_LENS_QUESTIONS`], and a test pins the two against each other so the
+/// counts restated here cannot drift from the catalog.
 pub const FRAMEWORK_LENS_PILLARS: &[(&str, usize)] = &[
     ("operationalExcellence", 11),
     ("security", 11),
@@ -70,6 +91,119 @@ pub const FRAMEWORK_LENS_PILLARS: &[(&str, usize)] = &[
     ("sustainability", 6),
 ];
 
+/// One question of the AWS-official framework lens, as this emulator's lens content:
+/// the pillar it belongs to, the id it is named by on the wire and its title.
+///
+/// This is the STATIC catalog's entry, distinct from [`LensQuestion`] — the question of
+/// a custom lens DOCUMENT, which carries the choice and risk-rule content that document
+/// supplies. The framework lens ships no choice content here (see
+/// [`FRAMEWORK_LENS_QUESTIONS`]), so its question is the smaller record.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameworkQuestion {
+    /// `AnswerSummary$PillarId` — the pillar this question belongs to, one of
+    /// [`FRAMEWORK_LENS_PILLARS`].
+    pub pillar_id: &'static str,
+    /// `AnswerSummary$QuestionId` (`@length(1, 128)`), stable for the life of the lens.
+    pub question_id: &'static str,
+    /// `AnswerSummary$QuestionTitle` (`@length(1, 512)`).
+    pub title: &'static str,
+}
+
+/// The AWS Well-Architected Framework lens's question set: the one lens definition this
+/// emulator ships, in pillar order and then in the framework's question order.
+///
+/// The pillars and the number of questions each asks are the framework's published
+/// numbering (OPS 1-11, SEC 1-11, REL 1-13, PERF 1-5, COST 1-11, SUS 1-6 — 57
+/// questions), and each `title` is that published question. The `question_id`s are this
+/// emulator's OWN stable ids for them, `<pillar prefix>-<two-digit number>`: a lens's
+/// wire question ids are lens content, which neither the Smithy model nor the service
+/// docs publish, so this emulator defines them rather than guessing at AWS's. They are
+/// what `QuestionId` means everywhere in this crate — `ListAnswers` reports them and an
+/// answer is stored under them.
+///
+/// Per-question CHOICES (the best practices a question offers) are deliberately NOT
+/// here: they are lens content this emulator does not ship, and `AnswerSummary$Choices`
+/// is optional in the model, so a summary reports the choices an ANSWER recorded and no
+/// catalog of them.
+pub const FRAMEWORK_LENS_QUESTIONS: &[FrameworkQuestion] = &[
+    // Operational excellence — OPS 1-11.
+    q("operationalExcellence", "ops-01", "How do you determine what your priorities are?"),
+    q("operationalExcellence", "ops-02", "How do you structure your organization to support your business outcomes?"),
+    q("operationalExcellence", "ops-03", "How does your organizational culture support your business outcomes?"),
+    q("operationalExcellence", "ops-04", "How do you implement observability in your workload?"),
+    q("operationalExcellence", "ops-05", "How do you reduce defects, ease remediation, and improve flow into production?"),
+    q("operationalExcellence", "ops-06", "How do you mitigate deployment risks?"),
+    q("operationalExcellence", "ops-07", "How do you know that you are ready to support a workload?"),
+    q("operationalExcellence", "ops-08", "How do you utilize workload observability in your organization?"),
+    q("operationalExcellence", "ops-09", "How do you understand the health of your operations?"),
+    q("operationalExcellence", "ops-10", "How do you manage workload and operations events?"),
+    q("operationalExcellence", "ops-11", "How do you evolve operations?"),
+    // Security — SEC 1-11.
+    q("security", "sec-01", "How do you securely operate your workload?"),
+    q("security", "sec-02", "How do you manage identities for people and machines?"),
+    q("security", "sec-03", "How do you manage permissions for people and machines?"),
+    q("security", "sec-04", "How do you detect and investigate security events?"),
+    q("security", "sec-05", "How do you protect your network resources?"),
+    q("security", "sec-06", "How do you protect your compute resources?"),
+    q("security", "sec-07", "How do you classify your data?"),
+    q("security", "sec-08", "How do you protect your data at rest?"),
+    q("security", "sec-09", "How do you protect your data in transit?"),
+    q("security", "sec-10", "How do you anticipate, respond to, and recover from incidents?"),
+    q("security", "sec-11", "How do you incorporate and validate the security properties of applications?"),
+    // Reliability — REL 1-13.
+    q("reliability", "rel-01", "How do you manage service quotas and constraints?"),
+    q("reliability", "rel-02", "How do you plan your network topology?"),
+    q("reliability", "rel-03", "How do you design your workload service architecture?"),
+    q("reliability", "rel-04", "How do you design interactions in a distributed system to prevent failures?"),
+    q("reliability", "rel-05", "How do you design interactions in a distributed system to mitigate or withstand failures?"),
+    q("reliability", "rel-06", "How do you monitor workload resources?"),
+    q("reliability", "rel-07", "How do you design your workload to adapt to changes in demand?"),
+    q("reliability", "rel-08", "How do you implement change?"),
+    q("reliability", "rel-09", "How do you back up data?"),
+    q("reliability", "rel-10", "How do you use fault isolation to protect your workload?"),
+    q("reliability", "rel-11", "How do you design your workload to withstand component failures?"),
+    q("reliability", "rel-12", "How do you test reliability?"),
+    q("reliability", "rel-13", "How do you plan for disaster recovery (DR)?"),
+    // Performance efficiency — PERF 1-5.
+    q("performance", "perf-01", "How do you select appropriate cloud resources and architecture patterns for your workload?"),
+    q("performance", "perf-02", "How do you select and use compute resources in your workload?"),
+    q("performance", "perf-03", "How do you store, manage, and access data in your workload?"),
+    q("performance", "perf-04", "How do you select and configure networking resources in your workload?"),
+    q("performance", "perf-05", "What process do you use to support more performance efficiency for your workload?"),
+    // Cost optimization — COST 1-11.
+    q("costOptimization", "cost-01", "How do you implement cloud financial management?"),
+    q("costOptimization", "cost-02", "How do you govern usage?"),
+    q("costOptimization", "cost-03", "How do you monitor usage and cost?"),
+    q("costOptimization", "cost-04", "How do you decommission resources?"),
+    q("costOptimization", "cost-05", "How do you evaluate cost when you select services?"),
+    q("costOptimization", "cost-06", "How do you meet cost targets when you select resource type, size and number?"),
+    q("costOptimization", "cost-07", "How do you use pricing models to reduce cost?"),
+    q("costOptimization", "cost-08", "How do you plan for data transfer charges?"),
+    q("costOptimization", "cost-09", "How do you manage demand, and supply resources?"),
+    q("costOptimization", "cost-10", "How do you evaluate new services?"),
+    q("costOptimization", "cost-11", "How do you evaluate the cost of effort?"),
+    // Sustainability — SUS 1-6.
+    q("sustainability", "sus-01", "How do you select Regions for your workload?"),
+    q("sustainability", "sus-02", "How do you align cloud resources to your demand?"),
+    q("sustainability", "sus-03", "How do you take advantage of software and architecture patterns to support your sustainability goals?"),
+    q("sustainability", "sus-04", "How do you take advantage of data access and usage patterns to support your sustainability goals?"),
+    q("sustainability", "sus-05", "How do your hardware management and usage practices support your sustainability goals?"),
+    q("sustainability", "sus-06", "How do your development and deployment processes support your sustainability goals?"),
+];
+
+/// One [`FrameworkQuestion`], so the catalog above reads as a table.
+const fn q(
+    pillar_id: &'static str,
+    question_id: &'static str,
+    title: &'static str,
+) -> FrameworkQuestion {
+    FrameworkQuestion {
+        pillar_id,
+        question_id,
+        title,
+    }
+}
+
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
 /// workload.
 pub const WORKLOAD_RESOURCE_TYPE: &str = "WORKLOAD";
@@ -77,6 +211,41 @@ pub const WORKLOAD_RESOURCE_TYPE: &str = "WORKLOAD";
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
 /// milestone.
 pub const MILESTONE_RESOURCE_TYPE: &str = "MILESTONE";
+
+/// `ResourceNotFoundException$ResourceType` for the review of one lens in one workload
+/// — the resource `ListAnswers` and the other per-lens reads resolve. The modelled
+/// member is a free-form string (`smithy_query(query="shape",
+/// shape="ExceptionResourceType")`), so the type names the resource that was missing:
+/// the workload's review OF that lens, which exists only while the lens is associated
+/// with the workload.
+pub const LENS_REVIEW_RESOURCE_TYPE: &str = "LENS_REVIEW";
+
+/// `AnswerSummary$QuestionType` for every question of a workload's lens review here.
+///
+/// The enum publishes exactly `PRIORITIZED` and `NON_PRIORITIZED`
+/// (`smithy_query(query="shape", shape="QuestionType")`), and a question is prioritized
+/// because a PROFILE associated with the workload prioritises it. No profile can be
+/// associated in this emulator yet — `CreateProfile` and `AssociateProfiles` are stubs,
+/// each with its own issue, and `CreateWorkload` refuses a `ProfileArn` with a 404 — so
+/// no question of any workload is prioritized.
+pub const DEFAULT_QUESTION_TYPE: &str = "NON_PRIORITIZED";
+
+/// The `QuestionType` a question is prioritized with, the counterpart of
+/// [`DEFAULT_QUESTION_TYPE`] (`smithy_query(query="shape", shape="QuestionType")`).
+pub const PRIORITIZED_QUESTION_TYPE: &str = "PRIORITIZED";
+
+/// The `QuestionPriority` that selects a question of the given `QuestionType`:
+/// `PRIORITIZED` selects the prioritized questions and `NONE` the rest. The two enums
+/// publish `PRIORITIZED | NONE` and `PRIORITIZED | NON_PRIORITIZED` respectively
+/// (`smithy_query(query="shape", shape="QuestionPriority,QuestionType")`). One mapping,
+/// here, so every operation that filters or reports a question's priority agrees.
+pub fn question_priority_of(question_type: &str) -> &'static str {
+    if question_type == PRIORITIZED_QUESTION_TYPE {
+        "PRIORITIZED"
+    } else {
+        "NONE"
+    }
+}
 
 /// The ARN service namespace (`OPERATIONS.md`: "ARN namespace: `wellarchitected`").
 pub const ARN_NAMESPACE: &str = "wellarchitected";
@@ -103,6 +272,61 @@ pub const MAX_WORKLOADS_PER_ACCOUNT_REGION: usize = 10_000;
 /// `@range(min: 1, max: 100)`. Numbers are handed out from 1 upwards and never reused,
 /// so this is what bounds the milestone map per workload.
 pub const MAX_MILESTONES_PER_WORKLOAD: i32 = 100;
+
+/// One stored answer to one question of one lens review, as the operations that answer
+/// a question record it.
+///
+/// Only the members a projection reports are held: `AnswerSummary` carries the selected
+/// choices, the per-choice answers, whether the question applies and the reason it does
+/// not. The question's RISK is not stored — it is derived from these by
+/// [`AnswerRecord::risk`] on every read, so it moves when the answer does.
+#[derive(Debug, Clone)]
+pub struct AnswerRecord {
+    /// `SelectedChoices`: the `ChoiceId`s of the best practices that are in place.
+    pub selected_choices: Vec<String>,
+    /// The answer recorded for each choice the answer speaks about, keyed by `ChoiceId`.
+    pub choice_answers: BTreeMap<String, ChoiceAnswerRecord>,
+    /// `IsApplicable`: false when the question does not apply to this workload.
+    pub is_applicable: bool,
+    /// `Reason` (an `AnswerReason`): why the question does not apply, when it does not.
+    pub reason: Option<String>,
+}
+
+/// One stored per-choice answer: the choice's status and the reason for it.
+#[derive(Debug, Clone)]
+pub struct ChoiceAnswerRecord {
+    /// A `ChoiceStatus` (`SELECTED` | `UNSELECTED` | `NOT_APPLICABLE`).
+    pub status: String,
+    /// A `ChoiceReason`, when one was given.
+    pub reason: Option<String>,
+}
+
+impl AnswerRecord {
+    /// The `Risk` this answer carries, derived from what it records.
+    ///
+    /// The Well-Architected Tool rates a question by how many of its best practices are
+    /// in place: a question that does not apply is `NOT_APPLICABLE`, one answered with
+    /// no best practice selected is `HIGH` risk, one where some choice is still
+    /// unselected is `MEDIUM`, and one with nothing left unselected is `NONE`.
+    /// `UNANSWERED` is not reachable here — it is what a question with NO stored answer
+    /// reports ([`RISK_UNANSWERED`]), which is why this takes an answer.
+    pub fn risk(&self) -> &'static str {
+        if !self.is_applicable {
+            return RISK_NOT_APPLICABLE;
+        }
+        if self.selected_choices.is_empty() {
+            return RISK_HIGH;
+        }
+        if self
+            .choice_answers
+            .values()
+            .any(|choice| choice.status == CHOICE_STATUS_UNSELECTED)
+        {
+            return RISK_MEDIUM;
+        }
+        RISK_NONE
+    }
+}
 
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
 /// lens — the resource type `ShareResourceType` names a lens by
@@ -200,19 +424,31 @@ pub struct WorkloadRecord {
     pub applications: Vec<String>,
     pub discovery_config: Option<WorkloadDiscoveryConfig>,
     pub jira_configuration: Option<WorkloadJiraConfigurationInput>,
+    /// The answers recorded against this workload's lens reviews: lens ALIAS (as
+    /// [`lens_alias`] resolves it, so one entry however the request named the lens),
+    /// then `QuestionId`. An answer lives on the workload rather than in a map of its
+    /// own because a milestone records the workload BY VALUE: freezing the workload
+    /// freezes the answers it had, which is what a milestone read reports.
+    pub answers: BTreeMap<String, BTreeMap<String, AnswerRecord>>,
 }
 
 impl WorkloadRecord {
+    /// The answer this workload records for one question of one lens, if any.
+    ///
+    /// `lens` is a lens as a request names it — an alias or an ARN — and resolves
+    /// through [`lens_alias`], so the same answer is found by either name.
+    pub fn answer(&self, lens: &str, question_id: &str) -> Option<&AnswerRecord> {
+        self.answers.get(lens_alias(lens))?.get(question_id)
+    }
+
     /// This workload's risk roll-up: one entry for every `Risk` the enum publishes, so
     /// a caller that reads a bucket to report review progress always finds it.
     ///
     /// `UNANSWERED` counts the questions of every lens attached to the workload that
     /// carries no answer yet; each other bucket counts the stored answers that carry
-    /// that risk. No operation in this emulator can answer a question — `UpdateAnswer`,
-    /// `GetAnswer` and `ListAnswers` are still stubs, each with its own issue — so
-    /// every question an attached lens asks is unanswered and the answered buckets are
-    /// 0. The map is DERIVED from the attached lenses on every read and never stored,
-    /// so it moves when the lenses do.
+    /// that risk ([`AnswerRecord::risk`]). The map is DERIVED from the attached lenses
+    /// and the stored answers on every read and never stored, so it moves when either
+    /// does.
     pub fn risk_counts(&self) -> BTreeMap<String, i32> {
         let mut counts: BTreeMap<String, i32> = RISK_VALUES
             .iter()
@@ -222,11 +458,18 @@ impl WorkloadRecord {
         // each name to its lens and count that lens's questions once.
         let attached: std::collections::BTreeSet<&str> =
             self.lenses.iter().map(|lens| lens_alias(lens)).collect();
-        let unanswered: usize = attached.iter().map(|lens| lens_question_count(lens)).sum();
-        counts.insert(
-            RISK_UNANSWERED.to_string(),
-            i32::try_from(unanswered).unwrap_or(i32::MAX),
-        );
+        for lens in attached {
+            for question in lens_questions(lens) {
+                let risk = match self.answer(lens, question.question_id) {
+                    Some(answer) => answer.risk(),
+                    None => RISK_UNANSWERED,
+                };
+                counts
+                    .entry(risk.to_string())
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+            }
+        }
         counts
     }
 
@@ -767,22 +1010,29 @@ pub fn lens_alias(lens: &str) -> &str {
     alias.split('/').next().unwrap_or(alias)
 }
 
-/// How many questions a lens ATTACHED TO A WORKLOAD asks, as this emulator knows it.
+/// The questions a lens ATTACHED TO A WORKLOAD asks, as this emulator knows it, in the
+/// lens's own order.
 ///
 /// Only the AWS-official Well-Architected Framework lens has a definition here
-/// ([`FRAMEWORK_LENS_PILLARS`]); another lens — an AWS-published specialised lens, or a
-/// custom one — carries no question set in this emulator yet, so it adds no questions
-/// to a roll-up. An imported custom lens is not a counter-example: `ImportLens` leaves
-/// it in DRAFT, and "the lens cannot be applied to workloads or shared with other
-/// Amazon Web Services accounts until it's published with CreateLensVersion"
-/// (`ImportLens` doc), which is still a stub with its own issue — so no custom lens in
-/// this emulator can be attached to a workload for its questions to be counted.
-pub fn lens_question_count(lens: &str) -> usize {
+/// ([`FRAMEWORK_LENS_QUESTIONS`]); another lens — an AWS-published specialised lens, or
+/// a custom one — carries no question set in this emulator yet, so it asks nothing. An
+/// imported custom lens is not a counter-example: `ImportLens` leaves it in DRAFT, and
+/// "the lens cannot be applied to workloads or shared with other Amazon Web Services
+/// accounts until it's published with CreateLensVersion" (`ImportLens` doc), which is
+/// still a stub with its own issue — so no custom lens in this emulator can be attached
+/// to a workload for its questions to be reported or counted.
+pub fn lens_questions(lens: &str) -> &'static [FrameworkQuestion] {
     if lens_alias(lens) == FRAMEWORK_LENS_ALIAS {
-        FRAMEWORK_LENS_PILLARS.iter().map(|(_, count)| count).sum()
+        FRAMEWORK_LENS_QUESTIONS
     } else {
-        0
+        &[]
     }
+}
+
+/// How many questions the named lens asks: the length of its [`lens_questions`], so the
+/// roll-up and the answer list cannot disagree about the question set.
+pub fn lens_question_count(lens: &str) -> usize {
+    lens_questions(lens).len()
 }
 
 /// Whether `alias` names `record`: an ARN must agree with the lens's own ARN (so the
@@ -814,6 +1064,25 @@ pub fn is_aws_official_lens(alias: &str) -> bool {
     // partition : service : region : account : resource
     let fields: Vec<&str> = arn.splitn(5, ':').collect();
     fields.len() < 5 || fields[3].is_empty()
+}
+
+/// The ARN of the AWS-OFFICIAL lens a `LensAlias` names, in the Region the request was
+/// signed for.
+///
+/// "the lens ARN, such as `arn:aws:wellarchitected:us-east-1::lens/serverless`"
+/// (`LensAlias` doc): an official lens ARN names no owner account, because AWS publishes
+/// the lens rather than an account owning it — the same distinction
+/// [`is_aws_official_lens`] reads. It is therefore the emulator's own ARN with the
+/// account segment emptied, so the partition, the namespace and the account placeholder
+/// still come from [`::engine::emulator_arn`] alone. A CUSTOM lens's ARN is not built
+/// here: the lens that import minted owns it ([`LensRecord::lens_arn`]).
+pub fn official_lens_arn(region: &str, lens: &str) -> String {
+    let arn = ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("lens/{}", lens_alias(lens)));
+    arn.replacen(
+        &format!(":{}:", ::engine::emulator_account_id()),
+        "::",
+        1,
+    )
 }
 
 /// The pillar priority order a workload is created with when the request names none:
@@ -1035,24 +1304,46 @@ pub fn parameter_fingerprint(parameters: &::serde_json::Value) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Encode a `ListWorkloads` cursor as an opaque, self-describing `NextToken`.
+/// Encode a paging cursor as an opaque, self-describing `NextToken`.
 ///
 /// Hex of the JSON cursor: it satisfies the modelled `NextToken` pattern
 /// `^[A-Za-z0-9+/=_-]+$` and carries the whole cursor, so paging needs no
 /// server-side token table — a reporting operation must not write to state.
-pub fn encode_next_token(workload_name: &str, workload_id: &str) -> String {
-    let cursor = ::serde_json::json!({ "n": workload_name, "i": workload_id });
+fn encode_cursor(cursor: &::serde_json::Value) -> String {
     hex::encode(cursor.to_string())
+}
+
+/// The cursor a `NextToken` carries, or `None` when the token is not one this service
+/// issued.
+fn decode_cursor(token: &str) -> Option<::serde_json::Value> {
+    let bytes = hex::decode(token).ok()?;
+    ::serde_json::from_slice(&bytes).ok()
+}
+
+/// Encode a `ListWorkloads` cursor: the last `(workload name, workload id)` served.
+pub fn encode_next_token(workload_name: &str, workload_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "n": workload_name, "i": workload_id }))
 }
 
 /// The `(workload name, workload id)` a `NextToken` points just past, or `None` when
 /// the token is not one this service issued.
 pub fn decode_next_token(token: &str) -> Option<(String, String)> {
-    let bytes = hex::decode(token).ok()?;
-    let cursor: ::serde_json::Value = ::serde_json::from_slice(&bytes).ok()?;
+    let cursor = decode_cursor(token)?;
     let name = cursor.get("n")?.as_str()?.to_string();
     let id = cursor.get("i")?.as_str()?.to_string();
     Some((name, id))
+}
+
+/// Encode a cursor over a lens's questions: the `QuestionId` last served, in the same
+/// opaque scheme as [`encode_next_token`].
+pub fn encode_question_token(question_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "q": question_id }))
+}
+
+/// The `QuestionId` a questions `NextToken` points just past, or `None` when the token
+/// is not one this service issued.
+pub fn decode_question_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("q")?.as_str()?.to_string())
 }
 
 /// `ValidationExceptionReason$FIELD_VALIDATION_FAILED` — the modelled classification for
@@ -1217,6 +1508,26 @@ pub fn milestone_not_found(workload_id: &str, milestone_number: i32) -> Resource
 /// and its number, which together identify it.
 pub fn milestone_resource_id(workload_id: &str, milestone_number: i32) -> String {
     format!("{workload_id}.{milestone_number}")
+}
+
+/// [`resource_not_found`] for a lens that is not associated with the workload, so the
+/// workload has no review of it to report.
+///
+/// A lens review is identified by the `(WorkloadId, LensAlias)` pair, so — as for a
+/// milestone — the `ResourceId` is the composite and the message names both. `lens` is
+/// the lens AS SENT, which is how the caller named it.
+pub fn lens_review_not_found(workload_id: &str, lens: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        LENS_REVIEW_RESOURCE_TYPE,
+        lens_review_resource_id(workload_id, lens),
+        &format!("review of lens {lens} in a workload with ID {workload_id}"),
+    )
+}
+
+/// How a lens review is named in an exception's `ResourceId`: the workload it belongs
+/// to and the lens it reviews.
+pub fn lens_review_resource_id(workload_id: &str, lens: &str) -> String {
+    format!("{workload_id}.{lens}")
 }
 
 /// [`resource_not_found`] for a `LensAlias` that names no readable custom lens — none

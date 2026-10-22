@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchPutDocument
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchPutDocument`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists each document into the named index in `crate::state`, keyed
+//! by `Document.Id` (which is unique per index, so a put with the same id replaces the
+//! previous version), and reports the ones it could not accept in `FailedDocuments`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchPutDocument::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The stored text is the document's `Blob` decoded as UTF-8; it is what `Query`
+//! searches. A document whose content this emulator cannot turn into text is NOT
+//! stored and is reported in `FailedDocuments` instead — never accepted silently.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +182,259 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchPutDocument` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchPutDocumentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchPutDocument"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchPutDocumentError::Modeled(BatchPutDocumentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the kendra emulator could not reach its state store".to_string(),
+                    ),
+                },
+            ))
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due_transitions(now);
+
+        // A custom document enrichment configuration runs the caller's own rules and
+        // Lambda hooks over every document as it is ingested. Nothing here performs
+        // that work, so the request is answered 501 rather than accepted as though the
+        // enrichment had run.
+        if input.custom_document_enrichment_configuration.is_some() {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "BatchPutDocument with a CustomDocumentEnrichmentConfiguration is \
+                              not implemented in this emulator"
+                        .to_string(),
+                },
+            ));
+        }
+
+        let Some(index) = state.index_mut(&input.index_id) else {
+            return Err(BatchPutDocumentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no index with id {}", input.index_id)),
+                },
+            )
+            .into());
+        };
+
+        // Documents can only be added to an index that is ready to use: until the
+        // index reaches ACTIVE this is a conflict with the resource's own state.
+        if index.status != crate::state::STATUS_ACTIVE {
+            return Err(BatchPutDocumentErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "index {} is in status {}; it must be {} before documents can be added",
+                    index.id,
+                    index.status,
+                    crate::state::STATUS_ACTIVE
+                )),
+            })
+            .into());
+        }
+
+        // Decode and index each document's text first, so the quota checks below see
+        // exactly what this request would add. A batch may name the same
+        // `Document.Id` twice — ids are unique per index — so the accepted documents
+        // are collected BY ID, last one winning, exactly as the insert would resolve
+        // them. That keeps the projection below an exact count, not an over-count.
+        let mut accepted: ::std::collections::HashMap<String, crate::state::StoredDocument> =
+            ::std::collections::HashMap::new();
+        let mut failed_documents = Vec::new();
+        for document in &input.documents {
+            match stored_document(document, now) {
+                Ok(stored) => {
+                    accepted.insert(stored.id.clone(), stored);
+                }
+                Err((error_code, error_message)) => {
+                    failed_documents.push(BatchPutDocumentResponseFailedDocument {
+                        id: Some(document.id.clone()),
+                        // Set only for a document a data source ingested; these come
+                        // straight from the caller.
+                        data_source_id: None,
+                        error_code: Some(error_code.to_string()),
+                        error_message: Some(error_message),
+                    });
+                }
+            }
+        }
+
+        // The index holds at most its edition's published document quota, and at most
+        // the emulator's indexed-text ceiling, so the request that would take it past
+        // either is refused with the modelled quota error rather than growing the
+        // store without bound. Replacing a document already in the index is not
+        // growth, so only what is new counts.
+        let quota = crate::state::document_quota(&index.edition);
+        let new_documents = accepted
+            .keys()
+            .filter(|id| !index.documents.contains_key(*id))
+            .count();
+        if index.documents.len() + new_documents > quota {
+            return Err(
+                BatchPutDocumentErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "index {} holds {} of the {quota} documents a {} index allows, so \
+                             this request's {new_documents} new document(s) cannot be added",
+                            index.id,
+                            index.documents.len(),
+                            index.edition
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let replaced_bytes: usize = accepted
+            .keys()
+            .filter_map(|id| index.documents.get(id))
+            .map(crate::state::StoredDocument::indexed_text_bytes)
+            .sum();
+        let added_bytes: usize = accepted
+            .values()
+            .map(crate::state::StoredDocument::indexed_text_bytes)
+            .sum();
+        let projected_bytes = index
+            .stored_text_bytes()
+            .saturating_sub(replaced_bytes)
+            + added_bytes;
+        if projected_bytes > crate::state::MAX_INDEXED_TEXT_BYTES {
+            return Err(
+                BatchPutDocumentErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "index {} would hold {projected_bytes} bytes of indexed text, over \
+                             the {} bytes an index allows",
+                            index.id,
+                            crate::state::MAX_INDEXED_TEXT_BYTES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        for (id, stored) in accepted {
+            index.documents.insert(id, stored);
+        }
+
+        // Ingesting documents changes the index: what `DescribeIndex` and
+        // `ListIndices` report about it (its statistics) is different afterwards, so
+        // its `UpdatedAt` moves to now. A batch in which every document failed
+        // changed nothing, so it does not.
+        if failed_documents.len() < input.documents.len() {
+            index.updated_at = now;
+        }
+
+        Ok(BatchPutDocumentOutput {
+            failed_documents: Some(failed_documents),
+        })
     }
+}
+
+/// The documented per-document limits: "Documents have the following file size
+/// limits. 50 MB total size for any file 5 MB extracted text for any file" (the
+/// operation's own doc for `Documents`).
+const MAX_DOCUMENT_FILE_BYTES: usize = 50 * 1_000_000;
+const MAX_DOCUMENT_TEXT_BYTES: usize = 5 * 1_000_000;
+
+/// The document to store for one request `Document`, or the `ErrorCode` and message
+/// saying why it cannot be accepted.
+///
+/// `ErrorCode` is an enum of exactly `InternalError` and `InvalidRequest`
+/// (`smithy_query(query="shape",shape="ErrorCode")`): a document the caller sent
+/// wrongly is `InvalidRequest`, and content the service itself cannot process is
+/// `InternalError`.
+///
+/// `AccessControlList` is stored but not applied, and `HierarchicalAccessControlList`
+/// and `AccessControlConfigurationId` are not stored at all: user-context filtering is
+/// not implemented in this slice, and `Query` answers 501 for a request that asks for
+/// it, so no answer is ever computed as though an ACL had been applied.
+fn stored_document(
+    document: &Document,
+    now: ::std::time::SystemTime,
+) -> Result<crate::state::StoredDocument, (&'static str, String)> {
+    let body_text = match (&document.blob, &document.s3_path) {
+        (Some(blob), _) => {
+            // The documented per-document file-size limit, checked BEFORE the blob is
+            // copied: "Documents have the following file size limits. 50 MB total
+            // size for any file 5 MB extracted text for any file" (the operation's
+            // doc for `Documents`). An oversized document is reported in
+            // `FailedDocuments`, which is where the real service reports it.
+            if blob.len() > MAX_DOCUMENT_FILE_BYTES {
+                return Err((
+                    "InvalidRequest",
+                    format!(
+                        "document {} carries {} bytes, over the {MAX_DOCUMENT_FILE_BYTES} bytes \
+                         a document's file may be",
+                        document.id,
+                        blob.len()
+                    ),
+                ));
+            }
+            let text = String::from_utf8(blob.clone()).map_err(|_| {
+                (
+                    "InvalidRequest",
+                    format!(
+                        "document {} has a Blob that is not UTF-8 text; this emulator indexes \
+                         UTF-8 text content, and does not extract text from binary content \
+                         types such as PDF, MS_WORD, PPT or MS_EXCEL",
+                        document.id
+                    ),
+                )
+            })?;
+            if text.len() > MAX_DOCUMENT_TEXT_BYTES {
+                return Err((
+                    "InvalidRequest",
+                    format!(
+                        "document {} extracts {} bytes of text, over the \
+                         {MAX_DOCUMENT_TEXT_BYTES} bytes a document may contribute",
+                        document.id,
+                        text.len()
+                    ),
+                ));
+            }
+            text
+        }
+        (None, Some(s3_path)) => {
+            return Err((
+                "InternalError",
+                format!(
+                    "document {} names its content by S3Path (s3://{}/{}), and reading document \
+                     content from Amazon S3 is not implemented in this emulator",
+                    document.id, s3_path.bucket, s3_path.key
+                ),
+            ));
+        }
+        (None, None) => {
+            return Err((
+                "InvalidRequest",
+                format!(
+                    "document {} provides neither Blob nor S3Path, so it carries no content",
+                    document.id
+                ),
+            ));
+        }
+    };
+
+    // `ContentType` is a modelled enum, so the boundary validator has already refused
+    // a value outside it before this runs.
+
+    Ok(crate::state::StoredDocument {
+        id: document.id.clone(),
+        title: document.title.clone(),
+        title_term_counts: document
+            .title
+            .as_deref()
+            .map(crate::state::term_counts)
+            .unwrap_or_default(),
+        body_term_counts: crate::state::term_counts(&body_text),
+        body_text,
+        content_type: document.content_type.clone(),
+        attributes: document.attributes.clone().unwrap_or_default(),
+        access_control_list: document.access_control_list.clone().unwrap_or_default(),
+        s3_path: document.s3_path.clone(),
+        indexed_at: now,
+    })
 }

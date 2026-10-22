@@ -19,3 +19,5 @@ mod not_found_message;
 mod state_roundtrip;
 #[path = "all/table_catalog.rs"]
 mod table_catalog;
+#[path = "all/table_listing.rs"]
+mod table_listing;

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves the change records a registered shard iterator is positioned at, and mints
+//! the iterator that continues the read past them. The input iterator is NOT moved —
+//! an iterator is a position, so re-reading with the same one returns the same records
+//! — and no record is created here: [`crate::state`] owns the capture side.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +105,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::RecordEntry;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -182,18 +179,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecords"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        // A stream belongs to the region of the table it follows, so an iterator into
+        // another region's stream resolves to nothing here.
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut state = state.lock();
+        let Some(bookmark) = state.shard_iterator(&input.shard_iterator).cloned() else {
+            return Err(unknown_iterator());
+        };
+        // "Each shard iterator is valid for 15 minutes after creation." An iterator
+        // past that is refused with the `ValidationExceptionType` the model declares
+        // for it rather than served from a stale position.
+        if bookmark.is_expired(::std::time::SystemTime::now()) {
+            return Err(validation(
+                "the shard iterator has expired; get a new one with GetShardIterator",
+                "ExpiredIterator",
+            ));
+        }
+        let Some(stream) = state.stream_in(region.as_deref(), &bookmark.stream_arn) else {
+            return Err(no_such_stream(&bookmark.stream_arn));
+        };
+        let Some(shard) = stream.shard(&bookmark.shard_id) else {
+            return Err(no_such_shard(&bookmark.shard_id, &bookmark.stream_arn));
+        };
+
+        let captured = shard.records.len();
+        // A shard's records are append-only and a bookmark is only ever minted at a
+        // position within the shard it names, so `next_index` cannot exceed what the
+        // shard holds; the `min` keeps the slice below sound rather than papering over
+        // a position the service could really have lost.
+        let from = bookmark.next_index.min(captured);
+        let until = from.saturating_add(page_size(input.max_results)).min(captured);
+        let change_records: Vec<Record> = shard.records[from..until].iter().map(reported).collect();
+        let records_remain = until < captured;
+        let shard_is_closed = !shard.is_open();
+
+        // "AT_TIP - No more records are currently available. BEHIND_TIP - Additional
+        // records may be available." (the `iteratorPosition` doc.)
+        let iterator_position = if records_remain { "BEHIND_TIP" } else { "AT_TIP" };
+        // "If null, the shard has been closed and the requested iterator will not
+        // return any more data." (the `nextShardIterator` output doc.) An open shard
+        // always continues, so its consumer can keep polling at the tip.
+        let next_shard_iterator = (records_remain || !shard_is_closed).then(|| {
+            state.mint_shard_iterator(&bookmark.stream_arn, &bookmark.shard_id, until)
+        });
+
+        Ok(GetRecordsOutput {
+            change_records: Some(change_records),
+            next_shard_iterator,
+            iterator_description: Some(IteratorDescription {
+                iterator_position: Some(iterator_position.to_string()),
+            }),
+        })
     }
+}
+
+/// One stored change record as the model reports it.
+fn reported(record: &RecordEntry) -> Record {
+    Record {
+        event_version: Some(record.event_version.clone()),
+        created_at: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+        origin: Some(record.origin.clone()),
+        partition_keys: keys_map(&record.partition_keys),
+        clustering_keys: keys_map(&record.clustering_keys),
+        new_image: record.new_image.clone(),
+        old_image: record.old_image.clone(),
+        sequence_number: Some(record.sequence_number.clone()),
+    }
+}
+
+/// A stored key map in the modelled map type, absent when the row has no column of
+/// that kind (a table without clustering columns has no clustering keys to report).
+fn keys_map(
+    keys: &::std::collections::BTreeMap<String, KeyspacesCellValue>,
+) -> Option<::std::collections::HashMap<String, KeyspacesCellValue>> {
+    (!keys.is_empty()).then(|| keys.clone().into_iter().collect())
+}
+
+/// "The maximum number of records to return in a single GetRecords request. The default
+/// value is 100. You can specify a limit between 1 and 1000" (the `maxResults` input
+/// doc; the model's `@range` refuses anything outside the bound before this handler
+/// runs).
+const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// The largest page `maxResults` can ask for.
+const MAX_MAX_RESULTS: i32 = 1000;
+
+/// How many records one page carries.
+fn page_size(max_results: Option<i32>) -> usize {
+    let requested = max_results
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .clamp(1, MAX_MAX_RESULTS);
+    usize::try_from(requested).unwrap_or(1)
+}
+
+/// The modelled 404 for a `shardIterator` this service never issued.
+fn unknown_iterator() -> GetRecordsError {
+    GetRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some("the shard iterator was not issued by this service".to_string()),
+    })
+    .into()
+}
+
+/// The modelled 404 for an iterator whose stream no longer exists.
+fn no_such_stream(stream_arn: &str) -> GetRecordsError {
+    GetRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("stream {stream_arn} does not exist")),
+    })
+    .into()
+}
+
+/// The modelled 404 for an iterator whose shard no longer exists.
+fn no_such_shard(shard_id: &str, stream_arn: &str) -> GetRecordsError {
+    GetRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "shard {shard_id} does not exist in stream {stream_arn}"
+        )),
+    })
+    .into()
+}
+
+/// The modelled 400 for a request this service refuses, carrying the
+/// `ValidationExceptionType` that says which kind of refusal it is.
+fn validation(message: &str, error_code: &str) -> GetRecordsError {
+    debug_assert!(
+        VALIDATION_EXCEPTION_TYPE_VALUES.contains(&error_code),
+        "{error_code} is not a ValidationExceptionType the model declares"
+    );
+    GetRecordsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+        error_code: Some(error_code.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 500 for an engine this service cannot reach.
+fn store_unavailable() -> GetRecordsError {
+    GetRecordsErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the KeyspacesStreams store is unavailable".to_string()),
+    })
+    .into()
 }

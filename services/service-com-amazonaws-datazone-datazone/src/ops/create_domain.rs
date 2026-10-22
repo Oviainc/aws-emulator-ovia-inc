@@ -296,6 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_at_ms: now,
             status_due_ms: Some(now + LIFECYCLE_SETTLE_MS),
             projects: std::collections::BTreeMap::new(),
+            glossaries: std::collections::BTreeMap::new(),
             asset_types: std::collections::BTreeMap::new(),
             id: id.clone(),
         };
@@ -305,7 +306,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Recorded AFTER the domain is stored: the bound this applies releases a token
         // whose domain is not in the store.
         if let Some(token) = input.client_token {
-            store.record_idempotency(token, id, now);
+            store.record_idempotency(
+                crate::state::IdempotencyKey::domain(&token),
+                id,
+                now,
+            );
         }
         Ok(output)
     }

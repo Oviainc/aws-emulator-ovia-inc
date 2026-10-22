@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reads one index back out of `crate::state`, including the index
+//! statistics derived from the documents `BatchPutDocument` stored in it. An `Id` no
+//! stored index matches answers `ResourceNotFoundException` (HTTP 404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is a REPORTING operation: the only state it writes is through
+//! `materialize_due_transitions`, which applies the index-status changes the clock
+//! already owed (`CREATING` -> `ACTIVE`, and the removal of a `DELETING` index).
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +190,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIndex"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeIndexError::Modeled(DescribeIndexErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the kendra emulator could not reach its state store".to_string(),
+                    ),
+                },
+            ))
+        })?;
+        let mut state = state.lock();
+        state.materialize_due_transitions(::std::time::SystemTime::now());
+
+        let Some(index) = state.index(&input.id) else {
+            return Err(DescribeIndexErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no index with id {}", input.id)),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeIndexOutput {
+            name: Some(index.name.clone()),
+            id: Some(index.id.clone()),
+            edition: Some(index.edition.clone()),
+            role_arn: Some(index.role_arn.clone()),
+            server_side_encryption_configuration: index
+                .server_side_encryption_configuration
+                .clone(),
+            status: Some(index.status.clone()),
+            description: index.description.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(index.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(index.updated_at)),
+            // `UpdateIndex` owns the metadata configuration and the capacity units,
+            // and is not implemented yet, so this index carries neither.
+            document_metadata_configurations: None,
+            index_statistics: Some(IndexStatistics {
+                faq_statistics: FaqStatistics {
+                    indexed_question_answers_count: index.faq_count,
+                },
+                text_document_statistics: TextDocumentStatistics {
+                    indexed_text_documents_count: index.indexed_text_documents_count(),
+                    indexed_text_bytes: index.indexed_text_bytes(),
+                },
+            }),
+            // `ErrorMessage` reports why an index reached `FAILED`; nothing in this
+            // emulator fails an index.
+            error_message: None,
+            capacity_units: None,
+            user_token_configurations: index.user_token_configurations.clone(),
+            user_context_policy: index.user_context_policy.clone(),
+            user_group_resolution_configuration: index
+                .user_group_resolution_configuration
+                .clone(),
+        })
     }
 }

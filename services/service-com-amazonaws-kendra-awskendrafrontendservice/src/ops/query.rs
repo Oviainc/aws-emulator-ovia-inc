@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Query
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Query`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: searches the documents `BatchPutDocument` stored in the named index
+//! and answers with a result item per matching document, a `QueryId` it mints, and the
+//! total number of matches found before the page slice.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Query::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A query term is matched against the terms of each stored document's title and body
+//! (see `crate::state::terms_of`), so a term no stored document carries returns zero
+//! results. The members that would change WHICH documents match, or in what order —
+//! `AttributeFilter`, `Facets`, the sorting and collapse configurations, `UserContext`,
+//! relevance overrides, spell correction — are answered with a 501 rather than ignored:
+//! ignoring one would answer a different question from the one asked.
 //!
 //! ## Shape of an operation
 //!
@@ -255,18 +256,462 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Query` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(QueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Query"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            QueryError::Modeled(QueryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the kendra emulator could not reach its state store".to_string(),
+                    ),
+                },
+            ))
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due_transitions(now);
+
+        // The resource comes first: an `IndexId` nothing stored matches is a 404,
+        // and an index that is not ready is a 409, whatever else the request asks
+        // for. Only then is the request itself judged — and the index borrow taken
+        // here is the ONE lookup this handler makes.
+        let query_id = loop {
+            let candidate = crate::state::mint_uuid();
+            if !state.queries.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let (result_items, total_number_of_results) = {
+            let Some(index) = state.index(&input.index_id) else {
+                return Err(QueryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("no index with id {}", input.index_id)),
+                    },
+                )
+                .into());
+            };
+            if index.status != crate::state::STATUS_ACTIVE {
+                return Err(QueryErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "index {} is in status {}; it must be {} before it can be queried",
+                        index.id,
+                        index.status,
+                        crate::state::STATUS_ACTIVE
+                    )),
+                })
+                .into());
+            }
+
+            let SearchRequest {
+                page_size,
+                page_number,
+                query_terms,
+            } = judge_request(&input)?;
+            let term_set: ::std::collections::HashSet<&str> =
+                query_terms.iter().map(String::as_str).collect();
+            let requested_attributes: Option<::std::collections::HashSet<&str>> = input
+                .requested_document_attributes
+                .as_ref()
+                .map(|keys| keys.iter().map(String::as_str).collect());
+
+            // DOCUMENT results come from the documents in the index. QUESTION_ANSWER
+            // and ANSWER results are drawn from FAQs, and no operation that indexes an
+            // FAQ is implemented, so a query filtered to those types matches nothing —
+            // a count computed from state, not a canned empty answer.
+            let wants_documents = input
+                .query_result_type_filter
+                .as_deref()
+                .is_none_or(|filter| filter == "DOCUMENT");
+            let matches = if wants_documents {
+                index.search(&query_terms)
+            } else {
+                Vec::new()
+            };
+            let total = i32::try_from(matches.len()).unwrap_or(i32::MAX);
+
+            // "Each query returns the 100 most relevant results" (the operation's own
+            // doc), so only that many are pageable however deep the caller pages.
+            // `TotalNumberOfResults` still reports every match found, which is what
+            // Kendra reports too, so a caller paging past the 100th result sees an
+            // empty page before it reaches that total.
+            let retrievable = matches.len().min(MAX_RETRIEVABLE_RESULTS);
+            let skip = (page_number - 1).saturating_mul(page_size);
+            let items: Vec<QueryResultItem> = matches[..retrievable]
+                .iter()
+                .enumerate()
+                .skip(skip)
+                .take(page_size)
+                .filter_map(|(rank, hit)| {
+                    index.documents.get(&hit.document_id).map(|document| {
+                        result_item(
+                            &query_id,
+                            rank + 1,
+                            document,
+                            hit,
+                            &term_set,
+                            query_terms.len(),
+                            requested_attributes.as_ref(),
+                        )
+                    })
+                })
+                .collect();
+            (items, total)
+        };
+
+        // Minting the `QueryId` is what this call does: `SubmitFeedback` resolves a
+        // result by the id of the query that returned it, so the query is recorded.
+        state.record_query(crate::state::QueryRecord {
+            query_id: query_id.clone(),
+            index_id: input.index_id.clone(),
+            query_text: input.query_text.clone(),
+            result_document_ids: result_items
+                .iter()
+                .filter_map(|item| item.document_id.clone())
+                .collect(),
+            created_at: now,
+        });
+
+        Ok(QueryOutput {
+            query_id: Some(query_id),
+            result_items: Some(result_items),
+            // Facets are refused above, so a facet result can never be owed.
+            facet_results: None,
+            total_number_of_results: Some(total_number_of_results),
+            warnings: None,
+            spell_corrected_queries: None,
+            // Featured results come from a featured results set, and none can exist:
+            // `CreateFeaturedResultsSet` is not implemented.
+            featured_results_items: None,
+        })
+    }
+}
+
+/// The documented default and cap of `PageSize`.
+const DEFAULT_PAGE_SIZE: usize = 10;
+const MAX_RESULTS_PER_PAGE: usize = 100;
+
+/// Characters a `QueryText` may carry, from the published Amazon Kendra quotas
+/// ("Maximum number of characters in a query text: 1,000"). The model declares no
+/// length for `QueryText`, so this operation enforces the quota itself: it is what
+/// bounds the per-request search work, together with the documents-per-index quota
+/// `BatchPutDocument` enforces.
+const MAX_QUERY_TEXT_CHARS: usize = 1_000;
+
+/// "Each query returns the 100 most relevant results" (the `Query` operation's doc).
+const MAX_RETRIEVABLE_RESULTS: usize = 100;
+
+/// `TextWithHighlights$Text` is modelled with length 1..2048, so neither a title nor an
+/// excerpt may exceed this many characters.
+const MAX_TEXT_CHARS: usize = 2048;
+
+/// How many characters of the document body an excerpt carries, and how much of it
+/// leads up to the first matching term.
+const EXCERPT_CHARS: usize = 300;
+const EXCERPT_LEAD_CHARS: usize = 40;
+
+/// `Url`, the shape `DocumentURI` targets, is modelled with length 1..2048.
+const MAX_URL_CHARS: usize = 2048;
+
+/// This operation's modeled `ValidationException` (HTTP 400).
+fn validation(message: impl Into<String>) -> QueryError {
+    QueryErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// What a judged `Query` request asks for: the page to cut, and the terms to search.
+struct SearchRequest {
+    page_size: usize,
+    page_number: usize,
+    /// The DISTINCT terms of `QueryText`, in the order they first appear.
+    query_terms: Vec<String>,
+}
+
+/// Judge the request itself (after the index it names has been resolved): refuse what
+/// this slice does not compute, apply the documented bounds, and reduce `QueryText` to
+/// the terms to search for.
+fn judge_request(input: &QueryInput) -> Result<SearchRequest, QueryError> {
+    // Each of these changes which documents match, or the order they come back in.
+    // None of them is computed here, so the request is refused with a 501 rather than
+    // answered as though the member had been honoured.
+    let unsupported = [
+        ("AttributeFilter", input.attribute_filter.is_some()),
+        (
+            "Facets",
+            input.facets.as_ref().is_some_and(|facets| !facets.is_empty()),
+        ),
+        ("SortingConfiguration", input.sorting_configuration.is_some()),
+        (
+            "SortingConfigurations",
+            input
+                .sorting_configurations
+                .as_ref()
+                .is_some_and(|configs| !configs.is_empty()),
+        ),
+        (
+            "CollapseConfiguration",
+            input.collapse_configuration.is_some(),
+        ),
+        ("UserContext", input.user_context.is_some()),
+        (
+            "DocumentRelevanceOverrideConfigurations",
+            input
+                .document_relevance_override_configurations
+                .as_ref()
+                .is_some_and(|configs| !configs.is_empty()),
+        ),
+        (
+            "SpellCorrectionConfiguration",
+            input
+                .spell_correction_configuration
+                .as_ref()
+                .is_some_and(|config| config.include_query_spell_check_suggestions),
+        ),
+    ];
+    if let Some((member, _)) = unsupported.iter().find(|(_, asked_for)| *asked_for) {
+        return Err(crate::scaffolded::Scaffolded::NotImplemented(
+            crate::scaffolded::NotImplemented {
+                message: format!("Query with {member} is not implemented in this emulator"),
+            },
+        ));
+    }
+
+    // `QueryResultTypeFilter` is a modelled enum, so a value outside it was already
+    // refused by the boundary validator.
+
+    // `PageSize`: "The default page size is 10. The maximum number of results returned
+    // is 100. If you ask for more than 100 results, only 100 are returned." (the
+    // model's own doc for this member).
+    let page_size = match input.page_size {
+        Some(size) if size < 1 => {
+            return Err(validation(format!(
+                "PageSize must be 1 or greater; got {size}"
+            )));
+        }
+        Some(size) => usize::try_from(size)
+            .unwrap_or(MAX_RESULTS_PER_PAGE)
+            .min(MAX_RESULTS_PER_PAGE),
+        None => DEFAULT_PAGE_SIZE,
+    };
+    let page_number = match input.page_number {
+        Some(number) if number < 1 => {
+            return Err(validation(format!(
+                "PageNumber must be 1 or greater; got {number}"
+            )));
+        }
+        Some(number) => usize::try_from(number).unwrap_or(1),
+        None => 1,
+    };
+
+    // `QueryText` carries no modelled length constraint, so the request's own size is
+    // the only thing bounding it. Amazon Kendra's published quota for a query is 1,000
+    // characters; anything longer is refused HERE, before any work proportional to it
+    // runs, so the search is bounded by a constant and not by the caller.
+    if let Some(query_text) = input.query_text.as_deref() {
+        let characters = query_text.chars().count();
+        if characters > MAX_QUERY_TEXT_CHARS {
+            return Err(validation(format!(
+                "QueryText must be at most {MAX_QUERY_TEXT_CHARS} characters; got {characters}"
+            )));
+        }
+    }
+
+    // The DISTINCT terms of the query text; a repeated word asks for the same term.
+    // Deduplicated through a set, so this is linear in the terms.
+    let mut seen_terms = ::std::collections::HashSet::new();
+    let mut query_terms: Vec<String> = Vec::new();
+    for term in input
+        .query_text
+        .as_deref()
+        .map(crate::state::terms_of)
+        .unwrap_or_default()
+    {
+        if seen_terms.insert(term.clone()) {
+            query_terms.push(term);
+        }
+    }
+    if query_terms.is_empty() {
+        return Err(validation(
+            "QueryText must carry at least one searchable term: this index can only be \
+             searched by text",
+        ));
+    }
+
+    Ok(SearchRequest {
+        page_size,
+        page_number,
+        query_terms,
+    })
+}
+
+/// One result item, built entirely from the stored document and how it matched.
+///
+/// `query_terms` is the SET of distinct query terms (membership is tested once per word
+/// of the text returned) and `query_term_count` how many there are, which is what the
+/// confidence bin is a fraction of.
+fn result_item(
+    query_id: &str,
+    rank: usize,
+    document: &crate::state::StoredDocument,
+    hit: &crate::state::DocumentMatch,
+    query_terms: &::std::collections::HashSet<&str>,
+    query_term_count: usize,
+    requested_attributes: Option<&::std::collections::HashSet<&str>>,
+) -> QueryResultItem {
+    QueryResultItem {
+        // `ResultId` is "the query result item id and the query result item document
+        // id combined" and is modelled 1..73 characters.
+        id: Some(result_id(query_id, rank)),
+        r#type: Some("DOCUMENT".to_string()),
+        // `Format` distinguishes a TABLE from a TEXT answer, and only applies when
+        // `Type` is ANSWER.
+        format: None,
+        additional_attributes: None,
+        document_id: Some(document.id.clone()),
+        document_title: document
+            .title
+            .as_deref()
+            .and_then(|title| text_with_highlights(title, query_terms)),
+        document_excerpt: text_with_highlights(&excerpt(&document.body_text, query_terms), query_terms),
+        document_uri: document_uri(document),
+        // Kendra returns the attributes the caller asked for.
+        document_attributes: requested_attributes.map(|keys| {
+            document
+                .attributes
+                .iter()
+                .filter(|attribute| keys.contains(attribute.key.as_str()))
+                .cloned()
+                .collect()
+        }),
+        score_attributes: Some(ScoreAttributes {
+            score_confidence: Some(
+                score_confidence(hit.matched_terms, query_term_count).to_string(),
+            ),
+        }),
+        // A feedback token identifies a result for `SubmitFeedback`, which is not
+        // implemented.
+        feedback_token: None,
+        table_excerpt: None,
+        collapsed_result_detail: None,
+    }
+}
+
+/// `ResultId` for one result: the query that returned it, and the result's 1-based
+/// RANK among that query's matches.
+///
+/// `ResultId` is modelled 1..73 characters while `Document.Id` is modelled 1..2048, so
+/// the document cannot travel as its own id, and a truncated id would collide between
+/// two documents whose ids agree on a prefix. The rank cannot: it identifies exactly
+/// one result item of one query, which is what a `ResultId` names, and at most
+/// [`MAX_RETRIEVABLE_RESULTS`] results are retrievable, so the id stays well inside the
+/// modelled length.
+fn result_id(query_id: &str, rank: usize) -> String {
+    format!("{query_id}-{rank}")
+}
+
+/// `DocumentURI` — "the URI of the original location of the document", which Kendra
+/// takes from the document's `_source_uri` attribute.
+///
+/// Only a value the modelled `Url` admits is reported: its pattern is
+/// `^(https?|ftp|file):\/\/([^\s]*)$` with length 1..2048, i.e. one of those four
+/// schemes followed by `://` and any run of non-whitespace characters.
+fn document_uri(document: &crate::state::StoredDocument) -> Option<String> {
+    let uri = document
+        .attributes
+        .iter()
+        .find(|attribute| attribute.key == "_source_uri")?
+        .value
+        .string_value
+        .clone()?;
+    const SCHEMES: [&str; 4] = ["http://", "https://", "ftp://", "file://"];
+    let authority = SCHEMES
+        .iter()
+        .find_map(|scheme| uri.strip_prefix(scheme))?;
+    let matches_pattern = !authority.chars().any(char::is_whitespace);
+    // A modelled `length` counts CHARACTERS, as the excerpt and highlight paths do.
+    let characters = uri.chars().count();
+    let within_length = (1..=MAX_URL_CHARS).contains(&characters);
+    (matches_pattern && within_length).then_some(uri)
+}
+
+/// `text` with every occurrence of a query term marked as a highlight, or `None` when
+/// there is no text to return (`TextWithHighlights$Text` is modelled 1..2048).
+fn text_with_highlights(
+    text: &str,
+    query_terms: &::std::collections::HashSet<&str>,
+) -> Option<TextWithHighlights> {
+    let text = truncate_chars(text.trim(), MAX_TEXT_CHARS);
+    if text.is_empty() {
+        return None;
+    }
+    let highlights: Vec<Highlight> = crate::state::word_spans(&text)
+        .into_iter()
+        .filter(|span| query_terms.contains(span.term.as_str()))
+        .map(|span| Highlight {
+            begin_offset: i32::try_from(span.begin).unwrap_or(i32::MAX),
+            end_offset: i32::try_from(span.end).unwrap_or(i32::MAX),
+            // `TopAnswer` marks the single best response; this emulator computes no
+            // top answer.
+            top_answer: false,
+            r#type: Some("STANDARD".to_string()),
+        })
+        .collect();
+    Some(TextWithHighlights {
+        text: Some(text),
+        highlights: Some(highlights),
+    })
+}
+
+/// The window of `body` an excerpt shows: the whole body when it is short enough,
+/// otherwise [`EXCERPT_CHARS`] characters starting shortly before the first matching
+/// term and never cutting into the middle of a word.
+///
+/// Every index into `chars` is clamped and checked, so no offset can take this out of
+/// range: `crate::state::word_spans` reports CHARACTER offsets into the same text, and
+/// an offset that somehow did not fit would shorten the excerpt rather than panic a
+/// handler.
+fn excerpt(body: &str, query_terms: &::std::collections::HashSet<&str>) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    if chars.len() <= EXCERPT_CHARS {
+        return body.trim().to_string();
+    }
+    let first_match = crate::state::word_spans(body)
+        .into_iter()
+        .find(|span| query_terms.contains(span.term.as_str()))
+        .map_or(0, |span| span.begin)
+        .min(chars.len());
+
+    let mut start = first_match.saturating_sub(EXCERPT_LEAD_CHARS);
+    // Walk forward to a word boundary, never past the matching term itself.
+    for _ in 0..EXCERPT_LEAD_CHARS {
+        let alphanumeric = chars.get(start).is_some_and(|c| c.is_alphanumeric());
+        if start == 0 || start >= first_match || !alphanumeric {
+            break;
+        }
+        start += 1;
+    }
+    let start = start.min(chars.len());
+    let end = (start + EXCERPT_CHARS).min(chars.len());
+    chars[start..end].iter().collect::<String>().trim().to_string()
+}
+
+/// `text` cut to at most `max` CHARACTERS (never mid-character).
+fn truncate_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// The confidence bin for a match: how much of the query the document carries.
+///
+/// AWS does not publish its relevance scoring, so this is the emulator's own binning
+/// over the fraction of distinct query terms the document matched. The values are the
+/// modelled `ScoreConfidence` enum (`smithy_query(query="shape",shape="ScoreConfidence")`:
+/// VERY_HIGH, HIGH, MEDIUM, LOW, NOT_AVAILABLE).
+fn score_confidence(matched_terms: usize, query_terms: usize) -> &'static str {
+    match (matched_terms, query_terms) {
+        (_, 0) => "NOT_AVAILABLE",
+        (matched, total) if matched >= total => "VERY_HIGH",
+        (matched, total) if matched * 4 >= total * 3 => "HIGH",
+        (matched, total) if matched * 2 >= total => "MEDIUM",
+        _ => "LOW",
     }
 }

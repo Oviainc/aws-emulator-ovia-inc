@@ -236,6 +236,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `EngineType` is an open string, so which engines a release label supports is a
+        // service-side rule rather than a model constraint: a pair the service does not
+        // support is refused with this operation's modelled `ValidationException`, and
+        // an engine it does support is stored in the canonical casing the API reports
+        // rather than in the casing the request asked in.
+        let Some(engine_type) =
+            crate::state::supported_engine_type(&input.r#type, &input.release_label)
+        else {
+            return Err(CreateApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::unsupported_engine_type_message(&input.r#type),
+                },
+            )
+            .into());
+        };
+
         let application_id = store.mint_application_id();
         let arn = crate::state::application_arn(&region, &application_id);
         let created_at = crate::state::now_timestamp(now);
@@ -244,16 +260,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             arn: arn.clone(),
             release_label: input.release_label,
-            r#type: input.r#type,
+            r#type: engine_type.to_string(),
             // A new application is not usable the instant the create returns; the clock
             // owes it `CREATED` once the transition span has passed.
             state: "CREATING".to_string(),
-            state_details: None,
+            state_details: Some(crate::state::CREATED_STATE_DETAILS.to_string()),
             initial_capacity: input.initial_capacity,
             maximum_capacity: input.maximum_capacity,
             created_at,
             updated_at: created_at,
-            tags: input.tags,
+            // An application created with no tags has an EMPTY tag map, and one created
+            // with none of the configuration blocks below runs under the default
+            // configuration the service applies: a read reports what the application
+            // carries, never an omission the caller has to guess at.
+            tags: crate::state::adopt_tags(input.tags),
             // `AutoStartConfig` and `AutoStopConfig` document their defaults, so the
             // stored record carries them and every reader reports the same values.
             auto_start_configuration: crate::state::adopt_auto_start(
@@ -261,20 +281,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             auto_stop_configuration: crate::state::adopt_auto_stop(input.auto_stop_configuration),
             network_configuration: input.network_configuration,
-            architecture: input.architecture,
+            architecture: crate::state::adopt_architecture(input.architecture),
             image_configuration: crate::state::adopt_image_configuration(input.image_configuration),
             worker_type_specifications: crate::state::adopt_worker_type_specifications(
                 input.worker_type_specifications,
             ),
             runtime_configuration: input.runtime_configuration,
-            monitoring_configuration: input.monitoring_configuration,
+            monitoring_configuration: crate::state::adopt_monitoring(input.monitoring_configuration),
             disk_encryption_configuration: input.disk_encryption_configuration,
             interactive_configuration: input.interactive_configuration,
             scheduler_configuration: input.scheduler_configuration,
             identity_center_configuration: crate::state::adopt_identity_center_configuration(
                 input.identity_center_configuration,
             ),
-            job_level_cost_allocation_configuration: input.job_level_cost_allocation_configuration,
+            job_level_cost_allocation_configuration:
+                crate::state::adopt_job_level_cost_allocation(
+                    input.job_level_cost_allocation_configuration,
+                ),
         };
         let name = application.name.clone();
 

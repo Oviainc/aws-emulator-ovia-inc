@@ -37,12 +37,12 @@ const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
 const ACCOUNT_ID: &str = "000000000000";
 
 /// Long enough for a clock-owed transition to have fallen due.
-fn wait_for_transition() {
+pub(crate) fn wait_for_transition() {
     std::thread::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(250));
 }
 
 /// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -51,26 +51,31 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The wire error code (`__type`), or the empty string on a success.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         // restJson1 renders the error shape id in `__type`, which may be namespaced.
         let raw = self.body["__type"].as_str().unwrap_or_default();
         raw.rsplit('#').next().unwrap_or_default()
     }
 
     /// The value at a JSON pointer, or `Value::Null`.
-    fn at(&self, pointer: &str) -> Value {
+    pub(crate) fn at(&self, pointer: &str) -> Value {
         self.body.pointer(pointer).cloned().unwrap_or(Value::Null)
     }
 }
 
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Answer {
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
     let mut builder = ::http::Request::builder()
         .method(method)
@@ -100,15 +105,15 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
     Answer { status, body }
 }
 
-async fn create_application(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn create_application(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "POST", "/applications", Some(request)).await
 }
 
-async fn get_application(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_application(router: &MultiServiceRouter, id: &str) -> Answer {
     call(router, "GET", &format!("/applications/{id}"), None).await
 }
 
-async fn list_applications(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list_applications(router: &MultiServiceRouter, query: &str) -> Answer {
     call(router, "GET", &format!("/applications{query}"), None).await
 }
 
@@ -120,7 +125,7 @@ async fn stop_application(router: &MultiServiceRouter, id: &str) -> Answer {
     call(router, "POST", &format!("/applications/{id}/stop"), None).await
 }
 
-async fn delete_application(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn delete_application(router: &MultiServiceRouter, id: &str) -> Answer {
     call(router, "DELETE", &format!("/applications/{id}"), None).await
 }
 
@@ -237,7 +242,7 @@ fn matches_next_token(token: &str) -> bool {
 
 /// A minimal `CreateApplication` body: only the three required members, with the
 /// client token the caller names.
-fn minimal_create(token: &str) -> Value {
+pub(crate) fn minimal_create(token: &str) -> Value {
     json!({
         "clientToken": token,
         "releaseLabel": "emr-7.1.0",
@@ -345,7 +350,9 @@ async fn the_application_and_job_run_lifecycle_round_trips_through_state() {
         ("/application/arn", json!(application_arn)),
         ("/application/name", json!("demo")),
         ("/application/releaseLabel", json!("emr-7.1.0")),
-        ("/application/type", json!("SPARK")),
+        // The engine type is reported in the service's canonical casing, not the
+        // casing the create asked in.
+        ("/application/type", json!("Spark")),
         ("/application/state", json!("CREATED")),
         ("/application/tags/team", json!("data")),
     ] {
@@ -507,23 +514,26 @@ async fn the_application_and_job_run_lifecycle_round_trips_through_state() {
         "DeleteApplication expected 200, got {} with {:?}",
         deleted.status, deleted.body
     );
+    // The deleted application is RETAINED in the terminal state of the
+    // `ApplicationState` enum, so a client polling it observes `TERMINATED` instead of
+    // the state it last had.
     let gone = get_application(&router, &application_id).await;
     assert_eq!(
-        gone.status, 404,
-        "case lifecycle: GetApplication after the delete expected 404, got {} with {:?}",
+        gone.status, 200,
+        "case lifecycle: GetApplication after the delete expected 200, got {} with {:?}",
         gone.status, gone.body
     );
     assert_eq!(
-        gone.error_code(),
-        "ResourceNotFoundException",
-        "case lifecycle: expected ResourceNotFoundException, got {:?}",
-        gone.body
+        gone.at("/application/state"),
+        json!("TERMINATED"),
+        "case lifecycle: the deleted application reports TERMINATED, got {:?}",
+        gone.at("/application/state")
     );
-    let remaining = list_applications(&router, "").await;
+    let remaining = list_applications(&router, "?states=TERMINATED").await;
     assert_eq!(
-        remaining.at("/applications"),
-        json!([]),
-        "case lifecycle: the deleted application is no longer listed, got {:?}",
+        remaining.at("/applications/0/id"),
+        json!(application_id),
+        "case lifecycle: the terminated application is listed under its state, got {:?}",
         remaining.body
     );
 }
@@ -653,6 +663,19 @@ async fn get_application_reports_exactly_what_the_create_stored() {
             let pointer = format!("/application/{member}");
             if member == "autoStartConfiguration" || member == "autoStopConfiguration" {
                 // Checked below together with their documented defaults.
+                continue;
+            }
+            if member == "type" {
+                // The engine type reads back in the service's canonical casing, which
+                // `an_engine_type_reads_back_in_the_services_own_casing` pins; here it
+                // only has to name the same engine.
+                let actual = fetched.at(&pointer);
+                assert!(
+                    actual.as_str().is_some_and(|reported| reported
+                        .eq_ignore_ascii_case(expected.as_str().unwrap_or_default())),
+                    "case {case:?}: GetApplication{pointer} expected the engine \
+                     {expected:?} named, got {actual:?}"
+                );
                 continue;
             }
             assert_eq!(
@@ -996,24 +1019,27 @@ async fn an_id_that_names_nothing_is_refused() {
 }
 
 /// `DeleteApplication` documents its precondition — "An application has to be in a
-/// stopped or created state in order to be deleted" — so the states it admits are
-/// exactly `CREATED` and `STOPPED`.
+/// stopped or created state in order to be deleted" — judged against the state the
+/// application has SETTLED on: it admits a transition on its way to `CREATED` or
+/// `STOPPED` and refuses one on its way to `STARTED`. An accepted delete leaves the
+/// application readable in the terminal `TERMINATED` state.
 #[tokio::test]
-async fn delete_application_admits_only_the_states_its_documentation_names() {
-    // One row per `ApplicationState` a client can put an application into, with the
-    // status the delete must answer. Source: the `ApplicationState` enum
-    // (`CREATING`, `CREATED`, `STARTING`, `STARTED`, `STOPPING`, `STOPPED`,
-    // `TERMINATED`); `TERMINATED` is unreachable through this API.
+async fn delete_application_admits_the_states_that_settle_on_the_ones_it_documents() {
+    // One row per `ApplicationState` a client can put an application into: the state it
+    // reports, the state it settles on and the status the delete must answer. Source:
+    // the `ApplicationState` enum (`CREATING`, `CREATED`, `STARTING`, `STARTED`,
+    // `STOPPING`, `STOPPED`, `TERMINATED`), every value of which is a row here.
     let cases = [
-        ("CREATING", 400),
-        ("CREATED", 200),
-        ("STARTING", 400),
-        ("STARTED", 400),
-        ("STOPPING", 400),
-        ("STOPPED", 200),
+        ("CREATING", "CREATED", 200),
+        ("CREATED", "CREATED", 200),
+        ("STARTING", "STARTED", 400),
+        ("STARTED", "STARTED", 400),
+        ("STOPPING", "STOPPED", 200),
+        ("STOPPED", "STOPPED", 200),
+        ("TERMINATED", "TERMINATED", 400),
     ];
 
-    for (state, expected_status) in cases {
+    for (state, settles_on, expected_status) in cases {
         let router = emulator();
         let created = create_application(&router, minimal_create("tok-delete")).await;
         let id = created
@@ -1042,6 +1068,10 @@ async fn delete_application_admits_only_the_states_its_documentation_names() {
                 stop_application(&router, &id).await;
                 wait_for_transition();
             }
+            "TERMINATED" => {
+                wait_for_transition();
+                delete_application(&router, &id).await;
+            }
             other => panic!("unhandled state {other}"),
         }
 
@@ -1056,8 +1086,16 @@ async fn delete_application_admits_only_the_states_its_documentation_names() {
         let deleted = delete_application(&router, &id).await;
         assert_eq!(
             deleted.status, expected_status,
-            "case {state:?}: DeleteApplication expected {expected_status}, got {} with {:?}",
+            "case {state:?}: DeleteApplication on an application settling on \
+             {settles_on:?} expected {expected_status}, got {} with {:?}",
             deleted.status, deleted.body
+        );
+        let after = get_application(&router, &id).await;
+        assert_eq!(
+            after.status, 200,
+            "case {state:?}: the application is still readable after the delete, got {} \
+             with {:?}",
+            after.status, after.body
         );
         if expected_status == 400 {
             assert_eq!(
@@ -1067,15 +1105,17 @@ async fn delete_application_admits_only_the_states_its_documentation_names() {
                 deleted.body
             );
             assert_eq!(
-                get_application(&router, &id).await.status,
-                200,
-                "case {state:?}: a refused delete must leave the application in place"
+                after.at("/application/state"),
+                json!(state),
+                "case {state:?}: a refused delete must leave the state alone, got {:?}",
+                after.at("/application/state")
             );
         } else {
             assert_eq!(
-                get_application(&router, &id).await.status,
-                404,
-                "case {state:?}: an accepted delete must remove the application"
+                after.at("/application/state"),
+                json!("TERMINATED"),
+                "case {state:?}: an accepted delete must report TERMINATED, got {:?}",
+                after.at("/application/state")
             );
         }
     }

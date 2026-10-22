@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an `appArn` and persists the application in
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::apps`], so
+//! `DescribeApp`, `ListApps`, `UpdateApp` and `DeleteApp` all see it.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +190,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApp"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // Every modeled constraint on this input — including each enum member's
+        // value set — is already refused by the boundary validator before this
+        // handler runs, so there is nothing left here to re-check.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // A replayed `@idempotencyToken` returns the app its first call created.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(first_arn) = store.created_by_token(Self::NAME, token).cloned() {
+                if let Some(first) = store.apps.get(&first_arn) {
+                    if describes_same_app(first, &input) {
+                        return Ok(CreateAppOutput { app: first.clone() });
+                    }
+                    return Err(conflict(
+                        format!(
+                            "clientToken {token} was already used to create application \
+                             {first_arn} with different parameters"
+                        ),
+                        first_arn,
+                    ));
+                }
+            }
+        }
+
+        // An application name identifies the application within the account, so a
+        // second application cannot take a name that is already in use.
+        if let Some(existing_arn) = store.app_name_index.get(&input.name) {
+            return Err(conflict(
+                format!("an application named {} already exists", input.name),
+                existing_arn.clone(),
+            ));
+        }
+
+        // A policy reference must resolve: storing a dangling one would make
+        // DescribeApp report a policy DescribeResiliencyPolicy cannot find.
+        if let Some(policy_arn) = input.policy_arn.as_deref() {
+            if !store.policies.contains_key(policy_arn) {
+                return Err(policy_not_found(policy_arn));
+            }
+        }
+
+        // The store is bounded: past the ceiling no further application is created.
+        if store.apps.len() >= crate::state::MAX_APPS {
+            return Err(quota_exceeded());
+        }
+
+        let app_arn = crate::state::mint_app_arn(&region);
+        let app = App {
+            app_arn: app_arn.clone(),
+            name: input.name.clone(),
+            description: input.description,
+            policy_arn: input.policy_arn,
+            creation_time: crate::state::now(),
+            // A freshly created application is immediately usable: `AppStatusType`'s
+            // only other value is `Deleting`, so `Active` is terminal here and the
+            // clock owes no later transition.
+            status: Some("Active".to_string()),
+            // Nothing has been assessed yet, so there is no compliance verdict, no
+            // score and no evaluation time.
+            compliance_status: Some("NotAssessed".to_string()),
+            last_app_compliance_evaluation_time: None,
+            resiliency_score: 0.0,
+            last_resiliency_score_evaluation_time: None,
+            tags: input.tags,
+            // `AppAssessmentScheduleType` is `Daily | Disabled`; an application the
+            // caller did not schedule is not scheduled.
+            assessment_schedule: Some(
+                input
+                    .assessment_schedule
+                    .unwrap_or_else(|| "Disabled".to_string()),
+            ),
+            permission_model: input.permission_model,
+            event_subscriptions: input.event_subscriptions,
+            // Drift is reported by an assessment, which has not run.
+            drift_status: Some("NotChecked".to_string()),
+            last_drift_evaluation_time: None,
+            // RTO/RPO are outcomes of an assessment, not inputs to a create.
+            rto_in_secs: None,
+            rpo_in_secs: None,
+            aws_application_arn: input.aws_application_arn,
+        };
+
+        store.apps.insert(app_arn.clone(), app.clone());
+        store.app_name_index.insert(input.name, app_arn.clone());
+        if let Some(token) = input.client_token.as_deref() {
+            store.record_idempotency_token(Self::NAME, token, &app_arn);
+        }
+
+        Ok(CreateAppOutput { app })
+    }
+}
+
+/// The 402 for a request that would take the store past
+/// [`crate::state::MAX_APPS`].
+fn quota_exceeded() -> CreateAppError {
+    CreateAppErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: Some(format!(
+            "this emulator stores at most {} applications; delete one before creating another",
+            crate::state::MAX_APPS
+        )),
+    })
+    .into()
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> CreateAppError {
+    CreateAppErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 409 `ConflictException` naming the application already holding the name or the
+/// replayed `clientToken`.
+fn conflict(message: impl Into<String>, app_arn: String) -> CreateAppError {
+    CreateAppErrorModeled::ConflictException(ConflictException {
+        message: Some(message.into()),
+        resource_id: Some(app_arn),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for a `policyArn` no `CreateResiliencyPolicy`
+/// ever minted.
+fn policy_not_found(policy_arn: &str) -> CreateAppError {
+    CreateAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("resiliency policy {policy_arn} does not exist")),
+        resource_id: Some(policy_arn.to_string()),
+        resource_type: Some("ResiliencyPolicy".to_string()),
+    })
+    .into()
+}
+
+/// Whether `stored` is the application `request` asks for — the idempotency check:
+/// a replayed token with the same parameters replays the first result, a replayed
+/// token with different parameters is a conflict.
+///
+/// Covers EVERY member `CreateApp` stores from the request, so a replay that
+/// differs in any of them is a conflict rather than a silent replay.
+fn describes_same_app(stored: &App, request: &CreateAppInput) -> bool {
+    stored.name == request.name
+        && stored.description == request.description
+        && stored.policy_arn == request.policy_arn
+        && stored.tags == request.tags
+        && stored.aws_application_arn == request.aws_application_arn
+        && stored.assessment_schedule.as_deref()
+            == Some(request.assessment_schedule.as_deref().unwrap_or("Disabled"))
+        && same_permission_model(
+            stored.permission_model.as_ref(),
+            request.permission_model.as_ref(),
+        )
+        && same_event_subscriptions(
+            stored.event_subscriptions.as_deref(),
+            request.event_subscriptions.as_deref(),
+        )
+}
+
+/// Member-wise equality for `PermissionModel`, which the generated shape does not
+/// derive `PartialEq` for.
+fn same_permission_model(stored: Option<&PermissionModel>, requested: Option<&PermissionModel>) -> bool {
+    match (stored, requested) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => {
+            stored.r#type == requested.r#type
+                && stored.invoker_role_name == requested.invoker_role_name
+                && stored.cross_account_role_arns == requested.cross_account_role_arns
+        }
+        _ => false,
+    }
+}
+
+/// Member-wise equality for an `EventSubscriptionList`, order included: the list
+/// is stored as sent.
+fn same_event_subscriptions(
+    stored: Option<&[EventSubscription]>,
+    requested: Option<&[EventSubscription]>,
+) -> bool {
+    match (stored, requested) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => {
+            stored.len() == requested.len()
+                && stored.iter().zip(requested).all(|(stored, requested)| {
+                    stored.name == requested.name
+                        && stored.event_type == requested.event_type
+                        && stored.sns_topic_arn == requested.sns_topic_arn
+                })
+        }
+        _ => false,
     }
 }

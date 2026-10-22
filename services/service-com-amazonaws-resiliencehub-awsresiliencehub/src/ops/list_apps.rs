@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: projects each stored application in
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::apps`] into an
+//! `AppSummary`, honouring every `@httpQuery` filter, `reverseOrder`, and
+//! `maxResults` as a real page bound with a resumable `nextToken`. A pure read.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +172,224 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAppsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApps"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(PageKey::decode(token).ok_or_else(|| {
+                invalid("nextToken: not a token this operation issued".to_string())
+            })?),
+        };
+        let descending = input.reverse_order == Some(true);
+
+        let store = state.lock();
+
+        // `name` is the application's unique identifier within the account, so the
+        // name index answers that filter directly instead of scanning.
+        let mut matching: Vec<&App> = match input.name.as_deref() {
+            Some(name) => store
+                .app_name_index
+                .get(name)
+                .and_then(|app_arn| store.apps.get(app_arn))
+                .into_iter()
+                .collect(),
+            None => store.apps.values().collect(),
+        };
+        matching.retain(|app| matches_filters(app, &input));
+
+        // A total order over the page, so a `nextToken` resumes at exactly the
+        // element after the last one returned. `reverseOrder` flips it.
+        matching.sort_by(|left, right| {
+            let ordering = PageKey::of(left).cmp(&PageKey::of(right));
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        // Resume past the token's element, and past anything deleted since, by
+        // taking the first element strictly beyond it in the requested direction.
+        let start = match resume_from {
+            None => 0,
+            Some(token) => matching
+                .iter()
+                .position(|app| {
+                    let ordering = PageKey::of(app).cmp(&token);
+                    if descending {
+                        ordering.is_lt()
+                    } else {
+                        ordering.is_gt()
+                    }
+                })
+                .unwrap_or(matching.len()),
+        };
+        // `maxResults` is modeled `@range(min: 1, max: 100)`, which the boundary
+        // validator already enforces; absent means "as many as a page allows". A
+        // value that reaches here outside the range is refused rather than clamped,
+        // so a validator regression cannot be masked by silently narrowing a page.
+        let page_size = match input.max_results {
+            None => MAX_PAGE_SIZE,
+            Some(requested) if (1..=MAX_PAGE_SIZE).contains(&requested) => requested,
+            Some(requested) => {
+                return Err(invalid(format!(
+                    "maxResults: {requested} is outside the modeled range of 1 to {MAX_PAGE_SIZE}"
+                )))
+            }
+        } as usize;
+        let page = &matching[start..];
+        let returned = &page[..page_size.min(page.len())];
+
+        let next_token = (page.len() > returned.len())
+            .then(|| returned.last().map(|app| PageKey::of(app).encode()))
+            .flatten();
+
+        Ok(ListAppsOutput {
+            app_summaries: returned.iter().map(|app| summarise(app)).collect(),
+            next_token,
+        })
     }
+}
+
+/// The largest page `maxResults` allows. Source: the `maxResults` member's
+/// `@range(min: 1, max: 100)` (smithy_query query="operation" operation="ListApps").
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The total order `ListApps` pages over: oldest first, application ARN breaking a
+/// tie between two applications created in the same instant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PageKey {
+    seconds: i64,
+    subsec_nanos: u32,
+    app_arn: String,
+}
+
+impl PageKey {
+    /// This application's position in the order.
+    fn of(app: &App) -> Self {
+        Self {
+            seconds: app.creation_time.secs(),
+            subsec_nanos: app.creation_time.subsec_nanos(),
+            app_arn: app.app_arn.clone(),
+        }
+    }
+
+    /// The `nextToken` form: the page key, hex-encoded with the workspace `hex`
+    /// crate — the same codec `ListDatasets`/`ListJobRuns` use for their tokens.
+    /// Hex is an ENCODING, not a secret — a caller could decode or forge one — so
+    /// the safety comes from `decode` doing bounded work: a token it cannot read is
+    /// refused with a 400, and one it reads that no longer matches a stored app
+    /// simply resumes past everything, yielding an empty page. Encoding it says
+    /// "not meant to be parsed by clients", which is how the real service presents
+    /// it, and the result carries no whitespace, so it satisfies `NextToken`'s
+    /// `^\S{1,2000}$`.
+    fn encode(&self) -> String {
+        ::hex::encode(format!(
+            "{}.{:09}:{}",
+            self.seconds, self.subsec_nanos, self.app_arn
+        ))
+    }
+
+    /// Parse a token this operation issued; `None` for anything else. Bounded
+    /// work: one hex decode, two `split_once`s and two integer parses.
+    fn decode(token: &str) -> Option<Self> {
+        let plain = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+        let (instant, app_arn) = plain.split_once(':')?;
+        let (seconds, subsec_nanos) = instant.split_once('.')?;
+        if app_arn.is_empty() {
+            return None;
+        }
+        Some(Self {
+            seconds: seconds.parse().ok()?,
+            subsec_nanos: subsec_nanos.parse().ok()?,
+            app_arn: app_arn.to_string(),
+        })
+    }
+}
+
+/// Whether `app` passes every filter the request set, EXCEPT `name`: the
+/// `app_name_index` lookup in `handle` owns that one, so re-testing it here would
+/// be dead work. An absent filter matches everything.
+fn matches_filters(app: &App, input: &ListAppsInput) -> bool {
+    if input
+        .app_arn
+        .as_deref()
+        .is_some_and(|app_arn| app.app_arn != app_arn)
+    {
+        return false;
+    }
+    if input
+        .aws_application_arn
+        .as_deref()
+        .is_some_and(|wanted| app.aws_application_arn.as_deref() != Some(wanted))
+    {
+        return false;
+    }
+    // `from`/`toLastAssessmentTime` bound the application's LAST assessment time, so
+    // an application that has never been assessed is outside any such range.
+    if input.from_last_assessment_time.is_some() || input.to_last_assessment_time.is_some() {
+        let Some(last) = app.last_app_compliance_evaluation_time else {
+            return false;
+        };
+        if input
+            .from_last_assessment_time
+            .is_some_and(|from| as_nanos(last) < as_nanos(from))
+        {
+            return false;
+        }
+        if input
+            .to_last_assessment_time
+            .is_some_and(|to| as_nanos(last) > as_nanos(to))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// A timestamp as a single comparable quantity.
+fn as_nanos(at: ::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
+}
+
+/// Project a stored application into the list's summary view.
+fn summarise(app: &App) -> AppSummary {
+    AppSummary {
+        app_arn: app.app_arn.clone(),
+        name: app.name.clone(),
+        description: app.description.clone(),
+        creation_time: app.creation_time,
+        compliance_status: app.compliance_status.clone(),
+        resiliency_score: app.resiliency_score,
+        assessment_schedule: app.assessment_schedule.clone(),
+        status: app.status.clone(),
+        drift_status: app.drift_status.clone(),
+        last_app_compliance_evaluation_time: app.last_app_compliance_evaluation_time,
+        rto_in_secs: app.rto_in_secs,
+        rpo_in_secs: app.rpo_in_secs,
+        aws_application_arn: app.aws_application_arn.clone(),
+    }
+}
+
+/// A 400 `ValidationException` carrying `message`.
+///
+/// The MODELED error, not `crate::scaffolded::Scaffolded::validation`: this
+/// operation declares `ValidationException`, so the modeled shape is what a client
+/// deserializes (see the note in `crate::scaffolded`).
+fn invalid(message: impl Into<String>) -> ListAppsError {
+    ListAppsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> ListAppsError {
+    ListAppsErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
 }

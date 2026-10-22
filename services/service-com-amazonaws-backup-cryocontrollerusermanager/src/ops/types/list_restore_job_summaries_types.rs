@@ -11,7 +11,12 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-backup-cryocontrollerusermanager.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.backup#ListRestoreJobSummariesInput")]
+// `MaxResults`'s `@range` and `AggregationPeriod`'s enum are checked by the
+// HANDLER — see the note on `ListProtectedResourcesInput`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.backup#ListRestoreJobSummariesInput",
+    skip_validation = ["MaxResults", "AggregationPeriod"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListRestoreJobSummariesInput {
     pub account_id: Option<String>,

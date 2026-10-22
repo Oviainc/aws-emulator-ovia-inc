@@ -74,9 +74,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // Two services sign as `cassandra`: this one (Amazon Keyspaces, whose requests
+        // name `KeyspacesService.<Op>` and whose endpoint is `cassandra.<region>.…`)
+        // and KeyspacesStreams (`KeyspacesStreams.<Op>`, endpoint
+        // `cassandra-streams.<region>.…`). The SigV4 signing name alone therefore
+        // cannot tell the two apart, and a request both services claim is answered by
+        // neither — the router rejects an ambiguous claim. So decline a request that
+        // names the streams service, and keep the signing-name rule for the rest.
+        if names_keyspaces_streams(parts) {
+            return false;
+        }
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
             None => false,
@@ -136,4 +143,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// Whether a request names KeyspacesStreams rather than Amazon Keyspaces.
+///
+/// Both services sign as `cassandra`, so the distinguishing signals are the ones that
+/// name the service directly: the `X-Amz-Target` prefix an awsJson request carries
+/// (`KeyspacesStreams.GetRecords` -> `keyspacesstreams`), then the endpoint host's
+/// first label (`cassandra-streams.<region>.amazonaws.com` -> `cassandra-streams`).
+///
+/// The streams service holds the mirror image of this helper, in
+/// `services/service-com-amazonaws-keyspacesstreams-keyspacesstreams/src/service.rs`,
+/// where it CLAIMS what this one declines. The two decide one split, so change them
+/// together.
+fn names_keyspaces_streams(parts: &http::request::Parts) -> bool {
+    /// The `X-Amz-Target` service prefix of KeyspacesStreams, normalized.
+    const STREAMS_TARGET_PREFIX: &str = "keyspacesstreams";
+    /// KeyspacesStreams's endpoint prefix (its model's `endpointPrefix`).
+    const STREAMS_ENDPOINT_PREFIX: &str = "cassandra-streams";
+
+    let named = emulator_server::service_from_target(&parts.headers)
+        .or_else(|| emulator_server::service_from_host(&parts.headers))
+        .or_else(|| emulator_server::service_from_authority(&parts.uri));
+    named.is_some_and(|service| {
+        service == STREAMS_TARGET_PREFIX || service == STREAMS_ENDPOINT_PREFIX
+    })
 }

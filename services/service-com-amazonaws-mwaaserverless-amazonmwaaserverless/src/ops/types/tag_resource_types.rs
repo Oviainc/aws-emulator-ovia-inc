@@ -11,7 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mwaaserverless-amazonmwaaserverless.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mwaaserverless#TagResourceRequest")]
+// Members whose modelled constraints the handler checks itself, by driving the
+// framework's own constraint walk over the shadow member schemas `crate::state`
+// re-declares, so a bad value is answered with the modelled
+// `ValidationException` instead of the framework's generic boundary refusal.
+//
+// The `Tags` map's 0..50 entry count moves off the framework boundary with it and
+// is carried by that shadow schema's own `@length` trait, so the SAME walk
+// enforces it before it visits any entry.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.mwaaserverless#TagResourceRequest",
+    skip_validation = ["ResourceArn", "Tags"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct TagResourceInput {
     pub resource_arn: String,

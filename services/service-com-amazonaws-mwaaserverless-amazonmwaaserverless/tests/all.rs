@@ -15,5 +15,7 @@
 mod missing_resource_lookups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_errors.rs"]
+mod validation_errors;
 #[path = "all/workflow_lifecycle.rs"]
 mod workflow_lifecycle;

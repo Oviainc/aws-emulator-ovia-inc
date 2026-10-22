@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads the Q App `CreateQApp`/`UpdateQApp` persisted under the
+//! request's `instance-id`, including the stored `appDefinition` of the version
+//! asked for. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +168,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQApp"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetQAppErrorModeled::InternalServerException(InternalServerException {
+                message: "the qapps store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let principal = crate::state::caller_principal(ctx);
+
+        let store = state.lock();
+        let app = store
+            .app(&input.instance_id, &input.app_id)
+            .ok_or_else(|| {
+                GetQAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Q App {} was not found", input.app_id),
+                    resource_id: input.app_id.clone(),
+                    resource_type: "qapp".to_string(),
+                })
+            })?;
+
+        // Absent `appVersion` means the current version; a version the app
+        // never had is as absent as an unknown app.
+        let app_version = input.app_version.unwrap_or(app.app_version);
+        let mut app_definition = app
+            .versions
+            .get(&app_version)
+            .map(|definition| AppDefinition::clone(definition))
+            .ok_or_else(|| {
+                GetQAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!(
+                        "Q App {} has no version {app_version}",
+                        input.app_id
+                    ),
+                    resource_id: input.app_id.clone(),
+                    resource_type: "qapp".to_string(),
+                })
+            })?;
+        // `canEdit` is a statement about THIS caller, so it is decided per
+        // read rather than frozen when the definition was stored.
+        app_definition.can_edit = Some(principal == app.created_by);
+
+        Ok(GetQAppOutput {
+            app_id: app.app_id.clone(),
+            app_arn: app.app_arn.clone(),
+            title: app.title.clone(),
+            description: app.description.clone(),
+            initial_prompt: app.initial_prompt.clone(),
+            app_version,
+            status: app.status.as_wire().to_string(),
+            created_at: app.created_at,
+            created_by: app.created_by.clone(),
+            updated_at: app.updated_at,
+            updated_by: app.updated_by.clone(),
+            required_capabilities: Some(app.required_capabilities.clone()),
+            app_definition,
+        })
     }
 }

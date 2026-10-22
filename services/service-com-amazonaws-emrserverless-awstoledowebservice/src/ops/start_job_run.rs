@@ -209,7 +209,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A job run only reaches an application that is running. `AutoStartConfig`
         // documents the alternative — "Enables the application to automatically start
         // on job submission" — so an application configured that way is started by this
-        // submit instead of refusing it.
+        // submit instead of refusing it. A TERMINATED application is past its lifecycle
+        // and starts for nothing, so a submit to one is refused.
+        if record.application.state == "TERMINATED" {
+            return Err(StartJobRunErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Application {} is in TERMINATED state and cannot run jobs",
+                        input.application_id
+                    ),
+                },
+            )
+            .into());
+        }
         if record.application.state != "STARTED" {
             if !record.auto_start_enabled() {
                 return Err(StartJobRunErrorModeled::ValidationException(

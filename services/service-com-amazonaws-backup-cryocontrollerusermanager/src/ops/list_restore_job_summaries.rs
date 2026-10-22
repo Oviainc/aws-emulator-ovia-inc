@@ -11,6 +11,12 @@
 //! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
 //! so leaving it on an implemented operation under-reports progress.
 //!
+//! The one thing this stub DOES assert is the refusal of a parameter value the
+//! model does not admit — an `AggregationPeriod` outside its enum, a
+//! `MaxResults` outside its `@range`: AWS answers both with this operation's
+//! modelled `InvalidParameterValueException`, which only a handler-returned
+//! error can be serialized as. A request the service accepts still answers 501.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -178,18 +184,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRestoreJobSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRestoreJobSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        let _ = (ctx, &self.engine);
+        // Both refusals are answered HERE rather than by the framework's
+        // boundary validator, because AWS answers them with this operation's
+        // modelled `InvalidParameterValueException` — and only an exception the
+        // handler returns is serialized as the shape the model declares, so the
+        // body carries `Message` (and `Code`, where the condition has a token).
+        if let Some(refusal) = crate::state::rejected_max_results(input.max_results) {
+            return Err(
+                ListRestoreJobSummariesErrorModeled::InvalidParameterValueException(refusal)
+                    .into(),
+            );
+        }
+        if let Some(refusal) =
+            crate::state::rejected_aggregation_period(input.aggregation_period.as_deref())
+        {
+            return Err(
+                ListRestoreJobSummariesErrorModeled::InvalidParameterValueException(refusal)
+                    .into(),
+            );
+        }
+        // A request the service accepts still has no implementation behind it:
+        // summarising restore jobs by period needs restore-job state this slice
+        // does not keep yet, so it keeps the scaffold's 501. Implement it here,
+        // then delete the SCAFFOLDED marker at the top of this file.
         Err(crate::scaffolded::Scaffolded::not_implemented("ListRestoreJobSummaries"))
     }
 }

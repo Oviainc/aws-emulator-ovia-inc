@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/application_projection.rs"]
+mod application_projection;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/state_roundtrip.rs"]

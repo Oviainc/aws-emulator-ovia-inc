@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a real, paginated read of the instance records `RegisterInstance`
+//! persisted under the named service, resumed through an opaque `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +133,22 @@ impl<Eng> ListInstances<Eng> {
     }
 }
 
+/// The number of instances returned when the request names no `MaxResults`, as
+/// `ListInstancesRequest$MaxResults` documents: "If you don't specify a value for
+/// MaxResults, Cloud Map returns up to 100 instances."
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The bounds `MaxResults` declares in the model (`MaxResults`, `range 1..100`). The
+/// framework refuses a value outside them before this handler runs; re-stating them
+/// here keeps an out-of-range value a refusal rather than a silent default page.
+const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = 100;
+
+/// The scope the `NextToken` this operation issues carries: this listing, over this
+/// service. A cursor minted for another operation or another service is therefore not
+/// honoured as a page boundary here.
+const NEXT_TOKEN_SCOPE: &str = "ListInstances";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListInstances<Eng>
 {
@@ -157,18 +166,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInstances"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListInstancesErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // A pure report: nothing below writes, so listing never changes what a later
+        // caller sees — no revision is bumped and no status moved by a read.
+        let state = state.lock();
+
+        // `ServiceId` is modelled as an `Arn`, and the docs say a service in a shared
+        // namespace is named by its ARN, so either reference resolves.
+        let Some(service) = state
+            .resolve_service_id(&input.service_id)
+            .and_then(|id| state.services.get(&id))
+        else {
+            return Err(ListInstancesErrorModeled::ServiceNotFound(ServiceNotFound {
+                message: Some(format!(
+                    "No service exists with the specified ID {}.",
+                    input.service_id
+                )),
+            })
+            .into());
+        };
+
+        // A `NextToken` is only ever a token this operation issued FOR THIS service:
+        // anything else is a bad request, not an invitation to resume another walk or
+        // to silently list from the start.
+        let token_scope = format!("{NEXT_TOKEN_SCOPE}:{}", service.id);
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_next_token(&token_scope, token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListInstancesErrorModeled::InvalidInput(InvalidInput {
+                        message: Some(format!(
+                            "The NextToken isn't a token ListInstances issued for service {}.",
+                            service.id
+                        )),
+                    })
+                    .into());
+                }
+            },
+        };
+
+        // Absent means the documented default; present means a value inside the
+        // declared range, and nothing else — a value that is not is refused rather
+        // than read as "unspecified".
+        let max_results = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(requested) => match usize::try_from(requested)
+                .ok()
+                .filter(|size| (MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(size))
+            {
+                Some(size) => size,
+                None => {
+                    return Err(ListInstancesErrorModeled::InvalidInput(InvalidInput {
+                        message: Some(format!(
+                            "Value '{requested}' at 'maxResults' failed to satisfy \
+                             constraint: Member must be between {MIN_MAX_RESULTS} and \
+                             {MAX_MAX_RESULTS}."
+                        )),
+                    })
+                    .into());
+                }
+            },
+        };
+
+        // Instances are stored keyed by `InstanceId` in a `BTreeMap`, so a page is the
+        // next `MaxResults` records after the cursor and every reader walks them in the
+        // same order — which is what makes a token resumable at all. One record past
+        // the page is read to learn whether a further page exists; an instance
+        // deregistered between two pages is simply no longer there, and the ids after
+        // it still follow the same cursor.
+        let mut page: Vec<&crate::state::InstanceRecord> = match resume_after {
+            Some(cursor) => service
+                .instances
+                .range::<String, _>((
+                    std::ops::Bound::Excluded(cursor),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(_, record)| record)
+                .take(max_results.saturating_add(1))
+                .collect(),
+            None => service
+                .instances
+                .values()
+                .take(max_results.saturating_add(1))
+                .collect(),
+        };
+        // "If more than MaxResults instances match the specified criteria, you can
+        // submit another ListInstances request": the token comes back only when a
+        // further record is actually stored, so a caller paginating to the end stops.
+        let more_to_come = page.len() > max_results;
+        page.truncate(max_results);
+        let next_token = if more_to_come {
+            page.last()
+                .map(|record| crate::state::encode_next_token(&token_scope, &record.instance_id))
+        } else {
+            None
+        };
+
+        let instances: Vec<InstanceSummary> = page
+            .into_iter()
+            .map(|record| InstanceSummary {
+                id: Some(record.instance_id.clone()),
+                // Exactly the attribute map that was registered, as `GetInstance` and
+                // `DiscoverInstances` report it.
+                attributes: Some(record.attributes.clone()),
+                // Set only for an instance another account registered into a shared
+                // namespace, which this emulator does not model: every resource it
+                // holds belongs to the one emulator account its ARNs carry.
+                created_by_account: None,
+            })
+            .collect();
+
+        Ok(ListInstancesOutput {
+            // `ResourceOwner` names the account that created the containing namespace,
+            // which only distinguishes a namespace shared from another account —
+            // omitted for the reason above, as this crate's other readers omit it.
+            resource_owner: None,
+            instances: Some(instances),
+            next_token,
+        })
     }
 }

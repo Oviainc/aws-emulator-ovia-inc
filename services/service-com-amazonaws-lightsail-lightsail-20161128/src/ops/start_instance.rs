@@ -197,6 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let operation = store.start_operation(
                 now,
                 crate::state::OPERATION_TYPE_START_INSTANCE,
+                crate::state::RESOURCE_TYPE_INSTANCE,
                 &name,
                 &location,
                 settles_at_ms,

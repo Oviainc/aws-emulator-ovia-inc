@@ -40,6 +40,26 @@ pub struct Hub {
     pub tags: HashMap<String, String>,
 }
 
+/// A custom action target's identity: the hub it lives in, plus the `Id` the
+/// creator chose. `CreateActionTarget` documents `Id` as the identifier of the
+/// custom action target, and the ARN it answers with is derived from it, so the two
+/// cannot name different resources.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ActionTargetKey {
+    pub account_id: String,
+    pub region: String,
+    pub target_id: String,
+}
+
+/// A custom action target as `CreateActionTarget` stored it and
+/// `DescribeActionTargets` reports it (the modelled `ActionTarget` members).
+#[derive(Debug, Clone)]
+pub struct ActionTargetRecord {
+    pub action_target_arn: String,
+    pub name: String,
+    pub description: String,
+}
+
 /// A finding as `BatchImportFindings` stored it, mutated in place by
 /// `BatchUpdateFindings`.
 #[derive(Debug, Clone)]
@@ -90,6 +110,8 @@ pub struct ComAmazonawsSecurityhubSecurityhubapiserviceState {
     pub hubs: HashMap<HubKey, Hub>,
     /// Imported findings, keyed by hub + `AwsSecurityFindingIdentifier`.
     pub findings: HashMap<FindingKey, StoredFinding>,
+    /// Custom action targets, keyed by hub + the creator-chosen `Id`.
+    pub action_targets: HashMap<ActionTargetKey, ActionTargetRecord>,
     /// The enabled standards, keyed by hub + standard ARN.
     pub standards: HashMap<StandardsSubscriptionKey, StandardsSubscriptionRecord>,
     /// Source of [`StoredFinding::imported_seq`] / [`StoredFinding::updated_seq`].
@@ -119,6 +141,45 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// The ARN namespace Security Hub signs and ARNs with (`awsService.arnNamespace`
 /// / `sigv4Name` in this service's Smithy model).
 pub const ARN_NAMESPACE: &str = "securityhub";
+
+/// The message a handler answers with when this service's store is unreachable,
+/// kept in one place so every operation refuses identically.
+pub const STATE_UNAVAILABLE_MESSAGE: &str = "the Security Hub CSPM state store is unavailable";
+
+/// The message a hub-scoped operation refuses a caller with when the account is not
+/// subscribed to Security Hub CSPM in the request's Region.
+pub fn not_subscribed_message(account_id: &str, region: &str) -> String {
+    format!("Account {account_id} is not subscribed to Security Hub CSPM in Region {region}")
+}
+
+/// How many custom action targets one hub (`(account, Region)`) may hold. The AWS
+/// Security Hub quotas table publishes 100 custom actions per account per Region, and
+/// `CreateActionTarget` models `LimitExceededException` for a create "beyond the
+/// current Amazon Web Services account … limits"; the bound is also what keeps this
+/// store from growing with the number of calls a caller makes.
+pub const MAX_ACTION_TARGETS_PER_HUB: usize = 100;
+
+/// The longest `Description` this store keeps for a custom action target. The model
+/// documents no bound for that member, so the cap mirrors the one this crate already
+/// applies to a finding's `Description` (`MAX_DESCRIPTION_LEN` in
+/// `ops/batch_import_findings.rs`): one record's size must not grow with whatever a
+/// caller sends.
+pub const MAX_ACTION_TARGET_DESCRIPTION_LEN: usize = 1024;
+
+/// A `NextToken` resuming a list at `offset`, carrying `prefix` so a token minted for
+/// another list — or a value a caller invented — is rejected rather than read as an
+/// offset. Opaque to the caller: the cursor is hex-encoded, so nothing in the
+/// response invites arithmetic on it.
+pub fn encode_list_token(prefix: &str, offset: usize) -> String {
+    ::hex::encode(format!("{prefix}{offset}"))
+}
+
+/// The offset a `NextToken` resumes at, or `None` when it is not one the list named
+/// by `prefix` minted.
+pub fn decode_list_token(prefix: &str, token: &str) -> Option<usize> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    decoded.strip_prefix(prefix)?.parse().ok()
+}
 
 /// The hub resource's fixed name: Security Hub CSPM creates exactly one hub per
 /// account/Region and calls it `default`.
@@ -363,6 +424,22 @@ pub fn request_account_id() -> String {
 /// The hub key for the request `ctx` belongs to.
 pub fn hub_key(ctx: &smithy_server_runtime::OperationContext<'_>) -> HubKey {
     (request_account_id(), request_region(ctx))
+}
+
+/// The resource prefix a custom action target's ARN carries:
+/// `arn:aws:securityhub:<region>:<account>:action/custom/<Id>` — the form the
+/// model's own `ActionTargetArn` examples carry (every one of them matches
+/// `"ActionTargetArn":"arn:aws:securityhub:<region>:<account>:action/custom/<Id>"`
+/// in this service's `smithy-model/`).
+pub const ACTION_TARGET_RESOURCE_PREFIX: &str = "action/custom/";
+
+/// The ARN `CreateActionTarget` answers with for `target_id` in `region`.
+pub fn action_target_arn(region: &str, target_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{ACTION_TARGET_RESOURCE_PREFIX}{target_id}"),
+    )
 }
 
 /// `arn:aws:securityhub:<region>:<account>:hub/default` for a hub key.

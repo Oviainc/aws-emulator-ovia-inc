@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/accessor_lifecycle.rs"]
 mod accessor_lifecycle;
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/invitations.rs"]
 mod invitations;
 #[path = "all/list_members.rs"]
@@ -23,6 +25,8 @@ mod modelled_error_payloads;
 mod network_and_node_lifecycle;
 #[path = "all/proposal_lifecycle.rs"]
 mod proposal_lifecycle;
+#[path = "all/public_networks_and_membership.rs"]
+mod public_networks_and_membership;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_node_log_publishing.rs"]

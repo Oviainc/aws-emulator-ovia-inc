@@ -16,10 +16,11 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Accessor, Invitation, Member, MemberFabricAttributes, MemberFrameworkAttributes,
-    MemberLogPublishingConfiguration, MemberSummary, Network, NetworkFabricAttributes,
-    NetworkFrameworkAttributes, NetworkSummary, Node, NodeFabricAttributes,
-    NodeFrameworkAttributes, NodeLogPublishingConfiguration, NodeSummary, Proposal,
-    ProposalActions, ResourceNotFoundException, VotingPolicy,
+    MemberLogPublishingConfiguration, MemberSummary, Network, NetworkEthereumAttributes,
+    NetworkFabricAttributes, NetworkFrameworkAttributes, NetworkSummary, Node,
+    NodeEthereumAttributes, NodeFabricAttributes, NodeFrameworkAttributes,
+    NodeLogPublishingConfiguration, NodeSummary, Proposal, ProposalActions, ProposalSummary,
+    ResourceNotFoundException, VotingPolicy,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service (the model's
@@ -47,6 +48,85 @@ pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 /// `@required` `MemberConfiguration` is itself documented "Applies only to Hyperledger
 /// Fabric", so an `ETHEREUM` network cannot be created.
 pub const FRAMEWORK_HYPERLEDGER_FABRIC: &str = "HYPERLEDGER_FABRIC";
+
+/// The other `com.amazonaws.managedblockchain#Framework` value (the enum is
+/// `HYPERLEDGER_FABRIC | ETHEREUM`). No create mints one: the Ethereum networks this
+/// service serves are the standing, AWS-owned public ones in [`PUBLIC_NETWORKS`].
+pub const FRAMEWORK_ETHEREUM: &str = "ETHEREUM";
+
+/// The Hyperledger Fabric framework versions a network can be created with.
+///
+/// `FrameworkVersionString` carries only `@length(1, 8)`, so the model does not enumerate
+/// the versions; this is the catalog the Amazon Managed Blockchain Hyperledger Fabric
+/// Developer Guide publishes for `CreateNetwork`'s `FrameworkVersion` (Hyperledger Fabric
+/// 1.2, 1.4 and 2.2). Anything else is a version the service does not support, and the
+/// create naming it is refused — see [`framework_version_supported`].
+pub const FABRIC_FRAMEWORK_VERSIONS: &[&str] = &["1.2", "1.4", "2.2"];
+
+/// The framework versions a network of `framework` can be created with.
+///
+/// Only Hyperledger Fabric networks are creatable here (`CreateNetwork` "Applies only to
+/// Hyperledger Fabric"), so every other framework supports no create-able version at all.
+pub fn supported_framework_versions(framework: &str) -> &'static [&'static str] {
+    if framework == FRAMEWORK_HYPERLEDGER_FABRIC {
+        FABRIC_FRAMEWORK_VERSIONS
+    } else {
+        &[]
+    }
+}
+
+/// Whether `framework_version` is one of the versions `framework` supports.
+pub fn framework_version_supported(framework: &str, framework_version: &str) -> bool {
+    supported_framework_versions(framework).contains(&framework_version)
+}
+
+/// One of AWS's standing, AWS-owned public blockchain networks.
+///
+/// These are not account resources: no call creates them, every account reads the same
+/// ids, and they are already `AVAILABLE` when first read, so the clock owes them no
+/// transition. [`ComAmazonawsManagedblockchainTaigawebserviceState::default`]
+/// materialises one record per entry, which is what `GetNetwork` resolves.
+#[derive(Debug, Clone, Copy)]
+pub struct PublicNetwork {
+    /// The id every account reads the network under.
+    pub id: &'static str,
+    /// `Network$Name`.
+    pub name: &'static str,
+    /// A `Framework` value.
+    pub framework: &'static str,
+    /// `NetworkEthereumAttributes$ChainId`.
+    pub chain_id: &'static str,
+    /// `Network$CreationDate`, in seconds since the epoch: the network's own genesis,
+    /// which is a fact about the public chain and so is stable across reads and across
+    /// runs — never the instant this emulator happened to materialise the record.
+    pub genesis_epoch_seconds: u64,
+}
+
+/// The AWS-owned public networks this service serves.
+///
+/// Catalog source: `NetworkEthereumAttributes$ChainId` documents the Ethereum chain ids
+/// Managed Blockchain reports ("mainnet = `1`"), and `AccessorNetworkType` names the
+/// public Ethereum networks the service exposes (`ETHEREUM_MAINNET`, `ETHEREUM_GOERLI`);
+/// the Goerli testnet's published chain id is `5`. The ids and names are the ones AMB
+/// Access publishes for those networks.
+pub const PUBLIC_NETWORKS: &[PublicNetwork] = &[
+    PublicNetwork {
+        id: "n-ethereum-mainnet",
+        name: "mainnet",
+        framework: FRAMEWORK_ETHEREUM,
+        chain_id: "1",
+        // Ethereum mainnet's first block, 2015-07-30T15:26:28Z.
+        genesis_epoch_seconds: 1_438_269_988,
+    },
+    PublicNetwork {
+        id: "n-ethereum-goerli",
+        name: "goerli",
+        framework: FRAMEWORK_ETHEREUM,
+        chain_id: "5",
+        // The Goerli testnet's genesis block, 2019-01-30T13:26:31Z.
+        genesis_epoch_seconds: 1_548_854_791,
+    },
+];
 
 /// The non-terminal status a freshly created network, member or node is reported in
 /// (`NetworkStatus` / `MemberStatus` / `NodeStatus` all declare it).
@@ -78,6 +158,16 @@ pub const VOTE_NO: &str = "NO";
 /// created a member to join the network, and the invitation hasn't yet expired"
 /// (`Invitation$Status`).
 pub const INVITATION_STATUS_PENDING: &str = "PENDING";
+
+/// The `InvitationStatus` of an invitation whose invitee has begun creating the member it
+/// grants: "`ACCEPTING` - The invitee has begun creating a member, and creation hasn't yet
+/// completed" (`Invitation$Status`).
+pub const INVITATION_STATUS_ACCEPTING: &str = "ACCEPTING";
+
+/// The `InvitationStatus` the clock owes an accepted invitation once the member it granted
+/// has finished creating: "`ACCEPTED` - The invitee created a member and joined the network
+/// using the `InvitationID`" (`Invitation$Status`).
+pub const INVITATION_STATUS_ACCEPTED: &str = "ACCEPTED";
 
 /// The `InvitationStatus` of an invitation its invitee turned down: "`REJECTED` - The
 /// invitee rejected the invitation" (`Invitation$Status`).
@@ -141,6 +231,10 @@ pub const NETWORK_MAX_RESULTS: i32 = 10;
 /// `ListNodes`'s `MaxResults` upper bound, from its `@range(1, 20)`. Also the page size
 /// used when a caller names none.
 pub const NODE_MAX_RESULTS: i32 = 20;
+
+/// `ListProposals`'s `MaxResults` upper bound, from `ProposalListMaxResults`'s
+/// `@range(1, 100)`. Also the page size used when a caller names none.
+pub const PROPOSAL_MAX_RESULTS: i32 = 100;
 
 /// `ListMembers`'s `MaxResults` upper bound, from its `@range(1, 20)`. Also the page size
 /// used when a caller names none.
@@ -223,13 +317,24 @@ pub struct StoredNetwork {
     pub name: String,
     pub description: Option<String>,
     pub framework: String,
-    pub framework_version: String,
+    /// `Network$FrameworkVersion`, as the create named it. Absent on an AWS-owned public
+    /// network: no request named one, and which client version the service reports for a
+    /// public chain is not documented, so reporting one would invent a value.
+    pub framework_version: Option<String>,
     /// `NetworkFabricAttributes$Edition`, as the create's `FrameworkConfiguration` set
     /// it; absent when the request configured no framework properties.
     pub fabric_edition: Option<String>,
-    /// `NetworkFabricAttributes$OrderingServiceEndpoint`, minted at create time.
-    pub ordering_service_endpoint: String,
-    pub voting_policy: VotingPolicy,
+    /// `NetworkFabricAttributes$OrderingServiceEndpoint`, minted at create time; `None`
+    /// on a network of a framework that has no ordering service.
+    pub ordering_service_endpoint: Option<String>,
+    /// `NetworkEthereumAttributes$ChainId`, on an Ethereum network only.
+    pub ethereum_chain_id: Option<String>,
+    /// Whether this is one of AWS's standing, AWS-owned public networks
+    /// ([`PUBLIC_NETWORKS`]) rather than a network this account created.
+    pub aws_owned: bool,
+    /// `Network$VotingPolicy`, as the create named it. `None` on a network of a framework
+    /// that has no member voting (`VotingPolicy` "Applies only to Hyperledger Fabric").
+    pub voting_policy: Option<VotingPolicy>,
     /// A `NetworkStatus` value.
     pub status: String,
     /// When `CREATING` -> `AVAILABLE` falls due. See [`TRANSITION_SPAN`].
@@ -293,6 +398,35 @@ impl StoredNetwork {
         }
     }
 
+    /// Whether the current account participates in this network, which is what
+    /// `ListNetworks` reports ("the networks in which the current Amazon Web Services
+    /// account participates").
+    ///
+    /// Every network the account created counts; one of AWS's standing public networks
+    /// counts only once the account holds a member or a node on it, because until then
+    /// the account merely *can read* it.
+    pub fn account_participates(&self) -> bool {
+        !self.aws_owned || !self.members.is_empty() || !self.nodes.is_empty()
+    }
+
+    /// The modelled `NetworkFrameworkAttributes` for this record: the framework's own
+    /// attributes, and nothing for a framework this record carries none for.
+    fn to_framework_attributes(&self) -> NetworkFrameworkAttributes {
+        NetworkFrameworkAttributes {
+            fabric: (self.ordering_service_endpoint.is_some() || self.fabric_edition.is_some())
+                .then(|| NetworkFabricAttributes {
+                    ordering_service_endpoint: self.ordering_service_endpoint.clone(),
+                    edition: self.fabric_edition.clone(),
+                }),
+            ethereum: self
+                .ethereum_chain_id
+                .clone()
+                .map(|chain_id| NetworkEthereumAttributes {
+                    chain_id: Some(chain_id),
+                }),
+        }
+    }
+
     /// The modelled `Network` for this record, as `GetNetwork` returns it.
     pub fn to_network(&self) -> Network {
         Network {
@@ -300,18 +434,10 @@ impl StoredNetwork {
             name: Some(self.name.clone()),
             description: self.description.clone(),
             framework: Some(self.framework.clone()),
-            framework_version: Some(self.framework_version.clone()),
-            framework_attributes: Some(NetworkFrameworkAttributes {
-                fabric: Some(NetworkFabricAttributes {
-                    ordering_service_endpoint: Some(self.ordering_service_endpoint.clone()),
-                    edition: self.fabric_edition.clone(),
-                }),
-                // Only Hyperledger Fabric networks can be created here, so no record
-                // ever carries Ethereum attributes.
-                ethereum: None,
-            }),
+            framework_version: self.framework_version.clone(),
+            framework_attributes: Some(self.to_framework_attributes()),
             vpc_endpoint_service_name: Some(self.vpc_endpoint_service_name.clone()),
-            voting_policy: Some(self.voting_policy.clone()),
+            voting_policy: self.voting_policy.clone(),
             status: Some(self.status.clone()),
             creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
             tags: Some(map_out(&self.tags)),
@@ -326,7 +452,7 @@ impl StoredNetwork {
             name: Some(self.name.clone()),
             description: self.description.clone(),
             framework: Some(self.framework.clone()),
-            framework_version: Some(self.framework_version.clone()),
+            framework_version: self.framework_version.clone(),
             status: Some(self.status.clone()),
             creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
             arn: Some(self.arn.clone()),
@@ -408,6 +534,26 @@ impl StoredMember {
     }
 }
 
+/// The endpoints a node exposes, which differ by the framework of the network it runs on:
+/// a Hyperledger Fabric node is reached through its peer endpoints
+/// (`NodeFabricAttributes`), an Ethereum node through its JSON-RPC endpoints
+/// (`NodeEthereumAttributes`). Both are minted once, at create time, and stored.
+#[derive(Debug, Clone)]
+pub enum StoredNodeEndpoints {
+    /// `NodeFabricAttributes$PeerEndpoint` and `$PeerEventEndpoint`.
+    Fabric {
+        peer_endpoint: String,
+        peer_event_endpoint: String,
+    },
+    /// `NodeEthereumAttributes$HttpEndpoint` ("the endpoint on which the Ethereum node
+    /// listens to run Ethereum API methods over HTTP connections") and
+    /// `$WebSocketEndpoint`.
+    Ethereum {
+        http_endpoint: String,
+        web_socket_endpoint: String,
+    },
+}
+
 /// One stored node of a network.
 #[derive(Debug, Clone)]
 pub struct StoredNode {
@@ -419,13 +565,13 @@ pub struct StoredNode {
     /// The Availability Zone the create named, or `None` when it named none: which zone
     /// the service would have picked is EC2 state this emulator does not hold.
     pub availability_zone: Option<String>,
-    /// `NodeFabricAttributes$PeerEndpoint`, minted at create time.
-    pub peer_endpoint: String,
-    /// `NodeFabricAttributes$PeerEventEndpoint`, minted at create time.
-    pub peer_event_endpoint: String,
+    /// The endpoints this node is reached on, minted at create time for the framework of
+    /// the network it runs on.
+    pub endpoints: StoredNodeEndpoints,
     pub log_publishing_configuration: Option<NodeLogPublishingConfiguration>,
-    /// A `StateDBType` value.
-    pub state_db: String,
+    /// A `StateDBType` value; `None` on a framework that has no state database
+    /// (`NodeConfiguration$StateDB` "Applies only to Hyperledger Fabric").
+    pub state_db: Option<String>,
     /// A `NodeStatus` value.
     pub status: String,
     /// When `CREATING` -> `AVAILABLE` falls due. See [`TRANSITION_SPAN`].
@@ -439,6 +585,33 @@ pub struct StoredNode {
 }
 
 impl StoredNode {
+    /// The modelled `NodeFrameworkAttributes` for this record: the attributes of the
+    /// framework whose endpoints it was minted with, and nothing for the other.
+    fn to_framework_attributes(&self) -> NodeFrameworkAttributes {
+        match &self.endpoints {
+            StoredNodeEndpoints::Fabric {
+                peer_endpoint,
+                peer_event_endpoint,
+            } => NodeFrameworkAttributes {
+                fabric: Some(NodeFabricAttributes {
+                    peer_endpoint: Some(peer_endpoint.clone()),
+                    peer_event_endpoint: Some(peer_event_endpoint.clone()),
+                }),
+                ethereum: None,
+            },
+            StoredNodeEndpoints::Ethereum {
+                http_endpoint,
+                web_socket_endpoint,
+            } => NodeFrameworkAttributes {
+                fabric: None,
+                ethereum: Some(NodeEthereumAttributes {
+                    http_endpoint: Some(http_endpoint.clone()),
+                    web_socket_endpoint: Some(web_socket_endpoint.clone()),
+                }),
+            },
+        }
+    }
+
     /// The modelled `Node` for this record, as `GetNode` returns it.
     pub fn to_node(&self) -> Node {
         Node {
@@ -447,17 +620,9 @@ impl StoredNode {
             id: Some(self.id.clone()),
             instance_type: Some(self.instance_type.clone()),
             availability_zone: self.availability_zone.clone(),
-            framework_attributes: Some(NodeFrameworkAttributes {
-                fabric: Some(NodeFabricAttributes {
-                    peer_endpoint: Some(self.peer_endpoint.clone()),
-                    peer_event_endpoint: Some(self.peer_event_endpoint.clone()),
-                }),
-                // Only Hyperledger Fabric networks can be created here, so no node ever
-                // carries Ethereum attributes.
-                ethereum: None,
-            }),
+            framework_attributes: Some(self.to_framework_attributes()),
             log_publishing_configuration: self.log_publishing_configuration.clone(),
-            state_db: Some(self.state_db.clone()),
+            state_db: self.state_db.clone(),
             status: Some(self.status.clone()),
             creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
             tags: Some(map_out(&self.tags)),
@@ -554,6 +719,27 @@ impl StoredProposal {
             arn: Some(self.arn.clone()),
         }
     }
+
+    /// The modelled `ProposalSummary` for this record, as `ListProposals` returns it.
+    ///
+    /// `network` is the network this proposal belongs to, for the same reason as in
+    /// [`Self::to_proposal`]: the proposing member's name is read from its current
+    /// membership rather than frozen into the proposal.
+    pub fn to_summary(&self, network: &StoredNetwork) -> ProposalSummary {
+        ProposalSummary {
+            proposal_id: Some(self.id.clone()),
+            description: self.description.clone(),
+            proposed_by_member_id: Some(self.proposed_by_member_id.clone()),
+            proposed_by_member_name: network
+                .members
+                .get(&self.proposed_by_member_id)
+                .map(|member| member.name.clone()),
+            status: Some(self.status.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            expiration_date: self.expiration_date.map(::aws_smithy_types::DateTime::from),
+            arn: Some(self.arn.clone()),
+        }
+    }
 }
 
 /// One stored accessor: the token-based access object `CreateAccessor` mints.
@@ -614,6 +800,10 @@ pub struct StoredInvitation {
     /// When it passes, a still-`PENDING` invitation is owed `EXPIRED` — see
     /// [`ComAmazonawsManagedblockchainTaigawebserviceState::settle`].
     pub expiration_date: SystemTime,
+    /// When `ACCEPTING` -> `ACCEPTED` falls due: the instant the member the invitee
+    /// created with this invitation finishes creating. `None` until `CreateMember`
+    /// accepts it.
+    pub accepted_at: Option<SystemTime>,
     pub arn: String,
 }
 
@@ -633,13 +823,36 @@ impl StoredInvitation {
             arn: Some(self.arn.clone()),
         }
     }
+
+    /// Materialise the status transitions the clock already owes this invitation: one
+    /// nobody acted on expires on its `ExpirationDate`, and one whose member has finished
+    /// creating is `ACCEPTED`.
+    fn settle(&mut self, now: SystemTime) {
+        if self.status == INVITATION_STATUS_PENDING && now >= self.expiration_date {
+            self.status = INVITATION_STATUS_EXPIRED.to_string();
+        }
+        if self.status == INVITATION_STATUS_ACCEPTING
+            && self.accepted_at.is_some_and(|accepted_at| now >= accepted_at)
+        {
+            self.status = INVITATION_STATUS_ACCEPTED.to_string();
+        }
+    }
+
+    /// Whether this invitation can still be used to create a member: only a `PENDING` one
+    /// can, since after its `ExpirationDate` "the invitee can no longer create a member
+    /// and join the network using this `InvitationId`", and a rejected or already accepted
+    /// invitation is spent.
+    pub fn is_usable(&self) -> bool {
+        self.status == INVITATION_STATUS_PENDING
+    }
 }
 
 /// Per-service state for com-amazonaws-managedblockchain-taigawebservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsManagedblockchainTaigawebserviceState {
-    /// Every created network, keyed by its minted id — which also orders the listings,
-    /// so a page cursor keys on the ordering itself.
+    /// Every network this store holds — the ones this account created and AWS's standing
+    /// public ones — keyed by id, which also orders the listings, so a page cursor keys
+    /// on the ordering itself.
     pub networks: BTreeMap<String, StoredNetwork>,
     /// Every created accessor, keyed by its minted id — which also orders the listings,
     /// so a page cursor keys on the ordering itself.
@@ -662,6 +875,58 @@ pub struct ComAmazonawsManagedblockchainTaigawebserviceState {
     id_seed: u64,
 }
 
+impl Default for ComAmazonawsManagedblockchainTaigawebserviceState {
+    /// A fresh store already holds AWS's standing, AWS-owned public networks.
+    ///
+    /// They are not account resources and no call creates them: "AMB Access exposes
+    /// standing public blockchain networks that every account can read", under the same
+    /// ids in every account. Materialising them here — rather than on first read — is
+    /// what keeps every read of them a pure read.
+    ///
+    /// Their ARNs and VPC endpoint service names name [`DEFAULT_REGION`]: nothing minted
+    /// them for a request, so there is no credential scope to read a Region from.
+    fn default() -> Self {
+        let mut state = Self {
+            networks: BTreeMap::new(),
+            accessors: BTreeMap::new(),
+            invitations: BTreeMap::new(),
+            idempotency: BTreeMap::new(),
+            idempotency_order: ::std::collections::VecDeque::new(),
+            id_seed: 0,
+        };
+        for public in PUBLIC_NETWORKS {
+            let genesis = SystemTime::UNIX_EPOCH + Duration::from_secs(public.genesis_epoch_seconds);
+            state.networks.insert(
+                public.id.to_string(),
+                StoredNetwork {
+                    id: public.id.to_string(),
+                    name: public.name.to_string(),
+                    description: None,
+                    framework: public.framework.to_string(),
+                    framework_version: None,
+                    fabric_edition: None,
+                    ordering_service_endpoint: None,
+                    ethereum_chain_id: Some(public.chain_id.to_string()),
+                    aws_owned: true,
+                    voting_policy: None,
+                    // A public network is standing and ready: AWS reports it `AVAILABLE`,
+                    // so the clock owes it no transition.
+                    status: STATUS_AVAILABLE.to_string(),
+                    available_at: genesis,
+                    creation_date: genesis,
+                    tags: BTreeMap::new(),
+                    arn: network_arn(DEFAULT_REGION, public.id),
+                    vpc_endpoint_service_name: vpc_endpoint_service_name(DEFAULT_REGION, public.id),
+                    members: BTreeMap::new(),
+                    nodes: BTreeMap::new(),
+                    proposals: BTreeMap::new(),
+                },
+            );
+        }
+        state
+    }
+}
+
 impl ComAmazonawsManagedblockchainTaigawebserviceState {
     /// Materialise every status transition the clock already owes. Called at the top of
     /// each handler, reporting ones included: they may write only a change that was
@@ -670,12 +935,11 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         for network in self.networks.values_mut() {
             network.settle(now);
         }
-        // An invitation nobody acted on before its `ExpirationDate` is `EXPIRED` — a
-        // transition the CLOCK owes, due at that instant whether or not anybody calls.
+        // An invitation nobody acted on before its `ExpirationDate` is `EXPIRED`, and one
+        // whose member has finished creating is `ACCEPTED` — transitions the CLOCK owes,
+        // due at that instant whether or not anybody calls.
         for invitation in self.invitations.values_mut() {
-            if invitation.status == INVITATION_STATUS_PENDING && now >= invitation.expiration_date {
-                invitation.status = INVITATION_STATUS_EXPIRED.to_string();
-            }
+            invitation.settle(now);
         }
     }
 
@@ -847,7 +1111,12 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         if self.invitations.len() >= MAX_INVITATIONS {
             return None;
         }
-        let duration = proposal_duration(&self.networks.get(network_id)?.voting_policy)
+        let duration = self
+            .networks
+            .get(network_id)?
+            .voting_policy
+            .as_ref()
+            .and_then(proposal_duration)
             // Both `Invitation$ExpirationDate` and `Proposal$ExpirationDate` are the
             // creation date plus the policy's `ProposalDurationInHours`, so both read it
             // through the one helper. Where they part is a policy that names NO duration:
@@ -866,6 +1135,7 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
             status: INVITATION_STATUS_PENDING.to_string(),
             creation_date: now,
             expiration_date: now + duration,
+            accepted_at: None,
         };
         self.invitations.insert(id.clone(), invitation);
         Some(id)
@@ -1038,6 +1308,43 @@ pub fn peer_endpoints(
         None => format!("{node_id}.{network_id}.{ARN_SERVICE}.{region}.amazonaws.com"),
     };
     (format!("{host}:30003"), format!("{host}:30004"))
+}
+
+/// The endpoints a node on an Ethereum network is reached on
+/// (`NodeEthereumAttributes$HttpEndpoint` and `$WebSocketEndpoint`), shaped as AMB Access
+/// publishes them: the JSON-RPC endpoint over HTTPS and the same node over WebSocket.
+/// Derived from the stored node id, so they are stable across reads and differ between two
+/// nodes.
+pub fn ethereum_endpoints(region: &str, node_id: &str) -> (String, String) {
+    (
+        format!("https://{node_id}.ethereum.{ARN_SERVICE}.{region}.amazonaws.com"),
+        format!("wss://{node_id}.wss.ethereum.{ARN_SERVICE}.{region}.amazonaws.com"),
+    )
+}
+
+/// The endpoints a node on `framework` is reached on, for the node and member ids its
+/// create minted: the framework decides which `NodeFrameworkAttributes` the node reports.
+pub fn node_endpoints(
+    framework: &str,
+    region: &str,
+    network_id: &str,
+    member_id: Option<&str>,
+    node_id: &str,
+) -> StoredNodeEndpoints {
+    if framework == FRAMEWORK_HYPERLEDGER_FABRIC {
+        let (peer_endpoint, peer_event_endpoint) =
+            peer_endpoints(region, network_id, member_id, node_id);
+        StoredNodeEndpoints::Fabric {
+            peer_endpoint,
+            peer_event_endpoint,
+        }
+    } else {
+        let (http_endpoint, web_socket_endpoint) = ethereum_endpoints(region, node_id);
+        StoredNodeEndpoints::Ethereum {
+            http_endpoint,
+            web_socket_endpoint,
+        }
+    }
 }
 
 /// One page of a `@paginated` listing: the items to return, plus the cursor that resumes

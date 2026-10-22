@@ -150,8 +150,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // The operation documents its precondition: "An application has to be in a
-        // stopped or created state in order to be deleted."
-        let application_state = record.application.state.clone();
+        // stopped or created state in order to be deleted." It is judged against the
+        // state the application has SETTLED on, so a transition the clock still owes it
+        // (a create on its way to `CREATED`, a stop on its way to `STOPPED`) completes
+        // here rather than refusing a delete the settled application admits.
+        let application_state = record.settled_state().to_string();
         if !crate::state::DELETABLE_APPLICATION_STATES.contains(&application_state.as_str()) {
             return Err(DeleteApplicationErrorModeled::ValidationException(
                 ValidationException {
@@ -164,9 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Removing the record also forgets this application's client tokens, so the
-        // token maps can never outgrow the applications they belong to.
-        store.applications.remove(&input.application_id);
+        // The record is RETAINED in the terminal `TERMINATED` state, so a client reading
+        // the application back after the delete observes a terminal state rather than
+        // the state it last had. Its client token is forgotten: the idempotency window
+        // ends with the application, so a later create reusing the token mints a new
+        // application instead of reporting this terminated one.
+        record.terminate(now);
         store
             .create_application_tokens
             .retain(|_, id| id != &input.application_id);

@@ -33,8 +33,8 @@ const REGION: &str = "us-west-2";
 /// A MediaPackageV2 emulator plus a tiny restJson1 client for it.
 ///
 /// `pub(crate)` so the crate's other suites drive the emulator through this one client
-/// rather than each growing its own copy of it (see `tests/all/channel_reset.rs` and
-/// `tests/all/control_plane_validation.rs`).
+/// rather than each growing its own copy of it (see `tests/all/channel_reset.rs`,
+/// `tests/all/control_plane_validation.rs` and `tests/all/origin_endpoint_reset.rs`).
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }

@@ -3,10 +3,11 @@
 //! Engine state for the com-amazonaws-lightsail-lightsail-20161128 service.
 //!
 //! The slice implemented so far is Lightsail's primary resource, the **instance**
-//! (a virtual private server), together with the append-only **operation log**
-//! every mutating instance call writes. Everything in this module is reached
-//! through [`with_state`], so no handler can observe a store whose clock-owed
-//! instance transitions have not been applied yet.
+//! (a virtual private server), the **domain** (a DNS zone the account holds
+//! recordsets in), and the append-only **operation log** every mutating call
+//! writes. Everything in this module is reached through [`with_state`], so no
+//! handler can observe a store whose clock-owed instance transitions have not
+//! been applied yet.
 //!
 //! Two kinds of value live on a stored instance:
 //!
@@ -23,9 +24,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AddOn, AddOnRequest, Instance, InstanceHardware, InstanceMetadataOptions, InstanceNetworking,
-    InstancePortInfo, InstanceState, MonthlyTransfer, Operation, ResourceLocation, Tag,
-    REGION_NAME_VALUES,
+    AddOn, AddOnRequest, Domain, DomainEntry, Instance, InstanceHardware, InstanceMetadataOptions,
+    InstanceNetworking, InstancePortInfo, InstanceState, MonthlyTransfer, Operation,
+    ResourceLocation, Tag, REGION_NAME_VALUES,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,29 @@ pub const INSTANCE_ARN_RESOURCE_PREFIX: &str = "Instance/";
 /// The `resourceType` an instance and its operations report, from the modelled
 /// `ResourceType` enum.
 pub const RESOURCE_TYPE_INSTANCE: &str = "Instance";
+
+/// The resource portion a domain ARN carries before its id, from the modelled
+/// `Domain$arn` documentation
+/// (`arn:aws:lightsail:global:123456789101:Domain/824cede0-…`).
+pub const DOMAIN_ARN_RESOURCE_PREFIX: &str = "Domain/";
+
+/// The `resourceType` a domain and its operations report, from the modelled
+/// `ResourceType` enum.
+pub const RESOURCE_TYPE_DOMAIN: &str = "Domain";
+
+/// The ARN region token of a domain recordset: a DNS zone is not a regional
+/// resource, which is why the modelled `Domain$arn` documentation shows `global`
+/// where an instance ARN carries a region.
+pub const DOMAIN_ARN_REGION: &str = "global";
+
+/// The region a domain recordset reports in its `ResourceLocation`.
+///
+/// `ResourceLocation$regionName` targets the modelled `RegionName` enum, which
+/// has no `global` member, and the modelled `InvalidInputException`
+/// documentation says "Domain and distribution APIs are only available in the
+/// N. Virginia (us-east-1) Amazon Web Services Region" — so that is the region a
+/// recordset of this account lives in.
+pub const DOMAIN_REGION_NAME: &str = "us-east-1";
 
 /// Applied when `CreateInstances` omits `ipAddressType`.
 ///
@@ -141,6 +165,8 @@ pub const OPERATION_TYPE_START_INSTANCE: &str = "StartInstance";
 pub const OPERATION_TYPE_STOP_INSTANCE: &str = "StopInstance";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_INSTANCE: &str = "DeleteInstance";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_DOMAIN: &str = "CreateDomain";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -162,6 +188,12 @@ pub const MAX_INSTANCES: usize = 500;
 /// Emulator resource guard: the modelled `StringList` declares no length, so this
 /// is where the bound on a caller-sized list lives.
 pub const MAX_INSTANCE_NAMES_PER_REQUEST: usize = 50;
+
+/// The most domain recordsets this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
+/// refused with the modelled `InvalidInputException`.
+pub const MAX_DOMAINS: usize = 500;
 
 /// The most tags one instance may carry.
 ///
@@ -393,17 +425,38 @@ pub fn region_names() -> String {
 }
 
 /// Where a stored record lives.
+///
+/// `availability_zone` is absent for a resource that is not zonal: the member
+/// documents the `us-east-2a` form, which addresses one zone of one region, and
+/// a DNS zone is held by the region as a whole, so there is no zone to name.
 #[derive(Debug, Clone)]
 pub struct StoredLocation {
-    pub availability_zone: String,
+    pub availability_zone: Option<String>,
     pub region_name: String,
 }
 
 impl StoredLocation {
+    /// The location of a resource created in one availability zone.
+    pub fn zonal(availability_zone: &str, region_name: &str) -> Self {
+        Self {
+            availability_zone: Some(availability_zone.to_string()),
+            region_name: region_name.to_string(),
+        }
+    }
+
+    /// The location of a domain recordset: [`DOMAIN_REGION_NAME`], and no
+    /// availability zone at all.
+    pub fn domain() -> Self {
+        Self {
+            availability_zone: None,
+            region_name: DOMAIN_REGION_NAME.to_string(),
+        }
+    }
+
     /// This location as the modelled `ResourceLocation`.
     pub fn view(&self) -> ResourceLocation {
         ResourceLocation {
-            availability_zone: Some(self.availability_zone.clone()),
+            availability_zone: self.availability_zone.clone(),
             region_name: Some(self.region_name.clone()),
         }
     }
@@ -625,6 +678,43 @@ impl StoredInstance {
     }
 }
 
+/// One stored domain recordset: the DNS zone `CreateDomain` created, with the
+/// entries the account has added to it.
+#[derive(Debug, Clone)]
+pub struct StoredDomain {
+    /// The domain name the request named, kept verbatim — it is this record's
+    /// store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    /// The recordsets held in this zone, newest last. A zone is created empty:
+    /// `CreateDomainEntry` is what adds an entry to it.
+    pub entries: Vec<DomainEntry>,
+}
+
+impl StoredDomain {
+    /// This record as the modelled `Domain`.
+    pub fn view(&self) -> Domain {
+        Domain {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_DOMAIN.to_string()),
+            tags: Some(self.tags.clone()),
+            domain_entries: Some(self.entries.clone()),
+            // Nothing has delegated a Route 53 registered domain to this zone:
+            // that delegation is made in Route 53, which this emulator does not
+            // serve, so there is no state to report.
+            registered_domain_delegation_info: None,
+        }
+    }
+}
+
 /// One entry of the operation log: what a mutating call did, and when.
 #[derive(Debug, Clone)]
 pub struct StoredOperation {
@@ -677,6 +767,10 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// operation takes. A `BTreeMap` so `GetInstances` walks a stable, total
     /// order and a page token can name the next instance.
     pub instances: BTreeMap<String, StoredInstance>,
+    /// Every domain recordset, keyed by its domain name — the identifier every
+    /// domain operation takes. A `BTreeMap` so `GetDomains` walks a stable,
+    /// total order.
+    pub domains: BTreeMap<String, StoredDomain>,
     /// The append-only operation log, newest last: the source of truth for the
     /// `operations` every mutating instance call answers with.
     pub operations: Vec<StoredOperation>,
@@ -705,6 +799,16 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Store a newly created instance.
     pub fn insert_instance(&mut self, instance: StoredInstance) {
         self.instances.insert(instance.name.clone(), instance);
+    }
+
+    /// The domain recordset `name` names, for a reporting operation.
+    pub fn domain(&self, name: &str) -> Option<&StoredDomain> {
+        self.domains.get(name)
+    }
+
+    /// Store a newly created domain recordset.
+    pub fn insert_domain(&mut self, domain: StoredDomain) {
+        self.domains.insert(domain.name.clone(), domain);
     }
 
     /// Remove the instance `name` names, answering it. `None` when nothing
@@ -771,6 +875,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
 
     /// Build and record an operation of `operation_type` against `resource_name`.
     ///
+    /// `resource_type` is the kind of resource the operation acted on, from the
+    /// modelled `ResourceType` enum, so the log says what each entry is about.
+    ///
     /// `settles_at_ms` is the instant the clock owes the operation its terminal
     /// status — `None` for work that was already finished when the call
     /// returned, in which case the operation is answered terminal.
@@ -778,6 +885,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
         &mut self,
         now_ms: i64,
         operation_type: &str,
+        resource_type: &str,
         resource_name: &str,
         location: &StoredLocation,
         settles_at_ms: Option<i64>,
@@ -787,7 +895,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
         let operation = StoredOperation {
             id,
             resource_name: resource_name.to_string(),
-            resource_type: RESOURCE_TYPE_INSTANCE.to_string(),
+            resource_type: resource_type.to_string(),
             created_at_ms: now_ms,
             location: location.clone(),
             is_terminal: terminal,
@@ -907,6 +1015,79 @@ fn default_snapshot_time_of_day(instance_name: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Domain names
+// ---------------------------------------------------------------------------
+
+/// The most characters a domain name may carry.
+///
+/// RFC 1035 §2.3.4 caps an encoded domain name at 255 octets, which is 253
+/// characters in the dotted presentation form a request uses.
+pub const MAX_DOMAIN_NAME_CHARS: usize = 253;
+
+/// The most characters one label of a domain name may carry, from the same
+/// RFC 1035 §2.3.4 limit on a single label.
+pub const MAX_DOMAIN_LABEL_CHARS: usize = 63;
+
+/// Refuse `domain_name` unless it is a DNS domain name this service can hold a
+/// recordset for, answering the member and the constraint it broke.
+///
+/// The modelled `DomainName` shape carries no pattern and no length, and the
+/// modelled `CreateDomain` documentation says the name is "the specified domain
+/// (example.com)" — so the rule is DNS's own: at least two dot-separated
+/// labels (a name with no parent zone addresses no domain), each a non-empty
+/// run of at most [`MAX_DOMAIN_LABEL_CHARS`] letters, digits and hyphens that
+/// neither begins nor ends with a hyphen (RFC 1035 §2.3.1 preferred syntax,
+/// widened to leading digits by RFC 1123 §2.1), and at most
+/// [`MAX_DOMAIN_NAME_CHARS`] characters overall.
+pub fn validate_domain_name(domain_name: &str) -> Result<(), String> {
+    if domain_name.chars().count() > MAX_DOMAIN_NAME_CHARS {
+        return Err(format!(
+            "domainName carries {} characters, more than the {MAX_DOMAIN_NAME_CHARS} a \
+             domain name may have",
+            domain_name.chars().count()
+        ));
+    }
+    let labels: Vec<&str> = domain_name.split('.').collect();
+    if labels.len() < 2 {
+        return Err(format!(
+            "domainName '{domain_name}' is not a domain name: it must carry at least two \
+             dot-separated labels (example.com)"
+        ));
+    }
+    for label in labels {
+        if label.is_empty() {
+            return Err(format!(
+                "domainName '{domain_name}' is not a domain name: every dot-separated label \
+                 must be non-empty"
+            ));
+        }
+        if label.chars().count() > MAX_DOMAIN_LABEL_CHARS {
+            return Err(format!(
+                "domainName label '{label}' carries {} characters, more than the \
+                 {MAX_DOMAIN_LABEL_CHARS} a label may have",
+                label.chars().count()
+            ));
+        }
+        if !label
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        {
+            return Err(format!(
+                "domainName label '{label}' is not a domain label: a label carries only \
+                 ASCII letters, digits and hyphens"
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!(
+                "domainName label '{label}' is not a domain label: a label neither begins \
+                 nor ends with a hyphen"
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Clocks and ids
 // ---------------------------------------------------------------------------
 
@@ -939,6 +1120,16 @@ pub fn instance_arn(region: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{INSTANCE_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The ARN of the domain recordset `id`. A DNS zone is not regional, so its ARN
+/// carries [`DOMAIN_ARN_REGION`] where an instance ARN carries a region.
+pub fn domain_arn(id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        DOMAIN_ARN_REGION,
+        &format!("{DOMAIN_ARN_RESOURCE_PREFIX}{id}"),
     )
 }
 

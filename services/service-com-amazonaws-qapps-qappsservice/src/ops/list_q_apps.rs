@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListQApps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListQApps`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: enumerates the Q Apps persisted for the request's
+//! `instance-id`, in creation order, one `limit`-sized page at a time. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListQApps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListQApps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListQAppsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListQApps"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListQAppsErrorModeled::InternalServerException(InternalServerException {
+                message: "the qapps store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let principal = crate::state::caller_principal(ctx);
+
+        let store = state.lock();
+        // Creation order, so a page boundary means the same thing on every
+        // call; a deleted app is no longer listed.
+        let listed: Vec<&crate::state::QApp> = store
+            .app_order
+            .iter()
+            .filter(|(instance_id, _)| *instance_id == input.instance_id)
+            .filter_map(|(_, app_id)| store.app(&input.instance_id, app_id))
+            .collect();
+
+        // A `nextToken` resumes immediately after the app it names; one this
+        // service did not issue for this instance, or one whose app is gone,
+        // names no position to resume from.
+        let start = match &input.next_token {
+            None => 0,
+            Some(token) => {
+                let resume_after = crate::state::decode_page_token(&input.instance_id, token)
+                    .and_then(|last_app_id| {
+                        listed
+                            .iter()
+                            .position(|app| app.app_id == last_app_id)
+                            .map(|index| index + 1)
+                    });
+                match resume_after {
+                    Some(index) => index,
+                    None => {
+                        return Err(ListQAppsErrorModeled::ValidationException(
+                            ValidationException {
+                                message: "nextToken is not a valid pagination token for this instance"
+                                    .to_string(),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        };
+
+        // Absent `limit` means the largest page the API lets a caller ask for
+        // (the model's `limit` is range 1..100), so one call never returns an
+        // unbounded list: the rest of the apps are reached with the token.
+        let page_size = input.limit.map_or(crate::state::DEFAULT_PAGE_SIZE, |limit| {
+            usize::try_from(limit).unwrap_or(0)
+        });
+        let end = start.saturating_add(page_size).min(listed.len());
+        let page = &listed[start.min(listed.len())..end];
+
+        let apps: Vec<UserAppItem> = page
+            .iter()
+            .map(|app| UserAppItem {
+                app_id: app.app_id.clone(),
+                app_arn: app.app_arn.clone(),
+                title: app.title.clone(),
+                description: app.description.clone(),
+                created_at: app.created_at,
+                // `canEdit` is a statement about THIS caller.
+                can_edit: Some(principal == app.created_by),
+                status: Some(app.status.as_wire().to_string()),
+                // Nothing in this emulator verifies an app; `isVerified`
+                // carries the model's own default.
+                is_verified: false,
+            })
+            .collect();
+
+        // A token only when apps remain after this page: its absence is what
+        // tells a caller the last page arrived.
+        let next_token = page
+            .last()
+            .filter(|_| end < listed.len())
+            .map(|last| crate::state::encode_page_token(&input.instance_id, &last.app_id));
+
+        Ok(ListQAppsOutput { apps, next_token })
     }
 }

@@ -6,9 +6,9 @@
 //! see was created by `CreateDistribution`, so this store starts EMPTY and every record
 //! in it was put there by a mutating call. The store is the single source of truth for
 //! each distribution's id, ARN, domain name, status, version token (`ETag`), its
-//! configuration as submitted, and the invalidations created under it — so a create or
-//! update followed by a get, a list or a delete answers from the one record rather than
-//! from the request that is being served.
+//! configuration as submitted, the tag set associated with it, and the invalidations
+//! created under it — so a create or update followed by a get, a list, a tag read or a
+//! delete answers from the one record rather than from the request that is being served.
 //!
 //! Two things in here are owed by the CLOCK rather than by a call:
 //!
@@ -32,10 +32,10 @@ use crate::ops::types::{
     CachedMethods, CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
     DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
     EntityAlreadyExists, EntityNotFound, ForwardedValues, FunctionAssociations, GeoRestriction,
-    Invalidation, InvalidationBatch, KGKeyPairIds, KeyPairIds, KeyValueStore,
-    LambdaFunctionAssociations, LoggingConfig, NoSuchDistribution, NoSuchInvalidation, Origin,
-    OriginSslProtocols, Paths, Restrictions, Signer, Tags, TrustedKeyGroups,
-    TrustedSigners, ViewerCertificate,
+    Invalidation, InvalidationBatch, InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore,
+    LambdaFunctionAssociations, LoggingConfig, NoSuchDistribution, NoSuchInvalidation,
+    NoSuchResource, Origin, OriginSslProtocols, Paths, Restrictions, Signer, Tag, Tags,
+    TrustedKeyGroups, TrustedSigners, ViewerCertificate,
 };
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
@@ -130,6 +130,14 @@ pub const MAX_TRUSTED_KEY_GROUPS: usize = 4;
 /// well. Over it, the refusal is the modelled `BatchTooLarge` (HTTP 413): "Invalidation
 /// batch specified is too large."
 pub const MAX_INVALIDATION_PATHS: usize = 3_000;
+
+/// The most tags ONE CloudFront resource may carry.
+///
+/// CloudFront's published quota for tagging is 50 tags per distribution, and a tag set
+/// is stored whole on the resource, so this bounds one resource's contribution to the
+/// store as well. Over it, the refusal is the modelled `InvalidTagging`: "The tagging
+/// specified is not valid."
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// `KeyValueStore$Status` while CloudFront is still provisioning a key value store.
 ///
@@ -348,6 +356,82 @@ const ID_BODY_LEN: usize = 13;
 /// token from: decimal digits and uppercase ASCII letters.
 const TOKEN_ALPHABET: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
+/// The tag set one resource carries: tag key -> the tag's value, where a tag whose
+/// `Value` the request left out carries none.
+///
+/// A map rather than the submitted list, because a resource carries at most ONE tag per
+/// key; a `BTreeMap` is what makes the order a tag read reports deterministic, which
+/// CloudFront leaves unspecified.
+pub type TagSet = BTreeMap<String, Option<String>>;
+
+/// The tag set `tags` describes, or the REASON a tag set no resource can carry was
+/// refused.
+///
+/// Two rules the model cannot express: a resource carries at most one tag per key, so a
+/// request naming one key twice describes no tag set at all; and a resource carries at
+/// most [`MAX_TAGS_PER_RESOURCE`] tags. Each tag's key and value length and character
+/// constraints ARE modelled (`TagKey`, `TagValue`), so those are already refused before
+/// any handler runs.
+///
+/// ONE rule for every resource kind this service tags. The reason carries no error
+/// wording of its own: each caller prefixes it with the wording of whichever refusal its
+/// OWN model declares, so the message a client reads names the error it was given.
+pub fn tag_set(tags: &Tags) -> Result<TagSet, String> {
+    let items = tags.items.as_deref().unwrap_or_default();
+    if items.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(format!(
+            "a CloudFront resource carries at most {MAX_TAGS_PER_RESOURCE} tags but the \
+             request names {}",
+            items.len()
+        ));
+    }
+    let mut set = TagSet::new();
+    for tag in items {
+        // One lookup: a key the set already held is a request that does not describe a
+        // tag set at all.
+        if set.insert(tag.key.clone(), tag.value.clone()).is_some() {
+            return Err(format!("the tag key {} is named more than once", tag.key));
+        }
+    }
+    Ok(set)
+}
+
+/// The `Tags` projection a tag read returns for a stored tag set.
+///
+/// "A complex type that contains zero or more `Tag` elements": a resource with no tags
+/// reports the empty list rather than nothing at all, so a caller reads the same shape
+/// whether or not the resource is tagged. ONE projection for every resource kind this
+/// service tags.
+pub fn tags_projection(tags: &TagSet) -> Tags {
+    Tags {
+        items: Some(
+            tags.iter()
+                .map(|(key, value)| Tag {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// The modelled `InvalidTagging` for a tag set no resource can carry, wording `reason`
+/// as that error documents itself — "The tagging specified is not valid."
+pub fn invalid_tagging(reason: String) -> InvalidTagging {
+    InvalidTagging {
+        message: Some(format!("The tagging specified is not valid: {reason}")),
+    }
+}
+
+/// The modelled `NoSuchResource` for an ARN no resource this emulator holds carries.
+pub fn no_such_resource(arn: &str) -> NoSuchResource {
+    NoSuchResource {
+        message: Some(format!(
+            "The specified CloudFront resource does not exist: {arn}"
+        )),
+    }
+}
+
 /// One invalidation batch submitted against one distribution.
 #[derive(Debug, Clone)]
 pub struct StoredInvalidation {
@@ -403,6 +487,9 @@ pub struct StoredDistribution {
     /// returns the configuration the distribution actually runs under rather than a
     /// re-derivation of it.
     pub config: DistributionConfig,
+    /// The tags associated with this distribution. A distribution created without a tag
+    /// set carries none, which is the empty set rather than an absent one.
+    pub tags: TagSet,
     /// Every invalidation created under this distribution, keyed by invalidation id.
     pub invalidations: BTreeMap<String, StoredInvalidation>,
 }
@@ -466,6 +553,11 @@ impl StoredDistribution {
             // names in the China partition, which this emulator does not serve.
             alias_icp_recordals: None,
         }
+    }
+
+    /// The `Tags` projection a tag read returns, built from the one stored tag set.
+    pub fn to_tags(&self) -> Tags {
+        tags_projection(&self.tags)
     }
 
     /// Every cache behaviour of the stored configuration, as the view that names the list
@@ -655,9 +747,10 @@ pub struct StoredKeyValueStore {
     /// The version token the last mutation handed back, and the single source of truth
     /// for every `If-Match` check against this store.
     pub etag: String,
-    /// The tags submitted with the create, held verbatim so a tagging operation reads
-    /// what was stored rather than re-deriving it.
-    pub tags: Option<Tags>,
+    /// The tags submitted with the create, held so a tagging operation reads what was
+    /// stored rather than re-deriving it. The SAME representation a distribution's tags
+    /// take, so one tagging rule covers both resource kinds.
+    pub tags: TagSet,
 }
 
 impl StoredKeyValueStore {
@@ -670,6 +763,11 @@ impl StoredKeyValueStore {
         if self.status == KVS_STATUS_PROVISIONING && now >= self.ready_due {
             self.status = KVS_STATUS_READY.to_string();
         }
+    }
+
+    /// The `Tags` projection a tag read returns, built from the one stored tag set.
+    pub fn to_tags(&self) -> Tags {
+        tags_projection(&self.tags)
     }
 
     /// The `KeyValueStore` projection every key value store operation returns, read from
@@ -724,6 +822,112 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The distribution `id` names, or `None` when the store holds none.
     pub fn distribution(&self, id: &str) -> Option<&StoredDistribution> {
         self.distributions.get(id)
+    }
+
+    /// The tag set of the resource `arn` names, across every resource kind this store
+    /// holds, or `None` when it holds no such resource.
+    ///
+    /// A tagging call names its resource by ARN rather than by id or name, and the ARN a
+    /// resource carries is the one minted when it was created, so the lookup compares
+    /// against the STORED value rather than re-deriving an identifier out of the
+    /// request. An ARN naming a kind of CloudFront resource this emulator does not hold
+    /// matches nothing, which is exactly what makes it a resource that does not exist.
+    pub fn tags_for_resource(&self, arn: &str) -> Option<&TagSet> {
+        if let Some(distribution) = self
+            .distributions
+            .values()
+            .find(|distribution| distribution.arn == arn)
+        {
+            return Some(&distribution.tags);
+        }
+        self.key_value_stores
+            .values()
+            .find(|store| store.arn == arn)
+            .map(|store| &store.tags)
+    }
+
+    /// Persist a new distribution carrying `config` and `tags`, and report the record
+    /// that was stored.
+    ///
+    /// The ONE create path. `CreateDistribution` and `CreateDistributionWithTags` create
+    /// the same resource under the same rules and differ only in whether the request
+    /// carries a tag set, so the configuration check, the caller-reference claim, the
+    /// store bound, the mint and the insert all live here and cannot drift apart.
+    ///
+    /// Every refusal is decided BEFORE anything is claimed, so a refused create leaves
+    /// the store exactly as it was: no id, domain name, version token or caller
+    /// reference is spent on it.
+    pub fn create_distribution(
+        &mut self,
+        config: DistributionConfig,
+        tags: TagSet,
+        now: SystemTime,
+    ) -> Result<CreatedDistribution, CreateRefusal> {
+        // "The value of Quantity and the size of Items don't match." A malformed
+        // configuration is refused before any id or caller reference is claimed for it.
+        if let Some(message) = config_quantity_mismatch(&config) {
+            return Err(CreateRefusal::InconsistentQuantities(message));
+        }
+
+        // A configuration is walked on every payload that reports it, so the counts that
+        // drive that walk are bounded by CloudFront's published quotas on the way IN,
+        // each refused with the error the model names for it.
+        if let Some(limit) = config_limit_exceeded(&config) {
+            return Err(CreateRefusal::ConfigLimit(limit));
+        }
+
+        // "The caller reference you attempted to create the distribution with is
+        // associated with another distribution": a caller reference identifies one
+        // distribution for its whole life, so a reference the store already holds cannot
+        // name a second one.
+        let caller_reference = config.caller_reference.clone();
+        if let Some(existing) = self.caller_references.get(&caller_reference) {
+            return Err(CreateRefusal::DistributionAlreadyExists(format!(
+                "The caller reference {caller_reference} is already associated with \
+                 distribution {existing}"
+            )));
+        }
+
+        // "Processing your request would cause you to exceed the maximum number of
+        // distributions allowed." The store grows only here and a distribution cannot be
+        // evicted (a later Get has to answer with what this create returned), so the
+        // bound is an entry count refused BEFORE anything is claimed.
+        if self.distributions.len() >= MAX_DISTRIBUTIONS {
+            return Err(CreateRefusal::TooManyDistributions(format!(
+                "This emulator holds at most {MAX_DISTRIBUTIONS} distributions; delete one \
+                 before creating another"
+            )));
+        }
+
+        let id = self.allocate_distribution_id();
+        let domain_name = self.allocate_domain_name();
+        let etag = self.next_etag();
+        let stored = StoredDistribution {
+            arn: distribution_arn(&id),
+            id: id.clone(),
+            domain_name,
+            // A distribution CloudFront has just accepted is not yet propagated to the
+            // edge locations, so it reports the transient status until the clock owes it
+            // the terminal one.
+            status: STATUS_IN_PROGRESS.to_string(),
+            deployed_due: now + PROPAGATION_DELAY,
+            last_modified_time: now,
+            etag: etag.clone(),
+            // Stored whole, with every member the service itself supplies resolved into
+            // it: a later read answers from this record — the configuration the
+            // distribution actually runs under — never from the request that was served.
+            config: resolve_distribution_config(config),
+            tags,
+            invalidations: BTreeMap::new(),
+        };
+        let created = CreatedDistribution {
+            id: id.clone(),
+            etag,
+            distribution: stored.to_distribution(),
+        };
+        self.caller_references.insert(caller_reference, id.clone());
+        self.distributions.insert(id, stored);
+        Ok(created)
     }
 
     /// A fresh value from the mint: a scrambled counter rendered in the id alphabet.
@@ -846,6 +1050,39 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         stored.deployed_due = now + PROPAGATION_DELAY;
         Some(stored)
     }
+}
+
+/// Why a create was refused, for the calling operation to report as its own modelled
+/// error.
+///
+/// Both of this service's distribution creates run the same checks, so each one reports
+/// these same refusals; a variant carries the message its modelled error takes.
+#[derive(Debug, Clone)]
+pub enum CreateRefusal {
+    /// `InconsistentQuantities` — "The value of Quantity and the size of Items don't
+    /// match."
+    InconsistentQuantities(String),
+    /// A count in the submitted configuration over this service's maximum, which names
+    /// the modelled error it is refused with (see [`ConfigLimit`]).
+    ConfigLimit(ConfigLimit),
+    /// `DistributionAlreadyExists` — "The caller reference you attempted to create the
+    /// distribution with is associated with another distribution."
+    DistributionAlreadyExists(String),
+    /// `TooManyDistributions` — "Processing your request would cause you to exceed the
+    /// maximum number of distributions allowed."
+    TooManyDistributions(String),
+}
+
+/// What a create hands back: the new record's id and version token, and the
+/// `Distribution` projection — every one of them read from the record just persisted.
+#[derive(Debug, Clone)]
+pub struct CreatedDistribution {
+    /// `Distribution$Id`, and the path segment the `Location` header names.
+    pub id: String,
+    /// The version token this create minted, reported in the `ETag` header.
+    pub etag: String,
+    /// The `Distribution` the response carries.
+    pub distribution: Distribution,
 }
 
 /// Whether a configuration describes a MULTI-TENANT distribution.

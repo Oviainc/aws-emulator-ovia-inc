@@ -28,6 +28,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The other service that signs as `cassandra`: `tests/all/signing_name_routing.rs`
+# mounts both on one router to pin that each request is claimed by exactly one.
+service-com-amazonaws-keyspaces-keyspacesservice = { workspace = true }
 
 [lints]
 workspace = true

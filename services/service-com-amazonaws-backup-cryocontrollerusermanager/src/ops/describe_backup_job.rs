@@ -253,11 +253,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_job(&input.backup_job_id, ::std::time::SystemTime::now());
 
         let Some(job) = store.backup_jobs.get(&input.backup_job_id) else {
+            // The `Code` and the sentence belong to the CONDITION, not to this
+            // operation, so both come from the service's one error vocabulary;
+            // the sentence names no part of the request, because AWS's does
+            // not.
             return Err(DescribeBackupJobErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Backup job {} not found", input.backup_job_id)),
-                    ..Default::default()
-                },
+                crate::state::backup_job_not_found(),
             )
             .into());
         };

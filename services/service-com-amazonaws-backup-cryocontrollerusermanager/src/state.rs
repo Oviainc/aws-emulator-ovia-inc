@@ -26,7 +26,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::Lifecycle;
+use crate::ops::types::{
+    AlreadyExistsException, InvalidParameterValueException, Lifecycle, ResourceNotFoundException,
+};
 
 /// The ARN namespace this service stamps into every ARN it mints
 /// (`OPERATIONS.md`: "ARN namespace: `backup`").
@@ -84,10 +86,19 @@ pub const PERCENT_DONE_NONE: &str = "0.0";
 /// `PercentDone` of a settled job.
 pub const PERCENT_DONE_COMPLETE: &str = "100.0";
 
+/// The smallest `MaxResults` this service accepts: the minimum of the model's
+/// `@range` on the `MaxResults` shape (`smithy_query` operation
+/// `ListProtectedResources`: `MaxResults` `range {min: 1, max: 1000}`), which
+/// every paginated Backup operation's `MaxResults` targets.
+pub const MAX_RESULTS_MIN: i32 = 1;
+/// The largest `MaxResults` this service accepts: the maximum of that same
+/// `@range`.
+pub const MAX_RESULTS_MAX: i32 = 1000;
+
 /// The page size a list operation uses when the caller names no `MaxResults`:
-/// the model's own `MaxResults` maximum (`@range(min: 1, max: 1000)`), so one
-/// unpaginated call returns everything a paginated one could.
-pub const MAX_PAGE_SIZE: usize = 1000;
+/// the model's own `MaxResults` maximum, so one unpaginated call returns
+/// everything a paginated one could.
+pub const MAX_PAGE_SIZE: usize = MAX_RESULTS_MAX as usize;
 
 /// The maximum either backup window accepts, in minutes: 100 years, as the
 /// model documents for both members (`StartWindowMinutes`: "This parameter has
@@ -260,6 +271,113 @@ pub fn is_arn(value: &str) -> bool {
         return false;
     };
     !partition.is_empty() && !service.is_empty() && !resource.is_empty()
+}
+
+// ===========================================================================
+// This service's error vocabulary
+// ===========================================================================
+//
+// Every AWS Backup client-error shape carries `Code`, `Message`, `Type` and
+// `Context` members (`smithy_query(query="shape", shape="InvalidParameterValueException")`),
+// and a real response fills `Code` with this service's own token for the
+// CONDITION — not for the exception class, since one class answers several
+// conditions with different tokens. Each condition whose token this emulator
+// has observed names it once here and builds its exception once below, so two
+// operations can never answer one condition with two codes or two sentences.
+//
+// A condition with no observed token leaves `Code` unset (the model makes the
+// member optional): inventing an `ERROR_nnnn` would hand a client branching on
+// the code a token AWS never sends, which is worse than the absent member.
+//
+// A token below, and a sentence marked FIXED, is one AWS states for the
+// condition rather than for the request — it names no part of the request, so
+// it is a constant here and not a format string.
+
+/// `Code` for "the backup job asked about is not one this account holds".
+pub const ERROR_CODE_BACKUP_JOB_NOT_FOUND: &str = "ERROR_2403";
+/// The sentence AWS states for that condition. A FIXED string: it names no part
+/// of the request, so the id asked about does not appear in it.
+pub const MESSAGE_BACKUP_JOB_NOT_FOUND: &str = "Cannot find Backup job";
+
+/// `Code` for "a backup vault of this name already exists".
+pub const ERROR_CODE_VAULT_ALREADY_EXISTS: &str = "ERROR_1101";
+/// The sentence AWS states for that condition — fixed, like the one above.
+pub const MESSAGE_VAULT_ALREADY_EXISTS: &str = "Backup vault with the same name already exists";
+
+/// `Code` for "`MaxResults` is outside the range the model declares".
+pub const ERROR_CODE_MAX_RESULTS_INVALID: &str = "ERROR_3607";
+/// The sentence AWS states for that condition — fixed, like the ones above.
+pub const MESSAGE_MAX_RESULTS_INVALID: &str = "Max Results is invalid";
+
+/// The values the model's `AggregationPeriod` enum admits, in model order
+/// (`smithy_query(query="shape", shape="AggregationPeriod")`). The summary
+/// operations name this list in the message they refuse an unknown period with,
+/// so the list a caller is told about is the list the model declares.
+pub const AGGREGATION_PERIODS: [&str; 3] = ["ONE_DAY", "SEVEN_DAYS", "FOURTEEN_DAYS"];
+
+/// The modelled refusal for an unknown backup job id, with its `Code`.
+pub fn backup_job_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        code: Some(ERROR_CODE_BACKUP_JOB_NOT_FOUND.to_string()),
+        message: Some(MESSAGE_BACKUP_JOB_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a create naming a vault that already exists.
+///
+/// `Arn` and `CreatorRequestId` are left UNSET: the shape declares them, but a
+/// real response to this condition does not disclose the existing vault's ARN
+/// or the token its creator sent.
+pub fn vault_already_exists() -> AlreadyExistsException {
+    AlreadyExistsException {
+        code: Some(ERROR_CODE_VAULT_ALREADY_EXISTS.to_string()),
+        message: Some(MESSAGE_VAULT_ALREADY_EXISTS.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a `MaxResults` outside
+/// [`MAX_RESULTS_MIN`]`..=`[`MAX_RESULTS_MAX`], or `None` when the caller's
+/// page size is one the model admits (including an absent one).
+///
+/// The bound is the model's own, so an operation calls this instead of spelling
+/// the range again. The check belongs to the OPERATION rather than to the
+/// framework's boundary validator: AWS answers it with this modelled exception,
+/// and only an exception the operation returns is serialized as the shape the
+/// model declares — the body a client reads `Code` and `Message` out of.
+pub fn rejected_max_results(max_results: Option<i32>) -> Option<InvalidParameterValueException> {
+    let value = max_results?;
+    if (MAX_RESULTS_MIN..=MAX_RESULTS_MAX).contains(&value) {
+        return None;
+    }
+    Some(InvalidParameterValueException {
+        code: Some(ERROR_CODE_MAX_RESULTS_INVALID.to_string()),
+        message: Some(MESSAGE_MAX_RESULTS_INVALID.to_string()),
+        ..Default::default()
+    })
+}
+
+/// The modelled refusal for an `AggregationPeriod` the model's enum does not
+/// list, or `None` when the caller named one it does (including none at all).
+///
+/// The message is BUILT FROM THE REQUEST: it names the rejected value and then
+/// the values the model admits, so a caller can fix the request from the
+/// response alone. No `Code` is set — this condition has no observed token.
+pub fn rejected_aggregation_period(
+    aggregation_period: Option<&str>,
+) -> Option<InvalidParameterValueException> {
+    let value = aggregation_period?;
+    if AGGREGATION_PERIODS.contains(&value) {
+        return None;
+    }
+    Some(InvalidParameterValueException {
+        message: Some(format!(
+            "Invalid input aggregation id {value}. Input aggregation period must be within {}",
+            AGGREGATION_PERIODS.join(", ")
+        )),
+        ..Default::default()
+    })
 }
 
 /// The Backup resource type of a protected resource, derived from its ARN.

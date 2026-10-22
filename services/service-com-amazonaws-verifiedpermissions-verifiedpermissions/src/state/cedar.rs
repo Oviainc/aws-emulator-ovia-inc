@@ -23,8 +23,10 @@
 //!   authorization request parses (the per-request step budget).
 //!   [`MAX_CEDAR_JSON_BYTES`] caps the `cedarJson` text a request may carry.
 //! * **Count** — [`MAX_ENTITIES_PER_REQUEST`] caps the entity store,
-//!   [`MAX_COLLECTION_LEN`] caps one set/record/attribute map, and
-//!   [`crate::state::MAX_POLICIES_PER_STORE`] caps the policies walked.
+//!   [`MAX_COLLECTION_LEN`] caps one set/record/attribute map,
+//!   [`crate::state::MAX_POLICIES_PER_STORE`] caps the policies walked, and
+//!   [`MAX_BATCH_REQUESTS`] caps how many authorization requests one batch call
+//!   evaluates against that one parsed policy set.
 //! * **Depth** — [`MAX_VALUE_DEPTH`] caps the nesting of any context or entity
 //!   value. Every conversion below carries a depth counter and refuses at the
 //!   bound INSTEAD of recursing, so no caller-supplied nesting drives this
@@ -38,8 +40,8 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use crate::ops::types::{
-    AttributeValue, CedarTagValue, ContextDefinition, EntitiesDefinition, EntityIdentifier,
-    EntityItem,
+    ActionIdentifier, AttributeValue, CedarTagValue, ContextDefinition, EntitiesDefinition,
+    EntityIdentifier, EntityItem,
 };
 
 use super::{Policy, ScopeEntity};
@@ -70,6 +72,14 @@ pub const MAX_COLLECTION_LEN: usize = 1_000;
 /// How many evaluation errors the response reports. Cedar can raise one per
 /// policy, so the response needs its own output cap.
 pub const MAX_REPORTED_EVALUATION_ERRORS: usize = 100;
+
+/// How many authorization requests one batch call may carry, from
+/// `BatchIsAuthorized`'s own model documentation: "The requests of a
+/// BatchIsAuthorized API request can contain up to 30 requests." The model's
+/// `@length` on `BatchIsAuthorizedInputList` is `min: 1` only, so the boundary
+/// validator cannot refuse an over-long list and this is the place that does. It
+/// is also the batch's output bound: one result per request.
+pub const MAX_BATCH_REQUESTS: usize = 30;
 
 /// How many bytes of Cedar schema JSON one policy store may hold. The model puts
 /// no upper `@length` on `SchemaJson` (`min 1` only), so the boundary validator
@@ -253,13 +263,39 @@ pub struct Verdict {
     pub errors: Vec<String>,
 }
 
-/// Evaluate `policies` for one authorization request.
+/// A store's static policies and its schema, parsed once for one API call, plus
+/// the load diagnostics every request evaluated against them reports.
 ///
-/// `principal`, `action` and `resource` are the request's triple; `context` and
-/// `entities` are Cedar JSON already built and already bounded by
-/// [`context_to_cedar_json`] / [`entities_to_cedar_json`]. A policy that will not
-/// parse is reported as an evaluation error rather than silently skipped, so a
-/// store holding one is never reported as a clean deny.
+/// One API call parses the store's Cedar text ONCE and evaluates each of its
+/// requests against the result, so a batch of [`MAX_BATCH_REQUESTS`] requests
+/// costs one parse of at most [`crate::state::MAX_POLICY_BYTES_PER_STORE`] bytes
+/// (plus one schema parse) rather than one per request.
+#[derive(Debug)]
+pub struct PreparedPolicies {
+    /// Every policy that parsed, each carrying its `policyId` as its Cedar
+    /// policy id so `determiningPolicies` names it.
+    set: cedar_policy::PolicySet,
+    /// The store's schema, when it holds one: what gives the request's entity
+    /// types, action and context their types.
+    schema: Option<cedar_policy::Schema>,
+    /// One description per policy that could NOT be loaded. Reported on every
+    /// request's `errors`, because every request was evaluated without it.
+    load_errors: Vec<String>,
+}
+
+impl PreparedPolicies {
+    /// The store's parsed schema, for the entity store every request of this call
+    /// is evaluated against.
+    pub fn schema(&self) -> Option<&cedar_policy::Schema> {
+        self.schema.as_ref()
+    }
+}
+
+/// Parse a store's static policies, and its schema when it holds one, into what
+/// an authorization request is evaluated against.
+///
+/// A policy that will not parse is reported as an evaluation error rather than
+/// silently skipped, so a store holding one is never reported as a clean deny.
 ///
 /// `schema_json` is the store's schema, when it holds one. A schema is what gives
 /// the request's entity types, action and context their types, so when one is
@@ -268,19 +304,14 @@ pub struct Verdict {
 /// which is the only way a `context` whose attribute has the wrong type can be
 /// told apart from a deny.
 ///
-/// The per-request step budget is enforced here, at the point of work: the total
-/// Cedar text this call parses is capped at
+/// The per-call step budget is enforced here, at the point of work: the total
+/// Cedar text one call parses is capped at
 /// [`crate::state::MAX_POLICY_BYTES_PER_STORE`], and the policy count at
 /// [`crate::state::MAX_POLICIES_PER_STORE`].
-pub fn authorize(
+pub fn load_policies(
     policies: &BTreeMap<String, Policy>,
-    principal: &ScopeEntity,
-    action: &ScopeEntity,
-    resource: &ScopeEntity,
-    context: serde_json::Value,
-    entities: serde_json::Value,
     schema_json: Option<&str>,
-) -> Result<Verdict, String> {
+) -> Result<PreparedPolicies, String> {
     let mut set = cedar_policy::PolicySet::new();
     let mut errors: Vec<String> = Vec::new();
     let mut parsed_bytes = 0usize;
@@ -316,31 +347,60 @@ pub fn authorize(
             Err(e) => errors.push(format!("policy {policy_id} could not be parsed: {e}")),
         }
     }
-
-    let principal_uid = entity_uid(principal, "principal")?;
-    let action_uid = entity_uid(action, "action")?;
-    let resource_uid = entity_uid(resource, "resource")?;
-
     let schema = match schema_json {
         Some(text) => Some(parse_schema(text)?.schema),
         None => None,
     };
+    Ok(PreparedPolicies {
+        set,
+        schema,
+        load_errors: errors,
+    })
+}
+
+/// Build the Cedar entity store one API call evaluates against, from the Cedar
+/// JSON [`entities_to_cedar_json`] already bounded, type-checked against the
+/// store's schema when it holds one.
+pub fn build_entities(
+    entities: serde_json::Value,
+    schema: Option<&cedar_policy::Schema>,
+) -> Result<cedar_policy::Entities, String> {
+    cedar_policy::Entities::from_json_value(entities, schema)
+        .map_err(|e| format!("entities are not a valid Cedar entity store: {e}"))
+}
+
+/// Evaluate ONE authorization request against an already-parsed policy set.
+///
+/// `principal`, `action` and `resource` are the request's triple and `context` is
+/// its Cedar JSON context, already bounded by [`context_to_cedar_json`]. The
+/// request itself is built against the store's schema when it holds one, so an
+/// entity type, action or context attribute the schema does not declare is
+/// refused rather than evaluated.
+pub fn evaluate(
+    prepared: &PreparedPolicies,
+    principal: &ScopeEntity,
+    action: &ScopeEntity,
+    resource: &ScopeEntity,
+    context: serde_json::Value,
+    entities: &cedar_policy::Entities,
+) -> Result<Verdict, String> {
+    let principal_uid = entity_uid(principal, "principal")?;
+    let action_uid = entity_uid(action, "action")?;
+    let resource_uid = entity_uid(resource, "resource")?;
 
     let context = cedar_policy::Context::from_json_value(context, None)
         .map_err(|e| format!("context is not a valid Cedar context: {e}"))?;
-    let entities = cedar_policy::Entities::from_json_value(entities, schema.as_ref())
-        .map_err(|e| format!("entities are not a valid Cedar entity store: {e}"))?;
 
     let request = cedar_policy::Request::new(
         principal_uid,
         action_uid,
         resource_uid,
         context,
-        schema.as_ref(),
+        prepared.schema(),
     )
     .map_err(|e| format!("the authorization request is not valid: {e}"))?;
 
-    let response = cedar_policy::Authorizer::new().is_authorized(&request, &set, &entities);
+    let response = cedar_policy::Authorizer::new().is_authorized(&request, &prepared.set, entities);
 
     let decision = match response.decision() {
         cedar_policy::Decision::Allow => "ALLOW",
@@ -352,13 +412,59 @@ pub fn authorize(
         .reason()
         .map(ToString::to_string)
         .collect();
+    let mut errors = prepared.load_errors.clone();
     errors.extend(response.diagnostics().errors().map(ToString::to_string));
+    // `EvaluationErrorList` is `@uniqueItems`, so the same description must not
+    // appear twice; the first occurrence keeps its position.
+    let mut seen = std::collections::BTreeSet::new();
+    errors.retain(|error| seen.insert(error.clone()));
     errors.truncate(MAX_REPORTED_EVALUATION_ERRORS);
 
     Ok(Verdict {
         decision,
         determining_policies,
         errors,
+    })
+}
+
+/// Evaluate `policies` for one authorization request: [`load_policies`] followed
+/// by [`build_entities`] and [`evaluate`], which is what a single-request
+/// operation needs.
+///
+/// `context` and `entities` are Cedar JSON already built and already bounded by
+/// [`context_to_cedar_json`] / [`entities_to_cedar_json`]; `schema_json` is the
+/// store's schema, when it holds one.
+pub fn authorize(
+    policies: &BTreeMap<String, Policy>,
+    principal: &ScopeEntity,
+    action: &ScopeEntity,
+    resource: &ScopeEntity,
+    context: serde_json::Value,
+    entities: serde_json::Value,
+    schema_json: Option<&str>,
+) -> Result<Verdict, String> {
+    let prepared = load_policies(policies, schema_json)?;
+    let entities = build_entities(entities, prepared.schema())?;
+    evaluate(&prepared, principal, action, resource, context, &entities)
+}
+
+/// An `EntityIdentifier` request member as a state scope entity. `None` for an
+/// absent member: an authorization request is evaluated as a complete Cedar
+/// triple, so every caller refuses an absent one by naming the member rather
+/// than answering with a deny.
+pub fn request_entity(identifier: Option<&EntityIdentifier>) -> Option<ScopeEntity> {
+    identifier.map(|e| ScopeEntity {
+        entity_type: e.entity_type.clone(),
+        entity_id: e.entity_id.clone(),
+    })
+}
+
+/// An `ActionIdentifier` request member as a state scope entity: an action is a
+/// Cedar entity too, whose type and id arrive as `actionType`/`actionId`.
+pub fn request_action(action: Option<&ActionIdentifier>) -> Option<ScopeEntity> {
+    action.map(|a| ScopeEntity {
+        entity_type: a.action_type.clone(),
+        entity_id: a.action_id.clone(),
     })
 }
 

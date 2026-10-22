@@ -67,6 +67,12 @@ pub const MAX_USERS_PER_ACCOUNT: usize = 5_000;
 /// with `LimitExceededException`.
 pub const MAX_USER_INLINE_POLICY_CHARACTERS: usize = 2_048;
 
+/// The aggregate size, in characters, of all inline policies embedded in one IAM
+/// role. AWS's "IAM and STS quotas" page gives the quota "Role policy size cannot
+/// exceed 10,240 characters"; a put that would carry the role past it is refused
+/// with `LimitExceededException`.
+pub const MAX_ROLE_INLINE_POLICY_CHARACTERS: usize = 10_240;
+
 /// How many sets of service-specific credentials one IAM user may hold for one
 /// supported service. `CreateServiceSpecificCredential`'s documentation: "You can
 /// have a maximum of two sets of service-specific credentials for each supported
@@ -323,6 +329,12 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// group, role, and policy names must be unique within the account. Names are
     /// not distinguished by case."
     pub user_inline_policies: BTreeMap<String, BTreeMap<String, InlinePolicy>>,
+    /// Inline role policies: [`name_key`] of the role name -> [`name_key`] of the
+    /// policy name -> the policy. Keyed exactly as
+    /// [`user_inline_policies`](Self::user_inline_policies) is, and for the same
+    /// reason: "user, group, role, and policy names must be unique within the
+    /// account. Names are not distinguished by case."
+    pub role_inline_policies: BTreeMap<String, BTreeMap<String, InlinePolicy>>,
     /// Access key id -> [`name_key`] of the user that owns it. `GetUser` with no
     /// `UserName` resolves the caller through this map; `CreateAccessKey` (still a
     /// stub) is what will populate it.
@@ -428,17 +440,39 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// This is the measure IAM's user policy size quota
     /// ([`MAX_USER_INLINE_POLICY_CHARACTERS`]) is taken against.
     pub fn user_inline_policy_characters(&self, user_key: &str, replacing: &str) -> usize {
-        self.user_inline_policies
-            .get(user_key)
-            .map(|policies| {
-                policies
-                    .iter()
-                    .filter(|(key, _)| key.as_str() != replacing)
-                    .map(|(_, policy)| policy.policy_document.chars().count())
-                    .sum()
-            })
-            .unwrap_or(0)
+        inline_policy_characters(&self.user_inline_policies, user_key, replacing)
     }
+
+    /// The same measure for the role keyed by `role_key`, the one IAM's role policy
+    /// size quota ([`MAX_ROLE_INLINE_POLICY_CHARACTERS`]) is taken against.
+    pub fn role_inline_policy_characters(&self, role_key: &str, replacing: &str) -> usize {
+        inline_policy_characters(&self.role_inline_policies, role_key, replacing)
+    }
+}
+
+/// The aggregate size, in characters, of the inline policies `policies` holds for
+/// the entity keyed by `entity_key`, counting every policy except the one keyed by
+/// `replacing`.
+///
+/// A put of an existing policy name REPLACES that document rather than adding to
+/// it, so the document being replaced does not count toward the quota the new one
+/// has to fit inside. One definition, shared by every entity kind that embeds
+/// inline policies.
+fn inline_policy_characters(
+    policies: &BTreeMap<String, BTreeMap<String, InlinePolicy>>,
+    entity_key: &str,
+    replacing: &str,
+) -> usize {
+    policies
+        .get(entity_key)
+        .map(|policies| {
+            policies
+                .iter()
+                .filter(|(key, _)| key.as_str() != replacing)
+                .map(|(_, policy)| policy.policy_document.chars().count())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// The case-folded form of an IAM entity name, used as its key.
@@ -481,6 +515,21 @@ pub fn now() -> ::aws_smithy_types::DateTime {
 /// [`SERVICE_LINKED_ROLE_PATH_PREFIX`].
 pub fn is_service_linked_role_path(path: &str) -> bool {
     path.starts_with(SERVICE_LINKED_ROLE_PATH_PREFIX)
+}
+
+/// The service principal a service-linked role's `path` names, or `None` when
+/// `path` is not one — a refinement of [`is_service_linked_role_path`] for the
+/// refusals whose message has to name that service.
+///
+/// A service-linked role lives at `/aws-service-role/<principal>/`, so the segment
+/// between that prefix and the closing `/` names the service that depends on the
+/// role — the one service AWS lets modify or delete it, which is what
+/// `UnmodifiableEntityException`'s documented message identifies.
+pub fn service_linked_role_principal(path: &str) -> Option<&str> {
+    let principal = path
+        .strip_prefix(SERVICE_LINKED_ROLE_PATH_PREFIX)?
+        .strip_suffix('/')?;
+    (!principal.is_empty()).then_some(principal)
 }
 
 /// The marker scope of the attachment set of the role keyed by `role_key`.

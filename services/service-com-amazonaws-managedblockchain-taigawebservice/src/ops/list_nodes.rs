@@ -117,6 +117,29 @@ impl From<ListNodesErrorModeled> for ListNodesError {
     }
 }
 
+/// This operation models NO `ResourceNotFoundException` (its client errors are
+/// `AccessDeniedException`, `InvalidRequestException` and `ThrottlingException`), so a
+/// member scope it cannot resolve is an invalid REQUEST — never a 404, and never an empty
+/// page, which would claim the member exists and owns no nodes.
+fn member_not_found(member_id: &str, network_id: &str) -> ListNodesError {
+    ListNodesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(format!(
+            "Member with Id {member_id} not found in network {network_id}."
+        )),
+    })
+    .into()
+}
+
+/// `MemberId` "Applies only to Hyperledger Fabric and is required for Hyperledger
+/// Fabric": a listing that must be scoped to a member and names none is refused for the
+/// same reason, rather than answered with a page of every member's nodes.
+fn member_id_required(network_id: &str) -> ListNodesError {
+    ListNodesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(format!("Member Id is required for network {network_id}.")),
+    })
+    .into()
+}
+
 /// The `ListNodes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -182,52 +205,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        // This operation models no `ResourceNotFoundException`, so an id that names no
-        // network is refused as an invalid request rather than answered with an empty
-        // page, which would claim the network exists and holds no nodes.
+        // A network this store does not hold has no framework to read the member rule
+        // from, so the request is answered through the member scope it names — or through
+        // the one it omits. Either way the answer is this operation's own
+        // `InvalidRequestException`, never a `ResourceNotFoundException` its model does
+        // not declare.
         let Some(network) = guard.networks.get(&input.network_id) else {
-            return Err(ListNodesErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "network {} does not exist on this account",
-                        input.network_id
-                    )),
-                },
-            )
-            .into());
+            return Err(match input.member_id.as_deref() {
+                Some(member_id) => member_not_found(member_id, &input.network_id),
+                None => member_id_required(&input.network_id),
+            });
         };
 
-        // `MemberId` "Applies only to Hyperledger Fabric and is required for Hyperledger
-        // Fabric": on a Fabric network the listing is scoped to one member's nodes.
-        if network.framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
-            && input.member_id.is_none()
-        {
-            return Err(ListNodesErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(format!(
-                        "memberId is required on a {} network",
-                        crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // A memberId that names no member of this network is as invalid as a networkId
-        // that names no network: an empty page would claim the member exists and owns no
-        // nodes.
-        if let Some(member_id) = input.member_id.as_deref() {
+        // On a Hyperledger Fabric network the listing is scoped to one member's nodes; on
+        // a framework whose networks hold no members, a scope naming one names something
+        // that cannot exist there.
+        if network.framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC {
+            let Some(member_id) = input.member_id.as_deref() else {
+                return Err(member_id_required(&input.network_id));
+            };
             if !network.members.contains_key(member_id) {
-                return Err(ListNodesErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!(
-                            "member {member_id} does not exist on network {}",
-                            input.network_id
-                        )),
-                    },
-                )
-                .into());
+                return Err(member_not_found(member_id, &input.network_id));
             }
+        } else if let Some(member_id) = input.member_id.as_deref() {
+            return Err(member_not_found(member_id, &input.network_id));
         }
 
         let selected: Vec<(String, NodeSummary)> = network

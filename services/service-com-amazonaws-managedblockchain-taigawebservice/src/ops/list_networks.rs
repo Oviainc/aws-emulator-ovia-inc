@@ -181,11 +181,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        // Each filter selects on the stored value of the member it names; an absent one
-        // selects everything.
+        // This operation "Returns information about the networks in which the current
+        // Amazon Web Services account participates", so AWS's standing, AWS-owned public
+        // networks are reported only once the account holds a member or a node on one;
+        // until then the account merely can READ them (`GetNetwork` resolves them).
+        // Each filter then selects on the stored value of the member it names; an absent
+        // one selects everything.
         let selected: Vec<(String, NetworkSummary)> = guard
             .networks
             .values()
+            .filter(|network| network.account_participates())
             .filter(|network| {
                 input
                     .name

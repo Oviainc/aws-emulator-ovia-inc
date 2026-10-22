@@ -262,10 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             planned.push((name.clone(), add_ons));
         }
 
-        let location = crate::state::StoredLocation {
-            availability_zone: input.availability_zone.clone(),
-            region_name: region.to_string(),
-        };
+        let location = crate::state::StoredLocation::zonal(&input.availability_zone, region);
         let now = crate::state::now_ms();
 
         crate::state::with_state(&*self.engine, |store| {
@@ -329,6 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .start_operation(
                             now,
                             crate::state::OPERATION_TYPE_CREATE_INSTANCE,
+                            crate::state::RESOURCE_TYPE_INSTANCE,
                             &name,
                             &location,
                             Some(due.at_ms),

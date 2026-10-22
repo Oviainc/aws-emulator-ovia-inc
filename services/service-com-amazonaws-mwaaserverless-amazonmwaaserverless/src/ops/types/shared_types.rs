@@ -77,7 +77,16 @@ pub enum Code {
     S3Location(S3Location),
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mwaaserverless#S3Location")]
+// Constrained members an operation reaches through its input: checked in the
+// handler, by driving the framework's own constraint walk over the shadow
+// `S3Location` schema in `crate::state`, so a bad value is answered with the
+// modelled `ValidationException` rather than the framework's generic boundary
+// refusal. Output shapes are never constraint-validated, so handing these over
+// costs a response nothing.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.mwaaserverless#S3Location",
+    skip_validation = ["Bucket", "ObjectKey", "VersionId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct S3Location {
     pub bucket: String,
@@ -85,7 +94,13 @@ pub struct S3Location {
     pub version_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mwaaserverless#EncryptionConfiguration")]
+// `Type` targets the `EncryptionType` enum; its value set travels with the
+// shadow `EncryptionConfiguration` schema in `crate::state`. `KmsKeyId` targets
+// a plain `String` and declares no constraint.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.mwaaserverless#EncryptionConfiguration",
+    skip_validation = ["Type"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct EncryptionConfiguration {
     pub r#type: String,
@@ -98,7 +113,13 @@ pub struct LoggingConfiguration {
     pub log_group_name: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mwaaserverless#NetworkConfiguration")]
+// Both id lists carry their element shape's `@length`/`@pattern`, which travel
+// with the shadow `NetworkConfiguration` schema in `crate::state` as the same
+// `ElementConstraintsTrait` codegen attached.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.mwaaserverless#NetworkConfiguration",
+    skip_validation = ["SecurityGroupIds", "SubnetIds"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct NetworkConfiguration {
     pub security_group_ids: Option<Vec<String>>,

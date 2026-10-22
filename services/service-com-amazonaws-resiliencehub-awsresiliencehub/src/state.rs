@@ -2,10 +2,116 @@
 
 //! Engine state for the com-amazonaws-resiliencehub-awsresiliencehub service.
 
+use crate::ops::types::{App, ResiliencyPolicy};
+use std::collections::{HashMap, VecDeque};
+
+/// The region every minted ARN falls back to when the request carries no usable
+/// SigV4 credential scope (an unsigned, in-process call, say).
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The most applications this emulator stores.
+///
+/// A MEMORY BOUND, not an AWS quota: `CreateApp` is reachable by any caller and
+/// stores a caller-sized record (description, tags, event subscriptions) per call,
+/// so without a ceiling a request loop grows the process until the host is out of
+/// memory. Past it `CreateApp` answers its own modelled
+/// `ServiceQuotaExceededException` (HTTP 402) — the channel AWS uses when an
+/// application cannot be created because a limit is reached.
+pub const MAX_APPS: usize = 200;
+
+/// The most resiliency policies this emulator stores, for the same reason as
+/// [`MAX_APPS`]. `CreateResiliencyPolicy` answers `ServiceQuotaExceededException`
+/// past it.
+pub const MAX_RESILIENCY_POLICIES: usize = 200;
+
+/// Hard ceiling on remembered idempotency tokens, oldest evicted first.
+///
+/// A BACKSTOP. One token is recorded per successfully created resource and
+/// `DeleteApp` forgets the tokens of the app it removes, so the map is already
+/// bounded by [`MAX_APPS`] + [`MAX_RESILIENCY_POLICIES`] while every creating
+/// handler releases what it allocated. The ceiling is here so that invariant does
+/// not depend on a future handler remembering to, and is enforced in
+/// [`ComAmazonawsResiliencehubAwsresiliencehubState::record_idempotency_token`],
+/// the only writer.
+pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_APPS + MAX_RESILIENCY_POLICIES;
+
 /// Per-service state for com-amazonaws-resiliencehub-awsresiliencehub. A handler reaches it through [`service_state`].
+///
+/// The modelled `App` and `ResiliencyPolicy` shapes ARE the stored records: a
+/// Describe is a clone of the stored value, so a read can never disagree with what
+/// the last write persisted.
+///
+/// Every map here is caller-driven, so every one is bounded: `apps` by
+/// [`MAX_APPS`], `app_name_index` by `apps` (one entry per stored app),
+/// `policies` by [`MAX_RESILIENCY_POLICIES`], and the idempotency store by
+/// [`MAX_IDEMPOTENCY_TOKENS`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsResiliencehubAwsresiliencehubState {
-    // TODO: add service-specific state fields
+    /// Every stored application, keyed by its minted `appArn`. At most
+    /// [`MAX_APPS`] entries.
+    pub apps: HashMap<String, App>,
+    /// `name` -> `appArn`. Application names are unique within an account, so this
+    /// is both the name filter's index and the duplicate-name conflict detector.
+    /// Exactly one entry per entry of `apps`.
+    pub app_name_index: HashMap<String, String>,
+    /// Every stored resiliency policy, keyed by its minted `policyArn`. At most
+    /// [`MAX_RESILIENCY_POLICIES`] entries.
+    pub policies: HashMap<String, ResiliencyPolicy>,
+    /// `<operation>/<clientToken>` -> the ARN that token's FIRST call created, so a
+    /// replayed `@idempotencyToken` returns the first result instead of creating a
+    /// second resource. Keyed by operation as well as token because the same token
+    /// may legitimately be replayed to two different operations.
+    ///
+    /// PRIVATE, with `record_idempotency_token` / `created_by_token` /
+    /// `forget_idempotency_tokens_for` as the only access: the entry-count ceiling
+    /// cannot be bypassed by a handler inserting directly.
+    idempotency_tokens: HashMap<String, String>,
+    /// The keys of `idempotency_tokens` in the order they were first recorded, so
+    /// the ceiling evicts the oldest.
+    idempotency_order: VecDeque<String>,
+}
+
+impl ComAmazonawsResiliencehubAwsresiliencehubState {
+    /// The ARN `operation`'s `client_token` created on its first call, if it is
+    /// still remembered.
+    pub fn created_by_token(&self, operation: &str, client_token: &str) -> Option<&String> {
+        self.idempotency_tokens
+            .get(&idempotency_key(operation, client_token))
+    }
+
+    /// Remember that `operation`'s `client_token` created `arn`, evicting the
+    /// oldest remembered token once [`MAX_IDEMPOTENCY_TOKENS`] is reached. Re-recording
+    /// a key already present replaces its ARN and keeps its original position, so a
+    /// replay cannot be used to push other callers' tokens out.
+    pub fn record_idempotency_token(&mut self, operation: &str, client_token: &str, arn: &str) {
+        let key = idempotency_key(operation, client_token);
+        if self
+            .idempotency_tokens
+            .insert(key.clone(), arn.to_string())
+            .is_some()
+        {
+            return;
+        }
+        self.idempotency_order.push_back(key);
+        while self.idempotency_order.len() > MAX_IDEMPOTENCY_TOKENS {
+            if let Some(oldest) = self.idempotency_order.pop_front() {
+                self.idempotency_tokens.remove(&oldest);
+            }
+        }
+    }
+
+    /// Forget every token that created `arn`, so deleting a resource releases what
+    /// creating it allocated.
+    pub fn forget_idempotency_tokens_for(&mut self, arn: &str) {
+        self.idempotency_tokens.retain(|_, created| created != arn);
+        self.idempotency_order
+            .retain(|key| self.idempotency_tokens.contains_key(key));
+    }
+
+    /// How many idempotency tokens are remembered. For tests and diagnostics.
+    pub fn remembered_token_count(&self) -> usize {
+        self.idempotency_tokens.len()
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -17,4 +123,176 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsResiliencehubAwsresiliencehubState>)
+}
+
+/// The idempotency-map key for `operation`'s `client_token`.
+fn idempotency_key(operation: &str, client_token: &str) -> String {
+    format!("{operation}/{client_token}")
+}
+
+/// Whether `region` satisfies the REGION component of the `Arn` shape's `@pattern`,
+/// transcribed from the model (`smithy_query query="shape" shape="Arn"` on
+/// `smithy-model/com-amazonaws-resiliencehub-awsresiliencehub.json`, whose region
+/// group is `([a-z]{2}-((iso[a-z]{0,1}-)|(gov-)){0,1}[a-z]+-[0-9])`): two lowercase
+/// letters, a hyphen, an OPTIONAL `iso`/`iso<letter>`/`gov` infix, one or more
+/// lowercase letters, a hyphen and one digit.
+///
+/// Every ARN this service hands back must satisfy the model's pattern, because it is
+/// the same pattern the boundary validator applies when that ARN comes back in as
+/// `appArn` or `policyArn` — and the region is the only part of a minted ARN the
+/// caller influences.
+///
+/// The optional group is tried BOTH ways, exactly as the pattern's alternation does:
+/// a region whose third segment merely starts with `iso` (`us-isolated-1`) matches
+/// through the empty branch, so committing to the `iso` branch would reject a region
+/// the pattern admits.
+pub fn region_matches_modeled_arn(region: &str) -> bool {
+    let Some((prefix, rest)) = region.split_once('-') else {
+        return false;
+    };
+    if prefix.len() != 2 || !prefix.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return false;
+    }
+
+    // `((iso[a-z]{0,1}-)|(gov-)){0,1}[a-z]+-[0-9]`: the empty branch, the `gov-`
+    // branch and the `iso`/`iso<letter>-` branch.
+    matches_region_tail(rest)
+        || rest.strip_prefix("gov-").is_some_and(matches_region_tail)
+        || iso_infix_tail(rest).is_some_and(matches_region_tail)
+}
+
+/// Whether `tail` is the pattern's `[a-z]+-[0-9]` ending.
+fn matches_region_tail(tail: &str) -> bool {
+    let Some((letters, digit)) = tail.split_once('-') else {
+        return false;
+    };
+    !letters.is_empty()
+        && letters.bytes().all(|byte| byte.is_ascii_lowercase())
+        && digit.len() == 1
+        && digit.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// What follows the pattern's `iso[a-z]{0,1}-` infix, when `rest` opens with it.
+fn iso_infix_tail(rest: &str) -> Option<&str> {
+    let after_iso = rest.strip_prefix("iso")?;
+    if let Some(tail) = after_iso.strip_prefix('-') {
+        return Some(tail);
+    }
+    let mut characters = after_iso.chars();
+    let letter = characters.next()?;
+    if !letter.is_ascii_lowercase() {
+        return None;
+    }
+    characters.as_str().strip_prefix('-')
+}
+
+/// The region to mint this request's ARNs in: the region of the caller's SigV4
+/// credential scope, or [`DEFAULT_REGION`] when the request is unsigned or scoped
+/// to a region that would make the minted ARN fail the model's own `Arn` pattern.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| region_matches_modeled_arn(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The next server-generated resource id, as the canonical 8-4-4-4-12 form AWS gives
+/// a Resilience Hub application or resiliency policy.
+///
+/// Unique within this emulator: the low half is a monotonic counter, so two ids
+/// minted in the same nanosecond still differ, and the high half is the minting
+/// instant, so ids do not repeat across a restart. Server-generated, never derived
+/// from the request.
+fn mint_resource_id() -> String {
+    static MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+
+    let sequence = MINTED.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    let minted_at = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (minted_at >> 32) as u32,
+        (minted_at >> 16) & 0xffff,
+        minted_at & 0xffff,
+        (sequence >> 48) & 0xffff,
+        sequence & 0xffff_ffff_ffff,
+    )
+}
+
+/// Mint a fresh `appArn`: `arn:aws:resiliencehub:<region>:<account>:app/<id>`.
+pub fn mint_app_arn(region: &str) -> String {
+    ::engine::emulator_arn(
+        "resiliencehub",
+        region,
+        &format!("app/{}", mint_resource_id()),
+    )
+}
+
+/// Mint a fresh `policyArn`:
+/// `arn:aws:resiliencehub:<region>:<account>:resiliency-policy/<id>`.
+pub fn mint_policy_arn(region: &str) -> String {
+    ::engine::emulator_arn(
+        "resiliencehub",
+        region,
+        &format!("resiliency-policy/{}", mint_resource_id()),
+    )
+}
+
+/// The refusal message for `value`, when the model's enum for `member` does not
+/// list it — `None` when it does.
+///
+/// The boundary constraint validator already walks every enum MEMBER of an input
+/// shape, so a handler never has to re-check one. What it does not walk is a
+/// map's KEY: `DisruptionPolicy`'s key targets the `DisruptionType` enum, and an
+/// unknown key reaches the handler. The sentence is NOT written here — it is built
+/// from the framework's own [`::smithy_server_runtime::Violation`] and rendered by
+/// `aws_smithy_schema_server::constraints::envelope`, the one place that wording
+/// lives, so a handler refusal and a boundary refusal read identically.
+pub fn enum_violation(member: &str, value: &str, allowed: &[&str]) -> Option<String> {
+    if allowed.contains(&value) {
+        return None;
+    }
+    let violation = ::smithy_server_runtime::Violation {
+        // Elided like the value: for a map KEY the path embeds caller-supplied
+        // text, so it is the same amplification vector.
+        path: elided(member),
+        kind: ::smithy_server_runtime::ViolationKind::EnumValue(
+            allowed.iter().map(|allowed| (*allowed).to_string()).collect(),
+        ),
+        // `Violation::value` must arrive ALREADY elided: the message interpolates
+        // it verbatim, and this one is a caller-supplied string of any length.
+        value: Some(elided(value)),
+    };
+    ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
+}
+
+/// The longest caller-supplied text a refusal message echoes, pinned to the
+/// boundary validator's own ceiling (`MAX_ECHOED_VALUE` in
+/// `aws_smithy_schema_server::constraints`).
+const MAX_ECHOED_VALUE: usize = 256;
+
+/// `text` as a refusal message may carry it: itself when short, a
+/// character-boundary-safe prefix with an elision when not, so a huge request
+/// member cannot be amplified into a huge response.
+///
+/// The framework's equivalent (`constraints::echoed`) is PRIVATE and lives under
+/// the agent-immutable `vendor/` tree, so it cannot be called or widened from
+/// here; the ceiling is therefore pinned to the same constant above.
+fn elided(text: &str) -> String {
+    if text.len() <= MAX_ECHOED_VALUE {
+        return text.to_string();
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &text[..end], text.len())
+}
+
+/// "Now", as the wire timestamp type every creation/evaluation time uses.
+pub fn now() -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
 }

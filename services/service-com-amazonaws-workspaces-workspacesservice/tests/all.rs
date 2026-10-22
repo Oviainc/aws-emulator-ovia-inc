@@ -14,6 +14,9 @@
 #[path = "all/account_byol_configuration.rs"]
 mod account_byol_configuration;
 
+#[path = "all/account_link_eligibility.rs"]
+mod account_link_eligibility;
+
 #[path = "all/account_links.rs"]
 mod account_links;
 

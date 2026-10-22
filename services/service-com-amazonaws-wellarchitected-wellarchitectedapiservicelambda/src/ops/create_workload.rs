@@ -419,6 +419,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             applications,
             discovery_config: input.discovery_config,
             jira_configuration: input.jira_configuration,
+            // A new workload's lens reviews carry no answers yet: every question of
+            // every attached lens is UNANSWERED until one is recorded.
+            answers: std::collections::BTreeMap::new(),
         };
         let workload_arn = record.workload_arn.clone();
 

@@ -3,8 +3,10 @@
 //! @op DeleteBillingView
 //! Removes the persisted billing view, so the next caller no longer sees it. A
 //! view other views draw from is refused with `ConflictException` (409) unless
-//! `force` is set; an ARN no view is stored under is a `ValidationException`
-//! (400), the only client error this operation models for it.
+//! `force` is set; an ARN outside the caller's own account is an
+//! `AccessDeniedException` (403); an ARN that names no existing `CUSTOM` view of
+//! this account — absent, or the account's `PRIMARY` view — is a
+//! `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -154,6 +156,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modeled `arn` pattern is refused by the boundary validator before
         // this runs.
         let _ = ctx;
+        // The account boundary comes first: a well-formed ARN outside the
+        // caller's own account is refused before the store is consulted, so the
+        // answer never depends on what another account holds.
+        if !crate::state::is_caller_account_arn(&input.arn) {
+            return Err(DeleteBillingViewErrorModeled::AccessDeniedException(
+                crate::state::cross_account_access_denied(Self::NAME, &input.arn),
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteBillingViewErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),
@@ -161,18 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        // `DeleteBillingView` models no `ResourceNotFoundException`, so an ARN
-        // that names no stored view is refused as invalid input rather than with
-        // an error this operation never declares.
-        if !state.billing_views.contains_key(&input.arn) {
-            return Err(DeleteBillingViewErrorModeled::ValidationException(ValidationException {
-                message: format!("Billing view {} does not exist", input.arn),
-                reason: "fieldValidationFailed".to_string(),
-                field_list: Some(vec![ValidationExceptionField {
-                    name: "arn".to_string(),
-                    message: "The specified ARN in the request doesn't exist.".to_string(),
-                }]),
-            })
+        // Only a `CUSTOM` view may be deleted, and eligibility is decided
+        // before existence: an ARN that names no `CUSTOM` view of this account
+        // — absent, or the account's `PRIMARY` view, which every account owns
+        // and no caller may remove — is the same `ValidationException`, which
+        // is also the only refusal class this operation models for it.
+        if state.custom_view(&input.arn).is_none() {
+            return Err(DeleteBillingViewErrorModeled::ValidationException(
+                crate::state::not_a_custom_view(&input.arn, "deleted"),
+            )
             .into());
         }
 

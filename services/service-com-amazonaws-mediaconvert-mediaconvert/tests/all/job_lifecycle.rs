@@ -46,22 +46,22 @@ const PAST_THE_SETTLE: Duration = Duration::from_millis(400);
 
 /// One emulator: a single shared engine behind the multi-service router, exactly as the
 /// production router assembles it.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 /// One HTTP reply, decoded far enough to assert on.
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// `x-amzn-errortype`, the header restJson1 resolves an error shape from.
-    error_type: Option<String>,
+    pub(crate) error_type: Option<String>,
     /// The JSON body, or `Value::Null` for an empty one.
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// A member of the body, or `Value::Null` when it is absent.
-    fn at(&self, pointer: &str) -> &Value {
+    pub(crate) fn at(&self, pointer: &str) -> &Value {
         self.body.pointer(pointer).unwrap_or(&Value::Null)
     }
 
@@ -77,7 +77,7 @@ impl Reply {
 impl Emulator {
     /// An emulator whose jobs stay `SUBMITTED` for the whole case. Every suite but the
     /// one about the clock wants this.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_settle_span(HELD_IN_SUBMITTED)
     }
 
@@ -99,7 +99,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
         self.send_in(REGION, method, uri, body).await
     }
 

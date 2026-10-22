@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQAppSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartQAppSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartQAppSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: starts a session over a stored Q App version, seeding its
+//! `cardStatus` map from the app's definition and the supplied `initialValues`,
+//! and persisting it for `GetQAppSession`. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,212 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartQAppSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartQAppSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartQAppSession"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartQAppSessionErrorModeled::InternalServerException(InternalServerException {
+                message: "the qapps store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let principal = crate::state::caller_principal(ctx);
+        let region = crate::state::caller_region(ctx);
+        let started_at = crate::state::now();
+        let initial_values = input.initial_values.clone().unwrap_or_default();
+
+        // A caller-supplied session id has to be of the service's `UUID`
+        // shape: every operation that reads a session back takes `UUID`.
+        if let Some(supplied) = &input.session_id {
+            if !crate::state::is_uuid_shaped(supplied) {
+                return Err(StartQAppSessionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "sessionId {supplied} is not a valid identifier for a Q App session"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // The app and the version asked for must both exist.
+        let definition = {
+            let app = store
+                .app(&input.instance_id, &input.app_id)
+                .ok_or_else(|| {
+                    StartQAppSessionErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!("Q App {} was not found", input.app_id),
+                            resource_id: input.app_id.clone(),
+                            resource_type: "qapp".to_string(),
+                        },
+                    )
+                })?;
+            app.versions
+                .get(&input.app_version)
+                .cloned()
+                .ok_or_else(|| {
+                    StartQAppSessionErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "Q App {} has no version {}",
+                                input.app_id, input.app_version
+                            ),
+                            resource_id: input.app_id.clone(),
+                            resource_type: "qapp".to_string(),
+                        },
+                    )
+                })?
+        };
+
+        // Every initial value has to name a card of that definition: the
+        // session's `cardStatus` map is keyed by those card ids.
+        for value in &initial_values {
+            if !definition
+                .cards
+                .iter()
+                .any(|card| crate::state::card_id(card) == value.card_id)
+            {
+                return Err(StartQAppSessionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "initialValues names card {}, which is not a card of Q App {} version {}",
+                            value.card_id, input.app_id, input.app_version
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let card_status = crate::state::seed_card_status(&definition, &initial_values);
+        let status = crate::state::session_status(&card_status);
+        let session_id = match &input.session_id {
+            Some(supplied) => supplied.clone(),
+            None => crate::state::mint_uuid(),
+        };
+        let session_arn = crate::state::session_arn(
+            &region,
+            &input.instance_id,
+            &input.app_id,
+            &session_id,
+        );
+        let session_key = (input.instance_id.clone(), session_id.clone());
+
+        // Guardrails on this emulator's memory, reported as the quota refusal
+        // the operation models. Restarting a session this store already holds
+        // is not growth, so it is not refused. The per-app bound keeps one app
+        // from filling the store; the total bound is what caps `sessions` and
+        // `sessions_by_app`, since both key components are caller-chosen.
+        let app_key = (input.instance_id.clone(), input.app_id.clone());
+        let is_restart = store.sessions.contains_key(&session_key);
+        let held = store
+            .sessions_by_app
+            .get(&app_key)
+            .map_or(0, Vec::len);
+        if held >= crate::state::MAX_SESSIONS_PER_APP && !is_restart {
+            return Err(StartQAppSessionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "Q App {} already holds the maximum of {} sessions",
+                        input.app_id,
+                        crate::state::MAX_SESSIONS_PER_APP
+                    ),
+                    resource_id: input.app_id.clone(),
+                    resource_type: "qapp-session".to_string(),
+                    service_code: "qapps".to_string(),
+                    quota_code: "SessionsPerQApp".to_string(),
+                },
+            )
+            .into());
+        }
+        if store.total_session_count() >= crate::state::MAX_SESSIONS_TOTAL && !is_restart {
+            return Err(StartQAppSessionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this endpoint already holds the maximum of {} Q App sessions",
+                        crate::state::MAX_SESSIONS_TOTAL
+                    ),
+                    resource_id: input.app_id.clone(),
+                    resource_type: "qapp-session".to_string(),
+                    service_code: "qapps".to_string(),
+                    quota_code: "QAppSessions".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A session that is restarted against another app leaves the app it
+        // used to run, so the index of that app must let go of it: otherwise
+        // deleting the OLD app would drop a session that now belongs to the new
+        // one, and the old app's session count would never come back down.
+        let previous_app = store
+            .sessions
+            .get(&session_key)
+            .map(|session| session.app_id.clone())
+            .filter(|previous| *previous != input.app_id);
+
+        match store.sessions.get_mut(&session_key) {
+            // Starting a session id that already exists restarts it: the
+            // session keeps its identity, name and creation time, and runs the
+            // version this call names from the values this call supplies.
+            Some(session) => {
+                session.app_id = input.app_id.clone();
+                session.app_version = input.app_version;
+                session.session_arn = session_arn.clone();
+                session.card_status = card_status;
+                session.card_values = initial_values;
+                session.status = status;
+                // The tags of the restarted run, like every other member here:
+                // REPLACED, not merged into. `tags` is a `map<string,string>`
+                // with no modelled length, so merging would let repeated
+                // restarts of one session id grow that one record without
+                // bound; replacing keeps a session's tags at one request body.
+                session.tags = input.tags.clone().unwrap_or_default();
+            }
+            None => {
+                store.sessions.insert(
+                    session_key,
+                    crate::state::QAppSession {
+                        session_id: session_id.clone(),
+                        session_arn: session_arn.clone(),
+                        session_name: None,
+                        app_id: input.app_id.clone(),
+                        app_version: input.app_version,
+                        status,
+                        card_status,
+                        card_values: initial_values,
+                        sharing_configuration: SessionSharingConfiguration::default(),
+                        owner: principal,
+                        tags: input.tags.clone().unwrap_or_default(),
+                        created_at: started_at,
+                    },
+                );
+            }
+        }
+
+        if let Some(previous_app) = previous_app {
+            if let Some(index) = store
+                .sessions_by_app
+                .get_mut(&(input.instance_id.clone(), previous_app))
+            {
+                index.retain(|held| *held != session_id);
+            }
+        }
+
+        // The app -> sessions index is what DeleteQApp walks to drop an app's
+        // sessions, so a restarted session is indexed under the app it now runs.
+        let index = store
+            .sessions_by_app
+            .entry((input.instance_id.clone(), input.app_id.clone()))
+            .or_default();
+        if !index.contains(&session_id) {
+            index.push(session_id.clone());
+        }
+
+        Ok(StartQAppSessionOutput {
+            session_id,
+            session_arn,
+        })
     }
 }

@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/batch_get_policy.rs"]
 mod batch_get_policy;
+#[path = "all/batch_is_authorized.rs"]
+mod batch_is_authorized;
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/identity_sources.rs"]
 mod identity_sources;
 #[path = "all/policy_store_alias.rs"]

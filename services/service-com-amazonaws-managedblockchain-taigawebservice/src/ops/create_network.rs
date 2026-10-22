@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetwork
-//! Implemented: mints a network id and the id of the first member described by
-//! `MemberConfiguration`, persists both in [`crate::state`], and returns the two ids
-//! read back out of the store. `GetNetwork`, `ListNetworks` and `GetMember` project the
-//! same records.
+//! Implemented: validates the requested `Framework`/`FrameworkVersion` pair, then mints a
+//! network id and the id of the first member described by `MemberConfiguration`, persists
+//! both in [`crate::state`], and returns the two ids read back out of the store.
+//! `GetNetwork`, `ListNetworks` and `GetMember` project the same records.
 //!
 //! ## Shape of an operation
 //!
@@ -200,6 +200,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `FrameworkVersion` is "The version of the blockchain framework that the network
+        // uses": only a version the requested framework supports names a network that can
+        // exist, so any other is refused BEFORE anything is provisioned. The versions are
+        // not an enum in the model, so the catalog lives in
+        // `crate::state::supported_framework_versions`.
+        if !crate::state::framework_version_supported(&input.framework, &input.framework_version) {
+            return Err(CreateNetworkErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Invalid version {} requested for framework {}.",
+                        input.framework_version, input.framework
+                    )),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
@@ -216,7 +233,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        if guard.networks.len() >= crate::state::MAX_NETWORKS {
+        // The store's ceiling counts the networks this account created; AWS's standing
+        // public networks are not account resources and consume none of it.
+        let owned = guard
+            .networks
+            .values()
+            .filter(|network| !network.aws_owned)
+            .count();
+        if owned >= crate::state::MAX_NETWORKS {
             return Err(CreateNetworkErrorModeled::ResourceLimitExceededException(
                 ResourceLimitExceededException {
                     message: Some(format!(
@@ -266,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             description: input.description,
             framework: input.framework,
-            framework_version: input.framework_version,
+            framework_version: Some(input.framework_version),
             // The edition is reported only when the request configured one: which
             // edition the service would otherwise pick is not documented, and inventing
             // one would report a value nothing chose.
@@ -274,8 +298,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .framework_configuration
                 .and_then(|configuration| configuration.fabric)
                 .map(|fabric| fabric.edition),
-            ordering_service_endpoint: crate::state::ordering_service_endpoint(&region, &network_id),
-            voting_policy: input.voting_policy,
+            ordering_service_endpoint: Some(crate::state::ordering_service_endpoint(
+                &region,
+                &network_id,
+            )),
+            // A Hyperledger Fabric network carries no Ethereum chain id.
+            ethereum_chain_id: None,
+            // This account's own network, not one of AWS's standing public ones.
+            aws_owned: false,
+            voting_policy: Some(input.voting_policy),
             status: crate::state::STATUS_CREATING.to_string(),
             available_at: now + crate::state::TRANSITION_SPAN,
             creation_date: now,

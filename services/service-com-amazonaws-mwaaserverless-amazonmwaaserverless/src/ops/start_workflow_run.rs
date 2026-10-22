@@ -203,6 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; the run is identified by its workflow.
         let _ = ctx;
+
+        // Every member whose declared constraint this operation's input struct
+        // hands over (`skip_validation`) is checked here, so a bad value is
+        // refused with the modelled `ValidationException` — `Message`,
+        // `Reason: fieldValidationFailed` and a `FieldList` entry per offending
+        // member — rather than the framework's generic 400.
+        validate_input(&input).map_err(|refusal| {
+            StartWorkflowRunError::from(StartWorkflowRunErrorModeled::ValidationException(refusal))
+        })?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let now = SystemTime::now();
         let fingerprint = request_fingerprint(&input);
@@ -347,6 +357,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The idempotency-ledger key for a `ClientToken` of THIS operation.
 fn token_key(client_token: &str) -> String {
     format!("StartWorkflowRun:{client_token}")
+}
+
+/// Check every `StartWorkflowRun` input member whose modelled constraint this
+/// operation took over from the framework boundary (see the `skip_validation`
+/// list on `StartWorkflowRunInput`).
+///
+/// The check is `::aws_smithy_schema_server::constraints::validate` — the SAME
+/// walk the request boundary runs — driven over the member schemas
+/// `crate::state` re-declares, so the clause, the elision of a long value, the
+/// violation cap and the path are the framework's, not this crate's.
+fn validate_input(input: &StartWorkflowRunInput) -> Result<(), ValidationException> {
+    use crate::state::ConstrainedValue::Text;
+
+    let mut members = vec![(&crate::state::M_WORKFLOW_ARN, Text(&input.workflow_arn))];
+    if let Some(token) = input.client_token.as_deref() {
+        members.push((&crate::state::M_CLIENT_TOKEN, Text(token)));
+    }
+    if let Some(version) = input.workflow_version.as_deref() {
+        members.push((&crate::state::M_WORKFLOW_VERSION_SELECTOR, Text(version)));
+    }
+    let violations = crate::state::validate_members(&members);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(crate::state::constraint_validation_exception(&violations))
 }
 
 /// The modelled server error for a store this handler could not reach.

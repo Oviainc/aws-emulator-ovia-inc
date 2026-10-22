@@ -186,6 +186,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // A tag set no resource can carry (one key named twice, or more tags than a
+        // resource may hold) is refused with "An argument is invalid" — the refusal this
+        // operation models for an unusable argument — before anything is minted. The
+        // rule is the service's one tagging rule, shared with every tagged resource.
+        let tags = input
+            .tags
+            .as_ref()
+            .map(crate::state::tag_set)
+            .transpose()
+            .map_err(|reason| {
+                CreateKeyValueStoreErrorModeled::InvalidArgument(InvalidArgument {
+                    message: Some(format!("An argument is invalid: {reason}")),
+                })
+            })?
+            .unwrap_or_default();
+
         // "In your account, the key value store names must be unique": a name identifies
         // one store for its whole life, so a name the store already holds cannot name a
         // second one. Checked BEFORE anything is minted.
@@ -227,9 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ready_due: now + crate::state::KVS_PROVISIONING_DELAY,
             last_modified_time: now,
             etag: etag.clone(),
-            // Held verbatim: a later read answers from this record, never from the
-            // request that is being served.
-            tags: input.tags,
+            // Held as the one tag representation every tagged resource uses: a later
+            // read answers from this record, never from the request that is being
+            // served.
+            tags,
         };
         let key_value_store = stored.to_key_value_store();
         let location =

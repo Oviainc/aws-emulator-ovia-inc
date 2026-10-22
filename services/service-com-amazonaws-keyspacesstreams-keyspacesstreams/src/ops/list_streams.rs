@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStreams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStreams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStreams::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the CDC streams this service's state holds, filtered by `keyspaceName`
+//! and `tableName` and paginated with an opaque `nextToken`. Reporting only: the
+//! streams come from the Keyspaces control plane's write side on
+//! [`crate::state`], never from this handler.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +105,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{resume_index, PageCursor, PageScope, PageTokenError};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -182,18 +179,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStreams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStreamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStreams"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        // A stream belongs to the region of the table it follows, and a request reaches
+        // one region's endpoint, so only that region's streams are visible here.
+        let region = crate::state::request_region(ctx.parts());
+
+        // "tableName … Must be used together with keyspaceName." (the `tableName`
+        // input doc) — a table name alone does not identify a table.
+        if input.table_name.is_some() && input.keyspace_name.is_none() {
+            return Err(validation(
+                "tableName must be specified together with keyspaceName",
+                "InvalidFormat",
+            ));
+        }
+
+        // The query this page belongs to. A `nextToken` resumes the query it was
+        // issued for and no other.
+        let scope = PageScope::Streams {
+            region: region.clone(),
+            keyspace_name: input.keyspace_name.clone(),
+            table_name: input.table_name.clone(),
+        };
+        let mut state = state.lock();
+        let resume_after = match state.resolve_page_token(input.next_token.as_deref(), &scope) {
+            Ok(resume_after) => resume_after,
+            Err(PageTokenError::NotIssued) => {
+                return Err(validation(
+                    "nextToken is not a pagination token this service issued",
+                    "InvalidFormat",
+                ))
+            }
+            Err(PageTokenError::Expired) => {
+                return Err(validation(
+                    "nextToken is no longer valid; start the enumeration again",
+                    "ExpiredNextToken",
+                ))
+            }
+            Err(PageTokenError::WrongQuery) => {
+                return Err(validation(
+                    "nextToken was issued for a different keyspaceName/tableName filter",
+                    "InvalidFormat",
+                ))
+            }
+        };
+
+        let matching: Vec<Stream> = state
+            .streams_in(region.as_deref())
+            .filter(|stream| {
+                input
+                    .keyspace_name
+                    .as_deref()
+                    .is_none_or(|keyspace| keyspace == stream.keyspace_name)
+            })
+            .filter(|stream| {
+                input
+                    .table_name
+                    .as_deref()
+                    .is_none_or(|table| table == stream.table_name)
+            })
+            .map(|stream| Stream {
+                stream_arn: stream.stream_arn.clone(),
+                keyspace_name: stream.keyspace_name.clone(),
+                table_name: stream.table_name.clone(),
+                stream_label: stream.stream_label.clone(),
+            })
+            .collect();
+
+        // The page starts just after the stream the previous page ended at, so a
+        // stream enabled between two pages cannot shift what the next page returns.
+        let arns: Vec<&str> = matching
+            .iter()
+            .map(|stream| stream.stream_arn.as_str())
+            .collect();
+        let from = match resume_after {
+            None => 0,
+            Some(after) => match resume_index(&arns, &after) {
+                Some(index) => index,
+                // The stream the token resumes after is gone, so there is no position
+                // to continue from that would neither skip nor repeat a stream.
+                None => {
+                    return Err(validation(
+                        "the stream this nextToken resumes after no longer exists",
+                        "ExpiredNextToken",
+                    ))
+                }
+            },
+        };
+        let page: Vec<Stream> = matching
+            .iter()
+            .skip(from)
+            .take(page_size(input.max_results))
+            .cloned()
+            .collect();
+        let more_streams = from.saturating_add(page.len()) < matching.len();
+        let next_token = page
+            .last()
+            .filter(|_| more_streams)
+            .map(|last| last.stream_arn.clone())
+            .map(|after| state.mint_page_token(PageCursor { scope, after }));
+
+        Ok(ListStreamsOutput {
+            streams: Some(page),
+            next_token,
+        })
     }
+}
+
+/// "The maximum number of streams to return in a single ListStreams request. The
+/// default value is 100. The minimum value is 1 and the maximum value is 100." (the
+/// `maxResults` input doc; the model's own `@range` refuses anything outside the bound
+/// before this handler runs, and the clamp keeps the default path honest.)
+const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// How many streams one page carries.
+fn page_size(max_results: Option<i32>) -> usize {
+    let requested = max_results
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .clamp(1, DEFAULT_MAX_RESULTS);
+    usize::try_from(requested).unwrap_or(1)
+}
+
+/// The modelled 400 for a request this service refuses, carrying the
+/// `ValidationExceptionType` that says which kind of refusal it is.
+fn validation(message: &str, error_code: &str) -> ListStreamsError {
+    debug_assert!(
+        VALIDATION_EXCEPTION_TYPE_VALUES.contains(&error_code),
+        "{error_code} is not a ValidationExceptionType the model declares"
+    );
+    ListStreamsErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+        error_code: Some(error_code.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 500 for an engine this service cannot reach. Never a fresh engine:
+/// that would answer from a store nobody else can see.
+fn store_unavailable() -> ListStreamsError {
+    ListStreamsErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the KeyspacesStreams store is unavailable".to_string()),
+    })
+    .into()
 }

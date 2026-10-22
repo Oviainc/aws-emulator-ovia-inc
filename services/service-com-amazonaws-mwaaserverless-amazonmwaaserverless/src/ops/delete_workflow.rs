@@ -176,6 +176,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; the workflow is named by its input.
         let _ = ctx;
+
+        // Every member whose declared constraint this operation's input struct
+        // hands over (`skip_validation`) is checked here, so a bad value is
+        // refused with the modelled `ValidationException` — `Message`,
+        // `Reason: fieldValidationFailed` and a `FieldList` entry per offending
+        // member — rather than the framework's generic 400.
+        validate_input(&input).map_err(|refusal| {
+            DeleteWorkflowError::from(DeleteWorkflowErrorModeled::ValidationException(refusal))
+        })?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteWorkflowErrorModeled::InternalServerException(InternalServerException {
                 message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
@@ -271,4 +281,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workflow_version: Some(deleted_version),
         })
     }
+}
+
+/// Check every `DeleteWorkflow` input member whose modelled constraint this
+/// operation took over from the framework boundary (see the `skip_validation`
+/// list on `DeleteWorkflowInput`).
+///
+/// The check is `::aws_smithy_schema_server::constraints::validate` — the SAME
+/// walk the request boundary runs — driven over the member schemas
+/// `crate::state` re-declares, so the clause, the elision of a long value, the
+/// violation cap and the path are the framework's, not this crate's.
+fn validate_input(input: &DeleteWorkflowInput) -> Result<(), ValidationException> {
+    use crate::state::ConstrainedValue::Text;
+
+    let mut members = vec![(&crate::state::M_WORKFLOW_ARN, Text(&input.workflow_arn))];
+    if let Some(version) = input.workflow_version.as_deref() {
+        members.push((&crate::state::M_WORKFLOW_VERSION_ID, Text(version)));
+    }
+    let violations = crate::state::validate_members(&members);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(crate::state::constraint_validation_exception(&violations))
 }
