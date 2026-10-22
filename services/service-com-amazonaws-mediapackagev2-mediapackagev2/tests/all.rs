@@ -37,6 +37,8 @@ mod origin_endpoint_reset;
 mod refusal_text_and_entity_tags;
 #[path = "all/rejection_rule_and_negative_paths.rs"]
 mod rejection_rule_and_negative_paths;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/server_materialised_members.rs"]
 mod server_materialised_members;
 #[path = "all/state_roundtrip.rs"]
