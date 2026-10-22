@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFileSystem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFileSystem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFileSystem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies a throughput change to the file system persisted in
+//! [`crate::state`] — the new `ThroughputMode` and/or `ProvisionedThroughputInMibps` —
+//! and answers the stored `FileSystemDescription`, which reports `updating` until the
+//! clock owes the file system `available` again.
 //!
 //! ## Shape of an operation
 //!
@@ -224,18 +219,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFileSystem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFileSystemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFileSystem"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        // "The ID of the file system that you want to update" — the member takes an id
+        // or a file-system ARN, and the store is keyed by the bare id.
+        let file_system_id = efs::file_system_id_of(&input.file_system_id).to_string();
+        let Some(file_system) = state.file_systems.get_mut(&file_system_id) else {
+            return Err(UpdateFileSystemErrorModeled::FileSystemNotFound(
+                FileSystemNotFound {
+                    error_code: "FileSystemNotFound".to_string(),
+                    // The one construction every "not found" refusal of this service is
+                    // built from; see `crate::state::does_not_exist`.
+                    message: Some(efs::file_system_not_found_message(&file_system_id)),
+                },
+            )
+            .into());
+        };
+
+        // `IncorrectFileSystemLifeCycleState`: "Returned if the file system's lifecycle
+        // state is not available" — so a file system still `creating`, or still settling
+        // an earlier throughput change, refuses this one.
+        if file_system.life_cycle_state != efs::LIFE_CYCLE_AVAILABLE {
+            return Err(
+                UpdateFileSystemErrorModeled::IncorrectFileSystemLifeCycleState(
+                    IncorrectFileSystemLifeCycleState {
+                        error_code: "IncorrectFileSystemLifeCycleState".to_string(),
+                        message: Some(format!(
+                            "File system {file_system_id} is in life cycle state {}, not {}",
+                            file_system.life_cycle_state,
+                            efs::LIFE_CYCLE_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "If you're not updating your throughput mode, you don't need to provide this
+        // value in your request" — an absent member leaves the stored one standing.
+        let current_mode = file_system.throughput_mode.clone();
+        let current_mibps = file_system.provisioned_throughput_in_mibps;
+        let mode = input.throughput_mode.clone().unwrap_or(current_mode.clone());
+
+        // "If you are changing the ThroughputMode to provisioned, you must also set a
+        // value for ProvisionedThroughputInMibps", which is "valid for file systems
+        // using ThroughputMode set to provisioned" and for no other mode.
+        let mibps = if mode == efs::THROUGHPUT_MODE_PROVISIONED {
+            let Some(mibps) = input.provisioned_throughput_in_mibps.or(current_mibps) else {
+                return Err(bad_request(
+                    "ProvisionedThroughputInMibps is required when ThroughputMode is provisioned",
+                ));
+            };
+            Some(mibps)
+        } else {
+            if input.provisioned_throughput_in_mibps.is_some() {
+                return Err(bad_request(format!(
+                    "ProvisionedThroughputInMibps is valid only when ThroughputMode is \
+                     provisioned; ThroughputMode is {mode}"
+                )));
+            }
+            None
+        };
+
+        // "Valid values are 1-3414 MiBps": the model carries only the lower bound, which
+        // the boundary already refused below, so the documented ceiling is checked here.
+        if let Some(mibps) = mibps {
+            if mibps > efs::MAX_PROVISIONED_THROUGHPUT_MIBPS {
+                return Err(UpdateFileSystemErrorModeled::ThroughputLimitExceeded(
+                    ThroughputLimitExceeded {
+                        error_code: "ThroughputLimitExceeded".to_string(),
+                        message: Some(format!(
+                            "ProvisionedThroughputInMibps must be at most {}; got {mibps}",
+                            efs::MAX_PROVISIONED_THROUGHPUT_MIBPS
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mode_changed = mode != current_mode;
+        // A request that asks for exactly what the file system already has changes
+        // nothing, so it neither starts a transition nor consumes the restriction window
+        // below: it just reports the file system.
+        if !mode_changed && mibps == current_mibps {
+            return Ok(file_system.describe_update());
+        }
+
+        // `TooManyRequests`: "Returned if you don't wait at least 24 hours before either
+        // changing the throughput mode, or decreasing the Provisioned Throughput value."
+        // An INCREASE of provisioned throughput is not one of the two, so it is never
+        // refused for the window.
+        let decreased = matches!((mibps, current_mibps), (Some(new), Some(old)) if new < old);
+        let restricted = mode_changed || decreased;
+        let inside_window = file_system
+            .last_restricted_throughput_change
+            .is_some_and(|last| {
+                now.duration_since(last).unwrap_or_default() < efs::THROUGHPUT_CHANGE_COOLDOWN
+            });
+        if restricted && inside_window {
+            return Err(UpdateFileSystemErrorModeled::TooManyRequests(
+                TooManyRequests {
+                    error_code: "TooManyRequests".to_string(),
+                    message: Some(format!(
+                        "File system {} must wait at least {} hours between changing its \
+                         throughput mode or decreasing its provisioned throughput",
+                        efs::quoted(&file_system_id),
+                        efs::THROUGHPUT_CHANGE_COOLDOWN.as_secs() / 3600
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The change is accepted: the file system carries the requested throughput from
+        // here on and settles back to `available` once the clock owes it, which is what
+        // the `updating` lifecycle phase reports in the meantime.
+        file_system.throughput_mode = mode;
+        file_system.provisioned_throughput_in_mibps = mibps;
+        file_system.life_cycle_state = efs::LIFE_CYCLE_UPDATING.to_string();
+        file_system.available_at = now + efs::CREATING_FOR;
+        if restricted {
+            file_system.last_restricted_throughput_change = Some(now);
+        }
+        Ok(file_system.describe_update())
     }
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> UpdateFileSystemError {
+    UpdateFileSystemErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> UpdateFileSystemError {
+    UpdateFileSystemErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }
