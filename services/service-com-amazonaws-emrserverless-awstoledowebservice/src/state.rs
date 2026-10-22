@@ -6,7 +6,9 @@
 //! job run lives inside one application. [`ApplicationRecord`] is the ONE copy of an
 //! application every handler reads and writes: `CreateApplication` mints it,
 //! `GetApplication` / `ListApplications` report it, `StartApplication` /
-//! `StopApplication` move its state, `DeleteApplication` removes it, and
+//! `StopApplication` move its state, `DeleteApplication` terminates it (the record is
+//! retained in the terminal `TERMINATED` state rather than dropped, so a client reading
+//! the application back after a delete observes that state), and
 //! `StartJobRun` / `GetJobRun` / `ListJobRuns` / `CancelJobRun` work on the job runs it
 //! owns.
 //!
@@ -22,8 +24,8 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     Application, ApplicationSummary, AutoStartConfig, AutoStopConfig, IdentityCenterConfiguration,
     IdentityCenterConfigurationInput, ImageConfiguration, ImageConfigurationInput, JobRun,
-    JobRunSummary, ResourceNotFoundException, WorkerTypeSpecification,
-    WorkerTypeSpecificationInput,
+    JobRunSummary, JobLevelCostAllocationConfiguration, MonitoringConfiguration,
+    ResourceNotFoundException, WorkerTypeSpecification, WorkerTypeSpecificationInput,
 };
 
 /// This service's ARN namespace, and the `sigv4Name` the model declares
@@ -91,6 +93,52 @@ pub const DEFAULT_IDLE_TIMEOUT_MINUTES: i32 = 15;
 /// whichever later call reads it — nothing sleeps.
 pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 
+/// The CPU architecture an application runs on when `CreateApplication` names none.
+///
+/// `Architecture` is `ARM64 | X86_64` and `CreateApplicationRequest$architecture` is
+/// optional; EMR Serverless applies the x86_64 architecture to an application that
+/// names none ("The default architecture is x86_64" in the EMR Serverless user guide's
+/// architecture section), and reports it on every later read.
+pub const DEFAULT_ARCHITECTURE: &str = "X86_64";
+
+/// `Application$stateDetails` for an application a caller created.
+///
+/// The member is "the state details of the application", and the detail an EMR
+/// Serverless application carries from its create says how it came to be; the service
+/// keeps it across the application's later states rather than rewriting it per state,
+/// so a transition with no detail of its own leaves this one in place.
+pub const CREATED_STATE_DETAILS: &str = "Application created by user.";
+
+/// One engine EMR Serverless serves: the casing its API reports the engine in, and the
+/// earliest Amazon EMR release that offers it.
+#[derive(Debug, Clone, Copy)]
+pub struct SupportedEngine {
+    /// The canonical `EngineType` value, which is what every read reports whatever
+    /// casing the create asked in.
+    pub canonical_type: &'static str,
+    /// The `(major, minor, patch)` of the earliest Amazon EMR release supporting it.
+    pub min_release: (u32, u32, u32),
+}
+
+/// Every engine type an application can be created for, with the release each needs.
+///
+/// `EngineType` is an OPEN string in the model (len 1..64, no enum), so which engines
+/// exist — and from which Amazon EMR release — is a service-side rule rather than a
+/// model constraint. Source: `Application$type`'s documentation, "The type of
+/// application, such as Spark or Hive", for the engines and the casing the API reports
+/// them in, and "EMR Serverless is available with Amazon EMR releases 6.6.0 and later"
+/// for the release each one needs.
+pub const SUPPORTED_ENGINES: &[SupportedEngine] = &[
+    SupportedEngine {
+        canonical_type: "Spark",
+        min_release: (6, 6, 0),
+    },
+    SupportedEngine {
+        canonical_type: "Hive",
+        min_release: (6, 6, 0),
+    },
+];
+
 /// `JobRun$stateDetails` for a job run that has been accepted but not yet run.
 pub const SUBMITTED_STATE_DETAILS: &str = "Job run submitted.";
 
@@ -113,7 +161,8 @@ pub const CANCELLED_STATE_DETAILS: &str = "Job run cancelled at the request of t
 /// finished run.
 pub const TERMINAL_JOB_RUN_STATES: &[&str] = &["SUCCESS", "FAILED", "CANCELLED"];
 
-/// The `ApplicationState` values `DeleteApplication` admits.
+/// The `ApplicationState` values `DeleteApplication` admits, judged against the state
+/// the application has SETTLED on ([`ApplicationRecord::settled_state`]).
 ///
 /// Source: the operation's own documentation — "An application has to be in a stopped
 /// or created state in order to be deleted."
@@ -122,6 +171,51 @@ pub const DELETABLE_APPLICATION_STATES: &[&str] = &["CREATED", "STOPPED"];
 /// The prefix a pagination cursor carries, so a token this service did not mint is
 /// refused rather than read as a resume point.
 const PAGE_TOKEN_PREFIX: &str = "v1_";
+
+/// The `(major, minor, patch)` release an `emr-<major>.<minor>.<patch>` label names, or
+/// `None` when the label carries no such version.
+///
+/// `ReleaseLabel` is a free string (pattern `^[A-Za-z0-9._/-]+$`), so a label this
+/// emulator cannot read a release out of is one it cannot order against any minimum.
+pub fn release_version(release_label: &str) -> Option<(u32, u32, u32)> {
+    let rest = release_label.strip_prefix("emr-")?;
+    // A label may carry a suffix after the version (`emr-6.6.0-20220101`); the version
+    // is what precedes it.
+    let version = rest.split('-').next()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((major, minor, patch))
+}
+
+/// The canonical engine type to store for a create naming `engine_type` at
+/// `release_label`, or `None` when that release supports no engine of that name — which
+/// the caller answers with its modelled `ValidationException`.
+///
+/// The engine is matched WITHOUT case, because the service reports it in its own
+/// casing rather than the caller's; a release label carrying no readable version is
+/// judged on the engine name alone rather than refused for a version nothing can order.
+pub fn supported_engine_type(engine_type: &str, release_label: &str) -> Option<&'static str> {
+    let engine = SUPPORTED_ENGINES
+        .iter()
+        .find(|engine| engine.canonical_type.eq_ignore_ascii_case(engine_type))?;
+    match release_version(release_label) {
+        Some(version) if version < engine.min_release => None,
+        _ => Some(engine.canonical_type),
+    }
+}
+
+/// The `ValidationException` message for a `type`/`releaseLabel` pair the service does
+/// not support: built from the request, naming the `type` member value it refused.
+///
+/// The wording is the one this service uses for the refusal, which names the rejected
+/// type and nothing else of the request — as its other refusals do (its
+/// `ResourceNotFoundException` for an application reads "Application does not exist",
+/// carrying no id).
+pub fn unsupported_engine_type_message(engine_type: &str) -> String {
+    format!("Type {engine_type} is not supported for release label")
+}
 
 /// True when `state` names a `JobRunState` a job run never leaves.
 pub fn is_terminal_job_run_state(state: &str) -> bool {
@@ -237,6 +331,34 @@ impl ApplicationRecord {
         for record in self.job_runs.values_mut() {
             record.settle(now);
         }
+    }
+
+    /// The lifecycle state this application has SETTLED on: the state the clock
+    /// already owes it while a transition is still pending, and the state it carries
+    /// now otherwise.
+    ///
+    /// A precondition on the lifecycle is judged against this, so a transition the
+    /// emulator has not materialised yet never refuses a call the settled application
+    /// admits.
+    pub fn settled_state(&self) -> &str {
+        self.pending
+            .as_ref()
+            .map_or(self.application.state.as_str(), |pending| {
+                pending.state.as_str()
+            })
+    }
+
+    /// Terminate this application, which is what `DeleteApplication` does to it.
+    ///
+    /// The record is RETAINED in `TERMINATED` — the terminal value of the
+    /// `ApplicationState` enum — rather than dropped, so a client polling the
+    /// application after a delete observes a terminal state instead of the state it
+    /// last had. `stateDetails` is left as stored: it says how the application came to
+    /// be, which the delete does not change.
+    pub fn terminate(&mut self, now: SystemTime) {
+        self.pending = None;
+        self.application.state = "TERMINATED".to_string();
+        self.application.updated_at = now_timestamp(now);
     }
 
     /// Mint an unused job run id matching `JobRunId`'s `^[0-9a-z]+$`.
@@ -407,6 +529,42 @@ pub fn adopt_auto_stop(config: Option<AutoStopConfig>) -> Option<AutoStopConfig>
                 .unwrap_or(DEFAULT_IDLE_TIMEOUT_MINUTES),
         ),
     })
+}
+
+/// The `tags` to persist: the caller's, or the empty map an application created with
+/// no tags carries.
+///
+/// `Application$tags` is "the tags assigned to the application", a `@length(0..200)`
+/// map, so an application with none has an EMPTY tag map rather than no tag map, and
+/// every read reports it.
+pub fn adopt_tags(tags: Option<HashMap<String, String>>) -> Option<HashMap<String, String>> {
+    Some(tags.unwrap_or_default())
+}
+
+/// The `architecture` to persist: the caller's, or [`DEFAULT_ARCHITECTURE`].
+pub fn adopt_architecture(architecture: Option<String>) -> Option<String> {
+    Some(architecture.unwrap_or_else(|| DEFAULT_ARCHITECTURE.to_string()))
+}
+
+/// The `monitoringConfiguration` to persist: the caller's, or the empty configuration
+/// an application created without one runs under.
+///
+/// `Application$monitoringConfiguration` reports "the configuration setting for
+/// monitoring" THIS application has, which every application has — nothing in it is
+/// required — so a read reports the configuration the service applied rather than
+/// omitting the block.
+pub fn adopt_monitoring(
+    config: Option<MonitoringConfiguration>,
+) -> Option<MonitoringConfiguration> {
+    Some(config.unwrap_or_default())
+}
+
+/// The `jobLevelCostAllocationConfiguration` to persist, on the same rule: the
+/// caller's, or the empty configuration an application created without one carries.
+pub fn adopt_job_level_cost_allocation(
+    config: Option<JobLevelCostAllocationConfiguration>,
+) -> Option<JobLevelCostAllocationConfiguration> {
+    Some(config.unwrap_or_default())
 }
 
 /// The `imageConfiguration` to persist for the `ImageConfigurationInput` a request
