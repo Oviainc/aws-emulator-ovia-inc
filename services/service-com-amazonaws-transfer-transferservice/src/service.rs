@@ -41,9 +41,61 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with.
+///
+/// Transfer's model declares no `ValidationException` of its own, so a refusal the
+/// framework makes before any handler runs renders the framework's synthetic one —
+/// which is also the code the real service answers these refusals with. It is
+/// restated here because `override_refusal` replaces code and message together: only
+/// the message's CONSTRUCTION changes below.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// Render ONE enum-constraint violation the way Transfer states it: the member path
+/// and the modelled value set the member must satisfy, and NOTHING of the value that
+/// was rejected.
+///
+/// Returns `None` for every other violation class — a length, range, pattern,
+/// uniqueness or absent-member refusal keeps the framework's wording, which states
+/// the submitted value the way AWS states those. Only the enum class is reworded,
+/// because that is the class whose message is known not to quote the rejected value
+/// back to the caller.
+fn enum_constraint_clause(violation: &Violation) -> Option<String> {
+    let ViolationKind::EnumValue(allowed) = &violation.kind else {
+        return None;
+    };
+    // The bracketed set is the model's own value order; no documented rule fixes it.
+    Some(format!(
+        "Value at '{}' failed to satisfy constraint: Member must satisfy enum value set: [{}]",
+        violation.path,
+        allowed.join(", ")
+    ))
+}
+
+/// The refusal message for a set of violations that are ALL enum-constraint
+/// violations: the AWS envelope (`N validation error(s) detected: `) over one clause
+/// per violation, in the same shape the framework's own envelope uses.
+///
+/// `None` declines the whole refusal — including a refusal that mixes an enum
+/// violation with another class, which keeps one consistent wording for the message
+/// rather than two half-rendered ones.
+fn enum_constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(enum_constraint_clause)
+        .collect::<Option<Vec<_>>>()?;
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-transfer-transferservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +150,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Transfer states a value outside an enumerated member's value set WITHOUT
+        // the value that was submitted: the message names the member path and the
+        // value set only, so caller-controlled input is never echoed back into a
+        // client's logs. The code stays the `ValidationException` the framework
+        // would have answered with — only the wording changes. Every other
+        // violation class, and an authentication refusal, keeps the framework's
+        // wording.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: enum_constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

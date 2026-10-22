@@ -34,11 +34,28 @@ const ARN_SERVICE: &str = "transfer";
 /// `^Transfer[A-Za-z0-9]*SecurityPolicy-[A-Za-z0-9-]+$`.
 pub const DEFAULT_SECURITY_POLICY_NAME: &str = "TransferSecurityPolicy-2018-11-05";
 
+/// `Domain`'s `S3` value (the `Domain` enum is `[S3, EFS]`).
+pub const DOMAIN_S3: &str = "S3";
+
 /// `Domain`'s documented default ("The default value is S3").
-pub const DEFAULT_DOMAIN: &str = "S3";
+pub const DEFAULT_DOMAIN: &str = DOMAIN_S3;
+
+/// The `IdentityProviderType` enum's values (`[SERVICE_MANAGED, API_GATEWAY,
+/// AWS_DIRECTORY_SERVICE, AWS_LAMBDA]`). The three below `SERVICE_MANAGED` are the
+/// ones `IdentityProviderDetails` documents itself as required for.
+pub const IDENTITY_PROVIDER_SERVICE_MANAGED: &str = "SERVICE_MANAGED";
+pub const IDENTITY_PROVIDER_API_GATEWAY: &str = "API_GATEWAY";
+pub const IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE: &str = "AWS_DIRECTORY_SERVICE";
+pub const IDENTITY_PROVIDER_AWS_LAMBDA: &str = "AWS_LAMBDA";
 
 /// `IdentityProviderType`'s documented default ("The default value is SERVICE_MANAGED").
-pub const DEFAULT_IDENTITY_PROVIDER_TYPE: &str = "SERVICE_MANAGED";
+pub const DEFAULT_IDENTITY_PROVIDER_TYPE: &str = IDENTITY_PROVIDER_SERVICE_MANAGED;
+
+/// The `EndpointType` enum's two VPC-hosted values (`[PUBLIC, VPC, VPC_ENDPOINT]`).
+/// A server with either one hosts its endpoint inside a VPC, so it is configured by
+/// `EndpointDetails`.
+pub const ENDPOINT_TYPE_VPC: &str = "VPC";
+pub const ENDPOINT_TYPE_VPC_ENDPOINT: &str = "VPC_ENDPOINT";
 
 /// `EndpointType`'s default: a server with no VPC endpoint settings is reachable over
 /// the public internet.
@@ -47,9 +64,23 @@ pub const DEFAULT_ENDPOINT_TYPE: &str = "PUBLIC";
 /// `IpAddressType`'s documented default ("The default value is IPV4").
 pub const DEFAULT_IP_ADDRESS_TYPE: &str = "IPV4";
 
+/// `IpAddressType`'s dual-stack value (the `IpAddressType` enum is
+/// `[IPV4, DUALSTACK]`).
+pub const IP_ADDRESS_TYPE_DUALSTACK: &str = "DUALSTACK";
+
 /// `Protocols`' default: SFTP alone, the only protocol a `PUBLIC`,
 /// `SERVICE_MANAGED` server can serve.
 pub const DEFAULT_PROTOCOL: &str = "SFTP";
+
+/// The `Protocol` enum values whose documentation states a requirement on another
+/// member of the server (the enum is `[SFTP, FTP, FTPS, AS2]`).
+pub const PROTOCOL_FTP: &str = "FTP";
+pub const PROTOCOL_FTPS: &str = "FTPS";
+pub const PROTOCOL_AS2: &str = "AS2";
+
+/// `HomeDirectoryType`'s value that makes `HomeDirectoryMappings` the user's home
+/// directory (the enum is `[PATH, LOGICAL]`).
+pub const HOME_DIRECTORY_TYPE_LOGICAL: &str = "LOGICAL";
 
 /// The page bound a `List*` call uses when the caller sends no `MaxResults`.
 ///
@@ -231,6 +262,256 @@ impl Server {
                 self.state_due = None;
             }
         }
+    }
+}
+
+// =============================================================================
+// Cross-member requirements
+//
+// Some of this service's members are only meaningful in combination: the model's own
+// documentation states, for a member, which value of ANOTHER member makes it
+// required, or makes it settable at all. The framework's boundary validator enforces
+// the single-member constraints (`@required`, `@length`, `@pattern`, enum value sets)
+// before a handler runs, but it cannot see across members — so these requirements are
+// checked here, by the create/update handler, BEFORE anything is persisted, and
+// refused with the modelled `InvalidRequestException` (HTTP 400), which the model
+// documents as "thrown when the client submits a malformed request".
+//
+// The wording below names the member and the condition it was submitted under, which
+// is built entirely from the request; no recorded message text is reproduced.
+// =============================================================================
+
+/// "`<member>` must be specified when `<condition>`" — a member the model documents as
+/// required under a condition the request meets, and did not send.
+fn required_when(member: &str, condition: &str) -> String {
+    format!("{member} must be specified when {condition}")
+}
+
+/// "`<member>` cannot be specified when `<condition>`" — a member the model documents
+/// as unusable under a condition the request meets, and sent anyway.
+fn forbidden_when(member: &str, condition: &str) -> String {
+    format!("{member} cannot be specified when {condition}")
+}
+
+/// "`<member>` can only be set when `<condition>`" — a member the model documents as
+/// settable under ONE condition, sent under another.
+fn settable_only_when(member: &str, condition: &str) -> String {
+    format!("{member} can only be set when {condition}")
+}
+
+/// "`<member>` must be `<requirement>` when `<condition>`" — a member whose VALUE the
+/// model constrains to another member's value.
+fn must_be_when(member: &str, requirement: &str, condition: &str) -> String {
+    format!("{member} must be {requirement} when {condition}")
+}
+
+/// The server configuration a `CreateServer` (or `UpdateServer`) request resolves to:
+/// every member a documented cross-member requirement mentions, with the model's
+/// documented defaults ALREADY applied.
+///
+/// Defaults are applied first because the requirements are about the configuration the
+/// server will actually have: a request that omits `EndpointType` selects `PUBLIC`,
+/// which needs no VPC endpoint settings at all.
+#[derive(Debug)]
+pub struct ServerConfig<'a> {
+    pub domain: &'a str,
+    pub endpoint_type: &'a str,
+    pub endpoint_details: Option<&'a EndpointDetails>,
+    pub identity_provider_type: &'a str,
+    pub identity_provider_details: Option<&'a IdentityProviderDetails>,
+    pub ip_address_type: &'a str,
+    pub protocols: &'a [String],
+    pub certificate: Option<&'a str>,
+}
+
+impl ServerConfig<'_> {
+    /// Whether this configuration's `IdentityProviderType` is one of the three the
+    /// model documents `IdentityProviderDetails` as required for.
+    fn needs_identity_provider_details(&self) -> bool {
+        matches!(
+            self.identity_provider_type,
+            IDENTITY_PROVIDER_API_GATEWAY
+                | IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE
+                | IDENTITY_PROVIDER_AWS_LAMBDA
+        )
+    }
+
+    /// Whether `Protocols` names `protocol`.
+    fn speaks(&self, protocol: &str) -> bool {
+        self.protocols.iter().any(|named| named == protocol)
+    }
+
+    /// The first documented cross-member requirement this configuration violates,
+    /// worded as the refusal states it — `None` when it violates none.
+    ///
+    /// Every rule below is a sentence in this service's own model:
+    ///
+    /// * `EndpointDetails` is "the virtual private cloud (VPC) endpoint settings that
+    ///   are configured for your server", whose `SubnetIds` are "required to host your
+    ///   server endpoint in your VPC" — so a server whose `EndpointType` hosts the
+    ///   endpoint in a VPC cannot be configured without them.
+    /// * each `EndpointDetails` member states the one `EndpointType` it "can only be
+    ///   set when" (`VpcEndpointId` -> `VPC_ENDPOINT`, the rest -> `VPC`), and
+    ///   `AddressAllocationIds` adds "You can't set address allocation IDs for servers
+    ///   that have an `IpAddressType` set to `DUALSTACK`".
+    /// * `IdentityProviderDetails` is "Required when `IdentityProviderType` is set to
+    ///   `AWS_DIRECTORY_SERVICE`, `AWS_LAMBDA` or `API_GATEWAY`" and "Cannot be
+    ///   specified when `IdentityProviderType` is set to `SERVICE_MANAGED`".
+    /// * `Certificate` is "Required when `Protocols` is set to `FTPS`".
+    /// * `Protocols` states "If `Protocol` includes either `FTP` or `FTPS`, then the
+    ///   `EndpointType` must be `VPC` and the `IdentityProviderType` must be either
+    ///   `AWS_DIRECTORY_SERVICE`, `AWS_LAMBDA`, or `API_GATEWAY`" and "If `Protocol`
+    ///   includes `AS2`, then the `EndpointType` must be `VPC`, and domain must be
+    ///   Amazon S3".
+    pub fn cross_member_violation(&self) -> Option<String> {
+        let endpoint_type = self.endpoint_type;
+        let hosted_in_vpc =
+            matches!(endpoint_type, ENDPOINT_TYPE_VPC | ENDPOINT_TYPE_VPC_ENDPOINT);
+
+        if hosted_in_vpc && self.endpoint_details.is_none() {
+            return Some(required_when(
+                "EndpointDetails",
+                &format!("EndpointType is {endpoint_type}"),
+            ));
+        }
+
+        if let Some(details) = self.endpoint_details {
+            for (member, submitted, only_with) in [
+                (
+                    "EndpointDetails.VpcId",
+                    details.vpc_id.is_some(),
+                    ENDPOINT_TYPE_VPC,
+                ),
+                (
+                    "EndpointDetails.SubnetIds",
+                    details.subnet_ids.is_some(),
+                    ENDPOINT_TYPE_VPC,
+                ),
+                (
+                    "EndpointDetails.SecurityGroupIds",
+                    details.security_group_ids.is_some(),
+                    ENDPOINT_TYPE_VPC,
+                ),
+                (
+                    "EndpointDetails.AddressAllocationIds",
+                    details.address_allocation_ids.is_some(),
+                    ENDPOINT_TYPE_VPC,
+                ),
+                (
+                    "EndpointDetails.VpcEndpointId",
+                    details.vpc_endpoint_id.is_some(),
+                    ENDPOINT_TYPE_VPC_ENDPOINT,
+                ),
+            ] {
+                if submitted && endpoint_type != only_with {
+                    return Some(settable_only_when(
+                        member,
+                        &format!("EndpointType is {only_with}"),
+                    ));
+                }
+            }
+            if details.address_allocation_ids.is_some()
+                && self.ip_address_type == IP_ADDRESS_TYPE_DUALSTACK
+            {
+                return Some(forbidden_when(
+                    "EndpointDetails.AddressAllocationIds",
+                    &format!("IpAddressType is {IP_ADDRESS_TYPE_DUALSTACK}"),
+                ));
+            }
+        }
+
+        let provider_condition = format!("IdentityProviderType is {}", self.identity_provider_type);
+        match (
+            self.needs_identity_provider_details(),
+            self.identity_provider_details.is_some(),
+        ) {
+            (true, false) => {
+                return Some(required_when("IdentityProviderDetails", &provider_condition))
+            }
+            (false, true) => {
+                return Some(forbidden_when(
+                    "IdentityProviderDetails",
+                    &provider_condition,
+                ))
+            }
+            _ => {}
+        }
+
+        // An empty `Certificate` names no certificate: the member's `len 0..1600`
+        // admits the empty string, so presence alone is not enough.
+        if self.speaks(PROTOCOL_FTPS)
+            && self
+                .certificate
+                .is_none_or(|certificate| certificate.trim().is_empty())
+        {
+            return Some(required_when(
+                "Certificate",
+                &format!("Protocols includes {PROTOCOL_FTPS}"),
+            ));
+        }
+
+        for protocol in [PROTOCOL_FTP, PROTOCOL_FTPS] {
+            if !self.speaks(protocol) {
+                continue;
+            }
+            if endpoint_type != ENDPOINT_TYPE_VPC {
+                return Some(must_be_when(
+                    "EndpointType",
+                    ENDPOINT_TYPE_VPC,
+                    &format!("Protocols includes {protocol}"),
+                ));
+            }
+            if !self.needs_identity_provider_details() {
+                return Some(must_be_when(
+                    "IdentityProviderType",
+                    &format!(
+                        "{IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE}, \
+                         {IDENTITY_PROVIDER_AWS_LAMBDA} or {IDENTITY_PROVIDER_API_GATEWAY}"
+                    ),
+                    &format!("Protocols includes {protocol}"),
+                ));
+            }
+        }
+
+        if self.speaks(PROTOCOL_AS2) {
+            if endpoint_type != ENDPOINT_TYPE_VPC {
+                return Some(must_be_when(
+                    "EndpointType",
+                    ENDPOINT_TYPE_VPC,
+                    &format!("Protocols includes {PROTOCOL_AS2}"),
+                ));
+            }
+            if self.domain != DOMAIN_S3 {
+                return Some(must_be_when(
+                    "Domain",
+                    DOMAIN_S3,
+                    &format!("Protocols includes {PROTOCOL_AS2}"),
+                ));
+            }
+        }
+
+        None
+    }
+}
+
+/// The documented cross-member requirement a user's home-directory configuration
+/// violates, worded as the refusal states it — `None` when it violates none.
+///
+/// `HomeDirectoryType` states "If `HomeDirectoryType` is `LOGICAL`, you must provide
+/// mappings, using the `HomeDirectoryMappings` parameter", and
+/// `HomeDirectoryMappings` states "This value can be set only when
+/// `HomeDirectoryType` is set to `LOGICAL`" — one requirement in each direction.
+pub fn home_directory_violation(
+    home_directory_type: Option<&str>,
+    home_directory_mappings: Option<&[HomeDirectoryMapEntry]>,
+) -> Option<String> {
+    let condition = format!("HomeDirectoryType is {HOME_DIRECTORY_TYPE_LOGICAL}");
+    let logical = home_directory_type == Some(HOME_DIRECTORY_TYPE_LOGICAL);
+    let mapped = home_directory_mappings.is_some_and(|mappings| !mappings.is_empty());
+    match (logical, mapped) {
+        (true, false) => Some(required_when("HomeDirectoryMappings", &condition)),
+        (false, true) => Some(settable_only_when("HomeDirectoryMappings", &condition)),
+        _ => None,
     }
 }
 

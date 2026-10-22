@@ -274,6 +274,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
+        // Every member the model gives a documented default is resolved ONCE, HERE,
+        // before the request is validated: a cross-member requirement is about the
+        // configuration the server will actually have, so omitting `EndpointType`
+        // selects `PUBLIC` — which needs no VPC endpoint settings — rather than
+        // leaving the requirement unevaluated.
+        let domain = input.domain.unwrap_or_else(|| st::DEFAULT_DOMAIN.to_string());
+        let identity_provider_type = input
+            .identity_provider_type
+            .unwrap_or_else(|| st::DEFAULT_IDENTITY_PROVIDER_TYPE.to_string());
+        let endpoint_type = input
+            .endpoint_type
+            .unwrap_or_else(|| st::DEFAULT_ENDPOINT_TYPE.to_string());
+        let ip_address_type = input
+            .ip_address_type
+            .unwrap_or_else(|| st::DEFAULT_IP_ADDRESS_TYPE.to_string());
+        let protocols = input
+            .protocols
+            .filter(|protocols| !protocols.is_empty())
+            .unwrap_or_else(|| vec![st::DEFAULT_PROTOCOL.to_string()]);
+        let security_policy_name = input
+            .security_policy_name
+            .unwrap_or_else(|| st::DEFAULT_SECURITY_POLICY_NAME.to_string());
+
+        // A configuration the service would never host is refused BEFORE the state
+        // write, with the modelled `InvalidRequestException` (HTTP 400) the model
+        // documents as "thrown when the client submits a malformed request" — so a
+        // caller never gets back a `ServerId` for a server that cannot exist.
+        let config = st::ServerConfig {
+            domain: &domain,
+            endpoint_type: &endpoint_type,
+            endpoint_details: input.endpoint_details.as_ref(),
+            identity_provider_type: &identity_provider_type,
+            identity_provider_details: input.identity_provider_details.as_ref(),
+            ip_address_type: &ip_address_type,
+            protocols: &protocols,
+            certificate: input.certificate.as_deref(),
+        };
+        if let Some(message) = config.cross_member_violation() {
+            return Err(CreateServerErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             CreateServerErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),
@@ -307,33 +351,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let server = st::Server {
             arn: st::server_arn(&region, &server_id),
-            domain: input.domain.unwrap_or_else(|| st::DEFAULT_DOMAIN.to_string()),
-            identity_provider_type: input
-                .identity_provider_type
-                .unwrap_or_else(|| st::DEFAULT_IDENTITY_PROVIDER_TYPE.to_string()),
+            domain,
+            identity_provider_type,
             identity_provider_details: input.identity_provider_details,
-            endpoint_type: input
-                .endpoint_type
-                .unwrap_or_else(|| st::DEFAULT_ENDPOINT_TYPE.to_string()),
+            endpoint_type,
             endpoint_details: input.endpoint_details,
-            protocols: input
-                .protocols
-                .filter(|protocols| !protocols.is_empty())
-                .unwrap_or_else(|| vec![st::DEFAULT_PROTOCOL.to_string()]),
+            protocols,
             protocol_details: input.protocol_details,
             logging_role: input.logging_role,
-            security_policy_name: input
-                .security_policy_name
-                .unwrap_or_else(|| st::DEFAULT_SECURITY_POLICY_NAME.to_string()),
+            security_policy_name,
             pre_authentication_login_banner: input.pre_authentication_login_banner,
             post_authentication_login_banner: input.post_authentication_login_banner,
             // No honest value exists yet: see the field's own documentation.
             host_key_fingerprint: None,
             structured_log_destinations: input.structured_log_destinations.unwrap_or_default(),
             s3_storage_options: input.s3_storage_options,
-            ip_address_type: input
-                .ip_address_type
-                .unwrap_or_else(|| st::DEFAULT_IP_ADDRESS_TYPE.to_string()),
+            ip_address_type,
             workflow_details: input.workflow_details,
             certificate: input.certificate,
             // A created server is instantiated but not yet able to serve file

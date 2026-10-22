@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/input_validation.rs"]
+mod input_validation;
 #[path = "all/not_found_errors.rs"]
 mod not_found_errors;
 #[path = "all/server_user_lifecycle.rs"]

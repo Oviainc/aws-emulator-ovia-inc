@@ -217,6 +217,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
+        // A home-directory configuration the service would never create is refused
+        // BEFORE the state write, with the modelled `InvalidRequestException`
+        // (HTTP 400) the model documents as "thrown when the client submits a
+        // malformed request".
+        if let Some(message) = st::home_directory_violation(
+            input.home_directory_type.as_deref(),
+            input.home_directory_mappings.as_deref(),
+        ) {
+            return Err(CreateUserErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             CreateUserErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),

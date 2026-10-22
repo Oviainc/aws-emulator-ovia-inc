@@ -80,6 +80,9 @@ async fn describe_server_rebuilds_every_created_member_from_stored_state() {
                     "InvocationRole": "arn:aws:iam::000000000000:role/transfer-idp",
                 },
                 "EndpointType": "VPC",
+                // A VPC-hosted endpoint is configured by its VPC endpoint settings;
+                // see `vpc_endpoint_requirements` in `tests/all/input_validation.rs`.
+                "EndpointDetails": {"VpcId": "vpc-0123456789abcdef0"},
             }),
             json!({
                 "IdentityProviderType": "API_GATEWAY",
@@ -88,6 +91,7 @@ async fn describe_server_rebuilds_every_created_member_from_stored_state() {
                     "InvocationRole": "arn:aws:iam::000000000000:role/transfer-idp",
                 },
                 "EndpointType": "VPC",
+                "EndpointDetails": {"VpcId": "vpc-0123456789abcdef0"},
                 "Domain": "S3",
             }),
         ),
@@ -98,12 +102,14 @@ async fn describe_server_rebuilds_every_created_member_from_stored_state() {
                 "IdentityProviderType": "AWS_LAMBDA",
                 "IdentityProviderDetails": {"Function": "arn:aws:lambda:us-east-1:000000000000:function:idp"},
                 "EndpointType": "VPC",
+                "EndpointDetails": {"SubnetIds": ["subnet-0123456789abcdef0"]},
                 "IpAddressType": "DUALSTACK",
                 "Certificate": "arn:aws:acm:us-east-1:000000000000:certificate/abcd",
             }),
             json!({
                 "Protocols": ["SFTP", "FTP", "FTPS", "AS2"],
                 "IdentityProviderType": "AWS_LAMBDA",
+                "EndpointDetails": {"SubnetIds": ["subnet-0123456789abcdef0"]},
                 "IpAddressType": "DUALSTACK",
                 "Certificate": "arn:aws:acm:us-east-1:000000000000:certificate/abcd",
             }),
