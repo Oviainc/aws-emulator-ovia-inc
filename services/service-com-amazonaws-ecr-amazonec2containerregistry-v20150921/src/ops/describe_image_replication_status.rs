@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImageReplicationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImageReplicationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImageReplicationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The registry's stored replication rules are deliberately NOT turned into statuses
+//! here. A `replicationStatuses` entry reports a replication ECR really started for a
+//! destination registry; this emulator serves exactly one registry and copies no image to
+//! another Region or account, so no replication was started for any stored image however
+//! the rules are configured. `replicationStatuses` is therefore the empty list ECR answers
+//! with for an image that has no destination — a per-destination status for a copy that
+//! never ran would be an invented one. A later change that really copies images between
+//! registries is where the per-destination statuses belong.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +123,28 @@ impl From<DescribeImageReplicationStatusErrorModeled> for DescribeImageReplicati
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> DescribeImageReplicationStatusErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            DescribeImageReplicationStatusErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        crate::state::Fault::ImageNotFound(_) => {
+            DescribeImageReplicationStatusErrorModeled::ImageNotFoundException(
+                ImageNotFoundException { message },
+            )
+        }
+        // No other fault can arise from a read of one image: the tag faults belong to
+        // the operations that write repository metadata tags.
+        _ => DescribeImageReplicationStatusErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
 /// The `DescribeImageReplicationStatus` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +181,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImageReplicationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImageReplicationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImageReplicationStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeImageReplicationStatusErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        // Both the repository and the image are resolved against the store before
+        // anything is projected: an unknown repository is refused with
+        // `RepositoryNotFoundException`, and an identifier no stored manifest answers to
+        // with `ImageNotFoundException`.
+        let store = state.lock();
+        let repo = store
+            .repository(&input.repository_name)
+            .map_err(fault_error)?;
+        let image = repo.resolve_image(&input.image_id).map_err(fault_error)?;
+
+        // One status per destination the registry's replication configuration sends this
+        // repository's images to. A status reports a replication that was really started:
+        // ECR copies the image to the destination registry and reports how that copy
+        // went. This emulator serves exactly one registry and copies nothing to another
+        // Region or account, so no replication was started for any stored image whatever
+        // the registry's replication rules say, and the list is empty — which is what ECR
+        // answers for an image with no destination. A destination status is never invented
+        // for a copy that never ran; see the module header.
+        let replication_statuses: Vec<ImageReplicationStatus> = Vec::new();
+
+        Ok(DescribeImageReplicationStatusOutput {
+            repository_name: Some(repo.name.clone()),
+            image_id: Some(image.identifier(input.image_id.image_tag.as_deref())),
+            replication_statuses: Some(replication_statuses),
+        })
     }
 }

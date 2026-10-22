@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePullThroughCacheRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePullThroughCacheRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePullThroughCacheRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +135,13 @@ impl From<UpdatePullThroughCacheRuleErrorModeled> for UpdatePullThroughCacheRule
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> UpdatePullThroughCacheRuleErrorModeled {
+    UpdatePullThroughCacheRuleErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(fault.message().to_string()),
+    })
+}
+
 /// The `UpdatePullThroughCacheRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -180,18 +178,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePullThroughCacheRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePullThroughCacheRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePullThroughCacheRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePullThroughCacheRuleErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An update names a rule that must already exist: the prefix is the key AWS
+        // addresses a rule by, and one no rule answers to is refused with
+        // `PullThroughCacheRuleNotFoundException` rather than created here.
+        let Some(rule) = store
+            .pull_through_cache_rules
+            .get_mut(&input.ecr_repository_prefix)
+        else {
+            return Err(
+                UpdatePullThroughCacheRuleErrorModeled::PullThroughCacheRuleNotFoundException(
+                    PullThroughCacheRuleNotFoundException {
+                        message: Some(crate::state::pull_through_cache_rule_not_found_message(
+                            &input.ecr_repository_prefix,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Only the two credentials this operation takes are updatable; the upstream the
+        // rule caches from is fixed at creation. A member the request omits keeps the
+        // value the rule already carries, so an update never silently drops a credential.
+        if let Some(credential_arn) = input.credential_arn {
+            rule.credential_arn = Some(credential_arn);
+        }
+        if let Some(custom_role_arn) = input.custom_role_arn {
+            rule.custom_role_arn = Some(custom_role_arn);
+        }
+        rule.updated_at = Some(::aws_smithy_types::DateTime::from(now));
+
+        // Everything reported back is read off the stored rule, so the answer is what a
+        // later read of the same rule reports.
+        Ok(UpdatePullThroughCacheRuleOutput {
+            ecr_repository_prefix: rule.ecr_repository_prefix.clone(),
+            registry_id: rule.registry_id.clone(),
+            updated_at: rule.updated_at,
+            credential_arn: rule.credential_arn.clone(),
+            custom_role_arn: rule.custom_role_arn.clone(),
+            upstream_repository_prefix: rule.upstream_repository_prefix.clone(),
+        })
     }
 }
