@@ -38,7 +38,10 @@ use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// The `Tagging` payload for a tag set, escaped the way a client's XML writer escapes it.
-fn tagging_payload(tags: &[(String, String)]) -> String {
+///
+/// `pub(crate)`, like the helpers below it: the object-tagging suite in this same test
+/// crate sends the same container at an object rather than owning a second builder of it.
+pub(crate) fn tagging_payload(tags: &[(String, String)]) -> String {
     let mut body = format!("<Tagging xmlns=\"{XMLNS}\"><TagSet>");
     for (key, value) in tags {
         body.push_str(&format!(

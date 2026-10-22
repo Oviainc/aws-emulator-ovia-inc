@@ -6,6 +6,15 @@
 //! ([`crate::state::ComAmazonawsXrayAwsxrayState::insights`]) — that the
 //! request selects: the ones belonging to the group its selector names, whose
 //! own interval overlaps the requested window, and whose `State` it asked for.
+//!
+//! Insight summaries are always scoped TO A GROUP: `GroupARN` is "required if
+//! the GroupName isn't provided" and `GroupName` "required if the GroupARN
+//! isn't provided"
+//! (`smithy_query(query="shape",shape="GetInsightSummariesRequest")`), so a
+//! request naming neither selector is refused with the operation's
+//! `InvalidRequestException` through the crate's one group lookup
+//! ([`crate::state::ComAmazonawsXrayAwsxrayState::find_group`]) rather than
+//! answered with an account-wide listing nothing asked for.
 //! Every member of every `InsightSummary` is the stored insight's, so an id
 //! this operation lists is an id `GetInsight` resolves, and one it does not
 //! hold is listed by neither.
@@ -221,25 +230,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // "Required if the GroupName isn't provided" and the other way about:
-        // a selector narrows the listing to that group, so one naming no group
-        // is an invalid request rather than an empty list, and `find_group`
-        // refuses a pair that names two identities. No selector lists every
-        // group's insights, which is how X-Ray reports an account's. A group's
-        // `FilterExpression` does not enter it: an insight carries the group it
-        // belongs to, so nothing here has to evaluate one.
-        let selected = if input.group_name.is_some() || input.group_arn.is_some() {
-            let region = crate::state::request_region(ctx.parts());
-            let group = store
-                .find_group(
-                    &region,
-                    input.group_name.as_deref(),
-                    input.group_arn.as_deref(),
-                )
-                .map_err(|failure| refuse(failure.message().to_string()))?;
-            Some(group)
-        } else {
-            None
-        };
+        // this operation "retrieves the summaries of all insights in the
+        // SPECIFIED group", so EXACTLY ONE selector is required — a request
+        // naming neither names no group to summarise and a request naming both
+        // states two identities, and the crate's one group lookup refuses both
+        // with one wording. A group's `FilterExpression` does not enter it: an
+        // insight carries the group it belongs to, so nothing here has to
+        // evaluate one.
+        let region = crate::state::request_region(ctx.parts());
+        let selected = store
+            .find_group(
+                &region,
+                input.group_name.as_deref(),
+                input.group_arn.as_deref(),
+            )
+            .map_err(|failure| refuse(failure.message().to_string()))?;
 
         // A token this service issued names the insight the next page starts
         // at. One still inside the keyspace being walked is honoured even if
@@ -269,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut insight_summaries = Vec::new();
         let mut next_token = None;
         for (insight_id, insight) in scan {
-            if !belongs_to(insight, selected.as_ref())
+            if !belongs_to(insight, &selected)
                 || !in_window(insight, window_start, window_end)
                 || !has_state(insight, wanted_state)
             {
@@ -310,12 +315,8 @@ fn refuse(message: String) -> GetInsightSummariesError {
 }
 
 /// Whether a stored insight belongs to the group a selector resolved, which it
-/// does when the insight carries that group's name or its ARN. No selector
-/// selects every insight.
-fn belongs_to(insight: &Insight, group: Option<&crate::state::GroupRecord>) -> bool {
-    let Some(group) = group else {
-        return true;
-    };
+/// does when the insight carries that group's name or its ARN.
+fn belongs_to(insight: &Insight, group: &crate::state::GroupRecord) -> bool {
     insight.group_name.as_deref() == Some(group.group_name.as_str())
         || insight.group_arn.as_deref() == Some(group.group_arn.as_str())
 }

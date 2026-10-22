@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendWorkflowStepState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendWorkflowStepState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendWorkflowStepState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The callback a custom workflow step's target resource reports its outcome through.
+//! The `WorkflowId` names the workflow, the `ExecutionId` one of its runs, and the
+//! `Token` ONE pending custom step of that run.
+//!
+//! A `WorkflowId` that names no workflow of this account is refused by AUTHORIZATION —
+//! 403 `AccessDeniedException` — because the workflow is the resource a permission for
+//! this action names, and this emulator holds no identity policies, so the refusal that
+//! discloses nothing is the one it can give. Once the workflow resolves the rest is
+//! domain validation: an execution it is not running is not found, and otherwise the
+//! `Token` is matched against the run's pending steps and the reported `Status` is
+//! recorded on the step it addresses.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +158,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendWorkflowStepState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendWorkflowStepStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            SendWorkflowStepStateErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        // Authorization is decided against the resource the callback NAMES — the
+        // workflow, which is what a `transfer:SendWorkflowStepState` permission can
+        // name — and before anything the callback carries is resolved: a `WorkflowId`
+        // naming no workflow of this account is refused as unauthorized.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendWorkflowStepState"))
+        // The real service would answer such an id 404 for a principal that holds the
+        // action and 403 for one that does not. This emulator models no principals and
+        // no identity policies, so it cannot tell those two callers apart and ONE
+        // answer has to serve both: the modelled 403 is that answer, because it is the
+        // one that is correct for an unauthorized caller and discloses nothing about
+        // whether the workflow exists.
+        if !guard.workflows.contains_key(&input.workflow_id) {
+            return Err(
+                SendWorkflowStepStateErrorModeled::AccessDeniedException(st::access_denied())
+                    .into(),
+            );
+        }
+
+        // The workflow resolved, so the rest is domain validation: an execution that
+        // workflow is not running is reported as not found, like every other resource
+        // of this service that cannot be resolved.
+        let key = (input.workflow_id.clone(), input.execution_id.clone());
+        let Some(execution) = guard.workflow_executions.get_mut(&key) else {
+            return Err(st::not_found(
+                SendWorkflowStepStateErrorModeled::ResourceNotFoundException(
+                    st::unknown_execution(&input.execution_id),
+                ),
+            ));
+        };
+
+        // `Token` is "used to distinguish between multiple callbacks for multiple
+        // Lambda steps within the same execution": one that addresses no pending step
+        // of this execution is a malformed callback, not a missing execution.
+        let Some(step_state) = execution.step_states.get_mut(&input.token) else {
+            return Err(SendWorkflowStepStateErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: "Token does not address a pending custom step of this execution"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A callback is consumed once: the step it addresses has already reported, so a
+        // second one would overwrite a completed step's outcome.
+        if let Some(reported) = step_state {
+            return Err(SendWorkflowStepStateErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: format!(
+                        "the custom step this Token addresses already reported {reported}"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        *step_state = Some(input.status);
+
+        Ok(SendWorkflowStepStateOutput {})
     }
 }

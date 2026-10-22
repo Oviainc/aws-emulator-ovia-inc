@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTable
-//! IMPLEMENTED: moves the stored table's provisioned throughput, its billing mode,
-//! its global secondary indexes (create, delete and throughput update), its table
-//! class and its deletion protection, and reports the table back as a
-//! `TableDescription` read from the stored table.
+//! IMPLEMENTED: moves the stored table's provisioned throughput, its billing mode, its
+//! warm throughput, its global secondary indexes (create, delete and throughput
+//! update), its table class and its deletion protection, and reports the table back as
+//! a `TableDescription` read from the stored table.
 //!
 //! Only the part of an update that asks DynamoDB to MOVE CAPACITY is asynchronous —
 //! the table's capacity mode, its provisioned throughput, its table class or one of
@@ -23,9 +23,9 @@
 //! A request that names NO updatable member at all is refused as a `ValidationException`
 //! before any of that: it is permanently invalid rather than a transient conflict.
 //!
-//! Members this slice does not store (streams, SSE, replicas, witnesses, on-demand and
-//! warm throughput, multi-region consistency and vector indexes) are refused with the
-//! scaffold's 501 and are their own gap issues.
+//! Members this slice does not store (streams, SSE, replicas, witnesses, on-demand
+//! throughput, a PER-INDEX warm throughput, multi-region consistency and vector
+//! indexes) are refused with the scaffold's 501 and are their own gap issues.
 //!
 //! ## Shape of an operation
 //!
@@ -352,6 +352,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let table_throughput = resolve_table_throughput(table, &billing_mode, &input)
             .map_err(lift)?;
+        // A warm-throughput change is reported `UPDATING` for the same span as the rest
+        // of the update, and becomes `ACTIVE` when the clock makes that span due; a
+        // request that names none leaves the pair in force exactly as it is.
+        let warm_throughput = crate::state::resolved_warm_throughput(
+            input.warm_throughput.as_ref(),
+            &table.warm_throughput,
+            now + crate::state::STATUS_TRANSITION,
+        )
+        .map_err(lift)?;
         let declared = merged_definitions(table, &declared_definitions);
         let indexes = resolve_indexes(table, &billing_mode, &declared, &index_updates, now)
             .map_err(lift)?;
@@ -362,12 +371,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             retained_definitions(declared, table, &indexes, &declared_definitions).map_err(lift)?;
 
         // Nothing above wrote to the table, so from here on the update applies whole.
-        if let (Some(before), Some(after)) = (
-            table.provisioned_throughput.clone(),
-            table_throughput.clone(),
-        ) {
-            table.throughput_history.record(now, &before, &after);
+        //
+        // What a capacity move is measured against is what a description REPORTS, where
+        // an on-demand table's pair is 0/0 ("on-demand mode does not use provisioned
+        // throughput" — `ProvisionedThroughputDescription$ReadCapacityUnits`). So going
+        // on-demand WITHDRAWS the capacity: the reported pair drops to zero, which is the
+        // last time it went down, without spending one of the day's counted decreases.
+        // Coming BACK from on-demand is no increase either: it SETS the table's initial
+        // values ("When switching from pay-per-request to provisioned capacity, initial
+        // provisioned capacity values must be set" — `UpdateTable$BillingMode`), and a
+        // value set for the first time has moved from nothing, not up from something.
+        match (&table.provisioned_throughput, &table_throughput) {
+            (Some(_), None) => table.throughput_history.record_capacity_withdrawal(now),
+            (None, Some(_)) => {}
+            (before, after) => {
+                let before = crate::state::reported_capacity(before.as_ref());
+                let after = crate::state::reported_capacity(after.as_ref());
+                table.throughput_history.record(now, &before, &after);
+            }
         }
+        // "Represents the time when PAY_PER_REQUEST was last set as the read/write
+        // capacity mode" is recorded below, once the instant the switch takes effect is
+        // known.
         // An update that moves capacity finishes later — the clock owes the move back
         // to ACTIVE; one that moves none is finished when it returns, so it leaves the
         // table settled and the next control-plane call is served.
@@ -387,6 +412,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         table.billing_mode = billing_mode;
         table.provisioned_throughput = table_throughput;
+        table.warm_throughput = warm_throughput;
         table.attribute_definitions = definitions;
         table.global_secondary_indexes = indexes;
         if let Some(table_class) = input.table_class.clone() {
@@ -506,16 +532,18 @@ fn empty_update_message() -> String {
 /// Whether this request asks DynamoDB to MOVE CAPACITY, which is the part of an
 /// `UpdateTable` that finishes after the call returns.
 ///
-/// The table's capacity mode and provisioned throughput, its table class and its
-/// secondary indexes are all backed by provisioned capacity or stored data, so changing
-/// one is the asynchronous update the doc describes ("while it's executing, the table
-/// status changes from ACTIVE to UPDATING"). Deletion protection is a guard flag with
-/// no capacity behind it: the service applies it with the call and answers with the
-/// table still `ACTIVE`, so nothing is left for the clock to finish and the next
-/// control-plane call is served.
+/// The table's capacity mode and provisioned throughput, the warm throughput it keeps
+/// ready ("the minimum provisioned capacity maintained for immediate data access" — the
+/// `TableWarmThroughputDescription` doc), its table class and its secondary indexes are
+/// all backed by provisioned capacity or stored data, so changing one is the asynchronous
+/// update the doc describes ("while it's executing, the table status changes from ACTIVE
+/// to UPDATING"). Deletion protection is a guard flag with no capacity behind it: the
+/// service applies it with the call and answers with the table still `ACTIVE`, so nothing
+/// is left for the clock to finish and the next control-plane call is served.
 fn asks_to_move_capacity(input: &UpdateTableInput) -> bool {
     input.billing_mode.is_some()
         || input.provisioned_throughput.is_some()
+        || input.warm_throughput.is_some()
         || input.table_class.is_some()
         || list_named(input.global_secondary_index_updates.as_ref())
 }
@@ -561,9 +589,6 @@ fn unsupported_member(input: &UpdateTableInput) -> Option<&'static str> {
     }
     if input.on_demand_throughput.is_some() {
         return Some("OnDemandThroughput");
-    }
-    if input.warm_throughput.is_some() {
-        return Some("WarmThroughput");
     }
     if input.multi_region_consistency.is_some() {
         return Some("MultiRegionConsistency");
@@ -821,6 +846,11 @@ fn resolve_indexes(
     // same way the table's own throughput was resolved.
     if billing_mode == "PAY_PER_REQUEST" {
         for index in &mut indexes {
+            // The index's reported capacity is withdrawn with the table's, by the same
+            // rule the table-level move in `handle` follows.
+            if index.provisioned_throughput.is_some() {
+                index.throughput_history.record_capacity_withdrawal(now);
+            }
             index.provisioned_throughput = None;
         }
     }
@@ -860,6 +890,9 @@ fn resolve_indexes(
                 transient_status: crate::state::IndexStatus::Creating,
                 active_at: now + crate::state::STATUS_TRANSITION,
                 throughput_history: crate::state::ThroughputHistory::default(),
+                // An index added to a table that already holds items is metered on the
+                // same schedule as every other one, starting from zero.
+                reported_counters: crate::state::MeteredCounters::new(now),
             });
         }
         if let Some(delete) = &update.delete {

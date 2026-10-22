@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBuckets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBuckets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the bucket records this service's store holds in the Region the
+//! request is made in.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBuckets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +172,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBuckets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBuckets"))
+        // A bucket is a REGIONAL resource: this operation reports "all of your
+        // buckets in the Amazon Web Services Region where the request is made",
+        // so the region the request is signed for selects which records answer.
+        let region = crate::state::request_region(ctx.parts());
+        // Each reported bucket's `url` is announced under the endpoint THIS
+        // request arrived at, never an AWS hostname; a request that names no host
+        // names no endpoint to announce.
+        let endpoint = crate::state::request_endpoint(ctx.parts());
+
+        // `includeCors` "is only supported when getting a single bucket with
+        // bucketName specified", so asking for CORS over a listing is a request
+        // this service does not serve rather than one it answers partially.
+        let include_cors = input.include_cors.unwrap_or(false);
+        if include_cors && input.bucket_name.is_none() {
+            return Err(invalid(
+                "includeCors is only supported when getting a single bucket with bucketName \
+                 specified"
+                    .to_string(),
+            ));
+        }
+        let include_connected_resources = input.include_connected_resources.unwrap_or(false);
+
+        // `pageToken` is the name the previous page stopped before, so a page is
+        // this region's stored buckets from that name onward in the store's own
+        // total order. Using the name rather than an index means a bucket deleted
+        // between two pages cannot make the walk skip or repeat another one.
+        let page_token = input.page_token.unwrap_or_default();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A named bucket is one record or a refusal: the caller asked about a
+            // bucket, so an answer with an empty list would say it exists.
+            if let Some(name) = &input.bucket_name {
+                let bucket = store.bucket(&region, name).ok_or_else(|| {
+                    not_found(format!(
+                        "bucketName '{name}' does not name a bucket of this account in {region}"
+                    ))
+                })?;
+                return Ok(GetBucketsOutput {
+                    buckets: Some(vec![bucket.view(
+                        endpoint.as_deref(),
+                        include_connected_resources,
+                        include_cors,
+                    )]),
+                    next_page_token: None,
+                    account_level_bpa_sync: Some(crate::state::account_level_bpa_sync()),
+                });
+            }
+
+            let mut buckets = Vec::new();
+            let mut next_page_token = None;
+            // The store keys buckets by `(region, name)`, so a range from this
+            // region and the page token walks exactly this region's buckets in
+            // name order and leaves it behind at the first key of the next one.
+            let page_start = (region.clone(), page_token);
+            for ((bucket_region, name), bucket) in store.buckets.range(page_start..) {
+                if bucket_region != &region {
+                    break;
+                }
+                if buckets.len() == crate::state::BUCKET_PAGE_SIZE {
+                    next_page_token = Some(name.clone());
+                    break;
+                }
+                buckets.push(bucket.view(
+                    endpoint.as_deref(),
+                    include_connected_resources,
+                    include_cors,
+                ));
+            }
+            Ok(GetBucketsOutput {
+                // A region with no buckets reports an empty list, not an absent
+                // one: the caller asked what it has, and the answer is
+                // "nothing".
+                buckets: Some(buckets),
+                next_page_token,
+                account_level_bpa_sync: Some(crate::state::account_level_bpa_sync()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> GetBucketsError {
+    GetBucketsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// This operation's 404 for a bucket name this account holds no bucket under: the
+/// modelled `NotFoundException`, which the model documents as what "Lightsail
+/// throws when it cannot find a resource".
+fn not_found(message: String) -> GetBucketsError {
+    GetBucketsErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetBucketsError {
+    GetBucketsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail bucket store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

@@ -705,7 +705,11 @@ async fn a_table_created_with_local_secondary_indexes_serves_its_items() {
         "case get absent: a missing item yields no Item member, got {missing}"
     );
 
-    // The index figures are derived from the table's items, so they move with them.
+    // The index figures are the METERED ones: "DynamoDB updates this value approximately
+    // every six hours. Recent changes might not be reflected in this value"
+    // (`LocalSecondaryIndexDescription$IndexSizeBytes`), so the write above does not move
+    // them. That the refresh then counts exactly the projected items is pinned by
+    // `table_description_members`, which drives the refresh the clock owes.
     let after_put = ok(&router, "DescribeTable", json!({"TableName": FAN_OUT})).await;
     for index in after_put["Table"]["LocalSecondaryIndexes"]
         .as_array()
@@ -714,15 +718,10 @@ async fn a_table_created_with_local_secondary_indexes_serves_its_items() {
     {
         let name = index["IndexName"].as_str().unwrap_or_default().to_string();
         assert_eq!(
-            index["ItemCount"],
-            json!(1),
-            "case describe after put {name}: the written item is projected into both \
-             local indexes, got {index}"
-        );
-        assert!(
-            index["IndexSizeBytes"].as_i64().unwrap_or(0) > 0,
-            "case describe after put {name}: a projected item gives the index a size, \
-             got {index}"
+            (index["ItemCount"].clone(), index["IndexSizeBytes"].clone()),
+            (json!(0), json!(0)),
+            "case describe after put {name}: expected the figures of the last metering \
+             refresh, which a write does not move, got {index}"
         );
     }
 

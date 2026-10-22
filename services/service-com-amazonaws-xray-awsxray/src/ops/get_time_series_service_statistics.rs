@@ -11,10 +11,18 @@
 //!
 //! A request asking for behaviour this slice does not evaluate — an
 //! `EntitySelectorExpression`, a forecast (which the model documents as
-//! requiring one), a group carrying a filter expression — is REFUSED with
-//! `InvalidRequestException` naming what is unsupported, rather than answered
-//! with an aggregation that quietly ignored it, and the window itself goes
-//! through the crate's one check in [`crate::state::validate_window`].
+//! requiring one) — is REFUSED with `InvalidRequestException` naming what is
+//! unsupported, rather than answered with an aggregation that quietly ignored
+//! it, and the window itself goes through the crate's one check in
+//! [`crate::state::validate_window`].
+//!
+//! A `GroupName` / `GroupARN` narrows the aggregation to the traffic that
+//! group's `FilterExpression` selects: the expression is compiled by the one
+//! compiler every surface of this crate reads the language with
+//! ([`crate::state::filter`]) and evaluated per stored trace, so a well-formed
+//! request over a group is ANSWERED — with an empty list and
+//! `ContainsOldGroupVersions` false when no stored traffic matches — rather than
+//! refused.
 //!
 //! ## Shape of an operation
 //!
@@ -238,41 +246,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A group selector narrows the aggregation to that group, so a selector
         // naming no stored group is an invalid request rather than an empty
-        // aggregate; a group that carries a filter expression would narrow it
-        // further than this slice can.
-        if input.group_name.is_some() || input.group_arn.is_some() {
-            let region = crate::state::request_region(ctx.parts());
-            let group = store
-                .find_group(
-                    &region,
-                    input.group_name.as_deref(),
-                    input.group_arn.as_deref(),
-                )
-                .map_err(|failure| {
-                    GetTimeSeriesServiceStatisticsErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            message: Some(failure.message().to_string()),
-                        },
-                    )
-                })?;
-            let filtered = group
-                .filter_expression
-                .as_deref()
-                .is_some_and(|filter| !filter.trim().is_empty());
-            if filtered {
-                return Err(unsupported(format!(
-                    "group `{}` carries a FilterExpression, which this emulator does not evaluate yet; pull statistics from a group without one",
-                    group.group_name
-                )));
-            }
-        }
+        // aggregate. What the group NARROWS it to is its own
+        // `FilterExpression`, resolved and compiled by the crate's ONE group
+        // resolution ([`crate::state::ComAmazonawsXrayAwsxrayState::group_filter`],
+        // shared with `GetServiceGraph`) and evaluated per trace below: a group
+        // that carries one selects a subset of the stored traffic, which is an
+        // aggregation of less data and never a client error.
+        let group_filter = store
+            .group_filter(
+                &crate::state::request_region(ctx.parts()),
+                input.group_name.as_deref(),
+                input.group_arn.as_deref(),
+            )
+            .map_err(unsupported)?;
 
         // Walked over the STORED segments, not over the window's periods, so the
         // work is bounded by what was ingested however wide the window or small
         // the period: a period with no completed request in it holds no entry.
+        //
+        // The group's filter expression, when it has one, is evaluated per trace
+        // under ONE budget for the whole request ([`crate::state::filter`]),
+        // which is what bounds the product of traces, nodes and segments this
+        // aggregation can cost; a walk that spends it is answered with the
+        // modelled throttling error rather than with an aggregate that stopped
+        // halfway. A trace with no segment in the window is skipped BEFORE the
+        // expression is evaluated: it cannot contribute to any period, so it must
+        // not spend the budget either.
+        let mut budget = crate::state::filter::QueryBudget::new();
         let mut periods: std::collections::BTreeMap<i64, Aggregate> =
             std::collections::BTreeMap::new();
         for trace in store.traces.values() {
+            if !trace.touches_window(start, end) {
+                continue;
+            }
+            if let Some(filter) = &group_filter {
+                if !filter.matches(trace, &mut budget) {
+                    continue;
+                }
+            }
             for segment in &trace.segments {
                 if segment.start_time < start || segment.start_time >= end {
                     continue;
@@ -301,6 +312,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .record(segment, response_time);
             }
         }
+        // A filtered walk that spent its whole budget stopped before the end of
+        // the store, so the aggregate it would report is short: the request is
+        // well formed and what it would COST is the problem, which is the
+        // modelled throttling error rather than one that blames the input. The
+        // sentence is the crate's one wording for a spent query budget.
+        if group_filter.is_some() && budget.exhausted() {
+            return Err(GetTimeSeriesServiceStatisticsErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(crate::state::FILTER_BUDGET_SPENT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         let scan = periods.range((
             resume.map_or(::std::ops::Bound::Unbounded, ::std::ops::Bound::Included),
@@ -321,8 +345,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetTimeSeriesServiceStatisticsOutput {
             time_series_service_statistics: Some(time_series_service_statistics),
             // Nothing in this emulator aggregates across a change to a group's
-            // filter expression: a group whose expression narrows the selection
-            // is refused above, so no answer can mix two versions of one.
+            // filter expression: the aggregate is recomputed from the stored
+            // segments on every call, through the expression the group carries
+            // NOW, so no answer can mix two versions of one.
             contains_old_group_versions: false,
             next_token,
         })

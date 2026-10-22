@@ -6,12 +6,13 @@
 //! (a virtual private server), the **block storage disk** (additional storage an
 //! instance can attach), the **domain** (a DNS zone the account holds
 //! recordsets in), the **container service** (a compute resource containers are
-//! deployed to), the append-only **operation log** every mutating call writes,
-//! and the service's static **Region catalog** — the Regions and Availability
-//! Zones `GetRegions` lists and every other operation validates a location
-//! against. Everything mutable in this module is reached through [`with_state`],
-//! so no handler can observe a store whose clock-owed transitions have not been
-//! applied yet.
+//! deployed to), the **bucket** (an object-storage resource of the Lightsail
+//! object storage service), the append-only **operation log** every mutating call
+//! writes, and the service's static **Region catalog** — the Regions and
+//! Availability Zones `GetRegions` lists and every other operation validates a
+//! location against. Everything mutable in this module is reached through
+//! [`with_state`], so no handler can observe a store whose clock-owed transitions
+//! have not been applied yet.
 //!
 //! Two kinds of value live on a stored instance:
 //!
@@ -28,13 +29,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AddOn, AddOnRequest, AvailabilityZone, Blueprint, BucketBundle, Container, ContainerImage,
+    AccessRules, AccountLevelBpaSync, AddOn, AddOnRequest, AvailabilityZone, Blueprint, Bucket,
+    BucketAccessLogConfig, BucketBundle, BucketCorsConfig, BucketCorsRule, BucketState, Container,
+    ContainerImage,
     ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
     ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, Domain, DomainEntry, Instance,
     InstanceHardware, InstanceMetadataOptions, InstanceNetworking, InstancePortInfo, InstanceState,
     MonthlyTransfer, Operation, PrivateRegistryAccess, Region, RelationalDatabaseBundle,
-    ResourceLocation, Tag, REGION_NAME_VALUES,
+    ResourceLocation, ResourceReceivingAccess, Tag, REGION_NAME_VALUES,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +72,15 @@ pub const CONTAINER_SERVICE_ARN_RESOURCE_PREFIX: &str = "ContainerService/";
 /// enum's values, so a resource created by an unsigned call still reports a
 /// region the model admits.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The `resourceType` a bucket and its operations report, from the same modelled
+/// `ResourceType` enum.
+pub const RESOURCE_TYPE_BUCKET: &str = "Bucket";
+
+/// The resource portion a bucket ARN carries before its id. Mirrors the
+/// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
+/// this resource's own `ResourceType` value.
+pub const BUCKET_ARN_RESOURCE_PREFIX: &str = "Bucket/";
 
 /// The resource portion a domain ARN carries before its id, from the modelled
 /// `Domain$arn` documentation
@@ -237,6 +249,8 @@ pub const OPERATION_TYPE_STOP_INSTANCE: &str = "StopInstance";
 pub const OPERATION_TYPE_DELETE_INSTANCE: &str = "DeleteInstance";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DOMAIN: &str = "CreateDomain";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_BUCKET: &str = "CreateBucket";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
 /// The `operationType` the log entry of a change to a zone's recordsets carries.
@@ -533,6 +547,233 @@ pub fn bucket_bundle_spec(bundle_id: &str) -> Option<BucketBundleSpec> {
         .iter()
         .find(|spec| spec.bundle_id == bundle_id)
         .copied()
+}
+
+// ---------------------------------------------------------------------------
+// Buckets
+// ---------------------------------------------------------------------------
+
+/// The `BucketState$code` of a bucket that is serving, from that member's own
+/// documentation: "`OK` - The bucket is in a running state." (its only other
+/// value, `Unknown`, says "Creation of the bucket might have timed-out", which no
+/// bucket this store holds did).
+pub const BUCKET_STATE_OK: &str = "OK";
+
+/// `Bucket$objectVersioning` when versioning was asked for, from that member's
+/// own documentation: "`Enabled` - Object versioning is enabled."
+pub const OBJECT_VERSIONING_ENABLED: &str = "Enabled";
+
+/// `Bucket$objectVersioning` when versioning was enabled and then turned off,
+/// from that member's own documentation: "`Suspended` - Object versioning was
+/// previously enabled but is currently suspended."
+///
+/// No stored bucket carries this value yet: suspending versioning is
+/// `UpdateBucket`'s business, and that operation is still a 501 scaffold under
+/// its own issue. The constant records the modelled value the store will hold
+/// once it is implemented.
+pub const OBJECT_VERSIONING_SUSPENDED: &str = "Suspended";
+
+/// `Bucket$objectVersioning` when versioning was never asked for, from that
+/// member's own documentation: "`NeverEnabled` - Object versioning has never been
+/// enabled."
+pub const OBJECT_VERSIONING_NEVER_ENABLED: &str = "NeverEnabled";
+
+/// The `AccessRules$getObject` of a new bucket: the modelled `AccessType` value
+/// `private`, which that member documents as "Sets all objects in the bucket to
+/// private, making them readable only by you or anyone you give access to" — the
+/// permission a bucket has until `UpdateBucket` widens it.
+pub const ACCESS_TYPE_PRIVATE: &str = "private";
+
+/// The `AccountLevelBpaSync$status` this emulator reports, from that member's own
+/// documentation: "`NeverSynced` - Synchronization has not yet happened." Nothing
+/// here fetches an Amazon S3 account-level block-public-access configuration, so
+/// no synchronization has happened and none is claimed.
+pub const ACCOUNT_LEVEL_BPA_NEVER_SYNCED: &str = "NeverSynced";
+
+/// The `AccountLevelBpaSync$message` that goes with [`ACCOUNT_LEVEL_BPA_NEVER_SYNCED`],
+/// from the modelled `BPAStatusMessage` documentation: "`SYNC_ON_HOLD` - The
+/// synchronization has not yet happened. This status message occurs immediately
+/// after you create your first Lightsail bucket."
+pub const ACCOUNT_LEVEL_BPA_SYNC_ON_HOLD: &str = "SYNC_ON_HOLD";
+
+/// The most buckets this emulator will hold, across every Region together.
+///
+/// Emulator resource guard on the store as a whole, NOT an AWS quota (which is
+/// per Region and per account). A create that would exceed it is refused with
+/// the modelled `InvalidInputException`.
+pub const MAX_BUCKETS: usize = 100;
+
+/// How many buckets one `GetBuckets` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more buckets remain.
+pub const BUCKET_PAGE_SIZE: usize = 10;
+
+/// The path space every bucket's address is published under, beneath the
+/// endpoint the emulator is reached on.
+///
+/// AWS publishes a Lightsail bucket's address as a DNS name under the Amazon S3
+/// zone that backs it (`<bucket>.s3.<region>.amazonaws.com`). That HOSTNAME is
+/// environment-specific — no caller may assume it — while the PROMISE the field
+/// makes is not: `Bucket$url` is "The URL of the bucket", so it has to be an
+/// address the caller can actually reach. This emulator owns no DNS zone, so the
+/// only address it can be reached on is the endpoint the request arrived at, and
+/// the two labels AWS puts in the hostname (region and bucket name) are carried
+/// in the path instead — never a literal AWS hostname, which would send the next
+/// client out of the emulator entirely (see [`request_endpoint`]). The prefix
+/// names this service and this resource type, so it cannot collide with another
+/// service's modelled URI space.
+///
+/// Nothing claims or answers this path space yet: a bucket's object data plane
+/// (put, get, list) is not implemented here, and it is `can_handle`'s business to
+/// claim the path once it is, as `CONTAINER_SERVICE_PUBLIC_PATH_PREFIX` already
+/// does for that resource. Until then the address says WHERE this emulator would
+/// serve the bucket — within this emulator rather than out at AWS — and a client
+/// following it gets the router's unknown-route answer.
+pub const BUCKET_PUBLIC_PATH_PREFIX: &str = "/lightsail-bucket";
+
+/// The URL of the bucket `name` in `region`, as announced to a caller that
+/// reached this emulator at `endpoint` (its `Host`/`:authority`).
+///
+/// `https`, because the emulator serves one TLS listener
+/// (`emulator_server::serve_emulator_until_shutdown`) and no plaintext one, so
+/// that is the scheme its own endpoint answers on. See
+/// [`BUCKET_PUBLIC_PATH_PREFIX`] for why the address is a path under the
+/// request's own endpoint rather than an AWS hostname.
+pub fn bucket_url(endpoint: &str, region: &str, name: &str) -> String {
+    format!("https://{endpoint}{BUCKET_PUBLIC_PATH_PREFIX}/{region}/{name}")
+}
+
+/// The ARN of the bucket `id` in `region`. A bucket is regional, so its ARN
+/// carries the region it was created in, and the resource portion mirrors the
+/// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows with
+/// this resource's own `ResourceType` value.
+pub fn bucket_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{BUCKET_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The `objectVersioning` a bucket reports for the `enableObjectVersioning` its
+/// create request carried: an absent flag is not a request to version, which is
+/// the `NeverEnabled` case.
+pub fn object_versioning_from_request(enable_object_versioning: Option<bool>) -> &'static str {
+    if enable_object_versioning.unwrap_or(false) {
+        OBJECT_VERSIONING_ENABLED
+    } else {
+        OBJECT_VERSIONING_NEVER_ENABLED
+    }
+}
+
+/// The account-level block-public-access synchronization status `GetBuckets`
+/// reports.
+///
+/// This emulator fetches nothing from Amazon S3, so the honest answer is the
+/// never-synchronized one: no `lastSyncedAt` (the member documents "This value is
+/// null when the account-level BPA configuration has not been synchronized"), and
+/// account-level BPA therefore affects no Lightsail bucket here.
+pub fn account_level_bpa_sync() -> AccountLevelBpaSync {
+    AccountLevelBpaSync {
+        status: Some(ACCOUNT_LEVEL_BPA_NEVER_SYNCED.to_string()),
+        last_synced_at: None,
+        message: Some(ACCOUNT_LEVEL_BPA_SYNC_ON_HOLD.to_string()),
+        bpa_impacts_lightsail: Some(false),
+    }
+}
+
+/// One stored bucket: the object-storage resource `CreateBucket` created.
+///
+/// What the caller asked for — name, bundle, tags, whether to version objects —
+/// is kept verbatim; the ARN, support code, creation time, URL and state are
+/// assigned by this store from the request plus its own allocators.
+#[derive(Debug, Clone)]
+pub struct StoredBucket {
+    /// The bucket name the request named, kept verbatim — it is half of this
+    /// record's store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    /// The bundle currently applied, an id of [`BUCKET_BUNDLE_SPECS`].
+    pub bundle_id: String,
+    /// One of [`OBJECT_VERSIONING_ENABLED`], [`OBJECT_VERSIONING_SUSPENDED`] or
+    /// [`OBJECT_VERSIONING_NEVER_ENABLED`].
+    pub object_versioning: String,
+    /// Whether the applied bundle may still be changed. A bucket's bundle can be
+    /// updated only once within a monthly billing cycle, so a bucket that has not
+    /// been moved yet can be.
+    pub able_to_update_bundle: bool,
+    /// The anonymous access permissions of the bucket's objects.
+    pub access_rules: AccessRules,
+    /// Accounts given read-only access to the bucket.
+    pub readonly_access_accounts: Vec<String>,
+    /// The Lightsail instances `SetResourceAccessForBucket` gave access to the
+    /// bucket.
+    pub resources_receiving_access: Vec<ResourceReceivingAccess>,
+    /// Where the bucket's access logs are written, and whether they are written
+    /// at all.
+    pub access_log_config: BucketAccessLogConfig,
+    /// The cross-origin resource sharing rules of the bucket.
+    pub cors_rules: Vec<BucketCorsRule>,
+    /// One of the modelled `BucketState$code` values — see [`BUCKET_STATE_OK`].
+    pub state_code: String,
+}
+
+impl StoredBucket {
+    /// This record as the modelled `Bucket`, announced to a caller that reached
+    /// this emulator at `endpoint` (its `Host`/`:authority`, as
+    /// [`request_endpoint`] reads it).
+    ///
+    /// `url` is the one member that depends on the request: it is the address the
+    /// caller is told to reach this bucket on, so it has to be the endpoint THIS
+    /// request arrived at (see [`BUCKET_PUBLIC_PATH_PREFIX`]). A request that
+    /// names no host at all names no endpoint to announce, so `url` is omitted
+    /// rather than filled with an address nothing serves.
+    ///
+    /// `include_connected_resources` and `include_cors` are the `GetBuckets`
+    /// flags of the same names: `resourcesReceivingAccess` is reported only when
+    /// the caller asked for the connected resources, and `cors` only when it
+    /// asked for the CORS configuration ("This field is only included in the
+    /// response when CORS configuration is requested", per `Bucket$cors`).
+    pub fn view(
+        &self,
+        endpoint: Option<&str>,
+        include_connected_resources: bool,
+        include_cors: bool,
+    ) -> Bucket {
+        Bucket {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_BUCKET.to_string()),
+            tags: Some(self.tags.clone()),
+            bundle_id: Some(self.bundle_id.clone()),
+            url: endpoint
+                .map(|endpoint| bucket_url(endpoint, &self.location.region_name, &self.name)),
+            object_versioning: Some(self.object_versioning.clone()),
+            able_to_update_bundle: Some(self.able_to_update_bundle),
+            access_rules: Some(self.access_rules.clone()),
+            readonly_access_accounts: Some(self.readonly_access_accounts.clone()),
+            resources_receiving_access: include_connected_resources
+                .then(|| self.resources_receiving_access.clone()),
+            state: Some(BucketState {
+                code: Some(self.state_code.clone()),
+                // `BucketState$message` "describes the state of the bucket"; a
+                // running bucket has nothing to explain.
+                message: None,
+            }),
+            access_log_config: Some(self.access_log_config.clone()),
+            cors: include_cors.then(|| BucketCorsConfig {
+                rules: Some(self.cors_rules.clone()),
+            }),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2998,6 +3239,13 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// where the request is made". A `BTreeMap` so a listing walks a stable,
     /// total order.
     pub container_services: BTreeMap<(String, String), StoredContainerService>,
+    /// Every bucket, keyed by the region it was created in and its name — the
+    /// pair that identifies it, because a bucket name is unique within one
+    /// region of the account and `GetBuckets` reports "all of your buckets in the
+    /// Amazon Web Services Region where the request is made". A `BTreeMap` so
+    /// `GetBuckets` walks a stable, total order and a page token can name the
+    /// next bucket.
+    pub buckets: BTreeMap<(String, String), StoredBucket>,
     /// Offset of the next address pair to hand out, so two instances never share
     /// a public or a private address within one process.
     next_address: u32,
@@ -3092,6 +3340,19 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.container_services.insert(
             (service.location.region_name.clone(), service.name.clone()),
             service,
+        );
+    }
+
+    /// The bucket `name` names in `region`, for a reporting operation.
+    pub fn bucket(&self, region: &str, name: &str) -> Option<&StoredBucket> {
+        self.buckets.get(&(region.to_string(), name.to_string()))
+    }
+
+    /// Store a newly created bucket.
+    pub fn insert_bucket(&mut self, bucket: StoredBucket) {
+        self.buckets.insert(
+            (bucket.location.region_name.clone(), bucket.name.clone()),
+            bucket,
         );
     }
 

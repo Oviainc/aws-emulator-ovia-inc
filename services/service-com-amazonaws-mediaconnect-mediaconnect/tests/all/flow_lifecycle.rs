@@ -61,13 +61,17 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=deadbeef";
 
 /// The Region of [`AUTHORIZATION`].
+///
+/// `pub(crate)` because the other suites assert the same Region in the ARNs they read
+/// back.
 pub(crate) const REGION: &str = "us-east-1";
 
 /// One emulator: a router with only this service mounted on one shared engine.
 ///
 /// Other suites in this test crate drive the same front door through it (see
 /// `tests/all/flow_outputs.rs`, `tests/all/update_flow.rs` and
-/// `tests/all/flow_entitlements.rs`), so there is one harness rather than one per file.
+/// `tests/all/flow_entitlements.rs` and `tests/all/gateway_lifecycle.rs`), so there is one
+/// harness rather than one per file.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The same engine the mounted service holds, so a suite that needs a particular

@@ -9,16 +9,18 @@
 //! different services, and every count, time and histogram recomputed from the
 //! documents `PutTraceSegments` kept.
 //!
-//! A `GroupName` / `GroupARN` names the group whose `FilterExpression` the
-//! graph would be scoped by; this slice does not evaluate an expression, so a
-//! group that carries one is refused rather than answered unscoped.
+//! A `GroupName` / `GroupARN` names the group whose `FilterExpression` scopes
+//! the graph: the expression is compiled by the one compiler every surface of
+//! this crate reads the language with ([`crate::state::filter`]) and evaluated
+//! per stored trace, so the graph is derived from the traces that group selects
+//! — an empty graph when none of them matches, never a refusal.
 //!
 //! Two refusals, both `InvalidRequestException` (400):
 //!
 //! * a `[StartTime, EndTime]` window that names no interval of recorded traffic,
 //!   through the one window check in [`crate::state::validate_window`]; and
 //! * a `GroupName` / `GroupARN` that names no stored group — and a group whose
-//!   `FilterExpression` this emulator cannot evaluate yet, because answering a
+//!   `FilterExpression` the compiler cannot evaluate, because answering a
 //!   filtered request with the UNFILTERED graph under HTTP 200 would be a wrong
 //!   answer rather than a missing one.
 //!
@@ -189,31 +191,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // A graph "based on which group" is the group's filter expression applied
-        // to the window. The group has to exist, and this slice cannot evaluate
-        // the expression — so a group that carries one is REFUSED rather than
-        // answered with every service in the window.
-        if input.group_name.is_some() || input.group_arn.is_some() {
-            let region = crate::state::request_region(ctx.parts());
-            let Ok(group) = store.find_group(
-                &region,
+        // to the window. The group has to exist, and its expression is what
+        // selects the traces the graph is derived from — resolved and compiled by
+        // the crate's ONE group resolution
+        // ([`crate::state::ComAmazonawsXrayAwsxrayState::group_filter`], shared
+        // with `GetTimeSeriesServiceStatistics`) and evaluated per trace below.
+        // Only an expression the evaluator cannot answer is refused, because
+        // answering a filtered request with the unfiltered graph would be a
+        // wrong answer rather than a missing one.
+        let group_filter = store
+            .group_filter(
+                &crate::state::request_region(ctx.parts()),
                 input.group_name.as_deref(),
                 input.group_arn.as_deref(),
-            ) else {
-                return Err(refuse(GROUP_NOT_FOUND.to_string()));
-            };
-            let filtered = group
-                .filter_expression
-                .as_deref()
-                .is_some_and(|filter| !filter.trim().is_empty());
-            if filtered {
-                return Err(refuse(format!(
-                    "the FilterExpression of group `{}` is not evaluated by this emulator yet; ask for a graph of a group without one, or omit the group",
-                    group.group_name
-                )));
-            }
-        }
+            )
+            .map_err(refuse)?;
 
-        let services = crate::state::service_graph(store.traces.values(), Some((start, end)));
+        // The traces the graph is derived from: every stored one when no group
+        // was named, and the ones the named group's expression selects when one
+        // was. A trace with no segment in the window is skipped BEFORE the
+        // expression is evaluated — it adds nothing to the graph, so it must not
+        // spend the query budget either — and the expression itself is evaluated
+        // under ONE budget for the whole request ([`crate::state::filter`]), so
+        // a derivation that spends it is answered with the modelled throttling
+        // error rather than with a graph that stopped halfway.
+        let mut budget = crate::state::filter::QueryBudget::new();
+        let selected = store.traces.values().filter(|trace| {
+            trace.touches_window(start, end)
+                && group_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.matches(trace, &mut budget))
+        });
+        let services = crate::state::service_graph(selected, Some((start, end)));
+        if group_filter.is_some() && budget.exhausted() {
+            return Err(GetServiceGraphErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(crate::state::FILTER_BUDGET_SPENT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
         let page = crate::state::page_service_graph(
             &services,
             input.next_token.as_deref(),
@@ -239,9 +256,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// emulator's: a `NextToken` is emitted only when the graph exceeded it, and
 /// resuming from that token returns the remainder.
 pub const SERVICE_GRAPH_PAGE_SIZE: usize = 5;
-
-/// What a `GroupName` / `GroupARN` naming no stored group is refused with.
-pub const GROUP_NOT_FOUND: &str = "Group not found";
 
 /// Refuse the request with the error this operation models for an invalid one.
 fn refuse(message: String) -> GetServiceGraphError {

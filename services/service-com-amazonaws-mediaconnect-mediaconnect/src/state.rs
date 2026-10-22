@@ -13,9 +13,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AddMediaStreamRequest, AddOutputRequest, EncodingConfig, Encryption, Entitlement,
-    FailoverConfig, Flow, Fmtp, GrantEntitlementRequest, ListedFlow, Maintenance, MediaStream,
-    MediaStreamAttributes, MonitoringConfig, NdiConfig, Output, Source, Transport, VpcInterface,
-    VpcInterfaceAttachment,
+    FailoverConfig, Flow, Fmtp, Gateway, GatewayNetwork, GrantEntitlementRequest, ListedFlow,
+    ListedGateway, Maintenance, MediaStream, MediaStreamAttributes, MonitoringConfig, NdiConfig,
+    Output, Source, Transport, VpcInterface, VpcInterfaceAttachment,
 };
 
 /// The `Status` enum the model declares for a flow
@@ -31,6 +31,14 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 pub const STATUS_STOPPING: &str = "STOPPING";
 /// See [`STATUS_STANDBY`].
 pub const STATUS_DELETING: &str = "DELETING";
+
+/// The `GatewayState` enum the model declares for a gateway
+/// (`smithy_query(query="shape",shape="GatewayState")`: CREATING | ACTIVE | UPDATING |
+/// ERROR | DELETING | DELETED). Only the two a gateway's lifecycle reaches here are
+/// named; the rest belong to operations that are still scaffolded.
+pub const GATEWAY_STATE_CREATING: &str = "CREATING";
+/// See [`GATEWAY_STATE_CREATING`].
+pub const GATEWAY_STATE_ACTIVE: &str = "ACTIVE";
 
 /// `SourceType` (`smithy_query(query="shape",shape="SourceType")`): a source that
 /// originated in this account is `OWNED`; one reached through another account's
@@ -88,6 +96,34 @@ pub const MAX_FLOWS: usize = 5_000;
 /// bound. CreateFlow refuses past it with `BadRequestException`, which the model
 /// describes as the error for "a semantic error" in the request.
 pub const MAX_FLOW_COLLECTION_ENTRIES: usize = 50;
+
+/// The ceiling on how many gateways this store holds, for the same reason as
+/// [`MAX_FLOWS`]: nothing evicts a gateway and DescribeGateway must still answer what
+/// CreateGateway created, so the store needs a maximum entry count. CreateGateway refuses
+/// past it with the service's own modelled `CreateGateway420Exception`, "raised by
+/// Elemental MediaConnect when creating the gateway" and declared on CreateGateway alone.
+/// The number is the emulator's own bound, not a published AWS default, and it is high
+/// enough that no ordinary workflow meets it.
+pub const MAX_GATEWAYS: usize = 1_000;
+
+/// How many networks one gateway may carry: "Creates a new gateway. The request must
+/// include at least one network (up to four)"
+/// (`smithy_query(query="operation",operation="CreateGateway")`). CreateGateway refuses a
+/// request outside this range with `BadRequestException`, the error the model describes
+/// as the one for "a semantic error" in the request.
+pub const MAX_GATEWAY_NETWORKS: usize = 4;
+
+/// The most egress CIDR blocks one gateway holds, so one request cannot store a record of
+/// caller-chosen size in a store nothing evicts (and that DescribeGateway echoes back
+/// whole).
+///
+/// AWS publishes no count for `EgressCidrBlocks` and the model puts no `@length` on it, so
+/// the bound is the one this crate already applies to a request-sized collection
+/// ([`MAX_FLOW_COLLECTION_ENTRIES`], CreateFlow's per-request bound), named through that
+/// constant so the two cannot drift. CreateGateway refuses past it with
+/// `BadRequestException`, the error the model describes as the one for "a semantic error"
+/// in the request.
+pub const MAX_GATEWAY_EGRESS_CIDR_BLOCKS: usize = MAX_FLOW_COLLECTION_ENTRIES;
 
 /// The most tags one resource carries, checked against the MERGED set a tag write would
 /// leave on the resource, so repeated tag writes cannot grow a resource's tag map past
@@ -601,6 +637,59 @@ impl StoredFlow {
     }
 }
 
+/// A gateway, as the service holds it between calls. Every gateway operation's response
+/// is computed from this record.
+#[derive(Debug, Clone)]
+pub struct StoredGateway {
+    pub gateway_arn: String,
+    pub name: String,
+    pub egress_cidr_blocks: Vec<String>,
+    pub networks: Vec<GatewayNetwork>,
+    pub gateway_state: String,
+    /// The state change the clock owes, if any. See [`TRANSITION_SPAN`].
+    pub pending: Option<PendingStatus>,
+}
+
+impl StoredGateway {
+    /// Materialise the state change the clock already made due, if it is due at `now`.
+    ///
+    /// As for a flow (see [`StoredFlow::settle`]) this is the only write a reporting
+    /// operation performs: the change was owed at `due_at` whether or not anybody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(pending) = self.pending.take() {
+            if now >= pending.due_at {
+                self.gateway_state = pending.status;
+            } else {
+                self.pending = Some(pending);
+            }
+        }
+    }
+
+    /// The modelled `Gateway` for this record.
+    pub fn to_gateway(&self) -> Gateway {
+        Gateway {
+            egress_cidr_blocks: self.egress_cidr_blocks.clone(),
+            gateway_arn: self.gateway_arn.clone(),
+            // `Gateway.GatewayMessages` carries "messages with information about the
+            // gateway"; a gateway this emulator serves reports none, so the member stays
+            // absent rather than being an empty list.
+            gateway_messages: None,
+            gateway_state: Some(self.gateway_state.clone()),
+            name: self.name.clone(),
+            networks: self.networks.clone(),
+        }
+    }
+
+    /// The modelled `ListedGateway` summary for this record.
+    pub fn to_listed_gateway(&self) -> ListedGateway {
+        ListedGateway {
+            gateway_arn: self.gateway_arn.clone(),
+            gateway_state: self.gateway_state.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-mediaconnect-mediaconnect. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediaconnectMediaconnectState {
@@ -608,6 +697,12 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     pub flows: BTreeMap<String, StoredFlow>,
     /// Flow name -> flow ARN, the index behind the name-uniqueness rule.
     pub flow_arns_by_name: BTreeMap<String, String>,
+    /// Every live gateway, keyed by its ARN. Ordered, so ListGateways pages stably.
+    ///
+    /// There is no index by name beside it: unlike a flow name, a gateway name is under
+    /// no uniqueness rule in the model, and the gateway id in the ARN is what keeps two
+    /// same-named gateways apart.
+    pub gateways: BTreeMap<String, StoredGateway>,
     /// Monotonic counter minting the unique fragment of every flow / source / output /
     /// entitlement ARN and of the addresses and ports the service assigns.
     pub next_arn_suffix: u64,
@@ -621,12 +716,13 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     }
 
     /// The tags of the resource `resource_arn` addresses, or `None` when this service
-    /// holds no such resource.
+    /// holds no tags for such a resource.
     ///
-    /// A flow is the only resource this emulator persists — every other MediaConnect
-    /// create (bridge, gateway, router input/output, reservation) is still scaffolded — so
-    /// a tag call resolves its `ResourceArn` against the flow store, and any other ARN
-    /// addresses nothing that exists in the system.
+    /// A flow is the only resource whose TAGS this emulator persists: a gateway record
+    /// carries no tag map (no gateway operation in the model takes or reports tags) and
+    /// every other MediaConnect create (bridge, router input/output, reservation) is still
+    /// scaffolded — so a tag call resolves its `ResourceArn` against the flow store, and
+    /// any other ARN addresses nothing whose tags exist in the system.
     pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
         self.flows.get(resource_arn).map(|flow| &flow.tags)
     }
@@ -637,10 +733,13 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         self.flows.get_mut(resource_arn).map(|flow| &mut flow.tags)
     }
 
-    /// Settle every flow whose status change the clock already made due.
+    /// Settle every flow and gateway whose status change the clock already made due.
     pub fn settle_due_transitions(&mut self, now: SystemTime) {
         for flow in self.flows.values_mut() {
             flow.settle(now);
+        }
+        for gateway in self.gateways.values_mut() {
+            gateway.settle(now);
         }
     }
 }
@@ -653,6 +752,16 @@ impl ComAmazonawsMediaconnectMediaconnectState {
 /// and is unique per flow.
 pub fn flow_resource_fragment(suffix: u64, name: &str) -> String {
     format!("flow:1-{suffix:08x}:{name}")
+}
+
+/// The resource fragment of a gateway ARN: `gateway:<gateway id>:<name>`.
+///
+/// Shaped like [`flow_resource_fragment`] — the id is the ARN counter in zero-padded hex,
+/// so the fragment is unique per gateway even when two gateways share a name — and it
+/// satisfies the `GatewayArn` pattern the model declares
+/// (`smithy_query(query="shape",shape="GatewayArn")`: `^arn:.+:mediaconnect.+:gateway:.+$`).
+pub fn gateway_resource_fragment(suffix: u64, name: &str) -> String {
+    format!("gateway:1-{suffix:08x}:{name}")
 }
 
 /// The resource fragment of an output ARN: `output:<output id>:<name>`.
@@ -820,6 +929,67 @@ pub fn is_valid_flow_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Whether `name` can be a gateway name.
+///
+/// The model puts no pattern or length on a gateway's `Name`
+/// (`smithy_query(query="shape",shape="Gateway")`: `Name` targets `String`), so this is
+/// only what minting an ADDRESSABLE ARN requires: the name is the last segment of the
+/// `GatewayArn` the service mints, and that ARN travels as an `@httpLabel` on
+/// DescribeGateway and DeleteGateway — so it must not be empty and must not carry the
+/// ARN segment separator `:` or the URI path separator `/`.
+pub fn is_valid_gateway_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(':') && !name.contains('/')
+}
+
+/// Whether the leading segments of a colon-split ARN are those this service mints for
+/// `resource_type`: the `arn` prefix, an `aws*` partition, this service's namespace, a
+/// region token, a 12-digit account id and the resource type itself.
+///
+/// The one encoding of that prefix, shared by [`is_mintable_flow_arn`] and
+/// [`is_mintable_gateway_arn`] so the two cannot drift apart.
+fn has_mintable_arn_prefix(segments: &[&str], resource_type: &str) -> bool {
+    let [prefix, partition, service, region, account, kind, ..] = segments else {
+        return false;
+    };
+    prefix == &"arn"
+        && partition.starts_with("aws")
+        && partition[3..]
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || b == b'-')
+        && service == &SERVICE_NAMESPACE
+        && !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && kind == &resource_type
+}
+
+/// Whether `arn` is a gateway ARN this service could have minted: the prefix
+/// [`has_mintable_arn_prefix`] describes for the `gateway` resource type, then the gateway
+/// id [`gateway_resource_fragment`] mints and a name [`is_valid_gateway_name`] accepts.
+/// It satisfies the modelled `GatewayArn` pattern
+/// (`smithy_query(query="shape",shape="GatewayArn")`:
+/// `^arn:.+:mediaconnect.+:gateway:.+$`), which is looser than this.
+///
+/// ListGateways' `NextToken` is the ARN its next page resumes at, so a token the service
+/// never minted is a semantic error in the request rather than a key to page from. The
+/// gateway it names need NOT still exist: paging must survive a delete between pages.
+pub fn is_mintable_gateway_arn(arn: &str) -> bool {
+    let segments: Vec<&str> = arn.split(':').collect();
+    let [.., gateway_id, gateway_name] = segments.as_slice() else {
+        return false;
+    };
+    segments.len() == 8
+        && has_mintable_arn_prefix(&segments, "gateway")
+        && !gateway_id.is_empty()
+        && gateway_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && is_valid_gateway_name(gateway_name)
+}
+
 /// Whether `arn` is a flow ARN this service could have minted.
 ///
 /// This function is the crate's ONE encoding of the modelled `FlowArn` constraint
@@ -835,24 +1005,11 @@ pub fn is_valid_flow_name(name: &str) -> bool {
 /// flow it names need NOT still exist: paging must survive a delete between pages.
 pub fn is_mintable_flow_arn(arn: &str) -> bool {
     let segments: Vec<&str> = arn.split(':').collect();
-    let [prefix, partition, service, region, account, resource_type, flow_id, flow_name] =
-        segments.as_slice()
-    else {
+    let [.., flow_id, flow_name] = segments.as_slice() else {
         return false;
     };
-    prefix == &"arn"
-        && partition.starts_with("aws")
-        && partition[3..]
-            .bytes()
-            .all(|b| b.is_ascii_alphabetic() || b == b'-')
-        && service == &SERVICE_NAMESPACE
-        && !region.is_empty()
-        && region
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && account.len() == 12
-        && account.bytes().all(|b| b.is_ascii_digit())
-        && resource_type == &"flow"
+    segments.len() == 8
+        && has_mintable_arn_prefix(&segments, "flow")
         && !flow_id.is_empty()
         && flow_id
             .bytes()

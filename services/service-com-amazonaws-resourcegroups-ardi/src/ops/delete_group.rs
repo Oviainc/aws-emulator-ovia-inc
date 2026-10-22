@@ -167,8 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Neither member is `@required`, but the operation addresses exactly one
         // group, so a request naming none cannot be served. `Group` wins over the
-        // deprecated `GroupName`, and the one identifier resolved here is the one
-        // every answer below names.
+        // deprecated `GroupName`, so the group a request addresses never depends on
+        // which of the two is read.
         let Some(identifier) = input.group.as_deref().or(input.group_name.as_deref()) else {
             return Err(DeleteGroupErrorModeled::BadRequestException(BadRequestException {
                 message: Some(
@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let not_found = || {
             DeleteGroupError::from(DeleteGroupErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!("no group found with the identifier {identifier}")),
+                    message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
                 },
             ))
         };

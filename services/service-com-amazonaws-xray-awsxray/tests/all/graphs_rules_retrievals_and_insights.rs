@@ -1571,12 +1571,12 @@ async fn update_group_updates_the_stored_record_and_refuses_a_conflicting_select
 }
 
 // =============================================================================
-// 8. A graph of a group: the group has to exist, and its filter has to be one
-//    this emulator can honour
+// 8. A graph of a group: the group has to exist, and its filter expression is
+//    what the graph is derived through
 // =============================================================================
 
 #[tokio::test]
-async fn a_service_graph_of_a_group_resolves_the_group_or_is_refused() {
+async fn a_service_graph_of_a_group_resolves_the_group_and_applies_its_filter() {
     let xray = Xray::new();
     let base = now() - 3_600.0;
     seed_graph(&xray, base).await;
@@ -1632,17 +1632,14 @@ async fn a_service_graph_of_a_group_resolves_the_group_or_is_refused() {
         );
     }
 
-    // A group that names nothing, and a filter this emulator cannot evaluate,
-    // are both refused rather than answered with the unfiltered graph.
+    // A group that names nothing is refused rather than answered with the
+    // unfiltered graph; a group that carries a filter expression is ANSWERED
+    // with the graph of the traces that expression selects.
     for (label, body) in [
         ("a group that does not exist", json!({"GroupName": "absent"})),
         (
             "a group ARN that does not exist",
             json!({"GroupARN": "arn:aws:xray:us-east-1:000000000000:group/absent/0123456789ab"}),
-        ),
-        (
-            "a group carrying a filter expression",
-            json!({"GroupName": "filtered"}),
         ),
     ] {
         let answer = xray.call("/ServiceGraph", &window(body)).await;
@@ -1652,4 +1649,38 @@ async fn a_service_graph_of_a_group_resolves_the_group_or_is_refused() {
             "case {label:?}: the request must be refused, got {answer:?}"
         );
     }
+
+    // The group's `FilterExpression` is "fault = true", and exactly one seeded
+    // trace recorded a fault (the 503 root and the service it called), so the
+    // graph is derived from that trace alone: narrower than the unfiltered one,
+    // and naming only the services that trace touched.
+    let answer = xray
+        .call("/ServiceGraph", &window(json!({"GroupName": "filtered"})))
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "a group carrying a FilterExpression must be answered, got {answer:?}"
+    );
+    let named: Vec<String> = array(&answer.body, "Services")
+        .iter()
+        .filter_map(|service| service.get("Name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    for present in ["frontend", "cache"] {
+        assert!(
+            named.iter().any(|name| name == present),
+            "the filtered graph must carry {present:?}, the service the faulted trace touched, got {answer:?}"
+        );
+    }
+    for absent in ["db", "worker"] {
+        assert!(
+            !named.iter().any(|name| name == absent),
+            "the filtered graph must not carry {absent:?}, which no faulted trace touched, got {answer:?}"
+        );
+    }
+    assert_eq!(
+        answer.get("ContainsOldGroupVersions"),
+        &json!(false),
+        "the graph is derived at read time, so it mixes no older group version, got {answer:?}"
+    );
 }

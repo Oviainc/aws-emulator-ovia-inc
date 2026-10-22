@@ -142,6 +142,24 @@ pub enum ObjectWrite {
     TotalByteBudgetReached { would_hold: usize },
 }
 
+/// What [`ComAmazonawsS3Amazons3State::replace_object_tags`] did, so the caller answers
+/// each outcome without re-deriving it — and cannot record a tag set without having gone
+/// through the byte budgets a stored object's tags count against, per bucket AND
+/// service-wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectTagWrite {
+    /// The object's tag set is now the one that was handed in.
+    Applied,
+    /// The bucket exists but holds no object at that key; nothing was written.
+    NoSuchKey,
+    /// Keeping the tag set would take the bucket past [`MAX_OBJECT_BYTES_PER_BUCKET`]
+    /// retained bytes; nothing was written.
+    ByteBudgetReached { would_hold: usize },
+    /// Keeping the tag set would take the whole store past [`MAX_OBJECT_BYTES_TOTAL`]
+    /// retained bytes; nothing was written.
+    TotalByteBudgetReached { would_hold: usize },
+}
+
 /// How many tags one bucket's tag set may carry.
 ///
 /// The Amazon S3 User Guide's bucket tagging restrictions ("Using cost allocation S3
@@ -151,43 +169,88 @@ pub enum ObjectWrite {
 /// refused rather than stored, which is what bounds what one bucket entry can hold.
 pub const MAX_TAGS_PER_BUCKET: usize = 50;
 
-/// The longest tag key a bucket tag set may carry, in Unicode characters.
+/// How many tags one OBJECT's tag set may carry.
 ///
-/// Same source as [`MAX_TAGS_PER_BUCKET`]. The model constrains the other end of the key
-/// — `Tag$Key` targets `ObjectKey`, `length {min 1}`
-/// (`smithy_query(query="shape",shape="Tag")`) — so an empty key is already refused at
-/// the boundary, before any handler runs.
+/// `PutObjectTagging`'s own documentation publishes this one: "Note that Amazon S3 limits
+/// the maximum number of tags to 10 tags per object." The character bounds below are the
+/// same for both tag sets (the "Tag Restrictions" page that operation points at), so the
+/// count is the only published limit that differs between a bucket's tag set and an
+/// object's.
+pub const MAX_TAGS_PER_OBJECT: usize = 10;
+
+/// The longest tag key a tag set may carry, in Unicode characters.
+///
+/// Same source as [`MAX_TAGS_PER_BUCKET`], and the same bound for an object's tag set. The
+/// model constrains the other end of the key — `Tag$Key` targets `ObjectKey`,
+/// `length {min 1}` (`smithy_query(query="shape",shape="Tag")`) — so an empty key is
+/// already refused at the boundary, before any handler runs.
 pub const MAX_TAG_KEY_CHARS: usize = 128;
 
-/// The longest tag value a bucket tag set may carry, in Unicode characters.
+/// The longest tag value a tag set may carry, in Unicode characters.
 ///
-/// Same source as [`MAX_TAGS_PER_BUCKET`]. `Tag$Value` targets the unconstrained `Value`
+/// Same source as [`MAX_TAG_KEY_CHARS`]. `Tag$Value` targets the unconstrained `Value`
 /// string, so nothing refuses an over-long value before this check.
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
 
-/// One tag on a bucket: the key/value pair `Tag` carries on the wire.
+/// One tag on a resource this emulator holds — a bucket's tag set or an object's: the
+/// key/value pair `Tag` carries on the wire.
 ///
-/// Held separately from the modelled `Tag` shape so this store owns no wire type, the way
-/// [`Bucket`] holds the Region as a plain `String`.
+/// ONE type for both, because a tag is the same thing in both places (`Tagging$TagSet` is
+/// the payload of `PutBucketTagging` and of `PutObjectTagging` alike). Held separately
+/// from the modelled `Tag` shape so this store owns no wire type, the way [`Bucket`]
+/// holds the Region as a plain `String`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BucketTag {
-    /// The tag's key — unique within a bucket's tag set.
+pub struct ResourceTag {
+    /// The tag's key — unique within one resource's tag set.
     pub key: String,
     /// The tag's value.
     pub value: String,
 }
 
-/// Why a tag set cannot be stored on a bucket.
+/// How many bytes a tag set retains: every key and value, in UTF-8 bytes.
 ///
-/// Each variant is one of the published restrictions on a bucket tag set, or the
-/// key-uniqueness the set itself has. AWS answers every one of them with `InvalidTag`,
-/// which this service's model does not declare as a shape
-/// (`smithy_query(query="operation",operation="PutBucketTagging")` reports `errors: []`),
-/// so the caller renders it through the framework's refusal channel — never as a success
-/// and never as a 501.
+/// What the object byte budgets count a tag set as — see [`Object::retained_bytes`].
+pub fn tag_set_bytes(tags: &[ResourceTag]) -> usize {
+    tags.iter()
+        .map(|tag| tag.key.len() + tag.value.len())
+        .sum()
+}
+
+/// The published limits one resource's tag set is judged against.
+///
+/// The character bounds are the same for every tag set, so what a scope carries is the tag
+/// COUNT its resource publishes plus the noun a refusal names it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagSetLimits {
+    /// The most tags this resource's tag set may carry.
+    pub max_tags: usize,
+    /// What the resource is called in a refusal ("bucket", "object").
+    pub resource: &'static str,
+}
+
+/// The limits a BUCKET's tag set is judged against ([`MAX_TAGS_PER_BUCKET`]).
+pub const BUCKET_TAG_SET_LIMITS: TagSetLimits = TagSetLimits {
+    max_tags: MAX_TAGS_PER_BUCKET,
+    resource: "bucket",
+};
+
+/// The limits an OBJECT's tag set is judged against ([`MAX_TAGS_PER_OBJECT`]).
+pub const OBJECT_TAG_SET_LIMITS: TagSetLimits = TagSetLimits {
+    max_tags: MAX_TAGS_PER_OBJECT,
+    resource: "object",
+};
+
+/// Which published restriction a tag set breaks.
+///
+/// Each variant is one of the published restrictions on a tag set, or the key-uniqueness
+/// the set itself has. AWS answers every one of them with `InvalidTag`, which this
+/// service's model does not declare as a shape
+/// (`smithy_query(query="operation",operation="PutBucketTagging")` and the same query for
+/// `PutObjectTagging` both report `errors: []`), so the caller renders it through the
+/// framework's refusal channel — never as a success and never as a 501.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TagSetRejection {
-    /// The tag set carries more than [`MAX_TAGS_PER_BUCKET`] tags.
+pub enum TagSetRejectionCause {
+    /// The tag set carries more tags than its resource's [`TagSetLimits::max_tags`].
     TooManyTags { count: usize },
     /// A key is longer than [`MAX_TAG_KEY_CHARS`] Unicode characters.
     KeyTooLong { chars: usize },
@@ -197,57 +260,75 @@ pub enum TagSetRejection {
     DuplicateKey { key: String },
 }
 
+/// Why a tag set cannot be stored on a resource: the restriction it breaks, and the
+/// limits — so the refusal names the resource and the bound it was judged against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagSetRejection {
+    /// The limits the set was judged against.
+    pub limits: TagSetLimits,
+    /// The restriction it breaks.
+    pub cause: TagSetRejectionCause,
+}
+
 impl std::fmt::Display for TagSetRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TooManyTags { count } => write!(
+        let TagSetLimits { max_tags, resource } = self.limits;
+        match &self.cause {
+            TagSetRejectionCause::TooManyTags { count } => write!(
                 f,
-                "Tagging.TagSet carries {count} tags, more than the {MAX_TAGS_PER_BUCKET} \
-                 tags a bucket may hold"
+                "Tagging.TagSet carries {count} tags, more than the {max_tags} \
+                 tags one {resource} may hold"
             ),
-            Self::KeyTooLong { chars } => write!(
+            TagSetRejectionCause::KeyTooLong { chars } => write!(
                 f,
                 "Tagging.TagSet has a Tag.Key of {chars} characters, more than the \
                  {MAX_TAG_KEY_CHARS} characters a tag key may hold"
             ),
-            Self::ValueTooLong { key, chars } => write!(
+            TagSetRejectionCause::ValueTooLong { key, chars } => write!(
                 f,
                 "Tagging.TagSet has a Tag.Value of {chars} characters for key {key:?}, \
                  more than the {MAX_TAG_VALUE_CHARS} characters a tag value may hold"
             ),
-            Self::DuplicateKey { key } => write!(
+            TagSetRejectionCause::DuplicateKey { key } => write!(
                 f,
-                "Tagging.TagSet names the key {key:?} twice; a bucket tag set holds one \
-                 value per key"
+                "Tagging.TagSet names the key {key:?} twice; a {resource} tag set holds \
+                 one value per key"
             ),
         }
     }
 }
 
-/// Whether `tags` may be stored as a bucket's tag set, reporting the first restriction it
-/// breaks.
+/// Whether `tags` may be stored as the tag set of a resource with these `limits`,
+/// reporting the first restriction it breaks.
 ///
-/// The count is checked before the per-tag rules so an enormous set is refused for what it
-/// is rather than for whichever of its tags happens to come first.
-pub fn validate_tag_set(tags: &[BucketTag]) -> Result<(), TagSetRejection> {
-    if tags.len() > MAX_TAGS_PER_BUCKET {
-        return Err(TagSetRejection::TooManyTags { count: tags.len() });
+/// ONE rule for every tag set S3 holds: the count against the resource's own published
+/// maximum, then each key and value against the character bounds every tag set shares, and
+/// the key-uniqueness the set itself has. The count is checked before the per-tag rules so
+/// an enormous set is refused for what it is rather than for whichever of its tags happens
+/// to come first.
+pub fn validate_tag_set(
+    tags: &[ResourceTag],
+    limits: TagSetLimits,
+) -> Result<(), TagSetRejection> {
+    let refuse = |cause| Err(TagSetRejection { limits, cause });
+    if tags.len() > limits.max_tags {
+        return refuse(TagSetRejectionCause::TooManyTags { count: tags.len() });
     }
     let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for tag in tags {
         let key_chars = tag.key.chars().count();
         if key_chars > MAX_TAG_KEY_CHARS {
-            return Err(TagSetRejection::KeyTooLong { chars: key_chars });
+            return refuse(TagSetRejectionCause::KeyTooLong { chars: key_chars });
         }
         let value_chars = tag.value.chars().count();
         if value_chars > MAX_TAG_VALUE_CHARS {
-            return Err(TagSetRejection::ValueTooLong {
+            return refuse(TagSetRejectionCause::ValueTooLong {
                 key: tag.key.clone(),
                 chars: value_chars,
             });
         }
         if !seen.insert(tag.key.as_str()) {
-            return Err(TagSetRejection::DuplicateKey {
+            return refuse(TagSetRejectionCause::DuplicateKey {
                 key: tag.key.clone(),
             });
         }
@@ -304,7 +385,7 @@ pub struct Bucket {
     /// Private, and empty when no tag set is associated with the bucket: "no tags" and
     /// "an empty tag set" are the same state on AWS, which is why `PutBucketTagging` with
     /// an empty `TagSet` and `DeleteBucketTagging` leave a bucket in the same place.
-    tags: Vec<BucketTag>,
+    tags: Vec<ResourceTag>,
     /// The bucket's ownership controls: one entry per `OwnershipControlsRule`, holding that
     /// rule's `ObjectOwnership` value in the order the request carried it, or `None` while
     /// no ownership controls are associated with the bucket.
@@ -335,7 +416,7 @@ impl Bucket {
     }
 
     /// The bucket's tag set, empty when none is associated with it.
-    pub fn tags(&self) -> &[BucketTag] {
+    pub fn tags(&self) -> &[ResourceTag] {
         &self.tags
     }
 
@@ -345,7 +426,7 @@ impl Bucket {
     /// will overwrite any current tags the bucket already has. You cannot use this
     /// operation to add tags to an existing list of tags" (`PutBucketTagging`'s own
     /// documentation).
-    pub fn replace_tags(&mut self, tags: Vec<BucketTag>) {
+    pub fn replace_tags(&mut self, tags: Vec<ResourceTag>) {
         self.tags = tags;
     }
 
@@ -409,6 +490,17 @@ impl Bucket {
     /// not exist.
     fn remove_object(&mut self, key: &str) -> bool {
         self.objects.remove(key).is_some()
+    }
+
+    /// The object stored at `key` for writing one of its subresources, or `None` when the
+    /// bucket holds no such key.
+    ///
+    /// PRIVATE, and reached only through
+    /// [`ComAmazonawsS3Amazons3State::replace_object_tags`]: that is the one place that
+    /// sees the byte budgets a subresource write also has to stay inside, so a handler
+    /// reaching an object this way directly would bypass them.
+    fn object_mut(&mut self, key: &str) -> Option<&mut Object> {
+        self.objects.get_mut(key)
     }
 
     /// Store `object` at `key`, replacing any object already there, and report what that
@@ -500,12 +592,21 @@ pub struct Object {
     pub website_redirect_location: Option<String>,
     /// The user-defined metadata the request carried in its `x-amz-meta-` headers.
     pub metadata: BTreeMap<String, String>,
+    /// The object's tag set, in the order the tagging request carried it.
+    ///
+    /// Empty when no tag set is associated with the object: "no tags" and "an empty tag
+    /// set" are the same state, which is why `PutObjectTagging` with an empty `TagSet`
+    /// leaves an object where `DeleteObjectTagging` would. A `PutObject` REPLACES the
+    /// whole object ("You cannot use PutObject to only update a single piece of metadata
+    /// for an existing object"), so the tag set of the object it replaces goes with it;
+    /// only [`ComAmazonawsS3Amazons3State::replace_object_tags`] sets one afterwards.
+    pub tags: Vec<ResourceTag>,
 }
 
 impl Object {
     /// How many bytes this stored object retains: its payload AND every string kept
-    /// beside it (its entity tag, storage class, the response headers it carries and its
-    /// user-defined metadata).
+    /// beside it (its entity tag, storage class, the response headers it carries, its
+    /// user-defined metadata and its tag set).
     ///
     /// This, not the payload alone, is what the per-bucket and service-wide budgets are
     /// computed from: a one-byte object with large metadata or a large
@@ -516,6 +617,7 @@ impl Object {
             + self.etag.len()
             + self.storage_class.len()
             + self.metadata_bytes()
+            + tag_set_bytes(&self.tags)
             + [
                 &self.content_type,
                 &self.cache_control,
@@ -650,6 +752,63 @@ impl ComAmazonawsS3Amazons3State {
         self.buckets
             .get_mut(bucket)
             .map(|held| held.put_object(key, object))
+    }
+
+    /// Replace the tag set of the object at `key` in the bucket named `bucket`, reporting
+    /// what that did, or `None` when this emulator holds no such bucket (so a tagging
+    /// write refuses a name that is not a bucket instead of creating one).
+    ///
+    /// A REPLACEMENT of the whole tag set, the way [`Bucket::replace_tags`] replaces a
+    /// bucket's: `Tagging` is the complete container the request carries, so what the
+    /// object holds afterwards is exactly what this call carried and nothing of the set
+    /// before it — an empty `TagSet` therefore leaves the object with no tags.
+    ///
+    /// This is the ONLY way an object's tag set is recorded, because it is the only place
+    /// that can see BOTH the per-bucket byte budget and the service-wide one: a tag set is
+    /// retained with the object ([`Object::retained_bytes`]) and is not bounded by
+    /// anything [`Self::put_object`] checked, so a tag set that would take the store past
+    /// either budget is refused rather than recorded. Nothing is written unless the answer
+    /// is [`ObjectTagWrite::Applied`].
+    pub fn replace_object_tags(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        tags: Vec<ResourceTag>,
+    ) -> Option<ObjectTagWrite> {
+        let held = self.buckets.get(bucket)?;
+        let Some(object) = held.object(key) else {
+            return Some(ObjectTagWrite::NoSuchKey);
+        };
+
+        // What the bucket and the whole store would retain with this tag set in place of
+        // the object's current one: everything they retain now, less the bytes the tag set
+        // being replaced holds, plus the bytes of the replacement.
+        let released = tag_set_bytes(&object.tags);
+        let taken = tag_set_bytes(&tags);
+        let would_hold = held.retained_bytes().saturating_sub(released) + taken;
+        if would_hold > MAX_OBJECT_BYTES_PER_BUCKET {
+            return Some(ObjectTagWrite::ByteBudgetReached { would_hold });
+        }
+        let total_would_hold = self
+            .buckets
+            .values()
+            .map(Bucket::retained_bytes)
+            .sum::<usize>()
+            .saturating_sub(released)
+            + taken;
+        if total_would_hold > MAX_OBJECT_BYTES_TOTAL {
+            return Some(ObjectTagWrite::TotalByteBudgetReached {
+                would_hold: total_would_hold,
+            });
+        }
+
+        self.buckets
+            .get_mut(bucket)
+            .and_then(|held| held.object_mut(key))
+            .map(|object| {
+                object.tags = tags;
+                ObjectTagWrite::Applied
+            })
     }
 
     /// Record a bucket named `name` in `region`, reporting what happened.
@@ -858,6 +1017,7 @@ mod tests {
             expires: None,
             website_redirect_location: None,
             metadata: BTreeMap::new(),
+            tags: Vec::new(),
         }
     }
 

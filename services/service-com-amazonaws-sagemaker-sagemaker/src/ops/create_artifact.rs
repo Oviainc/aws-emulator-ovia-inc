@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The id is the server's: a lineage entity is named by its ARN and the request
         // carries no identifier to derive one from.
         let arn =
-            crate::state::resource_arn(&region, "artifact", &crate::state::mint_lineage_entity_id());
+            crate::state::resource_arn(&region, "artifact", &crate::state::mint_opaque_resource_id());
         // The minted id is unique within the run by construction, so the key is free;
         // asserted rather than assumed, so an id-space defect fails a test run loudly
         // instead of replacing a stored artifact in silence.

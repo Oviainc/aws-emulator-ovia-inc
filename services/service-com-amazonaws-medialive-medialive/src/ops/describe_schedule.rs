@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One channel's schedule, read in the order its actions start in the channel and
+//! paginated over that sequence. Reporting only: the one write it makes is the
+//! cleanup the clock already owed the schedule (an action whose start time is more
+//! than an hour past is no longer in it), which [`crate::state::schedules`] owns.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSchedule"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeScheduleErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some(crate::state::NO_STORE.to_string()),
+                },
+            )
+        })?;
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to a finite ceiling, and an absent one
+        // uses that ceiling, so no single request can ask the service to project
+        // an unbounded number of actions in one response.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(bad_request(&format!(
+                    "maxResults must be at least 1, got {max_results}"
+                )));
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        // The token is how many actions of this schedule the previous pages
+        // already reported. An action's place in the schedule is its start time,
+        // not its name or its mint order, so the position in that sequence is what
+        // a page resumes from; a token that is not a whole-number position at all
+        // is refused rather than read as the first page. A position past the end
+        // is NOT refused: the schedule shrinks on its own (an action whose start
+        // time has long passed is cleaned up), so a token handed out for a page
+        // that has since been swept away resumes at the end of the schedule
+        // instead of failing a walk that was valid when it began. That same
+        // sweeping is what a positional cursor costs: an action removed between
+        // two pages shifts the ones after it, so a walk spanning the sweep can
+        // miss one — a page is a snapshot of the schedule it was read from, never
+        // a cursor the service holds open.
+        let already_reported = match input.next_token.as_deref() {
+            Some(token) => token.parse::<usize>().map_err(|_| {
+                bad_request(&format!("nextToken {token} is not a schedule position"))
+            })?,
+            None => 0,
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises what the clock already made due,
+        // so an action swept out of the schedule is not reported and a channel
+        // whose delete has come due is not found.
+        state.settle(::std::time::SystemTime::now());
+        let state = &*state;
+
+        let channel = state.channels.get(&input.channel_id).ok_or_else(|| {
+            DescribeScheduleErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Channel", &input.channel_id)),
+            })
+        })?;
+
+        let ordered = channel.schedule.in_start_order();
+        let schedule_actions: Vec<ScheduleAction> = ordered
+            .iter()
+            .skip(already_reported)
+            .take(page_size)
+            .map(|record| record.action.clone())
+            .collect();
+        let reported = already_reported.saturating_add(schedule_actions.len());
+        // Absent on the last page: a token is handed out only when an action is
+        // left over after this one.
+        let next_token = (reported < ordered.len()).then(|| reported.to_string());
+
+        Ok(DescribeScheduleOutput {
+            next_token,
+            schedule_actions: Some(schedule_actions),
+        })
     }
+}
+
+/// A request this operation cannot read, as its modelled 400.
+fn bad_request(message: &str) -> DescribeScheduleError {
+    DescribeScheduleErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

@@ -33,6 +33,8 @@ mod input_validation;
 mod not_found_errors;
 #[path = "all/profile_lifecycle.rs"]
 mod profile_lifecycle;
+#[path = "all/resource_resolution_refusals.rs"]
+mod resource_resolution_refusals;
 #[path = "all/security_policy_catalog.rs"]
 mod security_policy_catalog;
 #[path = "all/server_config_and_state.rs"]

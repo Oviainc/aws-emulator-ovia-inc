@@ -45,6 +45,27 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code AWS Chatbot answers a request whose input does not satisfy a modeled
+/// constraint with.
+///
+/// `InvalidRequestException` is this service's own client-input error — `@error("client")`
+/// `@httpError(400)`, documented "Your request input doesn't meet the constraints required
+/// by AWS Chatbot" — and the service model declares NO `ValidationException` at all, so the
+/// framework's synthetic `smithy.framework#ValidationException` names a shape no chatbot
+/// client (or code generator) can know. The distinction is client-visible: an SDK unmarshals
+/// a MODELED error into its typed exception, so the code a client branches on has to be this
+/// one.
+const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+
+/// The message that refusal carries.
+///
+/// It is constant: the request is refused before it is dispatched to an operation, so the
+/// answer names neither the member nor the constraint that failed. The status (400) and
+/// [`INVALID_REQUEST_EXCEPTION`] are the contract; this sentence is the text AWS Chatbot was
+/// recorded answering for such a refusal, identical on every operation, and not a value a
+/// client may rely on.
+const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+
 /// The `com-amazonaws-chatbot-wheatleyorchestration-20171011` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -98,15 +119,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
+        // service reword it.
+        //
+        // AWS Chatbot answers EVERY such refusal with its own modeled client-input
+        // error, `InvalidRequestException` (400) — "Your request input doesn't meet the
+        // constraints required by AWS Chatbot" — whichever operation was addressed and
+        // whichever constraint (pattern, range, length, required) failed. One decision
+        // for every operation and every constraint kind, because the request is refused
+        // before it is dispatched to an operation.
+        //
+        // The status stays with the protocol (400, which is also
+        // `InvalidRequestException`'s `@httpError`), and both the code and the message
+        // are replaced together: a message without its matching code is worse than
         // leaving both alone.
-        let _ = refusal;
-        None
+        //
+        // An authentication refusal is NOT an input-validation failure — it keeps the
+        // framework's SigV4 wording and 403 — and `Refusal` is `#[non_exhaustive]`, so a
+        // refusal class this crate has not seen keeps the default wording too.
+        match refusal {
+            Refusal::Invalid(_) => Some(Refused {
+                code: INVALID_REQUEST_EXCEPTION.to_string(),
+                message: INVALID_REQUEST_BODY_MESSAGE.to_string(),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

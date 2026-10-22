@@ -39,9 +39,10 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    As2ConnectorConfig, ConnectorEgressConfig, ConnectorVpcLatticeEgressConfig,
-    DescribedWebAppEndpointDetails, DescribedWebAppIdentityProviderDetails, EndpointDetails,
-    HomeDirectoryMapEntry, IdentityProviderDetails, PosixProfile, ProtocolDetails, ProxyConfig,
+    AccessDeniedException, As2ConnectorConfig, ConnectorEgressConfig,
+    ConnectorVpcLatticeEgressConfig, DescribedWebAppEndpointDetails,
+    DescribedWebAppIdentityProviderDetails, EndpointDetails, HomeDirectoryMapEntry,
+    IdentityProviderDetails, InvalidRequestException, PosixProfile, ProtocolDetails, ProxyConfig,
     ResourceExistsException, ResourceNotFoundException, S3StorageOptions, SftpConnectorConfig,
     SftpPortWithOptions, Tag, WebAppUnits, WorkflowDetails, WorkflowStep,
 };
@@ -309,6 +310,17 @@ pub const RESOURCE_TYPE_USER: &str = "User";
 /// `SshPublicKeyId`. Same convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_SSH_PUBLIC_KEY: &str = "SshPublicKey";
 
+/// `ResourceType` for a directory access grant, addressed by its `ExternalId`. Same
+/// convention as [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_ACCESS: &str = "Access";
+
+/// An `ExternalId` the resolved server holds no access grant for. Its own entry in the
+/// not-found table, like every other kind.
+pub const NOT_FOUND_ACCESS: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_ACCESS,
+    message: "Unknown access",
+};
+
 /// `ResourceType` for the connector resource, addressed by its `ConnectorId`. Same
 /// convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_CONNECTOR: &str = "Connector";
@@ -338,6 +350,17 @@ pub const RESOURCE_TYPE_PROFILE: &str = "Profile";
 /// `ResourceType` for the workflow resource, addressed by its `WorkflowId`. Same
 /// convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_WORKFLOW: &str = "Workflow";
+
+/// `ResourceType` for one execution of a workflow, addressed by its `ExecutionId`.
+/// Same convention as [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_EXECUTION: &str = "Execution";
+
+/// An `ExecutionId` the resolved workflow is not running. Its own entry in the
+/// not-found table, like every other kind.
+pub const NOT_FOUND_EXECUTION: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_EXECUTION,
+    message: "Unknown execution",
+};
 
 /// `ResourceType` as the duplicate-`UserName` `ResourceExistsException` carries it:
 /// the resource name in lower case, which is the value this service has answered that
@@ -568,10 +591,113 @@ pub fn unknown_ssh_public_key(ssh_public_key_id: &str) -> ResourceNotFoundExcept
     resource_not_found(&NOT_FOUND_SSH_PUBLIC_KEY, ssh_public_key_id)
 }
 
+/// The not-found payload for an `ExternalId` the named server holds no access grant
+/// for — never granted, or already deleted.
+pub fn unknown_access(external_id: &str) -> ResourceNotFoundException {
+    resource_not_found(&NOT_FOUND_ACCESS, external_id)
+}
+
 /// The not-found payload for a `ConnectorId` the store does not hold — never created,
 /// or already deleted.
 pub fn unknown_connector(connector_id: &str) -> ResourceNotFoundException {
     resource_not_found(&NOT_FOUND_CONNECTOR, connector_id)
+}
+
+/// The not-found payload for an `ExecutionId` the named workflow is not running — the
+/// execution never started, or has already finished.
+pub fn unknown_execution(execution_id: &str) -> ResourceNotFoundException {
+    resource_not_found(&NOT_FOUND_EXECUTION, execution_id)
+}
+
+/// The message the modelled `AccessDeniedException` carries.
+///
+/// It is the shape's own documented sentence
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`: "You do not have
+/// sufficient access to perform this action."). AWS's own text names the caller's ARN
+/// and the action, which is account- and principal-specific; the requirement is the
+/// 403 classification and the code, so the modelled sentence is what this states, and
+/// it deliberately says nothing about whether the named resource exists.
+pub const INSUFFICIENT_ACCESS_MESSAGE: &str =
+    "You do not have sufficient access to perform this action.";
+
+/// The authorization refusal for a request this emulator cannot authorize.
+///
+/// Carries [`INSUFFICIENT_ACCESS_MESSAGE`] and nothing else, so the refusal is the
+/// same for every request and discloses nothing about the resource it named. Returned
+/// through the operation's own modelled `AccessDeniedException` variant, so it keeps
+/// the model's HTTP 403.
+///
+/// WHICH identifier is judged here, and which is reported not found, is settled by the
+/// resource a permission for the action NAMES: `SendWorkflowStepState` is addressed at
+/// a workflow (its `ExecutionId` and `Token` address a run and a step INSIDE that
+/// workflow), so an unresolvable `WorkflowId` is refused here and an execution the
+/// resolved workflow is not running is reported not found. An operation whose input
+/// names ONE resource and nothing inside it resolves that resource through the
+/// modelled not-found instead (`DescribeWebApp`), so this refusal never makes an
+/// operation's own `ResourceNotFoundException` unreachable.
+pub fn access_denied() -> AccessDeniedException {
+    AccessDeniedException {
+        message: Some(INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+    }
+}
+
+/// Whether `identity_provider_type` names a CUSTOMER-run identity provider — one the
+/// server delegates authentication to — rather than Transfer's own user store.
+///
+/// The `IdentityProviderType` enum is `[SERVICE_MANAGED, API_GATEWAY,
+/// AWS_DIRECTORY_SERVICE, AWS_LAMBDA]`, and the three non-`SERVICE_MANAGED` values are
+/// exactly the ones `IdentityProviderDetails` documents itself as required for: each
+/// one points at something outside the service (a REST endpoint, a directory, a
+/// function). `SERVICE_MANAGED` points at nothing: its users are the ones `CreateUser`
+/// stores.
+pub fn is_external_identity_provider(identity_provider_type: &str) -> bool {
+    matches!(
+        identity_provider_type,
+        IDENTITY_PROVIDER_API_GATEWAY
+            | IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE
+            | IDENTITY_PROVIDER_AWS_LAMBDA
+    )
+}
+
+/// `TestIdentityProvider`'s refusal for a server that delegates authentication to
+/// nothing, so there is no identity provider for the call to test.
+///
+/// The wording is the model's own: "If you provide a server ID for a server that uses
+/// service-managed users, you get an error: An error occurred
+/// (InvalidRequestException) when calling the TestIdentityProvider operation:
+/// s-server-ID not configured for external auth" — the one documented message of this
+/// refusal, built from the `ServerId` the request named.
+pub fn not_configured_for_external_auth(server_id: &str) -> InvalidRequestException {
+    InvalidRequestException {
+        message: format!("{server_id} not configured for external auth"),
+    }
+}
+
+/// The refusal for an access-grant request addressed at a server that has no
+/// directory to hold groups.
+///
+/// An access grant IS a directory group: `ExternalId` is documented as "A unique
+/// identifier that is required to identify specific groups within your directory",
+/// read out of Active Directory with `Get-ADGroup`. Only a server whose
+/// `IdentityProviderType` is `AWS_DIRECTORY_SERVICE` authenticates against a
+/// directory, so on any other server there is no group an `ExternalId` could name —
+/// which is a malformed request, not a missing grant. The message names the member and
+/// the configuration the request was submitted under; both come from the request and
+/// the stored server.
+pub fn accesses_require_directory_provider(
+    server_id: &str,
+    identity_provider_type: &str,
+) -> InvalidRequestException {
+    InvalidRequestException {
+        message: must_be_when(
+            "IdentityProviderType",
+            IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE,
+            &format!(
+                "an access is addressed by ExternalId on server {server_id}, \
+                 whose IdentityProviderType is {identity_provider_type}"
+            ),
+        ),
+    }
 }
 
 /// The not-found payload for a `WebAppId` the store does not hold — never created, or
@@ -1806,13 +1932,12 @@ pub struct ServerConfig<'a> {
 impl ServerConfig<'_> {
     /// Whether this configuration's `IdentityProviderType` is one of the three the
     /// model documents `IdentityProviderDetails` as required for.
+    ///
+    /// Those three are exactly the types that delegate authentication to something
+    /// outside the service, so the enum membership is listed once, in
+    /// [`is_external_identity_provider`], and read from here.
     fn needs_identity_provider_details(&self) -> bool {
-        matches!(
-            self.identity_provider_type,
-            IDENTITY_PROVIDER_API_GATEWAY
-                | IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE
-                | IDENTITY_PROVIDER_AWS_LAMBDA
-        )
+        is_external_identity_provider(self.identity_provider_type)
     }
 
     /// Whether `Protocols` names `protocol`.
@@ -2073,6 +2198,30 @@ pub fn home_directory_violation(
     }
 }
 
+/// One stored directory access grant, keyed by `(ServerId, ExternalId)`.
+///
+/// An access grant is a GROUP in the directory the server authenticates against (see
+/// [`accesses_require_directory_provider`]), so a grant exists only on a server whose
+/// `IdentityProviderType` is `AWS_DIRECTORY_SERVICE`, and the server id is part of its
+/// key: the same directory group may be granted access on several servers
+/// independently. `BTreeMap` on that key so one server's grants are a contiguous,
+/// ordered range for `ListAccesses`.
+///
+/// `DeleteAccess` reads only the grant's identity; the members below are the ones
+/// `DescribedAccess` reports, which `CreateAccess` / `UpdateAccess` (their own stub
+/// issues) resolve when they write a grant.
+#[derive(Debug, Clone, Default)]
+pub struct Access {
+    pub server_id: String,
+    pub external_id: String,
+    pub home_directory: Option<String>,
+    pub home_directory_type: Option<String>,
+    pub home_directory_mappings: Vec<HomeDirectoryMapEntry>,
+    pub policy: Option<String>,
+    pub posix_profile: Option<PosixProfile>,
+    pub role: Option<String>,
+}
+
 /// One stored Transfer Family web app, keyed by `WebAppId`.
 ///
 /// Every member a reader reports is RESOLVED here, at create time — the documented
@@ -2105,6 +2254,24 @@ pub struct WebApp {
     /// which has no VPC endpoint to report.
     pub endpoint_details: Option<DescribedWebAppEndpointDetails>,
     pub tags: Vec<Tag>,
+}
+
+/// One workflow execution's custom-step callbacks, keyed by `(WorkflowId,
+/// ExecutionId)`.
+///
+/// A custom workflow step hands its target resource an `ExecutionId`, a `WorkflowId`
+/// and a `Token`, and the step stays pending until `SendWorkflowStepState` reports an
+/// outcome for that token. An execution exists only while a workflow runs over an
+/// uploaded file, so this is the state that callback is resolved against.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowExecution {
+    pub workflow_id: String,
+    pub execution_id: String,
+    /// The outcome reported for each pending custom step, by the `Token` that step was
+    /// handed: `None` until its callback arrives, then the `CustomStepStatus` it
+    /// carried. A token this map does not hold addresses no custom step of this
+    /// execution.
+    pub step_states: BTreeMap<String, Option<String>>,
 }
 
 /// The first documented step requirement a submitted step LIST violates, worded as the
@@ -2281,6 +2448,12 @@ pub struct ComAmazonawsTransferTransferserviceState {
     /// Users by `(ServerId, UserName)`, so one server's users are a contiguous,
     /// ordered range for `ListUsers`.
     pub users: BTreeMap<(String, String), User>,
+    /// Directory access grants by `(ServerId, ExternalId)`, so one server's grants are
+    /// a contiguous, ordered range for `ListAccesses`.
+    pub accesses: BTreeMap<(String, String), Access>,
+    /// Running workflow executions by `(WorkflowId, ExecutionId)`, so one workflow's
+    /// executions are a contiguous, ordered range for `ListExecutions`.
+    pub workflow_executions: BTreeMap<(String, String), WorkflowExecution>,
     /// Web apps by `WebAppId` (`"webapp-" + 17 hex`). `BTreeMap` so `ListWebApps` pages
     /// in a stable, resumable order.
     pub web_apps: BTreeMap<String, WebApp>,

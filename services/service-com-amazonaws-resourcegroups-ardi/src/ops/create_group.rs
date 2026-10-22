@@ -6,9 +6,10 @@
 //! ARN is minted once here, from the request's region and the emulator's account id, and
 //! every later read returns the stored one.
 //!
-//! A service `Configuration` is answered with 501: the operations that report one
-//! (`GetGroupConfiguration`, `PutGroupConfiguration`) are still scaffolded, so this
-//! emulator cannot answer for a configured group faithfully.
+//! A group is created with EITHER a `ResourceQuery` or a service `Configuration`, and
+//! both forms are stored on the same record, so a configured (application) group is an
+//! ordinary group afterwards: `GetGroup`, `GetGroupConfiguration`, `UpdateGroup` and
+//! `DeleteGroup` all resolve it by name or ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -212,10 +213,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  but not both",
             ));
         }
-        if configured {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateGroup with a service Configuration",
-            ));
+        // Modelled on `GroupConfigurationItem$Type`: "Each item must have a unique
+        // value for type." The list's own 0..2 length and each `Type`'s pattern are
+        // modelled constraints, already refused before this handler runs.
+        if let Some(items) = input.configuration.as_ref() {
+            if let Some(duplicate) = first_duplicate_type(items) {
+                return Err(bad_request(format!(
+                    "Configuration is not valid: each configuration item must have a \
+                     unique Type, and {duplicate} appears more than once",
+                )));
+            }
         }
         // Modelled on `CreateGroupInput$Name`: "The name cannot start with AWS, aws, or
         // any other possible capitalization; these are reserved." `get` keeps the
@@ -258,12 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // A group name is unique within an account and region, so a second create
-        // for a stored name is refused rather than overwriting it.
+        // for a stored name is refused rather than overwriting it. The refusal is
+        // the service's own fixed sentence and names nothing the caller sent: the
+        // name is already in the request.
         if store.groups.contains_key(&input.name) {
-            return Err(bad_request(format!(
-                "a group named {} already exists in this account",
-                input.name,
-            )));
+            return Err(bad_request("Cannot create group: group already exists"));
         }
         // The emulator's own ceiling on stored state (see `MAX_GROUPS`), so a client
         // looping on this operation is refused instead of growing the store without
@@ -277,6 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let record = crate::state::GroupRecord {
             group_arn: crate::state::group_arn(&region, &input.name),
+            owner_id: crate::state::owning_account_id(),
             name: input.name.clone(),
             description: input.description,
             criticality: input.criticality,
@@ -288,6 +295,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     query_type: query.r#type,
                     query: query.query,
                 }),
+            // A `Configuration` that carries no item configures nothing, so the
+            // group is stored exactly as one that sent none.
+            configuration: input.configuration.filter(|items| !items.is_empty()),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             members: Vec::new(),
         };
@@ -297,8 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group: Some(record.to_group()),
             resource_query: record.to_resource_query(),
             tags: Some(record.tags_map()),
-            // A group created without a `Configuration` has none.
-            group_configuration: None,
+            group_configuration: record.to_group_configuration(),
         };
         store.groups.insert(record.name.clone(), record);
         // Everything below is owned, so the store lock is released before the record
@@ -318,6 +327,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         Ok(output)
     }
+}
+
+/// The first configuration item `Type` that appears twice in `items`, or `None`
+/// when every item's `Type` is distinct.
+fn first_duplicate_type(items: &[GroupConfigurationItem]) -> Option<&str> {
+    items
+        .iter()
+        .enumerate()
+        .find(|(at, item)| items[..*at].iter().any(|earlier| earlier.r#type == item.r#type))
+        .map(|(_, item)| item.r#type.as_str())
 }
 
 /// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGroupConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGroupConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGroupConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the service configuration stored on a group in [`crate::state`]. An identifier
+//! that names no stored group is 404 `NotFoundException`; a group that holds no service
+//! configuration has none to report, which is a 400 `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGroupConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGroupConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGroupConfiguration"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. A read emits no audit record, so
+        // `ctx` carries nothing this handler needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetGroupConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the resource-groups store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // `Group` is the operation's only member and is not `@required`, but the
+        // operation addresses exactly one group, so a request naming none cannot be
+        // served.
+        let Some(identifier) = input.group.as_deref() else {
+            return Err(GetGroupConfigurationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        "the request must name the group whose configuration to get, in Group"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let not_found = || {
+            GetGroupConfigurationError::from(
+                GetGroupConfigurationErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
+                }),
+            )
+        };
+        let store = state.lock();
+        let name = store.lookup(identifier).ok_or_else(not_found)?;
+        let record = store.groups.get(&name).ok_or_else(not_found)?;
+        // A service configuration is an attribute only a service-linked group has:
+        // a group created with a `ResourceQuery`, or with neither, holds none. The
+        // group itself exists, so this is not `NotFoundException` ("One or more of
+        // the specified resources don't exist"); it is a request this group cannot
+        // answer — the modelled `BadRequestException`, "The request includes one or
+        // more parameters that violate validation rules." Answering 200 with an
+        // empty body instead would report the group as configured with nothing.
+        let Some(configuration) = record.to_group_configuration() else {
+            return Err(GetGroupConfigurationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "the group {name} has no service configuration",
+                    )),
+                },
+            )
+            .into());
+        };
+        Ok(GetGroupConfigurationOutput {
+            group_configuration: Some(configuration),
+        })
     }
 }

@@ -6,10 +6,15 @@
 //! of that token reports `RetrievalStatus` `CANCELLED` and answers no traces.
 //! A successful cancellation answers HTTP 200 with an empty body.
 //!
-//! Two refusals:
+//! Three refusals, and the ORDER is part of the contract \u2014 the request's own
+//! form is judged before the store is consulted:
 //!
-//! * a token this service never issued, or whose retrieval has timed out, names
-//!   no retrieval and is refused with `ResourceNotFoundException` (404); and
+//! * a `RetrievalToken` that is not of the form this service issues
+//!   ([`crate::state::is_retrieval_token_form`]) could never have named a
+//!   retrieval, so it is refused with `InvalidRequestException` (400);
+//! * a well-formed token this service never issued, or whose retrieval has timed
+//!   out, names no retrieval and is refused with `ResourceNotFoundException`
+//!   (404); and
 //! * a retrieval that is no longer ongoing — one that already completed, or that
 //!   was already cancelled — is refused with `InvalidRequestException` (400)
 //!   naming the status it is in, because there is no job left to cancel.
@@ -154,6 +159,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = crate::state::now_epoch_seconds();
+        // VALIDATED BEFORE THE TOKEN IS RESOLVED: a `RetrievalToken` that is not
+        // of the form this service issues could never have named a retrieval, so
+        // it is a malformed parameter (`InvalidRequestException`, 400) rather
+        // than a retrieval that is gone (`ResourceNotFoundException`, 404).
+        if !crate::state::is_retrieval_token_form(&input.retrieval_token) {
+            return Err(CancelTraceRetrievalErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::malformed_retrieval_token_message(
+                        "retrieval token",
+                        &input.retrieval_token,
+                    )),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         match store.cancel_trace_retrieval(&input.retrieval_token, now) {
             Ok(_) => Ok(CancelTraceRetrievalOutput {}),

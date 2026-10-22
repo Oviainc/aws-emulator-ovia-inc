@@ -24,9 +24,12 @@
 //!   uses;
 //! * a page carries at most the modelled maximum of traces, and a `NextToken`
 //!   is emitted only when traces are still unread;
-//! * a `RetrievalToken` no stored retrieval stands behind is refused with
-//!   `ResourceNotFoundException` at HTTP 404 by every operation that takes one;
-//!   and
+//! * a `RetrievalToken` that is not of the form this service mints is refused
+//!   with `InvalidRequestException` at HTTP 400 — before any lookup — by every
+//!   operation that takes one, while a WELL-FORMED token no stored retrieval
+//!   stands behind is refused with `ResourceNotFoundException` at HTTP 404;
+//! * `ListRetrievedTraces` requires a `TraceFormat`, and judges it before it
+//!   resolves the token; and
 //! * `CancelTraceRetrieval` moves an ONGOING retrieval to `CANCELLED` and is
 //!   refused with `InvalidRequestException` at HTTP 400 for one that is not
 //!   ongoing, leaving that retrieval as it was.
@@ -118,6 +121,10 @@ async fn start_retrieval(xray: &Xray, ids: &[String], start: f64, end: f64) -> S
 }
 
 /// `ListRetrievedTraces` for `token`, optionally resuming and in a format.
+///
+/// `TraceFormat` is required by the service ("TraceFormat cannot be empty"), so
+/// a row that is not about that member sends the format the retrieved spans
+/// exist in; the rows that ARE about it call the operation directly.
 async fn list_retrieved(
     xray: &Xray,
     token: &str,
@@ -128,9 +135,7 @@ async fn list_retrieved(
     if let Some(next) = next {
         body["NextToken"] = json!(next);
     }
-    if let Some(format) = format {
-        body["TraceFormat"] = json!(format);
-    }
+    body["TraceFormat"] = json!(format.unwrap_or(TRACE_FORMAT_XRAY));
     xray.call("/ListRetrievedTraces", &body).await
 }
 
@@ -646,20 +651,39 @@ async fn a_retrieval_of_more_traces_than_a_page_is_paginated() {
 // =============================================================================
 
 #[tokio::test]
-async fn a_retrieval_token_nothing_was_stored_under_is_refused_by_every_operation() {
+async fn a_malformed_token_is_a_bad_request_and_a_well_formed_unknown_one_is_not_found() {
     let xray = Xray::new();
     let base = base_window_start();
     // One real retrieval, so the store is not empty and the refusals below are
     // about the token rather than about an empty service.
     let real = start_retrieval(&xray, &[trace_id(480)], base, base + 300.0).await;
+    assert!(
+        real.len() == 32 && real.chars().all(|c| c.is_ascii_hexdigit()),
+        "a minted RetrievalToken is 32 hexadecimal digits, got {real:?}"
+    );
     let mut altered: Vec<char> = real.chars().collect();
     altered[0] = if altered[0] == 'a' { 'b' } else { 'a' };
     let altered: String = altered.into_iter().collect();
 
-    let tokens = [
+    // Rows differ in HOW the token misses: one that could never have been
+    // minted (400, a request to fix) against one that could have been and was
+    // not (404, a retrieval that is not there). The lengths sit either side of
+    // the minted width, and `RetrievalToken`'s modelled `@length` is 0..1020, so
+    // every row below reaches the handler.
+    let malformed = [
         ("the empty token", String::new()),
         ("a token that is not hexadecimal", "not-a-retrieval".to_string()),
+        (
+            "a UUID, which is not the form this service mints",
+            "59adda79-1d1f-4b1e-9f3a-2c7d5e8a9b01".to_string(),
+        ),
+        ("one digit short of the minted width", "a".repeat(31)),
+        ("one digit past the minted width", "a".repeat(33)),
+        ("the longest token the model allows", "a".repeat(1_020)),
+    ];
+    let well_formed = [
         ("a well-formed token nothing minted", "0".repeat(32)),
+        ("the same, in upper case", "0123456789ABCDEF".repeat(2)),
         ("one character off a real token", altered),
     ];
     let operations = [
@@ -668,13 +692,38 @@ async fn a_retrieval_token_nothing_was_stored_under_is_refused_by_every_operatio
         "/CancelTraceRetrieval",
     ];
 
+    // `TraceFormat` is a member of `ListRetrievedTraces` alone, and that
+    // operation requires it, so the body carries it only there: these rows are
+    // about the token, not about the format.
+    let body = |path: &str, token: &str| -> Value {
+        let mut body = json!({ "RetrievalToken": token });
+        if path == "/ListRetrievedTraces" {
+            body["TraceFormat"] = json!(TRACE_FORMAT_XRAY);
+        }
+        body
+    };
+
     for path in operations {
-        for (case, token) in &tokens {
-            let answer = xray.call(path, &json!({ "RetrievalToken": token })).await;
+        for (case, token) in &malformed {
+            let answer = xray.call(path, &body(path, token)).await;
+            assert_eq!(
+                (answer.status, answer.error_type.as_deref()),
+                (400, Some("InvalidRequestException")),
+                "case {case:?} on {path}: a token that could never have been minted must be refused as an invalid request, got {answer:?}"
+            );
+            assert!(
+                answer
+                    .message()
+                    .is_some_and(|message| message.contains(token.as_str())),
+                "case {case:?} on {path}: the refusal must name the token it could not read, got {answer:?}"
+            );
+        }
+        for (case, token) in &well_formed {
+            let answer = xray.call(path, &body(path, token)).await;
             assert_eq!(
                 (answer.status, answer.error_type.as_deref()),
                 (404, Some("ResourceNotFoundException")),
-                "case {case:?} on {path}: a token no retrieval stands behind must be refused, got {answer:?}"
+                "case {case:?} on {path}: a well-formed token no retrieval stands behind must be refused as not found, got {answer:?}"
             );
         }
     }
@@ -764,13 +813,22 @@ async fn a_retrieval_is_answered_in_the_format_its_spans_were_ingested_in() {
     tokio::time::sleep(completion_wait()).await;
 
     // Rows differ in the requested TraceFormat: the one the stored spans are in,
-    // omitted (which is that same one), and one no stored span exists in.
+    // one no stored span exists in, and the member omitted — which this
+    // operation requires, so it is refused as an invalid request.
     for (case, format, expected_status) in [
-        ("TraceFormat omitted", None, 200),
-        ("the format the spans were ingested in", Some(TRACE_FORMAT_XRAY), 200),
+        (
+            "the format the spans were ingested in",
+            Some(TRACE_FORMAT_XRAY),
+            200,
+        ),
         ("a format no stored span exists in", Some(TRACE_FORMAT_OTEL), 400),
+        ("TraceFormat omitted", None, 400),
     ] {
-        let answer = list_retrieved(&xray, &token, None, format).await;
+        let mut body = json!({ "RetrievalToken": &token });
+        if let Some(format) = format {
+            body["TraceFormat"] = json!(format);
+        }
+        let answer = xray.call("/ListRetrievedTraces", &body).await;
         assert_eq!(
             answer.status, expected_status,
             "case {case:?}: expected HTTP {expected_status}, got {answer:?}"

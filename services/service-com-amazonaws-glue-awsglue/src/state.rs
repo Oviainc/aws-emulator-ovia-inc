@@ -7,6 +7,10 @@
 //! database holds tables. Every handler reads and writes THIS store, so a
 //! `CreateTable` in one request is visible to a `GetTable` in the next.
 //!
+//! Crawlers sit BESIDE that tree, in one per-account namespace keyed by crawler name:
+//! every operation that addresses a crawler does so by name alone, so a crawler's
+//! `CatalogId` says where its output goes, not where the crawler itself lives.
+//!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
 //! lowercase when it is stored") and `TableInput$Name` — and every lookup folds the
@@ -16,8 +20,10 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Column, Database, DatabaseIdentifier, DatabaseInput, FederatedDatabase, FederatedTable,
-    PrincipalPermissions, StorageDescriptor, Table, TableIdentifier, TableInput,
+    Column, Crawler, CrawlerTargets, CreateCrawlerInput, Database, DatabaseIdentifier, DatabaseInput,
+    FederatedDatabase, FederatedTable, LakeFormationConfiguration, LineageConfiguration,
+    PrincipalPermissions, RecrawlPolicy, Schedule, SchemaChangePolicy, StorageDescriptor, Table,
+    TableIdentifier, TableInput,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -37,11 +43,44 @@ pub const MAX_TABLES_PER_DATABASE: usize = 1_000;
 /// let a caller grow the store far past what one process should hold.
 pub const MAX_STORED_TABLES: usize = 10_000;
 
+/// Ceiling on the crawlers this emulator will hold, for the same reason as
+/// [`MAX_DATABASES_PER_CATALOG`]: resident memory bounded against a create any caller
+/// can reach. A create past it is refused with `CreateCrawler`'s own modelled
+/// `ResourceNumberLimitExceededException`.
+pub const MAX_CRAWLERS: usize = 1_000;
+
+/// The `CrawlerState` of a crawler with no run in progress — the state a crawler is in
+/// the moment `CreateCrawler` returns, and the only one this emulator stores until
+/// `StartCrawler`/`StopCrawler` are implemented. One of the modelled `CrawlerState`
+/// values (`READY`, `RUNNING`, `STOPPING`).
+pub const CRAWLER_STATE_READY: &str = "READY";
+
+/// The `Schedule$State` reported for a crawler that carries a cron expression. One of
+/// the modelled `ScheduleState` values (`SCHEDULED`, `NOT_SCHEDULED`,
+/// `TRANSITIONING`); a crawler created WITHOUT a `Schedule` has no schedule object at
+/// all, so `NOT_SCHEDULED` is not reachable from a create alone.
+pub const SCHEDULE_STATE_SCHEDULED: &str = "SCHEDULED";
+
+/// The `Version` a crawler carries straight after `CreateCrawler`, mirroring
+/// [`FIRST_TABLE_VERSION_ID`] for tables: the first version of a resource is 1, and an
+/// update moves it on. The model's `@default` of 0 on `Crawler$Version` is what an
+/// ABSENT long deserializes to, not the version of a stored crawler.
+pub const FIRST_CRAWLER_VERSION: i64 = 1;
+
 /// Per-service state for com-amazonaws-glue-awsglue. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsGlueAwsglueState {
     /// Every Data Catalog this emulator holds, keyed by `CatalogId`.
     pub catalogs: HashMap<String, Catalog>,
+    /// Every crawler this emulator holds, keyed by its name.
+    ///
+    /// Crawlers live BESIDE the catalog tree rather than inside it: `GetCrawler`,
+    /// `DeleteCrawler` and `StartCrawler` address a crawler by name alone, with no
+    /// `CatalogId` member, so the namespace is per account and a crawler's `CatalogId`
+    /// says only where its output goes. The key is the name exactly as sent — unlike
+    /// `DatabaseInput$Name`/`TableInput$Name`, the model documents no case fold for
+    /// `Crawler$Name`.
+    pub crawlers: HashMap<String, CrawlerEntry>,
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -78,6 +117,11 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`MAX_STORED_TABLES`].
     pub fn can_store_table(&self) -> bool {
         self.stored_tables() < MAX_STORED_TABLES
+    }
+
+    /// Whether the store can hold another crawler, i.e. is below [`MAX_CRAWLERS`].
+    pub fn can_store_crawler(&self) -> bool {
+        self.crawlers.len() < MAX_CRAWLERS
     }
 }
 
@@ -267,6 +311,148 @@ impl TableEntry {
             rls_properties: None,
         }
     }
+}
+
+/// A stored crawler.
+///
+/// Every member of the modelled `Crawler` shape that a create can fill is held here, so
+/// a later `GetCrawler` reports what the create stored and nothing else: the members
+/// only a crawl produces (`LastCrawl`, `CrawlElapsedTime`) are not stored, because no
+/// crawl has run.
+#[derive(Debug, Clone)]
+pub struct CrawlerEntry {
+    /// The crawler's name, which is also its key in [`ComAmazonawsGlueAwsglueState::crawlers`].
+    pub name: String,
+    pub role: String,
+    pub targets: CrawlerTargets,
+    pub database_name: Option<String>,
+    pub description: Option<String>,
+    /// The custom classifiers associated with the crawler; empty when the create named
+    /// none, which is the accurate report for a crawler that has no custom classifier.
+    pub classifiers: Vec<String>,
+    pub table_prefix: Option<String>,
+    pub schema_change_policy: Option<SchemaChangePolicy>,
+    pub recrawl_policy: Option<RecrawlPolicy>,
+    pub lineage_configuration: Option<LineageConfiguration>,
+    pub lake_formation_configuration: Option<LakeFormationConfiguration>,
+    pub configuration: Option<String>,
+    pub crawler_security_configuration: Option<String>,
+    /// The cron expression the create supplied, if any. Reported inside a `Schedule`.
+    pub schedule_expression: Option<String>,
+    /// The catalog the crawler writes its output to.
+    pub catalog_id: String,
+    /// One of the modelled `CrawlerState` values; [`CRAWLER_STATE_READY`] at create.
+    pub state: String,
+    /// Server-set version counter, [`FIRST_CRAWLER_VERSION`] for a fresh crawler.
+    pub version: i64,
+    /// Server-set, written once at create so every later read reports the same instant.
+    pub creation_time: SystemTime,
+    /// Server-set; moves with every write to this crawler.
+    pub last_updated: SystemTime,
+    /// The request's `Tags`, which are not part of the `Crawler` shape — they are read
+    /// back through the tagging operations.
+    pub tags: HashMap<String, String>,
+}
+
+impl CrawlerEntry {
+    /// Build a stored crawler from a `CreateCrawler` request plus the server-derived
+    /// members (`State`, `Version`, `CreationTime`, `LastUpdated`), none of which the
+    /// client may set.
+    pub fn from_create_input(
+        input: &CreateCrawlerInput,
+        catalog_id: &str,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            name: input.name.clone(),
+            role: input.role.clone(),
+            targets: input.targets.clone(),
+            database_name: input.database_name.clone(),
+            description: input.description.clone(),
+            classifiers: input.classifiers.clone().unwrap_or_default(),
+            table_prefix: input.table_prefix.clone(),
+            schema_change_policy: input.schema_change_policy.clone(),
+            recrawl_policy: input.recrawl_policy.clone(),
+            lineage_configuration: input.lineage_configuration.clone(),
+            lake_formation_configuration: input.lake_formation_configuration.clone(),
+            configuration: input.configuration.clone(),
+            crawler_security_configuration: input.crawler_security_configuration.clone(),
+            schedule_expression: input.schedule.clone(),
+            catalog_id: catalog_id.to_string(),
+            state: CRAWLER_STATE_READY.to_string(),
+            version: FIRST_CRAWLER_VERSION,
+            creation_time: now,
+            last_updated: now,
+            tags: input.tags.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Rebuild the modelled `Crawler` output shape from what is stored.
+    pub fn to_crawler(&self) -> Crawler {
+        Crawler {
+            name: Some(self.name.clone()),
+            role: Some(self.role.clone()),
+            targets: Some(self.targets.clone()),
+            database_name: self.database_name.clone(),
+            description: self.description.clone(),
+            classifiers: Some(self.classifiers.clone()),
+            recrawl_policy: self.recrawl_policy.clone(),
+            schema_change_policy: self.schema_change_policy.clone(),
+            lineage_configuration: self.lineage_configuration.clone(),
+            state: Some(self.state.clone()),
+            table_prefix: self.table_prefix.clone(),
+            schedule: self.schedule_expression.as_ref().map(|expression| Schedule {
+                schedule_expression: Some(expression.clone()),
+                state: Some(SCHEDULE_STATE_SCHEDULED.to_string()),
+            }),
+            // "If the crawler is running, contains the total time elapsed since the
+            // last crawl began" — nothing has run, so no time has elapsed.
+            crawl_elapsed_time: 0,
+            creation_time: Some(to_date_time(self.creation_time)),
+            last_updated: Some(to_date_time(self.last_updated)),
+            // "Status and error information about the most recent crawl": absent until
+            // a crawl has produced one.
+            last_crawl: None,
+            version: self.version,
+            configuration: self.configuration.clone(),
+            crawler_security_configuration: self.crawler_security_configuration.clone(),
+            lake_formation_configuration: self.lake_formation_configuration.clone(),
+            catalog_id: Some(self.catalog_id.clone()),
+        }
+    }
+}
+
+/// Whether `targets` names at least one data store to crawl, across every target list
+/// `CrawlerTargets` carries. `CreateCrawler` documents that "at least one crawl target
+/// must be specified", and an empty list names none.
+pub fn has_crawl_target(targets: &CrawlerTargets) -> bool {
+    fn any<T>(list: &Option<Vec<T>>) -> bool {
+        list.as_ref().is_some_and(|entries| !entries.is_empty())
+    }
+
+    any(&targets.s3_targets)
+        || any(&targets.jdbc_targets)
+        || any(&targets.mongo_db_targets)
+        || any(&targets.dynamo_db_targets)
+        || any(&targets.catalog_targets)
+        || any(&targets.delta_targets)
+        || any(&targets.iceberg_targets)
+        || any(&targets.hudi_targets)
+}
+
+/// Whether `expression` has the form the service documents for a crawler schedule: a
+/// `cron(..)` expression of six fields ("to run something every day at 12:15 UTC, you
+/// would specify: `cron(15 12 * * ? *)`" — `Schedule$ScheduleExpression`). Only the
+/// form is checked here; the field values are the scheduler's business.
+pub fn is_cron_expression(expression: &str) -> bool {
+    let trimmed = expression.trim();
+    let Some(fields) = trimmed
+        .strip_prefix("cron(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    fields.split_whitespace().count() == 6
 }
 
 /// The `VersionId` a table carries straight after `CreateTable`.

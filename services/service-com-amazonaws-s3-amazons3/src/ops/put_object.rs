@@ -360,8 +360,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //   unretrievable without the key it is not storing).
         // * the Object Lock members decide whether a later delete is allowed; no
         //   retention or hold is emulated.
-        // * `x-amz-tagging` sets the object's tag set, which no implemented operation
-        //   here records or reports (`PutObjectTagging` / `GetObjectTagging` are stubs).
+        // * `x-amz-tagging` sets the object's tag set in the same request as the write,
+        //   as a URL-encoded query string this handler does not parse; the implemented
+        //   path for an object's tags is `PutObjectTagging`, which carries the modelled
+        //   `Tagging` container, so a write carrying the header is refused rather than
+        //   stored with the tag set silently dropped.
         //
         // The checksum members are NOT in this list: a checksum this handler neither
         // computes nor verifies is simply not reported back, so nothing is claimed about
@@ -460,6 +463,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
+            // A write REPLACES the whole object, so the object it replaces takes its tag
+            // set with it: a `PutObject` that carries no tag set leaves none associated
+            // with the key (`x-amz-tagging` is refused above). `PutObjectTagging` is what
+            // associates one afterwards.
+            tags: Vec::new(),
             body: input.body,
         };
 

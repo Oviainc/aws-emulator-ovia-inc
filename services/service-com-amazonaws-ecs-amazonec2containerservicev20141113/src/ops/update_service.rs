@@ -410,6 +410,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let snapshot = stored.clone();
         let daemon = snapshot.scheduling_strategy == crate::state::SCHEDULING_DAEMON;
+        let scheduler_owned = snapshot.places_tasks();
 
         // "You can't change the cluster name" is the same rule for the controller: the
         // deployment controller is chosen when the service is created.
@@ -496,6 +497,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             None
         };
+        // A new deployment rolls out a new service revision.
+        let new_revision_arn = if redeploy {
+            Some(guard.next_service_revision_arn(&region, &cluster_name, &name))
+        } else {
+            None
+        };
+        // The service leaves its steady state whenever the scheduler is given work to
+        // do: a new deployment to roll out, or a task count that is no longer the one it
+        // holds. `Deployment$rolloutState`: the rollout is COMPLETED only "when the
+        // service reaches a steady state", which the clock settles, never this call.
+        let count_changed = input
+            .desired_count
+            .is_some_and(|count| count != snapshot.desired_count);
+        let restarts_rollout = scheduler_owned && (redeploy || count_changed);
 
         let updated_at = crate::state::now();
         let service = guard
@@ -518,8 +533,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if let Some(configuration) = input.deployment_configuration.clone() {
-            service.deployment_configuration =
-                crate::state::deployment_configuration(Some(configuration), daemon);
+            service.deployment_configuration = crate::state::deployment_configuration(
+                Some(configuration),
+                daemon,
+                scheduler_owned,
+            );
         }
         // "For update service requests, when no value is specified for
         // AvailabilityZoneRebalancing, Amazon ECS defaults to the existing service's
@@ -571,6 +589,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(deployment_id) = new_deployment_id {
             service.deployment_id = deployment_id;
             service.deployment_created_at = updated_at;
+        }
+        if let Some(arn) = new_revision_arn {
+            service.service_revision_arn = arn;
+        }
+        if restarts_rollout {
+            service.deployment_steady_due_at = Some(now + crate::state::TRANSITION_SPAN);
         }
         service.deployment_updated_at = updated_at;
 

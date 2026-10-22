@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReleaseLabel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReleaseLabel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one Amazon EMR release of this emulator's release catalog
+//! ([`crate::state::release_label_record`]): the label as the catalog spells it, the
+//! applications that release bundles, and the Amazon Linux releases available for it.
+//! A label the catalog does not offer is refused with the modelled
+//! `InvalidRequestException` (HTTP 400).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReleaseLabel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTING ONLY: the releases a Region offers are facts about the service itself,
+//! not a resource any caller creates, so this handler reads the catalog and writes
+//! nothing — two identical calls answer identically.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +153,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReleaseLabel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReleaseLabelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReleaseLabel"))
+        // The release catalog is a fact about the service, so this operation needs
+        // neither the per-caller store on `self.engine` nor any request metadata.
+        let _ = (ctx, &self.engine);
+
+        // "The target release label to be described" (`ReleaseLabel` doc): there is no
+        // release to describe without one, so a request carrying none names no release.
+        let Some(requested) = input
+            .release_label
+            .as_deref()
+            .filter(|label| !label.is_empty())
+        else {
+            return Err(DescribeReleaseLabelErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some("ReleaseLabel is required.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let Some(record) = crate::state::release_label_record(requested) else {
+            return Err(DescribeReleaseLabelErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!("Invalid release label: {requested}")),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeReleaseLabelOutput {
+            release_label: Some(record.label),
+            applications: Some(record.applications),
+            available_os_releases: Some(record.available_os_releases),
+            // "The pagination token. Reserved for future use. Currently set to null."
+            // (`DescribeReleaseLabelOutput$NextToken` doc.) `MaxResults` carries the
+            // same note on the input, so neither trims nor pages this answer.
+            next_token: None,
+        })
     }
 }
