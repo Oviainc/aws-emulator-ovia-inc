@@ -22,6 +22,13 @@
 //! [`ComplianceInquiry::materialise`] applies from the stored due instant, so a reader
 //! only ever materialises a change the clock had already made due.
 //!
+//! An inquiry also carries the one TAG SET this service persists: `TagResource`,
+//! `UntagResource` and `ListTagsForResource` act on the tags of the resource their
+//! `resourceArn` names, and the only resource an account owns here is an inquiry (see
+//! [`ComAmazonawsArtifactArtifactState::tagged_resource`]), so the tags live on the
+//! inquiry record that `CreateComplianceInquiry` already accepts them with rather than in
+//! a second map beside it.
+//!
 //! An inquiry EXPORT is the second thing a caller creates: `ExportComplianceInquiry`
 //! produces a document from one inquiry, so each call mints an [`InquiryExport`] whose id
 //! the presigned URL it answers with carries.
@@ -203,6 +210,13 @@ pub const SUPPORT_MODE_AI_ONLY: &str = "AI_ONLY";
 
 /// `ReviewType`'s value for a response reviewed by the service's own model.
 pub const REVIEW_TYPE_AI: &str = "AI";
+
+/// How many tags one resource carries at most.
+///
+/// `TagsMap` is modelled `@length(max: 50)` and `ListTagsForResource` reports a resource's
+/// WHOLE tag set in that one map, so a resource holding more tags than the map admits
+/// could not be reported at all: the bound is the resource's, not just one request's.
+pub const TAGS_PER_RESOURCE_LIMIT: usize = 50;
 
 /// The host this emulator publishes report and term documents under. Nothing serves it;
 /// it is the stable location a document URL points at, built from the stored object
@@ -931,6 +945,15 @@ impl ComAmazonawsArtifactArtifactState {
         token
     }
 
+    /// The taggable resource `arn` names, for a WRITE to its tag set, or `None` when this
+    /// account holds no such resource. The read-only counterpart, and which ARNs name a
+    /// resource at all, is [`tagged_resource`](Self::tagged_resource).
+    pub fn tagged_resource_mut(&mut self, resource_arn: &str) -> Option<&mut ComplianceInquiry> {
+        self.inquiries
+            .values_mut()
+            .find(|inquiry| inquiry.arn == resource_arn)
+    }
+
     /// Mint and persist one compliance-inquiry export, returning its id.
     ///
     /// Every call produces a NEW document — that is what exporting is — so the id is
@@ -1270,6 +1293,28 @@ pub fn invalid_token() -> ValidationException {
         message: INVALID_TOKEN_MESSAGE.to_string(),
         reason: REASON_INVALID_TOKEN.to_string(),
         field_list: None,
+    }
+}
+
+/// The modelled `ValidationException` for a tag write that would leave a resource holding
+/// more tags than [`TAGS_PER_RESOURCE_LIMIT`].
+///
+/// `ValidationExceptionReason`'s `fieldValidationFailed`, naming `tags` in the field list:
+/// the member the service refused is the one the request carried the tags in, and the
+/// clause states the requirement — the limit, and the count the write would have left
+/// behind — rather than echoing the tags back at the caller.
+pub fn too_many_tags(total: usize) -> ValidationException {
+    let message = format!(
+        "a resource holds at most {TAGS_PER_RESOURCE_LIMIT} tags; this request would leave it \
+         with {total}"
+    );
+    ValidationException {
+        message: message.clone(),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "tags".to_string(),
+            message,
+        }]),
     }
 }
 
