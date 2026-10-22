@@ -222,6 +222,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // GuardDuty reads the account's data through its own service-linked
             // role; the account id and partition come from `engine::emulator_arn`.
             service_role: ::engine::emulator_arn("iam", "", GUARDDUTY_SERVICE_LINKED_ROLE),
+            // Malware Protection reads through its OWN service-linked role, under
+            // its own service principal.
+            malware_protection_service_role: ::engine::emulator_arn(
+                "iam",
+                "",
+                MALWARE_PROTECTION_SERVICE_LINKED_ROLE,
+            ),
             finding_publishing_frequency: Some(
                 input
                     .finding_publishing_frequency
@@ -266,6 +273,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// reports.
 const GUARDDUTY_SERVICE_LINKED_ROLE: &str =
     "role/aws-service-role/guardduty.amazonaws.com/AWSServiceRoleForAmazonGuardDuty";
+
+/// The resource portion of the Malware Protection service-linked role, the value
+/// `DataSources.MalwareProtection.ServiceRole` reports. Malware Protection runs
+/// under its own service principal (`malware-protection.guardduty.amazonaws.com`),
+/// so this is a different role from [`GUARDDUTY_SERVICE_LINKED_ROLE`] — the model
+/// calls it "The GuardDuty Malware Protection service role"
+/// (`smithy_query(shape="MalwareProtectionConfigurationResult")`).
+const MALWARE_PROTECTION_SERVICE_LINKED_ROLE: &str = "role/aws-service-role/malware-protection.guardduty.amazonaws.com/AWSServiceRoleForAmazonGuardDutyMalwareProtection";
 
 /// The publishing frequency a detector gets when the request names none. AWS
 /// documents SIX_HOURS as the cadence a new detector exports findings on; the
