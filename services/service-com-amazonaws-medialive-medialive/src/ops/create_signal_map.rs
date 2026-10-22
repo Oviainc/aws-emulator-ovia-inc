@@ -256,24 +256,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             event_bridge_rule_template_group_ids.push(group.id.clone());
         }
 
-        // An alarm template group, on the other hand, cannot exist here:
-        // `CreateCloudWatchAlarmTemplateGroup` is still a scaffold (HTTP 501), so
-        // nothing has ever created one and every identifier is unresolvable. The
-        // honest answer is this operation's modelled `NotFoundException`, not a
-        // response carrying group ids nothing created.
-        if let Some(identifier) = input
+        // A cloudwatch alarm template group resolves on exactly the same terms:
+        // `GetCloudWatchAlarmTemplateGroup`'s `Identifier` is also "its id or
+        // current name", so the signal map records the id of the group it
+        // resolved and an identifier naming no stored group is refused rather
+        // than answered with group ids nothing created.
+        let mut cloud_watch_alarm_template_group_ids: Vec<String> = Vec::new();
+        for identifier in input
             .cloud_watch_alarm_template_group_identifiers
             .iter()
             .flatten()
-            .next()
         {
-            return Err(CreateSignalMapErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message(
-                    "CloudWatch alarm template group",
-                    identifier,
-                )),
-            })
-            .into());
+            let group = state
+                .alarm_template_group(&region, identifier)
+                .ok_or_else(|| {
+                    CreateSignalMapErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(crate::state::not_found_message(
+                            "CloudWatch alarm template group",
+                            identifier,
+                        )),
+                    })
+                })?;
+            cloud_watch_alarm_template_group_ids.push(group.id.clone());
         }
 
         // `Name` is documented as unique "within the scope of a resource type in
@@ -320,6 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         signal_map.description = input.description;
         signal_map.tags = input.tags.unwrap_or_default();
         signal_map.event_bridge_rule_template_group_ids = event_bridge_rule_template_group_ids;
+        signal_map.cloud_watch_alarm_template_group_ids = cloud_watch_alarm_template_group_ids;
 
         state.signal_maps.insert(id.clone(), signal_map);
         if let Some(token) = input.request_id {

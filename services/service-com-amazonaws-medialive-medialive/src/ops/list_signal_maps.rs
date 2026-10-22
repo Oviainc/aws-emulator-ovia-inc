@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSignalMaps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSignalMaps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSignalMaps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +144,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSignalMaps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSignalMapsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSignalMaps"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        // A template group belongs to the region it was created in, so a group
+        // identifier this request filters by resolves in the region the request
+        // was signed for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to a finite ceiling, and an absent one
+        // uses that ceiling, so no single request can ask the service to project
+        // an unbounded number of signal maps in one response.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(ListSignalMapsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(format!("maxResults must be at least 1, got {max_results}")),
+                })
+                .into());
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises transitions the clock already made
+        // due, so a signal map whose discovery has come due is listed as
+        // `CREATE_COMPLETE` rather than still in progress.
+        state.settle(::std::time::SystemTime::now());
+
+        // A group identifier narrows the listing to the signal maps associated
+        // with THAT group, so it is resolved to a stored group's id first — by
+        // id or by current name, the two forms a group `Identifier` documents.
+        // An identifier naming no stored group names no set of signal maps at
+        // all, which is this operation's modelled `NotFoundException` (the only
+        // resolution this operation performs, and so the only thing its 404 can
+        // report).
+        let alarm_group_id = match input
+            .cloud_watch_alarm_template_group_identifier
+            .as_deref()
+        {
+            Some(identifier) => Some(
+                state
+                    .alarm_template_group(&region, identifier)
+                    .ok_or_else(|| group_not_found("CloudWatch alarm template group", identifier))?
+                    .id
+                    .clone(),
+            ),
+            None => None,
+        };
+        let rule_group_id = match input
+            .event_bridge_rule_template_group_identifier
+            .as_deref()
+        {
+            Some(identifier) => Some(
+                state
+                    .event_bridge_rule_template_group(&region, identifier)
+                    .ok_or_else(|| {
+                        group_not_found("EventBridge rule template group", identifier)
+                    })?
+                    .id
+                    .clone(),
+            ),
+            None => None,
+        };
+
+        let state = &*state;
+
+        // `NextToken` is the id the next page starts at, and ids sort in mint
+        // order in the `BTreeMap`, so resuming is a range scan from that id. A
+        // token naming a signal map deleted since the previous page simply
+        // resumes at the next surviving id instead of failing.
+        let first = match input.next_token.as_deref() {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = state
+            .signal_maps
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
+            .filter(|(_, map)| {
+                // Every filter the request named must hold, so naming both
+                // narrows the listing to the signal maps associated with both
+                // groups.
+                alarm_group_id
+                    .as_ref()
+                    .is_none_or(|id| map.cloud_watch_alarm_template_group_ids.contains(id))
+                    && rule_group_id
+                        .as_ref()
+                        .is_none_or(|id| map.event_bridge_rule_template_group_ids.contains(id))
+            });
+
+        let signal_maps: Vec<SignalMapSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, map)| state.signal_map_summary(map))
+            .collect();
+        // Absent on the last page: a token is handed out only when a signal map
+        // the filters admit is left over after this one.
+        let next_token = remaining.next().map(|(id, _)| id.clone());
+
+        Ok(ListSignalMapsOutput {
+            signal_maps: Some(signal_maps),
+            next_token,
+        })
     }
+}
+
+/// The request filtered by a template group that does not exist in the region it
+/// was signed for, so the filter names no set of signal maps.
+fn group_not_found(resource_type: &str, identifier: &str) -> ListSignalMapsError {
+    ListSignalMapsErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::not_found_message(resource_type, identifier)),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to list the signal maps from. A modelled server error,
+/// never a fresh engine (which would answer from an empty private store).
+fn unavailable() -> ListSignalMapsError {
+    ListSignalMapsErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

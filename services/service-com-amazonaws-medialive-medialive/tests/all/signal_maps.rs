@@ -635,11 +635,11 @@ async fn repeated_creates_and_unresolvable_group_identifiers_are_refused() {
     }
 
     // A group identifier resolves against the groups this store really holds:
-    // an eventbridge rule template group can be created here, so a signal map
-    // may name one by id or by current name, and the response reports the
-    // RESOLVED id. An alarm template group cannot exist
-    // (`CreateCloudWatchAlarmTemplateGroup` is still a scaffold), so every
-    // identifier of one is unresolvable.
+    // both template-group creates are implemented here, so a signal map may
+    // name a group by id or by current name and the response reports the
+    // RESOLVED id, while an identifier naming no stored group of that type is
+    // unresolvable. The alarm side of that rule is covered over a store that
+    // really holds alarm groups by `signal_map_listing`.
     let (status, group) = call(
         &router,
         "POST",

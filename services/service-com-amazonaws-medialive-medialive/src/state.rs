@@ -54,8 +54,8 @@ use crate::ops::types::{
     MulticastSettingsCreateRequest, MulticastSource, OutputDestination, PipelineDetail,
     RouterDestination, RouterInputSettings, RouterSettings, SdiSource, SdiSourceSummary,
     Smpte2110ReceiverGroupSettings, SrtCallerDecryption, SrtCallerSource,
-    SrtListenerDecryption, SrtListenerSettings, SrtSettings, SrtSettingsRequest,
-    SuccessfulMonitorDeployment,
+    SignalMapSummary, SrtListenerDecryption, SrtListenerSettings, SrtSettings,
+    SrtSettingsRequest, SuccessfulMonitorDeployment,
     VpcOutputSettings, VpcOutputSettingsDescription,
 };
 
@@ -130,6 +130,21 @@ pub mod channel_class {
 pub mod signal_map_status {
     pub const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
     pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+}
+
+/// The `SignalMapMonitorDeploymentStatus` value this slice uses, spelled exactly
+/// as the model declares it (`smithy_query(query="shape",
+/// shape="SignalMapMonitorDeploymentStatus")`: NOT_DEPLOYED |
+/// DRY_RUN_DEPLOYMENT_COMPLETE | DRY_RUN_DEPLOYMENT_FAILED |
+/// DRY_RUN_DEPLOYMENT_IN_PROGRESS | DEPLOYMENT_COMPLETE | DEPLOYMENT_FAILED |
+/// DEPLOYMENT_IN_PROGRESS | DELETE_COMPLETE | DELETE_FAILED |
+/// DELETE_IN_PROGRESS).
+///
+/// Only `NOT_DEPLOYED` is reachable here: a monitor deployment is started by
+/// `StartMonitorDeployment`, which is still a scaffold, so no signal map this
+/// store holds has ever had one.
+pub mod signal_map_monitor_deployment_status {
+    pub const NOT_DEPLOYED: &str = "NOT_DEPLOYED";
 }
 
 /// The `InputSecurityGroupState` enum values, spelled exactly as the model
@@ -1367,12 +1382,15 @@ impl ComAmazonawsMedialiveMedialiveState {
         let discovered = map.status == signal_map_status::CREATE_COMPLETE;
         Some(SignalMapDescription {
             arn: Some(map.arn.clone()),
-            // ABSENT, not empty: `CloudWatchAlarmTemplateGroupIds` reports the
-            // alarm template groups the signal map is associated with, and
-            // `CreateSignalMap` refuses a request naming any (no alarm template
-            // group can exist here — `CreateCloudWatchAlarmTemplateGroup` is
-            // still a scaffold), so there is no association to report.
-            cloud_watch_alarm_template_group_ids: None,
+            // The ids of the cloudwatch alarm template groups the create
+            // resolved, or ABSENT when the request named none — absent rather
+            // than empty, because `CloudWatchAlarmTemplateGroupIds` reports the
+            // groups the signal map is associated with and an association the
+            // request never asked for is not an empty list of associations.
+            cloud_watch_alarm_template_group_ids: (!map
+                .cloud_watch_alarm_template_group_ids
+                .is_empty())
+                .then(|| map.cloud_watch_alarm_template_group_ids.clone()),
             // The ids of the eventbridge rule template groups the create
             // resolved, or ABSENT when the request named none.
             event_bridge_rule_template_group_ids: (!map
@@ -1405,6 +1423,31 @@ impl ComAmazonawsMedialiveMedialiveState {
             tags: Some(map.tags.clone()),
         })
     }
+
+    /// The `SignalMapSummary` projection of one stored signal map, as
+    /// `ListSignalMaps` reports it.
+    ///
+    /// Every member is read off the stored record or derived from it, exactly as
+    /// [`Self::signal_map_description`] reads the same record for the flat
+    /// outputs: the summary is one view of one signal map, so the two cannot
+    /// disagree about its `Status`, its timestamps or its tags.
+    pub fn signal_map_summary(&self, map: &SignalMapRecord) -> SignalMapSummary {
+        SignalMapSummary {
+            arn: map.arn.clone(),
+            created_at: timestamp(map.created_at),
+            description: map.description.clone(),
+            id: map.id.clone(),
+            modified_at: Some(timestamp(map.modified_at)),
+            // No monitor has ever been deployed for a signal map in this
+            // emulator (`StartMonitorDeployment` is still a scaffold), which is
+            // what `NOT_DEPLOYED` reports.
+            monitor_deployment_status: signal_map_monitor_deployment_status::NOT_DEPLOYED
+                .to_string(),
+            name: map.name.clone(),
+            status: map.status.clone(),
+            tags: Some(map.tags.clone()),
+        }
+    }
 }
 
 /// One created signal map, as `CreateSignalMap` stored it plus the graph its
@@ -1420,6 +1463,9 @@ pub struct SignalMapRecord {
     /// the identifiers the request named — ids this store holds, never the
     /// identifiers themselves.
     pub event_bridge_rule_template_group_ids: Vec<String>,
+    /// The ids of the cloudwatch alarm template groups the create resolved, on
+    /// the same terms as the eventbridge ones beside them.
+    pub cloud_watch_alarm_template_group_ids: Vec<String>,
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
     /// Updated when the signal map changes — which, for a signal map nothing
@@ -1536,6 +1582,7 @@ pub fn new_signal_map(
         description: None,
         discovery_entry_point_arn,
         event_bridge_rule_template_group_ids: Vec::new(),
+        cloud_watch_alarm_template_group_ids: Vec::new(),
         tags: HashMap::new(),
         created_at: now,
         modified_at: now,
