@@ -19,6 +19,8 @@ mod external_connection;
 mod package_group_hierarchy;
 #[path = "all/package_listing.rs"]
 mod package_listing;
+#[path = "all/package_version_publish.rs"]
+mod package_version_publish;
 #[path = "all/repository_endpoint.rs"]
 mod repository_endpoint;
 #[path = "all/repository_permissions_policy.rs"]
