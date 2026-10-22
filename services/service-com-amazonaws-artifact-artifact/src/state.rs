@@ -36,8 +36,8 @@ use std::time::{Duration, SystemTime};
 use smithy_server_runtime::Violation;
 
 use crate::ops::types::{
-    ConflictException, CustomerAgreementSummary, InquiryDetail, InquirySummary, ReportDetail,
-    ReportSummary, ResourceNotFoundException, ValidationException,
+    ConflictException, CustomerAgreementSummary, InquiryDetail, InquirySummary, QuerySummary,
+    ReportDetail, ReportSummary, ResourceNotFoundException, ValidationException,
 };
 
 /// The region a report ARN names when the request carries no SigV4 credential scope to
@@ -419,6 +419,28 @@ pub struct InquiryQuery {
     /// One of `QueryStatusMessage`'s values.
     pub status_message: String,
     pub created_at: SystemTime,
+}
+
+impl InquiryQuery {
+    /// The `QuerySummary` projection `ListComplianceInquiryQueries` reports.
+    ///
+    /// `citations` and `updatedResponseVersions` are absent rather than empty: a citation
+    /// supports a GENERATED response and a response version records an EDIT to one, and
+    /// this query has no response at all (see [`InquiryQuery::response`]), so there is
+    /// nothing to cite and no version history to report.
+    pub fn to_summary(&self) -> QuerySummary {
+        QuerySummary {
+            query_identifier: self.identifier,
+            query: self.query.clone(),
+            response: self.response.clone(),
+            review_type: self.review_type.clone(),
+            citations: None,
+            status: self.status.clone(),
+            status_message: self.status_message.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_response_versions: None,
+        }
+    }
 }
 
 /// One compliance inquiry a caller created, as this emulator persists it.
@@ -834,28 +856,68 @@ pub fn is_inquiry_id(value: &str) -> bool {
     suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// The separator a `ListReportVersions` pagination token joins its report id and its
-/// resume version with. `:` is a query-safe sub-delimiter, and it cannot appear in a
-/// `ReportId`, so the split is unambiguous.
-const VERSIONS_TOKEN_SEPARATOR: char = ':';
+/// The separator a SCOPED pagination token — one cut for the sub-collection of ONE
+/// resource, as `ListReportVersions` and `ListComplianceInquiryQueries` both serve —
+/// joins the owning resource's id and the resume point with. `:` is a query-safe
+/// sub-delimiter, and it cannot appear in a `ReportId` or an `InquiryId`, so the split is
+/// unambiguous.
+const SCOPED_TOKEN_SEPARATOR: char = ':';
+
+/// The scoped pagination token that resumes the sub-collection of `scope` at `resume_at`.
+///
+/// ONE spelling for every scoped token this service issues, so the two paginated
+/// sub-collections cannot drift apart: the token carries the resource it was cut for, not
+/// just an offset, which is what stops a token issued for one resource being spent as a
+/// resume point on another and a number a client made up being mistaken for a token the
+/// service issued.
+fn scoped_token<T: ::std::fmt::Display>(scope: &str, resume_at: T) -> String {
+    format!("{scope}{SCOPED_TOKEN_SEPARATOR}{resume_at}")
+}
+
+/// The resume point a scoped token names, when it is a token THIS service issued for
+/// `scope`. `None` for anything else — a token cut for another resource, a value that is
+/// not a resume point at all, or one below the first position the sub-collection numbers
+/// from (every sequence this service pages is 1-based).
+fn parse_scoped_token<T>(token: &str, scope: &str) -> Option<T>
+where
+    T: ::std::str::FromStr + PartialOrd + From<u8>,
+{
+    let (id, resume_at) = token.split_once(SCOPED_TOKEN_SEPARATOR)?;
+    if id != scope {
+        return None;
+    }
+    resume_at
+        .parse::<T>()
+        .ok()
+        .filter(|resume_at| *resume_at >= T::from(1u8))
+}
 
 /// The `ListReportVersions` pagination token that resumes `report_id` at `version`.
-///
-/// The token carries the report it was cut for, not just an offset, so a token issued for
-/// one report cannot be spent as a resume point on another and a number a client made up
-/// is not mistaken for a token the service issued.
 pub fn report_versions_token(report_id: &str, version: i64) -> String {
-    format!("{report_id}{VERSIONS_TOKEN_SEPARATOR}{version}")
+    scoped_token(report_id, version)
 }
 
 /// The version a `ListReportVersions` token resumes at, when it is a token THIS service
 /// issued for `report_id`. `None` for anything else.
 pub fn parse_report_versions_token(token: &str, report_id: &str) -> Option<i64> {
-    let (id, version) = token.split_once(VERSIONS_TOKEN_SEPARATOR)?;
-    if id != report_id {
-        return None;
-    }
-    version.parse::<i64>().ok().filter(|version| *version >= 1)
+    parse_scoped_token(token, report_id)
+}
+
+/// The `ListComplianceInquiryQueries` pagination token that resumes `inquiry_id` at
+/// `identifier`.
+///
+/// Scoped to the inquiry it was cut for, for the same reason as
+/// [`report_versions_token`]: a query identifier is a small sequential number, so an
+/// unscoped token would be indistinguishable from one a client made up, and a token issued
+/// for one inquiry would be spendable as a resume point on another.
+pub fn inquiry_queries_token(inquiry_id: &str, identifier: i32) -> String {
+    scoped_token(inquiry_id, identifier)
+}
+
+/// The `queryIdentifier` a `ListComplianceInquiryQueries` token resumes at, when it is a
+/// token THIS service issued for `inquiry_id`. `None` for anything else.
+pub fn parse_inquiry_queries_token(token: &str, inquiry_id: &str) -> Option<i32> {
+    parse_scoped_token(token, inquiry_id)
 }
 
 /// The `ResourceNotFoundException` payload for a report id the catalog does not hold.
