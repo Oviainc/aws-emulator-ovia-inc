@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForDeliveryStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForDeliveryStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForDeliveryStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags the named stream carries in [`crate::state`], in key order, honouring
+//! `ExclusiveStartTagKey` and `Limit` and reporting whether any tag was left over.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForDeliveryStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForDeliveryStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForDeliveryStream"))
+        // Mounted on an engine that holds no state this service can reach. Unreachable
+        // through the router, which mounts every service on one shared `InMemoryEngine`,
+        // and this operation models no server-side error to report it with.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListTagsForDeliveryStream",
+            ));
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        // Reporting only: this applies the transitions the clock has ALREADY made due
+        // (`CREATING` -> `ACTIVE`, the removal of a deleted stream), which were owed at
+        // this instant whether or not anybody listed the stream's tags.
+        store.materialise_due(::std::time::SystemTime::now());
+
+        let Some(stream) = store.streams.get(&input.delivery_stream_name) else {
+            return Err(
+                ListTagsForDeliveryStreamErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Firehose stream {} not found",
+                            input.delivery_stream_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "If you set this parameter, ListTagsForDeliveryStream gets all tags that occur
+        // after ExclusiveStartTagKey" — the tag register is key-ordered, so the page is a
+        // prefix of what follows that key.
+        let start_after = input.exclusive_start_tag_key.as_deref();
+        // "The number of tags to return. If this number is less than the total number of
+        // tags associated with the Firehose stream, HasMoreTags is set to true."
+        let limit = input
+            .limit
+            .map_or(MAX_TAGS_PER_PAGE, |limit| {
+                usize::try_from(limit).unwrap_or(0)
+            })
+            .min(MAX_TAGS_PER_PAGE);
+
+        let mut remaining = stream
+            .tags
+            .iter()
+            .filter(|(key, _)| start_after.is_none_or(|start| key.as_str() > start));
+        let tags: Vec<Tag> = remaining
+            .by_ref()
+            .take(limit)
+            .map(|(key, value)| Tag {
+                key: key.clone(),
+                value: Some(value.clone()),
+            })
+            .collect();
+        // "If this is true in the response, more tags are available" — so look only for
+        // whether a further tag exists rather than materialising the rest of them.
+        let has_more_tags = remaining.next().is_some();
+
+        Ok(ListTagsForDeliveryStreamOutput {
+            tags,
+            has_more_tags,
+        })
     }
 }
+
+/// The most tags one response carries.
+///
+/// `Limit` has no documented default, and the modelled
+/// `ListTagsForDeliveryStreamOutputTagList` holds at most 50 entries — the same ceiling as
+/// `Limit`'s own range and as the tag list a create may supply — so a call that names no
+/// `Limit` reports every remaining tag up to that modelled maximum.
+const MAX_TAGS_PER_PAGE: usize = 50;

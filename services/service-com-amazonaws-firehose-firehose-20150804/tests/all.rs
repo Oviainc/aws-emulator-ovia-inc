@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/delivery_stream_lifecycle.rs"]
 mod delivery_stream_lifecycle;
+#[path = "all/delivery_stream_tags.rs"]
+mod delivery_stream_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
