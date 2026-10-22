@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteChangeSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteChangeSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteChangeSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: drops the named change set from this service's store, so a later
+//! `DescribeChangeSet` for it answers the modelled 404. Deleting a change set that is not
+//! there succeeds and changes nothing — the model declares no not-found error for this
+//! operation, and the request asks for a state the store is already in — and so does
+//! deleting one that has already been executed, which the recorded CloudFormation
+//! responses answer 200 for. The stack the change set described is never touched: deleting
+//! a change set discards a plan, not a stack.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +141,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteChangeSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteChangeSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteChangeSet"))
+        let _ = ctx;
+        // "If you specified the name of a change set to delete, specify the stack name ...
+        // associated with it": only an ARN names a change set on its own.
+        crate::state::require_stack_for_change_set_name(
+            &input.change_set_name,
+            input.stack_name.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no change set to delete, and
+            // nothing was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteChangeSet",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // Deleting a change set that is not addressable is a no-op that succeeds: the
+        // model declares no not-found error here, and the request asks for a state the
+        // store is already in.
+        let Some(change_set) = store
+            .resolve_change_set(&input.change_set_name, input.stack_name.as_deref())
+        else {
+            return Ok(DeleteChangeSetOutput {});
+        };
+        // A change set being executed is being applied to the stack, so the plan is no
+        // longer anyone's to discard: that is the case `InvalidChangeSetStatusException`
+        // documents. A change set whose execution has COMPLETED is deletable — the
+        // recorded CloudFormation responses answer 200 for one.
+        if change_set.execution_status == crate::state::execution_status::EXECUTE_IN_PROGRESS {
+            return Err(
+                DeleteChangeSetErrorModeled::InvalidChangeSetStatusException(
+                    InvalidChangeSetStatusException {
+                        message: Some(format!(
+                            "ChangeSet [{}] cannot be deleted while its execution status is \
+                             [{}]",
+                            change_set.change_set_id, change_set.execution_status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let change_set_id = change_set.change_set_id.clone();
+        store
+            .change_sets
+            .retain(|candidate| candidate.change_set_id != change_set_id);
+
+        Ok(DeleteChangeSetOutput {})
     }
 }

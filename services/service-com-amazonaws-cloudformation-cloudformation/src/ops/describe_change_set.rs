@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeChangeSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeChangeSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reads back the change set `CreateChangeSet` persisted — its stack, type,
+//! description, parameters, tags, capabilities, notification topics, creation time, status
+//! and execution status — together with the resource-level `Changes` computed when it was
+//! created, one bounded page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeChangeSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A change set is addressed by its ARN, or by name plus the stack it belongs to; neither
+//! resolving one answers the modelled 404. Members this emulator has nothing to report for
+//! are absent rather than invented: `ParentChangeSetId`/`RootChangeSetId` (nested stacks are
+//! not implemented) and a change's `Replacement`, which would need the resource schemas
+//! this emulator does not carry. A change's `Details` — the property-level evaluation
+//! behind it, which needs those same schemas — is reported as the empty list
+//! CloudFormation carries on a change that has none.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +147,42 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::StoredResourceChange;
+
+/// One stored change as the modelled `Change` shape.
+///
+/// `Type` is the model's only `ChangeType` value: a change set here describes resources.
+/// `PhysicalResourceId` is the id of the resource the change acts on, for a change to one
+/// the stack has already deployed. `Scope` and `Details` are reported, empty where the
+/// change has none: `Scope` is the set of the resource's template attributes the two
+/// templates declare differently — empty for an addition or a removal, which change the
+/// whole resource — and `Details` is the property-level evaluation behind the change, which
+/// needs the resource schemas this emulator does not carry. `Replacement` — whether the
+/// change forces the resource to be recreated — needs those same schemas and is absent
+/// rather than invented.
+fn change_view(stored: &StoredResourceChange) -> Change {
+    Change {
+        r#type: Some(crate::state::CHANGE_TYPE_RESOURCE.to_string()),
+        hook_invocation_count: None,
+        resource_change: Some(ResourceChange {
+            policy_action: None,
+            action: Some(stored.action.clone()),
+            logical_resource_id: Some(stored.logical_resource_id.clone()),
+            physical_resource_id: stored.physical_resource_id.clone(),
+            resource_type: Some(stored.resource_type.clone()),
+            replacement: None,
+            scope: Some(stored.scope.clone()),
+            resource_drift_status: None,
+            resource_drift_ignored_attributes: None,
+            details: Some(Vec::new()),
+            change_set_id: None,
+            module_info: None,
+            before_context: None,
+            after_context: None,
+            previous_deployment_context: None,
+        }),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -213,18 +252,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeChangeSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeChangeSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeChangeSet"))
+        let _ = ctx;
+        // "If you specify the name of a change set, you must also specify the stack name":
+        // only an ARN names a change set on its own.
+        crate::state::require_stack_for_change_set_name(
+            &input.change_set_name,
+            input.stack_name.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no change set store to read, so
+            // this answers 501 rather than an empty, truthful-looking change set.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeChangeSet",
+            ));
+        };
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due, which was owed whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        let change_set = store
+            .resolve_change_set(&input.change_set_name, input.stack_name.as_deref())
+            .ok_or_else(|| {
+                DescribeChangeSetError::from(
+                    DescribeChangeSetErrorModeled::ChangeSetNotFoundException(
+                        ChangeSetNotFoundException {
+                            message: Some(crate::state::change_set_does_not_exist(
+                                &input.change_set_name,
+                            )),
+                        },
+                    ),
+                )
+            })?;
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Changes)`: one
+        // response carries one bounded page of changes, and the token resumes just past it.
+        let (changes, next_token) = crate::state::paginate(
+            crate::state::PageOf::Changes,
+            change_set.changes.iter().map(change_view).collect(),
+            input.next_token.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(DescribeChangeSetOutput {
+            change_set_name: Some(change_set.change_set_name.clone()),
+            change_set_id: Some(change_set.change_set_id.clone()),
+            stack_id: Some(change_set.stack_id.clone()),
+            stack_name: Some(change_set.stack_name.clone()),
+            description: change_set.description.clone(),
+            parameters: crate::state::parameter_views(&change_set.parameters),
+            creation_time: Some(crate::state::timestamp(change_set.creation_time)),
+            execution_status: Some(change_set.execution_status.clone()),
+            status: Some(change_set.status.clone()),
+            status_reason: change_set.status_reason.clone(),
+            // Drift detection has never run against the stack this change set is for,
+            // which is what `NOT_CHECKED` reports (as `DescribeStacks` does).
+            stack_drift_status: Some(crate::state::DRIFT_STATUS_NOT_CHECKED.to_string()),
+            // `NotificationARNs`, `RollbackConfiguration` and `Capabilities` are carried on
+            // every change set CloudFormation describes, empty for a request that named
+            // none of them — which is what the recorded responses show, so an empty one is
+            // reported as empty rather than omitted. `Tags` is NOT among them: the recorded
+            // responses omit it for a change set with no tags, so it keeps the
+            // absent-when-empty form.
+            notification_ar_ns: Some(change_set.notification_arns.clone()),
+            rollback_configuration: crate::state::rollback_configuration_in_force(
+                change_set.rollback_configuration.as_ref(),
+            ),
+            capabilities: Some(change_set.capabilities.clone()),
+            tags: crate::state::tag_views(&change_set.tags),
+            changes: Some(changes),
+            next_token,
+            include_nested_stacks: Some(change_set.include_nested_stacks),
+            parent_change_set_id: None,
+            root_change_set_id: None,
+            on_stack_failure: change_set.on_stack_failure.clone(),
+            import_existing_resources: Some(change_set.import_existing_resources),
+            deployment_mode: change_set.deployment_mode.clone(),
+            deployment_config: crate::state::deployment_config_in_force(
+                change_set.deployment_config.as_ref(),
+            ),
+        })
     }
 }

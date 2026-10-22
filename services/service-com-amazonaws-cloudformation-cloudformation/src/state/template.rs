@@ -298,6 +298,12 @@ pub struct DeclaredResource {
     pub resource_type: String,
     /// `Properties`, with intrinsic functions still unevaluated.
     pub properties: Value,
+    /// The WHOLE resource object the template declares, `Type` and every other
+    /// `ResourceAttribute` (`Metadata`, `DeletionPolicy`, `UpdatePolicy`, …) included.
+    ///
+    /// A deployment only needs the type and the properties; comparing two templates needs
+    /// the rest, because `ResourceChange$Scope` names the resource ATTRIBUTES that differ.
+    pub declaration: Value,
 }
 
 /// One output a template declares, as the template spells it.
@@ -402,6 +408,7 @@ fn template_of(document: &Value) -> Option<Template> {
                     .get("Properties")
                     .cloned()
                     .unwrap_or(Value::Null),
+                declaration: declaration.clone(),
             });
         }
     }

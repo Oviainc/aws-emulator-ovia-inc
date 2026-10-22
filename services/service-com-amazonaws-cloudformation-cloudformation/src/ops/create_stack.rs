@@ -185,70 +185,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{status, StoredParameter, StoredStack};
+use crate::state::{status, StoredStack};
 
 /// The `OnFailure` value that means the same thing as `DisableRollback=true` (the model
 /// documents the two as alternative spellings: "You can specify either OnFailure or
 /// DisableRollback, but not both").
 const ON_FAILURE_DO_NOTHING: &str = "DO_NOTHING";
 
-/// `CreateStackInput$StackName`'s documented rule: "A stack name can contain only
-/// alphanumeric characters (case sensitive) and hyphens. It must start with an
-/// alphabetical character and can't be longer than 128 characters." The model carries no
-/// `@pattern` or `@length` for `StackName`, so the handler is what enforces it.
-const STACK_NAME_PATTERN: &str = "[a-zA-Z][-a-zA-Z0-9]*";
-const STACK_NAME_MAX_LEN: usize = 128;
-
-/// `Err(message)` naming the member and the constraint the name fails, in the form the
-/// service's own input validation words it.
-fn validate_stack_name(name: &str) -> Result<(), String> {
-    if name.len() > STACK_NAME_MAX_LEN {
-        return Err(format!(
-            "1 validation error detected: Value '{name}' at 'stackName' failed to satisfy \
-             constraint: Member must have length less than or equal to {STACK_NAME_MAX_LEN}"
-        ));
-    }
-    let well_formed = name.starts_with(|c: char| c.is_ascii_alphabetic())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-    if !well_formed {
-        return Err(format!(
-            "1 validation error detected: Value '{name}' at 'stackName' failed to satisfy \
-             constraint: Member must satisfy regular expression pattern: {STACK_NAME_PATTERN}"
-        ));
-    }
-    Ok(())
-}
-
-/// Resolve the request's `Parameters` into the key/value pairs the stack stores.
-///
-/// `Parameter$UsePreviousValue` is a stack-UPDATE instruction ("During a stack update,
-/// use the existing parameter value that the stack is using for a given parameter
-/// key"), so a create that asks for it has no previous value to use and is refused
-/// rather than silently storing an empty one.
-fn resolved_parameters(parameters: &[Parameter]) -> Result<Vec<StoredParameter>, String> {
-    parameters
-        .iter()
-        .map(|parameter| {
-            let key = parameter
-                .parameter_key
-                .clone()
-                .filter(|key| !key.is_empty())
-                .ok_or_else(|| {
-                    "Parameters: every parameter must have a ParameterKey".to_string()
-                })?;
-            if parameter.use_previous_value == Some(true) {
-                return Err(format!(
-                    "Parameters: [{key}] cannot use the previous value: the stack does not exist yet"
-                ));
-            }
-            let value = parameter
-                .parameter_value
-                .clone()
-                .ok_or_else(|| format!("Parameters: [{key}] must have values"))?;
-            Ok(StoredParameter { key, value })
-        })
-        .collect()
-}
+// `CreateStackInput$StackName`'s documented rule lives in
+// `crate::state::validate_stack_name`, which `CreateChangeSet` holds a new stack's name
+// to as well; `Parameters` are resolved by the shared
+// `crate::state::merged_parameters`.
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -361,13 +308,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "CreateStack with StackPolicyURL (fetching a stack policy from Amazon S3)",
             ));
         }
-        validate_stack_name(&input.stack_name)
+        crate::state::validate_stack_name(&input.stack_name)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // The documented `TemplateBody` maximum, which the model carries no `@length` for:
         // a stored body is caller-sized otherwise.
         crate::state::validate_template_body(&template_body)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-        let parameters = resolved_parameters(input.parameters.as_deref().unwrap_or_default())
+        // `Parameter$UsePreviousValue` is a stack-UPDATE instruction ("During a stack
+        // update, use the existing parameter value that the stack is using for a given
+        // parameter key"), so a create — which has no previous values at all — is refused
+        // rather than silently storing an empty one. That is the shared resolution with an
+        // empty previous set.
+        let parameters = crate::state::merged_parameters(&[], input.parameters.as_deref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -389,13 +341,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut stack = StoredStack::new(
             crate::state::new_stack_id(&region, &input.stack_name),
             input.stack_name.clone(),
-            template_body,
+            Some(template_body),
             now,
         );
         stack.region = region;
         // What the stack reports as `Parameters`: the values the request supplied, plus
         // the template's own `Default` for a declared parameter it passed none for.
-        stack.parameters = crate::state::parameters_in_force(&stack.template_body, parameters);
+        stack.parameters = crate::state::parameters_in_force(
+            stack.template_body.as_deref().unwrap_or_default(),
+            parameters,
+        );
         stack.capabilities = input.capabilities.clone().unwrap_or_default();
         stack.tags = crate::state::stored_tags(input.tags.as_deref().unwrap_or_default());
         stack.notification_arns = input.notification_ar_ns.clone().unwrap_or_default();
@@ -455,7 +410,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "After the call completes successfully, the stack creation starts": the stack
         // is answered in CREATE_IN_PROGRESS and settles to CREATE_COMPLETE once the
-        // clock makes that due.
+        // clock makes that due. `begin_transition` is what records the operation the
+        // stack reports as its last.
         stack.begin_transition(
             now,
             status::CREATE_IN_PROGRESS,

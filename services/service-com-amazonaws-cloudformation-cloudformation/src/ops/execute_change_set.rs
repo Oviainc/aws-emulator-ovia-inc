@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteChangeSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteChangeSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the change set's stored template, parameters, tags, capabilities
+//! and the rest of its configuration to the stack it belongs to, and opens the stack's
+//! transition — `CREATE_IN_PROGRESS` → `CREATE_COMPLETE` for a `CREATE` change set (the one
+//! that created the stack in `REVIEW_IN_PROGRESS`), `UPDATE_IN_PROGRESS` →
+//! `UPDATE_COMPLETE` for an `UPDATE` one — so `DescribeStacks` reports the stack settling
+//! just as it does after `CreateStack`/`UpdateStack`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteChangeSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The change set itself moves to `EXECUTE_IN_PROGRESS` and reaches `EXECUTE_COMPLETE`
+//! with the stack, and "CloudFormation deletes all other change sets associated with the
+//! stack because they aren't valid for the updated stack". A change set whose creation has
+//! not completed, or that has already been executed, is refused with the modelled
+//! `InvalidChangeSetStatusException`.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +100,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{change_set_type, execution_status, status, PendingChangeSetStatus};
+
+/// The `OnStackFailure` value `CreateChangeSet` records for what `ExecuteChangeSet` spells
+/// `DisableRollback=true` (the model documents the two as equivalent: "DO_NOTHING - if the
+/// stack creation fails, do nothing. This is equivalent to specifying true for the
+/// DisableRollback parameter").
+const ON_STACK_FAILURE_DO_NOTHING: &str = "DO_NOTHING";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -169,18 +179,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteChangeSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteChangeSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteChangeSet"))
+        let _ = ctx;
+        // "If you specified the name of a change set, specify the stack name ... that's
+        // associated with the change set": only an ARN names a change set on its own.
+        crate::state::require_stack_for_change_set_name(
+            &input.change_set_name,
+            input.stack_name.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no change set to execute, and
+            // nothing was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ExecuteChangeSet",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let change_set = store
+            .resolve_change_set(&input.change_set_name, input.stack_name.as_deref())
+            .ok_or_else(|| {
+                ExecuteChangeSetError::from(
+                    ExecuteChangeSetErrorModeled::ChangeSetNotFoundException(
+                        ChangeSetNotFoundException {
+                            message: Some(crate::state::change_set_does_not_exist(
+                                &input.change_set_name,
+                            )),
+                        },
+                    ),
+                )
+            })?;
+        // "This parameter can't be specified when the OnStackFailure parameter to the
+        // CreateChangeSet API operation was specified": the two say the same thing, so a
+        // request that states both is refused rather than one of them being dropped.
+        if input.disable_rollback.is_some() && change_set.on_stack_failure.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "DisableRollback cannot be specified when the change set was created with \
+                 OnStackFailure",
+            ));
+        }
+        // "The specified change set can't be used to update the stack. For example, the
+        // change set status might be CREATE_IN_PROGRESS": a change set is executable only
+        // once its creation has completed and nothing has executed it yet.
+        if !change_set.is_executable() {
+            return Err(
+                ExecuteChangeSetErrorModeled::InvalidChangeSetStatusException(
+                    InvalidChangeSetStatusException {
+                        message: Some(format!(
+                            "ChangeSet [{}] cannot be executed in its current status of [{}]",
+                            change_set.change_set_id, change_set.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Everything the change set carries onto the stack, read out before the stack is
+        // touched.
+        let change_set_id = change_set.change_set_id.clone();
+        let stack_id = change_set.stack_id.clone();
+        let creates_the_stack = change_set.change_set_type == change_set_type::CREATE;
+        let template_body = change_set.template_body.clone();
+        let parameters = change_set.parameters.clone();
+        let capabilities = change_set.capabilities.clone();
+        let tags = change_set.tags.clone();
+        let notification_arns = change_set.notification_arns.clone();
+        let role_arn = change_set.role_arn.clone();
+        let rollback_configuration = change_set.rollback_configuration.clone();
+        let deployment_config = change_set.deployment_config.clone();
+        let resource_types = change_set.resource_types.clone();
+        // "DO_NOTHING - if the stack creation fails, do nothing. This is equivalent to
+        // specifying true for the DisableRollback parameter."
+        let disable_rollback = input.disable_rollback.or_else(|| {
+            change_set
+                .on_stack_failure
+                .as_deref()
+                .map(|on_failure| on_failure == ON_STACK_FAILURE_DO_NOTHING)
+        });
+
+        // The stack the change set belongs to. An operation already in flight on it is
+        // exactly the case `InvalidChangeSetStatusException` documents ("the stack status
+        // might be UPDATE_IN_PROGRESS").
+        let Some(stack) = store.resolve_mut(&stack_id) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::stack_does_not_exist(&stack_id),
+            ));
+        };
+        if stack.pending.is_some() {
+            return Err(
+                ExecuteChangeSetErrorModeled::InvalidChangeSetStatusException(
+                    InvalidChangeSetStatusException {
+                        message: Some(format!(
+                            "ChangeSet [{change_set_id}] cannot be executed while stack \
+                             [{stack_id}] is in {} state",
+                            stack.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The change set's configuration becomes the stack's: this is the call that applies
+        // it, which is why the template only now reaches the stack.
+        stack.set_template_body(template_body);
+        stack.parameters = parameters;
+        stack.capabilities = capabilities;
+        stack.tags = tags;
+        stack.notification_arns = notification_arns;
+        stack.role_arn = role_arn;
+        stack.rollback_configuration = rollback_configuration;
+        stack.deployment_config = deployment_config;
+        stack.resource_types = resource_types;
+        if let Some(disable_rollback) = disable_rollback {
+            stack.disable_rollback = disable_rollback;
+        }
+        if let Some(retain_except_on_create) = input.retain_except_on_create {
+            stack.retain_except_on_create = Some(retain_except_on_create);
+        }
+        if let Some(token) = &input.client_request_token {
+            stack.client_request_token = Some(token.clone());
+        }
+        // `Stack$ChangeSetId` is the change set that last acted on the stack.
+        stack.change_set_id = Some(change_set_id.clone());
+        let operation_id = crate::state::new_operation_id();
+        // Executing a change set is what last changed the stack, including for a CREATE
+        // change set: the stack it had left in REVIEW_IN_PROGRESS is updated into
+        // existence, which is the update `Stack$LastUpdatedTime` reports ("the time the
+        // stack was last updated ... only returned if the stack has been updated at least
+        // once").
+        stack.last_updated_time = Some(now);
+        // Executing the change set DEPLOYS the template it carries: the stack's resources
+        // and outputs are computed from that body and the parameters in force, and are
+        // reported once this operation completes — exactly as they are for `CreateStack`
+        // and `UpdateStack`.
+        stack.deploy_template();
+        // "After the call successfully completes, CloudFormation starts updating the
+        // stack": a CREATE change set creates the stack it had left in REVIEW_IN_PROGRESS,
+        // an UPDATE change set updates one that already exists — which is the operation
+        // `Stack$LastOperations` reports from here on.
+        if creates_the_stack {
+            stack.begin_transition(
+                now,
+                status::CREATE_IN_PROGRESS,
+                status::CREATE_COMPLETE,
+                Some(operation_id),
+                input.client_request_token.clone(),
+            );
+        } else {
+            stack.begin_transition(
+                now,
+                status::UPDATE_IN_PROGRESS,
+                status::UPDATE_COMPLETE,
+                Some(operation_id),
+                input.client_request_token.clone(),
+            );
+        }
+
+        // "When you execute a change set, CloudFormation deletes all other change sets
+        // associated with the stack because they aren't valid for the updated stack."
+        store
+            .change_sets
+            .retain(|other| other.stack_id != stack_id || other.change_set_id == change_set_id);
+        // The change set is executing now and reaches EXECUTE_COMPLETE with the stack it
+        // applied, on the same due instant.
+        if let Some(change_set) = store.resolve_change_set_mut(&change_set_id, None) {
+            change_set.execution_status = execution_status::EXECUTE_IN_PROGRESS.to_string();
+            change_set.pending = Some(PendingChangeSetStatus {
+                status: None,
+                status_reason: None,
+                execution_status: Some(execution_status::EXECUTE_COMPLETE.to_string()),
+                due_at: now + crate::state::STATUS_TRANSITION_DELAY,
+            });
+        }
+
+        Ok(ExecuteChangeSetOutput {})
     }
 }

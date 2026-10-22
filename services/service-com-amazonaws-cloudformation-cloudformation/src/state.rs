@@ -11,6 +11,14 @@
 //! the template for running or deleted stacks"), so the single `stacks` vector carries
 //! live and deleted stacks alike and `StoredStack::is_live` is what separates them.
 //!
+//! Beside the stacks it holds every CHANGE SET, which is a persisted plan for one stack:
+//! `CreateChangeSet` writes the template and configuration it would apply plus the
+//! resource-level change list it computed, `DescribeChangeSet` / `GetTemplate` read them
+//! back, and `ExecuteChangeSet` is what copies the plan onto the stack. A change set lives
+//! as long as its stack does — CloudFormation deletes a stack's change sets with the
+//! stack, which
+//! [`ComAmazonawsCloudformationCloudformationState::settle`] enforces.
+//!
 //! ## Bounds
 //!
 //! Every growth site in this store is bounded, because a caller chooses both how many
@@ -20,8 +28,10 @@
 //! past that, which is this emulator's stand-in for CloudFormation's 90-day retention of
 //! deleted-stack summaries), [`MAX_EVENTS_PER_STACK`] events per stack (oldest-first),
 //! [`TEMPLATE_BODY_MAX_BYTES`] per stored template body (the documented `TemplateBody`
-//! maximum, which the model carries no `@length` for) and [`PAGE_SIZE`] items per
-//! paginated response.
+//! maximum, which the model carries no `@length` for), [`MAX_CHANGE_SETS_PER_STACK`]
+//! change sets per stack and [`MAX_CHANGE_SETS`] across the store (past either
+//! `CreateChangeSet` answers the modelled `LimitExceededException`), and [`PAGE_SIZE`]
+//! items per paginated response.
 //!
 //! Reading a stack's template body and evaluating what it declares is bounded by the
 //! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
@@ -37,6 +47,12 @@
 //! one that reads after the due instant sees the terminal status and the event that
 //! carries it. Nothing sleeps, and no read invents a transition the clock had not
 //! already made due.
+//!
+//! A change set's own creation is asynchronous the same way ("After the CreateChangeSet
+//! call successfully completes, CloudFormation starts creating the change set"), so it
+//! carries a [`PendingChangeSetStatus`]: it is answered `CREATE_PENDING` and settles to
+//! `CREATE_COMPLETE` — or to `FAILED`, when the plan it computed is empty — which is what
+//! `ExecuteChangeSet` waits for.
 //!
 //! What a create or update DEPLOYS — the resources the template declares and the outputs
 //! evaluated over them (see [`template`]) — rides on that same clock: the call computes
@@ -145,14 +161,54 @@ pub mod status {
     pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
     pub const DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
     pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
+    /// The status of a stack a `CREATE` change set brought into existence and nothing has
+    /// executed yet (`CreateChangeSetInput$ChangeSetType`: "If you create a change set for
+    /// a new stack, CloudFormation creates a stack with a unique stack ID, but no template
+    /// or resources. The stack will be in the REVIEW_IN_PROGRESS state until you execute
+    /// the change set").
+    pub const REVIEW_IN_PROGRESS: &str = "REVIEW_IN_PROGRESS";
+}
+
+/// `ChangeSetStatus` values this service puts a change set into (all from the model's
+/// `ChangeSetStatus` enum).
+pub mod change_set_status {
+    pub const CREATE_PENDING: &str = "CREATE_PENDING";
+    pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+    pub const FAILED: &str = "FAILED";
+}
+
+/// `ExecutionStatus` values this service puts a change set into (all from the model's
+/// `ExecutionStatus` enum).
+pub mod execution_status {
+    /// The change set is not (yet, or ever) executable: its creation has not completed, or
+    /// it failed.
+    pub const UNAVAILABLE: &str = "UNAVAILABLE";
+    pub const AVAILABLE: &str = "AVAILABLE";
+    pub const EXECUTE_IN_PROGRESS: &str = "EXECUTE_IN_PROGRESS";
+    pub const EXECUTE_COMPLETE: &str = "EXECUTE_COMPLETE";
+}
+
+/// `ChangeSetType` values (the model's `ChangeSetType` enum).
+pub mod change_set_type {
+    pub const CREATE: &str = "CREATE";
+    pub const UPDATE: &str = "UPDATE";
+    pub const IMPORT: &str = "IMPORT";
+}
+
+/// `ChangeAction` values this service computes (from the model's `ChangeAction` enum).
+pub mod change_action {
+    pub const ADD: &str = "Add";
+    pub const MODIFY: &str = "Modify";
+    pub const REMOVE: &str = "Remove";
 }
 
 /// `OperationType` values this service records for a stack operation (all from the
-/// model's `OperationType` enum).
+/// model's `OperationType` enum), one per call that acts on the stack.
 pub mod operation_type {
     pub const CREATE_STACK: &str = "CREATE_STACK";
     pub const UPDATE_STACK: &str = "UPDATE_STACK";
     pub const DELETE_STACK: &str = "DELETE_STACK";
+    pub const CREATE_CHANGESET: &str = "CREATE_CHANGESET";
 }
 
 /// The `OperationType` of the stack operation that moves a stack into `in_progress`, or
@@ -166,8 +222,32 @@ pub fn operation_type_of(in_progress: &str) -> Option<&'static str> {
     }
 }
 
+/// The `Change$Type` every change this service computes carries: the model's `ChangeType`
+/// enum has exactly one value, and a change set here describes resources.
+pub const CHANGE_TYPE_RESOURCE: &str = "Resource";
+
 /// The reason CloudFormation records on the event that opens a stack operation.
 pub const USER_INITIATED: &str = "User Initiated";
+
+/// The `StatusReason` CloudFormation puts on a change set that would change nothing —
+/// the message it answers for a change set whose computed change list is empty.
+pub const NO_CHANGES_REASON: &str = "The submitted information didn't contain changes. \
+                                     Submit different information to create a change set.";
+
+/// The most change sets one stack holds.
+///
+/// CloudFormation meters change sets per stack and models `LimitExceededException` on
+/// `CreateChangeSet` for exactly that case; the documented default quota is 20 change sets
+/// per stack and is adjustable through Service Quotas, so this is that default as this
+/// emulator's own ceiling.
+pub const MAX_CHANGE_SETS_PER_STACK: usize = 20;
+
+/// The most change sets this service holds across every stack.
+///
+/// The per-stack ceiling alone would let one caller hold `MAX_STACKS` × that many stored
+/// templates, so the store carries a second, global bound on the same records. Chosen,
+/// like every count here, and far above any client workflow.
+pub const MAX_CHANGE_SETS: usize = 2_000;
 
 /// A resolved stack parameter: the key and the value in force on the stack.
 ///
@@ -291,12 +371,18 @@ pub struct StoredStack {
     /// Every identifier the stack's resources carry is Regional, so this is what the
     /// template's `AWS::Region` pseudo parameter and every minted ARN resolve to.
     pub region: String,
-    pub template_body: String,
+    /// The template in force on the stack, or `None` for a stack that has none yet: a
+    /// `CREATE` change set creates its stack "with a unique stack ID, but no template or
+    /// resources", and the template becomes the stack's when the change set is executed.
+    pub template_body: Option<String>,
     /// The template's own `Description`, parsed once when the body is stored rather than
     /// on every read: this is where CloudFormation takes both `Stack$Description` and
     /// `StackSummary$TemplateDescription` from, and a read must not re-parse a
     /// caller-sized body under the store lock.
     pub template_description: Option<String>,
+    /// The change set that last acted on this stack (`Stack$ChangeSetId`): the one that
+    /// created it in `REVIEW_IN_PROGRESS`, or the one `ExecuteChangeSet` last applied.
+    pub change_set_id: Option<String>,
     pub parameters: Vec<StoredParameter>,
     pub capabilities: Vec<String>,
     pub tags: Vec<StoredTag>,
@@ -347,13 +433,19 @@ impl StoredStack {
     /// A stack as `CreateStack` first stores it: the identity and the template, with every
     /// optional member at its default. The caller fills in what the request supplied and
     /// then opens the create transition.
-    pub fn new(stack_id: String, stack_name: String, template_body: String, now: SystemTime) -> Self {
+    pub fn new(
+        stack_id: String,
+        stack_name: String,
+        template_body: Option<String>,
+        now: SystemTime,
+    ) -> Self {
         Self {
             stack_id,
             stack_name,
             region: DEFAULT_REGION.to_string(),
-            template_description: template::description(&template_body),
+            template_description: template_body.as_deref().and_then(template::description),
             template_body,
+            change_set_id: None,
             parameters: Vec::new(),
             capabilities: Vec::new(),
             tags: Vec::new(),
@@ -386,7 +478,7 @@ impl StoredStack {
     /// Replace the stored template body, re-deriving the description it carries.
     pub fn set_template_body(&mut self, template_body: String) {
         self.template_description = template::description(&template_body);
-        self.template_body = template_body;
+        self.template_body = Some(template_body);
     }
 
     /// Materialise what the stored template declares: one record per declared resource,
@@ -406,7 +498,14 @@ impl StoredStack {
     /// this service cannot read declares nothing, and leaves the stack with no resources
     /// and no outputs rather than with the previous template's.
     pub fn deploy_template(&mut self) {
-        let Some(declared) = template::parse(&self.template_body) else {
+        let Some(declared) = self
+            .template_body
+            .as_deref()
+            .and_then(template::parse)
+        else {
+            // No template at all (a stack a CREATE change set created and nothing has
+            // executed yet), or one this service will not read: either way the stack is
+            // left with no resources and no outputs rather than with invented ones.
             self.pending_deployment = Some(PendingDeployment::default());
             return;
         };
@@ -491,6 +590,15 @@ impl StoredStack {
         });
     }
 
+    /// Record the operation now acting on this stack, which is the one
+    /// `Stack$LastOperations` reports until the next one starts.
+    pub fn record_operation(&mut self, operation_type: &str, operation_id: &str) {
+        self.last_operation = Some(StoredOperation {
+            operation_type: operation_type.to_string(),
+            operation_id: operation_id.to_string(),
+        });
+    }
+
     /// Materialise the status transition the clock has already made due, if any.
     ///
     /// Only ever applies a transition whose due instant has passed, so it reports what
@@ -566,12 +674,125 @@ impl StoredStack {
     }
 }
 
+/// One resource-level change a change set would make, computed once when the change set
+/// is created by comparing the submitted template with the stack's current one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredResourceChange {
+    /// The model's `ChangeAction`: `Add`, `Modify` or `Remove`.
+    pub action: String,
+    pub logical_resource_id: String,
+    pub resource_type: String,
+    /// The physical id of the resource the change acts on, for a change to one the stack
+    /// has already deployed (a `Modify` or a `Remove`). `None` for an `Add`: the resource
+    /// does not exist yet, so it has no physical id to report.
+    pub physical_resource_id: Option<String>,
+    /// For a `Modify`, the resource attributes that differ, spelled as the model's
+    /// `ResourceAttribute` enum spells them and in that enum's order. Empty for an `Add`
+    /// or a `Remove`, which change the whole resource rather than an attribute of it.
+    pub scope: Vec<String>,
+}
+
+/// The change-set statuses a change set's creation is headed for, and the instant they
+/// are due.
+///
+/// `CreateChangeSet` answers while CloudFormation is still computing the change set ("After
+/// the CreateChangeSet call successfully completes, CloudFormation starts creating the
+/// change set"), so the terminal `Status`/`ExecutionStatus` pair is recorded as due a
+/// moment later and materialised by [`StoredChangeSet::settle`].
+#[derive(Debug, Clone)]
+pub struct PendingChangeSetStatus {
+    /// The `ChangeSetStatus` that becomes due, if this transition moves it.
+    pub status: Option<String>,
+    /// The `StatusReason` that comes with that status (the reason a creation that would
+    /// change nothing failed, say).
+    pub status_reason: Option<String>,
+    /// The `ExecutionStatus` that becomes due, if this transition moves it.
+    pub execution_status: Option<String>,
+    pub due_at: SystemTime,
+}
+
+/// One change set, as this emulator persists it.
+///
+/// The change set owns the template and the configuration the request submitted;
+/// `ExecuteChangeSet` is what copies them onto the stack. Nothing here is derived on a
+/// read: the change list is computed once, when the change set is created.
+#[derive(Debug, Clone)]
+pub struct StoredChangeSet {
+    pub change_set_id: String,
+    pub change_set_name: String,
+    /// The stack this change set belongs to, by id: a change set outlives its stack's
+    /// name changes and is never re-keyed.
+    pub stack_id: String,
+    pub stack_name: String,
+    /// `ChangeSetType`: `CREATE` for a change set that creates its stack, `UPDATE` for one
+    /// that updates an existing stack.
+    pub change_set_type: String,
+    pub description: Option<String>,
+    /// The template the change set would put on the stack.
+    pub template_body: String,
+    pub parameters: Vec<StoredParameter>,
+    pub capabilities: Vec<String>,
+    pub tags: Vec<StoredTag>,
+    pub notification_arns: Vec<String>,
+    pub role_arn: Option<String>,
+    pub rollback_configuration: Option<StoredRollbackConfiguration>,
+    pub deployment_config: Option<StoredDeploymentConfig>,
+    pub deployment_mode: Option<String>,
+    pub resource_types: Vec<String>,
+    pub on_stack_failure: Option<String>,
+    pub include_nested_stacks: bool,
+    pub import_existing_resources: bool,
+    pub client_token: Option<String>,
+    pub creation_time: SystemTime,
+    /// The model's `ChangeSetStatus`.
+    pub status: String,
+    pub status_reason: Option<String>,
+    /// The model's `ExecutionStatus`.
+    pub execution_status: String,
+    pub pending: Option<PendingChangeSetStatus>,
+    pub changes: Vec<StoredResourceChange>,
+}
+
+impl StoredChangeSet {
+    /// Materialise the change-set transition the clock has already made due, if any.
+    ///
+    /// Like [`StoredStack::settle`], it only ever applies a transition whose due instant
+    /// has passed: it reports what was owed at `now` even if nobody had called.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.pending.as_ref().is_none_or(|p| p.due_at > now) {
+            return;
+        }
+        let pending = self.pending.take().expect("checked just above");
+        if let Some(status) = pending.status {
+            self.status = status;
+            self.status_reason = pending.status_reason;
+        }
+        if let Some(execution_status) = pending.execution_status {
+            self.execution_status = execution_status;
+        }
+    }
+
+    /// Whether `ExecuteChangeSet` can apply this change set: CloudFormation executes a
+    /// change set only once its creation has completed and nothing has executed it yet
+    /// (`InvalidChangeSetStatusException`: "the change set status might be
+    /// CREATE_IN_PROGRESS").
+    pub fn is_executable(&self) -> bool {
+        self.status == change_set_status::CREATE_COMPLETE
+            && self.execution_status == execution_status::AVAILABLE
+    }
+}
+
 /// Per-service state for com-amazonaws-cloudformation-cloudformation. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudformationCloudformationState {
     /// Every stack, in creation order, so `DescribeStacks` and `ListStacks` are
     /// deterministic. Includes deleted stacks (see this module's docs).
     pub stacks: Vec<StoredStack>,
+    /// Every change set of every stack, in creation order, so `DescribeChangeSet` reads
+    /// back exactly what `CreateChangeSet` wrote. A change set lives as long as its stack
+    /// does: CloudFormation deletes a stack's change sets with the stack, which is what
+    /// [`Self::settle`] enforces here.
+    pub change_sets: Vec<StoredChangeSet>,
 }
 
 impl ComAmazonawsCloudformationCloudformationState {
@@ -583,7 +804,93 @@ impl ComAmazonawsCloudformationCloudformationState {
         for stack in &mut self.stacks {
             stack.settle(now);
         }
+        for change_set in &mut self.change_sets {
+            change_set.settle(now);
+        }
         self.reclaim_retired_stacks();
+        self.reclaim_orphaned_change_sets();
+    }
+
+    /// Drop the change sets whose stack is no longer live.
+    ///
+    /// Not a mutation a caller asked for: a change set describes changes to a stack, so it
+    /// is gone the moment that stack's deletion completes — which was owed at the same
+    /// instant whether or not anybody called. It is also what keeps the change-set store
+    /// from outliving the stacks it counts against.
+    fn reclaim_orphaned_change_sets(&mut self) {
+        if self.change_sets.is_empty() {
+            return;
+        }
+        // Disjoint fields: the live-id set borrows `stacks`, the retain mutates
+        // `change_sets`.
+        let live: ::std::collections::HashSet<&str> = self
+            .stacks
+            .iter()
+            .filter(|stack| stack.is_live())
+            .map(|stack| stack.stack_id.as_str())
+            .collect();
+        self.change_sets
+            .retain(|change_set| live.contains(change_set.stack_id.as_str()));
+    }
+
+    /// The change sets of one stack, in creation order: what `ListChangeSets` reports and
+    /// what [`MAX_CHANGE_SETS_PER_STACK`] bounds.
+    pub fn change_sets_of<'a>(
+        &'a self,
+        stack_id: &'a str,
+    ) -> impl Iterator<Item = &'a StoredChangeSet> {
+        self.change_sets
+            .iter()
+            .filter(move |change_set| change_set.stack_id == stack_id)
+    }
+
+    /// Resolve the `ChangeSetName` input member, which CloudFormation accepts as either a
+    /// change set name or its ARN: an ARN names the change set on its own, while a name is
+    /// resolved among the change sets of the stack the request names.
+    pub fn resolve_change_set(
+        &self,
+        name_or_id: &str,
+        stack_name_or_id: Option<&str>,
+    ) -> Option<&StoredChangeSet> {
+        self.change_set_position(name_or_id, stack_name_or_id)
+            .map(|index| &self.change_sets[index])
+    }
+
+    /// [`Self::resolve_change_set`], for a caller that mutates the change set it resolved.
+    pub fn resolve_change_set_mut(
+        &mut self,
+        name_or_id: &str,
+        stack_name_or_id: Option<&str>,
+    ) -> Option<&mut StoredChangeSet> {
+        self.change_set_position(name_or_id, stack_name_or_id)
+            .map(|index| &mut self.change_sets[index])
+    }
+
+    fn change_set_position(
+        &self,
+        name_or_id: &str,
+        stack_name_or_id: Option<&str>,
+    ) -> Option<usize> {
+        // The change set's own ARN identifies it; a stack named beside it must be the
+        // stack it belongs to, or the pair names nothing.
+        if let Some(index) = self
+            .change_sets
+            .iter()
+            .position(|change_set| change_set.change_set_id == name_or_id)
+        {
+            let change_set = &self.change_sets[index];
+            let stack_matches = stack_name_or_id.is_none_or(|stack| {
+                stack == change_set.stack_id || stack == change_set.stack_name
+            });
+            return stack_matches.then_some(index);
+        }
+        // A bare name is resolved within one stack ("If you specify the name of a change
+        // set, you must also specify the stack name").
+        let stack_name_or_id = stack_name_or_id?;
+        let stack_id = self.resolve(stack_name_or_id)?.stack_id.clone();
+        self.change_sets.iter().position(|change_set| {
+            change_set.stack_id == stack_id && change_set.change_set_name == name_or_id
+        })
     }
 
     /// Drop the oldest completed deletions past [`MAX_DELETED_STACKS_RETAINED`].
@@ -669,6 +976,190 @@ pub fn output_views(outputs: &[StoredOutput]) -> Option<Vec<crate::ops::types::O
             })
             .collect(),
     )
+}
+
+/// The `ResourceAttribute`s one resource declaration states differently from another, in
+/// the order the model's enum lists them.
+///
+/// Only attributes the model can name are reported, which is what `ResourceChange$Scope`
+/// carries: the whole resource declaration is compared, not just its `Properties`.
+fn differing_attributes(
+    resource: &template::DeclaredResource,
+    other: &template::DeclaredResource,
+) -> Vec<String> {
+    crate::ops::types::RESOURCE_ATTRIBUTE_VALUES
+        .iter()
+        .filter(|attribute| {
+            resource.declaration.get(**attribute) != other.declaration.get(**attribute)
+        })
+        .map(|attribute| (*attribute).to_string())
+        .collect()
+}
+
+/// The resources a template body declares, by logical id, for comparing two templates.
+///
+/// Read by the SAME reader a deployment uses ([`template::parse`], which takes a JSON or a
+/// YAML body under this service's template bounds), then SORTED by logical id — and that
+/// sort is load-bearing rather than a preference: the parsed object iterates in insertion
+/// order when anything in the build enables `serde_json`'s `preserve_order` feature
+/// (`vendor/smithy-macros` does) and in sorted order otherwise, so without it one change
+/// set would report its changes in two different orders depending on how the workspace was
+/// built.
+///
+/// `None` for a body this service will not read at all; `Some([])` for one that declares no
+/// resources — which `CreateChangeSet` refuses, since a change set is a plan over resources.
+pub fn template_resources(template_body: &str) -> Option<Vec<template::DeclaredResource>> {
+    let mut declared = template::parse(template_body)?.resources;
+    declared.sort_by(|left, right| left.logical_id.cmp(&right.logical_id));
+    Some(declared)
+}
+
+/// The resource-level changes that applying `next` to a stack whose template declares
+/// `previous` would make, against the resources that stack has `deployed`.
+///
+/// A resource only `next` declares is an `Add`, one only `previous` declares is a `Remove`,
+/// and one both declare differently is a `Modify` scoped to the attributes that differ —
+/// except when its `Type` itself changed, which cannot be modified into place and so is
+/// reported as the `Remove` of the old resource and the `Add` of the new one. A change to a
+/// resource the stack has already deployed carries that resource's physical id. The order is
+/// deterministic: the submitted template's resources (in the order
+/// [`template_resources`] yields them, which is by logical id), then the removals in the
+/// stack template's.
+pub fn computed_changes(
+    previous: &[template::DeclaredResource],
+    next: &[template::DeclaredResource],
+    deployed: &[StoredResource],
+) -> Vec<StoredResourceChange> {
+    let physical_id = |logical_id: &str| {
+        deployed
+            .iter()
+            .find(|resource| resource.logical_id == logical_id)
+            .map(|resource| resource.physical_resource_id.clone())
+    };
+    let change =
+        |action: &str, resource: &template::DeclaredResource, scope: Vec<String>| {
+            StoredResourceChange {
+                action: action.to_string(),
+                logical_resource_id: resource.logical_id.clone(),
+                resource_type: resource.resource_type.clone(),
+                // Only a change to a resource the stack has deployed has one; an addition
+                // has nothing deployed under that logical id yet.
+                physical_resource_id: (action != change_action::ADD)
+                    .then(|| physical_id(&resource.logical_id))
+                    .flatten(),
+                scope,
+            }
+        };
+    let mut changes = Vec::new();
+    for resource in next {
+        match previous
+            .iter()
+            .find(|candidate| candidate.logical_id == resource.logical_id)
+        {
+            None => changes.push(change(change_action::ADD, resource, Vec::new())),
+            Some(before) if before.declaration == resource.declaration => {}
+            Some(before) if before.resource_type != resource.resource_type => {
+                changes.push(change(change_action::REMOVE, before, Vec::new()));
+                changes.push(change(change_action::ADD, resource, Vec::new()));
+            }
+            Some(before) => changes.push(change(
+                change_action::MODIFY,
+                resource,
+                differing_attributes(resource, before),
+            )),
+        }
+    }
+    for resource in previous {
+        let still_declared = next
+            .iter()
+            .any(|candidate| candidate.logical_id == resource.logical_id);
+        if !still_declared {
+            changes.push(change(change_action::REMOVE, resource, Vec::new()));
+        }
+    }
+    changes
+}
+
+/// Resolve the request's `Parameters` against the values the stack already carries.
+///
+/// A request with no `Parameters` at all leaves the stack's parameters as they are;
+/// otherwise the request states the parameter set, and each entry either carries a new
+/// value or asks (`UsePreviousValue`) for the one the stack is already using. "If you
+/// specify true, do not specify a parameter value" — so a request doing both is refused,
+/// and so is one asking for a previous value the stack does not have.
+///
+/// Shared by `UpdateStack` and `CreateChangeSet`, which resolve the member the same way:
+/// a change set carries the parameters the update it describes would apply.
+pub fn merged_parameters(
+    previous: &[StoredParameter],
+    requested: Option<&[crate::ops::types::Parameter]>,
+) -> Result<Vec<StoredParameter>, String> {
+    let Some(requested) = requested else {
+        return Ok(previous.to_vec());
+    };
+    requested
+        .iter()
+        .map(|parameter| {
+            let key = parameter
+                .parameter_key
+                .clone()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| {
+                    "Parameters: every parameter must have a ParameterKey".to_string()
+                })?;
+            if parameter.use_previous_value == Some(true) {
+                if parameter.parameter_value.is_some() {
+                    return Err(format!(
+                        "Parameters: [{key}] cannot specify both a ParameterValue and \
+                         UsePreviousValue"
+                    ));
+                }
+                let value = previous
+                    .iter()
+                    .find(|stored| stored.key == key)
+                    .map(|stored| stored.value.clone())
+                    .ok_or_else(|| {
+                        format!("Parameters: [{key}] has no previous value on this stack")
+                    })?;
+                return Ok(StoredParameter { key, value });
+            }
+            let value = parameter
+                .parameter_value
+                .clone()
+                .ok_or_else(|| format!("Parameters: [{key}] must have values"))?;
+            Ok(StoredParameter { key, value })
+        })
+        .collect()
+}
+
+/// `CreateStackInput$StackName`'s documented rule: "A stack name can contain only
+/// alphanumeric characters (case sensitive) and hyphens. It must start with an
+/// alphabetical character and can't be longer than 128 characters." The model carries no
+/// `@pattern` or `@length` for `StackName`, so the handler is what enforces it.
+pub const STACK_NAME_PATTERN: &str = "[a-zA-Z][-a-zA-Z0-9]*";
+pub const STACK_NAME_MAX_LEN: usize = 128;
+
+/// `Err(message)` naming the member and the constraint the name fails, in the form the
+/// service's own input validation words it.
+///
+/// Shared by `CreateStack` and `CreateChangeSet`, which both name a stack that does not
+/// exist yet and so both have to hold its name to the same rule.
+pub fn validate_stack_name(name: &str) -> Result<(), String> {
+    if name.len() > STACK_NAME_MAX_LEN {
+        return Err(format!(
+            "1 validation error detected: Value '{name}' at 'stackName' failed to satisfy \
+             constraint: Member must have length less than or equal to {STACK_NAME_MAX_LEN}"
+        ));
+    }
+    let well_formed = name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !well_formed {
+        return Err(format!(
+            "1 validation error detected: Value '{name}' at 'stackName' failed to satisfy \
+             constraint: Member must satisfy regular expression pattern: {STACK_NAME_PATTERN}"
+        ));
+    }
+    Ok(())
 }
 
 /// The parameter values in force on a stack: what the request supplied, plus the
@@ -775,6 +1266,56 @@ pub fn new_operation_id() -> String {
     new_identifier("operation")
 }
 
+/// Mint a change set id: `arn:aws:cloudformation:<region>:<account>:changeSet/<name>/<uuid>`,
+/// the form CloudFormation gives a change set (`ChangeSetId` is modelled
+/// `@pattern("^arn:[-a-zA-Z0-9:/]*$")`).
+pub fn new_change_set_id(region: &str, change_set_name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("changeSet/{change_set_name}/{}", new_identifier(change_set_name)),
+    )
+}
+
+/// The message CloudFormation answers when a request names a change set that is not
+/// addressable: no change set of the named stack carries that name and no change set has
+/// that ARN.
+pub fn change_set_does_not_exist(name_or_id: &str) -> String {
+    format!("ChangeSet [{name_or_id}] does not exist")
+}
+
+/// The message CloudFormation answers when a request would act on a stack whose current
+/// status does not allow it — an operation still in flight on it, or a stack a `CREATE`
+/// change set created that nothing has executed yet.
+///
+/// Shared by `UpdateStack` and `CreateChangeSet`, which refuse the same states, so the two
+/// cannot drift apart.
+pub fn stack_cannot_be_updated(stack_id: &str, status: &str) -> String {
+    format!("Stack:{stack_id} is in {status} state and can not be updated.")
+}
+
+/// `Err(message)` for a request that names a change set by NAME without the stack it
+/// belongs to.
+///
+/// `ChangeSetNameOrId` is "the name or Amazon Resource Name (ARN) of the change set", and
+/// every operation that takes one documents the same constraint on its `StackName`: "If you
+/// specify the name of a change set, you must also specify the stack name". A bare name
+/// with no stack is therefore a bad request, not a change set that does not exist — only an
+/// ARN names a change set on its own.
+pub fn require_stack_for_change_set_name(
+    change_set_name: &str,
+    stack_name: Option<&str>,
+) -> Result<(), String> {
+    let named_by_arn = change_set_name.starts_with("arn:");
+    if named_by_arn || stack_name.is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "StackName must be specified if ChangeSetName is not specified as an ARN: \
+         [{change_set_name}]"
+    ))
+}
+
 /// Mint the request id one response carries — the `<RequestId>` element of an awsQuery
 /// `<ErrorResponse>` envelope, the counterpart of the `ResponseMetadata/RequestId` a
 /// successful response carries.
@@ -809,6 +1350,8 @@ pub enum PageOf {
     StackSummaries,
     /// `DescribeStackEvents`'s `StackEvents`.
     StackEvents,
+    /// `DescribeChangeSet`'s `Changes`.
+    Changes,
 }
 
 impl PageOf {
@@ -818,6 +1361,7 @@ impl PageOf {
             Self::Stacks => "stacks",
             Self::StackSummaries => "summaries",
             Self::StackEvents => "events",
+            Self::Changes => "changes",
         }
     }
 }
@@ -931,6 +1475,52 @@ pub fn parameter_views(
             })
             .collect(),
     )
+}
+
+/// The deployment mode a stack operation runs in when the request names none.
+///
+/// `DeploymentConfig$Mode`: "STANDARD - Use the standard deployment behavior, ensuring
+/// resources are ready to serve traffic before completing the operation. This is the
+/// default. You do not need to specify this value explicitly." The operation therefore ran
+/// in this mode whether or not the request spelled it, which is why the member is reported
+/// on every stack and change set rather than only on the ones that named it.
+pub const DEPLOYMENT_CONFIG_MODE_STANDARD: &str = "STANDARD";
+
+/// The deployment configuration in force on a stack or a change set, as the modelled
+/// member.
+///
+/// Unlike [`deployment_config_view`], which answers only what a request supplied, this is
+/// what a READ of the resource reports: CloudFormation carries the member on every stack
+/// and change set, with the default mode for one that named no mode.
+pub fn deployment_config_in_force(
+    config: Option<&StoredDeploymentConfig>,
+) -> Option<crate::ops::types::DeploymentConfig> {
+    Some(crate::ops::types::DeploymentConfig {
+        mode: config
+            .and_then(|config| config.mode.clone())
+            .or_else(|| Some(DEPLOYMENT_CONFIG_MODE_STANDARD.to_string())),
+        // `DeploymentConfig$DisableRollback`: "Specifies whether to disable rollback of
+        // the stack if the stack operation fails. Default: false." The operation ran with
+        // that default when the request named no value.
+        disable_rollback: config
+            .and_then(|config| config.disable_rollback)
+            .or(Some(false)),
+    })
+}
+
+/// The rollback configuration in force on a change set, as the modelled member.
+///
+/// CloudFormation carries the member on every change set it describes, empty for one whose
+/// request named no rollback triggers.
+pub fn rollback_configuration_in_force(
+    configuration: Option<&StoredRollbackConfiguration>,
+) -> Option<crate::ops::types::RollbackConfiguration> {
+    Some(rollback_configuration_view(configuration).unwrap_or(
+        crate::ops::types::RollbackConfiguration {
+            rollback_triggers: None,
+            monitoring_time_in_minutes: None,
+        },
+    ))
 }
 
 /// The request's `RollbackConfiguration` as stored configuration.

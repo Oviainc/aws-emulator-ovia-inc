@@ -33,7 +33,7 @@ pub(crate) fn router() -> MultiServiceRouter {
 
 /// The router AND the engine behind it, for a case that has to inspect the store or seed
 /// it with more records than a bound's worth of wire calls could create.
-fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -41,7 +41,7 @@ fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// This service's store in the shared engine, as every handler reaches it.
-fn store(
+pub(crate) fn store(
     engine: &Arc<engine::InMemoryEngine>,
 ) -> engine::ServiceState<ComAmazonawsCloudformationCloudformationState> {
     engine.state::<ComAmazonawsCloudformationCloudformationState>()
@@ -58,7 +58,11 @@ pub(crate) async fn wait_for_the_transition() {
 /// The guard is what keeps the case honest on a loaded machine: the emulator owes the
 /// in-progress status only until the due instant, so a read that lost the race to the
 /// clock must be held to the settled status instead of failing.
-pub(crate) fn expected_status(started: Instant, in_progress: &'static str, settled: &'static str) -> &'static str {
+pub(crate) fn expected_status(
+    started: Instant,
+    in_progress: &'static str,
+    settled: &'static str,
+) -> &'static str {
     if started.elapsed() < STATUS_TRANSITION_DELAY {
         in_progress
     } else {
@@ -171,13 +175,13 @@ pub(crate) async fn describe_stack(router: &MultiServiceRouter, name_or_id: &str
     .await
 }
 
-async fn get_template(router: &MultiServiceRouter, name_or_id: &str) -> (u16, String) {
+pub(crate) async fn get_template(router: &MultiServiceRouter, name_or_id: &str) -> (u16, String) {
     call(router, "GetTemplate", &[member("StackName", name_or_id)]).await
 }
 
 /// A created stack's id is the ARN form CloudFormation mints:
 /// `arn:aws:cloudformation:<region>:<account>:stack/<name>/<uuid>`.
-fn assert_stack_id_shape(case: &str, stack_id: &str, stack_name: &str) {
+pub(crate) fn assert_stack_id_shape(case: &str, stack_id: &str, stack_name: &str) {
     let prefix = format!("arn:aws:cloudformation:{REGION}:{ACCOUNT_ID}:stack/{stack_name}/");
     assert!(
         stack_id.starts_with(&prefix),
@@ -207,7 +211,7 @@ struct TemplateCase {
 }
 
 /// A borrowed key/value table as owned pairs.
-fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -1319,7 +1323,7 @@ async fn create_stack_refuses_a_stack_past_the_stores_stack_quota() {
             held.stacks.push(StoredStack::new(
                 format!("arn:aws:cloudformation:{REGION}:{ACCOUNT_ID}:stack/{name}/{index:05}"),
                 name,
-                "{}".to_string(),
+                Some("{}".to_string()),
                 now,
             ));
         }
@@ -1435,7 +1439,7 @@ async fn completed_deletions_are_retained_only_up_to_the_retention_bound() {
             let mut stack = StoredStack::new(
                 format!("arn:aws:cloudformation:{REGION}:{ACCOUNT_ID}:stack/{name}/{index:05}"),
                 name,
-                "{}".to_string(),
+                Some("{}".to_string()),
                 deleted_at,
             );
             stack.status = status::DELETE_COMPLETE.to_string();

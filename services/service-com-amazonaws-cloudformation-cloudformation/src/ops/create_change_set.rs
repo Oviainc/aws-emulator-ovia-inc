@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChangeSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChangeSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists a change set — its template, parameters, tags, capabilities and
+//! the rest of the request's configuration — together with the resource-level change list
+//! computed by comparing that template with the stack's current one, and answers the
+//! change set's ARN and its stack's id.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChangeSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ChangeSetType=CREATE` also brings the stack itself into existence, in
+//! `REVIEW_IN_PROGRESS` with no template and no resources, keyed by the `StackId` this call
+//! answers (`ChangeSetType`: "CloudFormation creates a stack with a unique stack ID, but no
+//! template or resources. The stack will be in the REVIEW_IN_PROGRESS state until you
+//! execute the change set"); `ExecuteChangeSet` is what puts the template on it.
+//!
+//! CloudFormation answers this call while it is still computing the change set ("After the
+//! CreateChangeSet call successfully completes, CloudFormation starts creating the change
+//! set"), so the change set is answered `CREATE_PENDING` and settles to `CREATE_COMPLETE`
+//! (or to `FAILED`, when it would change nothing) once the clock makes that due — which is
+//! what `DescribeChangeSet` reports and what `ExecuteChangeSet` waits for.
+//!
+//! The change list is read by the same template reader a deployment uses
+//! (`crate::state::template`), so it covers the JSON and YAML bodies `CreateStack` deploys;
+//! a body that reader will not read, or one declaring no resources, is refused with the
+//! `ValidationError` CloudFormation answers for a template format error.
+//!
+//! Answered 501 rather than guessed at: `TemplateURL` (fetching a template from Amazon S3
+//! needs an outbound connection this emulator does not make) and `ChangeSetType=IMPORT`
+//! (importing resources that already exist, which this emulator does not create).
 //!
 //! ## Shape of an operation
 //!
@@ -198,6 +214,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    change_set_status, change_set_type, execution_status, status, StoredChangeSet, StoredStack,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -269,18 +288,379 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChangeSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChangeSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChangeSet"))
+        // "Conditional: You must specify only one of the following parameters:
+        // TemplateBody, TemplateURL, or set the UsePreviousTemplate to true."
+        let template_sources = [
+            input.template_body.is_some(),
+            input.template_url.is_some(),
+            input.use_previous_template == Some(true),
+        ]
+        .into_iter()
+        .filter(|specified| *specified)
+        .count();
+        if template_sources != 1 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You must specify exactly one of TemplateBody, TemplateURL or \
+                 UsePreviousTemplate",
+            ));
+        }
+        // A `TemplateURL` names a template in an Amazon S3 bucket or a Systems Manager
+        // document, which would have to be fetched over the network — this emulator makes
+        // no outbound connections.
+        if input.template_url.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateChangeSet with TemplateURL (fetching a template from Amazon S3)",
+            ));
+        }
+        // "By default, CloudFormation specifies UPDATE."
+        let requested_type = input
+            .change_set_type
+            .as_deref()
+            .unwrap_or(change_set_type::UPDATE);
+        // An IMPORT change set brings resources that already exist under a stack's
+        // management. This emulator creates no stack resources, so it has none to import
+        // and answers 501 rather than a change set over resources nobody read.
+        if requested_type == change_set_type::IMPORT {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateChangeSet with ChangeSetType IMPORT (importing existing resources)",
+            ));
+        }
+        // "The resources to import into your stack" — only an IMPORT change set imports.
+        if input
+            .resources_to_import
+            .as_deref()
+            .is_some_and(|resources| !resources.is_empty())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "ResourcesToImport can only be specified when ChangeSetType is IMPORT",
+            ));
+        }
+        if let Some(body) = &input.template_body {
+            // The documented `TemplateBody` maximum, which the model carries no `@length`
+            // for.
+            crate::state::validate_template_body(body)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service was mounted on an engine that is not the shared in-memory one,
+            // so there is no store to create the change set in: nothing was written.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateChangeSet",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The stack the change set is for, when it already exists. A stack in
+        // REVIEW_IN_PROGRESS does NOT exist yet — "the stack will be in the
+        // REVIEW_IN_PROGRESS state until you execute the change set" — so a second CREATE
+        // change set for it is accepted and targets that same record.
+        let existing = store
+            .resolve(&input.stack_name)
+            .filter(|stack| stack.is_live())
+            .map(|stack| (stack.stack_id.clone(), stack.status.clone()));
+        let in_review = existing
+            .as_ref()
+            .is_some_and(|(_, status)| *status == status::REVIEW_IN_PROGRESS);
+
+        // "You can't use the UPDATE type to create a change set for a new stack or the
+        // CREATE type to create a change set for an existing stack."
+        let creates_the_stack = requested_type == change_set_type::CREATE;
+        if creates_the_stack {
+            if existing.is_some() && !in_review {
+                return Err(CreateChangeSetErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(format!("Stack [{}] already exists", input.stack_name)),
+                    },
+                )
+                .into());
+            }
+            if existing.is_none() {
+                // The stack does not exist yet, so this call names it: the documented
+                // stack-name rule applies, as it does on `CreateStack`.
+                crate::state::validate_stack_name(&input.stack_name)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                // "The quota for the resource has already been reached": the store holds at
+                // most `MAX_STACKS` live stacks, and a CREATE change set creates one.
+                if store.live_stacks().count() >= crate::state::MAX_STACKS {
+                    return Err(CreateChangeSetErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "Limit for stacks exceeded: no more than {} stacks can exist \
+                                 in this account and Region",
+                                crate::state::MAX_STACKS
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+        // The stack this change set belongs to, when it already exists: an UPDATE change
+        // set compares against it, and a CREATE change set for a stack still in
+        // REVIEW_IN_PROGRESS targets that same record. `None` means this call mints it.
+        let target_stack_id = match &existing {
+            Some((stack_id, _)) => {
+                if !creates_the_stack && in_review {
+                    // A stack a CREATE change set created and nothing has executed yet has
+                    // no template to compare an update against — the same refusal
+                    // `UpdateStack` answers for it.
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_cannot_be_updated(
+                            stack_id,
+                            status::REVIEW_IN_PROGRESS,
+                        ),
+                    ));
+                }
+                Some(stack_id.clone())
+            }
+            None => {
+                if !creates_the_stack {
+                    // An UPDATE change set compares against a stack that exists.
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(&input.stack_name),
+                    ));
+                }
+                None
+            }
+        };
+
+        // The stack's current template, parameters and DEPLOYED resources, which the
+        // change set is computed against. A stack that does not exist yet has none.
+        let (previous_template, previous_parameters, deployed) = match target_stack_id.as_deref() {
+            None => (None, Vec::new(), Vec::new()),
+            Some(stack_id) => {
+                let stack = store
+                    .resolve(stack_id)
+                    .expect("the stack resolved immediately above");
+                (
+                    stack.template_body.clone(),
+                    stack.parameters.clone(),
+                    stack.resources.clone(),
+                )
+            }
+        };
+        // "Whether to reuse the template that's associated with the stack to create the
+        // change set."
+        let template_body = match &input.template_body {
+            Some(body) => body.clone(),
+            None => previous_template.clone().ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation_error(format!(
+                    "Stack [{}] has no template to reuse",
+                    input.stack_name
+                ))
+            })?,
+        };
+        let parameters =
+            crate::state::merged_parameters(&previous_parameters, input.parameters.as_deref())
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        // The change list is what a change set IS: "Creates a list of changes that will be
+        // applied to a stack so that you can review the changes before executing them."
+        // It is computed here, once, from the two templates — never on a read — and by the
+        // SAME template reader a deployment uses, so a change set covers the JSON and YAML
+        // bodies `CreateStack` deploys.
+        let Some(declared) = crate::state::template_resources(&template_body) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Template format error: the TemplateBody is not a template this service can \
+                 read",
+            ));
+        };
+        if declared.is_empty() {
+            // A change set is a plan over resources, so a template that declares none has
+            // nothing to plan: "Template format error: At least one Resources member must
+            // be defined."
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Template format error: At least one Resources member must be defined.",
+            ));
+        }
+        // The stack's own template is read the same way. A stack with no template yet, or
+        // one whose template declares no resources, simply has none to compare against, so
+        // every resource the submitted template declares is an addition.
+        let previous_declared = previous_template
+            .as_deref()
+            .and_then(crate::state::template_resources)
+            .unwrap_or_default();
+        let changes = crate::state::computed_changes(&previous_declared, &declared, &deployed);
+
+        // A change set of this stack that this very request already created: "Specify this
+        // token if you plan to retry requests so that CloudFormation knows that you're not
+        // attempting to create another change set with the same name."
+        if let Some(token) = &input.client_token {
+            let replayed = target_stack_id.as_deref().and_then(|stack_id| {
+                store
+                    .change_sets_of(stack_id)
+                    .find(|change_set| {
+                        change_set.client_token.as_deref() == Some(token.as_str())
+                            && change_set.change_set_name == input.change_set_name
+                    })
+                    .map(|change_set| {
+                        (change_set.change_set_id.clone(), change_set.stack_id.clone())
+                    })
+            });
+            if let Some(replayed) = replayed {
+                return Ok(CreateChangeSetOutput {
+                    id: Some(replayed.0),
+                    stack_id: Some(replayed.1),
+                });
+            }
+        }
+        // "The name must be unique among all change sets that are associated with the
+        // specified stack."
+        if let Some(stack_id) = target_stack_id.as_deref() {
+            if store
+                .change_sets_of(stack_id)
+                .any(|change_set| change_set.change_set_name == input.change_set_name)
+            {
+                return Err(CreateChangeSetErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(format!(
+                            "ChangeSet [{}] already exists",
+                            input.change_set_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            if store.change_sets_of(stack_id).count()
+                >= crate::state::MAX_CHANGE_SETS_PER_STACK
+            {
+                return Err(CreateChangeSetErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Limit for change sets exceeded: no more than {} change sets can \
+                             exist for one stack",
+                            crate::state::MAX_CHANGE_SETS_PER_STACK
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        if store.change_sets.len() >= crate::state::MAX_CHANGE_SETS {
+            return Err(CreateChangeSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Limit for change sets exceeded: no more than {} change sets can \
+                         exist in this account and Region",
+                        crate::state::MAX_CHANGE_SETS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Validated and within quota: from here the call allocates.
+        let change_set_id = crate::state::new_change_set_id(&region, &input.change_set_name);
+        let stack_id = match target_stack_id {
+            Some(stack_id) => stack_id,
+            None => {
+                let stack_id = crate::state::new_stack_id(&region, &input.stack_name);
+                let mut stack = StoredStack::new(
+                    stack_id.clone(),
+                    input.stack_name.clone(),
+                    // "CloudFormation creates a stack with a unique stack ID, but no
+                    // template or resources": the template is the change set's until it is
+                    // executed.
+                    None,
+                    now,
+                );
+                stack.status = status::REVIEW_IN_PROGRESS.to_string();
+                stack.status_reason = Some(crate::state::USER_INITIATED.to_string());
+                // The Region the stack lives in is the one this call was signed for, as it
+                // is for a stack `CreateStack` creates.
+                stack.region = region.clone();
+                stack.record_event(
+                    now,
+                    status::REVIEW_IN_PROGRESS,
+                    Some(crate::state::USER_INITIATED.to_string()),
+                    None,
+                    None,
+                );
+                store.stacks.push(stack);
+                stack_id
+            }
+        };
+        // `Stack$ChangeSetId` is the change set that last acted on the stack. A CREATE
+        // change set is the only thing that has acted on the stack it created.
+        let operation_id = crate::state::new_operation_id();
+        if let Some(stack) = store.resolve_mut(&stack_id) {
+            if creates_the_stack {
+                stack.change_set_id = Some(change_set_id.clone());
+                // On the stack this change set brings into existence, creating the change
+                // set is the only operation performed so far, which is what the model's
+                // `CREATE_CHANGESET` operation type names. On a stack that ALREADY exists
+                // a change set changes nothing until it is executed, so that stack's last
+                // operation stays the create or update that last acted on it.
+                stack.record_operation(
+                    crate::state::operation_type::CREATE_CHANGESET,
+                    &operation_id,
+                );
+            }
+        }
+
+        // "CloudFormation starts creating the change set": it is answered CREATE_PENDING
+        // and settles once the clock makes the terminal status due. A change set that would
+        // change nothing settles to FAILED instead, with the reason CloudFormation gives.
+        let settles_to = if changes.is_empty() {
+            (change_set_status::FAILED, execution_status::UNAVAILABLE)
+        } else {
+            (change_set_status::CREATE_COMPLETE, execution_status::AVAILABLE)
+        };
+        let stack_name = store
+            .resolve(&stack_id)
+            .map(|stack| stack.stack_name.clone())
+            .unwrap_or_else(|| input.stack_name.clone());
+        store.change_sets.push(StoredChangeSet {
+            change_set_id: change_set_id.clone(),
+            change_set_name: input.change_set_name.clone(),
+            stack_id: stack_id.clone(),
+            stack_name,
+            change_set_type: if creates_the_stack {
+                change_set_type::CREATE.to_string()
+            } else {
+                change_set_type::UPDATE.to_string()
+            },
+            description: input.description.clone(),
+            template_body,
+            parameters,
+            capabilities: input.capabilities.clone().unwrap_or_default(),
+            tags: crate::state::stored_tags(input.tags.as_deref().unwrap_or_default()),
+            notification_arns: input.notification_ar_ns.clone().unwrap_or_default(),
+            role_arn: input.role_arn.clone(),
+            rollback_configuration: crate::state::stored_rollback_configuration(
+                input.rollback_configuration.as_ref(),
+            ),
+            deployment_config: crate::state::stored_deployment_config(
+                input.deployment_config.as_ref(),
+            ),
+            deployment_mode: input.deployment_mode.clone(),
+            resource_types: input.resource_types.clone().unwrap_or_default(),
+            on_stack_failure: input.on_stack_failure.clone(),
+            include_nested_stacks: input.include_nested_stacks.unwrap_or(false),
+            import_existing_resources: input.import_existing_resources.unwrap_or(false),
+            client_token: input.client_token.clone(),
+            creation_time: now,
+            status: change_set_status::CREATE_PENDING.to_string(),
+            status_reason: None,
+            execution_status: execution_status::UNAVAILABLE.to_string(),
+            pending: Some(crate::state::PendingChangeSetStatus {
+                status: Some(settles_to.0.to_string()),
+                status_reason: changes
+                    .is_empty()
+                    .then(|| crate::state::NO_CHANGES_REASON.to_string()),
+                execution_status: Some(settles_to.1.to_string()),
+                due_at: now + crate::state::STATUS_TRANSITION_DELAY,
+            }),
+            changes,
+        });
+
+        Ok(CreateChangeSetOutput {
+            id: Some(change_set_id),
+            stack_id: Some(stack_id),
+        })
     }
 }

@@ -3,6 +3,8 @@
 //! @op GetTemplate
 //! IMPLEMENTED: answers the exact template body `CreateStack`/`UpdateStack` persisted
 //! for the named stack — a byte-identical round trip — for a running or a deleted stack.
+//! A request naming a `ChangeSetName` instead answers the template that change set would
+//! put on the stack, with the stages the change set's own creation has reached.
 //!
 //! ## Shape of an operation
 //!
@@ -154,23 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // A change set's template is addressed by `ChangeSetName`. This emulator stores
-        // no change sets, so no change set name or id names one that exists — which is
-        // exactly what the modelled 404 says.
-        if let Some(change_set) = &input.change_set_name {
-            return Err(GetTemplateErrorModeled::ChangeSetNotFoundException(
-                ChangeSetNotFoundException {
-                    message: Some(format!("ChangeSet [{change_set}] does not exist")),
-                },
-            )
-            .into());
-        }
-        let Some(name_or_id) = input.stack_name.as_deref() else {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "Either StackName or ChangeSetName must be specified",
-            ));
-        };
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no template store to read.
             return Err(crate::scaffolded::Scaffolded::not_implemented("GetTemplate"));
@@ -180,6 +165,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock had already made due.
         store.settle(::std::time::SystemTime::now());
 
+        // "The name or Amazon Resource Name (ARN) of a change set for which CloudFormation
+        // returns the associated template. If you specify a name, you must also specify the
+        // StackName." A change set's template is the one it would put on its stack, which
+        // is what `CreateChangeSet` stored.
+        if let Some(change_set_name) = &input.change_set_name {
+            crate::state::require_stack_for_change_set_name(
+                change_set_name,
+                input.stack_name.as_deref(),
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            let change_set = store
+                .resolve_change_set(change_set_name, input.stack_name.as_deref())
+                .ok_or_else(|| {
+                    GetTemplateError::from(GetTemplateErrorModeled::ChangeSetNotFoundException(
+                        ChangeSetNotFoundException {
+                            message: Some(crate::state::change_set_does_not_exist(
+                                change_set_name,
+                            )),
+                        },
+                    ))
+                })?;
+            // "For change sets, the Original template is always available. After
+            // CloudFormation finishes creating the change set, the Processed template
+            // becomes available."
+            let mut stages_available = vec![TEMPLATE_STAGE_ORIGINAL.to_string()];
+            if change_set.status == crate::state::change_set_status::CREATE_COMPLETE {
+                stages_available.push(TEMPLATE_STAGE_PROCESSED.to_string());
+            }
+            return Ok(GetTemplateOutput {
+                template_body: Some(change_set.template_body.clone()),
+                stages_available: Some(stages_available),
+            });
+        }
+        let Some(name_or_id) = input.stack_name.as_deref() else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Either StackName or ChangeSetName must be specified",
+            ));
+        };
+
         // "You can get the template for running or deleted stacks" — a deleted stack is
         // addressable by its stack id, which is what `resolve` honours. "If the template
         // doesn't exist, a ValidationError is returned."
@@ -188,12 +212,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name_or_id,
             ))
         })?;
+        // A stack a `CREATE` change set created carries no template until that change set
+        // is executed, and "if the template doesn't exist, a ValidationError is returned".
+        let template_body = stack.template_body.clone().ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation_error(format!(
+                "Template does not exist for stack [{name_or_id}] in {} state",
+                stack.status
+            ))
+        })?;
 
         // The body is answered verbatim for either stage: this emulator runs no template
         // transforms, so the processed template IS the original one.
         // "For stacks, the Original and Processed templates are always available."
         Ok(GetTemplateOutput {
-            template_body: Some(stack.template_body.clone()),
+            template_body: Some(template_body),
             stages_available: Some(vec![
                 TEMPLATE_STAGE_ORIGINAL.to_string(),
                 TEMPLATE_STAGE_PROCESSED.to_string(),

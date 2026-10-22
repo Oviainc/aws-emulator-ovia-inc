@@ -193,7 +193,7 @@ use crate::state::{
 /// Cloned field by field rather than cloning the whole `StoredStack`, so an update never
 /// copies the stack's event log.
 struct PreviousValues {
-    template_body: String,
+    template_body: Option<String>,
     parameters: Vec<StoredParameter>,
     tags: Vec<StoredTag>,
     notification_arns: Vec<String>,
@@ -218,54 +218,9 @@ impl PreviousValues {
     }
 }
 
-/// Resolve the request's `Parameters` against the values the stack already carries.
-///
-/// A request with no `Parameters` at all leaves the stack's parameters as they are;
-/// otherwise the request states the parameter set, and each entry either carries a new
-/// value or asks (`UsePreviousValue`) for the one the stack is already using. "If you
-/// specify true, do not specify a parameter value" — so a request doing both is refused,
-/// and so is one asking for a previous value the stack does not have.
-fn merged_parameters(
-    previous: &[StoredParameter],
-    requested: Option<&[Parameter]>,
-) -> Result<Vec<StoredParameter>, String> {
-    let Some(requested) = requested else {
-        return Ok(previous.to_vec());
-    };
-    requested
-        .iter()
-        .map(|parameter| {
-            let key = parameter
-                .parameter_key
-                .clone()
-                .filter(|key| !key.is_empty())
-                .ok_or_else(|| {
-                    "Parameters: every parameter must have a ParameterKey".to_string()
-                })?;
-            if parameter.use_previous_value == Some(true) {
-                if parameter.parameter_value.is_some() {
-                    return Err(format!(
-                        "Parameters: [{key}] cannot specify both a ParameterValue and \
-                         UsePreviousValue"
-                    ));
-                }
-                let value = previous
-                    .iter()
-                    .find(|stored| stored.key == key)
-                    .map(|stored| stored.value.clone())
-                    .ok_or_else(|| {
-                        format!("Parameters: [{key}] has no previous value on this stack")
-                    })?;
-                return Ok(StoredParameter { key, value });
-            }
-            let value = parameter
-                .parameter_value
-                .clone()
-                .ok_or_else(|| format!("Parameters: [{key}] must have values"))?;
-            Ok(StoredParameter { key, value })
-        })
-        .collect()
-}
+// The request's `Parameters` are resolved against the stack's stored values by the shared
+// `crate::state::merged_parameters`, which `CreateChangeSet` resolves the same member
+// with.
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -394,12 +349,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !previous.is_live() {
             return Err(not_found());
         }
-        // An operation is still in flight on this stack, so the update cannot start.
-        if previous.pending.is_some() {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "Stack:{} is in {} state and can not be updated.",
-                previous.stack_id, previous.status
-            )));
+        // An operation still in flight on this stack, or a stack a `CREATE` change set
+        // created that nothing has executed yet (it has no template and no resources to
+        // update — the change set is what brings it into existence): neither can take an
+        // update.
+        if previous.pending.is_some() || previous.status == status::REVIEW_IN_PROGRESS {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::stack_cannot_be_updated(&previous.stack_id, &previous.status),
+            ));
         }
         let previous = PreviousValues::of(previous);
 
@@ -412,11 +369,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 body.clone()
             }
             // `UsePreviousTemplate`: "Reuse the existing template that is associated with
-            // the stack that you are updating."
-            None => previous.template_body.clone(),
+            // the stack that you are updating." A stack a `CREATE` change set created and
+            // nothing has executed yet carries no template to reuse.
+            None => previous.template_body.clone().ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation_error(format!(
+                    "Stack [{}] has no template to reuse",
+                    input.stack_name
+                ))
+            })?,
         };
-        let parameters = merged_parameters(&previous.parameters, input.parameters.as_deref())
-            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let parameters =
+            crate::state::merged_parameters(&previous.parameters, input.parameters.as_deref())
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // A parameter the template declares and the request passed no value for takes the
         // template's own `Default`, exactly as on a create.
         let parameters = crate::state::parameters_in_force(&template_body, parameters);
@@ -452,7 +416,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // CloudFormation refuses an update that would change nothing about the stack.
-        if template_body == previous.template_body
+        if Some(&template_body) == previous.template_body.as_ref()
             && parameters == previous.parameters
             && tags == previous.tags
             && notification_arns == previous.notification_arns

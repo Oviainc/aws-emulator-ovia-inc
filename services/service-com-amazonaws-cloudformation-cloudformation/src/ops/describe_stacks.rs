@@ -78,7 +78,7 @@ use crate::state::{StoredStack, DRIFT_STATUS_NOT_CHECKED};
 /// One stored stack as the modelled `Stack` shape.
 ///
 /// Every member is read back from what `CreateStack`/`UpdateStack`/`DeleteStack`/
-/// `UpdateTerminationProtection` persisted.
+/// `UpdateTerminationProtection` or `CreateChangeSet`/`ExecuteChangeSet` persisted.
 ///
 /// The members CloudFormation reports on EVERY stack are always present, as an empty
 /// element where the stack carries nothing: `NotificationARNs`, `Tags`,
@@ -87,10 +87,14 @@ use crate::state::{StoredStack, DRIFT_STATUS_NOT_CHECKED};
 /// `Parameters`, `Outputs`, `Capabilities` — appear only when the stack has some, since a
 /// stack that declares none has no list to report.
 ///
+/// `ChangeSetId` is the change set that last acted on the stack: the one that created it in
+/// `REVIEW_IN_PROGRESS`, or the one `ExecuteChangeSet` applied. `LastOperations` is the
+/// operation that last acted on the stack — the create, update or delete it ran, or the
+/// change-set creation that brought the stack into existence.
+///
 /// The members this emulator has nothing to report for are absent rather than invented:
 ///
-/// * `ChangeSetId`, `ParentId`, `RootId` — change sets and nested stacks are not
-///   implemented, so no stack here has any.
+/// * `ParentId`, `RootId` — nested stacks are not implemented, so no stack here has any.
 /// * `DetailedStatus` — nothing in this slice produces one.
 ///
 /// `DriftInformation` is `NOT_CHECKED`: drift detection compares a stack's resources
@@ -100,13 +104,13 @@ fn stack_view(stored: &StoredStack) -> Stack {
     Stack {
         stack_id: Some(stored.stack_id.clone()),
         stack_name: stored.stack_name.clone(),
-        change_set_id: None,
+        change_set_id: stored.change_set_id.clone(),
         description: stored.description(),
         parameters: crate::state::parameter_views(&stored.parameters),
         creation_time: crate::state::timestamp(stored.creation_time),
         deletion_time: stored.deletion_time.map(crate::state::timestamp),
         last_updated_time: stored.last_updated_time.map(crate::state::timestamp),
-        rollback_configuration: crate::state::rollback_configuration_view(
+        rollback_configuration: crate::state::rollback_configuration_in_force(
             stored.rollback_configuration.as_ref(),
         ),
         stack_status: stored.status.clone(),
