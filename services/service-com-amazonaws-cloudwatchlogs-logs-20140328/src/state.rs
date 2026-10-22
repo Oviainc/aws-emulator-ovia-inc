@@ -6,6 +6,11 @@
 //! small helpers every handler of that loop shares: ARN construction, the wall clock,
 //! log-group identifier resolution and the opaque pagination tokens
 //! `GetLogEvents` / `DescribeLogStreams` / `DescribeLogGroups` hand back.
+//!
+//! The account's resource policies live here too: an account-scoped one in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::account_resource_policies`], a
+//! resource-scoped one on the log group it is attached to
+//! ([`LogGroupRecord::resource_policy`]).
 
 use std::collections::BTreeMap;
 
@@ -34,6 +39,23 @@ pub const DEFAULT_EVENTS_LIMIT: i32 = 10_000;
 /// 1,000,000 log groups per Region per account."
 pub const MAX_LOG_GROUPS: usize = 1_000_000;
 
+/// AWS's documented resource-policy quota, from `PutResourcePolicy`: "An account can
+/// have a maximum of 10 policies without resourceARN and one per LogGroup resourceARN".
+/// The per-resource half of that quota is structural here: a resource-scoped policy is
+/// stored ON its log group ([`LogGroupRecord::resource_policy`]), so a group can hold
+/// exactly one.
+pub const MAX_ACCOUNT_RESOURCE_POLICIES: usize = 10;
+
+/// The scope of a policy attached to no resource, from the model's `PolicyScope` enum
+/// (`ACCOUNT` | `RESOURCE`). This is also the scope `DescribeResourcePolicies` reports
+/// on when the request names no `policyScope` ("When not specified, defaults to
+/// ACCOUNT").
+pub const POLICY_SCOPE_ACCOUNT: &str = "ACCOUNT";
+
+/// The scope of a policy attached to one CloudWatch Logs resource, from the model's
+/// `PolicyScope` enum (`ACCOUNT` | `RESOURCE`).
+pub const POLICY_SCOPE_RESOURCE: &str = "RESOURCE";
+
 /// THE EMULATOR'S OWN CEILING on the log streams one group holds, not an AWS quota:
 /// CloudWatch Logs documents no limit on log streams, but this emulator keeps every
 /// stream in memory, so it refuses to create more than this many in one group rather
@@ -59,6 +81,16 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// Monotonic ingestion counter. It totally orders events that share a timestamp
     /// and makes the pagination cursors and sequence tokens stable.
     pub next_ingestion_seq: u64,
+    /// The account-scoped resource policies — the ones `PutResourcePolicy` creates
+    /// without a `resourceArn` — keyed by `policyName`. A `BTreeMap` so
+    /// `DescribeResourcePolicies` enumerates them in policy-name order. A
+    /// resource-SCOPED policy is not here: it is attached to the log group its ARN
+    /// names ([`LogGroupRecord::resource_policy`]), so deleting that group revokes its
+    /// policy with it.
+    pub account_resource_policies: BTreeMap<String, ResourcePolicyRecord>,
+    /// Monotonic counter behind the resource-policy revision ids, so every update of a
+    /// resource-scoped policy mints a revision no earlier update used.
+    pub next_policy_revision: u64,
 }
 
 impl ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -67,6 +99,42 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         let seq = self.next_ingestion_seq;
         self.next_ingestion_seq = self.next_ingestion_seq.saturating_add(1);
         seq
+    }
+
+    /// Take the next resource-policy revision number, advancing the counter.
+    pub fn take_policy_revision(&mut self) -> u64 {
+        let seq = self.next_policy_revision;
+        self.next_policy_revision = self.next_policy_revision.saturating_add(1);
+        seq
+    }
+}
+
+/// One resource policy — "a policy enabling one or more entities to put logs to a log
+/// group in this account" — as it is stored.
+#[derive(Debug, Clone)]
+pub struct ResourcePolicyRecord {
+    pub policy_name: String,
+    pub policy_document: String,
+    pub last_updated_time_ms: i64,
+    /// The ARN this policy is attached to, for a resource-scoped policy; `None` for an
+    /// account-scoped one (`ResourcePolicy$resourceArn` is "only populated for
+    /// resource-scoped policies").
+    pub resource_arn: Option<String>,
+    /// The revision this policy is at, for a resource-scoped policy; `None` for an
+    /// account-scoped one (`ResourcePolicy$revisionId` is "only populated for
+    /// resource-scoped policies").
+    pub revision_id: Option<String>,
+}
+
+impl ResourcePolicyRecord {
+    /// This policy's `policyScope`: `RESOURCE` when it is attached to a resource,
+    /// `ACCOUNT` when it is attached to none.
+    pub fn policy_scope(&self) -> &'static str {
+        if self.resource_arn.is_some() {
+            POLICY_SCOPE_RESOURCE
+        } else {
+            POLICY_SCOPE_ACCOUNT
+        }
     }
 }
 
@@ -88,6 +156,9 @@ pub struct LogGroupRecord {
     pub tags: BTreeMap<String, String>,
     /// The group's log streams, keyed by `logStreamName`.
     pub streams: BTreeMap<String, LogStreamRecord>,
+    /// The resource-scoped policy attached to this group, if one has been put: AWS
+    /// allows "one per LogGroup resourceARN", so at most one.
+    pub resource_policy: Option<ResourcePolicyRecord>,
 }
 
 impl LogGroupRecord {
@@ -106,6 +177,7 @@ impl LogGroupRecord {
             metric_filter_count: 0,
             tags: BTreeMap::new(),
             streams: BTreeMap::new(),
+            resource_policy: None,
         }
     }
 }
@@ -264,6 +336,28 @@ pub fn log_stream_arn(region: &str, group_name: &str, stream_name: &str) -> Stri
     )
 }
 
+/// Whether an ARN names a CloudWatch Logs log group — the only resource type a resource
+/// policy can be attached to (`PutResourcePolicy$resourceArn`: "Currently only supports
+/// LogGroup ARN").
+///
+/// A log group's ARN is `arn:<partition>:logs:<region>:<account>:log-group:<name>`, with
+/// or without the trailing `:*` the `LogGroup$arn` member carries. A log STREAM's ARN
+/// also names a log group, so it is excluded here: it names a stream, which cannot carry
+/// a resource policy.
+pub fn is_log_group_arn(arn: &str) -> bool {
+    let Some(rest) = arn.strip_prefix("arn:") else {
+        return false;
+    };
+    // partition, service, region, account, then the whole resource segment.
+    let mut segments = rest.splitn(5, ':');
+    let (_partition, service) = (segments.next(), segments.next());
+    let (_region, _account) = (segments.next(), segments.next());
+    let resource = segments.next().unwrap_or_default();
+    service == Some("logs")
+        && resource.starts_with("log-group:")
+        && !resource.contains(":log-stream:")
+}
+
 /// The log group name a `logGroupIdentifier` names: the identifier itself when it is a
 /// name, or the name segment of a log-group ARN (either ARN version).
 pub fn log_group_name_from_identifier(identifier: &str) -> &str {
@@ -300,6 +394,14 @@ pub fn resolve_log_group_target(
             Err("either logGroupName or logGroupIdentifier must be specified".to_string())
         }
     }
+}
+
+/// The revision id a resource-scoped policy carries, minted from the monotonic policy
+/// revision counter so it is unique and derived from stored state. AWS documents no
+/// format for it — only that a put must present the revision the policy is currently
+/// at — so this renders the counter as a fixed-width hex string.
+pub fn mint_revision_id(seq: u64) -> String {
+    format!("{seq:032x}")
 }
 
 /// The sequence token a `PutLogEvents` call hands back, minted from the monotonic

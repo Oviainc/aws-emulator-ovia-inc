@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/log_core_loop.rs"]
 mod log_core_loop;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

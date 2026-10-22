@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeResourcePolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeResourcePolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: enumerates the resource policies in this account from the shared store
+//! — the account-scoped ones, or the one attached to a named resource — one page at a
+//! time. This is the ONLY file to touch for this operation.
+//!
+//! ## One deliberate deviation from the member docs
+//!
+//! `policyScope` is documented "When not specified, defaults to ACCOUNT". This handler
+//! applies that default only to a request that names no `resourceArn`: a request that
+//! names one is read as scope RESOURCE. The documented default taken literally would
+//! make `DescribeResourcePolicies{resourceArn}` answer an empty list for every input,
+//! because an account-scoped policy is attached to no resource — the one reading of the
+//! two members together that can never report anything. An explicit
+//! `policyScope: ACCOUNT` is still honoured exactly as written, so a caller that wants
+//! the documented reading can ask for it.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeResourcePolicies::handle`] with real behaviour and
@@ -111,6 +122,49 @@ impl From<DescribeResourcePoliciesErrorModeled> for DescribeResourcePoliciesErro
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeResourcePolicies";
+
+/// Where the next page resumes: the identity of the last policy returned, plus the
+/// filters of the enumeration it belongs to. A continuation that changes a filter is
+/// refused, because the token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    policy_scope: Option<String>,
+    resource_arn: Option<String>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "policyScope": self.policy_scope,
+            "resourceArn": self.resource_arn,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let string = |name: &str| {
+            value
+                .get(name)
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string)
+        };
+        Some(Self {
+            policy_scope: string("policyScope"),
+            resource_arn: string("resourceArn"),
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// The `DescribeResourcePolicies` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,18 +201,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeResourcePolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeResourcePoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeResourcePolicies"))
+        // `ctx` carries only request metadata, and this operation reports: it reads the
+        // store and writes nothing.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeResourcePoliciesError::from(
+                DescribeResourcePoliciesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeResourcePoliciesError::from(
+                DescribeResourcePoliciesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        // "Specifies the scope of the resource policy. Valid values are ACCOUNT or
+        // RESOURCE. When not specified, defaults to ACCOUNT." `policyScope` targets the
+        // modelled `PolicyScope` enum, so the boundary validator has already refused any
+        // other value. A request that names a `resourceArn` is asking about that
+        // resource's policy, and a resource only ever carries a resource-scoped one, so
+        // the ACCOUNT default applies to a request that names no resource.
+        let scope = match input.policy_scope.as_deref() {
+            Some(scope) => scope.to_string(),
+            None if input.resource_arn.is_some() => {
+                crate::state::POLICY_SCOPE_RESOURCE.to_string()
+            }
+            None => crate::state::POLICY_SCOPE_ACCOUNT.to_string(),
+        };
+
+        // A `resourceArn` filter names a log group, the only resource a resource policy
+        // attaches to, so it is held to the same rule the put and the delete hold it to;
+        // the two ARN forms a log group reports (with and without the trailing `:*`)
+        // select the same policy.
+        let wanted_group = match input.resource_arn.as_deref() {
+            Some(resource_arn) => {
+                if !crate::state::is_log_group_arn(resource_arn) {
+                    return Err(invalid(
+                        "resourceArn must be the ARN of a CloudWatch Logs log group",
+                    ));
+                }
+                Some(crate::state::log_group_name_from_identifier(resource_arn).to_string())
+            }
+            None => None,
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.policy_scope != input.policy_scope
+                    || cursor.resource_arn != input.resource_arn
+                {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeResourcePolicies request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // One enumeration, in the order the store holds it: account-scoped policies by
+        // policy name, resource-scoped policies by the log group they are attached to.
+        // Each entry is paired with the identity the cursor resumes after.
+        let matching: Vec<(String, &crate::state::ResourcePolicyRecord)> =
+            if scope == crate::state::POLICY_SCOPE_ACCOUNT {
+                store
+                    .account_resource_policies
+                    .values()
+                    // An account-scoped policy is attached to no resource, so a request
+                    // filtered to one selects none of them.
+                    .filter(|_| wanted_group.is_none())
+                    .map(|policy| (policy.policy_name.clone(), policy))
+                    .collect()
+            } else {
+                store
+                    .log_groups
+                    .iter()
+                    .filter(|(name, _)| {
+                        wanted_group
+                            .as_deref()
+                            .is_none_or(|wanted| wanted == name.as_str())
+                    })
+                    .filter_map(|(name, group)| {
+                        group.resource_policy.as_ref().map(|policy| (name.clone(), policy))
+                    })
+                    .collect()
+            };
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|(key, _)| key <= &cursor.after),
+            None => 0,
+        };
+        // `limit` is modelled `range 1..50`, so the boundary validator has already
+        // refused a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        let next_token = page.last().filter(|_| last < matching.len()).map(|(key, _)| {
+            Cursor {
+                policy_scope: input.policy_scope.clone(),
+                resource_arn: input.resource_arn.clone(),
+                after: key.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeResourcePoliciesOutput {
+            resource_policies: Some(
+                page.iter()
+                    .map(|(_, policy)| ResourcePolicy {
+                        policy_name: Some(policy.policy_name.clone()),
+                        policy_document: Some(policy.policy_document.clone()),
+                        last_updated_time: Some(policy.last_updated_time_ms),
+                        policy_scope: Some(policy.policy_scope().to_string()),
+                        resource_arn: policy.resource_arn.clone(),
+                        revision_id: policy.revision_id.clone(),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
