@@ -7,6 +7,11 @@
 //! `ListTagsForResource` and `DeleteCluster` all compute their responses from it.
 //! Nothing in `src/ops/` keeps a second copy of a cluster.
 //!
+//! It also holds the EKS Pod Identity association slice:
+//! `CreatePodIdentityAssociation` writes a [`PodIdentityAssociationRecord`] here
+//! and `DescribePodIdentityAssociation`, `UpdatePodIdentityAssociation` and
+//! `DeletePodIdentityAssociation` read, mutate and remove exactly that record.
+//!
 //! It also holds the Kubernetes version calendar `DescribeClusterVersions`
 //! reports ([`ClusterVersionRecord`]), which is seeded once because it is what
 //! Amazon EKS publishes rather than per-account data.
@@ -36,9 +41,8 @@ use crate::ops::types::{
     ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
     KubernetesNetworkConfigResponse, Logging, OidcIdentityProviderConfig, OutpostConfigResponse,
-    RemoteNetworkConfigResponse,
-    StorageConfigResponse, Update, UpdateParam, UpgradePolicyResponse, VpcConfigResponse,
-    ZonalShiftConfigResponse,
+    PodIdentityAssociation, RemoteNetworkConfigResponse, StorageConfigResponse, Update,
+    UpdateParam, UpgradePolicyResponse, VpcConfigResponse, ZonalShiftConfigResponse,
 };
 
 /// The `ClusterStatus` members this slice uses. The model's enum
@@ -547,6 +551,227 @@ impl ClusterRecord {
     }
 }
 
+/// The fixed prefix of an EKS Pod Identity association id.
+///
+/// Every association id AWS publishes — in the `CreatePodIdentityAssociation`
+/// response, in `ListPodIdentityAssociations` and inside the association ARN
+/// (`.../podidentityassociation/<cluster>/<associationId>`) — has the form `a-`
+/// followed by [`ASSOCIATION_ID_BODY_LEN`] lowercase alphanumeric characters
+/// (`a-abcdefghijklmnop1`). The model types `associationId` as a plain `String`
+/// with no `@pattern`, so nothing refuses a malformed id before a handler runs
+/// and each handler that takes one checks the form itself.
+pub const ASSOCIATION_ID_PREFIX: &str = "a-";
+/// The number of characters after [`ASSOCIATION_ID_PREFIX`] in an association id.
+pub const ASSOCIATION_ID_BODY_LEN: usize = 17;
+/// The association-id form as a regular expression, for the refusal message a
+/// malformed id earns.
+pub const ASSOCIATION_ID_PATTERN: &str = "^a-[0-9a-z]{17}$";
+/// The total length of an association id: the prefix plus the body.
+pub const ASSOCIATION_ID_LEN: usize = ASSOCIATION_ID_PREFIX.len() + ASSOCIATION_ID_BODY_LEN;
+
+/// The refusal message an identifier outside the association-id form earns.
+///
+/// Built from the member the value arrived in and the constraint it failed, the
+/// way every service's parameter complaint is: an id of the wrong LENGTH is told
+/// the length an association id has, and one of the right length carrying
+/// characters the form does not admit is told the form. Shared by every
+/// operation that takes an `associationId`, so all of them phrase the same
+/// refusal the same way.
+pub fn association_id_refusal(member: &str, value: &str) -> String {
+    if value.chars().count() == ASSOCIATION_ID_LEN {
+        format!("The parameter {member} should match the pattern {ASSOCIATION_ID_PATTERN}.")
+    } else {
+        format!("The parameter {member} should be {ASSOCIATION_ID_LEN} characters long.")
+    }
+}
+
+/// The characters an association id's body is drawn from: lowercase letters and
+/// digits, which is what [`ASSOCIATION_ID_PATTERN`] accepts.
+const ASSOCIATION_ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Whether `candidate` has the form of an association id
+/// ([`ASSOCIATION_ID_PATTERN`]).
+///
+/// An id outside this form names no association in any account or Region, so a
+/// request carrying one is refused as an invalid parameter rather than looked up.
+pub fn is_association_id(candidate: &str) -> bool {
+    candidate
+        .strip_prefix(ASSOCIATION_ID_PREFIX)
+        .is_some_and(|body| {
+            body.len() == ASSOCIATION_ID_BODY_LEN
+                && body
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+/// The cluster-name form, as a regular expression.
+///
+/// `CreateCluster$name` is `@length(1..100)` + `@pattern` this expression
+/// (`smithy_query query="operation" operation="CreateCluster"`), so no cluster in
+/// any Region can carry a name outside it. The `clusterName` member of the pod
+/// identity operations is a plain `String`, so they check the form themselves.
+pub const CLUSTER_NAME_PATTERN: &str = "^[0-9A-Za-z][A-Za-z0-9\\-_]*$";
+/// The maximum length of a cluster name (`CreateCluster$name` is `@length(1..100)`).
+pub const MAX_CLUSTER_NAME_LEN: usize = 100;
+
+/// Whether `candidate` has the form of a cluster name
+/// ([`CLUSTER_NAME_PATTERN`], within [`MAX_CLUSTER_NAME_LEN`]).
+pub fn is_cluster_name(candidate: &str) -> bool {
+    let mut characters = candidate.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && characters.all(|rest| rest.is_ascii_alphanumeric() || rest == '-' || rest == '_')
+        && candidate.chars().count() <= MAX_CLUSTER_NAME_LEN
+}
+
+/// The refusal message a value outside the cluster-name form earns, built from
+/// the member it arrived in and the constraint it failed. Shared by every
+/// operation that takes a `clusterName` without a modelled constraint on it, so
+/// all of them phrase the same refusal the same way.
+pub fn cluster_name_refusal(member: &str, value: &str) -> String {
+    if value.chars().count() > MAX_CLUSTER_NAME_LEN {
+        format!(
+            "Value '{value}' at '{member}' failed to satisfy constraint: Member must have \
+             length less than or equal to {MAX_CLUSTER_NAME_LEN}"
+        )
+    } else {
+        format!(
+            "Value '{value}' at '{member}' failed to satisfy constraint: Member must satisfy \
+             regular expression pattern: {CLUSTER_NAME_PATTERN}"
+        )
+    }
+}
+
+/// Whether `candidate` has the form of an IAM role ARN.
+///
+/// `roleArn` and `targetRoleArn` are documented as "The Amazon Resource Name
+/// (ARN) of the IAM role", and an IAM role ARN is
+/// `arn:<partition>:iam::<12-digit account>:role/<path and name>` — IAM is a
+/// global service, so the Region segment is empty. A value outside that form
+/// names no role in any account, so a request carrying one is refused as an
+/// invalid parameter. The account is NOT compared against this emulator's own:
+/// a role in another account is a well-formed ARN.
+pub fn is_iam_role_arn(candidate: &str) -> bool {
+    let fields: Vec<&str> = candidate.split(':').collect();
+    fields.len() == 6
+        && fields[0] == "arn"
+        && !fields[1].is_empty()
+        && fields[2] == "iam"
+        && fields[3].is_empty()
+        && fields[4].len() == 12
+        && fields[4].bytes().all(|byte| byte.is_ascii_digit())
+        && fields[5]
+            .strip_prefix("role/")
+            .is_some_and(|name| !name.is_empty())
+}
+
+/// The maximum length of a Kubernetes name this service accepts: the DNS-1123
+/// SUBDOMAIN limit, which bounds the longest Kubernetes object name (a service
+/// account name); a namespace, a DNS-1123 label, is shorter still.
+pub const MAX_KUBERNETES_NAME_LEN: usize = 253;
+
+/// The Kubernetes name form, as a regular expression, for the refusal message an
+/// `namespace` or `serviceAccount` outside it earns.
+pub const KUBERNETES_NAME_PATTERN: &str = "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$";
+
+/// Whether `candidate` has the form of a Kubernetes object name
+/// ([`KUBERNETES_NAME_PATTERN`], within [`MAX_KUBERNETES_NAME_LEN`]).
+///
+/// `namespace` and `serviceAccount` name Kubernetes objects ("The name of the
+/// Kubernetes namespace inside the cluster", "The name of the Kubernetes service
+/// account inside the cluster"), and Kubernetes names are DNS-1123 names:
+/// lowercase alphanumerics, `-` and `.`, starting and ending alphanumeric. A
+/// value outside that form can never name an object in any cluster, so a request
+/// carrying one is refused as an invalid parameter.
+pub fn is_kubernetes_name(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    let is_alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_KUBERNETES_NAME_LEN
+        && is_alphanumeric(bytes[0])
+        && is_alphanumeric(bytes[bytes.len() - 1])
+        && bytes
+            .iter()
+            .all(|byte| is_alphanumeric(*byte) || *byte == b'-' || *byte == b'.')
+}
+
+/// The number of EKS Pod Identity associations one cluster holds before
+/// `CreatePodIdentityAssociation` answers `ResourceLimitExceededException`.
+///
+/// AWS publishes an adjustable quota for EKS Pod Identity associations per
+/// cluster but the model does not state its value, so this ceiling is CHOSEN
+/// rather than cited: high enough that no realistic use reaches it, and a hard
+/// stop on how much one cluster's repeated creates can retain. The store as a
+/// whole is bounded by it, because an association is only created against a
+/// cluster that exists and clusters are bounded by [`MAX_STORED_CLUSTERS`].
+pub const MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER: usize = 1_000;
+
+/// One EKS Pod Identity association, as this service stores it.
+///
+/// Everything a `PodIdentityAssociation` reports is held here, including the
+/// server-generated parts (`associationId`, `associationArn`, `externalId`,
+/// `createdAt`, `modifiedAt`), so a describe answers exactly what the create or
+/// the last update wrote rather than recomputing anything per request.
+#[derive(Debug, Clone)]
+pub struct PodIdentityAssociationRecord {
+    pub cluster_name: String,
+    pub association_id: String,
+    pub association_arn: String,
+    pub namespace: String,
+    pub service_account: String,
+    pub role_arn: String,
+    pub target_role_arn: Option<String>,
+    /// Minted only for an association that names a `targetRoleArn`: the model
+    /// documents `externalId` as the value "you put in the trust policy of the
+    /// TARGET role", so an association without one has nothing to condition.
+    pub external_id: Option<String>,
+    pub policy: Option<String>,
+    pub disable_session_tags: Option<bool>,
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    pub modified_at: SystemTime,
+    /// The `@idempotencyToken` of the CREATE that minted this association, so a
+    /// retry of that create is absorbed rather than answered with a conflict.
+    pub client_request_token: Option<String>,
+    /// The `@idempotencyToken` of the last UPDATE that applied to this
+    /// association, kept apart from the create's own token: a token absorbs a
+    /// retry only of the call that sent it, so reusing a create's token on an
+    /// update can never swallow the update's change.
+    pub update_request_token: Option<String>,
+}
+
+impl PodIdentityAssociationRecord {
+    /// This record as the modelled `PodIdentityAssociation` shape.
+    pub fn to_association(&self) -> PodIdentityAssociation {
+        PodIdentityAssociation {
+            cluster_name: Some(self.cluster_name.clone()),
+            namespace: Some(self.namespace.clone()),
+            service_account: Some(self.service_account.clone()),
+            role_arn: Some(self.role_arn.clone()),
+            association_arn: Some(self.association_arn.clone()),
+            association_id: Some(self.association_id.clone()),
+            tags: Some(
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            disable_session_tags: self.disable_session_tags,
+            target_role_arn: self.target_role_arn.clone(),
+            external_id: self.external_id.clone(),
+            policy: self.policy.clone(),
+            // "If defined, the EKS Pod Identity association is owned by an Amazon
+            // EKS add-on" — an association created through this API is owned by
+            // the caller, so it reports no owner.
+            owner_arn: None,
+        }
+    }
+}
+
 /// The cluster type the Kubernetes version calendar publishes versions for.
 ///
 /// `DescribeClusterVersionsRequest$clusterType` is a free-form string ("The type
@@ -705,6 +930,43 @@ impl ClusterVersionRecord {
     }
 }
 
+/// The association id a create mints, derived from `seed`.
+///
+/// Opaque and stable: the digest of the seed, mapped onto
+/// [`ASSOCIATION_ID_ALPHABET`], so the result always satisfies
+/// [`ASSOCIATION_ID_PATTERN`]. It is computed once, at create time, and stored on
+/// the record; no read recomputes it.
+pub fn derive_association_id(seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
+    let body: String = digest
+        .iter()
+        .take(ASSOCIATION_ID_BODY_LEN)
+        .map(|byte| {
+            ASSOCIATION_ID_ALPHABET[usize::from(*byte) % ASSOCIATION_ID_ALPHABET.len()] as char
+        })
+        .collect();
+    format!("{ASSOCIATION_ID_PREFIX}{body}")
+}
+
+/// The `externalId` an association that names a `targetRoleArn` carries.
+///
+/// Derived from the association's own ARN — which already carries the account,
+/// Region, cluster and association id — so it is distinct per association and
+/// stable for the record's whole life, and rendered in the 8-4-4-4-12 hex form
+/// AWS's external ids use. Computed once at create time and stored.
+pub fn derive_association_external_id(association_arn: &str) -> String {
+    let digest = Sha256::digest(association_arn.as_bytes());
+    let hex = hex::encode(&digest[..16]);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 /// The Amazon EKS Kubernetes version calendar, as
 /// `(version, EKS release, end of standard support, end of extended support)`.
 ///
@@ -787,6 +1049,23 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// call name a cluster in any region. It holds exactly one entry per stored
     /// cluster, so [`MAX_STORED_CLUSTERS`] bounds it too.
     pub arn_index: BTreeMap<String, (String, String)>,
+    /// EKS Pod Identity associations by `(region, clusterName, associationId)`.
+    ///
+    /// An association belongs to exactly one cluster and a cluster name only
+    /// identifies a cluster within one Region, so the key carries both; the
+    /// association id is unique within the cluster. A `BTreeMap` so a listing
+    /// walks one cluster's associations as a contiguous, sorted range. Bounded by
+    /// [`MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER`] per cluster, which
+    /// `CreatePodIdentityAssociation` enforces, times the bounded number of
+    /// clusters.
+    pub pod_identity_associations: BTreeMap<(String, String, String), PodIdentityAssociationRecord>,
+    /// How many association ids this store has minted, ever.
+    ///
+    /// It is the uniqueness seam for [`Self::mint_association_id`]: two creates
+    /// for the same cluster, namespace and service account (one after the other
+    /// was deleted) must not mint the same id, so the counter — which never goes
+    /// back — is part of the seed.
+    pub minted_associations: u64,
     /// The Kubernetes version calendar `DescribeClusterVersions` reports, seeded
     /// once from [`VERSION_CALENDAR`] (see [`ClusterVersionRecord`]) and never
     /// written by a request: it is what Amazon EKS publishes, not per-account
@@ -812,6 +1091,8 @@ impl Default for ComAmazonawsEksAwswesleyfrontendState {
         Self {
             clusters: BTreeMap::new(),
             arn_index: BTreeMap::new(),
+            pod_identity_associations: BTreeMap::new(),
+            minted_associations: 0,
             cluster_versions: seed_cluster_versions(),
             minted_updates: 0,
         }
@@ -859,6 +1140,72 @@ impl ComAmazonawsEksAwswesleyfrontendState {
             .keys()
             .filter(move |(key_region, _)| key_region == region)
             .map(|(_, name)| name.as_str())
+    }
+
+    /// Every EKS Pod Identity association of one cluster, in association-id order.
+    ///
+    /// The map is keyed `(region, clusterName, associationId)`, so one cluster's
+    /// associations are a contiguous range of it.
+    pub fn pod_identity_associations_in<'a>(
+        &'a self,
+        region: &'a str,
+        cluster_name: &'a str,
+    ) -> impl Iterator<Item = &'a PodIdentityAssociationRecord> + 'a {
+        self.pod_identity_associations
+            .range((
+                std::ops::Bound::Included((
+                    region.to_string(),
+                    cluster_name.to_string(),
+                    String::new(),
+                )),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |((key_region, key_cluster, _), _)| {
+                key_region == region && key_cluster == cluster_name
+            })
+            .map(|(_, record)| record)
+    }
+
+    /// Mint an association id that no association of this cluster already holds.
+    ///
+    /// The seed carries the cluster, the pair the association is for and the
+    /// store's monotonic mint counter, so a re-create after a delete mints a NEW
+    /// id rather than resurrecting the old one. The loop is the collision guard:
+    /// a digest can repeat, and an id must be unique within its cluster.
+    pub fn mint_association_id(
+        &mut self,
+        region: &str,
+        cluster_name: &str,
+        namespace: &str,
+        service_account: &str,
+    ) -> String {
+        loop {
+            self.minted_associations = self.minted_associations.wrapping_add(1);
+            let id = derive_association_id(&format!(
+                "{region}/{cluster_name}/{namespace}/{service_account}/{}",
+                self.minted_associations
+            ));
+            let key = (region.to_string(), cluster_name.to_string(), id.clone());
+            if !self.pod_identity_associations.contains_key(&key) {
+                return id;
+            }
+        }
+    }
+
+    /// Drop every EKS Pod Identity association of one cluster.
+    ///
+    /// An association is a child of its cluster: once the cluster is gone the
+    /// associations are gone with it, so a cluster later created with the same
+    /// name in the same Region does not inherit them.
+    pub fn remove_pod_identity_associations_for_cluster(
+        &mut self,
+        region: &str,
+        cluster_name: &str,
+    ) {
+        self.pod_identity_associations
+            .retain(|(key_region, key_cluster, _), _| {
+                key_region != region || key_cluster != cluster_name
+            });
     }
 }
 
