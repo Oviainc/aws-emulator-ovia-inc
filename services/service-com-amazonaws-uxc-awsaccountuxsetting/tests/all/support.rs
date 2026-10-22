@@ -3,28 +3,26 @@
 //! What a suite EXPECTS a list setting to read back as, in one place.
 //!
 //! The harness that drives requests is `crate::wire`; this module holds only the
-//! expectation helper two suites share, so neither re-derives the rule it is
+//! expectation helper the suites share, so none of them re-derives the rule it is
 //! asserting in its own words.
 
 use crate::wire::strings;
 use serde_json::Value;
 
-/// The order a list setting is reported in: the members a request named,
-/// lexicographically ascending — see `state::canonical_members`.
+/// What a list setting reads back as after a request supplied `values`: exactly
+/// that sequence.
 ///
-/// The ORDER a caller lists members in carries no meaning to the service, so a
-/// response is a function of the members, not of the sequence. A duplicate is
-/// kept: `ServiceList`/`RegionsList` are lists with no `@uniqueItems`. One
-/// helper, so a suite cannot quietly assert a different order than its
-/// neighbour.
-pub fn canonical(values: &[&str]) -> Value {
-    let mut members: Vec<&str> = values.to_vec();
-    members.sort_unstable();
-    strings(&members)
+/// A list setting's value is the caller's document, and the element order of a
+/// JSON array is part of it: `ServiceList`/`RegionsList` declare no
+/// `@uniqueItems` and no ordering, so the service neither sorts nor de-duplicates
+/// what it was sent. One helper, so a suite cannot quietly assert a different
+/// expectation than its neighbour.
+pub fn reported(values: &[&str]) -> Value {
+    strings(values)
 }
 
-/// [`canonical`] for members a case built as owned strings (a generated list, or
+/// [`reported`] for members a case built as owned strings (a generated list, or
 /// one read back from `ListServices`).
-pub fn canonical_owned(values: &[String]) -> Value {
-    canonical(&values.iter().map(String::as_str).collect::<Vec<&str>>())
+pub fn reported_owned(values: &[String]) -> Value {
+    reported(&values.iter().map(String::as_str).collect::<Vec<&str>>())
 }

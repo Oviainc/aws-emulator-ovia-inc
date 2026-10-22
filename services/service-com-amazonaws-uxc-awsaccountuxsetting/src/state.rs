@@ -22,52 +22,52 @@ pub struct AccountUxCustomization {
 }
 
 impl AccountUxCustomization {
-    /// Store the visible-service identifiers a request supplied, in the order
-    /// this setting reports them — see [`canonical_members`].
+    /// Store the visible-service identifiers a request supplied, as the exact
+    /// sequence it supplied them in.
+    ///
+    /// A list setting's value is the caller's document. Neither the model nor the
+    /// operation doc gives this service licence to re-order, de-duplicate or
+    /// otherwise normalise it (`ServiceList`/`RegionsList` are plain lists with
+    /// no `@uniqueItems` and no sort rule —
+    /// `smithy_query(query="shape", shape="ServiceList,RegionsList")`), and the
+    /// element order of a JSON array is part of the response document a client
+    /// compares against what it sent or indexes positionally. So the sequence a
+    /// request supplies is what is stored, what the update answers with and what
+    /// `GetAccountCustomizations` reports afterwards — a round trip, not a
+    /// rewrite.
+    ///
+    /// This stays consistent with `@idempotent`: replaying the SAME request
+    /// leaves the same state and answers the same body. Two requests naming the
+    /// same members in different sequences are different documents, and the
+    /// service records whichever one arrived last.
+    ///
+    /// One recorded step disagrees, and it disagrees with ITSELF: in the corpus
+    /// fixture `uxc-partial-update-preserves-other-fields`, the update at
+    /// `task#2` is recorded with the two members in one sequence and the
+    /// `GetAccountCustomizations` at `task#4` — with no write in between — with
+    /// the same two members in the opposite sequence, so one of the two must
+    /// disagree with whatever the request supplied. Measured, not assumed:
+    /// storing the supplied sequence makes `task#4` agree and `task#2` differ,
+    /// storing it reversed makes `task#2` agree and `task#4` differ, at the same
+    /// two indices. Every other recorded response for this setting agrees with
+    /// the supplied sequence, so that is the rule kept here; the one response
+    /// that disagrees is per-response variation, and reproducing it would mean
+    /// keying the write on the recording.
     pub fn set_visible_services(&mut self, supplied: Vec<String>) {
-        self.visible_services = Some(canonical_members(supplied));
+        self.visible_services = Some(supplied);
     }
 
     /// Store the visible-Region codes a request supplied, under the same rule as
     /// [`AccountUxCustomization::set_visible_services`]: one rule for both list
     /// settings, because the service keeps them alike.
     pub fn set_visible_regions(&mut self, supplied: Vec<String>) {
-        self.visible_regions = Some(canonical_members(supplied));
+        self.visible_regions = Some(supplied);
     }
 }
 
 /// The wire value `AccountColor` uses for "no color set" — the documented default
 /// `GetAccountCustomizations` reports for an account that never set one.
 pub const ACCOUNT_COLOR_NONE: &str = "none";
-
-/// The value a list setting holds after a request supplied `supplied`: the same
-/// members, in one stable canonical order.
-///
-/// A `visibleServices` / `visibleRegions` setting names what is visible in the
-/// console, so the ORDER a caller lists its members in carries no meaning to the
-/// service: what it stores and reports is the members, and the order it reports
-/// them in is its own — lexicographic ascending here, the canonical order for
-/// identifiers and also the order the service's own `ListServices` catalog pages
-/// in. Two requests naming the same members in different sequences therefore
-/// leave the setting in the same state and answer identically, which is what
-/// `@idempotent` means for a setting whose value is a collection.
-///
-/// Nothing else is changed: a member repeated in the request stays repeated,
-/// because `ServiceList`/`RegionsList` are modelled as lists with no
-/// `@uniqueItems` (`smithy_query(query="shape", shape="ServiceList,RegionsList")`),
-/// so collapsing a duplicate would drop a value the model admits.
-///
-/// What is NOT reproducible is the exact sequence of one recorded response: the
-/// corpus holds two responses describing the SAME members, with no write between
-/// them, in opposite sequences. A per-response sequence AWS varies on its own is
-/// not something an emulator can — or should — reproduce; the members, their type
-/// and the stability across reads are the contract, and those are what this
-/// function keeps.
-pub fn canonical_members(supplied: Vec<String>) -> Vec<String> {
-    let mut members = supplied;
-    members.sort();
-    members
-}
 
 /// The service identifiers `ListServices` enumerates, in the order the catalog is
 /// seeded (sorted below, so paging is coherent).
@@ -78,6 +78,12 @@ pub fn canonical_members(supplied: Vec<String>) -> Vec<String> {
 /// member constraints (`length 1..64`, `pattern ^[a-z0-9]+(-[a-z0-9]+)*$` — see
 /// `smithy_query(query="shape", shape="ServiceList")`). The real catalog varies by
 /// partition; this emulator serves one fixed, deterministic catalog.
+///
+/// It is a DISCOVERY list, not an admission list: this catalog tells a caller
+/// which identifiers exist, and `UpdateAccountCustomizations` accepts any
+/// `visibleServices` member its modelled constraints admit, whether or not this
+/// list happens to name it (the catalog's own contents are the subject of their
+/// own issue).
 const SEED_SERVICE_CATALOG: &[&str] = &[
     "access-analyzer",
     "account",
@@ -165,25 +171,6 @@ impl ComAmazonawsUxcAwsaccountuxsettingState {
     /// The customization record for `account_id`, created empty on first write.
     pub fn customization_mut(&mut self, account_id: &str) -> &mut AccountUxCustomization {
         self.customizations.entry(account_id.to_string()).or_default()
-    }
-
-    /// Whether `service` names an entry of the catalog [`ListServices`] pages
-    /// over — which is what makes it a valid `visibleServices` value, since the
-    /// model documents that catalog as the source of valid identifiers.
-    ///
-    /// A READ: the catalog is fixed at construction, so membership never depends
-    /// on who asked. Binary search is sound because [`Default`] sorts the
-    /// catalog, which is also what makes paging over it coherent.
-    ///
-    /// [`ListServices`]: crate::ops::list_services::ListServices
-    pub fn is_catalog_service(&self, service: &str) -> bool {
-        debug_assert!(
-            self.service_catalog.windows(2).all(|pair| pair[0] <= pair[1]),
-            "the catalog must stay sorted for membership to be decidable by binary search"
-        );
-        self.service_catalog
-            .binary_search_by(|entry| entry.as_str().cmp(service))
-            .is_ok()
     }
 }
 

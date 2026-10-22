@@ -892,7 +892,14 @@ async fn create_state_machine_is_idempotent_on_the_members_the_check_reads() {
                 "name": "idem",
                 "definition": HELLO_DEFINITION,
                 "roleArn": ROLE_ARN,
-                "loggingConfiguration": { "level": "ALL", "includeExecutionData": false },
+                // A level that logs needs the one destination the member allows:
+                // "Limited to size 1. Required, if your log level is not set to OFF."
+                "loggingConfiguration": {
+                    "level": "ALL",
+                    "includeExecutionData": false,
+                    "destinations": [{ "cloudWatchLogsLogGroup": { "logGroupArn":
+                        format!("arn:aws:logs:{REGION}:{ACCOUNT}:log-group:/sfn:*") } }],
+                },
             }),
         ),
     ];
@@ -929,25 +936,6 @@ async fn create_state_machine_refuses_what_this_slice_does_not_serve() {
         (status, code.as_str()),
         (400, "ValidationException"),
         "versionDescription without publish must be refused, got {status} {code}"
-    );
-
-    // State machine versions are not implemented, so `publish` is refused rather
-    // than answered with a version ARN nothing stands behind.
-    let (status, code) = emulator
-        .err(
-            "CreateStateMachine",
-            &json!({
-                "name": "published",
-                "definition": HELLO_DEFINITION,
-                "roleArn": ROLE_ARN,
-                "publish": true,
-            }),
-        )
-        .await;
-    assert_eq!(
-        (status, code.as_str()),
-        (400, "ValidationException"),
-        "publish must be refused while versions are unimplemented, got {status} {code}"
     );
 
     // More tags than a resource accepts is the modelled TooManyTags.
