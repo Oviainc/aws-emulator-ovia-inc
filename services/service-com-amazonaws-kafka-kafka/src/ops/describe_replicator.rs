@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReplicator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReplicator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the replicator the given ARN names, rendered from the record
+//! `CreateReplicator` registered in [`crate::state::ComAmazonawsKafkaKafkaState`].
+//! A value that is not shaped like a replicator ARN is a `BadRequestException`; a
+//! well-formed ARN this region holds no replicator for is a `NotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReplicator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTING, not mutating: the one write it makes materialises the
+//! `CREATING` -> `RUNNING` transition the clock already owed THAT replicator,
+//! which was due at the same instant whether or not anybody called.
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
+//!
+//! The scaffold notes below describe the framework; they are kept because they
+//! document the seams this handler uses.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +174,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReplicator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReplicatorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReplicator"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeReplicatorErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::is_replicator_arn(&input.replicator_arn) {
+            return Err(
+                DescribeReplicatorErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ReplicatorArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK replicator ARN.",
+                        input.replicator_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+        // The state lock is held only for the lookup and the one write below, and
+        // dropped before the response is rendered: the rendering walks the
+        // record, so doing it under the shared mutex would make every other
+        // kafka caller wait behind this request's own work.
+        let replicator = {
+            let mut state = state.lock();
+            // Reporting only: the one write this makes materialises the
+            // CREATING -> RUNNING transition the clock already owed THIS
+            // replicator, which was due at the same instant whether or not
+            // anybody called.
+            let settled = state.settled_replicator_in(
+                &region,
+                &input.replicator_arn,
+                std::time::SystemTime::now(),
+            );
+            let Some(settled) = settled else {
+                return Err(
+                    DescribeReplicatorErrorModeled::NotFoundException(NotFoundException {
+                        invalid_parameter: Some("ReplicatorArn".to_string()),
+                        message: Some(format!(
+                            "No replicator exists in {region} with the ARN {}",
+                            input.replicator_arn
+                        )),
+                    })
+                    .into(),
+                );
+            };
+            settled.clone()
+        };
+        Ok(DescribeReplicatorOutput {
+            creation_time: Some(::aws_smithy_types::DateTime::from(replicator.creation_time)),
+            current_version: Some(replicator.current_version.clone()),
+            // Both read from the record: a replicator created here is the
+            // replicator itself, and a stored reference to one created in another
+            // region reports that region's resource ARN — the same two members
+            // `ListReplicators` reports from the same fields.
+            is_replicator_reference: Some(replicator.is_replicator_reference),
+            kafka_clusters: Some(replicator.kafka_cluster_descriptions()),
+            replication_info_list: Some(replicator.replication_info_descriptions()),
+            replicator_arn: Some(replicator.arn.clone()),
+            replicator_description: replicator.description.clone(),
+            replicator_name: Some(replicator.name.clone()),
+            replicator_resource_arn: Some(replicator.resource_arn.clone()),
+            replicator_state: Some(replicator.state.clone()),
+            service_execution_role_arn: Some(replicator.service_execution_role_arn.clone()),
+            // `StateInfo` carries the code and message explaining a state that
+            // needs explaining; neither CREATING nor RUNNING does.
+            state_info: None,
+            // Absent, not an empty map, when the replicator carries no tags —
+            // the same way the other request-carried members report absence.
+            tags: Some(replicator.tags.clone().into_iter().collect())
+                .filter(|tags: &std::collections::HashMap<String, String>| !tags.is_empty()),
+            log_delivery: replicator.log_delivery.clone(),
+        })
     }
 }
