@@ -641,6 +641,23 @@ impl ComAmazonawsDatazoneDatazoneState {
             .filter(|d| d.status != DOMAIN_STATUS_DELETING)
     }
 
+    /// The live domain that already carries `name`, if the account has one.
+    ///
+    /// A domain name is unique within the account, so this is what `CreateDomain`
+    /// refuses on. Every domain in this store belongs to the one account the emulator
+    /// serves (`Domain::managed_account_id`), so the whole store IS the account's
+    /// namespace. A domain already being deleted is on its way out and no longer holds
+    /// its name — the same liveness notion [`Self::live_domain`] applies.
+    ///
+    /// A linear scan, deliberately: the store is bounded by [`MAX_DOMAINS`] (the same
+    /// bound `settle_clock`'s per-request scan relies on), so one liveness rule shared
+    /// with [`Self::live_domain`] is worth more than a second index to keep in step.
+    pub fn live_domain_named(&self, name: &str) -> Option<&Domain> {
+        self.domains
+            .values()
+            .find(|d| d.name == name && d.status != DOMAIN_STATUS_DELETING)
+    }
+
     /// The tag set of the resource `arn` names, when this emulator stores that
     /// resource.
     ///
@@ -674,6 +691,52 @@ impl ComAmazonawsDatazoneDatazoneState {
             .map(|domain| &mut domain.tags)
     }
 }
+
+/// The resource kinds this service names in its not-found messages.
+///
+/// A closed set, so a handler cannot invent a third spelling of a kind or interpolate
+/// a caller-supplied identifier into the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Domain,
+    Project,
+    AssetType,
+    Glossary,
+}
+
+impl ResourceKind {
+    /// The kind as DataZone names it in a message.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Domain => "Domain",
+            Self::Project => "Project",
+            Self::AssetType => "Asset type",
+            Self::Glossary => "Glossary",
+        }
+    }
+
+    /// The `ResourceNotFoundException` message DataZone answers for a resource of this
+    /// kind that it cannot find: the KIND only, never the caller-supplied identifier
+    /// (recorded behaviour: "Project not found", "Account Pool not found"). Build every
+    /// not-found message in this service's handlers through this, so none of them can
+    /// echo the request back.
+    pub fn not_found_message(self) -> String {
+        format!("{} not found", self.as_str())
+    }
+}
+
+impl std::fmt::Display for ResourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `ConflictException` message `CreateDomain` answers when the account already has
+/// a domain with the requested name. The requirement is the 409 refusal and the code;
+/// this text is AWS's own recorded wording, and like the not-found text above it names
+/// no caller-supplied value.
+pub const DUPLICATE_DOMAIN_NAME_MESSAGE: &str =
+    "Domain name already exists under this account, please use another one";
 
 /// Lowercase base-36 encoding of `value` — the alphabet every DataZone id pattern
 /// accepts.

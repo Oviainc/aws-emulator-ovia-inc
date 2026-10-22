@@ -12,6 +12,10 @@
 //! `clientToken` is the operation's `@idempotencyToken`: a repeat carrying a token
 //! already seen returns the domain that token created rather than a second domain.
 //!
+//! A domain `name` is unique within the account: a create naming a name a live domain
+//! already holds is refused with the modelled `ConflictException` (409) and nothing is
+//! stored, so the account never holds two domains of one name.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -243,6 +247,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|token| store.idempotent_domain(token))
         {
             return Ok(domain_output(existing));
+        }
+
+        // A domain name is unique within the account: a second create for a name a
+        // live domain already holds is REFUSED, so the account is never left with two
+        // domains of one name. Checked before anything is minted or inserted, and
+        // after the `@idempotencyToken` short-circuit above, so a genuine retry still
+        // gets its original domain back rather than this conflict.
+        if store.live_domain_named(&input.name).is_some() {
+            return Err(CreateDomainErrorModeled::ConflictException(ConflictException {
+                message: crate::state::DUPLICATE_DOMAIN_NAME_MESSAGE.to_string(),
+            })
+            .into());
         }
 
         let region = caller_region(ctx);

@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let domain = store.domains.get_mut(&input.identifier).ok_or_else(|| {
             DeleteDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Domain {} was not found", input.identifier),
+                message: crate::state::ResourceKind::Domain.not_found_message(),
             })
         })?;
 

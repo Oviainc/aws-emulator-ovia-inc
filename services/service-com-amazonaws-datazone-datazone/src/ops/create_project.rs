@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|d| (d.status.clone(), d.projects.len()))
             .ok_or_else(|| {
                 CreateProjectErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("Domain {} was not found", input.domain_identifier),
+                    message: crate::state::ResourceKind::Domain.not_found_message(),
                 })
             })?;
         // A domain still being created, or already being deleted, cannot take a
