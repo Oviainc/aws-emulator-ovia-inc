@@ -16,6 +16,18 @@
 //! and recording what it grants is the call's whole effect — it changes no dashboard and
 //! no other session, so nothing a previous caller observed moves under it.
 //!
+//! ## Who may call it
+//!
+//! The operation's own docs restrict it: "available only to Amazon Web Services
+//! Organization management accounts or delegated administrators registered for the
+//! procurement insights … feature". That grant lives in AWS Organizations, not here, so
+//! this service can only hold it as a record in
+//! [`crate::state::ComAmazonawsMarketplacereportingAwsmarketplacereportingState::access`];
+//! a caller with no record is a standalone account and is refused with the modelled
+//! `UnauthorizedException` (401) before any URL is minted. [`access_refusal`] is that
+//! decision, and [`crate::service`] answers it ahead of the modelled input constraints —
+//! the order the real service decides in.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -133,6 +145,45 @@ impl From<GetBuyerDashboardErrorModeled> for GetBuyerDashboardError {
     }
 }
 
+/// The modelled refusal an availability decision comes to, or `None` when the API is
+/// available to the caller.
+///
+/// Single-homed here because the decision is answered from TWO places and the two must
+/// never disagree: this operation's own `handle` (below), and the pre-validation gate in
+/// [`crate::service`] that states it ahead of the modelled input constraints. The status
+/// and the wire code come from the model — `UnauthorizedException` is `@httpError(401)`
+/// and `AccessDeniedException` `@httpError(403)` — so they are not written out here.
+///
+/// The 401's message is the wording this service answers an unavailable caller with — a
+/// bare "Unauthorized", naming no grant, as the recorded traffic shows and as the shape's
+/// own documentation sentence ("You do not have permission to perform this action.")
+/// paraphrases. The requirement is the status and the code the model binds; the text
+/// follows the service.
+pub fn access_refusal(
+    decision: crate::state::AccessDecision,
+) -> Option<GetBuyerDashboardErrorModeled> {
+    match decision {
+        // "This API is available only to Amazon Web Services Organization management
+        // accounts or delegated administrators registered for the procurement insights
+        // … feature."
+        crate::state::AccessDecision::Allowed => None,
+        crate::state::AccessDecision::NoPermission => Some(
+            GetBuyerDashboardErrorModeled::UnauthorizedException(UnauthorizedException {
+                message: Some("Unauthorized".to_string()),
+            }),
+        ),
+        crate::state::AccessDecision::InsufficientAccess => Some(
+            GetBuyerDashboardErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(
+                    "this delegated administrator is not registered for the \
+                     procurement insights feature"
+                        .to_string(),
+                ),
+            }),
+        ),
+    }
+}
+
 /// The `GetBuyerDashboard` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -191,36 +242,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // redeemable and the store from growing without end.
         store.forget_lapsed_sessions(now);
 
-        // "This API is available only to Amazon Web Services Organization management
-        // accounts or delegated administrators registered for the procurement insights
-        // … feature."
-        match store.caller_access(&principal).decision() {
-            crate::state::AccessDecision::Allowed => {}
-            crate::state::AccessDecision::NoPermission => {
-                return Err(GetBuyerDashboardErrorModeled::UnauthorizedException(
-                    UnauthorizedException {
-                        message: Some(
-                            "GetBuyerDashboard is available only to an Organizations \
-                             management account or a delegated administrator registered \
-                             for procurement insights"
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into());
-            }
-            crate::state::AccessDecision::InsufficientAccess => {
-                return Err(GetBuyerDashboardErrorModeled::AccessDeniedException(
-                    AccessDeniedException {
-                        message: Some(
-                            "this delegated administrator is not registered for the \
-                             procurement insights feature"
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into());
-            }
+        // The availability decision, from the registration the store holds for this
+        // caller — nothing in the request takes part in it, so repeated and concurrent
+        // identical calls are refused identically. Over the wire the gate in
+        // `crate::service` has already answered this same decision, ahead of the
+        // modelled input constraints; it is answered again here because a caller
+        // reaching this operation directly (another service through the in-process
+        // callback, a typed test) must not get a different one, and because `handle` is
+        // where the decision belongs when the ordering does not matter.
+        if let Some(refusal) = access_refusal(store.access_decision(&principal)) {
+            return Err(refusal.into());
         }
 
         // `embeddingDomains` are "fully qualified domains"; the member's `@pattern` is

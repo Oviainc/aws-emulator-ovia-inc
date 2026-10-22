@@ -159,6 +159,11 @@ async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_su
     // the shapes those path spaces take (a literal per operation, a `/tags/{arn}`
     // label, a date-stamped prefix) — and the RPC three post to one path and name
     // themselves in `X-Amz-Target`. An expected `""` code is a success.
+    //
+    // Every row asserts PATH OWNERSHIP, not the owning service's own rules: what it
+    // excludes is the router's two routing failures (404 `UnknownService` when nobody
+    // claims a request, 500 `AmbiguousService` when several do), so any answer only the
+    // owning service can produce — a success, a modelled refusal, a 501 — serves.
     #[allow(clippy::type_complexity)]
     let rows: [(&str, &str, &str, Option<&str>, Option<Value>, u16, &str); 17] = [
         (
@@ -250,7 +255,14 @@ async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_su
             "",
         ),
         (
-            "reporting: a dashboard outside the modelled ARN pattern",
+            // `GetBuyerDashboard` is "available only to Amazon Web Services Organization
+            // management accounts or delegated administrators registered for the
+            // procurement insights … feature", a grant AWS Organizations holds and this
+            // router's fresh engine has no record of — so Reporting answers its own
+            // modelled `UnauthorizedException`, which it decides before reading the
+            // identifier. Neither of the router's routing failures could produce it, so
+            // the row still pins ownership of this path.
+            "reporting: a caller with no procurement-insights grant on record",
             "POST",
             "/getBuyerDashboard",
             None,
@@ -258,8 +270,8 @@ async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_su
                 "dashboardIdentifier": "arn:aws:aws-marketplace",
                 "embeddingDomains": ["https://a.example.com"],
             })),
-            400,
-            "ValidationException",
+            401,
+            "UnauthorizedException",
         ),
         (
             "deployment: a parameter write",

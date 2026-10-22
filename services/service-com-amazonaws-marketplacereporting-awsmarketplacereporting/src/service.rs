@@ -21,8 +21,10 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. THIS service overrides it: `GetBuyerDashboard`'s availability
+//!   decision is answered ahead of the modelled input constraints (see
+//!   `AvailabilityGate` below), and an available caller is then handed to the
+//!   generated walk unchanged.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -41,7 +43,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationError, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -52,6 +54,88 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Answers `GetBuyerDashboard`'s availability decision ahead of the modelled
+    /// input constraints; see [`AvailabilityGate`].
+    availability_gate: AvailabilityGate<Eng>,
+}
+
+/// Serves `GetBuyerDashboard` with its availability decision made BEFORE the
+/// modelled input constraints are checked, then hands an available caller to the
+/// generated walk unchanged.
+///
+/// WHY this is a seam and not a line in the handler: the framework validates every
+/// modelled constraint — `dashboardIdentifier`'s `@pattern` and `@length`,
+/// `embeddingDomains`' `@length` — BEFORE a handler runs, and answers a violation
+/// as the protocol's generic `400 ValidationException`. AWS Marketplace Reporting
+/// decides the other way round: a caller the API is not available to is refused with
+/// `UnauthorizedException` (401) whatever it sent, so an identifier outside that
+/// pattern comes back 401 and not 400 — which is what the recorded traffic this
+/// service is emulated from shows. A gate inside `handle` cannot produce that order,
+/// because `handle` runs after the validator. So the decision is answered HERE, from
+/// the same [`crate::ops::get_buyer_dashboard::access_refusal`] the handler itself
+/// uses, and rendered in the modelled error shape through this service's own
+/// protocol.
+///
+/// It is a pure READ of recorded registration state keyed by the request's principal:
+/// it writes nothing, so it cannot change what a later caller sees, and two identical
+/// requests — sequential or concurrent — get the identical answer.
+///
+/// Generic over the engine type for the same reason the rest of this file is: the
+/// operation whose name and state it reads is, so naming a concrete engine here would
+/// let this seam drift from the service the router mounts.
+struct AvailabilityGate<Eng> {
+    /// The shared engine, so the gate reads THIS service's store — the one the
+    /// handler reads — rather than a private one.
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> AvailabilityGate<Eng> {
+    /// The routing key the model names the gated operation by, read off the
+    /// operation rather than spelled out here.
+    fn operation_name() -> &'static str {
+        <crate::ops::get_buyer_dashboard::GetBuyerDashboard<Eng> as Operation>::NAME
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for AvailabilityGate<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            let principal = crate::state::caller_principal(ctx.parts());
+            // A store this service cannot reach is a server fault, not an
+            // authorization decision, and it is not this seam's to state: `None`
+            // falls through to the generated walk, which answers whatever that
+            // request comes to there — the handler's modelled
+            // `InternalServerException` for a request the boundary admits, and the
+            // boundary's own refusal for one it does not.
+            let refusal = crate::state::service_state(&*self.engine)
+                .map(|state| state.lock().access_decision(&principal))
+                .and_then(crate::ops::get_buyer_dashboard::access_refusal);
+            if let Some(refusal) = refusal {
+                return svc
+                    .definition()
+                    .protocol()
+                    .serialize_error(
+                        refusal.as_serializable(),
+                        refusal.variant_schema(),
+                        refusal.shape_name(),
+                        refusal.http_status(),
+                    )
+                    .unwrap_or_else(|e| svc.definition().framework_error_response(e));
+            }
+            // Available: run the generated deserialize -> validate -> handle ->
+            // serialize walk. Reached through the routing table rather than through
+            // `override_operation`, which would route straight back here.
+            match svc.definition().routing_table().get(Self::operation_name()) {
+                Some(op) => op.run(svc, req, ctx).await,
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +144,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            availability_gate: AvailabilityGate { engine },
         }
     }
 }
@@ -104,8 +189,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // One case needs it: `GetBuyerDashboard`, whose availability decision is
+        // made ahead of the modelled input constraints — see [`AvailabilityGate`]
+        // for why that cannot be done from inside `handle`. The operation name comes
+        // from the model, not from a literal, and a request naming any other
+        // operation is left to the generated routing table.
+        let routing_key = self.definition().protocol().routing_key(req).ok()?;
+        (routing_key == AvailabilityGate::<Eng>::operation_name())
+            .then_some(&self.availability_gate as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
