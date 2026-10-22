@@ -613,6 +613,32 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
     pub fn mint_uuid(&mut self, kind: &str) -> String {
         mint_uuid_from(&mut self.next_id, kind)
     }
+
+    /// Record a connection to a GitHub account under `token_name`, answering
+    /// whether it was added (a name the store already holds is left where it is,
+    /// so the linking order stays stable and no name is stored twice).
+    pub fn record_git_hub_account_token(&mut self, token_name: &str) -> bool {
+        if self
+            .git_hub_account_token_names
+            .iter()
+            .any(|stored| stored == token_name)
+        {
+            return false;
+        }
+        self.git_hub_account_token_names
+            .push(token_name.to_string());
+        true
+    }
+
+    /// Remove the connection to a GitHub account named `token_name`, answering
+    /// whether the store held one.
+    pub fn remove_git_hub_account_token(&mut self, token_name: &str) -> bool {
+        let before = self.git_hub_account_token_names.len();
+        self.git_hub_account_token_names
+            .retain(|stored| stored != token_name);
+        self.git_hub_account_token_names.len() != before
+    }
+
     /// Mint a `d-XXXXXXXXX` deployment id: the `d-` prefix and nine characters
     /// from CodeDeploy's uppercase-alphanumeric deployment-id alphabet.
     pub fn mint_deployment_id(&mut self) -> String {

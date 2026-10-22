@@ -17,9 +17,12 @@ use std::sync::Arc;
 /// One emulator with one CodeDeploy service mounted on one shared engine.
 ///
 /// `pub(crate)` because the other suites in this test target drive the service
-/// through the same front door; there is one harness, not one per suite.
+/// through the same front door; there is one harness, not one per suite. `engine`
+/// is the very store the handlers write through, for a case whose resource no API
+/// can create.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    pub engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -29,9 +32,11 @@ impl Emulator {
         // The suite signs nothing; routing is by `X-Amz-Target`.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_codedeploy_codedeploy_20141006::EmulatedService::new(engine),
+            service_com_amazonaws_codedeploy_codedeploy_20141006::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
-        Self { router }
+        Self { router, engine }
     }
 
     /// Call `operation` with `body`, answering its HTTP status and parsed body.
