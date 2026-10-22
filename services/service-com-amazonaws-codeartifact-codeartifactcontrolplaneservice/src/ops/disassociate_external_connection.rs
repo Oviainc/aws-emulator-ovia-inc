@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateExternalConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateExternalConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateExternalConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the external connection the request names from the repository it addresses.
+//!
+//! The association list lives on the stored repository record
+//! ([`crate::state::Repository::external_connections`]), so this handler is a pure
+//! read-modify-write of that list: resolve the domain, resolve the repository inside it,
+//! find the entry whose `externalConnectionName` equals the requested name, drop it, and
+//! answer with the repository's description as it stands AFTER the removal. Every
+//! addressing failure — a domain the account does not hold, a repository the domain does
+//! not hold, a connection the repository is not associated with — is
+//! `ResourceNotFoundException` (404), which is the only outcome the service has for a
+//! removal target that does not exist.
 //!
 //! ## Shape of an operation
 //!
@@ -163,20 +166,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateExternalConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateExternalConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateExternalConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateExternalConnectionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(
+                DisassociateExternalConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Domain {} not found.", input.domain),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some("domain".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let Some(repository) = domain.repositories.get_mut(&input.repository) else {
+            return Err(
+                DisassociateExternalConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Repository {} not found in domain {}.",
+                            input.repository, input.domain
+                        ),
+                        resource_id: Some(input.repository.clone()),
+                        resource_type: Some("repository".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The removal target is the association, addressed by its external connection
+        // name. Nothing is written unless the repository actually holds it, so a repeated
+        // call after a successful removal answers exactly as a call for a connection that
+        // was never associated does. `ResourceType` models no external-connection value,
+        // so the resource reported is the repository the request addressed.
+        let Some(position) = repository
+            .external_connections
+            .iter()
+            .position(|connection| {
+                connection.external_connection_name.as_deref() == Some(input.external_connection.as_str())
+            })
+        else {
+            return Err(
+                DisassociateExternalConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "The external connection '{}' is not associated with repository '{}'",
+                            input.external_connection, input.repository
+                        ),
+                        resource_id: Some(input.repository.clone()),
+                        resource_type: Some("repository".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `remove` rather than `swap_remove`: the remaining associations keep the order
+        // they were associated in, so a repository with several of them reads back the
+        // same way before and after an unrelated one is removed.
+        repository.external_connections.remove(position);
+
+        Ok(DisassociateExternalConnectionOutput {
+            repository: Some(repository.description()),
+        })
     }
 }

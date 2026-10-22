@@ -25,3 +25,11 @@ mod repository_endpoint;
 mod repository_permissions_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+
+// Declared last rather than in sorted position, deliberately: every concurrent change to
+// this crate adds its suite in sorted order, so an entry appended here is the one that
+// never collides with theirs when two of them land together. The build only requires that
+// a suite under `tests/all/` be declared (see `vendor/build-support`); ordering is a
+// readability convention, and the sorted list above is intact.
+#[path = "all/external_connection_disassociation.rs"]
+mod external_connection_disassociation;
