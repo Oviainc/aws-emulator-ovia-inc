@@ -4,167 +4,17 @@
 //! `UpdateAccountCustomizations`, `GetAccountCustomizations` and `ListServices`.
 //!
 //! Every case drives the real wire path — a `restJson1` request through the
-//! `MultiServiceRouter` into the service's own handlers — so what is asserted is
-//! the emulator's HTTP behaviour, not a handler called directly.
+//! `MultiServiceRouter` into the service's own handlers (the shared harness in
+//! `crate::wire`) — so what is asserted is the emulator's HTTP behaviour, not a
+//! handler called directly. The refusal rules live in their own suite,
+//! `body_validation_refusals`; this one covers what the service ACCEPTS and
+//! persists.
 
+use crate::wire::{
+    build_router, call, generated_region, get_customizations, list_page, list_services_uri,
+    strings, update_customizations, whole_catalog,
+};
 use serde_json::{json, Value};
-use service_com_amazonaws_uxc_awsaccountuxsetting::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
-use std::sync::Arc;
-
-/// A SigV4 `Authorization` header whose credential scope names this service, which
-/// is the routing key `MultiServiceRouter` dispatches on. The signature itself is
-/// never checked here: request authentication is off below.
-const SIGV4_UXC: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/uxc/aws4_request, SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000";
-
-/// A router mounting one freshly-stated copy of the service.
-fn build_router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Explicit, so the suite does not depend on the process-wide auth switch.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Percent-encode a query-parameter value: a page token is base64, whose `+`, `/`
-/// and `=` would otherwise be read as query syntax (or as a space).
-fn encode_query_value(value: &str) -> String {
-    value
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                char::from(b).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-/// Send one request and return `(status, error-type, body)`. `error-type` is the
-/// `x-amzn-errortype` header restJson1 resolves an error shape from.
-async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-) -> (u16, String, Value) {
-    let raw = body
-        .map(|b| serde_json::to_vec(&b).expect("serialize the request body"))
-        .unwrap_or_default();
-    let request = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("host", "uxc.us-east-1.amazonaws.com")
-        .header("authorization", SIGV4_UXC)
-        .header("content-type", "application/json")
-        .body(bytes::Bytes::from(raw))
-        .expect("build the request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let bytes = response.into_body();
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            panic!(
-                "response body is not JSON ({e}): {}",
-                String::from_utf8_lossy(&bytes)
-            )
-        })
-    };
-    (status, error_type, value)
-}
-
-async fn get_customizations(router: &MultiServiceRouter) -> (u16, String, Value) {
-    call(router, "GET", "/v1/account-customizations", None).await
-}
-
-async fn update_customizations(
-    router: &MultiServiceRouter,
-    body: Value,
-) -> (u16, String, Value) {
-    call(router, "PATCH", "/v1/account-customizations", Some(body)).await
-}
-
-/// The `ListServices` request URI for one page request.
-fn list_services_uri(max_results: Option<i64>, next_token: Option<&str>) -> String {
-    let mut query: Vec<String> = Vec::new();
-    if let Some(max) = max_results {
-        query.push(format!("maxResults={max}"));
-    }
-    if let Some(token) = next_token {
-        query.push(format!("nextToken={}", encode_query_value(token)));
-    }
-    if query.is_empty() {
-        "/v1/services".to_string()
-    } else {
-        format!("/v1/services?{}", query.join("&"))
-    }
-}
-
-/// One page of `ListServices`: `(services, nextToken)`.
-async fn list_page(
-    router: &MultiServiceRouter,
-    max_results: Option<i64>,
-    next_token: Option<&str>,
-) -> (Vec<String>, Option<String>) {
-    let uri = list_services_uri(max_results, next_token);
-
-    let (status, _, body) = call(router, "GET", &uri, None).await;
-    assert_eq!(status, 200, "ListServices {uri}: expected 200, got {status} with body {body}");
-    let services = body
-        .get("services")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("ListServices {uri}: no `services` array in {body}"))
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .unwrap_or_else(|| panic!("ListServices {uri}: non-string service in {body}"))
-                .to_string()
-        })
-        .collect();
-    let next = body
-        .get("nextToken")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    (services, next)
-}
-
-/// The whole catalog, as the single page an unsized request returns.
-async fn whole_catalog(router: &MultiServiceRouter) -> Vec<String> {
-    let (services, next) = list_page(router, None, None).await;
-    assert!(
-        next.is_none(),
-        "an unsized page holding the whole catalog must not carry a nextToken, got {next:?}"
-    );
-    services
-}
-
-/// A service identifier legal under the model's `Service` member pattern
-/// `^[a-z0-9]+(-[a-z0-9]+)*$` (`smithy_query(query="shape", shape="ServiceList")`).
-fn generated_service_id(n: usize) -> String {
-    format!("svc-{n}")
-}
-
-/// A Region code legal under the model's `Region` member pattern
-/// `^[a-z]{2}(-[a-z]{1,10}){1,2}-[1-9]$` (`smithy_query(query="shape", shape="RegionsList")`).
-fn generated_region(n: usize) -> String {
-    let first = char::from(b'a' + (n / 26) as u8);
-    let second = char::from(b'a' + (n % 26) as u8);
-    format!("eu-{first}{second}-1")
-}
-
-fn strings(values: &[&str]) -> Value {
-    Value::Array(values.iter().map(|v| json!(v)).collect())
-}
 
 // ---------------------------------------------------------------------------
 // GetAccountCustomizations
@@ -360,51 +210,24 @@ async fn settings_omitted_from_a_request_remain_unchanged() {
     );
 }
 
-/// A colour outside the modelled `AccountColor` value set is refused with HTTP 400
-/// `ValidationException`, and nothing is stored.
-#[tokio::test]
-async fn an_unmodelled_account_color_is_refused() {
-    // Cases: unknown word, wrong case for a modelled value, empty string, and a
-    // value of the wrong JSON type.
-    let cases: Vec<(&str, Value)> = vec![
-        ("unknown colour", json!("chartreuse")),
-        ("wrong case", json!("Teal")),
-        ("empty string", json!("")),
-        ("trailing space", json!("teal ")),
-    ];
-
-    for (name, color) in cases {
-        let router = build_router();
-        let (status, error_type, body) =
-            update_customizations(&router, json!({"accountColor": color})).await;
-        assert_eq!(
-            status, 400,
-            "case {name:?}: expected HTTP 400, got {status} ({body})"
-        );
-        assert_eq!(
-            error_type, "ValidationException",
-            "case {name:?}: expected a ValidationException, got {error_type:?} ({body})"
-        );
-
-        let (_, _, fetched) = get_customizations(&router).await;
-        assert_eq!(
-            fetched.get("accountColor").and_then(Value::as_str),
-            Some("none"),
-            "case {name:?}: a refused update must store nothing, got {fetched:?}"
-        );
-    }
-}
-
 /// The modelled list bounds (`visibleServices` max 500, `visibleRegions` max 100):
-/// a list AT the bound is accepted and read back; one element past it is refused
-/// with HTTP 400 and stores nothing.
+/// a list AT the bound is accepted and read back verbatim. (One element past the
+/// bound is a body-constraint refusal, which `body_validation_refusals` owns.)
+///
+/// `visibleServices` at its bound is built by cycling the catalog
+/// `ListServices` pages over, since every member must name a catalog service and
+/// `ServiceList` declares no `@uniqueItems`
+/// (`smithy_query(query="shape", shape="ServiceList")`).
 #[tokio::test]
-async fn lists_are_accepted_at_their_modelled_bound_and_refused_past_it() {
+async fn lists_are_accepted_at_their_modelled_bound() {
     // (member, bound) from `smithy_query(query="shape", shape="ServiceList,RegionsList")`.
-    let services_at_bound: Vec<String> = (0..500).map(generated_service_id).collect();
+    let router = build_router();
+    let catalog = whole_catalog(&router).await;
+    let services_at_bound: Vec<String> = (0..500)
+        .map(|n| catalog[n % catalog.len()].clone())
+        .collect();
     let regions_at_bound: Vec<String> = (0..100).map(generated_region).collect();
 
-    let router = build_router();
     let (status, _, body) = update_customizations(
         &router,
         json!({
@@ -428,29 +251,6 @@ async fn lists_are_accepted_at_their_modelled_bound_and_refused_past_it() {
         Some(&json!(regions_at_bound)),
         "100 Regions must round-trip verbatim"
     );
-
-    let over_services: Vec<String> = (0..501).map(generated_service_id).collect();
-    let over_regions: Vec<String> = (0..101).map(generated_region).collect();
-    for (name, request) in [
-        ("501 services", json!({"visibleServices": over_services})),
-        ("101 Regions", json!({"visibleRegions": over_regions})),
-    ] {
-        let router = build_router();
-        let (status, error_type, body) = update_customizations(&router, request).await;
-        assert_eq!(
-            status, 400,
-            "case {name:?}: one past the bound must be refused, got {status} ({body})"
-        );
-        assert_eq!(
-            error_type, "ValidationException",
-            "case {name:?}: expected a ValidationException, got {error_type:?} ({body})"
-        );
-        let (_, _, fetched) = get_customizations(&router).await;
-        assert!(
-            fetched.get("visibleServices").is_none() && fetched.get("visibleRegions").is_none(),
-            "case {name:?}: a refused update must store nothing, got {fetched:?}"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------

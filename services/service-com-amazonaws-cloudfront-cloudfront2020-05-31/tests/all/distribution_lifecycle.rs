@@ -76,8 +76,8 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Node {
     name: String,
-    text: String,
-    children: Vec<Node>,
+    pub(crate) text: String,
+    pub(crate) children: Vec<Node>,
 }
 
 impl Node {
@@ -338,7 +338,7 @@ async fn delete_distribution(
     .await
 }
 
-async fn list_distributions(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list_distributions(router: &MultiServiceRouter, query: &str) -> Answer {
     call(
         router,
         "GET",

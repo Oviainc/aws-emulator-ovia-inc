@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeServices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeServices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeServices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored services a request names, computing every count from the tasks
+//! their scheduler placed. A name that matches no service in the cluster is reported in
+//! `failures` with `reason: MISSING` rather than failing the call; `include: [TAGS]`
+//! gates the tags.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeServices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeServicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeServices"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeServicesErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        if input.services.len() > crate::state::MAX_DESCRIBE_SERVICES {
+            return Err(DescribeServicesErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "services must name at most {} services; got {}",
+                        crate::state::MAX_DESCRIBE_SERVICES,
+                        input.services.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        let fields = crate::state::ServiceFields::from_include(input.include.as_ref());
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.clusters.contains_key(&cluster_name) {
+            return Err(DescribeServicesErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                },
+            )
+            .into());
+        }
+
+        let mut services = Vec::new();
+        let mut failures = Vec::new();
+        // A service is reported once however many times the request names it: the same
+        // name repeated names the same service, so it is one answer, not one per entry.
+        let mut seen = ::std::collections::HashSet::new();
+        for reference in &input.services {
+            // A service ARN carries the cluster that hosts it. An entry naming another
+            // cluster names nothing in the cluster being described, which is a MISSING
+            // failure rather than a refusal.
+            let (arn_cluster, name) = crate::state::cluster_and_service_from_reference(reference);
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let entry_cluster = arn_cluster.unwrap_or_else(|| cluster_name.clone());
+            let found = if entry_cluster == cluster_name {
+                guard.services.get(&(cluster_name.clone(), name.clone()))
+            } else {
+                None
+            };
+            match found {
+                Some(service) => services.push(guard.service_view(service, fields)),
+                None => failures.push(crate::state::missing_failure(&crate::state::service_arn(
+                    &region,
+                    &entry_cluster,
+                    &name,
+                ))),
+            }
+        }
+
+        Ok(DescribeServicesOutput {
+            services: Some(services),
+            failures: Some(failures),
+        })
     }
 }

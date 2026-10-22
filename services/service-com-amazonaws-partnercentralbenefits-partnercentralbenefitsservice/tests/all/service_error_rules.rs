@@ -199,7 +199,8 @@ async fn refusal(
 
 /// One well-formed request per operation the service declares — nothing in any of them
 /// violates a modelled constraint, so the only thing that can refuse them is the
-/// entitlement gate.
+/// entitlement gate, except on the tagging path ([`UNGATED_OPERATIONS`]), which the gate
+/// does not front and which answers its own resource lookup instead.
 fn well_formed_requests() -> Vec<(&'static str, Value)> {
     vec![
         ("ListBenefits", json!({ "Catalog": CATALOG })),

@@ -15,3 +15,5 @@
 mod experiment_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/target_account_configurations.rs"]
+mod target_account_configurations;

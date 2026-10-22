@@ -21,6 +21,8 @@ mod delete_service;
 mod instance_health_status;
 #[path = "all/list_operations.rs"]
 mod list_operations;
+#[path = "all/namespace_listing.rs"]
+mod namespace_listing;
 #[path = "all/public_dns_namespace.rs"]
 mod public_dns_namespace;
 #[path = "all/service_attributes.rs"]

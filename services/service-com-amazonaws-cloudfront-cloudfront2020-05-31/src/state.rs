@@ -34,8 +34,8 @@ use crate::ops::types::{
     EntityAlreadyExists, EntityNotFound, ForwardedValues, FunctionAssociations, GeoRestriction,
     Invalidation, InvalidationBatch, KGKeyPairIds, KeyPairIds, KeyValueStore,
     LambdaFunctionAssociations, LoggingConfig, NoSuchDistribution, NoSuchInvalidation, Origin,
-    OriginSslProtocols, Paths, Restrictions, Signer, Tags, TrustedKeyGroups, TrustedSigners,
-    ViewerCertificate,
+    OriginSslProtocols, Paths, Restrictions, Signer, Tags, TrustedKeyGroups,
+    TrustedSigners, ViewerCertificate,
 };
 
 /// `Distribution$Status` while a configuration is still propagating to the edge
@@ -177,6 +177,40 @@ pub const DEFAULT_HTTP_VERSION: &str = "http2";
 /// `GeoRestriction$RestrictionType`'s value for a distribution that restricts nothing,
 /// reported for a stored configuration that carries no `Restrictions`.
 pub const GEO_RESTRICTION_NONE: &str = "none";
+
+/// The `ConnectionMode` value that makes a distribution MULTI-TENANT.
+///
+/// `DistributionConfig$ConnectionMode`: "This field specifies whether the connection mode
+/// is through a standard distribution (direct) or a multi-tenant distribution with
+/// distribution tenants (tenant-only)" — the model's `ConnectionMode` enum admits exactly
+/// `direct` and `tenant-only`.
+pub const CONNECTION_MODE_TENANT_ONLY: &str = "tenant-only";
+
+/// The `DomainName` a MULTI-TENANT distribution reports.
+///
+/// A tenant-only distribution serves no traffic of its own: its viewers reach it through
+/// the routing endpoint of a CONNECTION GROUP, and the distribution-level members that
+/// would describe one (`Aliases`, `IsIPV6Enabled`, `AnycastIpListId`) are documented as
+/// unsupported for it. So there is no `d<label>.cloudfront.net` domain to report, and
+/// CloudFront answers the required `Distribution$DomainName` with this fixed placeholder
+/// instead. Recorded behaviour — the model states no placeholder — but a fixed literal
+/// rather than a generated value.
+pub const MULTI_TENANT_DOMAIN_NAME: &str = "-";
+
+/// The order the service emits a cache behaviour's HTTP method list in.
+///
+/// `MethodsList` is an ORDERED XML list of `<Method>` elements, so its element order is
+/// part of the wire value — and CloudFront emits the methods of the chosen set in its own
+/// fixed order rather than in the order the request listed them. This is the order
+/// CloudFront's own responses carry for the full seven-method set; the smaller sets
+/// `AllowedMethods$Quantity` admits ("2 (for `GET` and `HEAD` requests), 3 (for `GET`,
+/// `HEAD`, and `OPTIONS` requests) and 7") come back as its subsequences — `HEAD, GET`
+/// and `HEAD, GET, OPTIONS`, which is also the order [`DEFAULT_ALLOWED_METHODS`] is
+/// written in. Recorded behaviour: the model fixes the member names (`Method`'s enum
+/// values) but not the order they are emitted in.
+pub const EMITTED_METHOD_ORDER: [&str; 7] = [
+    "HEAD", "DELETE", "POST", "GET", "OPTIONS", "PUT", "PATCH",
+];
 
 /// `IsIPV6Enabled` for a configuration that names none: a new distribution answers IPv6
 /// DNS requests with an IPv6 address ("Enable IPv6" is on for a new distribution — the
@@ -400,6 +434,21 @@ impl StoredDistribution {
         i32::try_from(in_progress).unwrap_or(i32::MAX)
     }
 
+    /// The `DomainName` this distribution reports.
+    ///
+    /// A standard distribution reports the edge domain allocated to it at creation; a
+    /// multi-tenant one has no domain of its own and reports
+    /// [`MULTI_TENANT_DOMAIN_NAME`]. Read from the STORED configuration, so every
+    /// projection of one record \u2014 `Distribution` and `DistributionSummary` alike \u2014 reports
+    /// the same value, and a configuration change is reflected by all of them at once.
+    pub fn reported_domain_name(&self) -> String {
+        if is_multi_tenant(&self.config) {
+            MULTI_TENANT_DOMAIN_NAME.to_string()
+        } else {
+            self.domain_name.clone()
+        }
+    }
+
     /// The `Distribution` projection `CreateDistribution`, `GetDistribution` and
     /// `UpdateDistribution` return.
     pub fn to_distribution(&self) -> Distribution {
@@ -409,7 +458,7 @@ impl StoredDistribution {
             status: self.status.clone(),
             last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
             in_progress_invalidation_batches: self.in_progress_invalidation_batches(),
-            domain_name: self.domain_name.clone(),
+            domain_name: self.reported_domain_name(),
             active_trusted_signers: Some(self.active_trusted_signers()),
             active_trusted_key_groups: Some(self.active_trusted_key_groups()),
             distribution_config: self.config.clone(),
@@ -525,7 +574,7 @@ impl StoredDistribution {
             e_tag: Some(self.etag.clone()),
             status: self.status.clone(),
             last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
-            domain_name: self.domain_name.clone(),
+            domain_name: self.reported_domain_name(),
             aliases: config.aliases.clone().unwrap_or_default(),
             origins: config.origins.clone(),
             origin_groups: config.origin_groups.clone(),
@@ -735,6 +784,10 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
 
     /// Allocate the domain name a distribution is served on: a generated label under
     /// `cloudfront.net`, in the lowercase DNS labels take.
+    ///
+    /// What a distribution REPORTS is [`StoredDistribution::reported_domain_name`]: a
+    /// multi-tenant distribution has no domain of its own, so it reports the placeholder
+    /// instead of the label allocated here.
     pub fn allocate_domain_name(&mut self) -> String {
         let label = self.mint(ID_BODY_LEN).to_lowercase();
         format!("d{label}.cloudfront.net")
@@ -793,6 +846,57 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         stored.deployed_due = now + PROPAGATION_DELAY;
         Some(stored)
     }
+}
+
+/// Whether a configuration describes a MULTI-TENANT distribution.
+///
+/// Two members say so, and either one is enough: `ConnectionMode` `tenant-only` selects
+/// "a multi-tenant distribution with distribution tenants", and `TenantConfig` is the
+/// member that "only supports multi-tenant distributions. You can't specify this field
+/// for standard distributions." A configuration naming neither is a standard
+/// (`direct`) distribution.
+///
+/// A configuration that names `TenantConfig` AND `direct` contradicts itself, and this
+/// reads it as multi-tenant rather than refusing it: the exclusivity the prose states is
+/// a validation this slice does not implement — no modelled refusal is wired for ANY of
+/// the members documented as unsupported per connection mode (`Aliases`,
+/// `IsIPV6Enabled`, `AnycastIpListId`, …), and adding one for this single pair would
+/// refuse a request the rest of the surface accepts. Until that validation is
+/// implemented as a whole, the tenancy-only member is the one taken to describe the
+/// distribution's tenancy, so the domain reported stays consistent with the tenancy the
+/// same configuration states.
+pub fn is_multi_tenant(config: &DistributionConfig) -> bool {
+    config.connection_mode.as_deref() == Some(CONNECTION_MODE_TENANT_ONLY)
+        || config.tenant_config.is_some()
+}
+
+/// `methods` in [`EMITTED_METHOD_ORDER`], as a permutation of what was submitted: each
+/// method the order names appears as many times as it was submitted, and a value the
+/// order does not name keeps its submitted position relative to the other such values,
+/// after them. The length is therefore unchanged, so the `Quantity` beside the list
+/// still states it.
+///
+/// The trailing group is unreachable for a request: `MethodsList`'s member targets the
+/// `Method` enum, so the framework's deserializer refuses a value outside it before a
+/// handler runs, and the order below names every value the enum has. It is kept so that
+/// this is a pure reordering — a value this function cannot place is never dropped.
+fn in_emitted_order(methods: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(methods.len());
+    for known in EMITTED_METHOD_ORDER {
+        out.extend(
+            methods
+                .iter()
+                .filter(|method| method.as_str() == known)
+                .cloned(),
+        );
+    }
+    out.extend(
+        methods
+            .iter()
+            .filter(|method| !EMITTED_METHOD_ORDER.contains(&method.as_str()))
+            .cloned(),
+    );
+    out
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -1150,16 +1254,24 @@ fn resolve_cache_behavior(behavior: CacheBehavior) -> CacheBehavior {
 /// The methods a cache behaviour allows and caches: the ones it names, or
 /// [`DEFAULT_ALLOWED_METHODS`] when it names none. A behaviour that names the allowed
 /// methods but not the cached ones caches the same default set.
+///
+/// Either list is reported in [`EMITTED_METHOD_ORDER`] rather than in the order the
+/// request listed it: `MethodsList` is an ordered XML list, and the service emits the
+/// methods of the set selected in its own fixed order. The default set is written in that
+/// order already, so the reordering is what a SUBMITTED list goes through.
 fn resolve_allowed_methods(allowed: Option<AllowedMethods>) -> AllowedMethods {
     let mut allowed = allowed.unwrap_or_else(|| AllowedMethods {
         quantity: i32::try_from(DEFAULT_ALLOWED_METHODS.len()).unwrap_or(i32::MAX),
         items: default_methods(),
         cached_methods: None,
     });
-    allowed.cached_methods = Some(allowed.cached_methods.unwrap_or_else(|| CachedMethods {
+    allowed.items = in_emitted_order(&allowed.items);
+    let mut cached = allowed.cached_methods.unwrap_or_else(|| CachedMethods {
         quantity: i32::try_from(DEFAULT_ALLOWED_METHODS.len()).unwrap_or(i32::MAX),
         items: default_methods(),
-    }));
+    });
+    cached.items = in_emitted_order(&cached.items);
+    allowed.cached_methods = Some(cached);
     allowed
 }
 

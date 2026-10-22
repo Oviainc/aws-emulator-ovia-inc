@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccountSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccountSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Signs one account up for QuickSight, storing the subscription that
+//! `DescribeAccountSubscription` then reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccountSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The sign-up is what gives an account its own name, edition, notification email and
+//! authentication method; an account that never signed up is reported with this
+//! service's defaults. A second sign-up for the same account is refused, as AWS
+//! refuses one for an account that already has a QuickSight subscription.
 //!
 //! ## Shape of an operation
 //!
@@ -256,18 +254,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccountSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccountSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccountSubscription"))
+        // The region a sign-up applies to is the one the client signed for ("the
+        // Amazon Web Services Region for the account is derived from what is
+        // configured in the CLI or SDK"), which is read off the request rather than
+        // from a parameter; the subscription itself is account-wide, so nothing below
+        // keys on it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAccountSubscriptionErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+
+        // `Edition` and `AuthenticationMethod` are modelled enums, so a value outside
+        // their catalogs is refused with a 400 before this handler runs; reaching here
+        // means both name a member. `Edition` is optional, and an account that names
+        // none gets the edition this service reports for an account that never chose
+        // one.
+        let edition = input
+            .edition
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_EDITION.to_string());
+
+        // The model documents which members each choice requires: ENTERPRISE_AND_Q
+        // requires the author's contact details ("This field is required if
+        // ENTERPPRISE_AND_Q is the selected edition"), ACTIVE_DIRECTORY requires the
+        // directory's name and realm plus an admin group, and IAM_IDENTITY_CENTER
+        // requires an admin group ("Either this field or the AdminProGroup field is
+        // required"). A request missing one of them names no complete account.
+        let mut missing: Vec<&str> = Vec::new();
+        if edition == crate::state::EDITION_ENTERPRISE_AND_Q {
+            for (member, value) in [
+                ("FirstName", &input.first_name),
+                ("LastName", &input.last_name),
+                ("EmailAddress", &input.email_address),
+                ("ContactNumber", &input.contact_number),
+            ] {
+                if value.as_ref().is_none_or(|value| value.is_empty()) {
+                    missing.push(member);
+                }
+            }
+        }
+        let has_admin_group = [&input.admin_group, &input.admin_pro_group]
+            .into_iter()
+            .any(|group| group.as_ref().is_some_and(|group| !group.is_empty()));
+        if input.authentication_method == crate::state::AUTHENTICATION_METHOD_ACTIVE_DIRECTORY {
+            for (member, value) in [
+                ("ActiveDirectoryName", &input.active_directory_name),
+                ("Realm", &input.realm),
+            ] {
+                if value.as_ref().is_none_or(|value| value.is_empty()) {
+                    missing.push(member);
+                }
+            }
+            if !has_admin_group {
+                missing.push("AdminGroup");
+            }
+        }
+        if input.authentication_method == crate::state::AUTHENTICATION_METHOD_IAM_IDENTITY_CENTER
+            && !has_admin_group
+        {
+            missing.push("AdminGroup");
+        }
+        if !missing.is_empty() {
+            return Err(
+                CreateAccountSubscriptionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "{} {} required for Edition {edition} with AuthenticationMethod {}.",
+                            missing.join(", "),
+                            if missing.len() == 1 { "is" } else { "are" },
+                            input.authentication_method
+                        )),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let created_time = crate::state::now_timestamp(std::time::SystemTime::now());
+
+        let mut store = state.lock();
+        if store
+            .account_subscriptions
+            .contains_key(&input.aws_account_id)
+        {
+            return Err(CreateAccountSubscriptionErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        "The account {} already has a QuickSight subscription.",
+                        input.aws_account_id
+                    )),
+                    resource_type: Some("ACCOUNT_SETTINGS".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+        // The key is the request's `AwsAccountId`, so a sign-up loop that varies it
+        // would grow this map without bound; the total is what bounds the process.
+        if store.account_subscriptions.len() >= crate::state::MAX_ACCOUNT_SUBSCRIPTIONS {
+            return Err(
+                CreateAccountSubscriptionErrorModeled::ResourceUnavailableException(
+                    ResourceUnavailableException {
+                        message: Some(format!(
+                            "This QuickSight emulator holds the maximum of {} account subscriptions.",
+                            crate::state::MAX_ACCOUNT_SUBSCRIPTIONS
+                        )),
+                        resource_type: Some("ACCOUNT_SETTINGS".to_string()),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.account_subscriptions.insert(
+            input.aws_account_id.clone(),
+            crate::state::AccountSubscriptionRecord {
+                account_name: input.account_name.clone(),
+                edition,
+                notification_email: input.notification_email,
+                authentication_method: input.authentication_method.clone(),
+                iam_identity_center_instance_arn: input.iam_identity_center_instance_arn,
+                active_directory_name: input.active_directory_name,
+                realm: input.realm,
+                directory_id: input.directory_id,
+                admin_groups: input.admin_group.unwrap_or_default(),
+                author_groups: input.author_group.unwrap_or_default(),
+                reader_groups: input.reader_group.unwrap_or_default(),
+                created_time,
+            },
+        );
+        // `FirstName`, `LastName`, `EmailAddress` and `ContactNumber` are deliberately
+        // not stored: they are the author's personal contact details and QuickSight
+        // returns them on no read.
+
+        Ok(CreateAccountSubscriptionOutput {
+            signup_response: Some(SignupResponse {
+                // "TRUE if Quick Sight uses IAM as an authentication method" — which
+                // the method this sign-up chose decides.
+                iam_user: crate::state::IAM_AUTHENTICATION_METHODS
+                    .contains(&input.authentication_method.as_str()),
+                // The login name belongs to the identity the account signs in with,
+                // which this emulator does not create, and the directory type belongs
+                // to an Active Directory it cannot inspect. Neither is invented here.
+                user_login_name: None,
+                directory_type: None,
+                account_name: Some(input.account_name),
+            }),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

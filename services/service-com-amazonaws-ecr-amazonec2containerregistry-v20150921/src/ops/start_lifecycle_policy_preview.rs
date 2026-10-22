@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartLifecyclePolicyPreview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartLifecyclePolicyPreview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartLifecyclePolicyPreview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a preview of a lifecycle policy against one repository: the policy the call
+//! names (or, naming none, the repository's own) is parsed, evaluated against the images
+//! the repository holds at that instant, and the evaluation is stored as a preview the
+//! repository carries. The preview answers `IN_PROGRESS` until the clock makes its
+//! completion due ([`crate::state::LIFECYCLE_PREVIEW_DELAY`]), and a second start while
+//! one is still running is refused with `LifecyclePolicyPreviewInProgressException`.
+//! `GetLifecyclePolicyPreview` reads the stored evaluation back.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +128,31 @@ impl From<StartLifecyclePolicyPreviewErrorModeled> for StartLifecyclePolicyPrevi
     }
 }
 
+/// The shared state helpers report their failures as [`crate::state::Fault`]; this maps
+/// each onto the modelled error this operation declares for it.
+fn fault_error(fault: crate::state::Fault) -> StartLifecyclePolicyPreviewErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            StartLifecyclePolicyPreviewErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // A malformed policy document, and a registry that is not this one, are each a
+        // parameter this operation cannot honour. The remaining kinds are unreachable
+        // here — this operation names no image and carries no tags — and an invalid
+        // parameter is what each of them is from this operation's point of view.
+        crate::state::Fault::InvalidParameter(_)
+        | crate::state::Fault::ImageNotFound(_)
+        | crate::state::Fault::InvalidTagParameter(_)
+        | crate::state::Fault::TooManyTags(_) => {
+            StartLifecyclePolicyPreviewErrorModeled::InvalidParameterException(
+                InvalidParameterException { message },
+            )
+        }
+    }
+}
+
 /// The `StartLifecyclePolicyPreview` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,20 +187,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartLifecyclePolicyPreview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartLifecyclePolicyPreviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartLifecyclePolicyPreview"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartLifecyclePolicyPreviewErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let repo = store
+            .repository_mut(&input.repository_name)
+            .map_err(fault_error)?;
+
+        // A preview completes on the clock, not on a call: write down the completion
+        // already owed before judging whether one is still running.
+        repo.settle_lifecycle_preview(now);
+
+        // A start while one is still running is refused whatever it asks for: the
+        // repository carries one preview at a time, so this state-level refusal comes
+        // before anything the request says about the policy.
+        if repo.lifecycle_preview_in_progress() {
+            return Err(
+                StartLifecyclePolicyPreviewErrorModeled::LifecyclePolicyPreviewInProgressException(
+                    LifecyclePolicyPreviewInProgressException {
+                        // The sentence the model states for this error, verbatim: unlike
+                        // the not-found failures around it, nothing in it is built from
+                        // the request.
+                        message: Some(
+                            "The previous lifecycle policy preview request has not \
+                             completed. Wait and try again."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "If you do not specify a policy, the current policy for the repository is
+        // used" — and with neither, "the lifecycle policy could not be found, and no
+        // policy is set to the repository".
+        let policy_text = match input.lifecycle_policy_text {
+            Some(text) => text,
+            None => repo.lifecycle_policy.clone().ok_or_else(|| {
+                StartLifecyclePolicyPreviewErrorModeled::LifecyclePolicyNotFoundException(
+                    LifecyclePolicyNotFoundException {
+                        message: Some(format!(
+                            "Lifecycle policy does not exist for the repository with \
+                             name '{}' in the registry with id '{}'",
+                            repo.name,
+                            crate::state::registry_id()
+                        )),
+                    },
+                )
+            })?,
+        };
+        let rules = crate::state::parse_lifecycle_policy(&policy_text).map_err(fault_error)?;
+
+        // The preview evaluates the repository as it stands now, and the evaluation is
+        // stored: reading the preview back reports that record rather than computing a
+        // fresh answer.
+        let results = crate::state::evaluate_lifecycle_policy(&rules, &repo.images, now);
+        repo.lifecycle_preview = Some(crate::state::LifecyclePreview {
+            policy_text: policy_text.clone(),
+            status: crate::state::PREVIEW_STATUS_IN_PROGRESS.to_string(),
+            complete_due_at: Some(now + crate::state::LIFECYCLE_PREVIEW_DELAY),
+            results,
+        });
+
+        Ok(StartLifecyclePolicyPreviewOutput {
+            registry_id: Some(repo.registry_id.clone()),
+            repository_name: Some(repo.name.clone()),
+            lifecycle_policy_text: Some(policy_text),
+            status: Some(crate::state::PREVIEW_STATUS_IN_PROGRESS.to_string()),
+        })
     }
 }

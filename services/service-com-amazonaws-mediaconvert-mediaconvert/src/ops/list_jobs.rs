@@ -121,37 +121,6 @@ impl From<ListJobsErrorModeled> for ListJobsError {
     }
 }
 
-/// Page size when the caller gives no `maxResults`: "Retrieve a JSON array of up to
-/// twenty of your most recently created jobs", which is also `MaxResults`' own maximum.
-const DEFAULT_PAGE_SIZE: i32 = 20;
-
-/// A `nextToken` that carries the ORDERING KEY of the last job of the page just
-/// returned — its creation instant and its id, the pair `ListJobs` orders by.
-///
-/// Encoding the key rather than just the id means the next page resumes at the first
-/// job strictly past that key in the requested direction, so a job whose status changed
-/// between pages (it settled, or was cancelled, and no longer matches the caller's
-/// `status` filter) is skipped instead of invalidating the token.
-///
-/// Hex-encoded so it is opaque to a caller — the documented contract is only that the
-/// string returned by one request is handed back to the next one.
-fn encode_token(job: &crate::state::JobRecord) -> String {
-    ::hex::encode(format!("{}:{}", crate::state::epoch_nanos(job.created_at), job.id))
-}
-
-/// The `(creation instant, id)` ordering key inside a `nextToken`, or `None` when the
-/// token is not one this service issued.
-fn decode_token(token: &str) -> Option<(u128, String)> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let (nanos, id) = decoded.split_once(':')?;
-    Some((nanos.parse().ok()?, id.to_string()))
-}
-
-/// The ordering key of one job: the pair the sort below is total on.
-fn ordering_key(job: &crate::state::JobRecord) -> (u128, &str) {
-    (crate::state::epoch_nanos(job.created_at), job.id.as_str())
-}
-
 /// The `ListJobs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -239,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let start = match input.next_token.as_deref() {
             None => 0,
             Some(token) => {
-                let Some((nanos, id)) = decode_token(token) else {
+                let Some((nanos, id)) = crate::state::decode_cursor(token) else {
                     return Err(ListJobsErrorModeled::BadRequestException(BadRequestException {
                         message: Some(
                             "nextToken is not a token this service issued.".to_string(),
@@ -255,9 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .iter()
                     .position(|job| {
                         if ascending {
-                            ordering_key(job) > anchor
+                            job.ordering_key() > anchor
                         } else {
-                            ordering_key(job) < anchor
+                            job.ordering_key() < anchor
                         }
                     })
                     .unwrap_or(matching.len())
@@ -266,13 +235,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `maxResults` carries the model's own 1..20 range, so the framework has already
         // refused anything outside it; the fallback only covers the absent case.
-        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_PAGE_SIZE))
-            .unwrap_or(DEFAULT_PAGE_SIZE as usize);
+        let page_size =
+            usize::try_from(input.max_results.unwrap_or(crate::state::DEFAULT_PAGE_SIZE))
+                .unwrap_or(crate::state::DEFAULT_PAGE_SIZE as usize);
         let page = &matching[start.min(matching.len())..];
         let page = &page[..page_size.min(page.len())];
         // A token only when there is a further page to fetch.
         let next_token = (start + page.len() < matching.len())
-            .then(|| page.last().map(|job| encode_token(job)))
+            .then(|| page.last().map(|job| job.cursor()))
             .flatten();
         let jobs = page.iter().map(|job| job.view(&region)).collect();
 

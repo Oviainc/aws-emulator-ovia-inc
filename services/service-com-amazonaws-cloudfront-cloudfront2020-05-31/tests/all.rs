@@ -19,3 +19,5 @@ mod distribution_lifecycle;
 mod key_value_store_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tenant_distribution_and_method_order.rs"]
+mod tenant_distribution_and_method_order;

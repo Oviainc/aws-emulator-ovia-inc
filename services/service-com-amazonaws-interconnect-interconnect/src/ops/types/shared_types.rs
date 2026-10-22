@@ -67,6 +67,42 @@ pub struct Bandwidths {
     pub supported: Option<Vec<String>>,
 }
 
+// The service's common errors. The model declares them on the SERVICE shape, so
+// every operation lists them (`smithy_query(query="operation")` merges them in)
+// even though no operation names one itself — which is why an implemented handler
+// widens them into its own error enum with `extra_errors`. Declared here, once,
+// because several operations reach them.
+
+#[smithy_macros::smithy(shape = "com.amazonaws.interconnect#ResourceNotFoundException")]
+#[derive(Debug, Clone, Default)]
+pub struct ResourceNotFoundException {
+    pub message: Option<String>,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.interconnect#InterconnectValidationException")]
+#[derive(Debug, Clone, Default)]
+pub struct InterconnectValidationException {
+    pub message: String,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.interconnect#InterconnectClientException")]
+#[derive(Debug, Clone, Default)]
+pub struct InterconnectClientException {
+    pub message: String,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.interconnect#InterconnectServerException")]
+#[derive(Debug, Clone, Default)]
+pub struct InterconnectServerException {
+    pub message: String,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.interconnect#ServiceQuotaExceededException")]
+#[derive(Debug, Clone, Default)]
+pub struct ServiceQuotaExceededException {
+    pub message: Option<String>,
+}
+
 /// The values `AttachPointType` accepts on the wire.
 pub const ATTACH_POINT_TYPE_VALUES: &[&str] = &["DirectConnectGateway"];
 

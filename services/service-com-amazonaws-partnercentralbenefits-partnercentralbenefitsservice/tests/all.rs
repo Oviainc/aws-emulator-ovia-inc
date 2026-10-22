@@ -19,6 +19,12 @@ mod benefit_application_lifecycle;
 mod recall_benefit_application;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+// `all/resource_tags.rs` is the `UntagResource` suite; it reuses the helpers of the
+// sibling `resource_tagging` suite (`TagResource` / `ListTagsForResource`), and each
+// suite's module doc says which operations it covers. (The build script requires the
+// module name to match the file name, so the two names stay as they are.)
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/service_error_rules.rs"]
 mod service_error_rules;
 #[path = "all/state_roundtrip.rs"]

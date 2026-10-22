@@ -13,5 +13,9 @@
 // points it into `tests/all/`.
 #[path = "all/account_customizations.rs"]
 mod account_customizations;
+#[path = "all/body_validation_refusals.rs"]
+mod body_validation_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/wire.rs"]
+mod wire;

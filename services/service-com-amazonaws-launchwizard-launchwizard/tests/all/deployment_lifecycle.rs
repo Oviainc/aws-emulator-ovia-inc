@@ -73,7 +73,7 @@ pub(crate) async fn create(
 }
 
 /// The deployment `GetDeployment` reports for `id`.
-async fn get(harness: &Harness, case: &str, id: &str) -> Value {
+pub(crate) async fn get(harness: &Harness, case: &str, id: &str) -> Value {
     let body = harness
         .ok(case, "/getDeployment", json!({"deploymentId": id}))
         .await;
