@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportComplianceInquiry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportComplianceInquiry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Exports one stored compliance inquiry as a document and answers with the presigned
+//! URL that document is published under, beside the inquiry's own tags.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportComplianceInquiry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules shape the handler:
+//!
+//! * it reports on a PERSISTED inquiry: an id the store does not hold names no inquiry
+//!   this account may export, which the front door answers with its 401 — the same
+//!   refusal `GetComplianceInquiryMetadata` and `ListComplianceInquiryQueries` give for
+//!   that id, rather than a 404 confirming the resource's absence — and the `tags` it
+//!   answers with are read off that one record — the same projection
+//!   `CreateComplianceInquiry` and `GetComplianceInquiryMetadata` return, so no two of
+//!   them can disagree;
+//! * `queryIdentifiers` selects WHICH of the inquiry's queries the export covers, so an
+//!   identifier that names no query of that inquiry is refused with the modelled
+//!   `ValidationException` naming the member and the requirement it failed; naming none
+//!   covers every query the inquiry owns;
+//! * exporting CREATES a document — this operation is not `@readonly`, unlike
+//!   `ListComplianceInquiryQueries` — so every call mints an
+//!   [`crate::state::InquiryExport`] and the URL carries that export's id. The inquiry
+//!   itself is left as it stands (bar the transition the clock already owed it), so an
+//!   export changes nothing a later reader of the inquiry sees.
+//!
+//! Nothing serves the URL and nothing renders the document: this emulator persists the
+//! export and publishes its location, and does not synthesise document bytes or a SigV4
+//! signature it did not compute.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +167,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportComplianceInquiry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportComplianceInquiryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportComplianceInquiry"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ExportComplianceInquiryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact compliance inquiry store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(inquiry) = store.inquiries.get_mut(&input.compliance_inquiry_id) else {
+            // Authorization of the targeted inquiry precedes the state lookup as far as a
+            // caller can tell: a well-formed id this account holds no inquiry for names no
+            // inquiry it may export, so the front door's refusal is what it sees — not the
+            // modelled 404, which would confirm the resource's absence. The same answer
+            // `GetComplianceInquiryMetadata` and `ListComplianceInquiryQueries` give for
+            // the same id.
+            return Err(crate::scaffolded::Scaffolded::unauthorized());
+        };
+
+        // The only write this operation makes to the INQUIRY: the transition the clock
+        // had already made due. The export below is a new resource, not a change to it.
+        inquiry.materialise(now);
+
+        let owned: Vec<i32> = inquiry
+            .queries
+            .iter()
+            .map(|query| query.identifier)
+            .collect();
+        // Read off the one stored record, so the tags this answers with are the tags the
+        // create and the metadata read report.
+        let tags = (!inquiry.tags.is_empty()).then(|| inquiry.tags_map());
+
+        // "List of query identifiers to include in the export": the export covers the
+        // queries the request named, or every query the inquiry owns when it named none.
+        let covered = match input.query_identifiers {
+            Some(requested) if !requested.is_empty() => {
+                if requested.iter().any(|id| !owned.contains(id)) {
+                    ::tracing::info!(
+                        operation = "ExportComplianceInquiry",
+                        compliance_inquiry_id = %input.compliance_inquiry_id,
+                        outcome = "refused",
+                        reason = "queryIdentifiers name a query the inquiry does not own",
+                        "refused a compliance inquiry export"
+                    );
+                    return Err(ExportComplianceInquiryErrorModeled::ValidationException(
+                        crate::state::unknown_query_identifiers(),
+                    )
+                    .into());
+                }
+                // Ascending and without repeats: which queries an export covers is a SET,
+                // so neither the order a request listed them in nor a repeat is part of
+                // it.
+                let mut covered = requested;
+                covered.sort_unstable();
+                covered.dedup();
+                covered
+            }
+            _ => owned,
+        };
+
+        let include_citations = input.include_citations.unwrap_or(false);
+        // Rendered HERE, from the inquiry as it stands, because an export is a snapshot:
+        // the document the URL below leads to is the one this call produced.
+        let document = inquiry.export_document(&covered, include_citations);
+        let export_id = store.record_inquiry_export(
+            &input.compliance_inquiry_id,
+            covered,
+            include_citations,
+            document,
+            now,
+        );
+
+        // Attributable: the inquiry exported and the export minted for it. NEVER the
+        // inquiry's name, content or queries — all `@sensitive` in the model — and never
+        // the URL, whose `PresignedUrl` shape is `@sensitive` too.
+        ::tracing::info!(
+            operation = "ExportComplianceInquiry",
+            compliance_inquiry_id = %input.compliance_inquiry_id,
+            export_id = %export_id,
+            include_citations,
+            outcome = "exported",
+            "exported a compliance inquiry"
+        );
+
+        Ok(ExportComplianceInquiryOutput {
+            document_presigned_url: Some(crate::state::inquiry_export_url(
+                &region,
+                &input.compliance_inquiry_id,
+                &export_id,
+            )),
+            // An untagged resource reports no `tags` member at all, rather than an empty
+            // map — the same projection every other inquiry operation returns.
+            tags,
+        })
     }
 }

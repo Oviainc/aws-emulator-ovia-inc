@@ -57,14 +57,23 @@ pub const MAX_MEMBERSHIPS_PER_STORE: usize = 2_000;
 /// `ServiceQuotaExceededException`.
 pub const MAX_MEMBERSHIPS_PER_GROUP: usize = 200;
 
-/// The page size `ListGroupMemberships` uses when the caller sends no `MaxResults`:
-/// the model's own declared default (`MaxResults` `@default: 100`, range 1..100 —
-/// `smithy_query(query="operation",operation="ListGroupMemberships")`).
+/// The page size a list operation uses when the caller sends no `MaxResults`: the
+/// model's own declared default, shared by every `MaxResults` member of this service
+/// (`@default: 100`, range 1..100 — `smithy_query(query="operation",operation="ListGroupMemberships")`,
+/// `smithy_query(query="operation",operation="ListGroups")`).
 pub const DEFAULT_MAX_RESULTS: i32 = 100;
 
-/// The largest page `ListGroupMemberships` will answer with: the upper bound of the
-/// modelled `MaxResults` range (1..100).
+/// The largest page a list operation will answer with: the upper bound of the modelled
+/// `MaxResults` range (1..100).
 pub const MAX_MAX_RESULTS: i32 = 100;
+
+/// The only attribute path `ListGroups`'s (deprecated) `Filters` member searches.
+///
+/// `Filter$AttributePath` is "the attribute path that is used to specify which
+/// attribute name to search … `DisplayName` is a valid attribute path for the
+/// `ListGroups` API" (`smithy_query(query="doc",shape="Filter",member="AttributePath")`),
+/// so a filter naming any other attribute is a syntax error in the request.
+pub const GROUP_FILTER_ATTRIBUTE_PATH: &str = "DisplayName";
 
 /// The `arnNamespace` / `endpointPrefix` of this service, from the model's
 /// `aws.api#service` trait (`smithy_query(query="service_info")`).
@@ -248,6 +257,40 @@ impl Group {
     /// The stored revision as the modelled `ResourceRevision` (pattern `^[0-9]+$`).
     pub fn revision(&self) -> String {
         self.revision.to_string()
+    }
+
+    /// This record as the modelled `Group` a list reports.
+    ///
+    /// Every optional member is reported only when the record holds one, so a group
+    /// stored without a `Description` (or a `DisplayName`, or an external id) comes
+    /// back without that member rather than with an invented or empty value.
+    pub fn to_group(&self, identity_store_id: &str) -> crate::ops::types::Group {
+        crate::ops::types::Group {
+            identity_store_id: identity_store_id.to_string(),
+            group_id: self.group_id.clone(),
+            group_arn: self.group_arn.clone(),
+            revision: self.revision(),
+            display_name: self.display_name.clone(),
+            external_ids: modeled_list(&self.external_ids),
+            description: self.description.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            created_by: self.created_by.clone(),
+            updated_by: self.updated_by.clone(),
+        }
+    }
+
+    /// The value of the group attribute `attribute_path` names, for a `ListGroups`
+    /// filter. `None` when the group does not carry that attribute.
+    ///
+    /// The path is matched case-insensitively: SCIM attribute names are
+    /// case-insensitive (RFC 7643 §2.1), which is also how `GetGroupId` reads its
+    /// `UniqueAttribute` path.
+    pub fn attribute(&self, attribute_path: &str) -> Option<&str> {
+        if attribute_path.eq_ignore_ascii_case(GROUP_FILTER_ATTRIBUTE_PATH) {
+            return self.display_name.as_deref();
+        }
+        None
     }
 }
 
@@ -455,6 +498,21 @@ impl IdentityStoreData {
         Some(membership)
     }
 
+    /// This store's groups in a stable listing order.
+    ///
+    /// Creation time first, then `GroupId` for two groups created inside one clock
+    /// tick, so a listing — and therefore its pagination — is deterministic and a
+    /// group keeps its place in the sequence across calls.
+    pub fn groups_in_order(&self) -> Vec<&Group> {
+        let mut groups: Vec<&Group> = self.groups.values().collect();
+        groups.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.group_id.cmp(&right.group_id))
+        });
+        groups
+    }
+
     /// The memberships of `group_id` in creation order.
     pub fn memberships_in_order(&self, group_id: &str) -> Vec<&GroupMembershipRecord> {
         self.memberships_by_group
@@ -506,6 +564,24 @@ impl ComAmazonawsIdentitystoreAwsidentitystoreState {
 /// of them reports an absent member rather than an empty list the model would refuse.
 pub fn modeled_list<T: Clone>(items: &[T]) -> Option<Vec<T>> {
     (!items.is_empty()).then(|| items.to_vec())
+}
+
+/// The `ResourceNotFoundException` for an identity store this emulator does not hold.
+///
+/// A store springs into being on its first mutating call (see
+/// [`ComAmazonawsIdentitystoreAwsidentitystoreState::try_store_mut`]),
+/// so an identifier no create has ever named holds nothing at all — and a reporting
+/// operation says so with the modelled 404 rather than vivifying one. `IDENTITY_STORE`
+/// is the `ResourceType` value for this kind (`RESOURCE_TYPE_VALUES`).
+pub fn identity_store_not_found(identifier: &str) -> ResourceNotFoundException {
+    let identity_store_id = identity_store_key(identifier);
+    ResourceNotFoundException {
+        resource_type: Some("IDENTITY_STORE".to_string()),
+        resource_id: Some(identity_store_id.clone()),
+        reason: None,
+        message: Some(format!("identity store {identity_store_id} not found")),
+        request_id: None,
+    }
 }
 
 /// The `ResourceNotFoundException` for a resource this store does not hold.
@@ -595,17 +671,17 @@ pub fn quota_exceeded(subject: String) -> ServiceQuotaExceededException {
     }
 }
 
-/// The cursor for a page of memberships that starts at `membership_id`.
+/// The cursor for a page that starts at the resource `resource_id` names.
 ///
 /// Hex of the id rather than the id itself, so a caller cannot read structure into the
 /// token and has nothing to build one from: a `NextToken` is opaque and only ever
 /// travels back unchanged. Hex also satisfies the modelled `NextToken` pattern
 /// `^[-a-zA-Z0-9+=/:_]*$`.
-pub fn encode_cursor(membership_id: &str) -> String {
-    ::hex::encode(membership_id.as_bytes())
+pub fn encode_cursor(resource_id: &str) -> String {
+    ::hex::encode(resource_id.as_bytes())
 }
 
-/// The membership id a cursor minted by [`encode_cursor`] carries, or `None` when the
+/// The resource id a cursor minted by [`encode_cursor`] carries, or `None` when the
 /// token was not minted by this service.
 pub fn decode_cursor(token: &str) -> Option<String> {
     String::from_utf8(::hex::decode(token).ok()?).ok()

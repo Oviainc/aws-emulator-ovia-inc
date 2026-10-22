@@ -102,7 +102,13 @@ fn expected_properties(
     let mut effective: BTreeMap<String, String> = table
         .properties
         .iter()
-        .map(|property| (property.name.to_string(), property.default_value.to_string()))
+        // A property the catalog publishes no default for assumes nothing, so it is in
+        // force only for a request that names it.
+        .filter_map(|property| {
+            property
+                .default_value
+                .map(|default| (property.name.to_string(), default.to_string()))
+        })
         .collect();
     for (name, value) in requested.into_iter().flatten() {
         effective.insert((*name).to_string(), (*value).to_string());
@@ -263,11 +269,11 @@ const KNOWN_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             ("recommendation_id", "String"),
             ("account_id", "String"),
             ("account_name", "String"),
-            ("estimated_monthly_savings_after_discount", "Number"),
-            ("recommendation_lookback_period_in_days", "Number"),
+            ("estimated_monthly_savings_after_discount", "Double"),
+            ("recommendation_lookback_period_in_days", "Integer"),
             ("last_refresh_timestamp", "Timestamp"),
             ("restart_needed", "Boolean"),
-            ("tags", "Map"),
+            ("tags", "String"),
         ],
     ),
     (

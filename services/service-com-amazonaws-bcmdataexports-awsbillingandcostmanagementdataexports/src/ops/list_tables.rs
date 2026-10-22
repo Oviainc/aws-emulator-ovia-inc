@@ -194,10 +194,11 @@ fn catalog_entries() -> Vec<(String, Table)> {
 
 /// One catalog entry as the modelled `Table`: its name, what it holds, and a
 /// `TablePropertyDescription` per table property it publishes — the property's name,
-/// every value it accepts, the value it assumes when a request does not name it, and
-/// what it does. A table the catalog publishes no properties for reports an empty list
-/// ("Tables are not required to have any TableProperties" — smithy_query shape
-/// `GetTableRequest`, member `TableProperties`).
+/// every value it accepts, the value it assumes when a request does not name it (absent
+/// for a property the catalog publishes no default for, which is in force only for a
+/// request that names it), and what it does. A table the catalog publishes no properties
+/// for reports an empty list ("Tables are not required to have any TableProperties" —
+/// smithy_query shape `GetTableRequest`, member `TableProperties`).
 fn listed_table(spec: &crate::state::TableSpec) -> Table {
     Table {
         table_name: Some(spec.name.to_string()),
@@ -214,7 +215,7 @@ fn listed_table(spec: &crate::state::TableSpec) -> Table {
                             .map(|value| (*value).to_string())
                             .collect(),
                     ),
-                    default_value: Some(property.default_value.to_string()),
+                    default_value: property.default_value.map(str::to_string),
                     description: Some(property.description.to_string()),
                 })
                 .collect(),

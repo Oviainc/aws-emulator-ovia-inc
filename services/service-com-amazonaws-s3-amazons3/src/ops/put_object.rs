@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds an object to a general purpose bucket, replacing any object already at that key.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -272,15 +265,24 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutObjectError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutObject")]
+// here — hence the `PutObjectError` alias below.
+//
+// `NoSuchBucket` is widened in with `extra_errors`: `Bucket` is an `@httpLabel` naming a
+// bucket that may not exist, and none of the four errors this operation lists says so, so
+// without it an object written into a bucket this emulator does not hold would have to be
+// answered as a success — a write no later `GetObject` could read back. The shape is this
+// SERVICE's own (`com.amazonaws.s3#NoSuchBucket`, "The specified bucket does not exist",
+// HTTP 404); only this operation's error list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutObject",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutObjectErrorModeled {
     EncryptionTypeMismatch(EncryptionTypeMismatch),
     InvalidRequest(InvalidRequest),
     InvalidWriteOffset(InvalidWriteOffset),
+    NoSuchBucket(NoSuchBucket),
     TooManyParts(TooManyParts),
 }
 
@@ -335,18 +337,214 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the object cannot be recorded at all, and none of the
+            // modelled errors says that, so the scaffold's 501 carries what is true:
+            // this emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("PutObject"));
+        };
+
+        // Members whose semantics this emulator cannot carry out faithfully. Each one
+        // decides something about the write that the stored object could not then
+        // report, and answering 200 anyway would claim behaviour nothing performed, so
+        // the request is refused rather than quietly stripped of its meaning:
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutObject"))
+        // * `If-Match` / `If-None-Match` make the write conditional, and the documented
+        //   answers when the condition fails are HTTP 412 `PreconditionFailed` and 409
+        //   `ConditionalRequestConflict` — neither is a shape in this model, and an
+        //   operation renders one success status, so the condition has no faithful answer.
+        // * the server-side-encryption members choose how the object is encrypted at
+        //   rest; this emulator stores the bytes as given and keeps no keys, so it can
+        //   neither honour nor report them (and SSE-C would make the object
+        //   unretrievable without the key it is not storing).
+        // * the Object Lock members decide whether a later delete is allowed; no
+        //   retention or hold is emulated.
+        // * `x-amz-tagging` sets the object's tag set, which no implemented operation
+        //   here records or reports (`PutObjectTagging` / `GetObjectTagging` are stubs).
+        //
+        // The checksum members are NOT in this list: a checksum this handler neither
+        // computes nor verifies is simply not reported back, so nothing is claimed about
+        // it, and refusing the request would break every SDK that sends one by default.
+        for (member, present) in [
+            ("If-Match", input.if_match.is_some()),
+            ("If-None-Match", input.if_none_match.is_some()),
+            (
+                "x-amz-server-side-encryption",
+                input.server_side_encryption.is_some(),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-algorithm",
+                input.sse_customer_algorithm.is_some(),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                input.sse_customer_key.is_some(),
+            ),
+            (
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                input.ssekms_key_id.is_some(),
+            ),
+            (
+                "x-amz-server-side-encryption-context",
+                input.ssekms_encryption_context.is_some(),
+            ),
+            (
+                "x-amz-server-side-encryption-bucket-key-enabled",
+                input.bucket_key_enabled.is_some(),
+            ),
+            ("x-amz-object-lock-mode", input.object_lock_mode.is_some()),
+            (
+                "x-amz-object-lock-retain-until-date",
+                input.object_lock_retain_until_date.is_some(),
+            ),
+            (
+                "x-amz-object-lock-legal-hold",
+                input.object_lock_legal_hold_status.is_some(),
+            ),
+            (
+                "x-amz-object-lock-event-hold",
+                input.object_lock_event_hold.is_some(),
+            ),
+            ("x-amz-tagging", input.tagging.is_some()),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "PutObject with {member}"
+                )));
+            }
+        }
+
+        // Appending to an object through a write offset "is only supported for objects in
+        // the Amazon S3 Express One Zone storage class in directory buckets"
+        // (`PutObjectOutput$Size`). This emulator holds general purpose buckets, so the
+        // header names a parameter that is not valid for this request, which is exactly
+        // what the modelled `InvalidRequest` reports ("A parameter or header in your
+        // request isn't valid. For details, see the description of this API operation.").
+        if input.write_offset_bytes.is_some() {
+            return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+        }
+
+        // `ContentMD5` is "the Base64 encoded 128-bit MD5 digest of the data. You must
+        // use this header as a message integrity check to verify that the request body
+        // was not corrupted in transit", so when the request carries it, it is CHECKED
+        // against the payload actually received. A mismatch means the body is not the
+        // body the client hashed; AWS answers `BadDigest`, a code this model carries no
+        // shape for, so the refusal goes out as the modelled `InvalidRequest` (HTTP 400)
+        // rather than storing bytes the client did not intend.
+        if let Some(declared) = input.content_md5.as_deref() {
+            let actual = crate::state::content_md5(&input.body);
+            if declared != actual {
+                return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+            }
+        }
+
+        let etag = crate::state::object_etag(&input.body);
+        let object = crate::state::Object {
+            etag: etag.clone(),
+            last_modified: ::std::time::SystemTime::now(),
+            storage_class: input
+                .storage_class
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_STORAGE_CLASS.to_string()),
+            content_type: input.content_type.clone(),
+            cache_control: input.cache_control.clone(),
+            content_disposition: input.content_disposition.clone(),
+            content_encoding: input.content_encoding.clone(),
+            content_language: input.content_language.clone(),
+            expires: input.expires.clone(),
+            website_redirect_location: input.website_redirect_location.clone(),
+            metadata: input
+                .metadata
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            body: input.body,
+        };
+
+        let mut store = state.lock();
+        // "Amazon S3 is a distributed system. If it receives multiple write requests for
+        // the same object simultaneously, it overwrites all but the last object written"
+        // — so a key that is already there is REPLACED, wholesale: "You cannot use
+        // PutObject to only update a single piece of metadata for an existing object."
+        //
+        // The store reports what the write did, because it may refuse: a bucket this
+        // emulator does not hold, an over-long key, and the four ceilings (per bucket and
+        // service-wide) that keep its object store bounded whatever a caller does. Each is
+        // answered as a refusal, so nothing is recorded and the caller is told; none of
+        // them is a 501, which would claim the operation is unwritten.
+        let Some(outcome) = store.put_object(&input.bucket, &input.key, object) else {
+            return Err(PutObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        match outcome {
+            crate::state::ObjectWrite::Created | crate::state::ObjectWrite::Replaced => {}
+            // "The name for a key is a sequence of Unicode characters whose UTF-8
+            // encoding is at most 1,024 bytes long" (Amazon S3 User Guide). A longer key
+            // is a parameter that is not valid for this request, which is what the
+            // modelled `InvalidRequest` reports; AWS's own `KeyTooLongError` is not a
+            // shape in this model and so cannot be rendered.
+            crate::state::ObjectWrite::KeyTooLong { .. } => {
+                return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+            }
+            // "Within the PUT request header, the user-defined metadata is limited to 2 KB
+            // in size" (Amazon S3 User Guide). Past it the request carries a header that
+            // is not valid for this operation, which is what the modelled
+            // `InvalidRequest` reports; AWS's own `MetadataTooLarge` is not a shape in
+            // this model and so cannot be rendered.
+            crate::state::ObjectWrite::MetadataTooLarge { .. } => {
+                return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+            }
+            // The emulator's own ceilings, not AWS quotas (S3 bounds neither the number of
+            // objects nor their total size), so no AWS error code describes them: they go
+            // out through the framework's 400 `ValidationException` channel, the same
+            // channel `CreateBucket` uses for the unmodelled bucket quota.
+            crate::state::ObjectWrite::ObjectCountReached => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the bucket {:?} already holds the maximum of {} objects this \
+                     emulator keeps per bucket; delete an object before writing {:?}",
+                    input.bucket,
+                    crate::state::MAX_OBJECTS_PER_BUCKET,
+                    input.key
+                )));
+            }
+            crate::state::ObjectWrite::ByteBudgetReached { would_hold } => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "storing {:?} would leave the bucket {:?} holding {would_hold} bytes \
+                     of objects, past the {} bytes this emulator keeps per bucket",
+                    input.key,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )));
+            }
+            crate::state::ObjectWrite::TotalObjectCountReached => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "this emulator already holds the maximum of {} objects across every \
+                     bucket; delete an object before writing {:?}",
+                    crate::state::MAX_OBJECTS_TOTAL, input.key
+                )));
+            }
+            crate::state::ObjectWrite::TotalByteBudgetReached { would_hold } => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "storing {:?} would leave this emulator holding {would_hold} bytes of \
+                     objects across every bucket, past the {} bytes it keeps in total",
+                    input.key,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )));
+            }
+        }
+
+        Ok(PutObjectOutput {
+            e_tag: Some(etag),
+            // Everything else this output can carry describes a feature no stored object
+            // here has, so none of it is reported rather than being invented:
+            // `Expiration` needs a lifecycle configuration (none is recorded for any
+            // bucket), `VersionId` needs bucket versioning (not emulated, and an
+            // unversioned bucket reports none), the checksum members need a checksum
+            // this handler did not compute, the encryption members are refused above,
+            // `Size` is for appends in directory buckets, and `RequestCharged` reports a
+            // Requester Pays charge this emulator does not model.
+            ..PutObjectOutput::default()
+        })
     }
 }

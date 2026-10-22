@@ -6,10 +6,14 @@
 //! stores, plus the few helpers the Slack-channel handlers share (the ARN form, the
 //! request's region, and the record -> modelled-shape projection). Handlers reach it
 //! through [`service_state`]; nothing here is per-request.
+//!
+//! It also owns the registry of Slack workspaces AUTHORIZED with the account, which a
+//! channel configuration has to name one of — see [`seed_slack_workspaces`] for how a
+//! workspace gets into it, given that no operation in this model authorizes one.
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{SlackChannelConfiguration, Tag};
+use crate::ops::types::{SlackChannelConfiguration, SlackWorkspace, Tag};
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. `us-east-1` is the emulator-wide default region.
@@ -52,10 +56,148 @@ const _: () = assert!(MAX_SLACK_CHANNEL_CONFIGURATIONS <= MAX_PAGE_SIZE);
 /// `BTreeMap` keyed by `ChatConfigurationArn`, so `DescribeSlackChannelConfigurations`
 /// walks the configurations in one stable total order and can resume that walk from
 /// an opaque token.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsChatbotWheatleyorchestration20171011State {
     /// Every Slack channel configuration, keyed by its `ChatConfigurationArn`.
     pub slack_channel_configurations: BTreeMap<String, SlackChannelConfigRecord>,
+    /// The Slack workspaces AUTHORIZED with this account, keyed by `SlackTeamId`.
+    ///
+    /// A Slack channel configuration can only be created for a workspace this map
+    /// holds, so this registry — and nothing about the spelling, length or shape of a
+    /// `SlackTeamId` — is what decides whether a workspace is authorized.
+    ///
+    /// `BTreeMap` for the same reason as the configurations: `DescribeSlackWorkspaces`
+    /// paginates over it in one stable total order.
+    ///
+    /// Populated out of band; see [`seed_slack_workspaces`].
+    slack_workspace_authorizations: BTreeMap<String, SlackWorkspaceRecord>,
+}
+
+impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
+    fn default() -> Self {
+        Self {
+            slack_channel_configurations: BTreeMap::new(),
+            slack_workspace_authorizations: seed_slack_workspaces()
+                .into_iter()
+                .map(|workspace| (workspace.slack_team_id.clone(), workspace))
+                .collect(),
+        }
+    }
+}
+
+impl ComAmazonawsChatbotWheatleyorchestration20171011State {
+    /// The authorized workspace `slack_team_id` names, or `None` when no workspace with
+    /// that id is authorized with this account.
+    ///
+    /// `CreateSlackChannelConfiguration` creates a configuration only for a workspace
+    /// this answers `Some` for; for anything else it raises the modelled 400
+    /// `InvalidRequestException` carrying
+    /// [`unauthorized_slack_workspace_message`] rather than binding a configuration to
+    /// a workspace the account never authorized.
+    pub fn slack_workspace(&self, slack_team_id: &str) -> Option<&SlackWorkspaceRecord> {
+        self.slack_workspace_authorizations.get(slack_team_id)
+    }
+
+    /// Every authorized workspace, in `SlackTeamId` order.
+    pub fn slack_workspaces(&self) -> impl Iterator<Item = &SlackWorkspaceRecord> {
+        self.slack_workspace_authorizations.values()
+    }
+
+    /// Record `slack_team_id` as a workspace authorized with this account under the
+    /// display name `slack_team_name`, and hand back the record now stored for it.
+    ///
+    /// This is the out-of-band authorization channel described on
+    /// `slack_workspace_authorizations`: on AWS a workspace is authorized by the
+    /// one-time Slack client (OAuth) handshake the AWS Chatbot console drives, which no
+    /// operation in this model performs, so nothing a client sends over the wire
+    /// reaches here. Authorizing a workspace that is already authorized REPLACES its
+    /// display name: one workspace id, one authorization.
+    pub fn authorize_slack_workspace(
+        &mut self,
+        slack_team_id: &str,
+        slack_team_name: &str,
+    ) -> SlackWorkspaceRecord {
+        let record = SlackWorkspaceRecord {
+            slack_team_id: slack_team_id.to_string(),
+            slack_team_name: slack_team_name.to_string(),
+            state: STATE_ENABLED.to_string(),
+            state_reason: None,
+        };
+        self.slack_workspace_authorizations
+            .insert(slack_team_id.to_string(), record.clone());
+        record
+    }
+}
+
+/// One authorized Slack workspace: what `DescribeSlackWorkspaces` reports and what a
+/// Slack channel configuration takes its `SlackTeamName` from.
+#[derive(Debug, Clone, Default)]
+pub struct SlackWorkspaceRecord {
+    pub slack_team_id: String,
+    pub slack_team_name: String,
+    /// `ENABLED` or `DISABLED`; see [`STATE_ENABLED`].
+    pub state: String,
+    pub state_reason: Option<String>,
+}
+
+impl SlackWorkspaceRecord {
+    /// Project the stored authorization onto the modelled `SlackWorkspace`.
+    pub fn view(&self) -> SlackWorkspace {
+        SlackWorkspace {
+            slack_team_id: self.slack_team_id.clone(),
+            slack_team_name: self.slack_team_name.clone(),
+            state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+        }
+    }
+}
+
+/// The Slack workspaces this store starts out holding an authorization for.
+///
+/// A workspace becomes authorized with an AWS account through the one-time Slack client
+/// (OAuth) handshake in the AWS Chatbot console. NO operation in this model performs
+/// it: `DescribeSlackWorkspaces` lists the authorizations and
+/// `DeleteSlackWorkspaceAuthorization` removes one, and neither creates one. Without a
+/// seed the registry would therefore be empty for good and every
+/// `CreateSlackChannelConfiguration` would be refused, so the workspaces below are a
+/// fixture standing in for that handshake: a client can discover them with
+/// `DescribeSlackWorkspaces` and configure a channel in either. A test (or an admin
+/// path) registers its own with
+/// [`ComAmazonawsChatbotWheatleyorchestration20171011State::authorize_slack_workspace`].
+///
+/// The ids satisfy the model's `SlackTeamId` pattern (`^[0-9A-Z]{1,255}$`) and the names
+/// its `SlackTeamName` length (1..255).
+pub fn seed_slack_workspaces() -> Vec<SlackWorkspaceRecord> {
+    [
+        ("TEMULATOR001", "Emulator Workspace"),
+        ("TEMULATOR002", "Emulator Secondary Workspace"),
+    ]
+    .into_iter()
+    .map(|(slack_team_id, slack_team_name)| SlackWorkspaceRecord {
+        slack_team_id: slack_team_id.to_string(),
+        slack_team_name: slack_team_name.to_string(),
+        state: STATE_ENABLED.to_string(),
+        state_reason: None,
+    })
+    .collect()
+}
+
+/// The message a create refused for an unauthorized Slack workspace carries: it names
+/// the workspace the request asked for and the account it is not authorized with, so a
+/// caller can tell WHICH workspace needs the one-time Slack client setup, and points at
+/// the guide that describes that setup.
+///
+/// The sentence around those two values is AWS Chatbot's own, as the AWS Chatbot
+/// administrator guide's Slack client setup section is the page it points a caller at;
+/// the workspace id comes from the request and the account id from the emulator's
+/// account, so nothing here is copied from any one recorded response.
+pub fn unauthorized_slack_workspace_message(slack_team_id: &str) -> String {
+    format!(
+        "Unable to create the configuration because Slack workspace {slack_team_id} is not \
+         authorized with AWS account {}. See  \
+         https://docs.aws.amazon.com/chatbot/latest/adminguide/slack-setup.html#slack-client-setup",
+        ::emulator_server::emulator_account_id()
+    )
 }
 
 /// One stored Slack channel configuration: everything a later `Describe`, `Update`,
@@ -166,4 +308,27 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsChatbotWheatleyorchestration20171011State>)
+}
+
+/// Authorize the Slack workspace `slack_team_id`, under the display name
+/// `slack_team_name`, with this account in `engine`'s store.
+///
+/// The engine-level form of
+/// [`ComAmazonawsChatbotWheatleyorchestration20171011State::authorize_slack_workspace`],
+/// for a fixture (or an admin path) that holds the shared engine rather than the store:
+/// the Slack client (OAuth) handshake that authorizes a workspace on AWS has no
+/// operation in this model, so this is the only way one gets authorized.
+///
+/// Answers `None` when `engine` is not the shared [`::engine::InMemoryEngine`] (so there
+/// is no store to write), otherwise the record now stored for the workspace.
+pub fn authorize_slack_workspace<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    slack_team_id: &str,
+    slack_team_name: &str,
+) -> Option<SlackWorkspaceRecord> {
+    let state = service_state(engine)?;
+    let record = state
+        .lock()
+        .authorize_slack_workspace(slack_team_id, slack_team_name);
+    Some(record)
 }
