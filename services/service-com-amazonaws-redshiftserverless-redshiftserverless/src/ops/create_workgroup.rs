@@ -4,7 +4,10 @@
 //! IMPLEMENTED: inserts a workgroup keyed by `workgroupName` into
 //! [`crate::state::ComAmazonawsRedshiftserverlessRedshiftserverlessState::workgroups`]
 //! and answers with the record it stored, so `GetWorkgroup` / `ListWorkgroups` report
-//! exactly these bytes back.
+//! exactly these bytes back. A `namespaceName` that resolves to nothing is refused with the
+//! modelled `ResourceNotFoundException` answered with HTTP 400
+//! ([`crate::state::namespace_not_found`]), the answer this service gives for any
+//! unresolvable namespace name.
 //!
 //! The workgroup is created in `CREATING` status — one of the four `WorkgroupStatus`
 //! values — and reaches `AVAILABLE` on its own a moment later, with nobody calling; see
@@ -228,15 +231,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before the `entry` below takes the borrow; it bounds only a NEW record.
         let stored_workgroups = state.workgroups.len();
 
-        // A workgroup holds the compute for an existing namespace's database.
+        // A workgroup holds the compute for an existing namespace's database. A
+        // `namespaceName` that resolves to nothing is the modelled
+        // `ResourceNotFoundException` answered with the status this service answers any
+        // namespace-name refusal with; see [`crate::state::namespace_not_found`].
         if !state.namespaces.contains_key(&input.namespace_name) {
-            return Err(CreateWorkgroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no namespace named {}", input.namespace_name),
-                    resource_name: Some(input.namespace_name.clone()),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::restated(
+                crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                CreateWorkgroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::namespace_not_found(&input.namespace_name),
+                        resource_name: Some(input.namespace_name.clone()),
+                    },
+                ),
+            ));
         }
 
         let region = crate::state::request_region(ctx);

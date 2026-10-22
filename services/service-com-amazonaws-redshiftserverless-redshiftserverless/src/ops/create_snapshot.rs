@@ -8,7 +8,10 @@
 //!
 //! A namespace with no workgroup has no compute to snapshot through, so the create is
 //! refused with the 404-status `ResourceNotFoundException` and stores NOTHING; the same
-//! request succeeds once a workgroup on that namespace exists.
+//! request succeeds once a workgroup on that namespace exists. A `namespaceName` that
+//! resolves to nothing at all is a different refusal: the same modelled shape answered with
+//! HTTP 400, as every operation that addresses a namespace by name answers it (see
+//! [`crate::state::namespace_not_found`]).
 //!
 //! The snapshot is minted in `CREATING` status — one of the `SnapshotStatus` values — and
 //! reaches `AVAILABLE` on its own a moment later, with nobody calling; see
@@ -193,13 +196,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.namespace_name)
             .map(|record| record.namespace.clone())
         else {
-            return Err(CreateSnapshotErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no namespace named {}", input.namespace_name),
-                    resource_name: Some(input.namespace_name.clone()),
-                },
-            )
-            .into());
+            // The name resolves to nothing: the modelled `ResourceNotFoundException`,
+            // answered with the status this service answers any namespace-name refusal
+            // with. See [`crate::state::namespace_not_found`].
+            return Err(crate::scaffolded::Scaffolded::restated(
+                crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                CreateSnapshotErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::namespace_not_found(&input.namespace_name),
+                        resource_name: Some(input.namespace_name.clone()),
+                    },
+                ),
+            ));
         };
 
         // A snapshot of a namespace is taken through the compute attached to it, so a

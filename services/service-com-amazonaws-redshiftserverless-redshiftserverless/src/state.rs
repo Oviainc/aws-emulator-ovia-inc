@@ -29,6 +29,26 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// database created in the namespace", and Redshift's first database is `dev`.
 pub const DEFAULT_DB_NAME: &str = "dev";
 
+/// The admin user a namespace reports when the create names none. Redshift Serverless
+/// always has an administrator for the first database (`Namespace$adminUsername` is "the
+/// username of the administrator for the first database created in the namespace"), and
+/// `admin` is the name it gives that account by default — the name the recorded
+/// `CreateNamespace`/`GetNamespace` responses carry for a create that supplied none.
+pub const DEFAULT_ADMIN_USERNAME: &str = "admin";
+
+/// The `kmsKeyId` a namespace reports when the create names no customer managed key:
+/// Redshift Serverless encrypts a namespace with an Amazon Web Services owned key unless
+/// a KMS key is supplied, and reports that choice under this sentinel rather than a key
+/// id (the value the recorded responses carry for a create with no `kmsKeyId`).
+pub const AWS_OWNED_KMS_KEY: &str = "AWS_OWNED_KMS_KEY";
+
+/// The `lakehouseRegistrationStatus` of a namespace that is not registered with Amazon
+/// Redshift federated permissions — every namespace until `UpdateLakehouseConfiguration`
+/// registers it. `Namespace$lakehouseRegistrationStatus` is "the status of the lakehouse
+/// registration for the namespace", and the recorded responses report this value for a
+/// namespace nobody registered.
+pub const LAKEHOUSE_NOT_REGISTERED: &str = "NOT_REGISTERED";
+
 /// `CreateWorkgroup`'s `baseCapacity` default, in Redshift Processing Units (RPUs).
 pub const DEFAULT_BASE_CAPACITY: i32 = 128;
 
@@ -115,15 +135,17 @@ pub const DEFAULT_USAGE_LIMIT_BREACH_ACTION: &str = "log";
 /// The `NamespaceStatus` values this slice reports
 /// (`smithy_query(query="shape", shape="NamespaceStatus")` -> AVAILABLE, MODIFYING,
 /// DELETING). There is no `CREATING`: a namespace holds no compute, so it is available as
-/// soon as it exists and has no transition to settle.
+/// soon as it exists.
 pub const NAMESPACE_AVAILABLE: &str = "AVAILABLE";
+/// See [`NAMESPACE_AVAILABLE`].
+pub const NAMESPACE_MODIFYING: &str = "MODIFYING";
 /// See [`NAMESPACE_AVAILABLE`].
 pub const NAMESPACE_DELETING: &str = "DELETING";
 
-/// How long after the call that starts it a workgroup's status transition falls due. A
-/// span this emulator chooses, not a duration the service documents: it only has to be
-/// long enough that a caller acting straight after the create still observes the
-/// transient status, and short enough to poll through.
+/// How long after the call that starts it a status transition falls due. A span this
+/// emulator chooses, not a duration the service documents: it only has to be long enough
+/// that a caller acting straight after the call still observes the transient status, and
+/// short enough to poll through.
 const SETTLE_AFTER: Duration = Duration::from_millis(500);
 
 /// True when `port` lies in one of the ranges `Workgroup$port` documents.
@@ -131,6 +153,31 @@ pub fn port_in_documented_range(port: i32) -> bool {
     PORT_RANGES
         .iter()
         .any(|(low, high)| (*low..=*high).contains(&port))
+}
+
+/// The HTTP status this service answers a namespace-NAME refusal with — a name already
+/// taken, or one that resolves to nothing — whatever the modelled error's `@httpError`
+/// names. From the recorded `CreateNamespace` / `GetNamespace` refusals, which carry the
+/// modelled error shape with this status. See [`namespace_not_found`].
+pub const NAMESPACE_NAME_REFUSAL_STATUS: u16 = 400;
+
+/// How this service states that a namespace name resolves to nothing.
+///
+/// The recorded traffic answers an unresolvable namespace NAME with HTTP **400** carrying
+/// the modelled `ResourceNotFoundException` shape — the model's `@httpError` 404 is the
+/// error's documented status, not the one this service sends for a namespace name — and
+/// words the refusal from the name the request asked for. Every operation that addresses a
+/// namespace by name refuses a miss this way, so the sentence lives here once; the status
+/// is restated through [`crate::scaffolded::Scaffolded::restated`].
+pub fn namespace_not_found(name: &str) -> String {
+    format!("Serverless namespace {name} not found.")
+}
+
+/// How this service states that a namespace name is already taken: HTTP **400** carrying
+/// the modelled `ConflictException` shape, worded from the name the request asked for. See
+/// [`namespace_not_found`] for the status.
+pub fn namespace_already_exists(name: &str) -> String {
+    format!("The namespace {name} already exists.")
 }
 
 /// `arn:aws:redshift-serverless:<region>:<account>:namespace/<namespaceId>`.
@@ -186,18 +233,18 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// A status change the clock owes a workgroup.
+/// A status change the clock owes a resource.
 ///
-/// `WorkgroupStatus` models `CREATING` and `MODIFYING` beside `AVAILABLE`, so a workgroup
-/// is reported in one of them while the compute it describes is being brought up or
-/// changed, and reaches `AVAILABLE` on its own a moment later with nobody calling. The
-/// due instant is STORED and applied when a later call observes the record; no handler
-/// ever sleeps for it.
+/// `WorkgroupStatus` models `CREATING` and `MODIFYING` beside `AVAILABLE`, and
+/// `NamespaceStatus` models `MODIFYING`, so a resource is reported in one of them while
+/// the change it describes is being applied, and reaches `AVAILABLE` on its own a moment
+/// later with nobody calling. The due instant is STORED and applied when a later call
+/// observes the record; no handler ever sleeps for it.
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
-    /// The instant from which [`status`](Self::status) is the workgroup's real status.
+    /// The instant from which [`status`](Self::status) is the resource's real status.
     pub due_at: Instant,
-    /// The status the workgroup settles into.
+    /// The status the resource settles into.
     pub status: &'static str,
 }
 
@@ -233,6 +280,27 @@ pub struct NamespaceRecord {
     /// The tags the create request carried. `Namespace` models no `tags` member, so they
     /// are reached through the tagging operations rather than echoed on a read.
     pub tags: Vec<Tag>,
+    /// The transition the clock owes this namespace, while one is outstanding.
+    pub pending_status: Option<PendingStatus>,
+}
+
+impl NamespaceRecord {
+    /// Report `transient` from now, and owe `settled` from [`SETTLE_AFTER`] onwards.
+    pub fn begin_transition(&mut self, transient: &str, settled: &'static str) {
+        self.namespace.status = Some(transient.to_string());
+        self.pending_status = Some(PendingStatus {
+            due_at: Instant::now() + SETTLE_AFTER,
+            status: settled,
+        });
+    }
+
+    /// Materialise the transition the clock has already made due, if any. See
+    /// [`WorkgroupRecord::settle`] for why a reporting operation may make this one write.
+    pub fn settle(&mut self, now: Instant) {
+        if let Some(pending) = self.pending_status.take_if(|pending| now >= pending.due_at) {
+            self.namespace.status = Some(pending.status.to_string());
+        }
+    }
 }
 
 /// A stored workgroup.
@@ -345,11 +413,15 @@ pub struct ComAmazonawsRedshiftserverlessRedshiftserverlessState {
 }
 
 impl ComAmazonawsRedshiftserverlessRedshiftserverlessState {
-    /// Apply every status transition the clock has already made due. Call it before
-    /// reading or writing a workgroup or a snapshot, so no caller observes a status the
-    /// service has already moved on from. See [`WorkgroupRecord::settle`].
+    /// Apply every status transition the clock has already made due, to every resource.
+    /// Call it before reading or writing a namespace, a workgroup or a snapshot, so no
+    /// caller observes a status the service has already moved on from. See
+    /// [`WorkgroupRecord::settle`].
     pub fn settle_due_transitions(&mut self) {
         let now = Instant::now();
+        for record in self.namespaces.values_mut() {
+            record.settle(now);
+        }
         for record in self.workgroups.values_mut() {
             record.settle(now);
         }

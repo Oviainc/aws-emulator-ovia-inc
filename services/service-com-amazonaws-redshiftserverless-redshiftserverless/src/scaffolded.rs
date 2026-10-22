@@ -196,6 +196,23 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// A modeled error the SERVICE answers with a different HTTP status from the one its
+    /// `@httpError` trait names.
+    ///
+    /// The error shape is unchanged — the `__type` / `<Code>` a client matches on, and
+    /// every member of the body, come from the modeled error exactly as
+    /// [`Scaffolded::Modeled`] renders them. Only the status line differs.
+    ///
+    /// This is NOT a licence to pick a status: use it only where the real service is
+    /// RECORDED answering a modeled error with another status (a published model's
+    /// `@httpError` is the error's documented status, which is not always the one the
+    /// service sends), and say so at the call site.
+    Restated {
+        /// The status the service answers with.
+        status: u16,
+        /// The modeled error, which still supplies the shape, the schema and the body.
+        error: E,
+    },
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +238,12 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// A modeled error answered with `status` instead of the status its `@httpError`
+    /// names. See [`Scaffolded::Restated`] for when that is correct.
+    pub fn restated(status: u16, error: E) -> Self {
+        Self::Restated { status, error }
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +252,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::Restated { error, .. } => write!(f, "{error}"),
         }
     }
 }
@@ -241,6 +265,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::Restated { error, .. } => error.source(),
         }
     }
 }
@@ -255,6 +280,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::Restated { error, .. } => error.as_serializable(),
         }
     }
 
@@ -263,6 +289,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::Restated { error, .. } => error.variant_schema(),
         }
     }
 
@@ -275,6 +302,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::Restated { error, .. } => error.shape_name(),
         }
     }
 
@@ -287,6 +315,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            // The whole point of the variant: the service's status, not the model's.
+            Self::Restated { status, .. } => *status,
         }
     }
 
@@ -299,6 +329,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::Restated { error, .. } => error.query_error_code(),
         }
     }
 }

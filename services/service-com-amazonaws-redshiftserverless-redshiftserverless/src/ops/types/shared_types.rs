@@ -144,7 +144,208 @@ pub struct NetworkInterface {
     pub ipv6_address: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.redshiftserverless#Namespace")]
+// `Namespace` and `Workgroup` are the TWO shapes in this module whose schemas are written
+// out below rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason
+// is a single trait the vendored codegen does not read: `@timestampFormat`.
+//
+// Both shapes carry `date-time` timestamps — `smithy_query(query="shape",
+// shape="Namespace,Workgroup")` reports `"timestampFormat": "date-time"` on
+// `Namespace$creationDate`, `Workgroup$creationDate` and
+// `Workgroup$customDomainCertificateExpiryTime`. `vendor/smithy-macros` never emits
+// `with_timestamp_format`, so a macro-built member schema reports no format and the
+// awsJson1_1 codec falls back to its protocol default, epoch seconds — a NUMBER where the
+// model (and every AWS SDK's generated deserializer for a `date-time` member) requires an
+// RFC 3339 string. The schemas below differ from the macro's output in exactly that one
+// chain call, which [`schema_for`] attaches for the `date_time` member kind.
+//
+// REMOVE THIS BLOCK when the vendored codegen learns `smithy.api#timestampFormat`: the fix
+// belongs there, not here, because every `@timestampFormat` member of every service has the
+// same defect and `vendor/` is outside what a fix may change. Once `vendor/smithy-macros`
+// emits `with_timestamp_format`, delete the three macros and the two
+// `schema_and_codec_for!` blocks and put `#[smithy_macros::smithy(shape = ...)]` back on
+// the two structs — `tests/all/namespace_response_fidelity.rs` pins the wire form, so it
+// fails if the attribute does not carry it.
+
+/// One member's schema, as the macro would emit it, plus the `@timestampFormat` chain call
+/// it cannot: one rule per member kind, each expanding to the whole `Schema` expression.
+///
+/// `$kind` is the member's shape kind — `string`, `boolean`, `integer`, `date_time`,
+/// `list_of_string`, `list_of(T)` (a list of structures) or `struct_of(T)`.
+macro_rules! schema_for {
+    ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!($ns, "#", $local, "$", $wire),
+                $ns,
+                $wire,
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            $wire,
+            $idx,
+        )
+        // The one call the vendored codegen omits; see the note above.
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime)
+    };
+    ($ns:literal, $local:literal, $wire:literal, $idx:literal, $kind:tt $(($inner:ty))?) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!($ns, "#", $local, "$", $wire),
+                $ns,
+                $wire,
+            ),
+            shape_type_for!($kind),
+            $wire,
+            $idx,
+        )
+    };
+}
+
+/// The `ShapeType` each member kind names. Mirrors the vendored codegen's
+/// `shape_type_ident`.
+macro_rules! shape_type_for {
+    (string) => {
+        ::aws_smithy_schema::ShapeType::String
+    };
+    (boolean) => {
+        ::aws_smithy_schema::ShapeType::Boolean
+    };
+    (integer) => {
+        ::aws_smithy_schema::ShapeType::Integer
+    };
+    (list_of_string) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
+    (list_of) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
+    (struct_of) => {
+        ::aws_smithy_schema::ShapeType::Structure
+    };
+}
+
+/// Write one member, as the vendored codegen's `emit_write` does for that kind. A list of
+/// structures writes each element against the ELEMENT shape's own schema, which is what
+/// the codegen does too.
+macro_rules! write_member {
+    ($s:ident, $m:expr, $v:expr, string) => { $s.write_string($m, $v.as_str())?; };
+    ($s:ident, $m:expr, $v:expr, boolean) => { $s.write_boolean($m, *$v)?; };
+    ($s:ident, $m:expr, $v:expr, integer) => { $s.write_integer($m, *$v)?; };
+    ($s:ident, $m:expr, $v:expr, date_time) => { $s.write_timestamp($m, $v)?; };
+    ($s:ident, $m:expr, $v:expr, list_of_string) => {
+        $s.write_list($m, &|__sl| {
+            for __it in $v.iter() {
+                __sl.write_string($m, __it.as_str())?;
+            }
+            Ok(())
+        })?;
+    };
+    ($s:ident, $m:expr, $v:expr, list_of($inner:ty)) => {
+        $s.write_list($m, &|__sl| {
+            for __it in $v.iter() {
+                __sl.write_struct(&<$inner>::SCHEMA, __it)?;
+            }
+            Ok(())
+        })?;
+    };
+    ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => { $s.write_struct($m, $v)?; };
+}
+
+/// Read one member, as the vendored codegen's `emit_read` does for that kind.
+macro_rules! read_member {
+    ($d:ident, $m:expr, string) => { $d.read_string($m)? };
+    ($d:ident, $m:expr, boolean) => { $d.read_boolean($m)? };
+    ($d:ident, $m:expr, integer) => { $d.read_integer($m)? };
+    ($d:ident, $m:expr, date_time) => { $d.read_timestamp($m)? };
+    ($d:ident, $m:expr, list_of_string) => {{
+        let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+        $d.read_list($m, &mut |__dl| {
+            __out.push(__dl.read_string($m)?);
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, list_of($inner:ty)) => {{
+        let mut __out: ::std::vec::Vec<$inner> = ::std::vec::Vec::new();
+        $d.read_list($m, &mut |__dl| {
+            __out.push(
+                <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__dl)?,
+            );
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, struct_of($inner:ty)) => {
+        <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize($d)?
+    };
+}
+
+/// The schema, the serializer and the deserializer for one structure, from its member
+/// list: everything `#[smithy_macros::smithy(shape = ...)]` emits for an output shape,
+/// with `@timestampFormat` honoured. Each member entry is
+/// `(CONST, field, "wireName", index, kind)`; the index is the member's position in the
+/// model's member list, as the codegen numbers them.
+macro_rules! schema_and_codec_for {
+    (
+        $ty:ident, $schema_static:ident, $shape:literal, $ns:literal, $local:literal,
+        $( ( $cname:ident, $field:ident, $wire:literal, $idx:literal, $($kind:tt)+ ) ),+ $(,)?
+    ) => {
+        #[allow(non_upper_case_globals)]
+        impl $ty {
+            $(
+                pub const $cname: ::aws_smithy_schema::Schema =
+                    schema_for!($ns, $local, $wire, $idx, $($kind)+);
+            )+
+
+            pub const SCHEMA: ::aws_smithy_schema::Schema =
+                ::aws_smithy_schema::Schema::new_struct(
+                    ::aws_smithy_schema::ShapeId::from_static($shape, $ns, $local),
+                    ::aws_smithy_schema::ShapeType::Structure,
+                    &[$(&Self::$cname,)+],
+                );
+        }
+
+        pub static $schema_static: &::aws_smithy_schema::Schema = &$ty::SCHEMA;
+
+        impl ::aws_smithy_schema::serde::SerializableStruct for $ty {
+            fn serialize_members(
+                &self,
+                s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+            ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+                $(
+                    if let ::std::option::Option::Some(v) = self.$field.as_ref() {
+                        write_member!(s, &Self::$cname, v, $($kind)+);
+                    }
+                )+
+                Ok(())
+            }
+        }
+
+        impl ::aws_smithy_schema_server::DeserializableStruct for $ty {
+            fn deserialize(
+                d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+            ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+                let mut out = Self::default();
+                d.read_struct(&Self::SCHEMA, &mut |member, d| {
+                    match member.member_index() {
+                        $(
+                            ::std::option::Option::Some($idx) => {
+                                out.$field = ::std::option::Option::Some(
+                                    read_member!(d, &Self::$cname, $($kind)+),
+                                )
+                            }
+                        )+
+                        _ => {}
+                    }
+                    Ok(())
+                })?;
+                Ok(out)
+            }
+        }
+    };
+}
+
+/// A collection of database objects and users. Member set and order from
+/// `smithy_query(query="shape", shape="Namespace")`.
 #[derive(Debug, Clone, Default)]
 pub struct Namespace {
     pub namespace_arn: Option<String>,
@@ -164,6 +365,60 @@ pub struct Namespace {
     pub catalog_arn: Option<String>,
     pub s3_table_publish_status: Option<S3TablePublishStatus>,
 }
+
+schema_and_codec_for!(
+    Namespace,
+    NAMESPACE_SCHEMA,
+    "com.amazonaws.redshiftserverless#Namespace",
+    "com.amazonaws.redshiftserverless",
+    "Namespace",
+    (M_NAMESPACE_ARN, namespace_arn, "namespaceArn", 0, string),
+    (M_NAMESPACE_ID, namespace_id, "namespaceId", 1, string),
+    (M_NAMESPACE_NAME, namespace_name, "namespaceName", 2, string),
+    (M_ADMIN_USERNAME, admin_username, "adminUsername", 3, string),
+    (M_DB_NAME, db_name, "dbName", 4, string),
+    (M_KMS_KEY_ID, kms_key_id, "kmsKeyId", 5, string),
+    (
+        M_DEFAULT_IAM_ROLE_ARN,
+        default_iam_role_arn,
+        "defaultIamRoleArn",
+        6,
+        string
+    ),
+    (M_IAM_ROLES, iam_roles, "iamRoles", 7, list_of_string),
+    (M_LOG_EXPORTS, log_exports, "logExports", 8, list_of_string),
+    (M_STATUS, status, "status", 9, string),
+    (M_CREATION_DATE, creation_date, "creationDate", 10, date_time),
+    (
+        M_ADMIN_PASSWORD_SECRET_ARN,
+        admin_password_secret_arn,
+        "adminPasswordSecretArn",
+        11,
+        string
+    ),
+    (
+        M_ADMIN_PASSWORD_SECRET_KMS_KEY_ID,
+        admin_password_secret_kms_key_id,
+        "adminPasswordSecretKmsKeyId",
+        12,
+        string
+    ),
+    (
+        M_LAKEHOUSE_REGISTRATION_STATUS,
+        lakehouse_registration_status,
+        "lakehouseRegistrationStatus",
+        13,
+        string
+    ),
+    (M_CATALOG_ARN, catalog_arn, "catalogArn", 14, string),
+    (
+        M_S3_TABLE_PUBLISH_STATUS,
+        s3_table_publish_status,
+        "s3TablePublishStatus",
+        15,
+        struct_of(S3TablePublishStatus)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.redshiftserverless#S3TablePublishStatus")]
 #[derive(Debug, Clone, Default)]
@@ -334,7 +589,9 @@ pub struct PerformanceTarget {
     pub level: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.redshiftserverless#Workgroup")]
+/// The collection of computing resources from which an endpoint is created. Member set and
+/// order from `smithy_query(query="shape", shape="Workgroup")`; its schema is hand-written
+/// for the `date-time` reason in the note above `Namespace`.
 #[derive(Debug, Clone, Default)]
 pub struct Workgroup {
     pub workgroup_id: Option<String>,
@@ -364,6 +621,112 @@ pub struct Workgroup {
     pub pending_track_name: Option<String>,
     pub extra_compute_for_automatic_optimization: Option<bool>,
 }
+
+schema_and_codec_for!(
+    Workgroup,
+    WORKGROUP_SCHEMA,
+    "com.amazonaws.redshiftserverless#Workgroup",
+    "com.amazonaws.redshiftserverless",
+    "Workgroup",
+    (M_WORKGROUP_ID, workgroup_id, "workgroupId", 0, string),
+    (M_WORKGROUP_ARN, workgroup_arn, "workgroupArn", 1, string),
+    (M_WORKGROUP_NAME, workgroup_name, "workgroupName", 2, string),
+    (M_NAMESPACE_NAME, namespace_name, "namespaceName", 3, string),
+    (M_BASE_CAPACITY, base_capacity, "baseCapacity", 4, integer),
+    (
+        M_ENHANCED_VPC_ROUTING,
+        enhanced_vpc_routing,
+        "enhancedVpcRouting",
+        5,
+        boolean
+    ),
+    (
+        M_CONFIG_PARAMETERS,
+        config_parameters,
+        "configParameters",
+        6,
+        list_of(ConfigParameter)
+    ),
+    (
+        M_SECURITY_GROUP_IDS,
+        security_group_ids,
+        "securityGroupIds",
+        7,
+        list_of_string
+    ),
+    (M_SUBNET_IDS, subnet_ids, "subnetIds", 8, list_of_string),
+    (M_STATUS, status, "status", 9, string),
+    (M_ENDPOINT, endpoint, "endpoint", 10, struct_of(Endpoint)),
+    (
+        M_PUBLICLY_ACCESSIBLE,
+        publicly_accessible,
+        "publiclyAccessible",
+        11,
+        boolean
+    ),
+    (M_CREATION_DATE, creation_date, "creationDate", 12, date_time),
+    (M_PORT, port, "port", 13, integer),
+    (
+        M_CUSTOM_DOMAIN_NAME,
+        custom_domain_name,
+        "customDomainName",
+        14,
+        string
+    ),
+    (
+        M_CUSTOM_DOMAIN_CERTIFICATE_ARN,
+        custom_domain_certificate_arn,
+        "customDomainCertificateArn",
+        15,
+        string
+    ),
+    (
+        M_CUSTOM_DOMAIN_CERTIFICATE_EXPIRY_TIME,
+        custom_domain_certificate_expiry_time,
+        "customDomainCertificateExpiryTime",
+        16,
+        date_time
+    ),
+    (
+        M_WORKGROUP_VERSION,
+        workgroup_version,
+        "workgroupVersion",
+        17,
+        string
+    ),
+    (M_PATCH_VERSION, patch_version, "patchVersion", 18, string),
+    (M_MAX_CAPACITY, max_capacity, "maxCapacity", 19, integer),
+    (
+        M_CROSS_ACCOUNT_VPCS,
+        cross_account_vpcs,
+        "crossAccountVpcs",
+        20,
+        list_of_string
+    ),
+    (M_IP_ADDRESS_TYPE, ip_address_type, "ipAddressType", 21, string),
+    (
+        M_PRICE_PERFORMANCE_TARGET,
+        price_performance_target,
+        "pricePerformanceTarget",
+        22,
+        struct_of(PerformanceTarget)
+    ),
+    (M_TRACK_NAME, track_name, "trackName", 23, string),
+    (
+        M_PENDING_TRACK_NAME,
+        pending_track_name,
+        "pendingTrackName",
+        24,
+        string
+    ),
+    (
+        M_EXTRA_COMPUTE_FOR_AUTOMATIC_OPTIMIZATION,
+        extra_compute_for_automatic_optimization,
+        "extraComputeForAutomaticOptimization",
+        25,
+        boolean
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.redshiftserverless#Endpoint")]
 #[derive(Debug, Clone, Default)]

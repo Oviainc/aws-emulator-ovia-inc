@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members the request names to the namespace stored under
+//! `namespaceName` and answers with the stored record, so a following `GetNamespace` /
+//! `ListNamespaces` reports exactly what this call left behind. A `namespaceName` that
+//! resolves to nothing is refused with the modelled `ResourceNotFoundException` answered
+//! with HTTP 400 ([`crate::state::namespace_not_found`]), as it is for every operation that
+//! addresses a namespace by name.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The namespace is answered in `MODIFYING` status and settles back to `AVAILABLE` on its
+//! own a moment later, with nobody calling
+//! ([`crate::state::NamespaceRecord::begin_transition`]).
+//!
+//! The pairings the operation documents are enforced before anything is written:
+//! `adminUsername` with `adminUserPassword`, `iamRoles` with `defaultIamRoleArn`,
+//! `kmsKeyId` not with `logExports`, and `adminUserPassword` not with
+//! `manageAdminPassword`. A refused request leaves the stored namespace untouched.
+//!
+//! The admin password is stored and never returned — `Namespace` models no password
+//! member — and `manageAdminPassword` mints no Secrets Manager secret, so
+//! `adminPasswordSecretArn` stays absent, exactly as on `CreateNamespace`.
+//!
+//! The Amazon S3 Tables log-publishing update (`logDestinationType` `s3table`) is NOT
+//! served: publishing system tables needs the S3 Tables resource this emulator does not
+//! have, so a request naming it answers 501 rather than reporting a publish status for
+//! tables nothing published.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +209,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNamespace"))
+        let _ = ctx;
+
+        // The S3 Tables log-publishing update is its own request and its own resource,
+        // neither of which this emulator serves; see the module note.
+        const S3_TABLE_DESTINATION: &str = "s3table";
+        let s3_table_destination = input
+            .log_destination_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case(S3_TABLE_DESTINATION));
+        if s3_table_destination {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateNamespace with logDestinationType s3table",
+            ));
+        }
+        // Each `s3Table*` member is documented as "valid only when logDestinationType is
+        // s3table", so naming one on any other request is a bad request.
+        if input.s3_table_action.is_some()
+            || input.s3_table_names.is_some()
+            || input.s3_table_kms_key_id.is_some()
+            || input.s3_table_granularity.is_some()
+        {
+            return Err(UpdateNamespaceErrorModeled::ValidationException(ValidationException {
+                message: "the s3Table parameters are valid only when logDestinationType is \
+                          s3table"
+                    .to_string(),
+            })
+            .into());
+        }
+
+        // The pairings the operation documents. Each names the two members that describe
+        // one setting, so naming one without the other, or two settings that cannot
+        // travel together, is refused before anything is written.
+        if input.admin_username.is_some() != input.admin_user_password.is_some() {
+            return Err(UpdateNamespaceErrorModeled::ValidationException(ValidationException {
+                message: "adminUsername and adminUserPassword must be updated together"
+                    .to_string(),
+            })
+            .into());
+        }
+        if input.iam_roles.is_some() != input.default_iam_role_arn.is_some() {
+            return Err(UpdateNamespaceErrorModeled::ValidationException(ValidationException {
+                message: "iamRoles and defaultIamRoleArn must be updated together".to_string(),
+            })
+            .into());
+        }
+        if input.kms_key_id.is_some() && input.log_exports.is_some() {
+            return Err(UpdateNamespaceErrorModeled::ValidationException(ValidationException {
+                message: "kmsKeyId and logExports cannot be updated in a single request"
+                    .to_string(),
+            })
+            .into());
+        }
+        // Either the caller supplies the admin password or the service manages it; the two
+        // members describe the same secret, so naming both is contradictory.
+        if input.manage_admin_password.unwrap_or(false) && input.admin_user_password.is_some() {
+            return Err(UpdateNamespaceErrorModeled::ValidationException(ValidationException {
+                message: "adminUserPassword cannot be set when manageAdminPassword is true"
+                    .to_string(),
+            })
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateNamespaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.settle_due_transitions();
+
+        let Some(record) = state.namespaces.get_mut(&input.namespace_name) else {
+            // The name resolves to nothing: the modelled `ResourceNotFoundException`,
+            // answered with the status this service answers a namespace-name refusal
+            // with. See [`crate::state::namespace_not_found`].
+            return Err(crate::scaffolded::Scaffolded::restated(
+                crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                UpdateNamespaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::namespace_not_found(&input.namespace_name),
+                        resource_name: Some(input.namespace_name.clone()),
+                    },
+                ),
+            ));
+        };
+
+        // Every member of `Namespace` this operation models, applied only when the request
+        // names it.
+        if let Some(admin_username) = input.admin_username {
+            record.namespace.admin_username = Some(admin_username);
+        }
+        if let Some(admin_user_password) = input.admin_user_password {
+            // Stored, never returned: `Namespace` models no password member.
+            record.admin_user_password = Some(admin_user_password);
+        }
+        if let Some(manage_admin_password) = input.manage_admin_password {
+            record.manage_admin_password = manage_admin_password;
+        }
+        if let Some(secret_kms_key_id) = input.admin_password_secret_kms_key_id {
+            record.namespace.admin_password_secret_kms_key_id = Some(secret_kms_key_id);
+        }
+        if let Some(kms_key_id) = input.kms_key_id {
+            record.namespace.kms_key_id = Some(kms_key_id);
+        }
+        if let Some(default_iam_role_arn) = input.default_iam_role_arn {
+            record.namespace.default_iam_role_arn = Some(default_iam_role_arn);
+        }
+        if let Some(iam_roles) = input.iam_roles {
+            record.namespace.iam_roles = Some(iam_roles);
+        }
+        if let Some(log_exports) = input.log_exports {
+            record.namespace.log_exports = Some(log_exports);
+        }
+
+        // `NamespaceStatus` models `MODIFYING` beside `AVAILABLE`, and the recorded
+        // `UpdateNamespace` answers in it: the namespace is being changed when the call
+        // returns, and is available again on its own a moment later with nobody calling.
+        // See [`crate::state::NamespaceRecord::begin_transition`].
+        record.begin_transition(
+            crate::state::NAMESPACE_MODIFYING,
+            crate::state::NAMESPACE_AVAILABLE,
+        );
+
+        Ok(UpdateNamespaceOutput {
+            namespace: record.namespace.clone(),
+        })
     }
 }

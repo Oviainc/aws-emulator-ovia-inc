@@ -2,9 +2,12 @@
 
 //! @op DeleteNamespace
 //! IMPLEMENTED: removes the namespace from state and answers with the record it removed,
-//! in `DELETING` status — so a following `GetNamespace` is a 404 and `ListNamespaces` no
-//! longer carries it. A namespace a workgroup is still attached to is a 409
-//! `ConflictException`, and an unknown name a 404 `ResourceNotFoundException`.
+//! in `DELETING` status — so a following `GetNamespace` refuses the name and
+//! `ListNamespaces` no longer carries it. A namespace a workgroup is still attached to is a
+//! 409 `ConflictException`; a `namespaceName` that resolves to nothing is the modelled
+//! `ResourceNotFoundException` answered with HTTP 400
+//! ([`crate::state::namespace_not_found`]), as it is for every operation that addresses a
+//! namespace by name.
 //!
 //! `finalSnapshotName` is NOT served: AWS takes that snapshot itself, without the
 //! namespace's compute (a namespace that can be deleted has no workgroup left to snapshot
@@ -166,15 +169,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = state.lock();
+        state.settle_due_transitions();
 
         let Some(record) = state.namespaces.get(&input.namespace_name) else {
-            return Err(DeleteNamespaceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("no namespace named {}", input.namespace_name),
-                    resource_name: Some(input.namespace_name.clone()),
-                },
-            )
-            .into());
+            // The name resolves to nothing: the modelled `ResourceNotFoundException`,
+            // answered with the status this service answers a namespace-name refusal
+            // with. See [`crate::state::namespace_not_found`].
+            return Err(crate::scaffolded::Scaffolded::restated(
+                crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                DeleteNamespaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::namespace_not_found(&input.namespace_name),
+                        resource_name: Some(input.namespace_name.clone()),
+                    },
+                ),
+            ));
         };
         let mut namespace = record.namespace.clone();
 

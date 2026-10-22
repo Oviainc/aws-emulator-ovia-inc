@@ -7,6 +7,15 @@
 //! exactly these bytes back. The admin password is stored and never returned —
 //! `Namespace` models no password member.
 //!
+//! Three members the request may leave unset the SERVICE fills in, and they are stored
+//! like any other: `adminUsername` ([`crate::state::DEFAULT_ADMIN_USERNAME`]), `kmsKeyId`
+//! ([`crate::state::AWS_OWNED_KMS_KEY`]) and `lakehouseRegistrationStatus`
+//! ([`crate::state::LAKEHOUSE_NOT_REGISTERED`]).
+//!
+//! A `namespaceName` that is already taken is refused with the modelled
+//! `ConflictException`, answered with HTTP 400 rather than the 409 its `@httpError` names;
+//! see [`crate::state::namespace_already_exists`].
+//!
 //! `manageAdminPassword` is recorded but mints no Secrets Manager secret, so
 //! `adminPasswordSecretArn` stays absent: the secret belongs to this emulator's Secrets
 //! Manager integration, not to this operation.
@@ -190,6 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = state.lock();
+        state.settle_due_transitions();
         // The store grows one record per create, so the account's quota bounds it. Read
         // before the `entry` below takes the borrow; it bounds only a NEW record.
         let stored_namespaces = state.namespaces.len();
@@ -200,13 +210,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             namespace_arn: Some(crate::state::namespace_arn(&region, &namespace_id)),
             namespace_id: Some(namespace_id),
             namespace_name: Some(input.namespace_name.clone()),
-            admin_username: input.admin_username,
+            // The namespace always has an administrator for its first database, so the
+            // service names one even when the request does not: see
+            // [`crate::state::DEFAULT_ADMIN_USERNAME`].
+            admin_username: Some(
+                input
+                    .admin_username
+                    .unwrap_or_else(|| crate::state::DEFAULT_ADMIN_USERNAME.to_string()),
+            ),
             db_name: Some(
                 input
                     .db_name
                     .unwrap_or_else(|| crate::state::DEFAULT_DB_NAME.to_string()),
             ),
-            kms_key_id: input.kms_key_id,
+            // A namespace is always encrypted; naming no customer managed key selects the
+            // Amazon Web Services owned key, which the service reports under the sentinel
+            // [`crate::state::AWS_OWNED_KMS_KEY`] rather than as a key id.
+            kms_key_id: Some(
+                input
+                    .kms_key_id
+                    .unwrap_or_else(|| crate::state::AWS_OWNED_KMS_KEY.to_string()),
+            ),
             default_iam_role_arn: input.default_iam_role_arn,
             iam_roles: Some(input.iam_roles.unwrap_or_default()),
             log_exports: Some(input.log_exports.unwrap_or_default()),
@@ -214,6 +238,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // there is no transition for the clock to owe it.
             status: Some(crate::state::NAMESPACE_AVAILABLE.to_string()),
             creation_date: Some(crate::state::now_timestamp()),
+            // A namespace starts unregistered with Amazon Redshift federated permissions;
+            // `UpdateLakehouseConfiguration` is the call that registers one.
+            lakehouse_registration_status: Some(
+                crate::state::LAKEHOUSE_NOT_REGISTERED.to_string(),
+            ),
             ..Namespace::default()
         };
         let record = crate::state::NamespaceRecord {
@@ -221,6 +250,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             admin_user_password: input.admin_user_password,
             manage_admin_password: input.manage_admin_password.unwrap_or(false),
             tags: input.tags.unwrap_or_default(),
+            // `NamespaceStatus` models no CREATING, so a create owes no transition.
+            pending_status: None,
         };
 
         // One lookup decides both the conflict and the insert: the name is the
@@ -229,10 +260,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reads.
         match state.namespaces.entry(input.namespace_name) {
             ::std::collections::btree_map::Entry::Occupied(occupied) => {
-                Err(CreateNamespaceErrorModeled::ConflictException(ConflictException {
-                    message: format!("a namespace named {} already exists", occupied.key()),
-                })
-                .into())
+                // A name already taken is the modelled `ConflictException`, answered with
+                // the status this service answers a namespace-name refusal with — 400, not
+                // the 409 the shape's `@httpError` names. See
+                // [`crate::state::namespace_already_exists`].
+                Err(crate::scaffolded::Scaffolded::restated(
+                    crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                    CreateNamespaceErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::namespace_already_exists(occupied.key()),
+                    }),
+                ))
             }
             ::std::collections::btree_map::Entry::Vacant(slot) => {
                 if stored_namespaces >= crate::state::MAX_NAMESPACES {

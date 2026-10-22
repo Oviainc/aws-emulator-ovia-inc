@@ -320,8 +320,9 @@ async fn the_snapshot_name_is_the_snapshot_identity_and_an_unknown_one_is_not_fo
         "CreateSnapshot on an existing name: got {status} with {body}"
     );
 
-    // Snapshotting a namespace that does not exist at all is the same 404 as snapshotting
-    // one with no compute.
+    // Snapshotting a namespace that does not exist at all is a NAME refusal, which this
+    // service answers with HTTP 400 carrying the same modelled shape — see
+    // `state::namespace_not_found` and tests/all/namespace_response_fidelity.rs.
     let (status, body) = call(
         &router,
         "CreateSnapshot",
@@ -330,7 +331,7 @@ async fn the_snapshot_name_is_the_snapshot_identity_and_an_unknown_one_is_not_fo
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "CreateSnapshot into an unknown namespace: got {status} with {body}"
     );
 

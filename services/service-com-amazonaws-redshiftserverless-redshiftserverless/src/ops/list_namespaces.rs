@@ -149,7 +149,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let state = state.lock();
+        let mut state = state.lock();
+        // A status transition the clock has already made due is this read's to
+        // materialise: it was owed at this instant whether or not anybody called.
+        state.settle_due_transitions();
 
         let page = crate::state::page(
             &state.namespaces,

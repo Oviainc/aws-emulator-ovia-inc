@@ -41,9 +41,82 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// A modelled `@pattern` as this service states it inside a validation message: without
+/// the anchors.
+///
+/// Smithy's `@pattern` is an unanchored FIND, so `^...$` in a model is how that model
+/// writes "the whole value", not part of the requirement a caller is told about — this
+/// service interpolates the constraint itself. A `$` escaped by an odd number of
+/// backslashes is a literal dollar inside the expression, not the end anchor, so it stays.
+///
+/// The SAME helper is hand-written in four sibling services for the same reason
+/// (`service-com-amazonaws-controlcatalog-controlcatalog/src/service.rs`,
+/// `...-directoryservicedata-directoryservicedata/src/service.rs`,
+/// `...-osis-amazonopensearchingestionservice/src/service/validation.rs`,
+/// `...-computeoptimizerautomation-computeoptimizerautomationservice/src/state.rs`), and
+/// this copy is deliberately the same function as theirs so the five cannot drift. The
+/// rendering rule is framework-level: it belongs in the shared constraint renderer
+/// (`vendor/smithy-schema-server/src/constraints.rs`, `Violation::requirement`), which a
+/// fix may not change from here — once it learns this, delete all five and the
+/// `override_refusal` body below with them.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// True when [`restate`] states this violation differently from the framework, i.e. when
+/// there is anything to reword at all.
+fn is_reworded(violation: &Violation) -> bool {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => unanchored(pattern) != pattern.as_str(),
+        _ => false,
+    }
+}
+
+/// One violation as this service states it: a `@pattern` violation carrying the
+/// un-anchored constraint, every other class untouched.
+///
+/// Only the DATUM changes — the sentence is still written by the framework's
+/// `Violation::message()` through [`validation_envelope`], so there is one copy of the
+/// wording and this service cannot drift from it.
+fn restate(violation: &Violation) -> Violation {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => Violation {
+            path: violation.path.clone(),
+            kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
+            value: violation.value.clone(),
+        },
+        _ => violation.clone(),
+    }
+}
+
+/// The `ValidationException` envelope for `violations`, or `None` when this service states
+/// every one of them exactly as the framework does (so the framework should answer).
+///
+/// Both the clauses and the envelope around them are rendered by the framework's own
+/// [`aws_smithy_schema_server::envelope`]: this service only hands it violations whose
+/// `@pattern` datum has been restated.
+fn validation_envelope(violations: &[Violation]) -> Option<String> {
+    if !violations.iter().any(is_reworded) {
+        return None;
+    }
+    let restated: Vec<Violation> = violations.iter().map(restate).collect();
+    aws_smithy_schema_server::envelope(&restated)
+}
 
 /// The `com-amazonaws-redshiftserverless-redshiftserverless` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +171,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // One rewording: how a `@pattern` is rendered INSIDE the sentence. This service
+        // states the constraint un-anchored — `[a-z0-9-]+` for a member whose modelled
+        // pattern is `^[a-z0-9-]+$` — because Smithy's `@pattern` is an unanchored find
+        // and the anchors are not part of the requirement a caller is told about. Only the
+        // interpolated pattern changes: the envelope, the path, the echoed value and the
+        // `ValidationException` code are the framework's, so a client that branches on the
+        // code sees exactly what it saw before.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let message = validation_envelope(violations)?;
+                Some(Refused {
+                    code: "ValidationException".to_string(),
+                    message,
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

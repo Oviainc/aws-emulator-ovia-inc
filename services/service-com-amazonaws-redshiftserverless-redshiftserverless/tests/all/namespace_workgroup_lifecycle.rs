@@ -197,8 +197,8 @@ async fn the_namespace_and_workgroup_lifecycle_is_served_from_state() {
         created_namespace["dbName"]
     );
     assert!(
-        created_namespace["creationDate"].is_number(),
-        "CreateNamespace: creationDate must be set, got {:?}",
+        created_namespace["creationDate"].is_string(),
+        "CreateNamespace: creationDate is a date-time string, got {:?}",
         created_namespace["creationDate"]
     );
     assert!(
@@ -223,7 +223,8 @@ async fn the_namespace_and_workgroup_lifecycle_is_served_from_state() {
         body["namespace"]
     );
 
-    // Re-creating the same name is a conflict, and the stored record is untouched.
+    // Re-creating the same name is refused as a bad request, and the stored record is
+    // untouched.
     let (status, body) = call(
         &router,
         "CreateNamespace",
@@ -232,7 +233,7 @@ async fn the_namespace_and_workgroup_lifecycle_is_served_from_state() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (409, "ConflictException"),
+        (400, "ConflictException"),
         "CreateNamespace on an existing name: got {status} with {body}"
     );
 
@@ -245,7 +246,7 @@ async fn the_namespace_and_workgroup_lifecycle_is_served_from_state() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "CreateWorkgroup into an unknown namespace: got {status} with {body}"
     );
 
@@ -458,7 +459,7 @@ async fn the_namespace_and_workgroup_lifecycle_is_served_from_state() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
+        (400, "ResourceNotFoundException"),
         "GetNamespace after the delete: got {status} with {body}"
     );
     let (status, body) = call(&router, "ListNamespaces", json!({})).await;
@@ -1002,20 +1003,54 @@ async fn a_name_outside_the_modelled_constraint_is_refused() {
 }
 
 #[tokio::test]
-async fn an_unknown_name_is_not_found_on_every_name_addressed_operation() {
+async fn an_unknown_name_is_refused_on_every_name_addressed_operation() {
+    // A namespace NAME that resolves to nothing carries the modelled
+    // `ResourceNotFoundException` with HTTP 400, the status this service answers a
+    // namespace-name refusal with; a workgroup name keeps the 404 its `@httpError` names.
     let router = emulator();
-    let cases: [(&str, Value); 5] = [
-        ("GetNamespace", json!({ "namespaceName": "absent-ns" })),
-        ("DeleteNamespace", json!({ "namespaceName": "absent-ns" })),
-        ("GetWorkgroup", json!({ "workgroupName": "absent-wg" })),
-        ("UpdateWorkgroup", json!({ "workgroupName": "absent-wg" })),
-        ("DeleteWorkgroup", json!({ "workgroupName": "absent-wg" })),
+    let cases: [(&str, Value, u16, &str); 6] = [
+        (
+            "GetNamespace",
+            json!({ "namespaceName": "absent-ns" }),
+            400,
+            "ResourceNotFoundException",
+        ),
+        (
+            "UpdateNamespace",
+            json!({ "namespaceName": "absent-ns", "logExports": ["userlog"] }),
+            400,
+            "ResourceNotFoundException",
+        ),
+        (
+            "DeleteNamespace",
+            json!({ "namespaceName": "absent-ns" }),
+            400,
+            "ResourceNotFoundException",
+        ),
+        (
+            "GetWorkgroup",
+            json!({ "workgroupName": "absent-wg" }),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "UpdateWorkgroup",
+            json!({ "workgroupName": "absent-wg" }),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "DeleteWorkgroup",
+            json!({ "workgroupName": "absent-wg" }),
+            404,
+            "ResourceNotFoundException",
+        ),
     ];
-    for (operation, request) in cases {
+    for (operation, request, expected_status, expected_code) in cases {
         let (status, body) = call(&router, operation, request.clone()).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
+            (expected_status, expected_code),
             "{operation} {request}: got {status} with {body}"
         );
     }
@@ -1130,8 +1165,8 @@ async fn the_store_is_bounded_by_the_accounts_quota_for_each_resource() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (409, "ConflictException"),
-        "CreateNamespace of an existing name at the quota is still a conflict: \
+        (400, "ConflictException"),
+        "CreateNamespace of an existing name at the quota is still refused: \
          got {status} with {body}"
     );
 
