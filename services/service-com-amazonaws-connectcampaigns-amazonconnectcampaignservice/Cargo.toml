@@ -21,13 +21,13 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hashes this process's entropy into the campaign ids CreateCampaign mints.
+sha2 = { workspace = true }
+# Renders those id bytes as the lowercase hex the `CampaignId` pattern allows.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
