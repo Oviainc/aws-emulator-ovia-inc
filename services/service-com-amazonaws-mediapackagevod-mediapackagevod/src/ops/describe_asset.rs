@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             egress_endpoints: Some(state.egress_endpoints(stored, std::time::Instant::now())),
             id: Some(stored.id.clone()),
             packaging_group_id: Some(stored.packaging_group_id.clone()),
-            resource_id: Some(stored.resource_id.clone()),
+            resource_id: stored.resource_id.clone(),
             source_arn: Some(stored.source_arn.clone()),
             source_role_arn: Some(stored.source_role_arn.clone()),
             tags: Some(state.tags_of(&stored.arn)),

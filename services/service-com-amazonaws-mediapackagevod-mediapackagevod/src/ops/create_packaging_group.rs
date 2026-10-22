@@ -6,6 +6,15 @@
 //! `DescribePackagingGroup` returns the identical `Arn`, `DomainName` and
 //! `CreatedAt`. This is the ONLY file to touch for this operation.
 //!
+//! NOTE ON THE MODEL: `ApproximateAssetCount` (jsonName `approximateAssetCount`,
+//! `__integer`) was ADDED to `CreatePackagingGroupResponse` in this service's
+//! `smithy-model/` copy. The shipped model omits it from the create response while
+//! declaring it on `DescribePackagingGroupResponse`, but AWS answers the create with
+//! the same group projection a describe returns — `approximateAssetCount` included
+//! (0 for a brand-new group) — as the recorded wire responses for this operation
+//! show. The emulator serialises what AWS puts on the wire, so the member is modeled
+//! here; nothing else in the shipped model was changed.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -220,6 +229,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         Ok(CreatePackagingGroupOutput {
+            // Counted from the asset map, exactly as `DescribePackagingGroup` counts
+            // it, so the create answer and the following read agree: zero for a group
+            // that has just been minted, and never a stored value that can drift.
+            approximate_asset_count: Some(state.asset_count(&input.id)),
             arn: Some(stored.arn.clone()),
             authorization: stored.authorization.clone(),
             created_at: Some(stored.created_at.clone()),

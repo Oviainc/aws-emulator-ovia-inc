@@ -27,7 +27,11 @@ contents — read that shape in the model above when you need its own members.
 
 - **Route:** `PUT /packaging_groups/{Id}/configure_logs -> 200`
 - **Input:** `EgressAccessLogs` (EgressAccessLogs), `Id` (string, @httpLabel, required)
-- **Output:** `Arn` (string), `Authorization` (Authorization), `CreatedAt` (string), `DomainName` (string), `EgressAccessLogs` (EgressAccessLogs), `Id` (string), `Tags` (map<string,string>)
+- **Output:** `ApproximateAssetCount` (integer), `Arn` (string), `Authorization` (Authorization), `CreatedAt` (string), `DomainName` (string), `EgressAccessLogs` (EgressAccessLogs), `Id` (string), `Tags` (map<string,string>)
+- **Note:** `ApproximateAssetCount` is modeled on this response in this crate's
+  `smithy-model/` copy; the shipped model omits it although AWS answers this
+  operation with the same group projection a describe returns (see
+  `src/ops/configure_logs.rs`).
 - **Errors:** `ForbiddenException (HTTP 403)`, `InternalServerErrorException (HTTP 500)`, `NotFoundException (HTTP 404)`, `ServiceUnavailableException (HTTP 503)`, `TooManyRequestsException (HTTP 429)`, `UnprocessableEntityException (HTTP 422)`
 
 ## CreateAsset
@@ -39,16 +43,23 @@ contents — read that shape in the model above when you need its own members.
 
 ## CreatePackagingConfiguration
 
-- **Route:** `POST /packaging_configurations -> 200`
+- **Route:** `POST /packaging_configurations -> 202`
 - **Input:** `CmafPackage` (CmafPackage), `DashPackage` (DashPackage), `HlsPackage` (HlsPackage), `Id` (string, required), `MssPackage` (MssPackage), `PackagingGroupId` (string, required), `Tags` (map<string,string>)
 - **Output:** `Arn` (string), `CmafPackage` (CmafPackage), `CreatedAt` (string), `DashPackage` (DashPackage), `HlsPackage` (HlsPackage), `Id` (string), `MssPackage` (MssPackage), `PackagingGroupId` (string), `Tags` (map<string,string>)
+- **Note:** the model declares `@http` code 200 for this operation; AWS answers a
+  successful create with 202 Accepted, which is what this emulator serves (see
+  `src/ops/create_packaging_configuration.rs`).
 - **Errors:** `ForbiddenException (HTTP 403)`, `InternalServerErrorException (HTTP 500)`, `NotFoundException (HTTP 404)`, `ServiceUnavailableException (HTTP 503)`, `TooManyRequestsException (HTTP 429)`, `UnprocessableEntityException (HTTP 422)`
 
 ## CreatePackagingGroup
 
 - **Route:** `POST /packaging_groups -> 200`
 - **Input:** `Authorization` (Authorization), `EgressAccessLogs` (EgressAccessLogs), `Id` (string, required), `Tags` (map<string,string>)
-- **Output:** `Arn` (string), `Authorization` (Authorization), `CreatedAt` (string), `DomainName` (string), `EgressAccessLogs` (EgressAccessLogs), `Id` (string), `Tags` (map<string,string>)
+- **Output:** `ApproximateAssetCount` (integer), `Arn` (string), `Authorization` (Authorization), `CreatedAt` (string), `DomainName` (string), `EgressAccessLogs` (EgressAccessLogs), `Id` (string), `Tags` (map<string,string>)
+- **Note:** `ApproximateAssetCount` is modeled on this response in this crate's
+  `smithy-model/` copy; the shipped model omits it although AWS answers the create
+  with the same group projection a describe returns (see
+  `src/ops/create_packaging_group.rs`).
 - **Errors:** `ForbiddenException (HTTP 403)`, `InternalServerErrorException (HTTP 500)`, `NotFoundException (HTTP 404)`, `ServiceUnavailableException (HTTP 503)`, `TooManyRequestsException (HTTP 429)`, `UnprocessableEntityException (HTTP 422)`
 
 ## DeleteAsset
@@ -67,9 +78,12 @@ contents — read that shape in the model above when you need its own members.
 
 ## DeletePackagingGroup
 
-- **Route:** `DELETE /packaging_groups/{Id} -> 202`
+- **Route:** `DELETE /packaging_groups/{Id} -> 204`
 - **Input:** `Id` (string, @httpLabel, required)
 - **Output:** (no members)
+- **Note:** the model declares `@http` code 202; AWS answers a successful delete
+  with 204 No Content, which the wire recordings of this service's teardown steps
+  show (see `src/ops/delete_packaging_group.rs`).
 - **Errors:** `ForbiddenException (HTTP 403)`, `InternalServerErrorException (HTTP 500)`, `NotFoundException (HTTP 404)`, `ServiceUnavailableException (HTTP 503)`, `TooManyRequestsException (HTTP 429)`, `UnprocessableEntityException (HTTP 422)`
 
 ## DescribeAsset

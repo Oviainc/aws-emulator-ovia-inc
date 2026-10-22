@@ -26,6 +26,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use super::packaging_lifecycle::assert_projection;
+
 /// The region the test signs for. It appears in the ARN the read reports, so it is
 /// asserted rather than assumed.
 const REGION: &str = "us-west-2";
@@ -131,7 +133,10 @@ async fn create_config(
     }
     let (status, _, config) =
         call(router, "POST", "/packaging_configurations", Some(body)).await;
-    assert_eq!(status, 200, "CreatePackagingConfiguration {id}: body {config}");
+    // 202 Accepted: the status the recorded wire responses show for a successful
+    // create, which `src/ops/create_packaging_configuration.rs` explains (the model
+    // declares 200).
+    assert_eq!(status, 202, "CreatePackagingConfiguration {id}: body {config}");
     config
 }
 
@@ -314,12 +319,17 @@ async fn describe_reports_the_stored_packaging_configuration() {
             );
         }
 
-        // The package block is persisted verbatim, so the read reports the block the
-        // create request carried, and nothing in the other three package members.
-        assert_eq!(
-            described[member], package[member],
-            "case {case:?}: {member} must round-trip verbatim, got {}",
-            described[member]
+        // The package block the create request carried is persisted: every member it
+        // stated reads back with the same value. The service also MATERIALISES the
+        // defaults of the members the request left unset (see
+        // `success_path_projections::create_packaging_configuration_materialises_the_server_side_defaults`),
+        // so the stored block is a superset of the requested one rather than a copy of
+        // it — hence the shared SUBSET comparison.
+        assert_projection(
+            case,
+            &format!("the stored {member}"),
+            &package[member],
+            &described[member],
         );
         for absent in PACKAGE_MEMBERS.iter().filter(|name| **name != member) {
             assert!(
@@ -404,10 +414,11 @@ async fn describe_changes_nothing_a_later_caller_sees() {
         "a refused duplicate create must not change the stored record: expected {}, got {after}",
         first_reads[0]
     );
-    assert_eq!(
-        after[first_row.member], first_row.package[first_row.member],
-        "a refused duplicate create must not replace the stored package block, got {}",
-        after[first_row.member]
+    assert_projection(
+        "a refused duplicate create",
+        &format!("the stored {}", first_row.member),
+        &first_row.package[first_row.member],
+        &after[first_row.member],
     );
     assert!(
         after.get(other_row.member).is_none_or(Value::is_null),

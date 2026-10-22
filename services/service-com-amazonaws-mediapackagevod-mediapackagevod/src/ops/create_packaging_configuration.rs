@@ -4,8 +4,16 @@
 //! IMPLEMENTED: mints a PackagingConfiguration against an existing PackagingGroup.
 //! Refuses a `PackagingGroupId` that resolves to nothing — and a request that does
 //! not carry exactly one package block — as a request-parameter violation,
-//! `UnprocessableEntityException` (422), persists the package block verbatim, and
-//! answers with the record just stored.
+//! `UnprocessableEntityException` (422); resolves the package block's server-side
+//! defaults ([`crate::state::hls_package_with_defaults`] and its DASH/CMAF/MSS
+//! siblings), persists the resolved block, and answers HTTP 202 with the record just
+//! stored.
+//!
+//! NOTE ON THE SUCCESS STATUS: the model declares `@http` code 200 for this operation
+//! (`POST /packaging_configurations`, code 200), but AWS answers a successful create
+//! with 202 Accepted — the packaging configuration is accepted and provisioned — as
+//! the recorded wire responses for this operation show (the issue's Cause 3). The
+//! recording is what this emulator follows: `SUCCESS_STATUS` below is 202.
 //!
 //! ## Shape of an operation
 //!
@@ -152,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreatePackagingConfiguration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_PACKAGING_CONFIGURATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_PACKAGING_CONFIGURATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = 202u16;
 
     async fn handle(
         &self,
@@ -263,10 +271,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
             created_at: crate::state::now_iso8601(),
             packaging_group_id: input.packaging_group_id,
-            hls_package: input.hls_package,
-            dash_package: input.dash_package,
-            cmaf_package: input.cmaf_package,
-            mss_package: input.mss_package,
+            // The service resolves the optional settings of the chosen packaging
+            // format to the values it will package with, and stores THOSE: every
+            // later read of this configuration reports the same resolved block as
+            // the answer below.
+            hls_package: input.hls_package.map(crate::state::hls_package_with_defaults),
+            dash_package: input
+                .dash_package
+                .map(crate::state::dash_package_with_defaults),
+            cmaf_package: input
+                .cmaf_package
+                .map(crate::state::cmaf_package_with_defaults),
+            mss_package: input.mss_package.map(crate::state::mss_package_with_defaults),
             created_instant: std::time::Instant::now(),
         };
         state.set_tags(&arn, input.tags.as_ref());

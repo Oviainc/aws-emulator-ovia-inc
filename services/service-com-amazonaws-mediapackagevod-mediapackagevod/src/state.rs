@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    Authorization, CmafPackage, DashPackage, EgressAccessLogs, EgressEndpoint, HlsPackage,
-    MssPackage,
+    Authorization, CmafPackage, DashManifest, DashPackage, EgressAccessLogs, EgressEndpoint,
+    HlsManifest, HlsPackage, MssPackage,
 };
 
 /// The region an unsigned request is served in. A signed request names its own
@@ -53,6 +53,40 @@ pub const EGRESS_STATUS_PLAYABLE: &str = "PLAYABLE";
 /// names none. `HlsManifest$ManifestName` (and the Dash/Mss equivalents) is "An
 /// optional string to include in the name of the manifest".
 pub const DEFAULT_MANIFEST_NAME: &str = "index";
+
+/// The ad-marker treatment an `HlsManifest` is packaged with when the request names
+/// none: `AdMarkers` value `NONE`, which "will omit all SCTE-35 ad markers from the
+/// output" (`HlsManifest$AdMarkers`) — the treatment of content carrying no markers.
+pub const DEFAULT_AD_MARKERS: &str = "NONE";
+
+/// The `EXT-X-PROGRAM-DATE-TIME` interval an `HlsManifest` is packaged with when the
+/// request names none. `HlsManifest$ProgramDateTimeIntervalSeconds` is "The interval
+/// (in seconds) between each EXT-X-PROGRAM-DATE-TIME tag inserted into manifests";
+/// zero is the interval that inserts none.
+pub const DEFAULT_PROGRAM_DATE_TIME_INTERVAL_SECONDS: i32 = 0;
+
+/// The segment-template form a `DashPackage` is packaged with when the request names
+/// none, from `SegmentTemplateFormat`: "When set to NUMBER_WITH_TIMELINE, a full
+/// timeline is presented in each SegmentTemplate, with $Number$ media URLs".
+pub const DEFAULT_SEGMENT_TEMPLATE_FORMAT: &str = "NUMBER_WITH_TIMELINE";
+
+/// The DASH profile a `DashManifest` is packaged with when the request names none,
+/// from `Profile`: the value that enables no profile-specific output (the other,
+/// `HBBTV_1_5`, "enables HbbTV 1.5 compliant output").
+pub const DEFAULT_DASH_PROFILE: &str = "NONE";
+
+/// The SCTE-marker source a `DashManifest` is packaged with when the request names
+/// none, from `ScteMarkersSource`: "When set to SEGMENTS, the scte markers are sourced
+/// from the segments of the ingested content."
+pub const DEFAULT_SCTE_MARKERS_SOURCE: &str = "SEGMENTS";
+
+/// The buffer a `DashManifest` advertises when the request names none —
+/// `DashManifest$MinBufferTimeSeconds`, "Minimum duration (in seconds) that a player
+/// will buffer media before starting the presentation".
+///
+/// The value is the one the service materialises, as the recorded create responses of
+/// this service show; the model declares no `@default`.
+pub const DEFAULT_MIN_BUFFER_TIME_SECONDS: i32 = 30;
 
 /// The most PackagingGroups this emulator holds.
 ///
@@ -157,8 +191,10 @@ pub struct AssetRecord {
     pub created_at: String,
     /// The `Id` of the PackagingGroup this asset was ingested into.
     pub packaging_group_id: String,
-    /// The resource id to include in SPEKE key requests; defaults to `Id`.
-    pub resource_id: String,
+    /// The resource id to include in SPEKE key requests, exactly as supplied — and
+    /// `None` when the caller supplied none, because the service reports this member
+    /// only where the caller stated it.
+    pub resource_id: Option<String>,
     /// ARN of the source object in S3.
     pub source_arn: String,
     /// The IAM role ARN used to read the source object.
@@ -276,9 +312,10 @@ fn egress_status(
 
 /// The parent-manifest URL one packaging configuration exposes one asset at.
 ///
-/// The host is the group's egress domain name, the path segment is derived from the
-/// (group, asset, configuration) triple so it is stable across reads and distinct
-/// per endpoint, and the file name is the configuration's manifest name plus the
+/// It is rooted at the group's `DomainName` (which carries its own scheme — see
+/// [`packaging_group_domain_name`]), the path segment is derived from the (group,
+/// asset, configuration) triple so it is stable across reads and distinct per
+/// endpoint, and the file name is the configuration's manifest name plus the
 /// extension that configuration's packaging format uses.
 pub fn playback_url(
     domain_name: &str,
@@ -293,7 +330,7 @@ pub fn playback_url(
         32,
     );
     let (manifest_name, suffix) = manifest_name_and_suffix(cfg);
-    format!("https://{domain_name}/out/v1/{path}/{manifest_name}.{suffix}")
+    format!("{domain_name}/out/v1/{path}/{manifest_name}.{suffix}")
 }
 
 /// The manifest name and file-name suffix a packaging configuration's format uses.
@@ -332,17 +369,123 @@ fn manifest_name(name: Option<&str>) -> String {
         .to_string()
 }
 
-/// The egress domain name assets in a packaging group are played back from.
+/// The package block a `CreatePackagingConfiguration` request stores: the one the
+/// caller supplied, with every member the service materialises a default for filled
+/// in.
 ///
-/// Shaped like the real one — an opaque host label under
-/// `egress.mediapackage-vod.<region>.amazonaws.com` — and derived from the group's
-/// own identity, so it is stable across reads and distinct per group.
+/// The service does not store a packaging configuration "as sent": it resolves the
+/// optional settings of the chosen packaging format to the values it will package
+/// with, and every later read of the configuration reports those resolved values. The
+/// defaults are therefore applied ONCE, here, on the way into state — so the create
+/// response, a describe and a list all project the identical block.
+///
+/// `SegmentDurationSeconds`, the encryption blocks, `StreamSelection`,
+/// `ManifestName` and `DashManifest$ManifestLayout` are deliberately left as sent:
+/// the recorded responses of this service report them only when the request
+/// supplied them, so materialising a value for them would invent one the service
+/// does not report.
+pub fn hls_package_with_defaults(mut package: HlsPackage) -> HlsPackage {
+    package.include_dvb_subtitles.get_or_insert(false);
+    package.use_audio_rendition_group.get_or_insert(false);
+    for manifest in &mut package.hls_manifests {
+        hls_manifest_apply_defaults(manifest);
+    }
+    package
+}
+
+/// See [`hls_package_with_defaults`]: the same resolution for a CMAF package, whose
+/// manifests are the same `HlsManifest` shape.
+pub fn cmaf_package_with_defaults(mut package: CmafPackage) -> CmafPackage {
+    package
+        .include_encoder_configuration_in_segments
+        .get_or_insert(false);
+    for manifest in &mut package.hls_manifests {
+        hls_manifest_apply_defaults(manifest);
+    }
+    package
+}
+
+/// See [`hls_package_with_defaults`]: the same resolution for a DASH package.
+pub fn dash_package_with_defaults(mut package: DashPackage) -> DashPackage {
+    package
+        .include_encoder_configuration_in_segments
+        .get_or_insert(false);
+    package.include_iframe_only_stream.get_or_insert(false);
+    // `PeriodTriggers` is "a list of triggers that controls when the outgoing
+    // [MPD] will be partitioned into multiple periods. If empty, the content will
+    // not be partitioned" — so the resolved value of an unset list is the empty one,
+    // reported rather than omitted.
+    package.period_triggers.get_or_insert_with(Vec::new);
+    package
+        .segment_template_format
+        .get_or_insert_with(|| DEFAULT_SEGMENT_TEMPLATE_FORMAT.to_string());
+    for manifest in &mut package.dash_manifests {
+        dash_manifest_apply_defaults(manifest);
+    }
+    package
+}
+
+/// See [`hls_package_with_defaults`]: a Microsoft Smooth package carries no member
+/// the service materialises a default for — `MssPackage` and `MssManifest` declare
+/// only `SegmentDurationSeconds`, `Encryption`, `ManifestName` and
+/// `StreamSelection`, each reported only as sent — so the stored block is the block
+/// supplied. The function exists so every packaging format is resolved through one
+/// named seam rather than three plus a silent case.
+pub fn mss_package_with_defaults(package: MssPackage) -> MssPackage {
+    package
+}
+
+/// The defaults the service materialises on one HLS manifest configuration (used by
+/// both the HLS and the CMAF packaging formats).
+fn hls_manifest_apply_defaults(manifest: &mut HlsManifest) {
+    manifest
+        .ad_markers
+        .get_or_insert_with(|| DEFAULT_AD_MARKERS.to_string());
+    manifest.include_iframe_only_stream.get_or_insert(false);
+    manifest
+        .program_date_time_interval_seconds
+        .get_or_insert(DEFAULT_PROGRAM_DATE_TIME_INTERVAL_SECONDS);
+    manifest.repeat_ext_x_key.get_or_insert(false);
+}
+
+/// The defaults the service materialises on one DASH manifest configuration.
+fn dash_manifest_apply_defaults(manifest: &mut DashManifest) {
+    manifest
+        .min_buffer_time_seconds
+        .get_or_insert(DEFAULT_MIN_BUFFER_TIME_SECONDS);
+    manifest
+        .profile
+        .get_or_insert_with(|| DEFAULT_DASH_PROFILE.to_string());
+    manifest
+        .scte_markers_source
+        .get_or_insert_with(|| DEFAULT_SCTE_MARKERS_SOURCE.to_string());
+}
+
+/// The scheme-and-separator prefix a packaging group's `DomainName` carries.
+///
+/// `DomainName` is documented as "The fully qualified domain name for Assets in the
+/// PackagingGroup", but what this service puts on the wire for it is the egress
+/// ORIGIN a player fetches from — scheme included — as the recorded create and
+/// describe responses of this service show, and as every `EgressEndpoint$Url` built
+/// from it needs. Playback is TLS-only, so the prefix is always this one. It carries
+/// the `://` separator, so a caller building a URL beneath the origin (see
+/// [`playback_url`]) appends a path and never re-adds a scheme.
+pub const EGRESS_ORIGIN_PREFIX: &str = "https://";
+
+/// The egress origin assets in a packaging group are played back from, which is what
+/// this service reports as the group's `DomainName` — an ORIGIN, not a bare hostname,
+/// so it is used as the root of a URL rather than as a host.
+///
+/// Shaped like the real one: [`EGRESS_ORIGIN_PREFIX`] followed by an opaque per-group
+/// host label, the `egress` data-plane label, this service's own name, the region and
+/// `amazonaws.com`. The label is DERIVED from the group's identity, never minted per
+/// call, so the value is stable across reads and distinct per group.
 pub fn packaging_group_domain_name(group_id: &str, region: &str) -> String {
     let label = digest_hex(
         &format!("{}/{region}/{group_id}", engine::emulator_account_id()),
         16,
     );
-    format!("{label}.egress.{ARN_NAMESPACE}.{region}.amazonaws.com")
+    format!("{EGRESS_ORIGIN_PREFIX}{label}.egress.{ARN_NAMESPACE}.{region}.amazonaws.com")
 }
 
 /// The first `len` hex characters of the SHA-256 of `input`.

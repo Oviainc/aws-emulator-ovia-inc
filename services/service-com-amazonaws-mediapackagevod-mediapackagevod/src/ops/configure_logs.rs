@@ -13,6 +13,15 @@
 //! `DescribePackagingGroup` agree. An `Id` no group is stored under is answered with
 //! the modelled `NotFoundException` (404).
 //!
+//! NOTE ON THE MODEL: `ApproximateAssetCount` (jsonName `approximateAssetCount`,
+//! `__integer`) was ADDED to `ConfigureLogsResponse` in this service's `smithy-model/`
+//! copy. The shipped model omits it there while declaring it on
+//! `DescribePackagingGroupResponse`, but AWS answers this operation with the same
+//! group projection a describe returns — `approximateAssetCount` included — as the
+//! recorded wire responses for it show. Like every other read of that member it is
+//! COUNTED from the asset map rather than stored, so configuring logs cannot change
+//! it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -196,6 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let egress_access_logs = stored.egress_access_logs.clone();
         let id = stored.id.clone();
         Ok(ConfigureLogsOutput {
+            // Counted from the asset map on every read, exactly as
+            // `DescribePackagingGroup` counts it: configuring logs changes no asset.
+            approximate_asset_count: Some(state.asset_count(&id)),
             authorization,
             created_at: Some(created_at),
             domain_name: Some(domain_name),

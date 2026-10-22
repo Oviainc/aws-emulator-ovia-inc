@@ -6,7 +6,9 @@
 //! instant, parent `PackagingGroupId`, the one package block it was created with and
 //! its tags, read from the single ARN-keyed tag store — and answers
 //! `NotFoundException` (404) for an `Id` this service holds no configuration for.
-//! Purely reporting: it writes nothing.
+//! Purely reporting: it writes nothing. What `CreatePackagingConfiguration` resolved
+//! and persisted (its server-side defaults among it) is therefore what this read
+//! reports.
 //!
 //! ## Shape of an operation
 //!

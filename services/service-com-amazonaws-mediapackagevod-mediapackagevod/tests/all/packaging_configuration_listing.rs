@@ -106,7 +106,10 @@ async fn create_config(
         body["tags"] = tags;
     }
     let (status, config) = call(router, "POST", "/packaging_configurations", Some(body)).await;
-    assert_eq!(status, 200, "CreatePackagingConfiguration {id}: body {config}");
+    // 202 Accepted: the status the recorded wire responses show for a successful
+    // create, which `src/ops/create_packaging_configuration.rs` explains (the model
+    // declares 200).
+    assert_eq!(status, 202, "CreatePackagingConfiguration {id}: body {config}");
     config
 }
 

@@ -31,22 +31,22 @@ use service_com_amazonaws_mediapackagevod_mediapackagevod::state as vod;
 
 /// The region the test signs for. It appears in every ARN and in the group's egress
 /// domain name, so it is asserted rather than assumed.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account id every emulated ARN carries (`engine::emulator_account_id`).
-fn account_id() -> &'static str {
+pub(crate) fn account_id() -> &'static str {
     engine::emulator_account_id()
 }
 
 /// A router carrying exactly this service over one shared engine — the same
 /// assembly `core/router` performs, minus the other services.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     router_over(Arc::new(engine::InMemoryEngine::new()))
 }
 
 /// The same router over an engine the caller already holds, so a test can pre-fill
 /// the store (to reach a capacity bound) without issuing one request per resource.
-fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -55,17 +55,18 @@ fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     router
 }
 
-/// Send one request and return its status and parsed JSON body (`Null` when empty).
+/// Send one request and return the WHOLE response, headers included — the one request
+/// seam both [`call`] and a test that asserts on a response header go through.
 ///
 /// The `Authorization` header carries only a SigV4 credential SCOPE: that is what the
 /// router routes on and what the handlers read the region from. Signature
 /// verification is off for this router, so the signature itself is never checked.
-async fn call(
+pub(crate) async fn call_raw(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
     body: Option<Value>,
-) -> (u16, Value) {
+) -> http::Response<bytes::Bytes> {
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
     let host = format!("mediapackage-vod.{REGION}.amazonaws.com");
     let request = http::Request::builder()
@@ -83,7 +84,17 @@ async fn call(
         .body(bytes::Bytes::from(payload))
         .expect("a well-formed test request");
 
-    let response = router.dispatch(request).await;
+    router.dispatch(request).await
+}
+
+/// Send one request and return its status and parsed JSON body (`Null` when empty).
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let response = call_raw(router, method, path, body).await;
     let status = response.status().as_u16();
     let bytes = response.into_body();
     let parsed = if bytes.is_empty() {
@@ -95,7 +106,11 @@ async fn call(
 }
 
 /// Create a packaging group, asserting it succeeded.
-async fn create_group(router: &MultiServiceRouter, id: &str, tags: Option<Value>) -> Value {
+pub(crate) async fn create_group(
+    router: &MultiServiceRouter,
+    id: &str,
+    tags: Option<Value>,
+) -> Value {
     let mut body = json!({ "id": id });
     if let Some(tags) = tags {
         body["tags"] = tags;
@@ -112,7 +127,7 @@ async fn create_group_from(router: &MultiServiceRouter, id: &str, body: Value) -
 }
 
 /// Create a packaging configuration from a package block, asserting it succeeded.
-async fn create_config(
+pub(crate) async fn create_config(
     router: &MultiServiceRouter,
     id: &str,
     group_id: &str,
@@ -126,12 +141,12 @@ async fn create_config(
         body[key] = value;
     }
     let (status, config) = call(router, "POST", "/packaging_configurations", Some(body)).await;
-    assert_eq!(status, 200, "CreatePackagingConfiguration {id}: body {config}");
+    assert_eq!(status, 202, "CreatePackagingConfiguration {id}: body {config}");
     config
 }
 
 /// Create an asset, asserting it succeeded.
-async fn create_asset(router: &MultiServiceRouter, id: &str, group_id: &str) -> Value {
+pub(crate) async fn create_asset(router: &MultiServiceRouter, id: &str, group_id: &str) -> Value {
     let body = json!({
         "id": id,
         "packagingGroupId": group_id,
@@ -186,6 +201,58 @@ async fn list_all_asset_ids(router: &MultiServiceRouter, query: &str) -> Vec<Str
     panic!("ListAssets never stopped returning a nextToken for query {query:?}");
 }
 
+/// Every leaf of `expected` must appear, with that value, at the same path of
+/// `actual`: a SUBSET comparison, so a response that also carries members the
+/// expectation does not state still passes.
+///
+/// `pub(crate)` and shared with this crate's other suites
+/// (`tests/all/success_path_projections.rs`, `tests/all/describe_packaging_configuration.rs`)
+/// rather than copied into each: both compare a request's or an expectation's members
+/// against a response that carries the service's resolved defaults besides them, and
+/// one walk means the two cannot drift. `which` names the body being compared and
+/// `case` the row, so a failure says which assertion of which row failed and where.
+pub(crate) fn assert_projection(case: &str, which: &str, expected: &Value, actual: &Value) {
+    assert_projection_at(case, which, "$", expected, actual);
+}
+
+/// See [`assert_projection`]; `path` is where in the body this comparison is.
+fn assert_projection_at(case: &str, which: &str, path: &str, expected: &Value, actual: &Value) {
+    match expected {
+        Value::Object(members) => {
+            for (key, value) in members {
+                assert_projection_at(
+                    case,
+                    which,
+                    &format!("{path}.{key}"),
+                    value,
+                    &actual[key.as_str()],
+                );
+            }
+        }
+        Value::Array(entries) => {
+            assert_eq!(
+                actual.as_array().map(Vec::len),
+                Some(entries.len()),
+                "case {case:?}: {which} at {path} must hold {} entries, got {actual}",
+                entries.len()
+            );
+            for (index, value) in entries.iter().enumerate() {
+                assert_projection_at(
+                    case,
+                    which,
+                    &format!("{path}[{index}]"),
+                    value,
+                    &actual[index],
+                );
+            }
+        }
+        _ => assert_eq!(
+            actual, expected,
+            "case {case:?}: {which} at {path} must be {expected}, got {actual}"
+        ),
+    }
+}
+
 /// The issue's happy path, end to end: every read answers from what the writes
 /// persisted, and a delete is visible to the following read.
 #[tokio::test]
@@ -207,7 +274,7 @@ async fn the_packaging_group_asset_lifecycle_round_trips_through_state() {
         .to_string();
     assert!(
         domain_name.ends_with(&format!(".egress.mediapackage-vod.{REGION}.amazonaws.com")),
-        "CreatePackagingGroup: expected an egress domain name in this region, got {domain_name:?}"
+        "CreatePackagingGroup: expected an egress origin in this region, got {domain_name:?}"
     );
     assert!(
         !group["createdAt"].as_str().unwrap_or_default().is_empty(),
@@ -263,9 +330,9 @@ async fn the_packaging_group_asset_lifecycle_round_trips_through_state() {
     // CreateAsset derives one egress endpoint per configuration on the group.
     let asset = create_asset(&router, "asset-1", "vod-group").await;
     assert_eq!(
-        asset["resourceId"].as_str(),
-        Some("asset-1"),
-        "CreateAsset without ResourceId: it must default to Id, got {}",
+        asset["resourceId"],
+        Value::Null,
+        "CreateAsset without ResourceId: the service states none of its own, got {}",
         asset["resourceId"]
     );
     assert_eq!(
@@ -397,8 +464,8 @@ async fn the_playback_url_manifest_follows_the_packaging_format() {
             "case {case:?}: expected the configuration's id, got {config_id:?}"
         );
         assert!(
-            url.starts_with(&format!("https://{domain_name}/out/v1/")),
-            "case {case:?}: expected a URL on the group's egress domain, got {url:?}"
+            url.starts_with(&format!("{domain_name}/out/v1/")),
+            "case {case:?}: expected a URL on the group's egress origin, got {url:?}"
         );
         assert!(
             url.ends_with(&format!("/{expected_file}")),
@@ -653,7 +720,7 @@ fn filler_asset(id: &str, group_id: &str) -> vod::AssetRecord {
         arn: vod::resource_arn("assets", REGION, id),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         packaging_group_id: group_id.to_string(),
-        resource_id: id.to_string(),
+        resource_id: Some(id.to_string()),
         source_arn: format!("arn:aws:s3:::test-bucket/{id}.smil"),
         source_role_arn: format!("arn:aws:iam::{}:role/MediaPackageVod", account_id()),
         created_instant: std::time::Instant::now(),
@@ -690,6 +757,8 @@ async fn creates_are_refused_at_each_capacity_bound() {
         )
         .await;
         let expected = if short_of_bound { 200 } else { 429 };
+        // A successful `CreatePackagingConfiguration` answers 202, not 200.
+        let expected_config = if short_of_bound { 202 } else { 429 };
         assert_eq!(
             status, expected,
             "CreatePackagingGroup holding {held} of {}: got {status}, body {body}",
@@ -728,7 +797,7 @@ async fn creates_are_refused_at_each_capacity_bound() {
         )
         .await;
         assert_eq!(
-            status, expected,
+            status, expected_config,
             "CreatePackagingConfiguration holding {held} of {}: got {status}, body {body}",
             vod::MAX_PACKAGING_CONFIGURATIONS
         );
@@ -763,7 +832,7 @@ async fn creates_are_refused_at_each_capacity_bound() {
         )
         .await;
         assert_eq!(
-            status, expected,
+            status, expected_config,
             "CreatePackagingConfiguration holding {held} of {} in one group: got {status}, \
              body {body}",
             vod::MAX_PACKAGING_CONFIGURATIONS_PER_GROUP
@@ -1259,22 +1328,31 @@ async fn list_packaging_groups_max_results_and_next_token_follow_their_modelled_
     );
 }
 
-/// A packaging group is removed only while nothing references it.
+/// A packaging group is removed whatever still references it, and its tags go with it.
 ///
 /// A PackagingConfiguration names the group it packages for by `PackagingGroupId`
-/// (`CreatePackagingConfiguration` refuses one that resolves to no stored group), so
-/// deleting the group would leave that reference dangling: the delete is refused with
-/// `UnprocessableEntityException` (HTTP 422 — "The parameters sent in the request are
-/// not valid"), attributed to the `Id` member the request addressed the group by, and
-/// removes nothing. With no such child the delete answers the modelled 202, the group
-/// reads back the modelled `NotFoundException` (404), and its tags are gone with it.
+/// (`CreatePackagingConfiguration` refuses one that resolves to no stored group), so a
+/// dependency REFUSAL would be a plausible rule — and this suite asserted one until the
+/// wire corpus contradicted it: the recorded teardown
+/// `mediapackage-vod-packaging-configuration-multi-format#teardown#11` deletes a group
+/// that still holds the configurations the fixture created and AWS answers it HTTP 204,
+/// with the following `DescribePackagingGroup` answering 404. Replaying that corpus
+/// against the refusal reported `expected HTTP 204, actual HTTP 422;
+/// UnprocessableEntityException: id cannot be deleted because it has attached packaging
+/// configurations` and left the group readable, so the rule this suite now asserts is
+/// the recorded one: the delete succeeds whatever the group holds, answering 204 (the
+/// status `src/ops/delete_packaging_group.rs` documents against the model's 202), the
+/// group reads back the modelled `NotFoundException` (404), and its tags are gone with
+/// it. Nothing is cascaded: a configuration or an asset of the deleted group is still
+/// its own resource, addressed by its own id. (The recording evidences the 204 and the
+/// following 404 only; that the children SURVIVE is the modelled default — each has its
+/// own delete operation and this one declares no error for a non-empty group — so a
+/// later recording could revise it.)
 ///
-/// The rows span the dependency count (none, one, several), the packaging format each
-/// dependent was created with, and whether the group also holds assets. An Asset is
-/// NOT a blocking dependent: neither the model nor the recorded behaviour makes it
-/// one, so a group holding only assets is still deletable.
+/// The rows span the dependent count (none, one, several), the packaging format each
+/// dependent was created with, and whether the group also holds assets.
 #[tokio::test]
-async fn a_packaging_group_is_deletable_only_while_no_configuration_references_it() {
+async fn a_packaging_group_is_deletable_whatever_still_references_it() {
     // (case, the package blocks of the configurations created in the group, how many
     // assets the group holds)
     let cases: Vec<(&str, Vec<Value>, usize)> = vec![
@@ -1313,54 +1391,24 @@ async fn a_packaging_group_is_deletable_only_while_no_configuration_references_i
         }
 
         let (status, body) = call(&router, "DELETE", "/packaging_groups/del-group", None).await;
-        if packages.is_empty() {
+        assert_eq!(
+            status, 204,
+            "case {case:?}: expected the recorded 204 No Content for a group holding {} \
+             configuration(s) and {assets} asset(s) (the model declares 202 — see \
+             `src/ops/delete_packaging_group.rs`), got {status} and body {body}",
+            packages.len()
+        );
+        // Nothing is cascaded: each configuration the group held is still its own
+        // resource, readable by its own id, and the state the engine holds says so.
+        {
+            let store = engine.state::<vod::ComAmazonawsMediapackagevodMediapackagevodState>();
+            let held = store.lock().packaging_configurations.len();
             assert_eq!(
-                status, 202,
-                "case {case:?}: expected the modelled 202 for a group no configuration \
-                 references, got {status} and body {body}"
-            );
-        } else {
-            assert_eq!(
-                status,
-                422,
-                "case {case:?}: expected 422 while {} configuration(s) reference the group, \
-                 got {status} and body {body}",
+                held,
+                packages.len(),
+                "case {case:?}: deleting the group must not remove its configurations, \
+                 {held} of {} left",
                 packages.len()
-            );
-            let message = body["message"].as_str().unwrap_or_default().to_string();
-            assert_eq!(
-                message, "id cannot be deleted because it has attached packaging configurations",
-                "case {case:?}: the refusal must be this service's member-attributed 422 \
-                 wording, got {message:?}"
-            );
-            assert_eq!(
-                body["errors"],
-                json!({
-                    "id": ["cannot be deleted because it has attached packaging configurations"]
-                }),
-                "case {case:?}: the violation must be attributed to the addressed member, got {}",
-                body["errors"]
-            );
-            // Refused, so nothing was removed: the group still reads back.
-            let (status, described) =
-                call(&router, "GET", "/packaging_groups/del-group", None).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: a refused delete must leave the group readable, got {status} \
-                 and body {described}"
-            );
-
-            // The refusal counts the configurations stored NOW rather than a stored
-            // dependency flag, so with the dependents gone the same delete succeeds.
-            {
-                let store = engine.state::<vod::ComAmazonawsMediapackagevodMediapackagevodState>();
-                store.lock().packaging_configurations.clear();
-            }
-            let (status, body) = call(&router, "DELETE", "/packaging_groups/del-group", None).await;
-            assert_eq!(
-                status, 202,
-                "case {case:?}: expected the modelled 202 once no configuration references \
-                 the group, got {status} and body {body}"
             );
         }
 
