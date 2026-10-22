@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDelete
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDelete`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts the delete of every resource the request names, one resource at a
+//! time, and reports a per-resource outcome. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDelete::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each named channel, input, input security group and multiplex is attempted on
+//! its own under the rule its single-resource delete follows, so one refusal
+//! never hides another resource's accepted delete: the call answers 200 with the
+//! accepted ones in `Successful` and the refused ones in `Failed`. An accepted
+//! delete leaves the resource in the state its own state enum models for a
+//! delete — `DELETING` for a channel, an input or a multiplex, which the clock
+//! then settles into the terminal `DELETED` they keep, and `DELETED` at once for
+//! an input security group, whose enum models no transient step.
+//!
+//! The batch itself is bounded: the ids one call may name are capped by
+//! [`crate::state::MAX_BATCH_DELETE_IDS`], refused with the operation's modelled
+//! `BadRequestException` before the state guard is taken, because the model puts
+//! no length constraint on the four id lists and each id costs a derivation over
+//! the stores plus one entry in the response.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +164,293 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDelete` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDelete"))
+        let _ = ctx;
+
+        // The request's four id lists carry no modelled length constraint, and
+        // each id costs a derivation over the stores plus one result entry, so
+        // the batch is bounded BEFORE the state guard is taken: the guard is
+        // never held for an amount of work the caller chose.
+        let named = input.channel_ids.as_ref().map_or(0, Vec::len)
+            + input.input_ids.as_ref().map_or(0, Vec::len)
+            + input.input_security_group_ids.as_ref().map_or(0, Vec::len)
+            + input.multiplex_ids.as_ref().map_or(0, Vec::len);
+        if named > crate::state::MAX_BATCH_DELETE_IDS {
+            return Err(BatchDeleteErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "BatchDelete names {named} resources, more than the {} one call may name",
+                    crate::state::MAX_BATCH_DELETE_IDS
+                )),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // "Starts delete of resources": each named resource is attempted on its
+        // own and reported on its own, so the call itself answers 200 even when
+        // every resource named in it was refused.
+        let mut results = Results::default();
+        for id in input.channel_ids.unwrap_or_default() {
+            results.push(delete_channel(&mut state, &id, now)?);
+        }
+        for id in input.input_ids.unwrap_or_default() {
+            results.push(delete_input(&mut state, &id, now)?);
+        }
+        for id in input.input_security_group_ids.unwrap_or_default() {
+            results.push(delete_input_security_group(&mut state, &id)?);
+        }
+        for id in input.multiplex_ids.unwrap_or_default() {
+            results.push(delete_multiplex(&mut state, &id, now)?);
+        }
+
+        Ok(BatchDeleteOutput {
+            failed: Some(results.failed),
+            successful: Some(results.successful),
+        })
     }
+}
+
+/// This service's state, named once so the per-resource helpers below read.
+type State = crate::state::ComAmazonawsMedialiveMedialiveState;
+
+/// The two output lists, filled in the order the request listed the resources.
+#[derive(Debug, Default)]
+struct Results {
+    failed: Vec<BatchFailedResultModel>,
+    successful: Vec<BatchSuccessfulResultModel>,
+}
+
+impl Results {
+    fn push(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Successful(result) => self.successful.push(result),
+            Outcome::Failed(result) => self.failed.push(result),
+        }
+    }
+}
+
+/// What attempting one resource's delete produced.
+#[derive(Debug)]
+enum Outcome {
+    Successful(BatchSuccessfulResultModel),
+    Failed(BatchFailedResultModel),
+}
+
+/// The `Code` a failed entry carries ("Error code for the failed operation"):
+/// the wire error code of the refusal the single-resource delete of that
+/// resource answers with, which on this service is the modelled exception's
+/// shape name (`smithy_query(query="operation", operation="DeleteChannel")`).
+mod failure_code {
+    /// No resource of that kind has that id — `NotFoundException` (404), which
+    /// every single-resource delete in this service models.
+    pub const NOT_FOUND: &str = "NotFoundException";
+    /// The resource exists but its current state does not allow a delete —
+    /// `ConflictException` (409), modelled by `DeleteChannel` and `DeleteInput`.
+    pub const CONFLICT: &str = "ConflictException";
+    /// The resource exists and is still in use by another one —
+    /// `BadRequestException` (400). `DeleteInputSecurityGroup` is the one delete
+    /// in this service that models no `ConflictException`
+    /// (`smithy_query(query="operation", operation="DeleteInputSecurityGroup")`),
+    /// so its refusal is the client error it does model.
+    pub const BAD_REQUEST: &str = "BadRequestException";
+}
+
+/// A failed entry for an id no resource of that kind has. No `Arn`: there is no
+/// resource to name one for.
+fn not_found(resource_type: &str, id: &str) -> Outcome {
+    Outcome::Failed(BatchFailedResultModel {
+        arn: None,
+        code: Some(failure_code::NOT_FOUND.to_string()),
+        id: Some(id.to_string()),
+        message: Some(crate::state::not_found_message(resource_type, id)),
+    })
+}
+
+/// A failed entry for a resource that exists: it carries the resource's own ARN
+/// beside the code and the message of the refusal.
+fn refused(id: &str, arn: &str, code: &str, message: String) -> Outcome {
+    Outcome::Failed(BatchFailedResultModel {
+        arn: Some(arn.to_string()),
+        code: Some(code.to_string()),
+        id: Some(id.to_string()),
+        message: Some(message),
+    })
+}
+
+/// A successful entry: the resource's id and ARN, and the state the accepted
+/// delete left it in, both read back out of the store.
+///
+/// The read-back is the operation's own view of what it wrote, so a description
+/// that is suddenly missing is a server fault, not an accepted delete with empty
+/// members — the same `unavailable()` `DeleteChannel` answers for it.
+fn accepted(
+    id: &str,
+    description: Option<(Option<String>, Option<String>)>,
+) -> Result<Outcome, BatchDeleteError> {
+    let (arn, state) = description.ok_or_else(unavailable)?;
+    Ok(Outcome::Successful(BatchSuccessfulResultModel {
+        arn,
+        id: Some(id.to_string()),
+        state,
+    }))
+}
+
+/// One channel's delete, under exactly `DeleteChannel`'s rule: a channel is
+/// deletable once it has stopped, and an accepted delete puts it in `DELETING`,
+/// owing the terminal `DELETED` state the clock then makes due.
+fn delete_channel(
+    state: &mut State,
+    id: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Outcome, BatchDeleteError> {
+    let Some(channel) = state.channels.get_mut(id) else {
+        return Ok(not_found("Channel", id));
+    };
+    if !channel.is_deletable() {
+        return Ok(refused(
+            id,
+            &channel.arn,
+            failure_code::CONFLICT,
+            crate::state::not_idle_message("Channel", id, &channel.state),
+        ));
+    }
+    crate::state::begin_delete(channel, now);
+
+    // Read the result back out of the store, so the entry reports what was
+    // written rather than what this handler meant to write.
+    accepted(
+        id,
+        state
+            .channel_description(id)
+            .map(|channel| (channel.arn, channel.state)),
+    )
+}
+
+/// One input's delete, under exactly `DeleteInput`'s rule: an input a channel
+/// still attaches is a conflict, and any other is accepted — a repeated delete
+/// included, since the state it asks for is the one the input is already in or
+/// heading for. An accepted delete puts a detached input in `DELETING`, owing
+/// the terminal `DELETED` state the clock then makes due.
+fn delete_input(
+    state: &mut State,
+    id: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Outcome, BatchDeleteError> {
+    let Some(input) = state.inputs.get(id) else {
+        return Ok(not_found("Input", id));
+    };
+    let arn = input.arn.clone();
+    let attached = state.attached_channels(id);
+
+    if !attached.is_empty() {
+        return Ok(refused(
+            id,
+            &arn,
+            failure_code::CONFLICT,
+            crate::state::attached_input_message(id, &attached),
+        ));
+    }
+
+    let Some(input) = state.inputs.get_mut(id) else {
+        return Ok(not_found("Input", id));
+    };
+    crate::state::begin_delete_input(input, now);
+
+    // Read back out of the store, for the same reason as the channel above.
+    accepted(
+        id,
+        state
+            .input_description(id)
+            .map(|input| (input.arn, input.state)),
+    )
+}
+
+/// One input security group's delete. The group's `Inputs` and `Channels` are
+/// "the list of inputs / channels currently using this Input Security Group", so
+/// a group a resource still uses is refused; a group nothing uses moves to the
+/// terminal `DELETED` state it then keeps.
+fn delete_input_security_group(
+    state: &mut State,
+    id: &str,
+) -> Result<Outcome, BatchDeleteError> {
+    let Some(group) = state.input_security_groups.get(id) else {
+        return Ok(not_found("Input security group", id));
+    };
+    let arn = group.arn.clone();
+    let inputs = state.inputs_using_security_group(id);
+    let channels = state.channels_using_security_group(id);
+    if !inputs.is_empty() || !channels.is_empty() {
+        let users: Vec<String> = inputs.into_iter().chain(channels).collect();
+        return Ok(refused(
+            id,
+            &arn,
+            failure_code::BAD_REQUEST,
+            format!(
+                "Input security group {id} is in use by {} and cannot be deleted",
+                users.join(", ")
+            ),
+        ));
+    }
+
+    // `InputSecurityGroupState` models no transient step before `DELETED`, so
+    // the delete is done with this call and the group keeps that terminal
+    // state. A repeated delete asks for the state the group is already in, so
+    // it changes nothing and is reported the same way.
+    let Some(group) = state.input_security_groups.get_mut(id) else {
+        return Ok(not_found("Input security group", id));
+    };
+    crate::state::delete_input_security_group(group);
+
+    // Read back out of the store, for the same reason as the channel above.
+    accepted(
+        id,
+        state
+            .input_security_group_description(id)
+            .map(|group| (group.arn, group.state)),
+    )
+}
+
+/// One multiplex's delete, the same shape a channel's has: a multiplex is
+/// deletable once it has stopped (`IDLE`), and an accepted delete puts it in
+/// `DELETING`, owing the terminal `DELETED` state the clock then makes due —
+/// both states the `MultiplexState` enum models.
+fn delete_multiplex(
+    state: &mut State,
+    id: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Outcome, BatchDeleteError> {
+    let Some(multiplex) = state.multiplexes.get_mut(id) else {
+        return Ok(not_found("Multiplex", id));
+    };
+    if !multiplex.is_deletable() {
+        return Ok(refused(
+            id,
+            &multiplex.arn,
+            failure_code::CONFLICT,
+            crate::state::not_idle_message("Multiplex", id, multiplex.state()),
+        ));
+    }
+    multiplex.begin_delete(now);
+
+    // Read back out of the store, for the same reason as the channel above.
+    accepted(
+        id,
+        state
+            .multiplex_description(id)
+            .map(|multiplex| (multiplex.arn, multiplex.state)),
+    )
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there are no resources to delete. A modelled server error, never a fresh
+/// engine (which would drop every deletion on return).
+fn unavailable() -> BatchDeleteError {
+    BatchDeleteErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

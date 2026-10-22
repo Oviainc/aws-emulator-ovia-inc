@@ -197,18 +197,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // starting, running, stopping or already-deleting channel is a conflict.
         if !channel.is_deletable() {
             return Err(DeleteChannelErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Channel {} is in state {} and must be IDLE before it can be deleted",
-                    channel.id, channel.state
+                message: Some(crate::state::not_idle_message(
+                    "Channel",
+                    &channel.id,
+                    &channel.state,
                 )),
             })
             .into());
         }
         crate::state::begin_delete(channel, now);
 
-        // The response is the channel as it now stands: `DELETING`. The clock owes
-        // its removal, after which `DescribeChannel` answers `NotFoundException`
-        // and `ListChannels` no longer carries it.
+        // The response is the channel as it now stands: `DELETING`. The clock
+        // owes it the terminal `DELETED` state, which the channel then keeps —
+        // the record stays in the account, so `DescribeChannel` goes on
+        // reporting the channel in that state (what the SDK's `ChannelDeleted`
+        // waiter polls for) instead of losing it.
         let channel = state
             .channel_description(&input.channel_id)
             .ok_or_else(unavailable)?;
