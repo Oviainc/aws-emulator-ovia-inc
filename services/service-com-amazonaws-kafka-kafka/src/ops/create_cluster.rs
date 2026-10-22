@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a provisioned MSK cluster from the submitted configuration and registers it
+//! in [`crate::state::ComAmazonawsKafkaKafkaState`]. A cluster name is unique within
+//! an account and region, so a second create under a name already taken is a
+//! `ConflictException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
+//!
+//! The scaffold notes below describe the framework; they are kept because they
+//! document the seams this handler uses.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +177,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateClusterErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // A broker count outside the modelled range must never reach the
+        // registry: a request value is what sizes the broker list, so the
+        // ceiling is checked here as well as by the boundary validator. Checked
+        // BEFORE the state lock is taken: it depends on the request alone, so the
+        // registry mutex is held only for the state-dependent work below.
+        if input.number_of_broker_nodes < 1
+            || input.number_of_broker_nodes > crate::state::MAX_BROKER_NODES_PER_CLUSTER
+        {
+            return Err(
+                CreateClusterErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("NumberOfBrokerNodes".to_string()),
+                    message: Some(format!(
+                        "NumberOfBrokerNodes must be between 1 and {}, not {}.",
+                        crate::state::MAX_BROKER_NODES_PER_CLUSTER, input.number_of_broker_nodes
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+
+        // A cluster name identifies a cluster within an account and region, so a
+        // name already in use IN THIS REGION is a conflict; the same name in
+        // another region is a different cluster.
+        if let Some(existing) = state.arn_for_name(&region, &input.cluster_name) {
+            return Err(
+                CreateClusterErrorModeled::ConflictException(ConflictException {
+                    invalid_parameter: Some("ClusterName".to_string()),
+                    message: Some(format!(
+                        "A cluster with the name '{}' already exists: {existing}",
+                        input.cluster_name
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The monotonic counter is what makes each cluster's ARN and endpoints
+        // distinct; it advances whether or not anything else about the request
+        // repeats an earlier one.
+        let suffix = state.next_cluster_suffix;
+        state.next_cluster_suffix += 1;
+        let cluster = crate::state::Cluster::provisioned(
+            &region,
+            suffix,
+            std::time::SystemTime::now(),
+            input,
+        );
+
+        let output = CreateClusterOutput {
+            cluster_arn: Some(cluster.arn.clone()),
+            cluster_name: Some(cluster.name.clone()),
+            state: Some(cluster.state.clone()),
+        };
+        // The registry is bounded, and it enforces its own ceilings on the one
+        // insertion path, so a create past them is refused there rather than
+        // growing the store by one more call. A refused create registers nothing,
+        // so the ordinal it reserved goes back: the counter counts clusters ever
+        // registered, not calls ever made.
+        if let Err(rejected) = state.register_cluster(cluster) {
+            state.next_cluster_suffix = suffix;
+            return Err(match rejected {
+                crate::state::RegisterRejected::RegionQuota => {
+                    CreateClusterErrorModeled::TooManyRequestsException(TooManyRequestsException {
+                        invalid_parameter: Some("ClusterName".to_string()),
+                        message: Some(format!(
+                            "The account has reached its limit of {} clusters in {region}.",
+                            crate::state::MAX_CLUSTERS_PER_REGION
+                        )),
+                    })
+                    .into()
+                }
+                // No request member is at fault for a process-wide backstop, so
+                // this one names none.
+                crate::state::RegisterRejected::RegistryCeiling => {
+                    CreateClusterErrorModeled::TooManyRequestsException(TooManyRequestsException {
+                        invalid_parameter: None,
+                        message: Some(format!(
+                            "This emulator holds its maximum of {} clusters.",
+                            crate::state::MAX_CLUSTERS_IN_REGISTRY
+                        )),
+                    })
+                    .into()
+                }
+                // Unreachable: the ordinal above is monotonic, so the ARN it
+                // mints is new. Reported as a server fault rather than
+                // overwriting a cluster.
+                crate::state::RegisterRejected::DuplicateArn => {
+                    CreateClusterErrorModeled::InternalServerErrorException(
+                        InternalServerErrorException {
+                            invalid_parameter: None,
+                            message: Some(
+                                "the minted cluster ARN is already registered".to_string(),
+                            ),
+                        },
+                    )
+                    .into()
+                }
+            });
+        }
+        Ok(output)
     }
 }
