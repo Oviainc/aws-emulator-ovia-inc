@@ -7,10 +7,12 @@
 //! table or column that showed the defect:
 //!
 //! 1. A column's `Type` names the KIND of data it stores, in the dictionary's mixed-case
-//!    vocabulary — `String`, `Number`, `Timestamp`, `Boolean`, `Map` — and every column
-//!    carries the dictionary's `Description` for it, within the modelled bound. No
-//!    column reports a storage-engine type name (`STRING`, `DOUBLE`,
-//!    `MAP<STRING,STRING>`).
+//!    vocabulary — `String`, `Number`, `Double`, `Integer`, `Timestamp`, `Boolean`,
+//!    `Map` — and every column carries the dictionary's `Description` for it, within the
+//!    modelled bound. No column reports a storage-engine type name (`STRING`,
+//!    `MAP<STRING,STRING>`). Which token a column carries is ITS schema's: the cost and
+//!    usage dictionary measures costs with `Number`, the recommendations dictionary with
+//!    `Double`.
 //! 2. The catalog publishes the dictionary's table set, and `GetTable` resolves the
 //!    `TableName` the request names to THAT table — never to another entry of the
 //!    catalog — so each table's schema is its own.
@@ -36,8 +38,19 @@ use super::export_lifecycle::{error_code, Client};
 
 /// Every value a `Column.Type` may take: the kinds of data the AWS Data Exports table
 /// dictionary publishes columns with. A type name outside this list is not a kind of
-/// data but a storage-engine type.
-const COLUMN_TYPE_VOCABULARY: &[&str] = &["String", "Number", "Timestamp", "Boolean", "Map"];
+/// data but a storage-engine type. The vocabulary is the catalog's as a whole: which of
+/// these tokens a given column carries is its own schema's choice, so
+/// `the_published_columns_are_reported_with_their_published_kind_of_data` pins the token
+/// per column.
+const COLUMN_TYPE_VOCABULARY: &[&str] = &[
+    "String",
+    "Number",
+    "Double",
+    "Integer",
+    "Timestamp",
+    "Boolean",
+    "Map",
+];
 
 /// `Column$Description`, `Column$Type` and `Column$Name` all target `GenericString`:
 /// `length 0..1024` (smithy_query shape `Column`).
@@ -59,6 +72,10 @@ const PUBLISHED_TABLES: &[&str] = &[
 /// dictionary).
 const TABLE_DESCRIPTIONS: &[(&str, &str)] = &[
     ("CARBON_EMISSIONS", "Carbon Emissions"),
+    (
+        "COST_AND_USAGE_DASHBOARD",
+        "A view over CUR for CostAndUsageDashboard",
+    ),
     ("COST_AND_USAGE_REPORT", "Cost and Usage Report"),
     (
         "COST_OPTIMIZATION_RECOMMENDATIONS",
@@ -82,11 +99,20 @@ const PUBLISHED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             ("usage_account_id", "String"),
             ("usage_period_end", "Timestamp"),
             ("location", "String"),
+            ("total_scope_2_mbm_emissions_value", "Number"),
+            ("total_scope_2_mbm_emissions_unit", "String"),
         ],
     ),
     (
         "COST_AND_USAGE_DASHBOARD",
         &[
+            // The view's own aggregate dimensions and measures …
+            ("billing_period", "Timestamp"),
+            ("usage_date", "Timestamp"),
+            ("linked_account_name", "String"),
+            ("unblended_cost", "Number"),
+            ("ri_sp_upfront_fees", "Number"),
+            // … beside the cost and usage columns it carries over unchanged.
             ("bill_payer_account_id", "String"),
             ("line_item_usage_amount", "Number"),
             ("resource_tags", "Map"),
@@ -101,6 +127,13 @@ const PUBLISHED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             ("reservation_unused_quantity", "Number"),
             ("bill_billing_period_end_date", "Timestamp"),
             ("tags", "Map"),
+            // The cost and usage dictionary publishes the Savings Plan commitment and
+            // rate as text rather than as a numeric measure.
+            (
+                "savings_plan_amortized_upfront_commitment_for_billing_period",
+                "String",
+            ),
+            ("savings_plan_savings_plan_rate", "String"),
         ],
     ),
     (
@@ -108,7 +141,13 @@ const PUBLISHED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("implementation_effort", "String"),
             ("rollback_possible", "Boolean"),
-            ("recommendation_lookback_period_in_days", "Number"),
+            // The recommendations dictionary measures money and percentages with
+            // `Double`, counts days with `Integer` and carries the resource's tags as
+            // text — tokens of its own, not the cost and usage dictionary's.
+            ("recommendation_lookback_period_in_days", "Integer"),
+            ("estimated_monthly_cost_before_discount", "Double"),
+            ("estimated_savings_percentage_after_discount", "Double"),
+            ("tags", "String"),
         ],
     ),
     (
@@ -142,48 +181,82 @@ const PUBLISHED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
 const FOCUS_1_2_ONLY_COLUMN: &str = "ServiceSubcategory";
 
 /// One published table property: its name, the values it accepts (empty for a free-form
-/// property) and the value it assumes when a request does not name it.
-type PropertyRow = (&'static str, &'static [&'static str], &'static str);
+/// property) and the value it assumes when a request does not name it (`None` for a
+/// property the dictionary publishes no default for).
+type PropertyRow = (
+    &'static str,
+    &'static [&'static str],
+    Option<&'static str>,
+);
 
 /// The table properties the dictionary publishes for a table, in the order it publishes
 /// them, with the values each accepts and the value it assumes when a request does not
 /// name it. An empty value list is a free-form property.
 const PUBLISHED_PROPERTIES: &[(&str, &[PropertyRow])] = &[
-    ("CARBON_EMISSIONS", &[("BILLING_VIEW_ARN", &[], "")]),
-    ("COST_AND_USAGE_DASHBOARD", &[("BILLING_VIEW_ARN", &[], "")]),
+    ("CARBON_EMISSIONS", &[("BILLING_VIEW_ARN", &[], Some(""))]),
+    (
+        "COST_AND_USAGE_DASHBOARD",
+        &[("BILLING_VIEW_ARN", &[], Some(""))],
+    ),
     (
         "COST_AND_USAGE_REPORT",
         &[
-            ("TIME_GRANULARITY", &["DAILY", "MONTHLY", "HOURLY"], "HOURLY"),
+            (
+                "TIME_GRANULARITY",
+                &["DAILY", "MONTHLY", "HOURLY"],
+                Some("HOURLY"),
+            ),
             (
                 "INCLUDE_CAPACITY_RESERVATION_DATA",
                 &["TRUE", "FALSE"],
-                "FALSE",
+                Some("FALSE"),
             ),
-            ("BILLING_VIEW_ARN", &[], ""),
-            ("INCLUDE_RESOURCES", &["TRUE", "FALSE"], "FALSE"),
-            (
-                "INCLUDE_SPLIT_COST_ALLOCATION_DATA",
-                &["TRUE", "FALSE"],
-                "FALSE",
-            ),
+            ("BILLING_VIEW_ARN", &[], Some("")),
             (
                 "INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY",
                 &["TRUE", "FALSE"],
-                "FALSE",
+                Some("FALSE"),
             ),
+            (
+                "INCLUDE_SPLIT_COST_ALLOCATION_DATA",
+                &["TRUE", "FALSE"],
+                Some("FALSE"),
+            ),
+            // Published with no default: in force only for a request that names it.
+            ("INCLUDE_IAM_PRINCIPAL_DATA", &["TRUE", "FALSE"], None),
+            ("INCLUDE_RESOURCES", &["TRUE", "FALSE"], Some("FALSE")),
         ],
     ),
     (
         "COST_OPTIMIZATION_RECOMMENDATIONS",
         &[
-            ("FILTER", &[], "{}"),
-            ("INCLUDE_ALL_RECOMMENDATIONS", &["TRUE", "FALSE"], "FALSE"),
+            (
+                "INCLUDE_ALL_RECOMMENDATIONS",
+                &["TRUE", "FALSE"],
+                Some("FALSE"),
+            ),
+            ("FILTER", &[], Some("{}")),
         ],
     ),
-    ("FOCUS_1_0_AWS", &[("BILLING_VIEW_ARN", &[], "")]),
-    ("FOCUS_1_0_AWS_PREVIEW", &[("BILLING_VIEW_ARN", &[], "")]),
-    ("FOCUS_1_2_AWS", &[("BILLING_VIEW_ARN", &[], "")]),
+    ("FOCUS_1_0_AWS", &[("BILLING_VIEW_ARN", &[], Some(""))]),
+    (
+        "FOCUS_1_0_AWS_PREVIEW",
+        &[
+            ("DEPRECATED", &["TRUE"], Some("TRUE")),
+            ("BILLING_VIEW_ARN", &[], Some("")),
+        ],
+    ),
+    (
+        "FOCUS_1_2_AWS",
+        &[
+            (
+                "TIME_GRANULARITY",
+                &["DAILY", "MONTHLY", "HOURLY"],
+                Some("HOURLY"),
+            ),
+            ("BILLING_VIEW_ARN", &[], Some("")),
+        ],
+    ),
 ];
 
 /// `GetTable` for `table`, requiring HTTP 200.
@@ -361,12 +434,24 @@ async fn get_table_resolves_the_name_the_request_names() {
         );
     }
 
-    // FOCUS 1.2 extends FOCUS 1.0 rather than aliasing it.
+    // FOCUS 1.2 extends the FOCUS 1.0 SPECIFICATION columns rather than aliasing them.
+    // The `x_`-prefixed provider extensions are each schema's own — the columns FOCUS 1.2
+    // standardises cover two of FOCUS 1.0's — so they are compared per schema in
+    // `catalog_schema.rs` instead.
     let focus_1_2 = &schemas["FOCUS_1_2_AWS"];
+    let specified = |columns: &BTreeSet<String>| -> BTreeSet<String> {
+        columns
+            .iter()
+            .filter(|name| !name.starts_with("x_"))
+            .cloned()
+            .collect()
+    };
+    let specified_1_0 = specified(focus);
+    let specified_1_2 = specified(focus_1_2);
     assert!(
-        focus.is_subset(focus_1_2),
-        "case \"FOCUS 1.2\": every FOCUS 1.0 column must still be published, missing {:?}",
-        focus.difference(focus_1_2).collect::<Vec<_>>()
+        specified_1_0.is_subset(&specified_1_2),
+        "case \"FOCUS 1.2\": every FOCUS 1.0 specification column must still be published, missing {:?}",
+        specified_1_0.difference(&specified_1_2).collect::<Vec<_>>()
     );
     assert!(
         focus_1_2.contains(FOCUS_1_2_ONLY_COLUMN) && !focus.contains(FOCUS_1_2_ONLY_COLUMN),
@@ -415,7 +500,7 @@ async fn every_table_property_is_reported_as_the_dictionary_publishes_it() {
             );
             assert_eq!(
                 property.get("DefaultValue").and_then(Value::as_str),
-                Some(*default_value),
+                *default_value,
                 "case {case:?}: expected the published default, got {property}"
             );
             let description = property
@@ -448,7 +533,9 @@ async fn every_table_property_is_reported_as_the_dictionary_publishes_it() {
             .unwrap_or_default();
         let expected: BTreeMap<String, String> = properties
             .iter()
-            .map(|(name, _, default_value)| ((*name).to_string(), (*default_value).to_string()))
+            .filter_map(|(name, _, default_value)| {
+                default_value.map(|default| ((*name).to_string(), default.to_string()))
+            })
             .collect();
         assert_eq!(
             described, expected,
