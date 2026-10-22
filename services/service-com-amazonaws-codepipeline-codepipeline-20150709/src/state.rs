@@ -16,9 +16,9 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     ActionConfigurationProperty, ActionState, ActionType, ActionTypeId, ActionTypeSettings,
-    ArtifactDetails, ExecutionTrigger, PipelineDeclaration, PipelineExecution,
-    PipelineExecutionSummary, PipelineMetadata, PipelineSummary, ResolvedPipelineVariable,
-    SourceRevision, StageState, Tag, ThirdPartyJob, TransitionState,
+    ArtifactDetails, CurrentRevision, ExecutionDetails, ExecutionTrigger, PipelineDeclaration,
+    PipelineExecution, PipelineExecutionSummary, PipelineMetadata, PipelineSummary,
+    ResolvedPipelineVariable, SourceRevision, StageState, Tag, ThirdPartyJob, TransitionState,
 };
 
 /// The region an ARN carries when the request names none.
@@ -61,6 +61,23 @@ pub const STATUS_IN_PROGRESS: &str = "InProgress";
 /// (`smithy_query query="shape" shape="TriggerType"`), whose member names the
 /// interaction that started the execution.
 pub const TRIGGER_TYPE_START_PIPELINE_EXECUTION: &str = "StartPipelineExecution";
+
+/// The `JobStatus` value a job carries while a job worker holds it and may still
+/// report a result for it: `AcknowledgeJob`/`AcknowledgeThirdPartyJob` document
+/// that acknowledging a job "confirms a job worker has received the specified job",
+/// and the status it moves to is this one, from the model's enum
+/// (`JOB_STATUS_VALUES` -> `Created`, `Dispatched`, `Failed`, `InProgress`,
+/// `Queued`, `Succeeded`, `TimedOut`).
+pub const JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// The `JobStatus` value a job carries once a job worker has reported success for
+/// it, from the same enum. Terminal: nothing moves a job out of it.
+pub const JOB_STATUS_SUCCEEDED: &str = "Succeeded";
+
+/// The `JobStatus` value a job carries while it waits for a worker to poll for it
+/// and acknowledge it, from the same enum. A queued job has no worker that owns its
+/// outcome yet, so no result can be reported for it.
+pub const JOB_STATUS_QUEUED: &str = "Queued";
 
 /// The `ExecutionType` of an execution that runs the pipeline forward, from the
 /// model's enum (`smithy_query query="shape" shape="ExecutionType"` -> `STANDARD`,
@@ -348,6 +365,43 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
             .retain(|(pipeline_name, _), _| pipeline_name != name);
     }
 
+    /// The third-party job `job_id`, for a worker that proved it holds the job's
+    /// `clientToken`.
+    ///
+    /// A worker's call names a job by id alone, so the search spans every action
+    /// type's queue: a job id identifies one job across the service, and which
+    /// queue it waits in is not something the caller knows or states.
+    ///
+    /// The two refusals are ordered the way the lookup itself is: a job the service
+    /// is not holding has no token to compare against, so an id that names no
+    /// retained job is "not found" whatever token accompanies it, and only a job
+    /// that WAS found can reject the token it was given. `ThirdPartyJobId` carries
+    /// no modelled pattern, so the id's form is never what decides this — only
+    /// whether a job is queued under it.
+    pub fn third_party_job_mut(
+        &mut self,
+        job_id: &str,
+        client_token: &str,
+    ) -> Result<&mut ThirdPartyJobRecord, ThirdPartyJobProblem> {
+        let job = self
+            .third_party_jobs
+            .values_mut()
+            .flatten()
+            .find(|job| job.job_id == job_id)
+            .ok_or_else(|| {
+                // The message AWS answers a missing job with, built from the
+                // request: the id the caller asked for, and nothing else about the
+                // store.
+                ThirdPartyJobProblem::NotFound(format!("Job with id '{job_id}' does not exist."))
+            })?;
+        if job.client_token != client_token {
+            return Err(ThirdPartyJobProblem::ClientToken(format!(
+                "the clientToken given does not grant access to job {job_id}"
+            )));
+        }
+        Ok(job)
+    }
+
     /// Register `record` under `key`, answering whether the store took it.
     ///
     /// `false` means the account is already holding [`MAX_ACTION_TYPES_PER_ACCOUNT`]
@@ -402,6 +456,22 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         }
         catalog
     }
+}
+
+/// Why a job worker's call naming a third-party job cannot be served, as
+/// [`ComAmazonawsCodepipelineCodepipeline20150709State::third_party_job_mut`]
+/// answers it.
+///
+/// Each variant names the modelled error shape that states it — every third-party
+/// operation models both — so the whole worker-side surface refuses one condition in
+/// exactly one way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThirdPartyJobProblem {
+    /// Refused as `JobNotFoundException`: no job the service holds carries that id.
+    NotFound(String),
+    /// Refused as `InvalidClientTokenException`: the token is not the one the job
+    /// was handed out with, so the caller is not the worker that holds it.
+    ClientToken(String),
 }
 
 /// An action type's identity: the four `ActionTypeId` members, in the order the
@@ -1114,16 +1184,49 @@ pub struct ThirdPartyJobRecord {
     /// worker presents the matching `clientToken` to `GetThirdPartyJobDetails` and
     /// `AcknowledgeThirdPartyJob`.
     pub client_id: String,
+    /// The `clientToken` half of that pair: the token a worker's call has to carry
+    /// to reach this job, as every third-party operation's `clientToken` member
+    /// documents ("used to verify that the calling entity is allowed access to the
+    /// job and its details"). `ClientToken` carries no modelled pattern, so this is
+    /// an opaque value minted with the job.
+    pub client_token: String,
+    /// A `JobStatus` value: where the job is between being queued and a worker
+    /// reporting its outcome.
+    pub status: String,
+    /// The continuation token the last successful result supplied, identifying a
+    /// partner action still in progress. `PutThirdPartyJobSuccessResult$continuationToken`
+    /// documents that "future jobs use this token to identify the running instance
+    /// of the action", and that "when the action is complete, no continuation token
+    /// should be supplied" — so an absent token here means the action finished with
+    /// this job.
+    pub continuation_token: Option<String>,
+    /// The revision the worker reported as current for the artifact it worked on.
+    pub current_revision: Option<CurrentRevision>,
+    /// The execution details the worker reported with its result.
+    pub execution_details: Option<ExecutionDetails>,
+    /// When this job's status last changed.
+    pub last_status_change: SystemTime,
 }
 
 impl ThirdPartyJobRecord {
     /// A record of the job identified by `job_id`, to be served to the worker holding
     /// `client_id` — what the action-execution plane queues when an execution reaches
     /// a partner action.
+    ///
+    /// The job starts at [`JOB_STATUS_QUEUED`]: it is waiting for a worker, and no
+    /// worker owns its outcome until one acknowledges it. The `clientToken` half of
+    /// the pair is minted here, so a queued job always has the one token that
+    /// reaches it.
     pub fn new(job_id: impl Into<String>, client_id: impl Into<String>) -> Self {
         Self {
             job_id: job_id.into(),
             client_id: client_id.into(),
+            client_token: random_uuid_v4(),
+            status: JOB_STATUS_QUEUED.to_string(),
+            continuation_token: None,
+            current_revision: None,
+            execution_details: None,
+            last_status_change: SystemTime::now(),
         }
     }
 
@@ -1133,6 +1236,32 @@ impl ThirdPartyJobRecord {
             client_id: Some(self.client_id.clone()),
             job_id: Some(self.job_id.clone()),
         }
+    }
+
+    /// Whether a job worker may still report a result for this job.
+    ///
+    /// Only a job the worker has acknowledged and not yet completed: a job still
+    /// being handed out (`Created`, `Queued`, `Dispatched`) has no worker that owns
+    /// its outcome, and one that already reached a terminal status (`Succeeded`,
+    /// `Failed`, `TimedOut`) has an outcome that cannot be replaced.
+    pub fn accepts_result(&self) -> bool {
+        self.status == JOB_STATUS_IN_PROGRESS
+    }
+
+    /// Record a worker's successful result: the job reaches
+    /// [`JOB_STATUS_SUCCEEDED`] and keeps what the worker reported with it.
+    pub fn record_success(
+        &mut self,
+        continuation_token: Option<String>,
+        current_revision: Option<CurrentRevision>,
+        execution_details: Option<ExecutionDetails>,
+        now: SystemTime,
+    ) {
+        self.status = JOB_STATUS_SUCCEEDED.to_string();
+        self.continuation_token = continuation_token;
+        self.current_revision = current_revision;
+        self.execution_details = execution_details;
+        self.last_status_change = now;
     }
 }
 
