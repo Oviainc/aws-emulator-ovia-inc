@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or replaces the stored session addressed by the four `@httpLabel`
+//! values, persisting the dialog state, messages and request attributes the
+//! caller supplied, and reports the stored session back on the `x-amz-lex-*`
+//! response headers.
 //!
 //! ## Shape of an operation
 //!
@@ -106,6 +102,98 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    check_attribute_bytes, check_request_attributes, AttributesRefused, SessionKey,
+    SessionStoreFull,
+};
+use aws_smithy_schema::codec::FinishSerializer;
+use aws_smithy_schema::serde::ShapeSerializer;
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::json::JsonShapeSerializer;
+use std::time::SystemTime;
+
+/// The response content type a caller gets when it asks for none.
+///
+/// `responseContentType` decides whether Amazon Lex V2 answers with text or
+/// speech (see `RecognizeUtterance$responseContentType`, which lists the
+/// accepted values); `text/plain;charset=utf-8` is the text form.
+const TEXT_CONTENT_TYPE: &str = "text/plain;charset=utf-8";
+
+/// Does this `responseContentType` ask for synthesized speech?
+///
+/// "If the value begins with `audio/`, Amazon Lex V2 returns speech in the
+/// response" — which it synthesizes with Amazon Polly.
+fn asks_for_speech(response_content_type: &str) -> bool {
+    response_content_type
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("audio/")
+}
+
+/// The member of `schema` named `member`, as the model declares it.
+///
+/// The header payloads below are the input's own `sessionState`, `messages` and
+/// `requestAttributes` shapes, so their schemas are read off the generated input
+/// schema rather than re-declared here.
+fn member_schema<'a>(schema: &'a Schema, member: &str) -> Option<&'a Schema> {
+    schema
+        .members()
+        .iter()
+        .copied()
+        .find(|candidate| candidate.member_name() == Some(member))
+}
+
+/// Serialize one modelled value to JSON with the service's own restJson1 codec
+/// and base64 encode it, which is how a structured value travels on a header.
+///
+/// `PutSessionResponse$sessionState` and `$requestAttributes` are each "a
+/// base-64-encoded gzipped field", and `RecognizeUtterance` states the rule for
+/// the whole family: "the following response fields are compressed using gzip
+/// and then base64 encoded by Amazon Lex V2" — `inputTranscript`,
+/// `interpretations`, `messages`, `requestAttributes`, `sessionState`. This
+/// emulator writes the base64 of the JSON WITHOUT the gzip layer: the value
+/// reported is the stored session, serialized with the model's own schemas, so a
+/// caller that base64-decodes a header reads the session state, but it must not
+/// inflate it first. The missing gzip layer is a declared gap of this slice,
+/// recorded with `RecognizeUtterance` and `StartConversation`; base64 itself is
+/// not optional, since a session attribute may hold any UTF-8 text and a header
+/// value may not.
+fn header_value(
+    write: impl FnOnce(&mut JsonShapeSerializer) -> Result<(), aws_smithy_schema::serde::SerdeError>,
+) -> Result<String, PutSessionError> {
+    // `true`: restJson1 honours `@jsonName`, so the keys are the wire names a
+    // client decoding the header expects.
+    let mut serializer = JsonShapeSerializer::new_with_config(true);
+    write(&mut serializer).map_err(|e| internal(format!("serializing a response header: {e}")))?;
+    Ok(aws_smithy_types::base64::encode(serializer.finish()))
+}
+
+/// A server fault this operation declares, for a failure that is the emulator's
+/// own and not the caller's.
+fn internal(message: impl Into<String>) -> PutSessionError {
+    PutSessionErrorModeled::InternalServerException(InternalServerException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// An attribute map the caller has to fix: the member and the rule it broke are
+/// in the message, so the request can be fixed from it.
+fn refused(error: AttributesRefused) -> PutSessionError {
+    PutSessionErrorModeled::ValidationException(ValidationException {
+        message: error.message(),
+    })
+    .into()
+}
+
+/// The store is at capacity, so this request cannot have a session: a refusal of
+/// the request rate, not a fault of the request itself.
+fn store_full(error: SessionStoreFull) -> PutSessionError {
+    PutSessionErrorModeled::ThrottlingException(ThrottlingException {
+        message: error.message(),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -182,18 +270,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSession"))
+        let _ = ctx;
+
+        // The content type the response is reported with: "the same as the type
+        // specified in the responseContentType field in the request".
+        let content_type = input
+            .response_content_type
+            .unwrap_or_else(|| TEXT_CONTENT_TYPE.to_string());
+        if asks_for_speech(&content_type) {
+            // Speech is synthesized by Amazon Polly, a dependency this emulator
+            // does not have, and an empty or invented audio stream would be a
+            // worse answer than the modelled dependency failure.
+            return Err(PutSessionErrorModeled::DependencyFailedException(
+                DependencyFailedException {
+                    message: format!(
+                        "responseContentType {content_type} requests synthesized speech, \
+                         which this emulator cannot produce; ask for {TEXT_CONTENT_TYPE}"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal("the Lex V2 runtime session store is unavailable"))?;
+
+        // Refuse an attribute map this operation may not store before a session
+        // is created for it: these are the two maps it stores, both bounded, and
+        // `requestAttributes` may not name the reserved namespace either.
+        check_attribute_bytes(
+            "sessionState.sessionAttributes",
+            None,
+            input.session_state.session_attributes.as_ref(),
+        )
+        .map_err(refused)?;
+        check_request_attributes("requestAttributes", None, input.request_attributes.as_ref())
+            .map_err(refused)?;
+
+        let now = SystemTime::now();
+        let session_id = input.session_id;
+        let key = SessionKey::new(
+            &input.bot_id,
+            &input.bot_alias_id,
+            &input.locale_id,
+            &session_id,
+        );
+
+        // Create or replace: the four labels address one session, and this
+        // operation "creates a new session or modifies an existing session". The
+        // values reported below are read back off the stored session, so the
+        // response is what a later GetSession observes and not the request echoed.
+        let (stored_state, stored_messages, stored_attributes, stored_session_id) = {
+            let mut store = state.lock();
+            // `session_mut` is the bounded insertion path: it expires idle
+            // sessions and refuses to grow the store past its cap.
+            let session = store.session_mut(key, now).map_err(store_full)?;
+            session.replace_session_state(input.session_state, now);
+            session.messages = input.messages.unwrap_or_default();
+            // The dialog this call replaces is gone, and so are the
+            // interpretations an earlier turn of it produced: this operation
+            // "creates a new session or modifies an existing session", and an
+            // interpretation of an utterance that is no longer part of the
+            // session would otherwise be reported by the next read.
+            session.interpretations.clear();
+            session.request_attributes = input.request_attributes.unwrap_or_default();
+            session.updated_at = now;
+            (
+                session.visible_session_state(now),
+                session.messages.clone(),
+                session.request_attributes.clone(),
+                session.session_id.clone(),
+            )
+        };
+
+        let input_schema = Self::INPUT_SCHEMA;
+        let state_schema = member_schema(input_schema, "sessionState")
+            .ok_or_else(|| internal("the model declares no sessionState member"))?;
+        let messages_schema = member_schema(input_schema, "messages")
+            .ok_or_else(|| internal("the model declares no messages member"))?;
+        let attributes_schema = member_schema(input_schema, "requestAttributes")
+            .ok_or_else(|| internal("the model declares no requestAttributes member"))?;
+
+        let session_state =
+            header_value(|serializer| serializer.write_struct(state_schema, &stored_state))?;
+        // Both of these are optional `NonEmptyString` headers: with nothing
+        // stored there is nothing to report, so the header is absent rather than
+        // an encoded empty collection.
+        let messages = if stored_messages.is_empty() {
+            None
+        } else {
+            // A list element is written with the list's own member schema
+            // (`Schema::member()`), so whatever the model says about the element
+            // is applied to it.
+            let element_schema = messages_schema
+                .member()
+                .ok_or_else(|| internal("the model declares no messages element member"))?;
+            Some(header_value(|serializer| {
+                serializer.write_list(messages_schema, &|element| {
+                    for message in &stored_messages {
+                        element.write_struct(element_schema, message)?;
+                    }
+                    Ok(())
+                })
+            })?)
+        };
+        let request_attributes = if stored_attributes.is_empty() {
+            None
+        } else {
+            // A map entry is written with its own key and value member schemas:
+            // `Schema::key()` is the map's key member and `Schema::member()` its
+            // value member, so whatever the model says about either (a name, a
+            // constraint) is applied to the right one. A model that declares
+            // neither is a mismatch this operation reports rather than papers
+            // over with the map's own schema.
+            let key_schema = attributes_schema
+                .key()
+                .ok_or_else(|| internal("the model declares no requestAttributes key member"))?;
+            let value_schema = attributes_schema
+                .member()
+                .ok_or_else(|| internal("the model declares no requestAttributes value member"))?;
+            Some(header_value(|serializer| {
+                serializer.write_map(attributes_schema, &|entry| {
+                    for (name, value) in &stored_attributes {
+                        entry.write_string(key_schema, name)?;
+                        entry.write_string(value_schema, value)?;
+                    }
+                    Ok(())
+                })
+            })?)
+        };
+
+        Ok(PutSessionOutput {
+            content_type: Some(content_type),
+            messages,
+            session_state: Some(session_state),
+            request_attributes,
+            session_id: Some(stored_session_id),
+            // Audio is returned only "if the requested content type was audio",
+            // and an audio request is refused above, so a text session carries
+            // no audio stream.
+            audio_stream: Vec::new(),
+        })
     }
 }

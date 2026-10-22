@@ -6,7 +6,8 @@
 //!
 //! The policy is a sub-resource of the channel, so three distinct absences all answer
 //! `ResourceNotFoundException` (404): the channel group, the channel, and a channel that
-//! exists but has never had a policy attached.
+//! exists but has never had a policy attached (or had it detached by
+//! `DeleteChannelPolicy`).
 //!
 //! ## Shape of an operation
 //!

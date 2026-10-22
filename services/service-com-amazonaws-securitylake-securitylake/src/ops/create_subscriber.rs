@@ -178,6 +178,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // ENABLEMENT PRECONDITION: see `ListSubscribers`. An account with Security Lake
+        // enabled in no Region at all gets the documented account-level remedy; the
+        // per-Region check below then covers an account that is enabled somewhere but not
+        // in the Region this request was signed for.
+        if !store.enabled_in_any_region() {
+            return Err(CreateSubscriberErrorModeled::ResourceNotFoundException(
+                crate::state::not_enabled_in_any_region(),
+            )
+            .into());
+        }
+
         // A subscriber subscribes to a data lake, so one must already exist in this
         // Region: without it there is no resource to subscribe to.
         let Some(lake) = store.data_lake(&region) else {

@@ -18,19 +18,22 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test's SigV4 credential scope names; every minted ARN is scoped to it.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// One emulator over one shared engine, driven through the same `dispatch` the served
 /// socket path uses.
-struct Emulator {
+///
+/// `pub(crate)` so every suite in this test target drives the emulator the same way
+/// rather than growing a second harness (see `tests/all/tags.rs`).
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite drives unsigned requests, so signature verification is off; the
@@ -46,7 +49,7 @@ impl Emulator {
     }
 
     /// Call `operation` with `body`, returning the HTTP status and the parsed response.
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -80,7 +83,7 @@ impl Emulator {
 }
 
 /// The `__type` discriminator an awsJson error body carries, or `""`.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 

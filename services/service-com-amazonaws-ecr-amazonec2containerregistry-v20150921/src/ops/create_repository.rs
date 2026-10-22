@@ -217,6 +217,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mutability = input
             .image_tag_mutability
             .unwrap_or_else(|| crate::state::DEFAULT_IMAGE_TAG_MUTABILITY.to_string());
+        // Exclusion filters belong only to a setting that has an exclusion to apply;
+        // one rule decides it for every operation that writes this configuration.
+        let exclusion_filters = input
+            .image_tag_mutability_exclusion_filters
+            .unwrap_or_default();
+        crate::state::check_exclusion_filters(&mutability, &exclusion_filters)
+            .map_err(fault_error)?;
 
         // The repository is encrypted at rest either way; `AES256` is what ECR uses when
         // the request names no encryption configuration.
@@ -291,9 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: name.clone(),
             created_at: now,
             image_tag_mutability: mutability,
-            image_tag_mutability_exclusion_filters: input
-                .image_tag_mutability_exclusion_filters
-                .unwrap_or_default(),
+            image_tag_mutability_exclusion_filters: exclusion_filters,
             image_scanning_config: input.image_scanning_configuration,
             encryption_config: encryption,
             tags: Vec::new(),

@@ -140,7 +140,7 @@ pub struct Channel {
     /// members: no `Channel*` shape in the model carries it, so it takes no part in the
     /// channel's ETag, and because it is stored inside the channel record it disappears
     /// with the channel. `None` is what makes `GetChannelPolicy` on a never-attached
-    /// policy a 404 rather than an empty success.
+    /// policy a 404, and `DeleteChannelPolicy` what puts it back.
     pub policy: Option<String>,
     pub origin_endpoints: BTreeMap<String, OriginEndpoint>,
 }

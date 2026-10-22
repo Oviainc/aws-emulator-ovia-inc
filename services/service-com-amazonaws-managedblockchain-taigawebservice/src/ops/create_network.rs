@@ -284,6 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_endpoint_service_name: crate::state::vpc_endpoint_service_name(&region, &network_id),
             members: ::std::collections::BTreeMap::from([(member_id.clone(), member)]),
             nodes: ::std::collections::BTreeMap::new(),
+            proposals: ::std::collections::BTreeMap::new(),
         };
 
         guard.networks.insert(network_id.clone(), network);
@@ -293,6 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 network_id: Some(network_id.clone()),
                 member_id: Some(member_id.clone()),
                 node_id: None,
+                proposal_id: None,
                 accessor_id: None,
             },
         );

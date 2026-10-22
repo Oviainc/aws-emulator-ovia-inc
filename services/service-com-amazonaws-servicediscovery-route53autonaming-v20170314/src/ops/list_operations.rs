@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOperations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOperations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOperations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a real page over the operation records this service's mutating calls
+//! filed, narrowed by the request's `Filters` and resumed through an opaque
+//! `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +134,236 @@ impl<Eng> ListOperations<Eng> {
     }
 }
 
+/// How many operations one page carries when the request names no `MaxResults`, as
+/// `ListOperationsRequest$MaxResults` documents: "If you don't specify a value for
+/// MaxResults, Cloud Map returns up to 100 operations."
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The version marker every `NextToken` this operation mints carries, so a token from
+/// some other paginator (or a hand-written one) is recognised as not ours and refused
+/// rather than silently read as "start from the beginning".
+const TOKEN_VERSION: &str = "lop1";
+
+/// `FilterCondition` values, from the model's enum (`FILTER_CONDITION_VALUES`).
+const CONDITION_EQ: &str = "EQ";
+const CONDITION_IN: &str = "IN";
+const CONDITION_BETWEEN: &str = "BETWEEN";
+
+/// `OperationFilterName` values, from the model's enum
+/// (`OPERATION_FILTER_NAME_VALUES`).
+const FILTER_NAMESPACE_ID: &str = "NAMESPACE_ID";
+const FILTER_SERVICE_ID: &str = "SERVICE_ID";
+const FILTER_STATUS: &str = "STATUS";
+const FILTER_TYPE: &str = "TYPE";
+const FILTER_UPDATE_DATE: &str = "UPDATE_DATE";
+
+/// `OperationTargetType` values, from the model's enum
+/// (`OPERATION_TARGET_TYPE_VALUES`): the keys of a record's `Targets` map.
+const TARGET_NAMESPACE: &str = "NAMESPACE";
+const TARGET_SERVICE: &str = "SERVICE";
+
+/// One validated request filter, ready to match a stored operation record.
+#[derive(Debug)]
+enum Matcher {
+    /// `NAMESPACE_ID` / `SERVICE_ID`: the operation's target of this type is one of
+    /// these ids.
+    Target {
+        target_type: &'static str,
+        values: Vec<String>,
+    },
+    /// `STATUS`: the operation's status is one of these values.
+    Status(Vec<String>),
+    /// `TYPE`: the operation's type is one of these values.
+    Type(Vec<String>),
+    /// `UPDATE_DATE`: the operation last changed status inside this closed range.
+    UpdateDate {
+        start: std::time::SystemTime,
+        end: std::time::SystemTime,
+    },
+}
+
+impl Matcher {
+    /// Whether `record` satisfies this one filter.
+    fn matches(&self, record: &crate::state::OperationRecord) -> bool {
+        match self {
+            Self::Target {
+                target_type,
+                values,
+            } => record
+                .targets
+                .get(*target_type)
+                .is_some_and(|target| values.iter().any(|value| value == target)),
+            Self::Status(values) => values.contains(&record.status),
+            Self::Type(values) => values.contains(&record.operation_type),
+            Self::UpdateDate { start, end } => {
+                record.update_date >= *start && record.update_date <= *end
+            }
+        }
+    }
+}
+
+/// One `UPDATE_DATE` bound: "Specify a start date and an end date in Unix date/time
+/// format and Coordinated Universal Time (UTC)" — seconds since the epoch, which the
+/// emulator accepts with or without a fraction.
+///
+/// A negative value is a well-formed date before the epoch, and no stored record can
+/// predate the epoch, so it clamps there instead of being refused; only a value that
+/// is not a Unix date/time at all, or one no instant can hold, is an error.
+fn unix_date(value: &str) -> Result<std::time::SystemTime, String> {
+    let malformed = || format!("{value} is not a date in Unix date/time format");
+    let seconds: f64 = value.trim().parse().map_err(|_| malformed())?;
+    if !seconds.is_finite() {
+        return Err(malformed());
+    }
+    if seconds <= 0.0 {
+        return Ok(std::time::SystemTime::UNIX_EPOCH);
+    }
+    let offset = std::time::Duration::try_from_secs_f64(seconds).map_err(|_| malformed())?;
+    std::time::SystemTime::UNIX_EPOCH
+        .checked_add(offset)
+        .ok_or_else(malformed)
+}
+
+/// Compile one request filter into a [`Matcher`], or say why the request is invalid.
+///
+/// The name/condition matrix is `OperationFilter$Condition`'s: "`EQ` ... is supported
+/// for `NAMESPACE_ID`, `SERVICE_ID`, `STATUS`, and `TYPE`. `EQ` is the default
+/// condition and can be omitted", "`IN` ... is supported for `STATUS` and `TYPE`",
+/// "`BETWEEN` ... is supported for `UPDATE_DATE`". A combination it does not list —
+/// `BEGINS_WITH` for any operation filter, `IN` for a resource id, `EQ` for a date
+/// range — is refused rather than guessed at.
+fn compile(filter: &OperationFilter) -> Result<Matcher, String> {
+    let name = filter.name.as_str();
+    let condition = filter.condition.as_deref().unwrap_or(CONDITION_EQ);
+    let supported: &[&str] = match name {
+        FILTER_NAMESPACE_ID | FILTER_SERVICE_ID => &[CONDITION_EQ],
+        FILTER_STATUS | FILTER_TYPE => &[CONDITION_EQ, CONDITION_IN],
+        FILTER_UPDATE_DATE => &[CONDITION_BETWEEN],
+        other => {
+            return Err(format!(
+                "{other} isn't a valid filter name for ListOperations; valid names are {}.",
+                OPERATION_FILTER_NAME_VALUES.join(", ")
+            ))
+        }
+    };
+    if !supported.contains(&condition) {
+        return Err(format!(
+            "condition {condition} isn't supported for the {name} filter; {name} supports {}.",
+            supported.join(", ")
+        ));
+    }
+    if filter.values.is_empty() {
+        return Err(format!("the {name} filter requires at least one value."));
+    }
+    // "When you specify EQ for the condition, you can specify only one value."
+    if condition == CONDITION_EQ && filter.values.len() != 1 {
+        return Err(format!(
+            "the {name} filter with condition EQ accepts only one value, but {} were specified.",
+            filter.values.len()
+        ));
+    }
+
+    /// Whether every filter value is one the named model enum accepts.
+    fn modelled(values: &[String], allowed: &[&str], shape: &str) -> Result<(), String> {
+        match values
+            .iter()
+            .find(|value| !allowed.contains(&value.as_str()))
+        {
+            Some(rejected) => Err(format!(
+                "{rejected} isn't a valid {shape}; valid values are {}.",
+                allowed.join(", ")
+            )),
+            None => Ok(()),
+        }
+    }
+
+    match name {
+        FILTER_NAMESPACE_ID => Ok(Matcher::Target {
+            target_type: TARGET_NAMESPACE,
+            values: filter.values.clone(),
+        }),
+        FILTER_SERVICE_ID => Ok(Matcher::Target {
+            target_type: TARGET_SERVICE,
+            values: filter.values.clone(),
+        }),
+        FILTER_STATUS => {
+            modelled(&filter.values, OPERATION_STATUS_VALUES, "OperationStatus")?;
+            Ok(Matcher::Status(filter.values.clone()))
+        }
+        FILTER_TYPE => {
+            modelled(&filter.values, OPERATION_TYPE_VALUES, "OperationType")?;
+            Ok(Matcher::Type(filter.values.clone()))
+        }
+        // `UPDATE_DATE`, the only name left, and only with `BETWEEN`.
+        _ => {
+            if filter.values.len() != 2 {
+                return Err(format!(
+                    "the {FILTER_UPDATE_DATE} filter with condition BETWEEN accepts exactly two \
+                     values, a start date and an end date, but {} were specified.",
+                    filter.values.len()
+                ));
+            }
+            let start = unix_date(&filter.values[0])?;
+            let end = unix_date(&filter.values[1])?;
+            // "The start date must be the first value."
+            if start > end {
+                return Err(format!(
+                    "the {FILTER_UPDATE_DATE} filter's start date must be the first value."
+                ));
+            }
+            Ok(Matcher::UpdateDate { start, end })
+        }
+    }
+}
+
+/// The `NextToken` that resumes paging after `record`.
+///
+/// The token names the LAST record of the page just served — its create instant and
+/// its `OperationId`, the pair `operations_in_order` sorts on — rather than an offset
+/// into the list, so operations filed between two pages neither hide nor duplicate a
+/// record. An `OperationId` is at most 255 characters, so the token always fits the
+/// modelled `NextToken` length of 0..4096.
+fn page_token(record: &crate::state::OperationRecord) -> String {
+    let since_epoch = record
+        .create_date
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "{TOKEN_VERSION}:{}.{:09}:{}",
+        since_epoch.as_secs(),
+        since_epoch.subsec_nanos(),
+        record.id
+    )
+}
+
+/// The `(create instant, OperationId)` boundary a `NextToken` names, or `None` when
+/// the token was not minted by [`page_token`].
+///
+/// TOTAL over its input: every component comes off the wire, so the instant is rebuilt
+/// with checked arithmetic and a nanosecond field that must be sub-second. In
+/// particular `std::time::Duration::new` is NOT used: it panics when the carry from an
+/// out-of-range nanosecond argument overflows its seconds counter, which a caller
+/// could reach with a hand-written token.
+fn parse_token(token: &str) -> Option<(std::time::SystemTime, String)> {
+    const NANOS_PER_SEC: u32 = 1_000_000_000;
+
+    let mut parts = token.splitn(3, ':');
+    if parts.next()? != TOKEN_VERSION {
+        return None;
+    }
+    let instant = parts.next()?;
+    let id = parts.next()?.to_string();
+    let (secs, nanos) = instant.split_once('.')?;
+    let nanos: u32 = nanos.parse().ok()?;
+    if nanos >= NANOS_PER_SEC {
+        return None;
+    }
+    let offset = std::time::Duration::from_secs(secs.parse().ok()?)
+        .checked_add(std::time::Duration::from_nanos(u64::from(nanos)))?;
+    let at = std::time::SystemTime::UNIX_EPOCH.checked_add(offset)?;
+    Some((at, id))
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListOperations<Eng>
 {
@@ -157,18 +381,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOperations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOperationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOperations"))
+        let _ = ctx;
+        let invalid = |message: String| -> Self::Error {
+            ListOperationsErrorModeled::InvalidInput(InvalidInput {
+                message: Some(message),
+            })
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(invalid(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()));
+        };
+
+        // "If you specify more than one filter, an operation must match all filters to
+        // be returned by ListOperations." Every filter is compiled BEFORE any record
+        // is read, so an invalid filter is refused rather than silently matching
+        // nothing.
+        let mut matchers = Vec::new();
+        for filter in input.filters.iter().flatten() {
+            matchers.push(compile(filter).map_err(invalid)?);
+        }
+
+        let resume = match input.next_token.as_deref() {
+            // An empty `NextToken` is within the modelled length and means "the first
+            // page", the same as omitting it.
+            None | Some("") => None,
+            Some(token) => Some(parse_token(token).ok_or_else(|| {
+                invalid(format!("{token} isn't a valid NextToken for ListOperations."))
+            })?),
+        };
+
+        let max_results = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        let now = std::time::SystemTime::now();
+        let ordered = state.lock().operations_in_order(now);
+
+        // The page starts after the record the token named; a token whose record has
+        // since been evicted still resumes at the right boundary, because the boundary
+        // is the sort key, not a position.
+        let start = match resume {
+            Some((at, id)) => ordered.partition_point(|record| {
+                (record.create_date, record.id.as_str()) <= (at, id.as_str())
+            }),
+            None => 0,
+        };
+        let page = ordered.get(start..).unwrap_or_default();
+        let page = &page[..page.len().min(max_results)];
+
+        // "Cloud Map gets MaxResults operations and then filters them based on the
+        // specified criteria. It's possible that no operations in the first MaxResults
+        // operations matched the specified criteria but that subsequent groups of
+        // MaxResults operations do contain operations that match the criteria" — so the
+        // window is taken first and filtered second, and a page may answer with fewer
+        // (even zero) operations while still carrying a `NextToken`.
+        let operations: Vec<OperationSummary> = page
+            .iter()
+            .filter(|record| matchers.iter().all(|matcher| matcher.matches(record)))
+            .map(|record| OperationSummary {
+                id: Some(record.id.clone()),
+                status: Some(record.status.clone()),
+            })
+            .collect();
+
+        // A `NextToken` is returned only while records remain beyond this window.
+        let next_token = match page.last() {
+            Some(last) if start + page.len() < ordered.len() => Some(page_token(last)),
+            _ => None,
+        };
+
+        Ok(ListOperationsOutput {
+            operations: Some(operations),
+            next_token,
+        })
     }
 }

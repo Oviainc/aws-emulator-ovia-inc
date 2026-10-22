@@ -374,18 +374,42 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
         }
     }
 
-    /// The operation `id`, with any status transition the clock already owes it
-    /// applied first.
+    /// Apply the status transition the clock already owes `record`.
     ///
-    /// Materialising here is what a reporting call may write: the operation was due to
-    /// succeed at `success_due_at` whether or not anybody asked.
-    pub fn operation(&mut self, id: &str, now: SystemTime) -> Option<&OperationRecord> {
-        let record = self.operations.get_mut(id)?;
+    /// Writing here is what a reporting call may do: the operation was due to succeed
+    /// at `success_due_at` whether or not anybody asked, and `update_date` is the
+    /// instant it became due rather than the instant somebody noticed, so two readers
+    /// of the same record report the same dates.
+    fn materialise(record: &mut OperationRecord, now: SystemTime) {
         if record.status == OPERATION_STATUS_SUBMITTED && now >= record.success_due_at {
             record.status = OPERATION_STATUS_SUCCESS.to_string();
             record.update_date = record.success_due_at;
         }
+    }
+
+    /// The operation `id`, with any status transition the clock already owes it
+    /// applied first.
+    pub fn operation(&mut self, id: &str, now: SystemTime) -> Option<&OperationRecord> {
+        let record = self.operations.get_mut(id)?;
+        Self::materialise(record, now);
         Some(record)
+    }
+
+    /// Every stored operation in one stable total order — oldest first, `OperationId`
+    /// breaking a tie — each with the status transition the clock already owes it
+    /// applied first, exactly as [`Self::operation`] applies it to a single record.
+    ///
+    /// The order is a property of the records themselves (create instant, then id), not
+    /// of the map's iteration order, so the page boundary a `ListOperations`
+    /// `NextToken` names stays put as later operations are filed.
+    pub fn operations_in_order(&mut self, now: SystemTime) -> Vec<OperationRecord> {
+        for record in self.operations.values_mut() {
+            Self::materialise(record, now);
+        }
+        let mut ordered: Vec<OperationRecord> = self.operations.values().cloned().collect();
+        ordered
+            .sort_by(|left, right| (left.create_date, &left.id).cmp(&(right.create_date, &right.id)));
+        ordered
     }
 
     /// `ServiceCount` for a namespace, derived from the service map.

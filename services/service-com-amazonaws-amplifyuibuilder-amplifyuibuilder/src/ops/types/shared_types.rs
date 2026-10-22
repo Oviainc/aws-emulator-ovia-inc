@@ -11,6 +11,326 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-amplifyuibuilder-amplifyuibuilder.json");
 
+// `Component`, `Theme` and `CodegenJob` are the THREE shapes in this module whose schemas
+// are written out below rather than produced by `#[smithy_macros::smithy(shape = ...)]`,
+// and the reason is a single trait the vendored codegen does not read:
+// `@timestampFormat`.
+//
+// Every `Timestamp` member of those three shapes carries `@timestampFormat("date-time")`
+// — `smithy_query(query="shape",shape="Component,Theme,CodegenJob")` reports
+// `"timestampFormat": "date-time"` on `Component$createdAt`, `Component$modifiedAt`,
+// `Theme$createdAt`, `Theme$modifiedAt`, `CodegenJob$createdAt` and
+// `CodegenJob$modifiedAt`, and they are the only `@timestampFormat` members this service
+// models. `vendor/smithy-macros` never emits `with_timestamp_format` (grep it: the only
+// call sites in the tree are hand-written service code), so a macro-built member schema
+// reports no format and the restJson1 JSON codec falls back to its protocol default,
+// epoch seconds — a NUMBER where the model (and every AWS SDK's generated deserializer
+// for a `date-time` member) requires an RFC 3339 / ISO-8601 string. The schemas below
+// differ from the macro's output in exactly that one chain call, which [`schema_for`]
+// attaches for the `date_time` member kind.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
+// schema per member (index = that member's position in the model's member list), a
+// `SCHEMA` naming them in that order, the `<SHAPE>_SCHEMA` alias, and the
+// serialize/deserialize pair (a `@required` member is read into a slot and refused when
+// absent, exactly as the codegen does). Constraint traits are deliberately absent: the
+// validating walk runs on operation INPUTS only and all three shapes are output-only, so
+// the macro's captured constraints would be inert here too.
+//
+// REMOVE THIS BLOCK when the vendored codegen learns `smithy.api#timestampFormat`: the
+// fix belongs there, not here, because every `@timestampFormat` member of every service
+// has the same defect and `vendor/` is outside what a fix may change. Once
+// `vendor/smithy-macros` emits `with_timestamp_format`, delete the five macros and the
+// three `schema_and_codec_for!` blocks and put `#[smithy_macros::smithy(shape = ...)]`
+// back on the three structs — `tests/all/component_wire_fidelity.rs` pins the wire form,
+// so it fails if the attribute does not carry it.
+
+/// The `ShapeType` one member kind names. Mirrors the vendored codegen's
+/// `shape_type_ident`.
+macro_rules! shape_type_for {
+    (string) => {
+        ::aws_smithy_schema::ShapeType::String
+    };
+    (boolean) => {
+        ::aws_smithy_schema::ShapeType::Boolean
+    };
+    (date_time) => {
+        ::aws_smithy_schema::ShapeType::Timestamp
+    };
+    (map_of_string) => {
+        ::aws_smithy_schema::ShapeType::Map
+    };
+    (map_of_map_of_string) => {
+        ::aws_smithy_schema::ShapeType::Map
+    };
+    (map_of) => {
+        ::aws_smithy_schema::ShapeType::Map
+    };
+    (list_of) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
+    (struct_of) => {
+        ::aws_smithy_schema::ShapeType::Structure
+    };
+    (union_of) => {
+        ::aws_smithy_schema::ShapeType::Union
+    };
+}
+
+/// One member's schema, as the macro would emit it, plus the `@timestampFormat` chain
+/// call it cannot.
+///
+/// `$kind` is the member's shape kind — `string`, `boolean`, `date_time`,
+/// `map_of_string`, `map_of_map_of_string`, `map_of(T)`, `list_of(T)`, `struct_of(T)` or
+/// `union_of(T)`.
+macro_rules! schema_for {
+    ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!($ns, "#", $local, "$", $wire),
+                $ns,
+                $wire,
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            $wire,
+            $idx,
+        )
+        // The one call the vendored codegen omits; see the note above.
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime)
+    };
+    ($ns:literal, $local:literal, $wire:literal, $idx:literal, $kind:tt $(($inner:ty))?) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!($ns, "#", $local, "$", $wire),
+                $ns,
+                $wire,
+            ),
+            shape_type_for!($kind),
+            $wire,
+            $idx,
+        )
+    };
+}
+
+/// Write one member, as the vendored codegen's `emit_write` does for that kind: a map
+/// writes each value against the MAP member's schema and a list of structures writes each
+/// element against the element shape's own `SCHEMA`, which is what the codegen does too.
+macro_rules! write_member {
+    ($s:ident, $m:expr, $v:expr, string) => { $s.write_string($m, $v.as_str())?; };
+    ($s:ident, $m:expr, $v:expr, boolean) => { $s.write_boolean($m, *$v)?; };
+    ($s:ident, $m:expr, $v:expr, date_time) => { $s.write_timestamp($m, $v)?; };
+    ($s:ident, $m:expr, $v:expr, map_of_string) => {
+        $s.write_map($m, &|__sm| {
+            for (__k, __mv) in $v.iter() {
+                __sm.write_string($m, __k.as_str())?;
+                __sm.write_string($m, __mv.as_str())?;
+            }
+            Ok(())
+        })?;
+    };
+    ($s:ident, $m:expr, $v:expr, map_of_map_of_string) => {
+        $s.write_map($m, &|__sm| {
+            for (__k, __inner) in $v.iter() {
+                __sm.write_string($m, __k.as_str())?;
+                __sm.write_map($m, &|__sm_inner| {
+                    for (__ik, __iv) in __inner.iter() {
+                        __sm_inner.write_string($m, __ik.as_str())?;
+                        __sm_inner.write_string($m, __iv.as_str())?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+    };
+    ($s:ident, $m:expr, $v:expr, map_of($inner:ty)) => {
+        $s.write_map($m, &|__sm| {
+            for (__k, __mv) in $v.iter() {
+                __sm.write_string($m, __k.as_str())?;
+                __sm.write_struct($m, __mv)?;
+            }
+            Ok(())
+        })?;
+    };
+    ($s:ident, $m:expr, $v:expr, list_of($inner:ty)) => {
+        $s.write_list($m, &|__sl| {
+            for __it in $v.iter() {
+                __sl.write_struct(&<$inner>::SCHEMA, __it)?;
+            }
+            Ok(())
+        })?;
+    };
+    ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => { $s.write_struct($m, $v)?; };
+    ($s:ident, $m:expr, $v:expr, union_of($inner:ty)) => { $s.write_struct($m, $v)?; };
+}
+
+/// Read one member, as the vendored codegen's `emit_read` does for that kind.
+///
+/// NESTING IS BOUNDED BY THE CODEC, not by these arms, which is also where the
+/// macro-built readers of this module (`ComponentProperty$concat`,
+/// `ComponentChild$children`, `Predicate$or`, `ThemeValue$children`, … — the
+/// self-referential shapes an operation INPUT can nest) get their bound: the vendored
+/// JSON deserializer takes a depth guard at the entry of every recursive reader
+/// (`enter_depth` at `vendor/smithy-schema-server/src/json.rs:598`, called from
+/// `read_struct`, `read_list` and `read_map`, and from `skip_value` for a member no shape
+/// claims) and refuses a body nesting deeper than `MAX_DEPTH` (127) with a `SerdeError`,
+/// which the protocol boundary renders as a client refusal. Every `$d.read_*` below goes
+/// through one of those readers, so a request-chosen nesting depth cannot drive this
+/// recursion past that limit — `a_deeply_nested_request_body_is_refused_not_fatal` in
+/// `tests/all/component_wire_fidelity.rs` pins that. Element and entry COUNTS are bounded
+/// by the request body the server already reads with a cap, not per collection.
+macro_rules! read_member {
+    ($d:ident, $m:expr, string) => { $d.read_string($m)? };
+    ($d:ident, $m:expr, boolean) => { $d.read_boolean($m)? };
+    ($d:ident, $m:expr, date_time) => { $d.read_timestamp($m)? };
+    ($d:ident, $m:expr, map_of_string) => {{
+        let mut __out: ::std::collections::HashMap<
+            ::std::string::String,
+            ::std::string::String,
+        > = ::std::collections::HashMap::new();
+        $d.read_map($m, &mut |__k, __dm| {
+            __out.insert(__k, __dm.read_string($m)?);
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, map_of_map_of_string) => {{
+        let mut __out: ::std::collections::HashMap<
+            ::std::string::String,
+            ::std::collections::HashMap<::std::string::String, ::std::string::String>,
+        > = ::std::collections::HashMap::new();
+        $d.read_map($m, &mut |__k, __dm| {
+            let mut __inner: ::std::collections::HashMap<
+                ::std::string::String,
+                ::std::string::String,
+            > = ::std::collections::HashMap::new();
+            __dm.read_map($m, &mut |__ik, __dm_inner| {
+                __inner.insert(__ik, __dm_inner.read_string($m)?);
+                Ok(())
+            })?;
+            __out.insert(__k, __inner);
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, map_of($inner:ty)) => {{
+        let mut __out: ::std::collections::HashMap<::std::string::String, $inner> =
+            ::std::collections::HashMap::new();
+        $d.read_map($m, &mut |__k, __dm| {
+            let __value =
+                <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__dm)?;
+            __out.insert(__k, __value);
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, list_of($inner:ty)) => {{
+        let mut __out: ::std::vec::Vec<$inner> = ::std::vec::Vec::new();
+        $d.read_list($m, &mut |__dl| {
+            __out.push(
+                <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__dl)?,
+            );
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, struct_of($inner:ty)) => {
+        <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize($d)?
+    };
+    ($d:ident, $m:expr, union_of($inner:ty)) => {
+        <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize($d)?
+    };
+}
+
+/// The schema, the serializer and the deserializer for one structure, from its member
+/// list: everything `#[smithy_macros::smithy(shape = ...)]` emits for an output shape,
+/// with `@timestampFormat` honoured. Each member entry is
+/// `(CONST, field, "wireName", index, req|opt, kind)`; `req` is a `@required` member (a
+/// bare Rust field, refused when absent on the wire) and `opt` an `Option` one.
+macro_rules! schema_and_codec_for {
+    (
+        $ty:ident, $schema_static:ident, $shape:literal, $ns:literal, $local:literal,
+        $( ( $cname:ident, $field:ident, $wire:literal, $idx:literal, $presence:tt, $($kind:tt)+ ) ),+ $(,)?
+    ) => {
+        #[allow(non_upper_case_globals)]
+        impl $ty {
+            $(
+                pub const $cname: ::aws_smithy_schema::Schema =
+                    schema_for!($ns, $local, $wire, $idx, $($kind)+);
+            )+
+
+            pub const SCHEMA: ::aws_smithy_schema::Schema =
+                ::aws_smithy_schema::Schema::new_struct(
+                    ::aws_smithy_schema::ShapeId::from_static($shape, $ns, $local),
+                    ::aws_smithy_schema::ShapeType::Structure,
+                    &[$(&Self::$cname,)+],
+                );
+        }
+
+        pub static $schema_static: &::aws_smithy_schema::Schema = &$ty::SCHEMA;
+
+        impl ::aws_smithy_schema::serde::SerializableStruct for $ty {
+            fn serialize_members(
+                &self,
+                s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+            ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+                $(
+                    write_present_member!(s, self, Self::$cname, $field, $presence, $($kind)+);
+                )+
+                Ok(())
+            }
+        }
+
+        impl ::aws_smithy_schema_server::DeserializableStruct for $ty {
+            fn deserialize(
+                d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+            ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+                $( let mut $field = ::std::option::Option::None; )+
+                d.read_struct(&Self::SCHEMA, &mut |member, d| {
+                    match member.member_index() {
+                        $(
+                            ::std::option::Option::Some($idx) => {
+                                $field = ::std::option::Option::Some(
+                                    read_member!(d, &Self::$cname, $($kind)+),
+                                );
+                            }
+                        )+
+                        _ => {}
+                    }
+                    Ok(())
+                })?;
+                Ok(Self {
+                    $( $field: member_value!($field, $wire, $presence) ),+
+                })
+            }
+        }
+    };
+}
+
+/// Write a member only when the value is there: a `@required` member always, an `Option`
+/// one when it is `Some` — the codegen's own `is_option` split.
+macro_rules! write_present_member {
+    ($s:ident, $this:ident, $m:path, $field:ident, req, $($kind:tt)+) => {
+        write_member!($s, &$m, (&$this.$field), $($kind)+);
+    };
+    ($s:ident, $this:ident, $m:path, $field:ident, opt, $($kind:tt)+) => {
+        if let ::std::option::Option::Some(__v) = $this.$field.as_ref() {
+            write_member!($s, &$m, __v, $($kind)+);
+        }
+    };
+}
+
+/// The value a read slot contributes to the struct: a `@required` member absent from the
+/// wire is refused by name, an optional one stays `None`.
+macro_rules! member_value {
+    ($slot:ident, $wire:literal, req) => {
+        $slot.ok_or_else(|| ::aws_smithy_schema_server::missing_member($wire))?
+    };
+    ($slot:ident, $wire:literal, opt) => {
+        $slot
+    };
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.amplifyuibuilder#InvalidParameterException")]
 #[derive(Debug, Clone, Default)]
 pub struct InvalidParameterException {
@@ -150,7 +470,9 @@ pub struct CodegenFeatureFlags {
     pub is_non_model_supported: Option<bool>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.amplifyuibuilder#CodegenJob")]
+/// A code generation job. Member set and order from
+/// `smithy_query(query="shape", shape="CodegenJob")`; its schema is hand-written because
+/// `createdAt`/`modifiedAt` carry `@timestampFormat("date-time")` (see the note above).
 #[derive(Debug, Clone, Default)]
 pub struct CodegenJob {
     pub id: String,
@@ -168,6 +490,77 @@ pub struct CodegenJob {
     pub modified_at: Option<::aws_smithy_types::DateTime>,
     pub dependencies: Option<Vec<CodegenDependency>>,
 }
+
+schema_and_codec_for!(
+    CodegenJob,
+    CODEGEN_JOB_SCHEMA,
+    "com.amazonaws.amplifyuibuilder#CodegenJob",
+    "com.amazonaws.amplifyuibuilder",
+    "CodegenJob",
+    (M_ID, id, "id", 0, req, string),
+    (M_APP_ID, app_id, "appId", 1, req, string),
+    (
+        M_ENVIRONMENT_NAME,
+        environment_name,
+        "environmentName",
+        2,
+        req,
+        string
+    ),
+    (
+        M_RENDER_CONFIG,
+        render_config,
+        "renderConfig",
+        3,
+        opt,
+        union_of(CodegenJobRenderConfig)
+    ),
+    (
+        M_GENERIC_DATA_SCHEMA,
+        generic_data_schema,
+        "genericDataSchema",
+        4,
+        opt,
+        struct_of(CodegenJobGenericDataSchema)
+    ),
+    (
+        M_AUTO_GENERATE_FORMS,
+        auto_generate_forms,
+        "autoGenerateForms",
+        5,
+        opt,
+        boolean
+    ),
+    (
+        M_FEATURES,
+        features,
+        "features",
+        6,
+        opt,
+        struct_of(CodegenFeatureFlags)
+    ),
+    (M_STATUS, status, "status", 7, opt, string),
+    (
+        M_STATUS_MESSAGE,
+        status_message,
+        "statusMessage",
+        8,
+        opt,
+        string
+    ),
+    (M_ASSET, asset, "asset", 9, opt, struct_of(CodegenJobAsset)),
+    (M_TAGS, tags, "tags", 10, opt, map_of_string),
+    (M_CREATED_AT, created_at, "createdAt", 11, opt, date_time),
+    (M_MODIFIED_AT, modified_at, "modifiedAt", 12, opt, date_time),
+    (
+        M_DEPENDENCIES,
+        dependencies,
+        "dependencies",
+        13,
+        opt,
+        list_of(CodegenDependency)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.amplifyuibuilder#CodegenJobAsset")]
 #[derive(Debug, Clone, Default)]
@@ -326,7 +719,9 @@ pub struct SortProperty {
     pub direction: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.amplifyuibuilder#Component")]
+/// A component of an Amplify app. Member set and order from
+/// `smithy_query(query="shape", shape="Component")`; its schema is hand-written because
+/// `createdAt`/`modifiedAt` carry `@timestampFormat("date-time")` (see the note above).
 #[derive(Debug, Clone)]
 pub struct Component {
     pub app_id: String,
@@ -347,6 +742,101 @@ pub struct Component {
     pub events: Option<std::collections::HashMap<String, ComponentEvent>>,
     pub schema_version: Option<String>,
 }
+
+schema_and_codec_for!(
+    Component,
+    COMPONENT_SCHEMA,
+    "com.amazonaws.amplifyuibuilder#Component",
+    "com.amazonaws.amplifyuibuilder",
+    "Component",
+    (M_APP_ID, app_id, "appId", 0, req, string),
+    (
+        M_ENVIRONMENT_NAME,
+        environment_name,
+        "environmentName",
+        1,
+        req,
+        string
+    ),
+    (M_SOURCE_ID, source_id, "sourceId", 2, opt, string),
+    (M_ID, id, "id", 3, req, string),
+    (M_NAME, name, "name", 4, req, string),
+    (
+        M_COMPONENT_TYPE,
+        component_type,
+        "componentType",
+        5,
+        req,
+        string
+    ),
+    (
+        M_PROPERTIES,
+        properties,
+        "properties",
+        6,
+        req,
+        map_of(ComponentProperty)
+    ),
+    (
+        M_CHILDREN,
+        children,
+        "children",
+        7,
+        opt,
+        list_of(ComponentChild)
+    ),
+    (
+        M_VARIANTS,
+        variants,
+        "variants",
+        8,
+        req,
+        list_of(ComponentVariant)
+    ),
+    (
+        M_OVERRIDES,
+        overrides,
+        "overrides",
+        9,
+        req,
+        map_of_map_of_string
+    ),
+    (
+        M_BINDING_PROPERTIES,
+        binding_properties,
+        "bindingProperties",
+        10,
+        req,
+        map_of(ComponentBindingPropertiesValue)
+    ),
+    (
+        M_COLLECTION_PROPERTIES,
+        collection_properties,
+        "collectionProperties",
+        11,
+        opt,
+        map_of(ComponentDataConfiguration)
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 12, req, date_time),
+    (M_MODIFIED_AT, modified_at, "modifiedAt", 13, opt, date_time),
+    (M_TAGS, tags, "tags", 14, opt, map_of_string),
+    (
+        M_EVENTS,
+        events,
+        "events",
+        15,
+        opt,
+        map_of(ComponentEvent)
+    ),
+    (
+        M_SCHEMA_VERSION,
+        schema_version,
+        "schemaVersion",
+        16,
+        opt,
+        string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.amplifyuibuilder#ResourceConflictException")]
 #[derive(Debug, Clone, Default)]
@@ -545,7 +1035,9 @@ pub struct ThemeValue {
     pub children: Option<Vec<ThemeValues>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.amplifyuibuilder#Theme")]
+/// A theme of an Amplify app. Member set and order from
+/// `smithy_query(query="shape", shape="Theme")`; its schema is hand-written because
+/// `createdAt`/`modifiedAt` carry `@timestampFormat("date-time")` (see the note above).
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub app_id: String,
@@ -558,6 +1050,37 @@ pub struct Theme {
     pub overrides: Option<Vec<ThemeValues>>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+schema_and_codec_for!(
+    Theme,
+    THEME_SCHEMA,
+    "com.amazonaws.amplifyuibuilder#Theme",
+    "com.amazonaws.amplifyuibuilder",
+    "Theme",
+    (M_APP_ID, app_id, "appId", 0, req, string),
+    (
+        M_ENVIRONMENT_NAME,
+        environment_name,
+        "environmentName",
+        1,
+        req,
+        string
+    ),
+    (M_ID, id, "id", 2, req, string),
+    (M_NAME, name, "name", 3, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 4, req, date_time),
+    (M_MODIFIED_AT, modified_at, "modifiedAt", 5, opt, date_time),
+    (M_VALUES, values, "values", 6, req, list_of(ThemeValues)),
+    (
+        M_OVERRIDES,
+        overrides,
+        "overrides",
+        7,
+        opt,
+        list_of(ThemeValues)
+    ),
+    (M_TAGS, tags, "tags", 8, opt, map_of_string),
+);
 
 /// The values `CodegenGenericDataFieldDataType` accepts on the wire.
 pub const CODEGEN_GENERIC_DATA_FIELD_DATA_TYPE_VALUES: &[&str] = &["AWSDate", "AWSDateTime", "AWSEmail", "AWSIPAddress", "AWSJSON", "AWSPhone", "AWSTime", "AWSTimestamp", "AWSURL", "Boolean", "Enum", "Float", "ID", "Int", "Model", "NonModel", "String"];

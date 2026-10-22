@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomPlugin
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomPlugin`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomPlugin::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a custom plugin under a freshly minted `customPluginArn` and answers with the
+//! identity the service assigned it. A name identifies at most one plugin, so a repeat of
+//! a stored name is a `ConflictException`. The plugin is answered `CREATING` and becomes
+//! `ACTIVE` once the clock says so (`crate::state::TRANSITION_SPAN`), which every later
+//! read materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +164,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomPlugin` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomPluginErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomPlugin"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCustomPluginErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the kafkaconnect store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+        state.settle_due();
+
+        if let Some(existing) = state.custom_plugin_named(&input.name) {
+            return Err(CreateCustomPluginErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A custom plugin named {} already exists ({}). Retry your request with another name.",
+                    input.name, existing.arn
+                )),
+            })
+            .into());
+        }
+
+        // The quota on stored custom plugins. The real service meters this and
+        // answers the same error once it is reached.
+        if state.custom_plugin_quota_reached() {
+            return Err(CreateCustomPluginErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "Limit exceeded. Resource limit reached: this account already holds {} custom plugins.",
+                        crate::state::RESOURCE_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_resource_id("custom-plugin", &input.name);
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &region,
+            &format!("custom-plugin/{}/{}", input.name, id),
+        );
+        let plugin = crate::state::CustomPluginRecord {
+            arn: arn.clone(),
+            name: input.name,
+            description: input.description,
+            content_type: input.content_type,
+            location: input.location,
+            state: crate::state::CUSTOM_PLUGIN_CREATING.to_string(),
+            revision: crate::state::FIRST_PLUGIN_REVISION,
+            creation_time: ::std::time::SystemTime::now(),
+            tags: input.tags.unwrap_or_default(),
+            pending: Some(crate::state::PendingChange::in_a_moment(
+                crate::state::PendingKind::Settle,
+            )),
+        };
+
+        let output = CreateCustomPluginOutput {
+            custom_plugin_arn: Some(plugin.arn.clone()),
+            custom_plugin_state: Some(plugin.state.clone()),
+            name: Some(plugin.name.clone()),
+            revision: plugin.revision,
+        };
+        state.custom_plugins.insert(arn, plugin);
+        Ok(output)
     }
 }

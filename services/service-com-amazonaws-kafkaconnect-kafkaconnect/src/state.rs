@@ -1,11 +1,558 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-kafkaconnect-kafkaconnect service.
+//!
+//! Two resources live here — custom plugins and connectors — beside the
+//! conversions from the shapes a create request carries to the `*Description`
+//! shapes the read operations answer with, and the paging helper both list
+//! operations share. Every handler in `src/ops/` reaches this ONE struct through
+//! [`service_state`], so no two operations can read two copies of one resource.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime};
+
+use sha2::Digest;
+
+#[allow(unused_imports)]
+use crate::ops::types::*;
+
+/// The marker every `nextToken` this service issues carries, so a token it did
+/// not issue is refused rather than honoured as a resume point.
+const PAGE_TOKEN_MARKER: &str = "kafkaconnect:v1:";
+
+/// The region an ARN carries when the caller signed with no credential scope the
+/// service can read (an unsigned request in a test, say). Every emulator
+/// defaults to `us-east-1`.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The ARN service namespace (`arnNamespace` in the model's `aws.api#service`
+/// trait) every ARN this service mints carries.
+pub const ARN_SERVICE: &str = "kafkaconnect";
+
+/// How long after the call that starts it a resource's move out of its transient
+/// state is due.
+///
+/// `CreateCustomPlugin` and `CreateConnector` both answer with a non-terminal
+/// state (`CREATING`), and `DeleteConnector` / `DeleteCustomPlugin` both answer
+/// with `DELETING` for a resource that is still there; the clock, not the next
+/// call, is what finishes each of those. The span is deliberately non-zero, so a
+/// caller that reads the resource straight after creating it still observes
+/// `CREATING` — exactly as it would against the real service, where the
+/// transition takes minutes. It is a chosen span (AWS documents no duration for
+/// it), kept short enough that a test can wait it out.
+pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
+
+/// `CustomPluginState` while the plugin's file is still being taken on; one of
+/// [`CUSTOM_PLUGIN_STATE_VALUES`].
+pub const CUSTOM_PLUGIN_CREATING: &str = "CREATING";
+/// `CustomPluginState` once the plugin can be referenced by a connector.
+pub const CUSTOM_PLUGIN_ACTIVE: &str = "ACTIVE";
+/// `CustomPluginState` between `DeleteCustomPlugin` and the plugin's removal.
+pub const CUSTOM_PLUGIN_DELETING: &str = "DELETING";
+
+/// `ConnectorState` while the connector's workers are being provisioned; one of
+/// [`CONNECTOR_STATE_VALUES`].
+pub const CONNECTOR_CREATING: &str = "CREATING";
+/// `ConnectorState` once the connector's workers run.
+pub const CONNECTOR_RUNNING: &str = "RUNNING";
+/// `ConnectorState` between `DeleteConnector` and the connector's removal.
+pub const CONNECTOR_DELETING: &str = "DELETING";
+
+/// The version a freshly created connector is at. `currentVersion` is an opaque
+/// string to a client, which only ever echoes it back on an update or a delete.
+pub const FIRST_CONNECTOR_VERSION: &str = "1";
+
+/// The revision a freshly created custom plugin is at. `CustomPlugin$revision`
+/// is modelled `__longMin1` (range 1..), so revisions start at one.
+pub const FIRST_PLUGIN_REVISION: i64 = 1;
+
+/// The `networkType` a connector that named none takes: "Defaults to IPV4",
+/// per the `networkType` member's own documentation.
+pub const DEFAULT_NETWORK_TYPE: &str = "IPV4";
+
+/// The largest page either list operation returns, and the page it returns when
+/// the caller names no `maxResults`: the `MaxResults` shape's own maximum
+/// (`range 1..100`).
+pub const MAX_PAGE_SIZE: i32 = 100;
+/// The smallest page `maxResults` may ask for, from the same `range`.
+pub const MIN_PAGE_SIZE: i32 = 1;
+
+/// How many custom plugins, and how many connectors, this emulator holds before
+/// it refuses the next create with the modelled `TooManyRequestsException`
+/// (HTTP 429, "Limit exceeded. Resource limit reached.").
+///
+/// The real service meters both resources against a service quota and answers
+/// that same error once it is reached, so a cap is the faithful behaviour as
+/// well as the one that keeps a long-lived emulator's state from growing without
+/// bound on repeated calls. The value is the quota AWS ships for MSK Connect
+/// connectors and custom plugins.
+///
+/// The cap, like the name uniqueness both creates check, is counted over this
+/// emulator's ONE store: the emulator serves a single account and does not
+/// partition state by region, so a resource created under one signing region is
+/// the same resource a call signed for another region reads. Only the ARN a
+/// resource was minted with records the region of the call that created it.
+pub const RESOURCE_QUOTA: usize = 100;
+
+/// What the clock still owes a resource, and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingChange {
+    /// Which change is owed.
+    pub kind: PendingKind,
+    /// The instant it becomes due. Stored, never slept on.
+    pub due: Instant,
+}
+
+impl PendingChange {
+    /// The change `kind`, due [`TRANSITION_SPAN`] from now.
+    pub fn in_a_moment(kind: PendingKind) -> Self {
+        Self {
+            kind,
+            due: Instant::now() + TRANSITION_SPAN,
+        }
+    }
+
+    /// Whether this change is owed at `now`.
+    pub fn is_due(&self, now: Instant) -> bool {
+        self.due <= now
+    }
+}
+
+/// The two changes the clock owes a kafkaconnect resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingKind {
+    /// Leave the transient creating state for the resource's running state.
+    Settle,
+    /// Finish a delete: drop the resource.
+    Remove,
+}
+
+/// One stored custom plugin: the whole `CreateCustomPlugin` request plus the
+/// identity and lifecycle the service assigned it.
+#[derive(Debug, Clone)]
+pub struct CustomPluginRecord {
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub content_type: String,
+    pub location: CustomPluginLocation,
+    pub state: String,
+    pub revision: i64,
+    pub creation_time: SystemTime,
+    pub tags: HashMap<String, String>,
+    pub pending: Option<PendingChange>,
+}
+
+impl CustomPluginRecord {
+    /// This plugin's stored location, as the read operations report it.
+    pub fn location_description(&self) -> CustomPluginLocationDescription {
+        CustomPluginLocationDescription {
+            s3_location: Some(S3LocationDescription {
+                bucket_arn: Some(self.location.s3_location.bucket_arn.clone()),
+                file_key: Some(self.location.s3_location.file_key.clone()),
+                object_version: self.location.s3_location.object_version.clone(),
+            }),
+        }
+    }
+
+    /// The summary of this plugin's latest (only) revision.
+    ///
+    /// `fileDescription` is left unset: it reports the md5 and size of the
+    /// plugin file in the caller's S3 bucket, which this emulator never reads.
+    pub fn latest_revision(&self) -> CustomPluginRevisionSummary {
+        CustomPluginRevisionSummary {
+            content_type: Some(self.content_type.clone()),
+            creation_time: Some(date_time(self.creation_time)),
+            description: self.description.clone(),
+            file_description: None,
+            location: Some(self.location_description()),
+            revision: self.revision,
+        }
+    }
+
+    /// This plugin as `ListCustomPlugins` reports it.
+    pub fn summary(&self) -> CustomPluginSummary {
+        CustomPluginSummary {
+            creation_time: Some(date_time(self.creation_time)),
+            custom_plugin_arn: Some(self.arn.clone()),
+            custom_plugin_state: Some(self.state.clone()),
+            description: self.description.clone(),
+            latest_revision: Some(self.latest_revision()),
+            name: Some(self.name.clone()),
+        }
+    }
+}
+
+/// One stored connector: the whole `CreateConnector` request plus the identity,
+/// version and lifecycle the service assigned it.
+#[derive(Debug, Clone)]
+pub struct ConnectorRecord {
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub configuration: HashMap<String, String>,
+    pub capacity: Capacity,
+    pub kafka_cluster: KafkaCluster,
+    pub kafka_cluster_client_authentication: KafkaClusterClientAuthentication,
+    pub kafka_cluster_encryption_in_transit: KafkaClusterEncryptionInTransit,
+    pub kafka_connect_version: String,
+    pub network_type: String,
+    pub plugins: Vec<Plugin>,
+    pub service_execution_role_arn: String,
+    pub worker_configuration: Option<WorkerConfiguration>,
+    pub log_delivery: Option<LogDelivery>,
+    pub state: String,
+    pub current_version: String,
+    pub creation_time: SystemTime,
+    pub tags: HashMap<String, String>,
+    pub pending: Option<PendingChange>,
+}
+
+impl ConnectorRecord {
+    /// This connector's stored capacity, as the read operations report it.
+    pub fn capacity_description(&self) -> CapacityDescription {
+        CapacityDescription {
+            auto_scaling: self
+                .capacity
+                .auto_scaling
+                .as_ref()
+                .map(|scaling| AutoScalingDescription {
+                    max_worker_count: scaling.max_worker_count,
+                    mcu_count: scaling.mcu_count,
+                    min_worker_count: scaling.min_worker_count,
+                    scale_in_policy: scaling.scale_in_policy.as_ref().map(|policy| {
+                        ScaleInPolicyDescription {
+                            cpu_utilization_percentage: policy.cpu_utilization_percentage,
+                        }
+                    }),
+                    scale_out_policy: scaling.scale_out_policy.as_ref().map(|policy| {
+                        ScaleOutPolicyDescription {
+                            cpu_utilization_percentage: policy.cpu_utilization_percentage,
+                        }
+                    }),
+                    max_autoscaling_task_count: scaling.max_autoscaling_task_count,
+                }),
+            provisioned_capacity: self.capacity.provisioned_capacity.as_ref().map(|fixed| {
+                ProvisionedCapacityDescription {
+                    mcu_count: fixed.mcu_count,
+                    worker_count: fixed.worker_count,
+                }
+            }),
+        }
+    }
+
+    /// This connector's stored Kafka cluster, as the read operations report it.
+    pub fn kafka_cluster_description(&self) -> KafkaClusterDescription {
+        let cluster = &self.kafka_cluster.apache_kafka_cluster;
+        KafkaClusterDescription {
+            apache_kafka_cluster: Some(ApacheKafkaClusterDescription {
+                bootstrap_servers: Some(cluster.bootstrap_servers.clone()),
+                vpc: Some(VpcDescription {
+                    security_groups: cluster.vpc.security_groups.clone(),
+                    subnets: Some(cluster.vpc.subnets.clone()),
+                }),
+            }),
+        }
+    }
+
+    /// This connector's stored client authentication, as reported.
+    pub fn client_authentication_description(&self) -> KafkaClusterClientAuthenticationDescription {
+        KafkaClusterClientAuthenticationDescription {
+            authentication_type: Some(
+                self.kafka_cluster_client_authentication
+                    .authentication_type
+                    .clone(),
+            ),
+        }
+    }
+
+    /// This connector's stored encryption in transit, as reported.
+    pub fn encryption_in_transit_description(&self) -> KafkaClusterEncryptionInTransitDescription {
+        KafkaClusterEncryptionInTransitDescription {
+            encryption_type: Some(
+                self.kafka_cluster_encryption_in_transit
+                    .encryption_type
+                    .clone(),
+            ),
+        }
+    }
+
+    /// This connector's stored log delivery, as reported; `None` when the
+    /// request named none.
+    pub fn log_delivery_description(&self) -> Option<LogDeliveryDescription> {
+        let delivery = self.log_delivery.as_ref()?;
+        let worker = &delivery.worker_log_delivery;
+        Some(LogDeliveryDescription {
+            worker_log_delivery: Some(WorkerLogDeliveryDescription {
+                cloud_watch_logs: worker.cloud_watch_logs.as_ref().map(|logs| {
+                    CloudWatchLogsLogDeliveryDescription {
+                        enabled: logs.enabled,
+                        log_group: logs.log_group.clone(),
+                    }
+                }),
+                firehose: worker
+                    .firehose
+                    .as_ref()
+                    .map(|firehose| FirehoseLogDeliveryDescription {
+                        delivery_stream: firehose.delivery_stream.clone(),
+                        enabled: firehose.enabled,
+                    }),
+                s3: worker.s3.as_ref().map(|s3| S3LogDeliveryDescription {
+                    bucket: s3.bucket.clone(),
+                    enabled: s3.enabled,
+                    prefix: s3.prefix.clone(),
+                }),
+            }),
+        })
+    }
+
+    /// This connector's stored worker configuration, as reported; `None` when
+    /// the request named none.
+    pub fn worker_configuration_description(&self) -> Option<WorkerConfigurationDescription> {
+        self.worker_configuration
+            .as_ref()
+            .map(|worker| WorkerConfigurationDescription {
+                revision: worker.revision,
+                worker_configuration_arn: Some(worker.worker_configuration_arn.clone()),
+            })
+    }
+
+    /// The plugins this connector was created with, as reported.
+    pub fn plugin_descriptions(&self) -> Vec<PluginDescription> {
+        self.plugins
+            .iter()
+            .map(|plugin| PluginDescription {
+                custom_plugin: Some(CustomPluginDescription {
+                    custom_plugin_arn: Some(plugin.custom_plugin.custom_plugin_arn.clone()),
+                    revision: plugin.custom_plugin.revision,
+                }),
+            })
+            .collect()
+    }
+
+    /// This connector as `ListConnectors` reports it.
+    pub fn summary(&self) -> ConnectorSummary {
+        ConnectorSummary {
+            capacity: Some(self.capacity_description()),
+            connector_arn: Some(self.arn.clone()),
+            connector_description: self.description.clone(),
+            connector_name: Some(self.name.clone()),
+            connector_state: Some(self.state.clone()),
+            creation_time: Some(date_time(self.creation_time)),
+            current_version: Some(self.current_version.clone()),
+            kafka_cluster: Some(self.kafka_cluster_description()),
+            kafka_cluster_client_authentication: Some(self.client_authentication_description()),
+            kafka_cluster_encryption_in_transit: Some(self.encryption_in_transit_description()),
+            kafka_connect_version: Some(self.kafka_connect_version.clone()),
+            log_delivery: self.log_delivery_description(),
+            network_type: Some(self.network_type.clone()),
+            plugins: Some(self.plugin_descriptions()),
+            service_execution_role_arn: Some(self.service_execution_role_arn.clone()),
+            worker_configuration: self.worker_configuration_description(),
+        }
+    }
+}
 
 /// Per-service state for com-amazonaws-kafkaconnect-kafkaconnect. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKafkaconnectKafkaconnectState {
-    // TODO: add service-specific state fields
+    /// Stored custom plugins, keyed by `customPluginArn`.
+    pub custom_plugins: HashMap<String, CustomPluginRecord>,
+    /// Stored connectors, keyed by `connectorArn`.
+    pub connectors: HashMap<String, ConnectorRecord>,
+    /// How many resources this service has minted an id for. Feeds the ARN
+    /// suffix, so two resources of one name (one created after the other was
+    /// deleted) never share an ARN.
+    pub minted: u64,
+}
+
+impl ComAmazonawsKafkaconnectKafkaconnectState {
+    /// Apply every change the clock already owes: a creating resource becomes
+    /// available, and a deleting one is dropped, once its due instant has
+    /// passed.
+    ///
+    /// Called at the top of EVERY handler, read or write, so what a caller sees
+    /// depends on the clock alone and not on which operation happened to run.
+    /// This is the one write a reporting operation may make: each change was
+    /// owed at the same instant whether or not anybody called.
+    pub fn settle_due(&mut self) {
+        let now = Instant::now();
+
+        self.custom_plugins
+            .retain(|_, plugin| !removal_due(plugin.pending, now));
+        for plugin in self.custom_plugins.values_mut() {
+            if settling_due(plugin.pending, now) {
+                plugin.state = CUSTOM_PLUGIN_ACTIVE.to_string();
+                plugin.pending = None;
+            }
+        }
+
+        self.connectors
+            .retain(|_, connector| !removal_due(connector.pending, now));
+        for connector in self.connectors.values_mut() {
+            if settling_due(connector.pending, now) {
+                connector.state = CONNECTOR_RUNNING.to_string();
+                connector.pending = None;
+            }
+        }
+    }
+
+    /// Whether this store already holds as many custom plugins as it may
+    /// ([`RESOURCE_QUOTA`], counted over the whole store), so the next
+    /// `CreateCustomPlugin` must be refused.
+    pub fn custom_plugin_quota_reached(&self) -> bool {
+        self.custom_plugins.len() >= RESOURCE_QUOTA
+    }
+
+    /// Whether this store already holds as many connectors as it may
+    /// ([`RESOURCE_QUOTA`], counted over the whole store), so the next
+    /// `CreateConnector` must be refused.
+    pub fn connector_quota_reached(&self) -> bool {
+        self.connectors.len() >= RESOURCE_QUOTA
+    }
+
+    /// The stored plugin of this name, if any. A name identifies at most one
+    /// plugin, which is what makes a repeat of it a conflict.
+    pub fn custom_plugin_named(&self, name: &str) -> Option<&CustomPluginRecord> {
+        self.custom_plugins
+            .values()
+            .find(|plugin| plugin.name == name)
+    }
+
+    /// The stored connector of this name, if any.
+    pub fn connector_named(&self, name: &str) -> Option<&ConnectorRecord> {
+        self.connectors
+            .values()
+            .find(|connector| connector.name == name)
+    }
+
+    /// Mint the random-looking suffix of a resource ARN: the UUID AWS gives a
+    /// kafkaconnect resource.
+    ///
+    /// Derived from this service's own mint counter through SHA-256, with the
+    /// version and variant nibbles set, so the result is a syntactically valid
+    /// v4-shaped UUID that is unique within the emulator and reproducible for a
+    /// given sequence of calls — never derived from the request's own values,
+    /// which would collide across two resources of the same name.
+    pub fn mint_resource_id(&mut self, kind: &str, name: &str) -> String {
+        self.minted = self.minted.saturating_add(1);
+        let seed = format!("{ARN_SERVICE}/{kind}/{name}/{}", self.minted);
+        let digest = sha2::Sha256::digest(seed.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex = hex::encode(bytes);
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
+    }
+}
+
+/// Whether `pending` is a removal that is already owed at `now`.
+fn removal_due(pending: Option<PendingChange>, now: Instant) -> bool {
+    pending.is_some_and(|change| change.kind == PendingKind::Remove && change.is_due(now))
+}
+
+/// Whether `pending` is a move out of the creating state that is already owed.
+fn settling_due(pending: Option<PendingChange>, now: Instant) -> bool {
+    pending.is_some_and(|change| change.kind == PendingKind::Settle && change.is_due(now))
+}
+
+/// `at` as the `__timestampIso8601` the read operations carry.
+pub fn date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(at)
+}
+
+/// The region every ARN this request mints carries: the one the caller signed
+/// for, or [`DEFAULT_REGION`] when the request carries no credential scope.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// One page of a list operation: the items to answer with, and the `nextToken`
+/// that resumes after them (`None` when this page is the last).
+#[derive(Debug)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_token: Option<String>,
+}
+
+/// A `nextToken` the service did not emit.
+#[derive(Debug)]
+pub struct BadPageToken;
+
+/// Page `keyed` — `(sort key, item)` pairs, one per stored resource — honouring
+/// `max_results` and resuming after `next_token`.
+///
+/// The key is the resource's ARN: unique and stable, so sorting by it gives both
+/// a total order and a resume point that survives a resource being created or
+/// deleted between two pages. The token is opaque (hex of that key), as the
+/// model's `@paginated` contract requires: a client only ever echoes it back.
+///
+/// `max_results` is clamped rather than refused because a value outside the
+/// `MaxResults` shape's `range 1..100` never reaches here: the framework refuses
+/// it from the model's own constraint before the handler runs (the tests assert
+/// 0 and 101 are 400s). The clamp is what keeps this helper total should a later
+/// caller page an unconstrained count.
+pub fn page<T>(
+    mut keyed: Vec<(String, T)>,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+) -> Result<Page<T>, BadPageToken> {
+    let resume_after = match next_token {
+        Some(token) => Some(decode_page_token(token)?),
+        None => None,
+    };
+    let page_size = max_results
+        .unwrap_or(MAX_PAGE_SIZE)
+        .clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE);
+    let page_size = usize::try_from(page_size).unwrap_or(1);
+
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut items = Vec::new();
+    let mut next = None;
+    for (key, item) in keyed {
+        if resume_after.as_deref().is_some_and(|from| key.as_str() < from) {
+            continue;
+        }
+        if items.len() == page_size {
+            next = Some(encode_page_token(&key));
+            break;
+        }
+        items.push(item);
+    }
+    Ok(Page {
+        items,
+        next_token: next,
+    })
+}
+
+/// The opaque form of a resume key: the key behind a marker only this service
+/// writes, hex-encoded. The marker is what makes a forged token detectable —
+/// without it any hex string would decode to "some" resume key and be honoured
+/// as a silent resume point.
+fn encode_page_token(key: &str) -> String {
+    hex::encode(format!("{PAGE_TOKEN_MARKER}{key}"))
+}
+
+/// The resume key inside an opaque token, or [`BadPageToken`] when the token is
+/// not one this service emitted.
+fn decode_page_token(token: &str) -> Result<String, BadPageToken> {
+    let bytes = hex::decode(token).map_err(|_| BadPageToken)?;
+    let decoded = String::from_utf8(bytes).map_err(|_| BadPageToken)?;
+    decoded
+        .strip_prefix(PAGE_TOKEN_MARKER)
+        .map(ToString::to_string)
+        .ok_or(BadPageToken)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
