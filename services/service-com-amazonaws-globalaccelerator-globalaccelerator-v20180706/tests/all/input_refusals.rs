@@ -92,7 +92,7 @@ fn error_code(body: &Value) -> String {
 /// The error message out of an awsJson error envelope. A modelled error renders its
 /// member as the model spells it (`Message`); the boundary's own envelope uses
 /// `message`, so both spellings are read here.
-fn error_message(body: &Value) -> String {
+pub(crate) fn error_message(body: &Value) -> String {
     body.get("Message")
         .or_else(|| body.get("message"))
         .and_then(Value::as_str)
