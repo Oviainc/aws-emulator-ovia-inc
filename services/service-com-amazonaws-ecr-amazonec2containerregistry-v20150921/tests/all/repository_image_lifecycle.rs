@@ -59,6 +59,11 @@ type PushCase<'a> = (
 /// pairs the listing must report for it.
 type FilterCase<'a> = (&'a str, Value, BTreeSet<ImagePair>);
 
+/// One row of the scanning-configuration table: the case name, the repository name, the
+/// `scanOnPush` the create carried (`None` when it named no scanning configuration), the
+/// `scanOnPush` values put in order, and whether the put names `registryId`.
+type ScanningCase<'a> = (&'a str, &'a str, Option<bool>, Vec<bool>, bool);
+
 /// The digest a registry addresses a manifest by: `sha256:<hex>` over the manifest
 /// bytes. Computed here independently of the crate's own helper.
 fn manifest_digest(manifest: &str) -> String {
@@ -320,6 +325,154 @@ async fn a_created_repository_is_described_from_what_was_stored() {
     assert_eq!(
         reported, created_names,
         "a describe naming no repository reports every stored one in name order"
+    );
+}
+
+/// `PutImageScanningConfiguration` replaces the named repository's image scanning
+/// configuration with the one the request carries, reports the setting it stored, and
+/// leaves it there for `DescribeRepositories` to read back. No other repository moves.
+///
+/// The rows differ along the setting the repository was created with (absent, off, on),
+/// the sequence of values put — a switch, a toggle and back, and the same value twice —
+/// whether the request names this registry, and the shape and length of the name.
+#[tokio::test]
+async fn image_scanning_configuration_is_replaced_by_what_was_put() {
+    // case, repository name, the create's `imageScanningConfiguration.scanOnPush`
+    // (`None` for a create that names no scanning configuration at all), the
+    // `scanOnPush` values put in order, and whether the put names `registryId`.
+    let cases: Vec<ScanningCase<'_>> = vec![
+        (
+            "created without one, switched on",
+            "scanned-app",
+            None,
+            vec![true],
+            false,
+        ),
+        (
+            "created without one, switched off",
+            "unscanned-app",
+            None,
+            vec![false],
+            false,
+        ),
+        (
+            "created off, toggled on and back off",
+            "toggling-app",
+            Some(false),
+            vec![true, false],
+            false,
+        ),
+        (
+            "created on, toggled off and back on, namespaced name",
+            "project-a/toggling-app",
+            Some(true),
+            vec![false, true],
+            false,
+        ),
+        (
+            "the same value put twice, shortest name the model admits",
+            "ab",
+            Some(false),
+            vec![true, true],
+            false,
+        ),
+        (
+            "naming this registry explicitly",
+            "explicit-registry-app",
+            None,
+            vec![true],
+            true,
+        ),
+    ];
+
+    let router = emulator();
+    // A repository nothing in this test puts a configuration on: its own setting must
+    // stay exactly as its create left it.
+    given_repository(
+        &router,
+        "untouched-app",
+        json!({"imageScanningConfiguration": {"scanOnPush": true}}),
+    )
+    .await;
+
+    for (case, name, created_with, puts, names_registry) in cases {
+        let mut create = json!({});
+        if let Some(scan_on_push) = created_with {
+            create["imageScanningConfiguration"] = json!({"scanOnPush": scan_on_push});
+        }
+        given_repository(&router, name, create).await;
+
+        for scan_on_push in puts {
+            let expected = json!({"scanOnPush": scan_on_push});
+            let mut request = json!({
+                "repositoryName": name,
+                "imageScanningConfiguration": expected.clone(),
+            });
+            if names_registry {
+                request["registryId"] = json!(REGISTRY_ID);
+            }
+
+            let put = ok(
+                &router,
+                case,
+                "PutImageScanningConfiguration",
+                &request,
+            )
+            .await;
+            assert_eq!(
+                at(&put, "/imageScanningConfiguration"),
+                expected,
+                "case {case:?}: the put reports the setting it stored, got {:?}",
+                at(&put, "/imageScanningConfiguration")
+            );
+            assert_eq!(
+                at(&put, "/repositoryName"),
+                json!(name),
+                "case {case:?}: the put reports the repository it updated, got {:?}",
+                at(&put, "/repositoryName")
+            );
+            assert_eq!(
+                at(&put, "/registryId"),
+                json!(REGISTRY_ID),
+                "case {case:?}: the put reports this registry, got {:?}",
+                at(&put, "/registryId")
+            );
+
+            let described = ok(
+                &router,
+                case,
+                "DescribeRepositories",
+                &json!({"repositoryNames": [name]}),
+            )
+            .await;
+            assert_eq!(
+                at(&described, "/repositories/0/imageScanningConfiguration"),
+                expected,
+                "case {case:?}: the stored repository reports the setting that was put, got {:?}",
+                at(&described, "/repositories/0/imageScanningConfiguration")
+            );
+            // The update touches that one setting and nothing else about the record.
+            assert_eq!(
+                at(&described, "/repositories/0/repositoryArn"),
+                json!(format!("arn:aws:ecr:{REGION}:{REGISTRY_ID}:repository/{name}")),
+                "case {case:?}: the repository keeps the identity its create computed, got {:?}",
+                at(&described, "/repositories/0/repositoryArn")
+            );
+        }
+    }
+
+    let untouched = ok(
+        &router,
+        "untouched-app",
+        "DescribeRepositories",
+        &json!({"repositoryNames": ["untouched-app"]}),
+    )
+    .await;
+    assert_eq!(
+        at(&untouched, "/repositories/0/imageScanningConfiguration"),
+        json!({"scanOnPush": true}),
+        "a put on one repository leaves every other repository's setting alone, got {:?}",
+        at(&untouched, "/repositories/0/imageScanningConfiguration")
     );
 }
 
@@ -1271,6 +1424,13 @@ async fn an_unknown_repository_is_refused_by_every_operation_that_names_one() {
             "DeleteRepository",
             json!({"repositoryName": "missing-repo", "force": true}),
         ),
+        (
+            "PutImageScanningConfiguration",
+            json!({
+                "repositoryName": "missing-repo",
+                "imageScanningConfiguration": {"scanOnPush": true},
+            }),
+        ),
     ];
 
     for (case, request) in cases {
@@ -1317,6 +1477,14 @@ async fn a_request_naming_another_registry_is_refused() {
         (
             "DeleteRepository",
             json!({"repositoryName": "present", "registryId": "123456789012"}),
+        ),
+        (
+            "PutImageScanningConfiguration",
+            json!({
+                "repositoryName": "present",
+                "registryId": "123456789012",
+                "imageScanningConfiguration": {"scanOnPush": true},
+            }),
         ),
     ];
 
