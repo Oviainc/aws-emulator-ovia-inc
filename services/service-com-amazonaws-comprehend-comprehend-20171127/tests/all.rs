@@ -15,6 +15,8 @@
 mod comprehend_client;
 #[path = "all/document_classifiers.rs"]
 mod document_classifiers;
+#[path = "all/request_validation.rs"]
+mod request_validation;
 #[path = "all/sentiment_jobs.rs"]
 mod sentiment_jobs;
 #[path = "all/state_roundtrip.rs"]

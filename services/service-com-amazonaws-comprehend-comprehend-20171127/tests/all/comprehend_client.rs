@@ -108,3 +108,18 @@ pub fn error_code(body: &Value) -> String {
         .unwrap_or("<no __type>")
         .to_string()
 }
+
+/// The message of a failure response.
+///
+/// Comprehend's modelled errors spell the member `Message`, as the model does,
+/// while the framework's own refusals (`ValidationException`) spell it `message`;
+/// both are read here so a suite asserts on the sentence without caring which
+/// layer produced it.
+pub fn error_message(body: &Value) -> String {
+    for key in ["Message", "message"] {
+        if let Some(message) = body.get(key).and_then(Value::as_str) {
+            return message.to_string();
+        }
+    }
+    "<no message>".to_string()
+}

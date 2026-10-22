@@ -65,8 +65,38 @@ pub const QUEUE_SPAN: Duration = Duration::from_millis(300);
 pub const PROCESSING_SPAN: Duration = Duration::from_millis(300);
 
 /// How long a job stays `STOP_REQUESTED` before the clock owes it `STOPPED`.
-/// The emulator's own span, chosen for the same reason as [`QUEUE_SPAN`].
+/// The emulator's own span, chosen for the same reason as [`QUEUE_SPAN`]. It is
+/// deliberately non-zero, so a caller that stops a job and reads it straight back
+/// still observes the intermediate `STOP_REQUESTED` state the stop reported.
 pub const STOPPING_SPAN: Duration = Duration::from_millis(300);
+
+/// The statuses an analysis job can never leave, out of
+/// `ops::types::JOB_STATUS_VALUES`.
+///
+/// A status is terminal when no further transition can take a job out of it:
+/// `COMPLETED` and `FAILED` end a run, and `STOPPED` ends a cancellation. The
+/// remaining three (`SUBMITTED`, `IN_PROGRESS`, `STOP_REQUESTED`) all still owe
+/// the clock a transition, so each of them is still stoppable.
+///
+/// `COMPLETED` is listed because the modelled vocabulary has it and this record
+/// serves every job family, not because a sentiment-detection job can reach it:
+/// [`AnalysisJob::settle`] ends a started job in `FAILED`, so `COMPLETED` is
+/// reserved for a family whose work this emulator can genuinely perform.
+pub const TERMINAL_JOB_STATUSES: &[&str] = &["COMPLETED", "FAILED", "STOPPED"];
+
+/// The message a `JobNotFoundException` carries, whichever job operation raised
+/// it and whatever `JobId` was asked for.
+///
+/// Amazon Comprehend answers a well-formed `JobId` that names no job with ONE
+/// fixed sentence: the refusal states that the service holds no such job, and
+/// nothing the caller sent is echoed back into it.
+pub const JOB_NOT_FOUND_MESSAGE: &str = "Could not find specified job.";
+
+/// The message the `InvalidRequestException` carries when a stop is refused
+/// because the job has already reached one of [`TERMINAL_JOB_STATUSES`]. Fixed
+/// for the same reason as [`JOB_NOT_FOUND_MESSAGE`]: it states the job's class of
+/// state, not the request.
+pub const JOB_ALREADY_TERMINAL_MESSAGE: &str = "Job is already in terminal state.";
 
 /// The most analysis-job records this emulator retains, across every family.
 ///
@@ -177,36 +207,43 @@ impl AnalysisJob {
     }
 
     /// Record that a caller asked for this job to stop, naming the reason in
-    /// `Message`. A job that has not started processing stops outright, because
-    /// nothing was running to wind down.
+    /// `Message`.
+    ///
+    /// Cancelling an analysis job is a TWO-PHASE transition for every job that is
+    /// not yet terminal, queued (`SUBMITTED`) as much as running
+    /// (`IN_PROGRESS`): the job is marked for termination — `STOP_REQUESTED`, the
+    /// status the stop call reports — and the clock owes it `STOPPED`
+    /// [`STOPPING_SPAN`] later, which [`Self::settle`] materialises. The job is
+    /// never put straight into `STOPPED`, so the intermediate state a client waits
+    /// for is always observable.
+    ///
+    /// A job already in one of [`TERMINAL_JOB_STATUSES`] never reaches here: the
+    /// stop operation refuses it with a 400 first ([`Self::is_terminal`]). One
+    /// already in `STOP_REQUESTED` keeps the due instant its first stop set — a
+    /// repeated stop neither postpones the settlement nor rewrites the `Message`.
     pub fn request_stop(&mut self, now: SystemTime) {
         match self.job_status.as_str() {
-            "SUBMITTED" => {
-                self.job_status = "STOPPED".to_string();
-                self.end_time = Some(now);
-            }
-            "IN_PROGRESS" => {
+            "SUBMITTED" | "IN_PROGRESS" => {
                 self.job_status = "STOP_REQUESTED".to_string();
                 self.stopped_due_at = Some(now + STOPPING_SPAN);
             }
-            // Already stopping, stopped, or terminal: nothing to wind down.
+            // Already stopping, or terminal: nothing more to mark.
             _ => return,
         }
         self.message = Some("The job was stopped at the request of the caller.".to_string());
     }
 
-    /// Whether this job has reached a status it can never leave.
+    /// Whether this job has reached a status it can never leave, i.e. one of
+    /// [`TERMINAL_JOB_STATUSES`].
     ///
-    /// `STOPPED` is deliberately NOT terminal here: the stop operation documents a
-    /// 400 only for `COMPLETED` and `FAILED`, so re-stopping a stopped job answers
-    /// 200 with its unchanged status rather than a refusal.
-    ///
-    /// `COMPLETED` is listed because the modelled vocabulary has it and this record
-    /// serves every job family, not because a sentiment-detection job can reach it:
-    /// [`Self::settle`] ends a started job in `FAILED`, so `COMPLETED` is reserved
-    /// for a family whose work this emulator can genuinely perform.
+    /// `STOPPED` is terminal: a cancelled job never re-enters the lifecycle, so a
+    /// further stop against it has nothing to mark and is refused with the same
+    /// 400 `InvalidRequestException` a finished job's stop gets. (The operation's
+    /// own prose names only `COMPLETED` and `FAILED` — and names the
+    /// dominant-language operation while doing it — but recorded behaviour refuses
+    /// a stop on a `STOPPED` job too, which is what "terminal" means.)
     pub fn is_terminal(&self) -> bool {
-        matches!(self.job_status.as_str(), "COMPLETED" | "FAILED")
+        TERMINAL_JOB_STATUSES.contains(&self.job_status.as_str())
     }
 
     /// Why a started job fails: the input it was pointed at was never read, so no

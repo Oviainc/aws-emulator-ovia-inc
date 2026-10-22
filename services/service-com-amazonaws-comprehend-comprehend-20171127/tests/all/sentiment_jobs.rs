@@ -19,9 +19,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::JOB_STATUS_VALUES;
-use service_com_amazonaws_comprehend_comprehend_20171127::state::MAX_ANALYSIS_JOB_RECORDS;
+use service_com_amazonaws_comprehend_comprehend_20171127::state::{
+    JOB_ALREADY_TERMINAL_MESSAGE, JOB_NOT_FOUND_MESSAGE, MAX_ANALYSIS_JOB_RECORDS,
+    TERMINAL_JOB_STATUSES,
+};
 
-use crate::comprehend_client::{error_code, Comprehend, ACCOUNT_ID, REGION};
+use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID, REGION};
 
 /// The lifecycle order a job's status may only move forward along.
 ///
@@ -118,6 +121,40 @@ async fn describe(comprehend: &Comprehend, job_id: &str) -> Value {
         )
         .await;
     output["SentimentDetectionJobProperties"].clone()
+}
+
+/// Poll `DescribeSentimentDetectionJob` until the job reports `status`, and
+/// return the properties reported then.
+async fn wait_for_status(comprehend: &Comprehend, job_id: &str, status: &str, case: &str) -> Value {
+    let started = Instant::now();
+    loop {
+        let properties = describe(comprehend, job_id).await;
+        if properties["JobStatus"].as_str() == Some(status) {
+            return properties;
+        }
+        assert!(
+            started.elapsed() < SETTLE_TIMEOUT,
+            "case {case:?}: the job never reached {status}, last read {properties}"
+        );
+        sleep(Duration::from_millis(40));
+    }
+}
+
+/// Poll `DescribeSentimentDetectionJob` until the job reports one of the statuses
+/// it can never leave, and return the properties reported then.
+async fn wait_for_terminal(comprehend: &Comprehend, job_id: &str, case: &str) -> Value {
+    let started = Instant::now();
+    loop {
+        let properties = describe(comprehend, job_id).await;
+        if TERMINAL_JOB_STATUSES.contains(&properties["JobStatus"].as_str().unwrap_or_default()) {
+            return properties;
+        }
+        assert!(
+            started.elapsed() < SETTLE_TIMEOUT,
+            "case {case:?}: the job never reached a terminal status, last read {properties}"
+        );
+        sleep(Duration::from_millis(40));
+    }
 }
 
 #[tokio::test]
@@ -306,6 +343,15 @@ async fn describe_and_stop_refuse_an_unknown_job_id() {
                 error_code(&body),
                 "JobNotFoundException",
                 "case {operation} with {job_id:?}: expected JobNotFoundException, got {body}"
+            );
+            // The refusal states that no such job exists and nothing else: the
+            // sentence is the same for every operation and every id, and echoes
+            // none of them.
+            assert_eq!(
+                error_message(&body),
+                JOB_NOT_FOUND_MESSAGE,
+                "case {operation} with {job_id:?}: expected the fixed not-found \
+                 sentence, got {body}"
             );
         }
     }
@@ -803,8 +849,13 @@ async fn list_refuses_a_token_it_did_not_issue() {
     }
 }
 
+/// Cancelling an analysis job is two-phase: a job that has not reached a status
+/// it can never leave is MARKED for termination, so the stop answers
+/// `STOP_REQUESTED` — never a terminal status — and the clock then owes the job
+/// `STOPPED`. Asserted over every submission, so it holds whatever the job was
+/// started with.
 #[tokio::test]
-async fn stopping_a_running_job_is_persisted_and_idempotent() {
+async fn a_stop_on_a_non_terminal_job_answers_stop_requested_then_settles_to_stopped() {
     let comprehend = Comprehend::new();
     let mut stopped_rows = 0usize;
 
@@ -816,13 +867,13 @@ async fn stopping_a_running_job_is_persisted_and_idempotent() {
             .await;
         if http_status == 400 {
             // The clock owed this job its terminal status before the stop reached
-            // it, which the operation documents as a 400. That is the other
-            // suite's case, so this row has nothing left to assert.
+            // it, which is a refusal. That is the other suite's case, so this row
+            // has nothing left to assert.
             let properties = describe(&comprehend, &job_id).await;
             assert_eq!(
                 properties["JobStatus"].as_str(),
                 Some(TERMINAL_STATUS),
-                "case {case:?}: a stop was refused for a job that is not finished: \
+                "case {case:?}: a stop was refused for a job that is not terminal: \
                  {stopped} with {properties}"
             );
             continue;
@@ -836,14 +887,18 @@ async fn stopping_a_running_job_is_persisted_and_idempotent() {
             Some(job_id.as_str()),
             "case {case:?}: Stop reported a different JobId: {stopped}"
         );
-        let status = stopped["JobStatus"].as_str().unwrap_or_default().to_string();
-        assert!(
-            status == "STOP_REQUESTED" || status == "STOPPED",
-            "case {case:?}: expected STOP_REQUESTED or STOPPED, got {stopped}"
+        assert_eq!(
+            stopped["JobStatus"].as_str(),
+            Some("STOP_REQUESTED"),
+            "case {case:?}: a stop on a non-terminal job must answer STOP_REQUESTED, \
+             got {stopped}"
         );
+        stopped_rows += 1;
 
-        // The new status is the stored one, so Describe observes it, and the stop
-        // explains itself in the modelled Message.
+        // The marked state is the STORED one, so Describe observes it, and the
+        // stop explains itself in the modelled Message. The stopping span is
+        // non-zero but not infinite, so a read taken straight after the call sees
+        // either the marked state or the `STOPPED` it settles into.
         let properties = describe(&comprehend, &job_id).await;
         let observed = properties["JobStatus"].as_str().unwrap_or_default();
         assert!(
@@ -858,17 +913,19 @@ async fn stopping_a_running_job_is_persisted_and_idempotent() {
              {properties}"
         );
 
-        // Stopping again changes nothing: a stopped job never re-enters the
-        // lifecycle.
-        let again = comprehend
-            .ok("StopSentimentDetectionJob", &json!({ "JobId": job_id }))
-            .await;
-        let repeated = again["JobStatus"].as_str().unwrap_or_default();
+        // And the clock settles it into STOPPED, which is where it stays: a
+        // cancelled job never re-enters the lifecycle, and reading it again
+        // changes nothing.
+        let settled = wait_for_status(&comprehend, &job_id, "STOPPED", case).await;
         assert!(
-            repeated == "STOP_REQUESTED" || repeated == "STOPPED",
-            "case {case:?}: a repeated stop changed the status to {again}"
+            settled["EndTime"].as_f64().is_some_and(|end| end > 0.0),
+            "case {case:?}: a stopped job must carry an EndTime, got {settled}"
         );
-        stopped_rows += 1;
+        let again = describe(&comprehend, &job_id).await;
+        assert_eq!(
+            settled, again,
+            "case {case:?}: reading a stopped job changed it: {settled} then {again}"
+        );
     }
 
     // The 400 branch above is a legitimate outcome for a row, but if EVERY row took
@@ -880,40 +937,81 @@ async fn stopping_a_running_job_is_persisted_and_idempotent() {
     );
 }
 
+/// A stop on a job that already holds a status it can never leave has nothing to
+/// mark for termination: it is refused with 400 `InvalidRequestException` and the
+/// stored record is left exactly as it was.
+///
+/// The rows are the terminal statuses a sentiment-detection job can be driven
+/// into: `FAILED`, which the clock owes a started job, and `STOPPED`, which the
+/// clock owes a cancelled one. `COMPLETED` is in the modelled vocabulary but no
+/// job reaches it here (nothing performs the batch run), so it cannot be driven.
 #[tokio::test]
-async fn stopping_a_job_that_already_finished_is_refused() {
+async fn a_stop_on_a_terminal_job_is_refused_and_changes_nothing() {
     let comprehend = Comprehend::new();
-    let (job_id, _) = start(
-        &comprehend,
-        "already finished",
-        &submission("only the required members"),
-    )
-    .await;
 
-    let started = Instant::now();
-    loop {
-        let properties = describe(&comprehend, &job_id).await;
-        if properties["JobStatus"].as_str() == Some(TERMINAL_STATUS) {
-            break;
+    for row in TERMINAL_JOB_STATUSES {
+        if *row == "COMPLETED" {
+            continue;
         }
-        assert!(
-            started.elapsed() < SETTLE_TIMEOUT,
-            "case \"already finished\": the job never reached {TERMINAL_STATUS}: \
-             {properties}"
-        );
-        sleep(Duration::from_millis(40));
-    }
-
-    let (status, body) = comprehend
-        .call("StopSentimentDetectionJob", &json!({ "JobId": job_id }))
+        let (job_id, _) = start(
+            &comprehend,
+            row,
+            &submission("only the required members"),
+        )
         .await;
-    assert_eq!(
-        status, 400,
-        "case \"already finished\": expected 400, got {status}: {body}"
-    );
-    assert_eq!(
-        error_code(&body),
-        "InvalidRequestException",
-        "case \"already finished\": expected InvalidRequestException, got {body}"
-    );
+
+        let mut expected = TERMINAL_STATUS;
+        if *row == "STOPPED" {
+            let (http_status, stopped) = comprehend
+                .call("StopSentimentDetectionJob", &json!({ "JobId": job_id }))
+                .await;
+            // A 200 means the stop landed, so this job's terminal status will be
+            // STOPPED; a 400 means the clock had already finished it, which is the
+            // FAILED row over again and is asserted identically below.
+            if http_status == 200 {
+                expected = "STOPPED";
+                assert_eq!(
+                    stopped["JobStatus"].as_str(),
+                    Some("STOP_REQUESTED"),
+                    "case {row}: the accepted stop must answer STOP_REQUESTED, got \
+                     {stopped}"
+                );
+            }
+        }
+
+        let before = wait_for_terminal(&comprehend, &job_id, row).await;
+        assert_eq!(
+            before["JobStatus"].as_str(),
+            Some(expected),
+            "case {row}: expected the job to settle into {expected}, got {before}"
+        );
+
+        // Twice, so the refusal is not a one-off and neither call moves the job.
+        for attempt in 1..=2 {
+            let (status, body) = comprehend
+                .call("StopSentimentDetectionJob", &json!({ "JobId": job_id }))
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {row} attempt {attempt}: expected 400, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidRequestException",
+                "case {row} attempt {attempt}: expected InvalidRequestException, got \
+                 {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                JOB_ALREADY_TERMINAL_MESSAGE,
+                "case {row} attempt {attempt}: unexpected refusal message in {body}"
+            );
+            let after = describe(&comprehend, &job_id).await;
+            assert_eq!(
+                after, before,
+                "case {row} attempt {attempt}: a refused stop must leave the job \
+                 unchanged: {before} became {after}"
+            );
+        }
+    }
 }
