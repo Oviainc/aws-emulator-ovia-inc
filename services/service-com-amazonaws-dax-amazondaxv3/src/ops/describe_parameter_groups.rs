@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeParameterGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeParameterGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeParameterGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the stored parameter groups back, in one stable order (by name), filtered by
+//! `ParameterGroupNames` when given and paged by `MaxResults`/`NextToken`. A name that
+//! names no stored group is answered with `ParameterGroupNotFoundFault`.
+//!
+//! It is a pure read: the default parameter group every DAX account carries is seeded
+//! into the store itself (`crate::state::ComAmazonawsDaxAmazondaxv3State::default`), so
+//! this handler writes nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +151,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeParameterGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeParameterGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeParameterGroups"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+
+        // "The value for MaxResults must be between 20 and 100" (`MaxResults`). DAX
+        // answers the recorded, request-independent template for this rejection.
+        if let Some(max_results) = input.max_results {
+            if !(crate::state::MIN_MAX_RESULTS..=crate::state::MAX_MAX_RESULTS)
+                .contains(&max_results)
+            {
+                return Err(
+                    DescribeParameterGroupsErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::max_results_out_of_range_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A continuation token this service did not issue is refused, rather than
+        // answering an arbitrary page with a 200.
+        let start_from = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_token(token) {
+                Some(from) => Some(from),
+                None => {
+                    return Err(
+                        DescribeParameterGroupsErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(
+                                    "NextToken is not a continuation token from a prior \
+                                     DescribeParameterGroups response"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        let store = state.lock();
+        // "If a parameter group name is specified, the list will contain only the
+        // descriptions for that group."
+        let requested = input.parameter_group_names.unwrap_or_default();
+        let names: Vec<String> = if requested.is_empty() {
+            store.parameter_groups.keys().cloned().collect()
+        } else {
+            let mut named: Vec<String> = Vec::with_capacity(requested.len());
+            for name in &requested {
+                if !store.parameter_groups.contains_key(name) {
+                    return Err(
+                        DescribeParameterGroupsErrorModeled::ParameterGroupNotFoundFault(
+                            ParameterGroupNotFoundFault {
+                                message: Some(crate::state::parameter_group_not_found_message()),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                named.push(name.clone());
+            }
+            named.sort_unstable();
+            named.dedup();
+            named
+        };
+
+        let all: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (page, next_token) =
+            crate::state::page(&all, input.max_results, start_from.as_deref());
+        let parameter_groups = page
+            .iter()
+            .filter_map(|name| store.parameter_groups.get(*name))
+            .map(crate::state::ParameterGroupRecord::view)
+            .collect();
+
+        Ok(DescribeParameterGroupsOutput {
+            next_token,
+            parameter_groups: Some(parameter_groups),
+        })
     }
 }

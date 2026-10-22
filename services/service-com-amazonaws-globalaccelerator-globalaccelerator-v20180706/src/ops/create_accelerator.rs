@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccelerator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccelerator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccelerator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and PERSISTS an accelerator in [`crate::state`]: a new ARN, the DNS name(s) the
+//! model's naming convention describes, two allocated static IPv4 addresses (plus two
+//! IPv6 addresses for a dual-stack accelerator), `Enabled` defaulting to true, and a
+//! deployment that settles from `IN_PROGRESS` to `DEPLOYED`. Repeating the call with the
+//! same `IdempotencyToken` returns the accelerator that token already minted.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +169,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccelerator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAcceleratorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccelerator"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAcceleratorErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Global Accelerator store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let invalid = |message: String| -> CreateAcceleratorError {
+            CreateAcceleratorErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        crate::state::validate_accelerator_name(&input.name).map_err(invalid)?;
+
+        // `IpAddressType` defaults to IPV4: the model offers IPV4 | DUAL_STACK, and a
+        // standard accelerator created without the member is an IPv4-only one.
+        let ip_address_type = input
+            .ip_address_type
+            .unwrap_or_else(|| crate::state::IP_ADDRESS_TYPE_IPV4.to_string());
+        let dual_stack = ip_address_type == crate::state::IP_ADDRESS_TYPE_DUAL_STACK;
+
+        // The BYOIP path of `IpAddresses`: "you can assign one IPv4 address from your
+        // range to it. Global Accelerator assigns you a second static IPv4 address from
+        // an Amazon IP address range." So supplied addresses lead the IPv4 set and the
+        // service allocates the remainder of the two.
+        let byoip = input.ip_addresses.unwrap_or_default();
+        crate::state::validate_static_ipv4_addresses(&byoip).map_err(invalid)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let token_key = crate::state::accelerator_idempotency_key(&input.idempotency_token);
+        // A replay returns the accelerator the token already minted. SIMPLIFICATION: the
+        // replayed request's other members are not compared with the stored record, so a
+        // token reused with DIFFERENT parameters replays rather than being refused as a
+        // conflict. Implementing that refusal needs the original request's parameters kept
+        // beside the minted ARN; it is left for its own issue.
+        if let Some(minted) = store.idempotency.get(&token_key) {
+            if let Some(existing) = store.accelerators.get(minted) {
+                return Ok(CreateAcceleratorOutput {
+                    accelerator: Some(existing.to_wire(now)),
+                });
+            }
+        }
+
+        // The per-account quota bounds this store: a create past it is refused rather
+        // than growing resident state without limit. Stale idempotency records (whose
+        // resource was deleted) are released first, so the token map stays bounded by
+        // the number of live resources too.
+        store.prune_idempotency();
+        if store.accelerators.len() >= crate::state::MAX_ACCELERATORS_PER_ACCOUNT {
+            return Err(CreateAcceleratorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the account already holds the maximum of {} accelerators",
+                        crate::state::MAX_ACCELERATORS_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let uuid = store.mint_uuid();
+        let (arn, label) = crate::state::mint_accelerator(&uuid);
+        let mut ipv4_addresses = byoip;
+        while ipv4_addresses.len() < 2 {
+            let allocated = store.allocate_ipv4();
+            ipv4_addresses.push(allocated);
+        }
+        let mut ip_sets = vec![crate::state::StoredIpSet {
+            ip_address_family: crate::state::IP_FAMILY_IPV4.to_string(),
+            ip_addresses: ipv4_addresses,
+        }];
+        if dual_stack {
+            // A dual-stack accelerator has "four static IP addresses: two IPv4 addresses
+            // and two IPv6 addresses" (`Accelerator$DualStackDnsName`).
+            let ipv6_addresses = vec![store.allocate_ipv6(), store.allocate_ipv6()];
+            ip_sets.push(crate::state::StoredIpSet {
+                ip_address_family: crate::state::IP_FAMILY_IPV6.to_string(),
+                ip_addresses: ipv6_addresses,
+            });
+        }
+
+        let record = crate::state::StoredAccelerator {
+            arn: arn.clone(),
+            name: input.name,
+            ip_address_type,
+            ip_sets,
+            dns_name: crate::state::dns_name(&label),
+            dual_stack_dns_name: dual_stack.then(|| crate::state::dual_stack_dns_name(&label)),
+            // "The default value is true" (`CreateAccelerator$Enabled`).
+            enabled: input.enabled.unwrap_or(true),
+            created_time: now,
+            last_modified_time: now,
+            deployed_at: now + crate::state::DEPLOYMENT_SETTLE,
+            tags: crate::state::tags_to_pairs(input.tags),
+            listener_arns: Vec::new(),
+        };
+        let accelerator = record.to_wire(now);
+
+        store.accelerator_attributes.insert(
+            arn.clone(),
+            crate::state::StoredAcceleratorAttributes::default(),
+        );
+        store.idempotency.insert(token_key, arn.clone());
+        store.accelerators.insert(arn, record);
+
+        Ok(CreateAcceleratorOutput {
+            accelerator: Some(accelerator),
+        })
     }
 }

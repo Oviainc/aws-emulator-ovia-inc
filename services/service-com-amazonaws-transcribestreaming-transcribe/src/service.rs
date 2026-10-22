@@ -40,18 +40,45 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use crate::ops::start_medical_scribe_stream::StartMedicalScribeStream;
+use crate::ops::start_medical_stream_transcription::StartMedicalStreamTranscription;
+use crate::ops::start_stream_transcription::StartStreamTranscription;
+use crate::ops::types::EventStreamRoute;
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
+
+/// The path of a request URI, without its query string.
+fn request_path(uri: &str) -> &str {
+    let path = uri.split('?').next().unwrap_or_default();
+    // An absolute-form URI (`https://host/path`) carries the authority before the
+    // path; the origin form a server usually sees does not.
+    match path.find("://") {
+        Some(scheme_end) => match path[scheme_end + 3..].find('/') {
+            Some(authority_end) => &path[scheme_end + 3 + authority_end..],
+            None => "/",
+        },
+        None => path,
+    }
+}
 
 /// The `com-amazonaws-transcribestreaming-transcribe` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
+///
+/// Besides the generated entry it holds this service's three event-stream
+/// operations. They are NOT in the entry's routing table in a servable form: the
+/// generated `ErasedOperation` shim of an operation whose output is a `@streaming`
+/// union declines the request (it cannot drive `serialize_as_event_stream<P>`
+/// through an object-safe `run`), so each one is held here behind an
+/// [`EventStreamRoute`] and routed by [`EmulatedService::override_operation`] —
+/// which the router consults FIRST, before the generated table.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    start_stream_transcription: EventStreamRoute<StartStreamTranscription<Eng>>,
+    start_medical_stream_transcription: EventStreamRoute<StartMedicalStreamTranscription<Eng>>,
+    start_medical_scribe_stream: EventStreamRoute<StartMedicalScribeStream<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +87,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(engine.clone()),
+            start_stream_transcription: EventStreamRoute(StartStreamTranscription::new(
+                engine.clone(),
+            )),
+            start_medical_stream_transcription: EventStreamRoute(
+                StartMedicalStreamTranscription::new(engine.clone()),
+            ),
+            start_medical_scribe_stream: EventStreamRoute(StartMedicalScribeStream::new(engine)),
         }
     }
 }
@@ -87,12 +121,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // The three event-stream operations the generated routing table cannot
+        // serve. Routed by the method and path the model gives each one, so a
+        // request the model does not name here still resolves through the generated
+        // table (`GET /medical-scribe-stream/{SessionId}`), and
+        // `StartCallAnalyticsStreamTranscription` — which this slice does not
+        // implement — keeps answering the framework's "modeled but not served"
+        // response rather than being half-served here.
+        if req.method() != http::Method::POST.as_str() {
+            return None;
+        }
+        match request_path(req.uri()) {
+            "/stream-transcription" => Some(&self.start_stream_transcription),
+            "/medical-stream-transcription" => Some(&self.start_medical_stream_transcription),
+            "/medical-scribe-stream" => Some(&self.start_medical_scribe_stream),
+            _ => None,
+        }
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

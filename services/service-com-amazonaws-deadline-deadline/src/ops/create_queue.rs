@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a queue under a farm and persists it there under the `queueId` it mints.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +169,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQueue"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateQueueErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A queue lives under its farm, so an unknown farm is a 404 and nothing is created.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(CreateQueueErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+
+        // `clientToken` is `@idempotencyToken`: a retry of the same create must answer
+        // with the resource the first call made, not make a second one.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, &input.farm_id, token));
+        if let Some(key) = token.as_deref() {
+            if let Some(queue_id) = store.remembered_resource(key).map(str::to_string) {
+                if store.queue(&input.farm_id, &queue_id).is_some() {
+                    return Ok(CreateQueueOutput { queue_id });
+                }
+            }
+        }
+
+        // A farm holds at most this many queues: each one is a caller-driven insert that
+        // only a DeleteQueue releases.
+        if store
+            .farm(&input.farm_id)
+            .is_some_and(|farm| farm.queues.len() >= crate::state::MAX_QUEUES_PER_FARM)
+        {
+            return Err(CreateQueueErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::RESOURCE_TYPE_QUEUE,
+                    "You exceeded the number of queues this emulator stores for one farm. \
+                     Delete a queue and try again.",
+                ),
+            )
+            .into());
+        }
+
+        let queue_id = store.mint_id("queue");
+        let queue = crate::state::Queue {
+            queue_id: queue_id.clone(),
+            farm_id: input.farm_id.clone(),
+            display_name: input.display_name,
+            description: input.description,
+            // A queue schedules nothing until a fleet is associated with it.
+            status: crate::state::QUEUE_STATUS_IDLE.to_string(),
+            default_budget_action: input.default_budget_action,
+            blocked_reason: None,
+            role_arn: input.role_arn,
+            job_attachment_settings: input.job_attachment_settings,
+            job_run_as_user: input.job_run_as_user,
+            required_file_system_location_names: input.required_file_system_location_names,
+            allowed_storage_profile_ids: input.allowed_storage_profile_ids,
+            scheduling_configuration: input.scheduling_configuration,
+            tags: input.tags.unwrap_or_default(),
+            created_at: ::std::time::SystemTime::now(),
+            created_by: crate::state::caller_principal(ctx),
+            updated_at: None,
+            updated_by: None,
+            jobs: ::std::collections::HashMap::new(),
+        };
+
+        let Some(farm) = store.farms.get_mut(&input.farm_id) else {
+            return Err(CreateQueueErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        };
+        farm.queues.insert(queue_id.clone(), queue);
+        if let Some(key) = token {
+            store.remember_resource(key, &queue_id);
+        }
+
+        Ok(CreateQueueOutput { queue_id })
     }
 }

@@ -41,6 +41,6 @@ pub struct CreateAppInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.amplify#CreateAppResult")]
 #[derive(Debug, Clone)]
 pub struct CreateAppOutput {
-    pub app: App,
+    pub app: AppProjection,
 }
 

@@ -251,25 +251,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A profile or review template named here has to exist to be associated. Neither
         // resource can be created in this emulator yet (CreateProfile / CreateReviewTemplate
         // are still stubs), so no ARN a caller passes resolves.
-        for (member, resource_type, arns) in [
+        for (resource_type, subject, arns) in [
             (
-                "ProfileArns",
                 "PROFILE",
+                "profile",
                 input.profile_arns.unwrap_or_default(),
             ),
             (
-                "ReviewTemplateArns",
                 "REVIEW_TEMPLATE",
+                "review template",
                 input.review_template_arns.unwrap_or_default(),
             ),
         ] {
             if let Some(arn) = arns.first() {
                 return Err(CreateWorkloadErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("{member} references a resource that does not exist"),
-                        resource_id: arn.clone(),
-                        resource_type: resource_type.to_string(),
-                    },
+                    crate::state::resource_not_found(
+                        resource_type,
+                        arn.clone(),
+                        &format!("{subject} with ARN {arn}"),
+                    ),
                 )
                 .into());
             }
@@ -315,12 +315,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = store.create_workload_tokens.get(&input.client_request_token) {
             if token.fingerprint != fingerprint {
                 let workload_id = token.workload_id.clone();
-                return Err(CreateWorkloadErrorModeled::ConflictException(ConflictException {
-                    message: "ClientRequestToken was already used with different parameters"
-                        .to_string(),
-                    resource_id: workload_id,
-                    resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
-                })
+                return Err(CreateWorkloadErrorModeled::ConflictException(
+                    crate::state::idempotency_token_conflict(
+                        crate::state::WORKLOAD_RESOURCE_TYPE,
+                        workload_id,
+                        &input.client_request_token,
+                    ),
+                )
                 .into());
             }
             if let Some(existing) = store.workloads.get(&token.workload_id) {
@@ -333,15 +334,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The name must be unique within an account within an Amazon Web Services Region.
         // Spaces and capitalization are ignored when checking for uniqueness."
-        if let Some(existing_id) = store.workload_name_index.get(&normalized_name) {
-            return Err(CreateWorkloadErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "A workload named {:?} already exists in this account and Region",
-                    input.workload_name
-                ),
-                resource_id: existing_id.clone(),
-                resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
-            })
+        if let Some((existing_name, existing_id)) =
+            store.workload_holding_name(&input.workload_name)
+        {
+            return Err(CreateWorkloadErrorModeled::ConflictException(
+                crate::state::workload_name_conflict(existing_name, existing_id),
+            )
             .into());
         }
 

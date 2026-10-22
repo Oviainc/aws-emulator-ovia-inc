@@ -14,12 +14,20 @@
 //! acceptance receipt (`termToken`) that `GetReport` requires, and that token is
 //! persisted here so `GetReport` can check it against the report and version it was
 //! issued for.
+//!
+//! The CUSTOMER-AGREEMENT set is held the same way, and for the same reason: the API has
+//! no operation that creates, accepts or terminates one — an account's agreements are
+//! established outside this API — so the set a caller can see is persisted state built by
+//! this struct's [`Default`], and `ListCustomerAgreements` only reads it. Unlike a report,
+//! a customer-agreement belongs to the calling identity's ACCOUNT, which is what its ARN
+//! and its `awsAccountId` name.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ConflictException, ReportDetail, ReportSummary, ResourceNotFoundException, ValidationException,
+    ConflictException, CustomerAgreementSummary, ReportDetail, ReportSummary,
+    ResourceNotFoundException, ValidationException,
 };
 
 /// The region a report ARN names when the request carries no SigV4 credential scope to
@@ -33,10 +41,30 @@ pub const REPORT_RESOURCE_TYPE: &str = "Report";
 /// The `resourceType` reported for a term grant that does not cover the request.
 pub const TERM_RESOURCE_TYPE: &str = "Term";
 
-/// The largest page every paginated report operation serves, and the page size used
-/// when a request names no `maxResults`: `MaxResultsAttribute` is modelled
-/// `@range(min: 1, max: 300)`.
+/// The largest page every paginated operation of this service serves, and the page size
+/// used when a request names no `maxResults`: every one of them takes its `maxResults`
+/// from `MaxResultsAttribute`, modelled `@range(min: 1, max: 300)`.
 pub const REPORT_PAGE_LIMIT: i32 = 300;
+
+/// `CustomerAgreementState`'s value for an agreement that is in force. The one state
+/// `ListCustomerAgreements` reports: it "List[s] active customer-agreements applicable to
+/// calling identity".
+pub const AGREEMENT_STATE_ACTIVE: &str = "ACTIVE";
+
+/// `CustomerAgreementState`'s value for an agreement the customer terminated.
+pub const AGREEMENT_STATE_CUSTOMER_TERMINATED: &str = "CUSTOMER_TERMINATED";
+
+/// `CustomerAgreementState`'s value for an agreement AWS terminated.
+pub const AGREEMENT_STATE_AWS_TERMINATED: &str = "AWS_TERMINATED";
+
+/// `AgreementType`'s value for an agreement accepted as AWS publishes it.
+pub const AGREEMENT_TYPE_DEFAULT: &str = "DEFAULT";
+
+/// `AgreementType`'s value for a published agreement accepted with modifications.
+pub const AGREEMENT_TYPE_MODIFIED: &str = "MODIFIED";
+
+/// `AgreementType`'s value for an agreement negotiated for one customer.
+pub const AGREEMENT_TYPE_CUSTOM: &str = "CUSTOM";
 
 /// How many term grants the store holds before `GetTermForReport` releases the oldest.
 ///
@@ -176,6 +204,70 @@ impl Report {
     }
 }
 
+/// One AWS Artifact customer-agreement resource, as this emulator persists it.
+///
+/// A customer-agreement is the calling identity's acceptance of an AWS-published
+/// agreement; this record holds every member of `CustomerAgreementSummary` that can
+/// differ between two of them.
+#[derive(Debug, Clone)]
+pub struct CustomerAgreement {
+    /// `CustomerAgreementIdAttribute`, `^customer-agreement-[a-zA-Z0-9]{16}$`.
+    pub id: String,
+    /// "Name of the customer-agreement resource."
+    pub name: String,
+    /// "Description of the resource."
+    pub description: String,
+    /// The AWS-published agreement resource this customer-agreement represents, which
+    /// its `agreementArn` names.
+    pub agreement_id: String,
+    /// One of `AgreementType`'s values ([`AGREEMENT_TYPE_DEFAULT`],
+    /// [`AGREEMENT_TYPE_MODIFIED`], [`AGREEMENT_TYPE_CUSTOM`]).
+    pub agreement_type: String,
+    /// One of `CustomerAgreementState`'s values ([`AGREEMENT_STATE_ACTIVE`],
+    /// [`AGREEMENT_STATE_CUSTOMER_TERMINATED`], [`AGREEMENT_STATE_AWS_TERMINATED`]).
+    pub state: String,
+    /// "Timestamp indicating when the agreement became effective."
+    pub effective_start: SystemTime,
+    /// "Timestamp indicating when the agreement was terminated" — so only a terminated
+    /// agreement carries one.
+    pub effective_end: Option<SystemTime>,
+    /// "Terms required to accept the agreement resource." `AgreementTerms`, at most 10.
+    pub acceptance_terms: Vec<String>,
+    /// "Terms required to terminate the customer-agreement resource." `AgreementTerms`,
+    /// at most 10.
+    pub terminate_terms: Vec<String>,
+}
+
+impl CustomerAgreement {
+    /// True when this agreement is in `CustomerAgreementState`'s `ACTIVE` state — the
+    /// agreements `ListCustomerAgreements` reports.
+    pub fn is_active(&self) -> bool {
+        self.state == AGREEMENT_STATE_ACTIVE
+    }
+
+    /// The `CustomerAgreementSummary` projection `ListCustomerAgreements` returns.
+    pub fn to_summary(&self, region: &str) -> CustomerAgreementSummary {
+        CustomerAgreementSummary {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            arn: Some(customer_agreement_arn(region, &self.id)),
+            agreement_arn: Some(agreement_arn(&self.agreement_id)),
+            aws_account_id: Some(::engine::emulator_account_id().to_string()),
+            // "ARN of the organization that owns the resource": this emulator presents a
+            // single standalone account, so no organization owns the agreement and
+            // naming one would claim an organization that does not exist.
+            organization_arn: None,
+            effective_start: Some(::aws_smithy_types::DateTime::from(self.effective_start)),
+            effective_end: self.effective_end.map(::aws_smithy_types::DateTime::from),
+            state: Some(self.state.clone()),
+            description: Some(self.description.clone()),
+            acceptance_terms: Some(self.acceptance_terms.clone()),
+            terminate_terms: Some(self.terminate_terms.clone()),
+            r#type: Some(self.agreement_type.clone()),
+        }
+    }
+}
+
 /// A term grant: the acceptance receipt `GetTermForReport` minted, and the report
 /// version it covers. `GetReport` serves a document only for a token it finds here
 /// whose report and version match the request.
@@ -206,6 +298,10 @@ pub struct ComAmazonawsArtifactArtifactState {
     pub term_tokens: BTreeMap<String, TermGrant>,
     /// The counter term tokens are minted from, so two calls never share a token.
     pub term_token_seq: u64,
+    /// The calling account's customer-agreements, keyed by id. A `BTreeMap` is what
+    /// gives `ListCustomerAgreements` the stable total order its pagination token
+    /// indexes into.
+    pub customer_agreements: BTreeMap<String, CustomerAgreement>,
 }
 
 impl Default for ComAmazonawsArtifactArtifactState {
@@ -214,6 +310,7 @@ impl Default for ComAmazonawsArtifactArtifactState {
             reports: seed_catalog(),
             term_tokens: BTreeMap::new(),
             term_token_seq: 0,
+            customer_agreements: seed_customer_agreements(),
         }
     }
 }
@@ -274,6 +371,27 @@ pub fn report_arn(region: &str, report_id: &str) -> String {
 pub fn term_arn(region: &str, report_id: &str, version: i64) -> String {
     let suffix = report_id.strip_prefix("report-").unwrap_or(report_id);
     format!("arn:aws:artifact:{region}::term/term-{suffix}-v{version}")
+}
+
+/// The ARN of a customer-agreement resource.
+///
+/// A customer-agreement is ACCOUNT-owned — it is one account's acceptance of an
+/// agreement, which is what its `awsAccountId` reports — so unlike [`report_arn`] its ARN
+/// carries the account id beside the region the request was signed for.
+pub fn customer_agreement_arn(region: &str, id: &str) -> String {
+    format!(
+        "arn:aws:artifact:{region}:{account}:customer-agreement/{id}",
+        account = ::engine::emulator_account_id()
+    )
+}
+
+/// The ARN of the AWS-published agreement resource a customer-agreement represents.
+///
+/// The agreement itself is published by AWS rather than owned by an account, and it is
+/// not regional, so both fields are empty — the same service-owned ARN form [`report_arn`]
+/// uses for a report, which carries no account id.
+pub fn agreement_arn(agreement_id: &str) -> String {
+    format!("arn:aws:artifact:::agreement/{agreement_id}")
 }
 
 /// The URL a caller downloads a stored document from.
@@ -364,7 +482,22 @@ fn is_region_shaped(value: &str) -> bool {
 /// front door in [`crate::service`], which decides whether a request names a resource
 /// at all BEFORE that validator runs.
 pub fn is_report_id(value: &str) -> bool {
-    let Some(suffix) = value.strip_prefix("report-") else {
+    is_id_shaped(value, "report-")
+}
+
+/// True when `value` satisfies `CustomerAgreementIdAttribute`'s
+/// `^customer-agreement-[a-zA-Z0-9]{16}$`.
+///
+/// As with [`is_report_id`], this is for a value the model does not constrain: the
+/// `nextToken` `ListCustomerAgreements` carries a customer-agreement id in.
+pub fn is_customer_agreement_id(value: &str) -> bool {
+    is_id_shaped(value, "customer-agreement-")
+}
+
+/// True when `value` is `prefix` followed by 16 alphanumerics — the shape every
+/// `<resource>-[a-zA-Z0-9]{16}` id attribute in this model declares.
+fn is_id_shaped(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
         return false;
     };
     suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -447,7 +580,7 @@ pub fn grant_does_not_cover(token: &str, grant: &TermGrant) -> ConflictException
     }
 }
 
-/// The page size a paginated report operation serves for `max_results`.
+/// The page size a paginated operation of this service serves for `max_results`.
 ///
 /// `MaxResultsAttribute` is modelled `@range(min: 1, max: 300)` and the boundary
 /// validator refused anything outside it before a handler ran, so the only case left is
@@ -701,6 +834,137 @@ fn seed_catalog() -> BTreeMap<String, Report> {
                     .collect(),
             };
             (report.id.clone(), report)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The seeded customer-agreement set.
+// ---------------------------------------------------------------------------
+
+/// One seeded customer-agreement, before it becomes a [`CustomerAgreement`].
+struct SeedAgreement {
+    id: &'static str,
+    name: &'static str,
+    agreement_id: &'static str,
+    description: &'static str,
+    agreement_type: &'static str,
+    state: &'static str,
+    effective_start: u64,
+    effective_end: Option<u64>,
+    acceptance_terms: &'static [&'static str],
+    terminate_terms: &'static [&'static str],
+}
+
+/// The customer-agreement set this emulator serves for its one account.
+///
+/// The API has no operation that creates, accepts or terminates a customer-agreement, so
+/// this set is the account's established agreements rather than anything a caller made:
+/// five records spanning every `AgreementType` and every `CustomerAgreementState`, so the
+/// state rule `ListCustomerAgreements` applies is observable. Every value satisfies its
+/// member's modelled constraints — `id` matches `CustomerAgreementIdAttribute`'s
+/// `^customer-agreement-[a-zA-Z0-9]{16}$`, and each name, description and term matches
+/// `LongStringAttribute`'s `^[^<>]*$` within 1..2048 bytes.
+const AGREEMENT_SEED: &[SeedAgreement] = &[
+    SeedAgreement {
+        id: "customer-agreement-baaagreement0001",
+        name: "AWS Business Associate Addendum",
+        agreement_id: "AWS-BAA",
+        description: "HIPAA Business Associate Addendum to the AWS Customer Agreement",
+        agreement_type: AGREEMENT_TYPE_DEFAULT,
+        state: AGREEMENT_STATE_ACTIVE,
+        effective_start: T2024H1,
+        effective_end: None,
+        acceptance_terms: &[
+            "Acceptance by an authorized representative of the account",
+            "Designation of the AWS services used to process protected health information",
+        ],
+        terminate_terms: &["Written notice of termination by an authorized representative"],
+    },
+    SeedAgreement {
+        id: "customer-agreement-cjisagreement001",
+        name: "AWS CJIS Security Addendum",
+        agreement_id: "AWS-CJIS",
+        description: "Criminal Justice Information Services Security Addendum",
+        agreement_type: AGREEMENT_TYPE_DEFAULT,
+        state: AGREEMENT_STATE_CUSTOMER_TERMINATED,
+        effective_start: T2023H1,
+        effective_end: Some(T2024H2),
+        acceptance_terms: &["Acceptance by an authorized representative of the account"],
+        terminate_terms: &["Written notice of termination by an authorized representative"],
+    },
+    SeedAgreement {
+        id: "customer-agreement-gdprsccagreement",
+        name: "AWS GDPR Data Processing Addendum",
+        agreement_id: "AWS-GDPR-DPA",
+        description: "Data Processing Addendum with the EU standard contractual clauses",
+        agreement_type: AGREEMENT_TYPE_MODIFIED,
+        state: AGREEMENT_STATE_ACTIVE,
+        effective_start: T2024H2,
+        effective_end: None,
+        acceptance_terms: &[
+            "Acceptance by an authorized representative of the account",
+            "Identification of the data exporter and the data importer",
+            "Selection of the standard contractual clauses module that applies",
+        ],
+        terminate_terms: &[
+            "Written notice of termination by an authorized representative",
+            "Completion of the deletion or return of personal data",
+        ],
+    },
+    SeedAgreement {
+        id: "customer-agreement-ndaagreement0001",
+        name: "AWS Nondisclosure Agreement",
+        agreement_id: "AWS-NDA",
+        description: "Mutual nondisclosure agreement negotiated for this customer",
+        agreement_type: AGREEMENT_TYPE_CUSTOM,
+        state: AGREEMENT_STATE_ACTIVE,
+        effective_start: T2025H1,
+        effective_end: None,
+        acceptance_terms: &["Signature by an authorized representative of the account"],
+        terminate_terms: &["Expiry of the confidentiality period"],
+    },
+    SeedAgreement {
+        id: "customer-agreement-pcidssagreement1",
+        name: "AWS PCI DSS Merchant Addendum",
+        agreement_id: "AWS-PCI-DSS",
+        description: "Payment Card Industry Data Security Standard merchant addendum",
+        agreement_type: AGREEMENT_TYPE_MODIFIED,
+        state: AGREEMENT_STATE_AWS_TERMINATED,
+        effective_start: T2023H2,
+        effective_end: Some(T2025H1),
+        acceptance_terms: &["Acceptance by an authorized representative of the account"],
+        terminate_terms: &["Written notice of termination by AWS"],
+    },
+];
+
+/// Build the customer-agreement set from [`AGREEMENT_SEED`]. Deterministic: the same
+/// records, in the same order, every time the state is constructed.
+fn seed_customer_agreements() -> BTreeMap<String, CustomerAgreement> {
+    AGREEMENT_SEED
+        .iter()
+        .map(|seed| {
+            let agreement = CustomerAgreement {
+                id: seed.id.to_string(),
+                name: seed.name.to_string(),
+                description: seed.description.to_string(),
+                agreement_id: seed.agreement_id.to_string(),
+                agreement_type: seed.agreement_type.to_string(),
+                state: seed.state.to_string(),
+                effective_start: at(seed.effective_start),
+                effective_end: seed.effective_end.map(at),
+                acceptance_terms: seed
+                    .acceptance_terms
+                    .iter()
+                    .map(|term| (*term).to_string())
+                    .collect(),
+                terminate_terms: seed
+                    .terminate_terms
+                    .iter()
+                    .map(|term| (*term).to_string())
+                    .collect(),
+            };
+            (agreement.id.clone(), agreement)
         })
         .collect()
 }

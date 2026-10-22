@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a job under a farm's queue and persists it there under the `jobId` it mints.
 //!
 //! ## Shape of an operation
 //!
@@ -150,6 +142,27 @@ impl From<CreateJobErrorModeled> for CreateJobError {
     }
 }
 
+/// The name an Open Job Description template declares at its top level.
+///
+/// From `smithy_query(query="shape", shape="JobTemplateType")` a template is written in
+/// one of two languages: `JSON` or `YAML`. Only JSON is read here — see the note in
+/// [`CreateJob::handle`] on why a YAML template whose name would have to be read answers
+/// the scaffold's 501 instead of a guess.
+///
+/// `serde_json` bounds what the DOCUMENT can cost against what the REQUEST already bounds
+/// (`JobTemplate, len 1..1000000`): it builds a value linear in the input and enforces its
+/// own recursion limit, returning an error rather than growing the call stack — so a
+/// template of pure nesting is a modeled 400, not a process abort. It is never reached
+/// while the shared store lock is held: the caller resolves the name BEFORE it locks.
+fn json_template_name(template: &str) -> Result<Option<String>, String> {
+    let document: serde_json::Value = serde_json::from_str(template)
+        .map_err(|error| format!("The template isn't valid JSON: {error}"))?;
+    Ok(document
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
+}
+
 /// The `CreateJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -186,18 +199,236 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // FIRST, with no lock held and before the store is even reached: validate the
+        // caller-supplied template and read the name out of it. Parsing is the one step
+        // whose cost a caller controls, so it must not run while every other request of
+        // this service is waiting on the shared store lock.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJob"))
+        // Only the template THIS request carries is ever parsed. When the template comes
+        // from a source job instead, that job's name was resolved and stored when IT was
+        // created, so it is read from state rather than parsed again.
+        //
+        // A `YAML` template is the one case this slice cannot read: a YAML reader needs a
+        // YAML parser, no crate in this build provides one, and a hand-written subset
+        // would be a guess at a language rather than a reading of it. So when the name
+        // would have to come out of a YAML template, the operation answers the scaffold's
+        // 501 — "nobody has written this yet" — instead of inventing a name or refusing a
+        // request the real service accepts. Everything else about a YAML template works:
+        // pass `nameOverride` and the job is created and the template stored verbatim.
+        if input.template.is_some() && input.template_type.is_none() {
+            return Err(CreateJobErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "templateType",
+                    "templateType is required when a template is specified.",
+                ),
+            )
+            .into());
+        }
+        // The converse is NOT refused: the model marks both members optional, and a
+        // templateType that describes no template is a stray value the service can
+        // simply not read a template from, not a request it is documented to reject.
+        let name_from_template = match (
+            input.template.as_deref(),
+            input.template_type.as_deref(),
+            input.name_override.as_deref(),
+        ) {
+            (Some(body), Some("JSON"), _) => json_template_name(body).map_err(|message| {
+                CreateJobError::from(CreateJobErrorModeled::ValidationException(
+                    crate::state::cannot_parse("template", &message),
+                ))
+            })?,
+            (Some(_), Some("YAML"), None) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "CreateJob reading a job name out of a YAML template (pass nameOverride)",
+                ))
+            }
+            _ => None,
+        }
+        // A declared name has to be a name: `JobName` is `len 1..512`, so a template that
+        // declares an empty one has declared nothing and falls through to the refusal
+        // below unless `nameOverride` supplies one.
+        .filter(|name| !name.is_empty());
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateJobErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A job lives under a queue of a farm: either one missing is a 404, and nothing
+        // is created.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(CreateJobErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(CreateJobErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        }
+
+        // `clientToken` is `@idempotencyToken`: a retry of the same create must answer
+        // with the resource the first call made, not make a second one.
+        let token = input.client_token.as_deref().map(|token| {
+            crate::state::idempotency_key(
+                Self::NAME,
+                &format!("{}/{}", input.farm_id, input.queue_id),
+                token,
+            )
+        });
+        if let Some(key) = token.as_deref() {
+            if let Some(job_id) = store.remembered_resource(key).map(str::to_string) {
+                if store
+                    .queue(&input.farm_id, &input.queue_id)
+                    .is_some_and(|queue| queue.jobs.contains_key(&job_id))
+                {
+                    return Ok(CreateJobOutput { job_id });
+                }
+            }
+        }
+
+        // A job created from another job takes that job's template, parameters and name
+        // where this request does not override them, so the source job must exist in the
+        // same queue.
+        let source = match input.source_job_id.as_deref() {
+            None => None,
+            Some(source_job_id) => {
+                let found = store
+                    .queue(&input.farm_id, &input.queue_id)
+                    .and_then(|queue| queue.jobs.get(source_job_id))
+                    .cloned();
+                if found.is_none() {
+                    return Err(CreateJobErrorModeled::ResourceNotFoundException(
+                        crate::state::not_found(crate::state::RESOURCE_TYPE_JOB, source_job_id),
+                    )
+                    .into());
+                }
+                found
+            }
+        };
+
+        let template = input
+            .template
+            .clone()
+            .or_else(|| source.as_ref().and_then(|job| job.template.clone()));
+        let template_type = input
+            .template_type
+            .clone()
+            .or_else(|| source.as_ref().and_then(|job| job.template_type.clone()));
+
+        // The job's name is the override when the request carries one, otherwise the name
+        // its own template declared (read above, before the lock), otherwise the source
+        // job's stored name.
+        let name = match input
+            .name_override
+            .clone()
+            .or(name_from_template)
+            .or_else(|| source.as_ref().map(|job| job.name.clone()))
+        {
+            Some(name) => name,
+            None => {
+                return Err(CreateJobErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(
+                        "nameOverride",
+                        "The job has no name: pass nameOverride, or a template that \
+                         declares a name.",
+                    ),
+                )
+                .into())
+            }
+        };
+
+        let parameters = input
+            .parameters
+            .clone()
+            .or_else(|| source.as_ref().and_then(|job| job.parameters.clone()));
+        let description = input
+            .description_override
+            .clone()
+            .filter(|description| !description.is_empty());
+
+        // A queue holds at most this many jobs, and the stored job templates share one
+        // byte budget: a job carries up to a megabyte of template, and `sourceJobId`
+        // lets a tiny request store another copy of one, so both the count and the bytes
+        // are bounded and the create past either is refused with the operation's own
+        // modeled quota error.
+        if store
+            .queue(&input.farm_id, &input.queue_id)
+            .is_some_and(|queue| queue.jobs.len() >= crate::state::MAX_JOBS_PER_QUEUE)
+        {
+            return Err(CreateJobErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::RESOURCE_TYPE_JOB,
+                    "You exceeded the number of jobs this emulator stores for one queue. \
+                     Delete a job's queue and try again.",
+                ),
+            )
+            .into());
+        }
+        let template_bytes = template.as_deref().map_or(0, str::len);
+        if !store.template_bytes_fit(template_bytes) {
+            return Err(CreateJobErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::RESOURCE_TYPE_JOB,
+                    "You exceeded the total job-template size this emulator stores. Delete \
+                     jobs and try again.",
+                ),
+            )
+            .into());
+        }
+
+        let job_id = store.mint_id("job");
+        let job = crate::state::Job {
+            job_id: job_id.clone(),
+            queue_id: input.queue_id.clone(),
+            farm_id: input.farm_id.clone(),
+            name,
+            description,
+            template,
+            template_type,
+            // The service assembles the job after answering, so it starts in the
+            // non-terminal lifecycle status and the move to CREATE_COMPLETE is owed by
+            // the clock (see `crate::state::JOB_CREATE_COMPLETE_AFTER`).
+            lifecycle_status: crate::state::JOB_LIFECYCLE_CREATE_IN_PROGRESS.to_string(),
+            lifecycle_status_message: "The job is being created.".to_string(),
+            priority: input.priority,
+            parameters,
+            attachments: input.attachments,
+            storage_profile_id: input.storage_profile_id,
+            target_task_run_status: input.target_task_run_status,
+            max_failed_tasks_count: input.max_failed_tasks_count,
+            max_retries_per_task: input.max_retries_per_task,
+            max_worker_count: input.max_worker_count,
+            source_job_id: input.source_job_id,
+            tags: input.tags.unwrap_or_default(),
+            created_at: ::std::time::SystemTime::now(),
+            created_by: crate::state::caller_principal(ctx),
+            updated_at: None,
+            updated_by: None,
+            started_at: None,
+            ended_at: None,
+            create_complete_due_at: Some(
+                ::std::time::Instant::now() + crate::state::JOB_CREATE_COMPLETE_AFTER,
+            ),
+        };
+
+        let Some(queue) = store.queue_mut(&input.farm_id, &input.queue_id) else {
+            return Err(CreateJobErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        };
+        queue.jobs.insert(job_id.clone(), job);
+        store.charge_template_bytes(template_bytes);
+        if let Some(key) = token {
+            store.remember_resource(key, &job_id);
+        }
+
+        Ok(CreateJobOutput { job_id })
     }
 }

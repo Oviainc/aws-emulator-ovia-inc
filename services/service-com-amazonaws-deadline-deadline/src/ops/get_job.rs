@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the job `jobId` names under `farmId`/`queueId` from this service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +179,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetJob"))
+        // A report: the only write it makes is materialising the lifecycle transition the
+        // clock already made due, which was owed at this instant whether or not anybody
+        // called (see `crate::state::Job::settle_lifecycle`).
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetJobErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        if store.farm(&input.farm_id).is_none() {
+            return Err(GetJobErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(GetJobErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        }
+        let Some(job) = store.settled_job(&input.farm_id, &input.queue_id, &input.job_id) else {
+            return Err(GetJobErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_JOB, &input.job_id),
+            )
+            .into());
+        };
+
+        Ok(GetJobOutput {
+            job_id: job.job_id.clone(),
+            name: job.name.clone(),
+            lifecycle_status: job.lifecycle_status.clone(),
+            lifecycle_status_message: job.lifecycle_status_message.clone(),
+            priority: job.priority,
+            created_at: crate::state::timestamp(job.created_at),
+            created_by: job.created_by.clone(),
+            updated_at: job.updated_at.map(crate::state::timestamp),
+            updated_by: job.updated_by.clone(),
+            started_at: job.started_at.map(crate::state::timestamp),
+            ended_at: job.ended_at.map(crate::state::timestamp),
+            // This slice persists no steps or tasks, so the job has no task run status to
+            // aggregate and these stay absent until the step/task operations are written.
+            task_run_status: None,
+            target_task_run_status: Some(job.target_task_run_status.clone()),
+            task_run_status_counts: None,
+            task_failure_retry_count: None,
+            storage_profile_id: job.storage_profile_id.clone(),
+            max_failed_tasks_count: Some(job.max_failed_tasks_count),
+            max_retries_per_task: Some(job.max_retries_per_task),
+            parameters: job.parameters.clone(),
+            attachments: job.attachments.clone(),
+            description: job.description.clone(),
+            max_worker_count: job.max_worker_count,
+            source_job_id: job.source_job_id.clone(),
+        })
     }
 }

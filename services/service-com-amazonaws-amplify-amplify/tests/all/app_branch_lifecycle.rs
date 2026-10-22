@@ -175,7 +175,7 @@ pub(crate) fn string_member(record: &Value, member: &str) -> String {
         .to_string()
 }
 
-fn bool_member(record: &Value, member: &str) -> bool {
+pub(crate) fn bool_member(record: &Value, member: &str) -> bool {
     record
         .get(member)
         .and_then(Value::as_bool)
@@ -190,20 +190,39 @@ pub(crate) fn list_member<'a>(record: &'a Value, member: &str) -> &'a Vec<Value>
 }
 
 /// A timestamp member, as epoch seconds.
-fn timestamp_member(record: &Value, member: &str) -> f64 {
+pub(crate) fn timestamp_member(record: &Value, member: &str) -> f64 {
     record
         .get(member)
         .and_then(Value::as_f64)
         .unwrap_or_else(|| panic!("member `{member}` is not a timestamp in {record:?}"))
 }
 
+/// `record` without its `tags` member.
+///
+/// A READ of an app or a branch reports the resource's tag map — the empty map when
+/// it has none — while the operation that WROTE the record echoes only the tags the
+/// request set, so two records taken from opposite sides of that rule are compared
+/// without it. The rule itself is asserted in `tests/all/app_branch_projection.rs`.
+pub(crate) fn without_tags(record: &Value) -> Value {
+    let mut copy = record.clone();
+    if let Some(members) = copy.as_object_mut() {
+        members.remove("tags");
+    }
+    copy
+}
+
 /// One `CreateApp` request plus the record the rule says it must produce.
+///
+/// `description`, `repository` and `environment_variables` are the WIRE values
+/// expected for those members, so a member the request leaves unset is
+/// `Value::Null` — Amplify reports a member it has no value for as JSON null, never
+/// as the empty string or the empty map (see `tests/all/app_branch_projection.rs`).
 struct AppCase {
     case: &'static str,
     request: Value,
     platform: &'static str,
-    description: &'static str,
-    repository: &'static str,
+    description: Value,
+    repository: Value,
     environment_variables: Value,
     enable_branch_auto_build: bool,
     enable_basic_auth: bool,
@@ -220,9 +239,9 @@ fn app_cases() -> Vec<AppCase> {
             case: "only the required name",
             request: json!({ "name": "demo-app" }),
             platform: "WEB",
-            description: "",
-            repository: "",
-            environment_variables: json!({}),
+            description: Value::Null,
+            repository: Value::Null,
+            environment_variables: Value::Null,
             enable_branch_auto_build: false,
             enable_basic_auth: false,
         },
@@ -237,8 +256,8 @@ fn app_cases() -> Vec<AppCase> {
                 "enableBranchAutoBuild": true,
             }),
             platform: "WEB",
-            description: "a static site",
-            repository: "https://example.invalid/org/static-site",
+            description: json!("a static site"),
+            repository: json!("https://example.invalid/org/static-site"),
             environment_variables: json!({ "KEY": "VAL" }),
             enable_branch_auto_build: true,
             enable_basic_auth: false,
@@ -254,8 +273,8 @@ fn app_cases() -> Vec<AppCase> {
                 "buildSpec": "version: 1",
             }),
             platform: "WEB_COMPUTE",
-            description: "",
-            repository: "",
+            description: Value::Null,
+            repository: Value::Null,
             environment_variables: json!({ "A": "1", "B": "2", "C": "3" }),
             enable_branch_auto_build: false,
             enable_basic_auth: true,
@@ -270,9 +289,9 @@ fn app_cases() -> Vec<AppCase> {
                 "tags": { "team": "web" },
             }),
             platform: "WEB_DYNAMIC",
-            description: "original SSR support",
-            repository: "",
-            environment_variables: json!({}),
+            description: json!("original SSR support"),
+            repository: Value::Null,
+            environment_variables: Value::Null,
             enable_branch_auto_build: false,
             enable_basic_auth: false,
         },
@@ -280,9 +299,9 @@ fn app_cases() -> Vec<AppCase> {
             case: "name at the modelled length maximum",
             request: json!({ "name": "n".repeat(255) }),
             platform: "WEB",
-            description: "",
-            repository: "",
-            environment_variables: json!({}),
+            description: Value::Null,
+            repository: Value::Null,
+            environment_variables: Value::Null,
             enable_branch_auto_build: false,
             enable_basic_auth: false,
         },
@@ -297,9 +316,9 @@ fn app_cases() -> Vec<AppCase> {
                 "accessToken": "ghp_0123456789abcdefghijklmnopqrstuvwxyz",
             }),
             platform: "WEB",
-            description: "",
-            repository: "https://example.invalid/org/github-app",
-            environment_variables: json!({}),
+            description: Value::Null,
+            repository: json!("https://example.invalid/org/github-app"),
+            environment_variables: Value::Null,
             enable_branch_auto_build: false,
             enable_basic_auth: false,
         },
@@ -311,9 +330,9 @@ fn app_cases() -> Vec<AppCase> {
                 "oauthToken": "oauth-0123456789abcdef",
             }),
             platform: "WEB",
-            description: "",
-            repository: "https://example.invalid/org/bitbucket-app",
-            environment_variables: json!({}),
+            description: Value::Null,
+            repository: json!("https://example.invalid/org/bitbucket-app"),
+            environment_variables: Value::Null,
             enable_branch_auto_build: false,
             enable_basic_auth: false,
         },
@@ -370,14 +389,14 @@ async fn create_app_mints_and_persists_a_record_get_app_reads_back_field_for_fie
             app.get("platform")
         );
         assert_eq!(
-            string_member(&app, "description"),
-            case.description,
+            app.get("description"),
+            Some(&case.description),
             "case {label:?}: unexpected description, got {:?}",
             app.get("description")
         );
         assert_eq!(
-            string_member(&app, "repository"),
-            case.repository,
+            app.get("repository"),
+            Some(&case.repository),
             "case {label:?}: unexpected repository, got {:?}",
             app.get("repository")
         );
@@ -420,8 +439,8 @@ async fn create_app_mints_and_persists_a_record_get_app_reads_back_field_for_fie
             "case {label:?}: expected HTTP 200 from GetApp, got {fetched:?}"
         );
         assert_eq!(
-            fetched.member("app"),
-            app,
+            without_tags(&fetched.member("app")),
+            without_tags(&app),
             "case {label:?}: GetApp must return the created record field-for-field, got {:?}",
             fetched.member("app")
         );
@@ -563,13 +582,17 @@ async fn list_apps_pages_over_everything_in_state_for_every_page_bound() {
 }
 
 /// One `CreateBranch` request plus the record the rule says it must produce.
+///
+/// `environment_variables` is the WIRE value expected for that member, so a request
+/// that sets none expects `Value::Null`: Amplify reports a member it has no value
+/// for as JSON null (see `tests/all/app_branch_projection.rs`).
 struct BranchCase {
     case: &'static str,
     request: Value,
     stage: &'static str,
     display_name: &'static str,
     ttl: &'static str,
-    framework: &'static str,
+    framework: Value,
     enable_auto_build: bool,
     environment_variables: Value,
 }
@@ -587,9 +610,9 @@ fn branch_cases() -> Vec<BranchCase> {
             stage: "DEVELOPMENT",
             display_name: "dev",
             ttl: "5",
-            framework: "",
+            framework: Value::Null,
             enable_auto_build: false,
-            environment_variables: json!({}),
+            environment_variables: Value::Null,
         },
         BranchCase {
             case: "production branch with a framework and an explicit ttl",
@@ -604,9 +627,9 @@ fn branch_cases() -> Vec<BranchCase> {
             stage: "PRODUCTION",
             display_name: "main",
             ttl: "60",
-            framework: "React",
+            framework: json!("React"),
             enable_auto_build: true,
-            environment_variables: json!({}),
+            environment_variables: Value::Null,
         },
         BranchCase {
             case: "beta branch with its own display name and environment",
@@ -619,7 +642,7 @@ fn branch_cases() -> Vec<BranchCase> {
             stage: "BETA",
             display_name: "beta-display",
             ttl: "5",
-            framework: "",
+            framework: Value::Null,
             enable_auto_build: false,
             environment_variables: json!({ "A": "1", "B": "2" }),
         },
@@ -634,9 +657,9 @@ fn branch_cases() -> Vec<BranchCase> {
             stage: "PULL_REQUEST",
             display_name: "pr-7",
             ttl: "5",
-            framework: "",
+            framework: Value::Null,
             enable_auto_build: false,
-            environment_variables: json!({}),
+            environment_variables: Value::Null,
         },
         BranchCase {
             case: "experimental branch with a zero ttl and basic auth",
@@ -651,9 +674,9 @@ fn branch_cases() -> Vec<BranchCase> {
             stage: "EXPERIMENTAL",
             display_name: "Experimental.1",
             ttl: "0",
-            framework: "",
+            framework: Value::Null,
             enable_auto_build: false,
-            environment_variables: json!({}),
+            environment_variables: Value::Null,
         },
     ]
 }
@@ -704,8 +727,8 @@ async fn create_branch_persists_under_its_app_and_get_branch_reads_it_back() {
             branch.get("ttl")
         );
         assert_eq!(
-            string_member(&branch, "framework"),
-            case.framework,
+            branch.get("framework"),
+            Some(&case.framework),
             "case {label:?}: unexpected framework, got {:?}",
             branch.get("framework")
         );
@@ -722,9 +745,10 @@ async fn create_branch_persists_under_its_app_and_get_branch_reads_it_back() {
             branch.get("environmentVariables")
         );
         assert_eq!(
-            string_member(&branch, "activeJobId"),
-            "",
-            "case {label:?}: a branch that was never built has no active job, got {:?}",
+            branch.get("activeJobId"),
+            Some(&Value::Null),
+            "case {label:?}: a branch that was never built has no active job, so Amplify \
+             reports activeJobId as null, got {:?}",
             branch.get("activeJobId")
         );
         assert_eq!(
@@ -733,9 +757,11 @@ async fn create_branch_persists_under_its_app_and_get_branch_reads_it_back() {
             "case {label:?}: a branch that was never built has run no jobs, got {:?}",
             branch.get("totalNumberOfJobs")
         );
-        assert!(
-            list_member(&branch, "customDomains").is_empty(),
-            "case {label:?}: a new branch has no custom domains, got {:?}",
+        assert_eq!(
+            branch.get("customDomains"),
+            Some(&Value::Null),
+            "case {label:?}: a new branch has no custom domains, so Amplify reports \
+             customDomains as null, got {:?}",
             branch.get("customDomains")
         );
 
@@ -752,8 +778,8 @@ async fn create_branch_persists_under_its_app_and_get_branch_reads_it_back() {
             "case {label:?}: expected HTTP 200 from GetBranch, got {fetched:?}"
         );
         assert_eq!(
-            fetched.member("branch"),
-            branch,
+            without_tags(&fetched.member("branch")),
+            without_tags(&branch),
             "case {label:?}: GetBranch must return the created record field-for-field, got {:?}",
             fetched.member("branch")
         );
@@ -1073,8 +1099,8 @@ async fn delete_app_returns_the_deleted_record_and_removes_it_with_its_branches(
         "case \"DeleteApp\": expected HTTP 200, got {deleted:?}"
     );
     assert_eq!(
-        deleted.member("app"),
-        before,
+        without_tags(&deleted.member("app")),
+        without_tags(&before),
         "case \"DeleteApp\": the response must be the record as it existed at delete time, \
          got {:?}",
         deleted.member("app")

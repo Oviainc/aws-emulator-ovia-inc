@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMilestone
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMilestone`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMilestone::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records the workload as it stands now as the next milestone of that
+//! workload and persists it in [`crate::state`], so `GetMilestone` reads it back. The
+//! path `WorkloadId` is resolved by lookup — an id no workload carries is
+//! `ResourceNotFoundException` (404) — a repeated `MilestoneName` within the workload is
+//! `ConflictException` (409), and the hundredth-and-first milestone is
+//! `ServiceQuotaExceededException` (402).
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMilestone` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMilestoneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMilestone"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMilestoneErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "MilestoneName": &input.milestone_name,
+            "WorkloadId": &input.workload_id,
+        }));
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters returns
+        // the milestone the original request recorded instead of recording a second one.
+        if let Some(token) = store.create_milestone_tokens.get(&input.client_request_token) {
+            if token.fingerprint != fingerprint {
+                let resource_id = crate::state::milestone_resource_id(
+                    &token.workload_id,
+                    token.milestone_number,
+                );
+                return Err(CreateMilestoneErrorModeled::ConflictException(
+                    crate::state::idempotency_token_conflict(
+                        crate::state::MILESTONE_RESOURCE_TYPE,
+                        resource_id,
+                        &input.client_request_token,
+                    ),
+                )
+                .into());
+            }
+            if let Some(recorded) = store.milestone(&token.workload_id, token.milestone_number) {
+                return Ok(CreateMilestoneOutput {
+                    workload_id: Some(recorded.workload.workload_id.clone()),
+                    milestone_number: Some(recorded.milestone_number),
+                });
+            }
+        }
+
+        // "Create a milestone for an existing workload": the path id is resolved by
+        // this lookup, so an id no workload carries is the lookup's 404 whatever its
+        // syntax. The record itself is only copied once the request is accepted, below.
+        if !store.workloads.contains_key(&input.workload_id) {
+            return Err(CreateMilestoneErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+            .into());
+        }
+
+        // "Milestone names must be unique within a workload"
+        // (`CreateMilestoneInput$MilestoneName` doc).
+        if let Some(existing) = store
+            .milestones
+            .get(&input.workload_id)
+            .and_then(|recorded| {
+                recorded
+                    .values()
+                    .find(|record| record.milestone_name == input.milestone_name)
+            })
+        {
+            return Err(CreateMilestoneErrorModeled::ConflictException(
+                crate::state::milestone_name_conflict(
+                    &existing.milestone_name,
+                    &input.workload_id,
+                    existing.milestone_number,
+                ),
+            )
+            .into());
+        }
+
+        let milestone_number = store.next_milestone_number(&input.workload_id);
+        if milestone_number > crate::state::MAX_MILESTONES_PER_WORKLOAD {
+            return Err(CreateMilestoneErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The workload with ID {} already holds the maximum of {} milestones",
+                        input.workload_id,
+                        crate::state::MAX_MILESTONES_PER_WORKLOAD
+                    ),
+                    resource_id: Some(input.workload_id.clone()),
+                    resource_type: Some(crate::state::WORKLOAD_RESOURCE_TYPE.to_string()),
+                    // The model publishes no numeric Service Quotas code for this
+                    // quota, so it is named by what it meters; the service code is this
+                    // service's own signing name.
+                    quota_code: "MilestonesPerWorkload".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A milestone records the workload as it stands NOW, by value: a later
+        // `UpdateWorkload` must not change what this milestone reports. This is the
+        // first copy of the record, taken only now that the request is accepted.
+        let Some(workload) = store.workloads.get(&input.workload_id).cloned() else {
+            return Err(CreateMilestoneErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+            .into());
+        };
+        let record = crate::state::MilestoneRecord {
+            milestone_number,
+            milestone_name: input.milestone_name,
+            recorded_at: std::time::SystemTime::now(),
+            workload,
+        };
+        store
+            .milestones
+            .entry(input.workload_id.clone())
+            .or_default()
+            .insert(milestone_number, record);
+        store.create_milestone_tokens.insert(
+            input.client_request_token,
+            crate::state::CreateMilestoneToken {
+                workload_id: input.workload_id.clone(),
+                milestone_number,
+                fingerprint,
+            },
+        );
+
+        Ok(CreateMilestoneOutput {
+            workload_id: Some(input.workload_id),
+            milestone_number: Some(milestone_number),
+        })
     }
 }

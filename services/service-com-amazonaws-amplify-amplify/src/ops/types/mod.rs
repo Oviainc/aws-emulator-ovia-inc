@@ -13,6 +13,10 @@
 //! `pub mod <operation>;` per operation and glob-re-exports both, so a submodule
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
+//!
+//! `projection` is the one hand-written submodule: it holds the `App` / `Branch`
+//! wrappers that every operation returning one of those shapes puts in its output,
+//! so the record reaches the wire the way Amplify reports it.
 
 pub mod create_app_types;
 pub mod create_backend_environment_types;
@@ -42,6 +46,7 @@ pub mod list_domain_associations_types;
 pub mod list_jobs_types;
 pub mod list_tags_for_resource_types;
 pub mod list_webhooks_types;
+pub mod projection;
 pub mod shared_types;
 pub mod start_deployment_types;
 pub mod start_job_types;
@@ -109,6 +114,8 @@ pub use list_jobs_types::*;
 pub use list_tags_for_resource_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_webhooks_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use projection::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

@@ -12596,6 +12596,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-smithy-eventstream",
  "aws-smithy-runtime-api",
  "aws-smithy-schema",
  "aws-smithy-types",
@@ -12606,6 +12607,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

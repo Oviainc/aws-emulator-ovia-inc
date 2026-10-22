@@ -156,13 +156,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A pure read over every app in state, in `appId` order, so the page this
-        // call serves and the page the next `nextToken` serves never overlap.
+        // call serves and the page the next `nextToken` serves never overlap. Each
+        // element is projected the way a read reports an app, so a listed app and a
+        // `GetApp` of the same app agree member for member.
         let store = state.lock();
         let (apps, next_token) = crate::state::page(
             store
                 .apps
                 .iter()
-                .map(|(app_id, stored)| (app_id.clone(), stored.app.clone())),
+                .map(|(app_id, stored)| (app_id.clone(), AppProjection::reported(stored.app.clone()))),
             input.next_token.as_deref(),
             crate::state::page_size(input.max_results, MAX_RESULTS),
         );

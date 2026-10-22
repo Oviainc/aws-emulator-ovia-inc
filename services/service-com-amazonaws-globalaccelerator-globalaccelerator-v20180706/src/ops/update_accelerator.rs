@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccelerator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccelerator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccelerator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the stored accelerator in [`crate::state`] in place — `Name`, `IpAddressType`,
+//! `IpAddresses`, `Enabled` — bumps `LastModifiedTime`, restarts the deployment so the
+//! record reads `IN_PROGRESS` again, and returns the UPDATED record. An unknown ARN is
+//! `AcceleratorNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccelerator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAcceleratorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccelerator"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAcceleratorErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Global Accelerator store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let invalid = |message: String| -> UpdateAcceleratorError {
+            UpdateAcceleratorErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // The same `Name` rule `CreateAccelerator` enforces: it is a property of an
+        // accelerator name, not of the call that sets it.
+        if let Some(name) = input.name.as_deref() {
+            crate::state::validate_accelerator_name(name).map_err(invalid)?;
+        }
+        let replacement_addresses = input.ip_addresses.unwrap_or_default();
+        crate::state::validate_static_ipv4_addresses(&replacement_addresses).map_err(invalid)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // CLONED rather than removed: the stored record stays in place until the mutated
+        // copy replaces it, so no future error path inside the mutation below can leave
+        // the store short an accelerator. An owned copy also lets the IP pool be drawn on
+        // without a second borrow of the store, and the lock is held across both, so no
+        // other request can observe a half-applied update.
+        let Some(mut record) = store.accelerators.get(&input.accelerator_arn).cloned() else {
+            return Err(UpdateAcceleratorErrorModeled::AcceleratorNotFoundException(
+                AcceleratorNotFoundException {
+                    message: Some(format!(
+                        "accelerator {} not found",
+                        input.accelerator_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        if let Some(enabled) = input.enabled {
+            record.enabled = enabled;
+        }
+        if !replacement_addresses.is_empty() {
+            let mut addresses = replacement_addresses;
+            while addresses.len() < 2 {
+                let allocated = store.allocate_ipv4();
+                addresses.push(allocated);
+            }
+            match crate::state::ipv4_set_index(&record.ip_sets) {
+                Some(index) => record.ip_sets[index].ip_addresses = addresses,
+                None => record.ip_sets.insert(
+                    0,
+                    crate::state::StoredIpSet {
+                        ip_address_family: crate::state::IP_FAMILY_IPV4.to_string(),
+                        ip_addresses: addresses,
+                    },
+                ),
+            }
+        }
+        if let Some(ip_address_type) = input.ip_address_type {
+            let dual_stack = ip_address_type == crate::state::IP_ADDRESS_TYPE_DUAL_STACK;
+            let already_dual_stack = record
+                .ip_sets
+                .iter()
+                .any(|set| set.ip_address_family == crate::state::IP_FAMILY_IPV6);
+            // A dual-stack accelerator carries an IPv6 set and the second DNS name; an
+            // IPv4 one carries neither (`Accelerator$DualStackDnsName`). The DNS label
+            // itself is the accelerator's and does not change.
+            let label = record
+                .dns_name
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if dual_stack {
+                if !already_dual_stack {
+                    let addresses = vec![store.allocate_ipv6(), store.allocate_ipv6()];
+                    record.ip_sets.push(crate::state::StoredIpSet {
+                        ip_address_family: crate::state::IP_FAMILY_IPV6.to_string(),
+                        ip_addresses: addresses,
+                    });
+                }
+                record.dual_stack_dns_name = Some(crate::state::dual_stack_dns_name(&label));
+            } else {
+                record
+                    .ip_sets
+                    .retain(|set| set.ip_address_family != crate::state::IP_FAMILY_IPV6);
+                record.dual_stack_dns_name = None;
+            }
+            record.ip_address_type = ip_address_type;
+        }
+
+        record.last_modified_time = now;
+        record.deployed_at = now + crate::state::DEPLOYMENT_SETTLE;
+
+        let accelerator = record.to_wire(now);
+        store.accelerators.insert(input.accelerator_arn, record);
+
+        Ok(UpdateAcceleratorOutput {
+            accelerator: Some(accelerator),
+        })
     }
 }

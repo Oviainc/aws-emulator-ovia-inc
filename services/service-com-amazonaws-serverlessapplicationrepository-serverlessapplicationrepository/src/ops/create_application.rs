@@ -38,6 +38,8 @@
 //!
 //! * `Author` (__string) **required** — The name of the author publishing the app. Minimum
 //!   length=1. Maximum length=127. Pattern "^[a-z0-9](([a-z0-9]|-(?!-))*[a-z0-9])?$";
+//!   (the model carries NO `@pattern` on this member and the service accepts any text
+//!   within the documented length — see `crate::state::validate_author`)
 //! * `Description` (__string) **required** — The description of the application. Minimum
 //!   length=1. Maximum length=256
 //! * `HomePageUrl` (__string) — A URL with more information about the application, for
@@ -194,12 +196,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The model expresses none of these as constraint traits, so the boundary
-        // validator passes them and the service enforces them here, as the one error it
-        // models for an invalid parameter.
-        validate_name(&input.name)?;
-        validate_author(&input.author)?;
-        validate_description(&input.description)?;
-        validate_labels(input.labels.as_deref().unwrap_or_default())?;
+        // validator passes them and the service enforces the documented bounds here, as
+        // the one error it models for an invalid parameter. The bounds themselves live in
+        // `crate::state`, shared with `UpdateApplication`, which rewrites the same
+        // members.
+        crate::state::validate_name(&input.name).map_err(bad_request)?;
+        crate::state::validate_author(&input.author).map_err(bad_request)?;
+        crate::state::validate_description(&input.description).map_err(bad_request)?;
+        crate::state::validate_labels(input.labels.as_deref().unwrap_or_default())
+            .map_err(bad_request)?;
         if let Some(semantic_version) = input.semantic_version.as_deref() {
             if !crate::state::is_semantic_version(semantic_version) {
                 return Err(bad_request(format!(
@@ -225,16 +230,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
         // An inline body is retained for the life of the record, so its size is bounded
         // before it is stored, at the maximum the member documents.
-        bounded_bytes(
+        crate::state::bounded_bytes(
             "LicenseBody",
             input.license_body.as_ref(),
             crate::state::MAX_ARTIFACT_BYTES,
-        )?;
-        bounded_bytes(
+        )
+        .map_err(bad_request)?;
+        crate::state::bounded_bytes(
             "ReadmeBody",
             input.readme_body.as_ref(),
             crate::state::MAX_ARTIFACT_BYTES,
-        )?;
+        )
+        .map_err(bad_request)?;
 
         // Parsed BEFORE the store is locked: the template is caller-supplied, so the work
         // it costs must not be paid while holding the lock every other request waits on.
@@ -246,6 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name_key = crate::state::name_key(&region, &input.name);
 
         let mut store = state.lock();
+        // A name already in the catalogue is the modelled conflict (HTTP 409), and the
+        // message names the application that is in the way, which is the ARN minted from
+        // the requested name.
         if store.name_index.contains_key(&name_key) {
             // The condition is "this name is already published", so that is what the
             // body's `errorCode` names — not the 409 the status line already carries.
@@ -377,107 +387,6 @@ fn internal_error(message: &str) -> CreateApplicationError {
 /// service documents.
 fn bad_request(message: String) -> CreateApplicationError {
     CreateApplicationErrorModeled::BadRequestException(crate::state::bad_request(message)).into()
-}
-
-/// `Name`: "Minimum length=1. Maximum length=140 Pattern: \"[a-zA-Z0-9\\-]+\""
-/// (`smithy_query(query="doc", shape="CreateApplicationRequest", member="Name")`).
-fn validate_name(name: &str) -> Result<(), CreateApplicationError> {
-    bounded_length("Name", name, 1, 140)?;
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return Err(bad_request(format!(
-            "Name must satisfy pattern [a-zA-Z0-9\\-]+: {name}"
-        )));
-    }
-    Ok(())
-}
-
-/// `Author`: "Minimum length=1. Maximum length=127. Pattern
-/// \"^[a-z0-9](([a-z0-9]|-(?!-))*[a-z0-9])?$\"" — lowercase alphanumerics and single
-/// hyphens, neither leading nor trailing
-/// (`smithy_query(query="doc", shape="CreateApplicationRequest", member="Author")`).
-fn validate_author(author: &str) -> Result<(), CreateApplicationError> {
-    bounded_length("Author", author, 1, 127)?;
-    let refuse = || {
-        Err(bad_request(format!(
-            "Author must satisfy pattern ^[a-z0-9](([a-z0-9]|-(?!-))*[a-z0-9])?$: {author}"
-        )))
-    };
-    let allowed = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
-    if !author.chars().all(allowed)
-        || author.starts_with('-')
-        || author.ends_with('-')
-        || author.contains("--")
-    {
-        return refuse();
-    }
-    Ok(())
-}
-
-/// `Description`: "Minimum length=1. Maximum length=256"
-/// (`smithy_query(query="doc", shape="CreateApplicationRequest", member="Description")`).
-fn validate_description(description: &str) -> Result<(), CreateApplicationError> {
-    bounded_length("Description", description, 1, 256)
-}
-
-/// `Labels`: "Minimum length=1. Maximum length=127. Maximum number of labels: 10
-/// Pattern: \"^[a-zA-Z0-9+\\-_:\\/@]+$\""
-/// (`smithy_query(query="doc", shape="CreateApplicationRequest", member="Labels")`).
-fn validate_labels(labels: &[String]) -> Result<(), CreateApplicationError> {
-    const MAX_LABELS: usize = 10;
-    if labels.len() > MAX_LABELS {
-        return Err(bad_request(format!(
-            "Labels must have at most {MAX_LABELS} entries, got {}",
-            labels.len()
-        )));
-    }
-    for label in labels {
-        bounded_length("Labels", label, 1, 127)?;
-        if !label.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '_' | ':' | '/' | '@')
-        }) {
-            return Err(bad_request(format!(
-                "Labels must satisfy pattern ^[a-zA-Z0-9+\\-_:\\/@]+$: {label}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// The documented minimum/maximum length of one member, in characters.
-fn bounded_length(
-    member: &str,
-    value: &str,
-    min: usize,
-    max: usize,
-) -> Result<(), CreateApplicationError> {
-    let length = value.chars().count();
-    if length < min || length > max {
-        return Err(bad_request(format!(
-            "{member} must have length between {min} and {max}, got {length}"
-        )));
-    }
-    Ok(())
-}
-
-/// The documented maximum size of an inline body, in bytes — checked before the body is
-/// retained, because the store holds it for the life of the record.
-fn bounded_bytes(
-    member: &str,
-    value: Option<&String>,
-    max: usize,
-) -> Result<(), CreateApplicationError> {
-    if let Some(value) = value {
-        if value.len() > max {
-            return Err(bad_request(format!(
-                "{member} must be at most {max} bytes, got {}",
-                value.len()
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// "You can specify only one of {body} and {url}; otherwise an error results"

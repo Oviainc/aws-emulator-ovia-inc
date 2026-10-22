@@ -1476,8 +1476,8 @@ async fn the_operations_outside_this_slice_still_answer_not_implemented() {
     // Rows: one operation from each family left to its own gap issue.
     let cases: [(&str, Value); 5] = [
         (
-            "CreateParameterGroup",
-            json!({ "ParameterGroupName": "pg" }),
+            "UpdateParameterGroup",
+            json!({ "ParameterGroupName": "pg", "ParameterNameValues": [] }),
         ),
         (
             "DecreaseReplicationFactor",

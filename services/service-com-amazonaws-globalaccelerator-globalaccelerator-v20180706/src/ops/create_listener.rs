@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateListener
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateListener`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateListener::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and PERSISTS a listener under its parent accelerator in [`crate::state`]: a
+//! `ListenerArn` derived from the parent's ARN, the supplied port ranges and protocol,
+//! and `ClientAffinity` defaulting to `NONE`. An unknown `AcceleratorArn` is
+//! `AcceleratorNotFoundException`; a port range that names no ports is
+//! `InvalidPortRangeException`. Repeating the call with the same `IdempotencyToken`
+//! returns the listener that token already minted.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateListener` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateListenerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateListener"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateListenerErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Global Accelerator store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every supplied range must name at least one port before anything is written.
+        let mut port_ranges = Vec::with_capacity(input.port_ranges.len());
+        for range in &input.port_ranges {
+            match crate::state::validate_port_range(range) {
+                Ok(pair) => port_ranges.push(pair),
+                Err(message) => {
+                    return Err(CreateListenerErrorModeled::InvalidPortRangeException(
+                        InvalidPortRangeException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            }
+        }
+
+        let mut store = state.lock();
+
+        if !store.accelerators.contains_key(&input.accelerator_arn) {
+            return Err(CreateListenerErrorModeled::AcceleratorNotFoundException(
+                AcceleratorNotFoundException {
+                    message: Some(format!(
+                        "accelerator {} not found",
+                        input.accelerator_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let token_key = crate::state::listener_idempotency_key(
+            &input.accelerator_arn,
+            &input.idempotency_token,
+        );
+        if let Some(minted) = store.idempotency.get(&token_key) {
+            if let Some(existing) = store.listeners.get(minted) {
+                return Ok(CreateListenerOutput {
+                    listener: Some(existing.to_wire()),
+                });
+            }
+        }
+
+        // The per-accelerator quota bounds this store, the same way the per-account
+        // accelerator quota bounds the accelerators; stale idempotency records are
+        // released first.
+        store.prune_idempotency();
+        let attached = store
+            .accelerators
+            .get(&input.accelerator_arn)
+            .map_or(0, |parent| parent.listener_arns.len());
+        if attached >= crate::state::MAX_LISTENERS_PER_ACCELERATOR {
+            return Err(CreateListenerErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the accelerator already holds the maximum of {} listeners",
+                        crate::state::MAX_LISTENERS_PER_ACCELERATOR
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let uuid = store.mint_uuid();
+        let arn = crate::state::mint_listener_arn(&input.accelerator_arn, &uuid);
+        let record = crate::state::StoredListener {
+            arn: arn.clone(),
+            accelerator_arn: input.accelerator_arn.clone(),
+            port_ranges,
+            protocol: input.protocol,
+            // "The default value is NONE" (`Listener$ClientAffinity`).
+            client_affinity: input
+                .client_affinity
+                .unwrap_or_else(|| crate::state::CLIENT_AFFINITY_NONE.to_string()),
+        };
+        let listener = record.to_wire();
+
+        if let Some(parent) = store.accelerators.get_mut(&input.accelerator_arn) {
+            parent.listener_arns.push(arn.clone());
+        }
+        store.idempotency.insert(token_key, arn.clone());
+        store.listeners.insert(arn, record);
+
+        Ok(CreateListenerOutput {
+            listener: Some(listener),
+        })
     }
 }

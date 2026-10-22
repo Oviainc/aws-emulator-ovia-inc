@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the request's tags into the metadata tags of the repository its `resourceArn`
+//! names, in [`crate::state`]: a key the repository already carries takes the new value,
+//! a key it does not carry is added, and a key the request does not name is left alone.
+//! `ListTagsForResource` reads back exactly what this left.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +108,32 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors: the ARN
+/// resolution and the tag checks both live in [`crate::state`], so every operation that
+/// tags a resource refuses the same requests with the error its own model declares.
+fn fault_error(fault: crate::state::Fault) -> TagResourceErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            TagResourceErrorModeled::RepositoryNotFoundException(RepositoryNotFoundException {
+                message,
+            })
+        }
+        crate::state::Fault::InvalidTagParameter(_) => {
+            TagResourceErrorModeled::InvalidTagParameterException(InvalidTagParameterException {
+                message,
+            })
+        }
+        crate::state::Fault::TooManyTags(_) => {
+            TagResourceErrorModeled::TooManyTagsException(TooManyTagsException { message })
+        }
+        // `ImageNotFound` cannot arise here: this operation resolves no image.
+        _ => TagResourceErrorModeled::InvalidParameterException(InvalidParameterException {
+            message,
+        }),
+    }
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +170,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::ServerException(ServerException {
+                message: Some("the ecr repository store is unavailable".to_string()),
+            })
+            .into());
+        };
+        // Nothing about tagging depends on request metadata: the resource is named by
+        // the ARN in the body, and this registry's repositories are keyed by name.
+        let _ = ctx;
+
+        // What the request asks for is refused before any repository is resolved: an
+        // unusable key or value is a bad request whether or not the resource exists.
+        crate::state::check_tags(&input.tags).map_err(fault_error)?;
+        let name =
+            crate::state::repository_name_from_arn(&input.resource_arn).map_err(fault_error)?;
+
+        let mut store = state.lock();
+        let repo = store.repository_mut(&name).map_err(fault_error)?;
+        // The limit is on the tags the resource ends up carrying, so it is checked
+        // against what this repository already holds.
+        crate::state::check_tag_count(&repo.tags, &input.tags).map_err(fault_error)?;
+        repo.merge_tags(input.tags);
+
+        Ok(TagResourceOutput {})
     }
 }

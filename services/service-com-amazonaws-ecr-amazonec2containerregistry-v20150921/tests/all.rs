@@ -17,6 +17,8 @@ mod pull_time_update_exclusions;
 mod registry_policy;
 #[path = "all/repository_image_lifecycle.rs"]
 mod repository_image_lifecycle;
+#[path = "all/resource_tag_mutations.rs"]
+mod resource_tag_mutations;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/scanning_configuration.rs"]

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkload
-//! IMPLEMENTED: removes the stored workload and everything keyed to it, so a later
-//! `GetWorkload` or `DeleteWorkload` for that id answers `ResourceNotFoundException`
-//! (404) and `ListWorkloads` no longer enumerates it.
+//! IMPLEMENTED: removes the stored workload and everything keyed to it — its name
+//! reservation, its create tokens and its milestones — so a later `GetWorkload` or
+//! `DeleteWorkload` for that id answers `ResourceNotFoundException` (404) and
+//! `ListWorkloads` no longer enumerates it. An id that does not satisfy the modelled
+//! `WorkloadId` pattern is resolved by the same lookup, so it is a 404 too.
 //!
 //! ## Shape of an operation
 //!
@@ -186,11 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         if store.remove_workload(&input.workload_id).is_none() {
             return Err(DeleteWorkloadErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("No workload exists with id {}", input.workload_id),
-                    resource_id: input.workload_id.clone(),
-                    resource_type: crate::state::WORKLOAD_RESOURCE_TYPE.to_string(),
-                },
+                crate::state::workload_not_found(&input.workload_id),
             )
             .into());
         }

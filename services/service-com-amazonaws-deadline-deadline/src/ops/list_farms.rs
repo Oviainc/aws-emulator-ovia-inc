@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFarms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFarms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFarms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the farms this service's store holds, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +147,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFarms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFarmsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFarms"))
+        // A read: nothing here writes.
+        let _ = ctx;
+        // `principalId` asks for the farms one Identity Center principal is a member of.
+        // Farm memberships are not persisted yet (AssociateMemberToFarm / ListFarmMembers
+        // are still scaffolded), so that filter cannot be answered from state — and
+        // answering it with the unfiltered list would be a wrong answer, not a missing one.
+        if input.principal_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListFarms with a principalId filter (farm memberships are not persisted yet)",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFarmsErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // Oldest first, with the id breaking a tie, so paging over the list is stable.
+        let mut ordered: Vec<(::std::time::SystemTime, String)> = store
+            .farms
+            .values()
+            .map(|farm| (farm.created_at, farm.farm_id.clone()))
+            .collect();
+        ordered.sort();
+        let ids: Vec<String> = ordered.into_iter().map(|(_, farm_id)| farm_id).collect();
+
+        let (page, next_token) =
+            crate::state::page_keys(&ids, input.next_token.as_deref(), input.max_results).map_err(
+                |message| {
+                    ListFarmsError::from(ListFarmsErrorModeled::ValidationException(
+                        crate::state::field_validation_failed("nextToken", &message),
+                    ))
+                },
+            )?;
+
+        let farms = page
+            .iter()
+            .filter_map(|farm_id| store.farm(farm_id))
+            .map(|farm| FarmSummary {
+                farm_id: farm.farm_id.clone(),
+                display_name: farm.display_name.clone(),
+                kms_key_arn: farm.kms_key_arn.clone(),
+                created_at: crate::state::timestamp(farm.created_at),
+                created_by: farm.created_by.clone(),
+                updated_at: farm.updated_at.map(crate::state::timestamp),
+                updated_by: farm.updated_by.clone(),
+            })
+            .collect();
+
+        Ok(ListFarmsOutput { farms, next_token })
     }
 }

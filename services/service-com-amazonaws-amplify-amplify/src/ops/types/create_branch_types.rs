@@ -40,6 +40,6 @@ pub struct CreateBranchInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.amplify#CreateBranchResult")]
 #[derive(Debug, Clone)]
 pub struct CreateBranchOutput {
-    pub branch: Branch,
+    pub branch: BranchProjection,
 }
 

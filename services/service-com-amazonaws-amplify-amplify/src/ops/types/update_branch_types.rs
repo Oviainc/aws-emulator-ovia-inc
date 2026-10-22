@@ -39,6 +39,6 @@ pub struct UpdateBranchInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.amplify#UpdateBranchResult")]
 #[derive(Debug, Clone)]
 pub struct UpdateBranchOutput {
-    pub branch: Branch,
+    pub branch: BranchProjection,
 }
 
