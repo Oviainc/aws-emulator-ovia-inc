@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Merges the members `updatedComponent` carries onto the stored component, leaves every
+//! other member as the create (or the previous update) left it, and reports the merged
+//! record. `UpdateComponent` declares no `ResourceNotFoundException`, so an `id` that
+//! names no component in that app environment is refused with the modelled
+//! `InvalidParameterException` (HTTP 400).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `clientToken` needs no replay record here: a merge is idempotent in the members it
+//! writes, so repeating one leaves the same record (only `modifiedAt`, which reports the
+//! last call that changed the component, moves). Nothing is minted, consumed or counted
+//! that a second application could duplicate.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +148,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateComponent"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateComponentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the amplifyuibuilder component store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let patch = input.updated_component;
+
+        // `UpdateComponentData$id` is documented as "The unique ID of the
+        // component to update" — it names the same component the `@httpLabel`
+        // does, so a payload naming a different one is a contradictory request
+        // rather than an instruction to renumber the component.
+        if let Some(named) = patch.id.as_deref() {
+            if named != input.id {
+                return Err(UpdateComponentErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "updatedComponent.id {named:?} does not name the component being \
+                             updated ({:?})",
+                            input.id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The same reserved-name rule `CreateComponent` enforces: a component's
+        // property maps may not carry a `tags` entry, so an update may not
+        // introduce one either.
+        for (member, carries) in [
+            (
+                "properties",
+                patch
+                    .properties
+                    .as_ref()
+                    .is_some_and(crate::state::carries_reserved_name),
+            ),
+            (
+                "overrides",
+                patch
+                    .overrides
+                    .as_ref()
+                    .is_some_and(crate::state::carries_reserved_name),
+            ),
+            (
+                "bindingProperties",
+                patch
+                    .binding_properties
+                    .as_ref()
+                    .is_some_and(crate::state::carries_reserved_name),
+            ),
+            (
+                "collectionProperties",
+                patch
+                    .collection_properties
+                    .as_ref()
+                    .is_some_and(crate::state::carries_reserved_name),
+            ),
+        ] {
+            if carries {
+                return Err(UpdateComponentErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "updatedComponent.{member} cannot carry the reserved property \
+                             name {:?}",
+                            crate::state::RESERVED_PROPERTY_NAME
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(component) =
+            store.component_mut(&input.app_id, &input.environment_name, &input.id)
+        else {
+            return Err(UpdateComponentErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "id {:?} does not name a component in app {:?} environment {:?}",
+                        input.id, input.app_id, input.environment_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Every `UpdateComponentData` member is optional: one the request carries
+        // replaces what was stored, one it leaves out keeps it. `appId`,
+        // `environmentName`, `id` and `createdAt` identify the record and are not
+        // `UpdateComponentData` members at all, so they never move.
+        if let Some(name) = patch.name {
+            component.name = name;
+        }
+        if let Some(component_type) = patch.component_type {
+            component.component_type = component_type;
+        }
+        if let Some(properties) = patch.properties {
+            component.properties = properties;
+        }
+        if let Some(variants) = patch.variants {
+            component.variants = variants;
+        }
+        if let Some(overrides) = patch.overrides {
+            component.overrides = overrides;
+        }
+        if let Some(binding_properties) = patch.binding_properties {
+            component.binding_properties = binding_properties;
+        }
+        if patch.children.is_some() {
+            component.children = patch.children;
+        }
+        if patch.collection_properties.is_some() {
+            component.collection_properties = patch.collection_properties;
+        }
+        if patch.events.is_some() {
+            component.events = patch.events;
+        }
+        if patch.source_id.is_some() {
+            component.source_id = patch.source_id;
+        }
+        if patch.schema_version.is_some() {
+            component.schema_version = patch.schema_version;
+        }
+        component.modified_at = Some(now);
+
+        Ok(UpdateComponentOutput {
+            entity: Some(component.to_component()),
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComponents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComponents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComponents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one page of the components stored for the app environment the request names,
+//! in creation order. `nextToken` carries the app environment it was issued for and the
+//! cursor the next page resumes at; a token this operation never issued for that app
+//! environment is refused with the modelled `InvalidParameterException`.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComponents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComponentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComponents"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListComponentsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the amplifyuibuilder component store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` targets `ListEntityLimit`, modelled `@range(min: 1, max:
+        // 100)`, and the boundary validator refused anything outside it before
+        // this handler ran, so the only case left is an absent value: serve the
+        // largest page the model allows. The `clamp` states that invariant rather
+        // than correcting a caller — a value reaching here outside the range is a
+        // validator bug, which the debug assertion surfaces.
+        let requested = input
+            .max_results
+            .unwrap_or(crate::state::COMPONENT_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::COMPONENT_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::COMPONENT_PAGE_LIMIT))
+            .expect("a page size clamped into 1..=100 fits in usize");
+
+        let key = (input.app_id.clone(), input.environment_name.clone());
+        let store = state.lock();
+
+        // The token carries the app environment it was issued for and the cursor
+        // the next page starts at. A token this operation never issued — a
+        // malformed one, one issued while listing another app environment, or a
+        // cursor past everything handed out — names no page, so it is refused
+        // rather than silently served as a page of this list.
+        let cursor = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                match crate::state::parse_page_token(token, &key, store.cursor_seq) {
+                    Some(cursor) => cursor,
+                    None => {
+                        return Err(ListComponentsErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(format!(
+                                    "nextToken {token:?} is not a token returned by \
+                                     ListComponents for this app environment"
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        let mut entities = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for component in store.components_in(&input.app_id, &input.environment_name) {
+            // Resume at the first component at or after the cursor, so a page is
+            // still served when the component the token named was deleted
+            // meanwhile.
+            if component.cursor < cursor {
+                continue;
+            }
+            if entities.len() == page_size {
+                next_token = Some(crate::state::page_token(&key, component.cursor));
+                break;
+            }
+            entities.push(component.to_summary());
+        }
+
+        Ok(ListComponentsOutput {
+            entities,
+            next_token,
+        })
     }
 }
