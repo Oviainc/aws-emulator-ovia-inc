@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted export records, newest page last, filtered by
+//! `domainName` when the request names one. `exportSummaries` is built from the stored
+//! records; `nextToken` appears only while records remain.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `maxResults`' `@range(min: 1)`, `nextToken`'s `@length(1, 2048)` and
+        // `domainName`'s `@length(min: 1)` are modelled constraints the centralized
+        // walk already refused anything outside of.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExports"))
+        // An engine without this service's store is "nobody wired that engine up", not
+        // a request failure, and this operation's model declares no server error to say
+        // so with: 501 is the honest answer, never a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("ListExports"))?;
+
+        // The page size is the server's own decision: clamped into
+        // 1..=MAX_PAGE_SIZE whatever the request asked for, so no allocation below is
+        // sized by the request. `maxResults` carries no modelled maximum, so this is
+        // where the ceiling lives.
+        let page_size = input.max_results.map_or(
+            crate::state::MAX_PAGE_SIZE as usize,
+            |requested| requested.clamp(1, crate::state::MAX_PAGE_SIZE) as usize,
+        );
+
+        let mut store = state.lock();
+        // The ONLY write a read makes: every status move materialised here was due on
+        // the clock whether or not anybody called. See `StoredExport::settle`.
+        store.settle_all(::std::time::SystemTime::now());
+
+        // `domainName` filters the enumeration; absent, every domain's exports are
+        // listed. A domain with no exports yields an empty list rather than an error:
+        // see `start_domain_export.rs` on why `NoSuchDomainException` is unreachable
+        // in this emulator.
+        let domain_filter = input.domain_name.as_deref();
+
+        // The token names how far into the creation order the previous page got, and
+        // which filter it got there under. A token this service did not issue — one
+        // naming a position the store no longer has, or one issued under a different
+        // filter, which would continue a stream this caller never started — is the
+        // modelled `InvalidNextTokenException`; its own text is not echoed back.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                crate::state::decode_page_token(token, store.export_count(), domain_filter)
+                    .ok_or_else(|| {
+                        access(ctx, "refused-invalid-next-token", 0);
+                        ListExportsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message:
+                                    "nextToken is not a pagination token issued by ListExports \
+                                     for this request"
+                                        .to_string(),
+                            },
+                        )
+                    })?
+            }
+            None => 0,
+        };
+
+        let mut export_summaries = Vec::new();
+        let mut next_token = None;
+        // `enumerate` counts positions in the WHOLE creation order, so one offset
+        // arithmetic serves every filter; the token's own digest is what keeps a page
+        // from being continued under a different one.
+        for (position, export) in store.exports_in_order().enumerate().skip(start) {
+            if domain_filter.is_some_and(|domain| export.domain_name != domain) {
+                continue;
+            }
+            if export_summaries.len() == page_size {
+                // The first record that did not fit is where the next page starts, and
+                // only then is a token emitted — the last page carries none.
+                next_token = Some(crate::state::encode_page_token(position, domain_filter));
+                break;
+            }
+            export_summaries.push(export.to_summary());
+        }
+
+        access(ctx, "read", export_summaries.len());
+        Ok(ListExportsOutput {
+            // `exportSummaries` is `@required`, so an empty store answers an empty
+            // list, never a missing member.
+            export_summaries,
+            next_token,
+        })
     }
+}
+
+/// Access record for this reporting operation: who asked, how it ended, and how much
+/// it reported.
+///
+/// Emitted at INFO so it survives the emulator's default log filtering. Only wire
+/// metadata and the page size go in — never the caller's own `nextToken` or
+/// `domainName` text, and never the emulator's own credentials.
+fn access(ctx: &smithy_server_runtime::OperationContext<'_>, outcome: &str, reported: usize) {
+    ::tracing::info!(
+        audit = true,
+        operation = "ListExports",
+        outcome,
+        reported,
+        caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+        "ListExports {outcome}"
+    );
 }

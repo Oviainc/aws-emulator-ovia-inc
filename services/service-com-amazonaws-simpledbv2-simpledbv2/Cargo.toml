@@ -21,13 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque `nextToken` encoding for ListExports' pagination cursor, and the hex
+# rendering of a minted identifier.
+hex = { workspace = true }
+# The digest behind a minted export id / client token, and the digest of the
+# `domainName` filter a ListExports page token carries.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
