@@ -17,12 +17,16 @@ mod api_key_collection_members;
 mod api_key_lifecycle;
 #[path = "all/delete_lifecycle.rs"]
 mod delete_lifecycle;
+#[path = "all/epoch_second_timestamps.rs"]
+mod epoch_second_timestamps;
 #[path = "all/method_integration.rs"]
 mod method_integration;
 #[path = "all/method_response.rs"]
 mod method_response;
 #[path = "all/patch_updates.rs"]
 mod patch_updates;
+#[path = "all/query_value_coercion.rs"]
+mod query_value_coercion;
 #[path = "all/rest_api_defaults.rs"]
 mod rest_api_defaults;
 #[path = "all/rest_api_lifecycle.rs"]

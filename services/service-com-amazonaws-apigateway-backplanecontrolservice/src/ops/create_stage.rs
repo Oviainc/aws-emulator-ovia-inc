@@ -334,7 +334,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         bound_input(&input).map_err(bad_request)?;
         validate_stage_name(&input.stage_name).map_err(bad_request)?;
 
-        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        // Whole epoch seconds, like every other instant this surface reports; see
+        // `crate::state::now`.
+        let now = crate::state::now();
         let mut store = state.lock();
         let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
             CreateStageErrorModeled::NotFoundException(NotFoundException {
