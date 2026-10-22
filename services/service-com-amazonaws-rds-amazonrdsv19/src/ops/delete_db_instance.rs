@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBInstance
-//! IMPLEMENTED: this operation removes the stored DB instance, taking the requested
-//! final snapshot first. This is the ONLY file to touch for it.
+//! IMPLEMENTED: this operation accepts the delete of the stored DB instance, taking
+//! the requested final snapshot first, moving the instance to `deleting` and leaving
+//! the clock owing its removal from the store. This is the ONLY file to touch for it.
 //!
 //! Its records and their projection onto the modelled wire shapes live in
 //! [`crate::state`], shared with the other implemented operations.
@@ -119,6 +120,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The statuses this operation documents as deletable ONLY with `SkipFinalSnapshot`
+/// enabled: "When a DB instance is in a failure state and has a status of failed,
+/// incompatible-restore, or incompatible-network, you can only delete it when you skip
+/// creation of the final snapshot with the SkipFinalSnapshot parameter." No other
+/// status refuses a delete, so nothing else belongs in this list
+/// (`smithy_query(query="doc",shape="DeleteDBInstance")`).
+const FAILURE_STATUSES: [&str; 3] = ["failed", "incompatible-restore", "incompatible-network"];
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -255,14 +264,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // Nor can one that is still coming up or already on its way out: RDS answers
-        // the same state fault, and the state the clock has yet to settle is real.
+        // Nor can one whose delete is already running: "This operation can't be
+        // canceled or reverted after it begins", so a second delete of an instance
+        // already in `deleting` is the same state fault. Every other status accepts
+        // the delete — a provisioning status this emulator's clock has yet to settle
+        // included, because a delete does not need the instance to be up.
         let current_status = store.db_instances[&key].status.clone();
-        if current_status != "available" && current_status != "modifying" {
+        if store.db_instances[&key].is_deleting() {
             return Err(DeleteDBInstanceErrorModeled::InvalidDBInstanceStateFault(
                 InvalidDBInstanceStateFault {
                     message: Some(format!(
-                        "DB instance {identifier} is not available for deletion (status {current_status})"
+                        "DB instance {identifier} is already being deleted (status {current_status})"
+                    )),
+                },
+            )
+            .into());
+        }
+        // The one status class this operation documents as undeletable, and only while
+        // a final snapshot is asked for: "When a DB instance is in a failure state and
+        // has a status of failed, incompatible-restore, or incompatible-network, you
+        // can only delete it when you skip creation of the final snapshot with the
+        // SkipFinalSnapshot parameter."
+        if !skip_final_snapshot && FAILURE_STATUSES.contains(&current_status.as_str()) {
+            return Err(DeleteDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} is in a failure state (status \
+                         {current_status}) and can only be deleted with SkipFinalSnapshot \
+                         enabled"
                     )),
                 },
             )
@@ -303,14 +332,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.db_snapshots.insert(snapshot_key, snapshot);
         }
 
-        let mut record = store
+        let record = store
             .db_instances
-            .remove(&key)
+            .get_mut(&key)
             .expect("the instance was found above and the store is locked");
-        // The instance is gone from the store, so the next read of this identifier is
-        // a 404; the response reports the status the deletion leaves it in.
-        record.status = "deleting".to_string();
-        record.pending_status = None;
+        // The delete is accepted, so the instance reports `deleting` and the clock
+        // owes its removal: the next read within the span sees `deleting`, and every
+        // read after it is a `DBInstanceNotFoundFault`.
+        record.begin_deletion();
 
         Ok(DeleteDBInstanceOutput {
             db_instance: Some(record.to_wire()),
