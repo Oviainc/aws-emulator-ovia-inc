@@ -7,9 +7,10 @@
 //! The move on to `stopped` — and with it `endTime`, "the time that the experiment ended"
 //! — is owed to the clock (see [`crate::state::ExperimentRecord::settle`]), so a caller
 //! reading the experiment immediately still sees it stopping and a later
-//! `GetExperiment` sees it stopped. Stopping an experiment that is already stopping or
-//! stopped changes nothing, so `endTime` never moves once it is set. An id naming no
-//! record answers `ResourceNotFoundException` (HTTP 404).
+//! `GetExperiment` sees it stopped. Stopping an experiment that is already stopping
+//! changes nothing, so `endTime` never moves once it is set; stopping one already in a
+//! FINAL state is refused with `ValidationException` (HTTP 400) and leaves the record
+//! untouched. An id naming no record answers `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -154,6 +155,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // An experiment that has already ended cannot be stopped: the call is refused and
+        // the record — its status, its reason and its `endTime` — is left exactly as the
+        // run left it, so a caller can tell a stop it performed from one the service
+        // would never have accepted.
+        if record.status.is_terminal() {
+            return Err(StopExperimentErrorModeled::ValidationException(
+                crate::state::final_state_refusal(&input.id),
+            )
+            .into());
+        }
         record.request_stop(now);
 
         Ok(StopExperimentOutput {
