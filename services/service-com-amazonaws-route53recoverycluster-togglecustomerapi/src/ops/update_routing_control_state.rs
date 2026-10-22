@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRoutingControlState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRoutingControlState`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: moves the named routing control's stored state to `On` or `Off` in
+//! `crate::state`, so a later read reports it. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRoutingControlState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An ARN the registry does not hold is a `ResourceNotFoundException` (404), and a
+//! state outside the modelled `On`/`Off` value set is a `ValidationException` (400).
+//!
+//! `SafetyRulesToOverride` is accepted and IGNORED in this first slice: safety-rule
+//! assertion and gating is left to its own gap issue.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +172,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRoutingControlState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRoutingControlStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRoutingControlState"))
+        // `ctx` carries request metadata; the audit record below reads the caller's
+        // presented access-key id from it.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // `SafetyRulesToOverride` is accepted and ignored in this slice (see the
+        // module header): no safety rule is asserted yet, so there is none to override.
+        let _ = &input.safety_rules_to_override;
+
+        // The modelled `RoutingControlState` value set is enforced at the boundary
+        // before this handler runs; parsing it again here keeps the stored state a
+        // typed switch rather than whatever string arrived.
+        let Some(new_state) =
+            crate::state::RoutingControlState::from_wire(&input.routing_control_state)
+        else {
+            return Err(UpdateRoutingControlStateErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "RoutingControlState must satisfy enum value set: [{}]",
+                        ROUTING_CONTROL_STATE_VALUES.join(", ")
+                    ),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "RoutingControlState".to_string(),
+                        message: format!(
+                            "Member must satisfy enum value set: [{}]",
+                            ROUTING_CONTROL_STATE_VALUES.join(", ")
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateRoutingControlStateError::from(
+                UpdateRoutingControlStateErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the routing control registry is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // Resolve and mutate under ONE guard, so the control cannot vanish between
+        // the lookup and the write.
+        let mut guard = state.lock();
+        let Some(control) = guard.routing_controls.get_mut(&input.routing_control_arn) else {
+            return Err(
+                UpdateRoutingControlStateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Routing control {} was not found",
+                            input.routing_control_arn
+                        ),
+                        resource_id: input.routing_control_arn.clone(),
+                        resource_type: "RoutingControl".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let previous_state = control.state;
+        control.state = new_state;
+
+        // Audit record for a state-changing call: the caller's presented access-key
+        // id (never a secret), the resource, and the transition.
+        tracing::info!(
+            operation = "UpdateRoutingControlState",
+            caller_akid = %caller_akid,
+            routing_control_arn = %input.routing_control_arn,
+            previous_state = previous_state.as_wire(),
+            new_state = new_state.as_wire(),
+            "routing control state updated"
+        );
+
+        // The modelled output carries no members: the state change IS the result.
+        Ok(UpdateRoutingControlStateOutput {})
     }
 }

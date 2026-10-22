@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the snapshot stored under `snapshotName` (or the one carrying
+//! `snapshotArn`), exactly as `CreateSnapshot` stored it, bar the retention countdown the
+//! clock walks down — see [`crate::state::SnapshotRecord::reported`]. An unknown snapshot
+//! is a 404 `ResourceNotFoundException`, and a request that names neither member a 400
+//! `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +139,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSnapshot"))
+        let _ = ctx;
+        // Both identifying members are optional in the model, but a read has to address
+        // ONE snapshot: a request naming neither is refused rather than answered with an
+        // arbitrary record.
+        if input.snapshot_name.is_none() && input.snapshot_arn.is_none() {
+            return Err(GetSnapshotErrorModeled::ValidationException(
+                ValidationException {
+                    message: "either snapshotName or snapshotArn must be specified"
+                        .to_string(),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.settle_due_transitions();
+
+        // Name first, ARN second; when both are given they have to agree, so a mismatched
+        // pair addresses no snapshot. `ownerAccount` likewise narrows the lookup, so a
+        // snapshot this account does not own is not found.
+        let found = match input.snapshot_name.as_deref() {
+            Some(name) => state.snapshots.get(name),
+            None => state.snapshots.values().find(|record| {
+                record.snapshot.snapshot_arn.as_deref() == input.snapshot_arn.as_deref()
+            }),
+        }
+        .filter(|record| {
+            input
+                .snapshot_arn
+                .as_deref()
+                .is_none_or(|arn| record.snapshot.snapshot_arn.as_deref() == Some(arn))
+        })
+        .filter(|record| {
+            input
+                .owner_account
+                .as_deref()
+                .is_none_or(|account| record.snapshot.owner_account.as_deref() == Some(account))
+        });
+
+        let Some(record) = found else {
+            let identifier = input
+                .snapshot_name
+                .clone()
+                .or_else(|| input.snapshot_arn.clone())
+                .unwrap_or_default();
+            return Err(GetSnapshotErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no snapshot named {identifier}"),
+                    resource_name: Some(identifier),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetSnapshotOutput {
+            snapshot: Some(record.reported(::std::time::Instant::now())),
+        })
     }
 }

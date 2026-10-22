@@ -97,16 +97,44 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound). The framework's
+        // default codes for the query protocols are `MalformedInput` /
+        // `ValidationError`; Elastic Beanstalk names these two refusals itself,
+        // and its model says which code for which case:
+        //
+        // * a value that cannot be used -> `InvalidParameterValue`
+        //   (`CreateEnvironment$EnvironmentName`: "If the specified name already
+        //   exists in the region, Elastic Beanstalk returns an
+        //   InvalidParameterValue error.")
+        // * an absent required parameter -> `MissingRequiredParameter`
+        //   (`TerminateEnvironment$EnvironmentId`: "If you do not specify
+        //   either, Elastic Beanstalk returns MissingRequiredParameter error.")
+        //
+        // Both the code and the message are replaced together, so a client that
+        // branches on the code reads one that matches the prose. An
+        // authentication refusal keeps the framework's wording.
+        match refusal {
+            Refusal::Invalid(violations) if !violations.is_empty() => {
+                let all_absent = violations.iter().all(|violation| {
+                    violation.kind == smithy_server_runtime::ViolationKind::MissingRequiredMember
+                });
+                let code = if all_absent {
+                    crate::scaffolded::MISSING_REQUIRED_PARAMETER
+                } else {
+                    crate::scaffolded::INVALID_PARAMETER_VALUE
+                };
+                let message = violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect::<Vec<String>>()
+                    .join(" ");
+                Some(Refused {
+                    code: code.to_string(),
+                    message,
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

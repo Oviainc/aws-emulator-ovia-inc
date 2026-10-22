@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConfigurationManager
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConfigurationManager`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the ONE stored configuration manager the ARN names — its name,
+//! description, timestamps, tags, status summaries and the configuration definitions
+//! with the ids `CreateConfigurationManager` assigned them — or the modelled 404 when
+//! no manager has that ARN.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConfigurationManager::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting, not mutating: the only write it makes is materialising the status
+//! change the clock already owes (see [`crate::state::ComAmazonawsSsmquicksetupQuicksetupState::settle`]),
+//! which was due at that instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +159,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConfigurationManager` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConfigurationManagerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConfigurationManager"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetConfigurationManagerErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the configuration manager store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(manager) = store.managers.get(&input.manager_arn) else {
+            return Err(GetConfigurationManagerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no configuration manager with ARN {} exists",
+                        input.manager_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetConfigurationManagerOutput {
+            manager_arn: manager.manager_arn.clone(),
+            description: manager.description.clone(),
+            name: manager.name.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(manager.created_at)),
+            last_modified_at: Some(::aws_smithy_types::DateTime::from(manager.last_modified_at)),
+            status_summaries: Some(
+                manager
+                    .status_summaries
+                    .iter()
+                    .map(crate::state::StatusSummaryRecord::to_status_summary)
+                    .collect(),
+            ),
+            configuration_definitions: Some(
+                manager
+                    .definitions
+                    .iter()
+                    .map(crate::state::ConfigurationDefinitionRecord::to_configuration_definition)
+                    .collect(),
+            ),
+            // Tags are stored with the manager, so a manager created without any
+            // reports an empty map rather than nothing at all.
+            tags: Some(crate::state::to_hash_map(&manager.tags)),
+        })
     }
 }

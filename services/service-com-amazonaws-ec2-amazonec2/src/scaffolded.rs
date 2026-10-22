@@ -177,6 +177,71 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `ServiceError` error shape.
+static SERVICE_ERROR_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ServiceError$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `ServiceError` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
+/// shape is not in any service's model. The wire `<Code>` comes from the variant's
+/// own `code`, not from this schema's shape name.
+pub static SERVICE_ERROR_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#ServiceError",
+        "smithy.framework",
+        "ServiceError",
+    ),
+    ShapeType::Structure,
+    &[&SERVICE_ERROR_MESSAGE],
+);
+
+/// A failure this service answers with an error code of its own that its model
+/// declares no shape for.
+///
+/// EC2's model declares ZERO error shapes — every operation's `errors` list is empty
+/// (`smithy_query(query="operation",operation="<Op>")`) — while the real service
+/// refuses requests with codes its clients branch on: `InvalidParameterValue` for a
+/// value it cannot accept, `DryRunOperation` for a `DryRun` request that would have
+/// succeeded. This is how a handler answers with THAT code and status instead of
+/// flattening every such refusal into `ValidationException`, which no EC2 client
+/// matches on. Reach it through a named constructor in `crate::state` rather than
+/// inventing a code at the call site.
+#[derive(Debug, Clone)]
+pub struct ServiceError {
+    /// The wire error code (`<Code>`). A `&'static str` so it can only be one of
+    /// this service's known codes, never text taken from a request.
+    pub code: &'static str,
+    /// The HTTP status the real service answers this code with.
+    pub status: u16,
+    /// Why the request was refused; built from the request, never from a recording.
+    pub message: String,
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ServiceError {}
+
+impl SerializableStruct for ServiceError {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&SERVICE_ERROR_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +261,9 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The request was refused with one of this service's own error codes, for a
+    /// failure its model declares no shape for. Renders with that code and status.
+    ServiceError(ServiceError),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +289,19 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request with one of this service's own error codes.
+    ///
+    /// For a service whose model declares no error shapes, this is the only way to
+    /// answer the code and status the real service answers — see [`ServiceError`].
+    /// `code` is `&'static str` so the wire code is always one this service chose.
+    pub fn service_error(code: &'static str, status: u16, message: impl Into<String>) -> Self {
+        Self::ServiceError(ServiceError {
+            code,
+            status,
+            message: message.into(),
+        })
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +310,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::ServiceError(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +323,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::ServiceError(e) => e.source(),
         }
     }
 }
@@ -255,6 +338,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::ServiceError(e) => e,
         }
     }
 
@@ -263,6 +347,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::ServiceError(_) => &SERVICE_ERROR_SCHEMA,
         }
     }
 
@@ -275,6 +360,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::ServiceError(e) => e.code,
         }
     }
 
@@ -287,6 +373,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::ServiceError(e) => e.status,
         }
     }
 
@@ -299,6 +386,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            // The code is already the wire code the query envelope renders, so there
+            // is no legacy `awsQueryError` alias to add on top of it.
+            Self::ServiceError(_) => None,
         }
     }
 }

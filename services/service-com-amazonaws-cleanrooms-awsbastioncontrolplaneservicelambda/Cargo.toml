@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints the lowercase-hex v4 UUIDs the model's `UUID` shape requires for
+# collaboration and membership ids.
+uuid = { version = "1", features = ["v4"] }
+# Encodes the opaque pagination tokens ListCollaborations/ListMemberships hand out.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

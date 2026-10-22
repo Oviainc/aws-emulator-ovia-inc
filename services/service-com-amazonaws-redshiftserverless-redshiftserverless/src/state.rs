@@ -2,11 +2,11 @@
 
 //! Engine state for the com-amazonaws-redshiftserverless-redshiftserverless service.
 //!
-//! The namespace + workgroup store and the usage limits taken out over them, plus the
-//! little that every handler of those resources shares: the server-derived fields (id,
-//! ARN, endpoint address, creation date), the clock-owed status transition a just-created
-//! or just-modified workgroup settles through, and the opaque page token the paginated
-//! lists hand out.
+//! The namespace + workgroup + snapshot store and the usage limits taken out over them,
+//! plus the little that every handler of those resources shares: the server-derived
+//! fields (id, ARN, endpoint address, creation date), the clock-owed status transition a
+//! just-created or just-modified workgroup or snapshot settles through, and the opaque
+//! page token the paginated lists hand out.
 //!
 //! `src/ops/mod.rs` is generated, so a helper more than one operation reaches lives here
 //! rather than in a second module under `src/ops/`.
@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::ops::types::{Namespace, Tag, UsageLimit, Workgroup};
+use crate::ops::types::{Namespace, Snapshot, Tag, UsageLimit, Workgroup};
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
 /// (`smithy_query(query="service_info")` -> `awsService.arnNamespace`). Also its SigV4
@@ -46,7 +46,8 @@ pub const PORT_RANGES: [(i32, i32); 2] = [(5431, 5455), (8191, 8215)];
 pub const WORKGROUP_VERSION: &str = "1.0";
 
 /// The page bound a list applies when the caller names none: `maxResults`'
-/// `@range(min: 1, max: 100)` on `ListNamespaces` / `ListWorkgroups`.
+/// `@range(min: 1, max: 100)` on `ListNamespaces` / `ListWorkgroups` / `ListSnapshots` /
+/// `ListUsageLimits`.
 pub const MAX_PAGE_SIZE: i32 = 100;
 
 /// The account's quota for each resource in one Region, from AWS's "Quotas for Amazon
@@ -56,6 +57,14 @@ pub const MAX_PAGE_SIZE: i32 = 100;
 pub const MAX_NAMESPACES: usize = 25;
 /// See [`MAX_NAMESPACES`].
 pub const MAX_WORKGROUPS: usize = 25;
+
+/// How many snapshots this emulator keeps for the account in one Region. Unlike
+/// [`MAX_NAMESPACES`] this is NOT an AWS-documented number — it is a bound this emulator
+/// chooses so a caller cannot grow the in-memory store without limit, surfaced as
+/// `CreateSnapshot`'s own modelled `ServiceQuotaExceededException`. (The usage-limit store
+/// needs no such bound: it is already bounded by the namespace and workgroup quotas times
+/// the modelled usage types and periods.)
+pub const MAX_SNAPSHOTS: usize = 100;
 
 /// The `WorkgroupStatus` values this slice reports
 /// (`smithy_query(query="shape", shape="WorkgroupStatus")` -> CREATING, AVAILABLE,
@@ -67,6 +76,31 @@ pub const WORKGROUP_AVAILABLE: &str = "AVAILABLE";
 pub const WORKGROUP_MODIFYING: &str = "MODIFYING";
 /// See [`WORKGROUP_CREATING`].
 pub const WORKGROUP_DELETING: &str = "DELETING";
+
+/// The `SnapshotStatus` values this slice reports
+/// (`smithy_query(query="shape", shape="SnapshotStatus")` -> AVAILABLE, CREATING,
+/// DELETED, CANCELLED, FAILED, COPYING). A snapshot this emulator takes is reported
+/// `CREATING` and settles into `AVAILABLE`; the other four belong to operations that are
+/// still scaffolded.
+pub const SNAPSHOT_CREATING: &str = "CREATING";
+/// See [`SNAPSHOT_CREATING`].
+pub const SNAPSHOT_AVAILABLE: &str = "AVAILABLE";
+
+/// The retention period of a snapshot kept until it is deleted by hand. Redshift's manual
+/// snapshot retention uses `-1` for "retained indefinitely", and
+/// `Snapshot$snapshotRetentionPeriod` is "the period of time, in days, of how long the
+/// snapshot is retained", which admits no 0-day snapshot — so a create that names no
+/// period reports this.
+pub const SNAPSHOT_RETENTION_INDEFINITE: i32 = -1;
+
+/// The longest retention a manual snapshot accepts, in days: Redshift's manual-snapshot
+/// retention period "must be either -1 or an integer between 1 and 3,653" (3,653 days is
+/// ten years plus the leap days). The model carries no `@range` for it, so the handler
+/// enforces it.
+pub const MAX_SNAPSHOT_RETENTION_DAYS: i32 = 3653;
+
+/// Seconds in a day, the unit `Snapshot$snapshotRemainingDays` counts in.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// `CreateUsageLimit`'s `period` default. From the model's `CreateUsageLimitRequest$period`
 /// doc: "The time period that the amount applies to. A weekly period begins on Sunday. The
@@ -107,6 +141,11 @@ pub fn namespace_arn(region: &str, namespace_id: &str) -> String {
 /// `arn:aws:redshift-serverless:<region>:<account>:workgroup/<workgroupId>`.
 pub fn workgroup_arn(region: &str, workgroup_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("workgroup/{workgroup_id}"))
+}
+
+/// `arn:aws:redshift-serverless:<region>:<account>:snapshot/<snapshotId>`.
+pub fn snapshot_arn(region: &str, snapshot_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("snapshot/{snapshot_id}"))
 }
 
 /// `arn:aws:redshift-serverless:<region>:<account>:usage-limit/<usageLimitId>`.
@@ -162,6 +201,24 @@ pub struct PendingStatus {
     pub status: &'static str,
 }
 
+impl PendingStatus {
+    /// The transition into `status` that the call made just now owes, due
+    /// [`SETTLE_AFTER`] from now.
+    pub fn due_after_settle(status: &'static str) -> Self {
+        Self {
+            due_at: Instant::now() + SETTLE_AFTER,
+            status,
+        }
+    }
+
+    /// Take this transition when `now` has made it due, leaving it outstanding otherwise.
+    fn settled_by(pending: &mut Option<Self>, now: Instant) -> Option<&'static str> {
+        pending
+            .take_if(|pending| now >= pending.due_at)
+            .map(|pending| pending.status)
+    }
+}
+
 /// A stored namespace.
 #[derive(Debug, Clone)]
 pub struct NamespaceRecord {
@@ -194,10 +251,7 @@ impl WorkgroupRecord {
     /// Report `transient` from now, and owe `settled` from [`SETTLE_AFTER`] onwards.
     pub fn begin_transition(&mut self, transient: &str, settled: &'static str) {
         self.workgroup.status = Some(transient.to_string());
-        self.pending_status = Some(PendingStatus {
-            due_at: Instant::now() + SETTLE_AFTER,
-            status: settled,
-        });
+        self.pending_status = Some(PendingStatus::due_after_settle(settled));
     }
 
     /// Materialise the transition the clock has already made due, if any.
@@ -206,23 +260,84 @@ impl WorkgroupRecord {
     /// whether or not anybody called, so applying it does not change what a later caller
     /// sees — it is what a later caller sees.
     pub fn settle(&mut self, now: Instant) {
-        if let Some(pending) = self.pending_status.take_if(|pending| now >= pending.due_at) {
-            self.workgroup.status = Some(pending.status.to_string());
+        if let Some(status) = PendingStatus::settled_by(&mut self.pending_status, now) {
+            self.workgroup.status = Some(status.to_string());
         }
     }
 }
 
+/// A stored snapshot.
+///
+/// A snapshot is taken THROUGH the compute attached to its namespace, so it is minted
+/// only while a workgroup on that namespace exists; it then outlives every change to
+/// that compute, which is why the record holds the namespace-derived fields it answered
+/// with rather than looking the namespace up again on each read.
+#[derive(Debug, Clone)]
+pub struct SnapshotRecord {
+    /// The resource every reader of this snapshot returns, bar the retention countdown
+    /// [`reported`](Self::reported) recomputes from the clock.
+    pub snapshot: Snapshot,
+    /// The tags the create request carried; see [`NamespaceRecord::tags`].
+    pub tags: Vec<Tag>,
+    /// The transition the clock owes this snapshot, while one is outstanding.
+    pub pending_status: Option<PendingStatus>,
+    /// When the snapshot was taken, the instant `snapshotRemainingDays` counts down from.
+    pub created_at: Instant,
+}
+
+impl SnapshotRecord {
+    /// Report `transient` from now, and owe `settled` from [`SETTLE_AFTER`] onwards.
+    pub fn begin_transition(&mut self, transient: &str, settled: &'static str) {
+        self.snapshot.status = Some(transient.to_string());
+        self.pending_status = Some(PendingStatus::due_after_settle(settled));
+    }
+
+    /// Materialise the `CREATING` -> `AVAILABLE` transition the clock has already made
+    /// due, if any. See [`WorkgroupRecord::settle`].
+    pub fn settle(&mut self, now: Instant) {
+        if let Some(status) = PendingStatus::settled_by(&mut self.pending_status, now) {
+            self.snapshot.status = Some(status.to_string());
+        }
+    }
+
+    /// The snapshot as a reader reports it: the stored record with the retention
+    /// countdown recomputed, because `snapshotRemainingDays` is "the amount of days until
+    /// the snapshot is deleted" and that shrinks with the clock, not with any call.
+    pub fn reported(&self, now: Instant) -> Snapshot {
+        let mut snapshot = self.snapshot.clone();
+        snapshot.snapshot_remaining_days = snapshot.snapshot_retention_period.map(|retention| {
+            remaining_retention_days(retention, now.saturating_duration_since(self.created_at))
+        });
+        snapshot
+    }
+}
+
+/// The days left of a `retention`-day retention period after `elapsed`, floored at 0 —
+/// or [`SNAPSHOT_RETENTION_INDEFINITE`] for a snapshot kept indefinitely, which never
+/// counts down.
+pub fn remaining_retention_days(retention: i32, elapsed: Duration) -> i32 {
+    if retention < 0 {
+        return SNAPSHOT_RETENTION_INDEFINITE;
+    }
+    let elapsed_days = i64::try_from(elapsed.as_secs() / SECONDS_PER_DAY).unwrap_or(i64::MAX);
+    i32::try_from((i64::from(retention) - elapsed_days).max(0)).unwrap_or(0)
+}
+
 /// Per-service state for com-amazonaws-redshiftserverless-redshiftserverless. A handler reaches it through [`service_state`].
 ///
-/// Both resources are keyed by NAME, which is their identity in this API (every operation
-/// addresses them by `namespaceName` / `workgroupName`), and held in a `BTreeMap` so the
-/// two paginated lists walk them in one deterministic order that a page token can resume.
+/// Namespaces, workgroups and snapshots are keyed by NAME, which is their identity in
+/// this API (every operation addresses them by `namespaceName` / `workgroupName` /
+/// `snapshotName`); a usage limit has no name, so it is keyed by the `usageLimitId` the
+/// service mints for it and `GetUsageLimit` reads back. All four are `BTreeMap`s so each
+/// paginated list walks them in one deterministic order that a page token can resume.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRedshiftserverlessRedshiftserverlessState {
     /// Namespaces by `namespaceName`.
     pub namespaces: BTreeMap<String, NamespaceRecord>,
     /// Workgroups by `workgroupName`.
     pub workgroups: BTreeMap<String, WorkgroupRecord>,
+    /// Snapshots by `snapshotName`.
+    pub snapshots: BTreeMap<String, SnapshotRecord>,
     /// Usage limits by `usageLimitId`, which is this resource's identity in the API:
     /// `GetUsageLimit`, `UpdateUsageLimit` and `DeleteUsageLimit` all address them by it.
     /// The resource is held whole, so every reader answers what the create stored.
@@ -230,12 +345,15 @@ pub struct ComAmazonawsRedshiftserverlessRedshiftserverlessState {
 }
 
 impl ComAmazonawsRedshiftserverlessRedshiftserverlessState {
-    /// Apply every workgroup status transition the clock has already made due. Call it
-    /// before reading or writing a workgroup, so no caller observes a status the service
-    /// has already moved on from. See [`WorkgroupRecord::settle`].
+    /// Apply every status transition the clock has already made due. Call it before
+    /// reading or writing a workgroup or a snapshot, so no caller observes a status the
+    /// service has already moved on from. See [`WorkgroupRecord::settle`].
     pub fn settle_due_transitions(&mut self) {
         let now = Instant::now();
         for record in self.workgroups.values_mut() {
+            record.settle(now);
+        }
+        for record in self.snapshots.values_mut() {
             record.settle(now);
         }
     }
@@ -274,7 +392,8 @@ impl ComAmazonawsRedshiftserverlessRedshiftserverlessState {
     }
 
     /// The names of the workgroups attached to `namespace_name`, in list order. A
-    /// namespace with any of these cannot be deleted.
+    /// namespace with any of these cannot be deleted, and a namespace with none of them
+    /// holds no compute to take a snapshot through.
     pub fn workgroups_in_namespace(&self, namespace_name: &str) -> Vec<&str> {
         self.workgroups
             .values()
@@ -329,6 +448,18 @@ pub fn page<'a, V>(
     next_token: Option<&str>,
     max_results: Option<i32>,
 ) -> Result<Page<'a, V>, String> {
+    page_matching(entries, |_| true, next_token, max_results)
+}
+
+/// [`page`] over the records `keep` accepts: the page bound counts MATCHING records, so a
+/// filtered listing fills its pages the same way an unfiltered one does, and the token it
+/// hands out resumes after the same key.
+pub fn page_matching<'a, V>(
+    entries: &'a BTreeMap<String, V>,
+    keep: impl Fn(&V) -> bool,
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> Result<Page<'a, V>, String> {
     let bound = max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
     let bound = usize::try_from(bound).unwrap_or(1);
     let after = match next_token {
@@ -338,7 +469,8 @@ pub fn page<'a, V>(
 
     let mut remaining = entries
         .iter()
-        .filter(|(key, _)| after.as_deref().is_none_or(|from| key.as_str() > from));
+        .filter(|(key, _)| after.as_deref().is_none_or(|from| key.as_str() > from))
+        .filter(|(_, value)| keep(value));
     let selected: Vec<(&String, &V)> = remaining.by_ref().take(bound).collect();
     // A token only when a record is left over: the last page of a listing carries none.
     let next_token = remaining

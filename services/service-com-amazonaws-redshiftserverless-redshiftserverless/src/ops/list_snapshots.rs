@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the stored snapshots in `snapshotName` order, at most
+//! `maxResults` of them per page, narrowed by whichever of `namespaceName`,
+//! `namespaceArn`, `ownerAccount`, `startTime` and `endTime` the request carries — so a
+//! listing scoped to a namespace reports exactly the snapshots `CreateSnapshot` took of
+//! it, and none while it has taken none.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The page bound counts MATCHING snapshots and `nextToken` resumes after the last one
+//! reported; see [`crate::state::page_matching`].
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +152,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSnapshots"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSnapshotsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.settle_due_transitions();
+
+        // Every member but the two pagination ones NARROWS the listing, and a snapshot is
+        // reported only when it satisfies all of them. `startTime`/`endTime` bound
+        // `snapshotCreateTime`, inclusively, so a window that starts at a snapshot's own
+        // create time still carries it.
+        let page = crate::state::page_matching(
+            &state.snapshots,
+            |record| {
+                let snapshot = &record.snapshot;
+                input
+                    .namespace_name
+                    .as_deref()
+                    .is_none_or(|name| snapshot.namespace_name.as_deref() == Some(name))
+                    && input
+                        .namespace_arn
+                        .as_deref()
+                        .is_none_or(|arn| snapshot.namespace_arn.as_deref() == Some(arn))
+                    && input.owner_account.as_deref().is_none_or(|account| {
+                        snapshot.owner_account.as_deref() == Some(account)
+                    })
+                    && input.start_time.is_none_or(|start| {
+                        snapshot
+                            .snapshot_create_time
+                            .is_some_and(|taken| instant_key(&taken) >= instant_key(&start))
+                    })
+                    && input.end_time.is_none_or(|end| {
+                        snapshot
+                            .snapshot_create_time
+                            .is_some_and(|taken| instant_key(&taken) <= instant_key(&end))
+                    })
+            },
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|message| {
+            ListSnapshotsErrorModeled::ValidationException(ValidationException { message })
+        })?;
+
+        let now = ::std::time::Instant::now();
+        Ok(ListSnapshotsOutput {
+            snapshots: Some(page.items.iter().map(|record| record.reported(now)).collect()),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// A timestamp as a totally ordered key, so the `startTime`/`endTime` window can be
+/// compared: `DateTime` carries whole seconds plus a subsecond remainder.
+fn instant_key(timestamp: &::aws_smithy_types::DateTime) -> (i64, u32) {
+    (timestamp.secs(), timestamp.subsec_nanos())
 }

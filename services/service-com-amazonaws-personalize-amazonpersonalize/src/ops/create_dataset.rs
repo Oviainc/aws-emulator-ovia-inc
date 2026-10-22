@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,20 +155,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataset"))
+        use crate::state::{
+            active_at, canonical_dataset_type, creation_status, dataset_arn, DatasetRecord,
+            DATASET_TYPE_VALUES, MAX_DATASETS, STATUS_ACTIVE,
+        };
+        use std::time::SystemTime;
+
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDataset",
+            ));
+        };
+
+        // `DatasetType` is a plain string shape, so the boundary validator only checks
+        // its pattern. The permitted set is the model's own documented one, matched
+        // "case insensitive" as that documentation says, and stored in the canonical
+        // spelling the service reports back.
+        let Some(dataset_type) = canonical_dataset_type(&input.dataset_type) else {
+            return Err(invalid_input(format!(
+                "Value '{}' at 'datasetType' failed to satisfy constraint: Member must be one of \
+                 [{}]",
+                input.dataset_type,
+                DATASET_TYPE_VALUES.join(", ")
+            )));
+        };
+
+        let mut state = state.lock();
+
+        let Some(group) = state.dataset_groups.get(&input.dataset_group_arn) else {
+            return Err(not_found(&input.dataset_group_arn));
+        };
+        // "You must wait until the status of the dataset group is ACTIVE before adding a
+        // dataset to the group": a group whose create is still pending is in use by that
+        // create, not available to hold a dataset.
+        let group_status = creation_status(group.active_at);
+        if group_status != STATUS_ACTIVE {
+            return Err(CreateDatasetErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Dataset group {arn} is in status {group_status}; wait until it is \
+                         {STATUS_ACTIVE} before adding a dataset.",
+                        arn = input.dataset_group_arn
+                    )),
+                },
+            )
+            .into());
+        }
+        let arn = dataset_arn(&group.region, &group.name, dataset_type);
+
+        if !state.schemas.contains_key(&input.schema_arn) {
+            return Err(not_found(&input.schema_arn));
+        }
+
+        // A dataset's identity inside its group is its TYPE — "a dataset group can
+        // contain at most three datasets, one for each type of dataset" — so the clash is
+        // looked up by (group, type) rather than by the minted ARN alone.
+        if let Some(existing) = state.datasets.values().find(|record| {
+            record.dataset_group_arn == input.dataset_group_arn
+                && record.dataset_type == dataset_type
+        }) {
+            return Err(CreateDatasetErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "Dataset {existing_arn} of type {dataset_type} already exists in dataset \
+                         group {group_arn}.",
+                        existing_arn = existing.dataset_arn,
+                        group_arn = input.dataset_group_arn
+                    )),
+                },
+            )
+            .into());
+        }
+        if state.datasets.len() >= MAX_DATASETS {
+            return Err(CreateDatasetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator holds at most {MAX_DATASETS} datasets; delete one before \
+                         creating another."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = SystemTime::now();
+        state.datasets.insert(
+            arn.clone(),
+            DatasetRecord {
+                name: input.name.clone(),
+                dataset_arn: arn.clone(),
+                dataset_group_arn: input.dataset_group_arn.clone(),
+                dataset_type: dataset_type.to_string(),
+                schema_arn: input.schema_arn.clone(),
+                creation_date_time: now,
+                last_updated_date_time: now,
+                // Like its group, a dataset is not created ready: "CREATE PENDING >
+                // CREATE IN_PROGRESS > ACTIVE".
+                active_at: active_at(now),
+                tags: input.tags.clone().unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateDatasetOutput {
+            dataset_arn: Some(arn),
+        })
     }
+}
+
+/// This operation's modelled `InvalidInputException`, carrying `message`.
+fn invalid_input(message: impl Into<String>) -> CreateDatasetError {
+    CreateDatasetErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's modelled `ResourceNotFoundException` for an ARN this service holds no
+/// resource for.
+fn not_found(arn: &str) -> CreateDatasetError {
+    CreateDatasetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Resource not found: {arn}")),
+    })
+    .into()
 }

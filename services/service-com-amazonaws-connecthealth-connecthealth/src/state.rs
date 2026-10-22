@@ -1,11 +1,394 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-connecthealth-connecthealth service.
+//!
+//! The Domain -> Subscription lifecycle lives here. Every field a response carries is
+//! read back OUT of these records: a handler persists what it was given, derives what
+//! the service itself owns (ids, ARNs, timestamps, status), and then renders the stored
+//! record. Nothing is echoed straight from a request.
+//!
+//! Helpers several operations share (id minting, ARN building, the opaque pagination
+//! cursor, the `SubscriptionDescription` projection) live here rather than being copied
+//! into each `src/ops/*.rs`: `src/lib.rs` is generated, so this module is the crate's
+//! one shared, editable home.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
+
+use sha2::{Digest, Sha256};
+
+use crate::ops::types::SubscriptionDescription;
+
+/// The region an emulated ARN carries when the request names none.
+const DEFAULT_REGION: &str = "us-east-1";
+
+/// This service's ARN namespace / SigV4 signing name (`OPERATIONS.md`, "Wire protocol").
+const ARN_NAMESPACE: &str = "health-agent";
+
+/// How long a `Domain` stays in `DELETING` before the deletion the clock owes is
+/// materialised — the record is purged, and `GetDomain` then answers
+/// `ResourceNotFoundException`.
+///
+/// AWS documents no duration for this, so the span is CHOSEN, and chosen inside the
+/// emulator's transient window (250-750 ms): a caller that reads straight after
+/// `DeleteDomain` still observes the `DELETING` state rather than an instant purge.
+pub const DOMAIN_DELETION_SPAN: Duration = Duration::from_millis(500);
+
+/// The most `Domain` records this store holds. Every growth site is capped so a caller
+/// looping a create cannot grow the shared store without limit; the cap is the
+/// EMULATOR's own ceiling, refused through the operations' own modelled
+/// `ServiceQuotaExceededException`, not an AWS-published quota.
+pub const MAX_DOMAINS: usize = 100;
+
+/// The most `Subscription` records one `Domain` holds, so the product
+/// (domains x subscriptions) is bounded too.
+pub const MAX_SUBSCRIPTIONS_PER_DOMAIN: usize = 100;
+
+/// The most tag entries one resource ARN carries, and the longest key and value an
+/// entry may have — AWS's standard tagging limits (50 tags, key 128, value 256), which
+/// also bound what one request can add to the tag store.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+pub const MAX_TAG_KEY_LEN: usize = 128;
+pub const MAX_TAG_VALUE_LEN: usize = 256;
+
+/// A `Domain`'s lifecycle, as the model's `DomainStatus` enum declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainStatus {
+    Active,
+    Deleting,
+    /// Accepted as a `ListDomains` filter value because the model declares it, but
+    /// never stored: a domain goes ACTIVE -> DELETING -> purged, so a deleted domain is
+    /// gone rather than sitting in DELETED.
+    Deleted,
+}
+
+impl DomainStatus {
+    /// The wire value — one of `types::DOMAIN_STATUS_VALUES`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Active => "ACTIVE",
+            Self::Deleting => "DELETING",
+            Self::Deleted => "DELETED",
+        }
+    }
+
+    /// The status a wire value names, or `None` when it names none.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "ACTIVE" => Some(Self::Active),
+            "DELETING" => Some(Self::Deleting),
+            "DELETED" => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+}
+
+/// A `Subscription`'s lifecycle, as the model's `SubscriptionStatus` enum declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionStatus {
+    Active,
+    Inactive,
+    Deleted,
+}
+
+impl SubscriptionStatus {
+    /// The wire value — one of `types::SUBSCRIPTION_STATUS_VALUES`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Active => "ACTIVE",
+            Self::Inactive => "INACTIVE",
+            Self::Deleted => "DELETED",
+        }
+    }
+}
+
+/// How a `Domain`'s data is encrypted, as the model's `EncryptionType` enum declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionType {
+    AwsOwnedKey,
+    CustomerManagedKey,
+}
+
+impl EncryptionType {
+    /// The wire value — one of `types::ENCRYPTION_TYPE_VALUES`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::AwsOwnedKey => "AWS_OWNED_KEY",
+            Self::CustomerManagedKey => "CUSTOMER_MANAGED_KEY",
+        }
+    }
+}
+
+/// The stored web-application configuration of a `Domain` — the OUTPUT form
+/// (`WebAppConfiguration`), derived once from the `CreateWebAppConfiguration` the
+/// caller supplied: the Identity Center *instance* id it names is exchanged for the
+/// Identity Center *application* id this service creates in that instance.
+#[derive(Debug, Clone)]
+pub struct WebAppConfigurationRecord {
+    pub ehr_role: String,
+    pub idc_application_id: String,
+    pub idc_region: String,
+}
+
+/// A persisted `Domain`.
+#[derive(Debug, Clone)]
+pub struct Domain {
+    pub domain_id: String,
+    pub arn: String,
+    pub name: String,
+    pub kms_key_arn: Option<String>,
+    pub encryption_type: EncryptionType,
+    pub status: DomainStatus,
+    /// When the owed `DELETING` -> purged transition becomes due; `None` unless the
+    /// domain is being deleted.
+    pub purge_due_at: Option<SystemTime>,
+    pub web_app_url: Option<String>,
+    pub web_app_configuration: Option<WebAppConfigurationRecord>,
+    pub created_at: SystemTime,
+    pub subscriptions: BTreeMap<String, Subscription>,
+}
+
+/// A persisted `Subscription`, stored under its own `Domain`.
+#[derive(Debug, Clone)]
+pub struct Subscription {
+    pub domain_id: String,
+    pub subscription_id: String,
+    pub arn: String,
+    pub status: SubscriptionStatus,
+    pub created_at: SystemTime,
+    pub last_updated_at: SystemTime,
+    pub activated_at: Option<SystemTime>,
+    pub deactivated_at: Option<SystemTime>,
+}
+
+impl Subscription {
+    /// Whether this record is still live: one `DeleteDomain` already marked `DELETED`
+    /// is gone as far as every reader and every transition is concerned.
+    pub fn is_live(&self) -> bool {
+        self.status != SubscriptionStatus::Deleted
+    }
+
+    /// This record as the modelled `SubscriptionDescription` four operations return.
+    pub fn description(&self) -> SubscriptionDescription {
+        SubscriptionDescription {
+            domain_id: self.domain_id.clone(),
+            subscription_id: self.subscription_id.clone(),
+            arn: self.arn.clone(),
+            status: self.status.as_wire().to_string(),
+            created_at: to_timestamp(self.created_at),
+            last_updated_at: to_timestamp(self.last_updated_at),
+            activated_at: self.activated_at.map(to_timestamp),
+            deactivated_at: self.deactivated_at.map(to_timestamp),
+        }
+    }
+}
 
 /// Per-service state for com-amazonaws-connecthealth-connecthealth. A handler reaches it through [`service_state`].
+///
+/// `BTreeMap` throughout, so `ListDomains` / `ListSubscriptions` walk a deterministic,
+/// key-ordered sequence and a `nextToken` naming the last key returned is a stable
+/// cursor into it.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConnecthealthConnecthealthState {
-    // TODO: add service-specific state fields
+    /// Every live `Domain`, keyed by `domainId`.
+    pub domains: BTreeMap<String, Domain>,
+    /// The ONE tag store, keyed by resource ARN so domain and subscription ARNs both
+    /// work. `CreateDomain` seeds it; `TagResource`/`UntagResource`/
+    /// `ListTagsForResource` (still scaffolded) will share it.
+    pub tags_by_arn: BTreeMap<String, BTreeMap<String, String>>,
+    /// Monotonic per-process sequence folded into every minted id, so two ids minted
+    /// in the same nanosecond still differ.
+    pub next_id_seq: u64,
+}
+
+impl ComAmazonawsConnecthealthConnecthealthState {
+    /// The next value of the id sequence.
+    fn next_seq(&mut self) -> u64 {
+        let seq = self.next_id_seq;
+        self.next_id_seq = self.next_id_seq.wrapping_add(1);
+        seq
+    }
+
+    /// Mint an unused `domainId`: `dom-` plus 16 lowercase hex characters, which is 20
+    /// characters long and matches `^(hai-|dom-)[a-z0-9]+$` (len 20..25).
+    pub fn mint_domain_id(&mut self) -> String {
+        loop {
+            let seq = self.next_seq();
+            let candidate = mint_id("dom-", 16, seq);
+            if !self.domains.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint a `subscriptionId` unused within `domain_id`: `sub-` plus 21 hex
+    /// characters, which is exactly 25 characters and matches `^sub-[a-zA-Z0-9]{21}$`.
+    pub fn mint_subscription_id(&mut self, domain_id: &str) -> String {
+        loop {
+            let seq = self.next_seq();
+            let candidate = mint_id("sub-", 21, seq);
+            let taken = self
+                .domains
+                .get(domain_id)
+                .is_some_and(|domain| domain.subscriptions.contains_key(&candidate));
+            if !taken {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint the Identity Center application id this service creates for a web app.
+    pub fn mint_idc_application_id(&mut self) -> String {
+        let seq = self.next_seq();
+        mint_id("apl-", 16, seq)
+    }
+
+    /// Materialise every deletion the CLOCK has already made due: a `Domain` whose
+    /// `DELETING` span has elapsed is purged, with its subscriptions and every tag
+    /// entry keyed by one of their ARNs.
+    ///
+    /// Called at the top of every handler, including the reporting ones: it writes only
+    /// what was owed at this instant whether or not anybody called.
+    pub fn purge_due_deletions(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .domains
+            .values()
+            .filter(|domain| domain.purge_due_at.is_some_and(|due| due <= now))
+            .map(|domain| domain.domain_id.clone())
+            .collect();
+        for domain_id in due {
+            if let Some(domain) = self.domains.remove(&domain_id) {
+                self.tags_by_arn.remove(&domain.arn);
+                for subscription in domain.subscriptions.values() {
+                    self.tags_by_arn.remove(&subscription.arn);
+                }
+            }
+        }
+    }
+
+    /// The tags recorded for `arn`, in key order.
+    pub fn tags_for(&self, arn: &str) -> BTreeMap<String, String> {
+        self.tags_by_arn.get(arn).cloned().unwrap_or_default()
+    }
+
+    /// The live domain `domain_id` names, for reading.
+    ///
+    /// `None` when it is absent or no longer `ACTIVE` — the cases every operation on a
+    /// domain's subscriptions answers with `ResourceNotFoundException`. ONE liveness
+    /// rule, so a subscription a caller can enumerate is one it can also read.
+    pub fn live_domain(&self, domain_id: &str) -> Option<&Domain> {
+        self.domains
+            .get(domain_id)
+            .filter(|domain| domain.status == DomainStatus::Active)
+    }
+
+    /// The live domain `domain_id` names, for writing. Liveness is exactly
+    /// [`Self::live_domain`]'s.
+    pub fn live_domain_mut(&mut self, domain_id: &str) -> Option<&mut Domain> {
+        self.domains
+            .get_mut(domain_id)
+            .filter(|domain| domain.status == DomainStatus::Active)
+    }
+
+    /// The live subscription `subscription_id` carries under `domain_id`, for reading.
+    ///
+    /// `None` when the domain is not live, or when the subscription is absent or
+    /// already `DELETED` — the cases every operation on a subscription answers with
+    /// `ResourceNotFoundException`.
+    pub fn live_subscription(
+        &self,
+        domain_id: &str,
+        subscription_id: &str,
+    ) -> Option<&Subscription> {
+        self.live_domain(domain_id)?
+            .subscriptions
+            .get(subscription_id)
+            .filter(|subscription| subscription.is_live())
+    }
+
+    /// The live subscription `subscription_id` carries under `domain_id`, for writing.
+    /// Liveness is exactly [`Self::live_subscription`]'s.
+    pub fn live_subscription_mut(
+        &mut self,
+        domain_id: &str,
+        subscription_id: &str,
+    ) -> Option<&mut Subscription> {
+        self.live_domain_mut(domain_id)?
+            .subscriptions
+            .get_mut(subscription_id)
+            .filter(|subscription| subscription.is_live())
+    }
+}
+
+/// Mint an id: `prefix` followed by `body_len` characters of a SHA-256 digest over the
+/// prefix, the caller's sequence number, this process and the current instant.
+///
+/// Hex digits are lowercase alphanumerics, so one minting rule satisfies every id
+/// pattern this service declares, and folding in both the sequence and the clock keeps
+/// ids unique within a process and across processes.
+fn mint_id(prefix: &str, body_len: usize, seq: u64) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(seq.to_be_bytes());
+    hasher.update(nanos.to_be_bytes());
+    hasher.update(std::process::id().to_be_bytes());
+    let body = hex::encode(hasher.finalize());
+    format!("{prefix}{}", &body[..body_len])
+}
+
+/// The ARN of a `Domain`:
+/// `arn:aws:health-agent:<region>:<account>:domain/<domainId>`.
+pub fn domain_arn(region: &str, domain_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("domain/{domain_id}"))
+}
+
+/// The ARN of a `Subscription`: its domain's ARN plus `/subscription/<subscriptionId>`.
+pub fn subscription_arn(domain_arn: &str, subscription_id: &str) -> String {
+    format!("{domain_arn}/subscription/{subscription_id}")
+}
+
+/// The web-app URL of a `Domain`, derived from the domain's own id and region.
+pub fn web_app_url(region: &str, domain_id: &str) -> String {
+    format!("https://{domain_id}.{ARN_NAMESPACE}.{region}.on.aws")
+}
+
+/// The region this request was signed for, or [`DEFAULT_REGION`] when it names none.
+///
+/// Constrained to the `[a-z0-9-]+` segment every ARN pattern in this model declares, so
+/// a request signed for a nonsense region cannot mint an ARN that fails its own pattern.
+pub fn region_of(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| {
+            !region.is_empty()
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// A stored instant as the modelled timestamp type.
+pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(at)
+}
+
+/// The opaque `nextToken` for a page that stopped at `last_key`.
+///
+/// Hex of the key, so the token is opaque to a client yet resumes EXACTLY where the
+/// page stopped: the next page starts at the first key strictly after it, whether or
+/// not that key still exists.
+pub fn encode_page_token(last_key: &str) -> String {
+    hex::encode(last_key.as_bytes())
+}
+
+/// The key a `nextToken` resumes after, or `None` when the token is not one this
+/// service issued.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    String::from_utf8(hex::decode(token).ok()?).ok()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `subscriptionId`, builds its ARN under the parent domain's,
+//! and PERSISTS the subscription under that domain in [`crate::state`]. A domain no
+//! live record carries is a 404 `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSubscription"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSubscriptionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "CreateSubscription could not reach this service's store".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.purge_due_deletions(now);
+
+        let not_found = || -> Self::Error {
+            CreateSubscriptionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("Domain {} was not found", input.domain_id)),
+            })
+            .into()
+        };
+
+        // A subscription can only be created in a domain that is live: one already
+        // being deleted is on its way out, so it is reported as not found.
+        let Some(domain) = store.live_domain(&input.domain_id) else {
+            return Err(not_found());
+        };
+        // Bound the store BEFORE minting, so a refused request advances nothing.
+        if domain.subscriptions.len() >= crate::state::MAX_SUBSCRIPTIONS_PER_DOMAIN {
+            return Err(CreateSubscriptionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "domain {} already holds the maximum of {} subscriptions",
+                        input.domain_id,
+                        crate::state::MAX_SUBSCRIPTIONS_PER_DOMAIN
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let subscription_id = store.mint_subscription_id(&input.domain_id);
+        let Some(domain) = store.live_domain_mut(&input.domain_id) else {
+            return Err(not_found());
+        };
+        let subscription = crate::state::Subscription {
+            domain_id: domain.domain_id.clone(),
+            subscription_id: subscription_id.clone(),
+            arn: crate::state::subscription_arn(&domain.arn, &subscription_id),
+            // A new subscription is not billable until it is activated.
+            status: crate::state::SubscriptionStatus::Inactive,
+            created_at: now,
+            last_updated_at: now,
+            activated_at: None,
+            deactivated_at: None,
+        };
+        // `or_insert` hands back the record it STORED, so every field rendered below is
+        // read out of the store rather than echoed from the request.
+        let stored = domain
+            .subscriptions
+            .entry(subscription_id)
+            .or_insert(subscription);
+        Ok(CreateSubscriptionOutput {
+            domain_id: stored.domain_id.clone(),
+            subscription_id: stored.subscription_id.clone(),
+            arn: stored.arn.clone(),
+            status: stored.status.as_wire().to_string(),
+            created_at: crate::state::to_timestamp(stored.created_at),
+            last_updated_at: crate::state::to_timestamp(stored.last_updated_at),
+            activated_at: stored.activated_at.map(crate::state::to_timestamp),
+            deactivated_at: stored.deactivated_at.map(crate::state::to_timestamp),
+        })
     }
 }

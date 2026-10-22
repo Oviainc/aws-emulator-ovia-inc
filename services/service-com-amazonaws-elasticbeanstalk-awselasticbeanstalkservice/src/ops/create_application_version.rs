@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplicationVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplicationVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplicationVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores the application version (creating its application when
+//! `AutoCreateApplication` asks for it) and answers with the
+//! `ApplicationVersionDescription` built from what was stored. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +192,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplicationVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplicationVersion"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApplicationVersionError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+
+        if !store.applications.contains_key(&input.application_name) {
+            // `AutoCreateApplication`: "Set to true to create an application with
+            // the specified name if it doesn't already exist."
+            if input.auto_create_application != Some(true) {
+                return Err(CreateApplicationVersionError::invalid_parameter_value(
+                    format!("No Application named '{}' found.", input.application_name),
+                ));
+            }
+            let created = crate::state::now();
+            // "TooManyApplicationsException: The specified account has reached
+            // its limit of applications" — auto-creation is subject to the same
+            // quota as CreateApplication.
+            if store.applications.len() >= crate::state::MAX_APPLICATIONS {
+                return Err(
+                    CreateApplicationVersionErrorModeled::TooManyApplicationsException(
+                        TooManyApplicationsException {
+                            message: Some(format!(
+                                "The number of applications in this account has reached the limit of {}.",
+                                crate::state::MAX_APPLICATIONS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let application = crate::state::Application {
+                name: input.application_name.clone(),
+                arn: crate::state::application_arn(&region, &input.application_name),
+                description: None,
+                date_created: created,
+                date_updated: created,
+                resource_lifecycle_config: None,
+                configuration_templates: Vec::new(),
+                tags: Vec::new(),
+            };
+            store
+                .applications
+                .insert(application.name.clone(), application);
+        }
+
+        let key = (input.application_name.clone(), input.version_label.clone());
+        if store.application_versions.contains_key(&key) {
+            return Err(CreateApplicationVersionError::invalid_parameter_value(
+                format!("Application Version {} already exists.", input.version_label),
+            ));
+        }
+
+        let created = crate::state::now();
+        // "TooManyApplicationVersionsException: The specified account has reached
+        // its limit of application versions." Enforcing the quota is also what
+        // bounds the store: the number of records a caller can create is capped.
+        if store.application_versions.len() >= crate::state::MAX_APPLICATION_VERSIONS {
+            return Err(
+                CreateApplicationVersionErrorModeled::TooManyApplicationVersionsException(
+                    TooManyApplicationVersionsException {
+                        message: Some(format!(
+                            "The number of application versions in this account has reached the \
+                             limit of {}.",
+                            crate::state::MAX_APPLICATION_VERSIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let sequence = store.next_counter();
+        let version = crate::state::ApplicationVersion {
+            application_name: input.application_name.clone(),
+            version_label: input.version_label.clone(),
+            arn: crate::state::application_version_arn(
+                &region,
+                &input.application_name,
+                &input.version_label,
+            ),
+            description: input.description,
+            source_bundle: input.source_bundle,
+            process: input.process,
+            // Nothing here builds or validates a source bundle, so the version
+            // stays at the status a version has before processing: it is never
+            // reported `Processing`, `Processed`, `Building` or `Failed` for work
+            // that did not run.
+            status: crate::state::VERSION_STATUS_UNPROCESSED.to_string(),
+            date_created: created,
+            date_updated: created,
+            tags: input.tags.unwrap_or_default(),
+            sequence,
+        };
+        let description = version.to_description();
+        store.application_versions.insert(key, version);
+
+        Ok(CreateApplicationVersionOutput {
+            application_version: Some(description),
+        })
     }
 }

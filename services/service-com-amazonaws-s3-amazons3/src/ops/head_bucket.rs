@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op HeadBucket
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `HeadBucket`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`HeadBucket::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +186,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `HeadBucket` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(HeadBucketErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("HeadBucket"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about a bucket the emulator cannot look up, and
+            // the one modeled error here says "no such bucket", which would be a false
+            // statement about the bucket. The scaffold's 501 says what is true: this
+            // emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("HeadBucket"));
+        };
+
+        // Read-only: the guard is taken, the bucket's Region is copied out, and nothing
+        // is written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(HeadBucketErrorModeled::NotFound(NotFound {}).into());
+        };
+
+        Ok(HeadBucketOutput {
+            bucket_region: Some(bucket.region.clone()),
+            // The request named a bucket, not an access point alias, which is what this
+            // member reports (`AccessPointAlias`: "Indicates whether the bucket name used
+            // in the request is an access point alias").
+            access_point_alias: Some(false),
+            // The remaining three members are documented as directory-bucket only
+            // (`BucketArn`, `BucketLocationName`, `BucketLocationType`), and this
+            // emulator holds general purpose buckets, so none is reported.
+            bucket_arn: None,
+            bucket_location_name: None,
+            bucket_location_type: None,
+        })
     }
 }

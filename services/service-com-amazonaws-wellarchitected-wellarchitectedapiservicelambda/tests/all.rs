@@ -14,5 +14,11 @@
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/workload_computed_members.rs"]
+mod workload_computed_members;
+
+#[path = "all/workload_harness.rs"]
+mod workload_harness;
+
 #[path = "all/workload_lifecycle.rs"]
 mod workload_lifecycle;

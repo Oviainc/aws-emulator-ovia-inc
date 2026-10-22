@@ -6,9 +6,11 @@
 //! longer carries it. A namespace a workgroup is still attached to is a 409
 //! `ConflictException`, and an unknown name a 404 `ResourceNotFoundException`.
 //!
-//! `finalSnapshotName` is NOT served: taking the final snapshot needs the snapshot
-//! resource, which is still scaffolded, so a request naming one answers 501 rather than
-//! silently dropping the snapshot the caller asked for.
+//! `finalSnapshotName` is NOT served: AWS takes that snapshot itself, without the
+//! namespace's compute (a namespace that can be deleted has no workgroup left to snapshot
+//! through), and this emulator does not model that path — so a request naming one answers
+//! 501 rather than silently dropping the snapshot the caller asked for. `CreateSnapshot`
+//! serves the caller-driven snapshot.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +179,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut namespace = record.namespace.clone();
 
         // A workgroup holds the compute attached to this namespace, so the namespace
-        // cannot go while one still references it.
-        let attached: Vec<String> = state
+        // cannot go while one still references it. The message is the remediation AWS
+        // builds from the blocking resource: delete THAT workgroup first. It names one
+        // workgroup — the first in list order, so the text is deterministic — because the
+        // caller's next call is a single DeleteWorkgroup either way.
+        let blocking = state
             .workgroups_in_namespace(&input.namespace_name)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        if !attached.is_empty() {
+            .first()
+            .map(|name| name.to_string());
+        if let Some(workgroup_name) = blocking {
             return Err(DeleteNamespaceErrorModeled::ConflictException(ConflictException {
                 message: format!(
-                    "namespace {} still has workgroups attached: {}",
-                    input.namespace_name,
-                    attached.join(", ")
+                    "Delete the associated workgroup {workgroup_name} before you delete \
+                     the namespace."
                 ),
             })
             .into());

@@ -1,0 +1,1167 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The feed ASSOCIATION, end to end over the wire: `AssociateFeed` and
+//! `DisassociateFeed`, read back through `GetFeed` and `ListFeeds`.
+//!
+//! Every case here drives the real request path — the router picks the service from the
+//! SigV4 credential scope, the framework deserializes and validates the body, the
+//! handler runs, and the response is serialized as `restJson1` — so what these tests
+//! assert is what a client sees.
+//!
+//! The rules under test, each asserted over a TABLE of inputs rather than one recorded
+//! case:
+//!
+//! * `AssociateFeed` CLAIMS a feed for one resource and APPENDS the request's outputs to
+//!   the stored ones ("New outputs will be appended"), each appended output reporting
+//!   `fromAssociation: true`; the claimed feed reports `ACTIVE` and its association;
+//! * a feed takes an association only from a status that admits one — `AVAILABLE`, or
+//!   `ACTIVE` for the resource that already holds it; from any other status, and for a
+//!   second, different resource ("you can associate only one resource with each feed"),
+//!   the call is refused with the modelled `ValidationException` naming the status, and
+//!   the stored feed is left exactly as it was;
+//! * an output that would MODIFY an existing one (same name) is a `ConflictException`,
+//!   and a feed's output list is BOUNDED: an append past the quota answers the modelled
+//!   `ServiceQuotaExceededException`;
+//! * `associatedResourceName` "must not resemble an ARN", a rule its own pattern cannot
+//!   express — and one judged over the whole value, including the non-ASCII word
+//!   characters that pattern admits;
+//! * `DisassociateFeed` RELEASES the named resource, disables every output and archives
+//!   the feed, irreversibly: an `ARCHIVED` feed takes no further association and cannot
+//!   be released again; a name that is not the associated resource's is refused;
+//! * `dryRun` on either operation validates and persists NOTHING, so a later read
+//!   reports the feed unchanged;
+//! * an id no live feed has is `ResourceNotFoundException` (HTTP 404) on both.
+
+use serde_json::{json, Value};
+use service_com_amazonaws_elementalinference_elementalinference::state::{
+    MAX_OUTPUTS_PER_FEED, TRANSITION_SPAN,
+};
+use service_com_amazonaws_elementalinference_elementalinference::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+use std::sync::Arc;
+
+/// The region every request below is signed for.
+const REGION: &str = "us-west-2";
+
+/// This service's SigV4 signing name (`OPERATIONS.md`, "Wire protocol"): the router
+/// resolves the claiming service from it.
+const SIGNING_NAME: &str = "elemental-inference";
+
+/// Long enough for a clock-owed feed transition to have fallen due.
+fn past_the_transition_span() {
+    // A plain blocking sleep: the test's runtime has nothing else to run, and the
+    // service never sleeps for a transition — it stores the due instant.
+    std::thread::sleep(TRANSITION_SPAN + std::time::Duration::from_millis(250));
+}
+
+/// A router serving this service alone over one shared engine.
+fn router() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // These requests carry an unsigned placeholder Authorization header, which is
+    // there only so the router can resolve the signing name.
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(engine));
+    router
+}
+
+/// Send one request and return its status and parsed body (`Value::Null` when empty).
+async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let payload = body.map_or_else(Vec::new, |body| serde_json::to_vec(&body).unwrap());
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/{SIGNING_NAME}/aws4_request, \
+                 SignedHeaders=host, Signature=deadbeef"
+            ),
+        )
+        .body(bytes::Bytes::from(payload))
+        .unwrap();
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or_else(|e| {
+            panic!(
+                "{method} {uri}: body is not JSON ({e}): {}",
+                String::from_utf8_lossy(response.body())
+            )
+        })
+    };
+    (status, parsed)
+}
+
+/// One `outputConfig` of each kind the `OutputConfig` union models
+/// (`smithy_query(query="shape",shape="OutputConfig")`: cropping, clipping,
+/// subtitling, contextualMetadata).
+fn output_config(kind: &str) -> Value {
+    match kind {
+        "cropping" => json!({"cropping": {"templateGroups": [
+            {"name": "group1", "templateUris": ["s3://templates/wide.psd"]}
+        ]}}),
+        "clipping" => json!({"clipping": {
+            "callbackMetadata": "season opener",
+            "dataSourceConfiguration": {"fixtureId": "fixture-1"}
+        }}),
+        "subtitling" => json!({"subtitling": {
+            "language": "eng-gb",
+            "aspectRatio": {"width": 16, "height": 9},
+            "profanityFilter": "CENSOR"
+        }}),
+        "contextualMetadata" => json!({"contextualMetadata": {
+            "summaryGeneration": "ENABLED",
+            "extendedAnalysis": "DISABLED"
+        }}),
+        other => panic!("no such OutputConfig member: {other}"),
+    }
+}
+
+/// One output, named `name`, carrying the `kind` config and `status`.
+fn output(name: &str, kind: &str, status: &str) -> Value {
+    json!({"name": name, "outputConfig": output_config(kind), "status": status})
+}
+
+/// Create a feed carrying `outputs` and return its id, leaving it in `CREATING`.
+async fn create_feed(router: &MultiServiceRouter, name: &str, outputs: Value) -> String {
+    let (status, created) = call(
+        router,
+        "POST",
+        "/v1/feed",
+        Some(json!({"name": name, "outputs": outputs})),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "case {name:?}: CreateFeed answers 202, got {status} with {created}"
+    );
+    created["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {name:?}: CreateFeed returns an id, got {created}"))
+        .to_string()
+}
+
+/// Create a feed and let the clock settle it to `AVAILABLE` — the only status from
+/// which a never-associated feed takes an association.
+async fn available_feed(router: &MultiServiceRouter, name: &str, outputs: Value) -> String {
+    let id = create_feed(router, name, outputs).await;
+    past_the_transition_span();
+    let (status, feed) = call(router, "GET", &format!("/v1/feed/{id}"), None).await;
+    assert_eq!(
+        (status, &feed["status"]),
+        (200, &json!("AVAILABLE")),
+        "case {name:?}: the feed settles to AVAILABLE before the association, got {feed}"
+    );
+    id
+}
+
+/// `POST /v1/feed/{id}/associate` with `associatedResourceName` and `outputs`.
+async fn associate(
+    router: &MultiServiceRouter,
+    id: &str,
+    resource: &str,
+    outputs: Value,
+) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        &format!("/v1/feed/{id}/associate"),
+        Some(json!({"associatedResourceName": resource, "outputs": outputs})),
+    )
+    .await
+}
+
+/// `POST /v1/feed/{id}/disassociate` with `associatedResourceName`.
+async fn disassociate(router: &MultiServiceRouter, id: &str, resource: &str) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        &format!("/v1/feed/{id}/disassociate"),
+        Some(json!({"associatedResourceName": resource})),
+    )
+    .await
+}
+
+/// `GET /v1/feed/{id}`, asserting it is served.
+async fn get_feed(router: &MultiServiceRouter, id: &str, label: &str) -> Value {
+    let (status, feed) = call(router, "GET", &format!("/v1/feed/{id}"), None).await;
+    assert_eq!(
+        status, 200,
+        "case {label:?}: GetFeed answers 200, got {status} with {feed}"
+    );
+    feed
+}
+
+/// The ARN form the model gives a feed: `feed/<id>` under this service's namespace,
+/// in the request's region and the emulator's account.
+fn expected_arn(id: &str) -> String {
+    format!(
+        "arn:aws:{SIGNING_NAME}:{REGION}:{}:feed/{id}",
+        engine::EMULATOR_ACCOUNT_ID
+    )
+}
+
+/// The `GetOutput` projection of `submitted`, with `fromAssociation` set to
+/// `from_association` (`GetOutput$fromAssociation`: true only for an output that
+/// entered the feed through `AssociateFeed`).
+fn expected_outputs(submitted: &Value, from_association: bool) -> Vec<Value> {
+    submitted
+        .as_array()
+        .expect("the submitted outputs are a list")
+        .iter()
+        .map(|output| {
+            let mut output = output.clone();
+            output
+                .as_object_mut()
+                .expect("an output is an object")
+                .insert("fromAssociation".to_string(), json!(from_association));
+            output
+        })
+        .collect()
+}
+
+/// One row of the association table: a feed's own outputs, the resource that claims it
+/// and the outputs that claim appends. The rows differ along what the rule generalises
+/// over — how many outputs are appended (none, one, several), which `OutputConfig`
+/// member each carries, the output statuses, and the form and length of the resource
+/// name (every character class its pattern `^[\w \-\.',@:;/]*$` admits, at the minimum
+/// and the maximum of its `@length` 1..2048).
+struct AssociationCase {
+    label: &'static str,
+    feed_outputs: Value,
+    resource: String,
+    appended: Value,
+}
+
+fn association_cases() -> Vec<AssociationCase> {
+    vec![
+        AssociationCase {
+            label: "one appended output onto a one-output feed",
+            feed_outputs: json!([output("crop1", "cropping", "ENABLED")]),
+            resource: "source-media-1".to_string(),
+            appended: json!([output("subs1", "subtitling", "ENABLED")]),
+        },
+        AssociationCase {
+            label: "three appended outputs, one per remaining OutputConfig member",
+            feed_outputs: json!([output("crop1", "cropping", "DISABLED")]),
+            resource: "Stadium cam 2 - east.side's feed".to_string(),
+            appended: json!([
+                output("clip1", "clipping", "ENABLED"),
+                output("subs1", "subtitling", "DISABLED"),
+                {"name": "meta1", "outputConfig": output_config("contextualMetadata"),
+                 "status": "ENABLED", "description": "contextual metadata"}
+            ]),
+        },
+        AssociationCase {
+            label: "no appended outputs: the claim alone",
+            feed_outputs: json!([output("crop1", "cropping", "ENABLED")]),
+            resource: "media@venue:cam/1;take-2".to_string(),
+            appended: json!([]),
+        },
+        AssociationCase {
+            label: "a one-character resource name, the minimum its @length admits",
+            feed_outputs: json!([output("clip1", "clipping", "ENABLED")]),
+            resource: "a".to_string(),
+            appended: json!([output("crop9", "cropping", "ENABLED")]),
+        },
+        AssociationCase {
+            label: "a 2048-character resource name, the maximum its @length admits",
+            feed_outputs: json!([output("meta1", "contextualMetadata", "ENABLED")]),
+            resource: "m".repeat(2048),
+            appended: json!([output("subs2", "subtitling", "DISABLED")]),
+        },
+    ]
+}
+
+/// AssociateFeed claims the feed for one resource and appends the request's outputs to
+/// the stored list; GetFeed and ListFeeds report that stored record.
+#[tokio::test]
+async fn associate_feed_claims_the_feed_and_appends_its_outputs() {
+    let router = router();
+
+    for case in association_cases() {
+        let label = case.label;
+        let id = available_feed(&router, "assoc-feed", case.feed_outputs.clone()).await;
+
+        let (status, associated) = associate(&router, &id, &case.resource, case.appended.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: AssociateFeed answers 200, got {status} with {associated}"
+        );
+        assert_eq!(
+            associated,
+            json!({"arn": expected_arn(&id), "id": id}),
+            "case {label:?}: the response is the feed's arn and id, got {associated}"
+        );
+
+        // The round trip: the claim and the appended outputs are what storage holds.
+        let feed = get_feed(&router, &id, label).await;
+        assert_eq!(
+            feed["status"],
+            json!("ACTIVE"),
+            "case {label:?}: an associated feed reports ACTIVE, got {feed}"
+        );
+        assert_eq!(
+            feed["association"],
+            json!({"associatedResourceName": case.resource}),
+            "case {label:?}: the feed reports the associated resource, got {}",
+            feed["association"]
+        );
+        let mut expected = expected_outputs(&case.feed_outputs, false);
+        expected.extend(expected_outputs(&case.appended, true));
+        assert_eq!(
+            feed["outputs"],
+            Value::Array(expected),
+            "case {label:?}: the appended outputs follow the feed's own, each marked \
+             fromAssociation, got {}",
+            feed["outputs"]
+        );
+
+        // ListFeeds projects the same association.
+        let (status, listed) = call(&router, "GET", "/v1/feeds?maxResults=100", None).await;
+        let summary = listed["feeds"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|feed| feed["id"] == json!(id));
+        assert_eq!(
+            summary.as_ref().map(|feed| feed["association"].clone()),
+            Some(json!({"associatedResourceName": case.resource})),
+            "case {label:?}: ListFeeds reports the association too (HTTP {status}), got {listed}"
+        );
+    }
+}
+
+/// AssociateFeed is a PATCH: the SAME resource associating again only appends more
+/// outputs, and leaves everything else as it was.
+#[tokio::test]
+async fn re_associating_the_same_resource_appends_more_outputs() {
+    let router = router();
+    let resource = "source-media-patch";
+    let id = available_feed(
+        &router,
+        "patch-feed",
+        json!([output("crop1", "cropping", "ENABLED")]),
+    )
+    .await;
+
+    // Each row appends a different number of further outputs; the expected list grows
+    // by exactly those, in request order.
+    let rounds = [
+        json!([output("subs1", "subtitling", "ENABLED")]),
+        json!([]),
+        json!([
+            output("clip1", "clipping", "DISABLED"),
+            output("meta1", "contextualMetadata", "ENABLED")
+        ]),
+    ];
+    let mut expected = expected_outputs(&json!([output("crop1", "cropping", "ENABLED")]), false);
+
+    for (round, appended) in rounds.iter().enumerate() {
+        let label = format!("round {round} appending {} outputs", appended.as_array().unwrap().len());
+        let (status, body) = associate(&router, &id, resource, appended.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: re-associating the same resource is accepted, got {status} with {body}"
+        );
+        expected.extend(expected_outputs(appended, true));
+
+        let feed = get_feed(&router, &id, &label).await;
+        assert_eq!(
+            feed["outputs"],
+            Value::Array(expected.clone()),
+            "case {label:?}: the new outputs are appended to the existing ones, got {}",
+            feed["outputs"]
+        );
+        assert_eq!(
+            feed["association"],
+            json!({"associatedResourceName": resource}),
+            "case {label:?}: the association is unchanged, got {}",
+            feed["association"]
+        );
+        assert_eq!(
+            feed["status"],
+            json!("ACTIVE"),
+            "case {label:?}: the feed stays ACTIVE, got {}",
+            feed["status"]
+        );
+    }
+}
+
+/// "You can associate only one resource with each feed": a second, different resource is
+/// refused with the modelled `ValidationException`, and the first claim stands.
+#[tokio::test]
+async fn a_second_resource_is_refused_and_the_first_claim_stands() {
+    let router = router();
+    let holder = "source-media-holder";
+    // The rows differ in how the second name differs from the holder's: a plain other
+    // name, one that only differs in case, and one that is a prefix of the holder's.
+    for other in [
+        "source-media-other",
+        "SOURCE-MEDIA-HOLDER",
+        "source-media",
+        "a",
+    ] {
+        let id = available_feed(
+            &router,
+            "single-resource-feed",
+            json!([output("crop1", "cropping", "ENABLED")]),
+        )
+        .await;
+        let (status, _) = associate(
+            &router,
+            &id,
+            holder,
+            json!([output("subs1", "subtitling", "ENABLED")]),
+        )
+        .await;
+        assert_eq!(status, 200, "case {other:?}: the first claim is accepted");
+
+        let (status, error) = associate(
+            &router,
+            &id,
+            other,
+            json!([output("clip1", "clipping", "ENABLED")]),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {other:?}: a second resource is a 400, got {status} with {error}"
+        );
+        assert_eq!(
+            error["__type"],
+            json!("ValidationException"),
+            "case {other:?}: that 400 is a ValidationException, got {error}"
+        );
+        assert!(
+            error["message"].as_str().is_some_and(|m| m.contains("ACTIVE")),
+            "case {other:?}: the refusal names the feed's status, got {}",
+            error["message"]
+        );
+
+        // The refusal changed nothing: neither the holder nor its outputs.
+        let feed = get_feed(&router, &id, other).await;
+        assert_eq!(
+            feed["association"],
+            json!({"associatedResourceName": holder}),
+            "case {other:?}: the first claim still holds, got {}",
+            feed["association"]
+        );
+        assert_eq!(
+            feed["outputs"].as_array().map(Vec::len),
+            Some(2),
+            "case {other:?}: the refused outputs were not appended, got {}",
+            feed["outputs"]
+        );
+    }
+}
+
+/// A feed takes an association only from a status that admits one: from every other
+/// status the call is refused with the modelled `ValidationException` naming the status,
+/// and nothing is written.
+#[tokio::test]
+async fn associate_is_refused_from_every_status_that_takes_no_association() {
+    let router = router();
+    let feed_outputs = json!([output("crop1", "cropping", "ENABLED")]);
+
+    // One row per non-associable status the service produces (`FeedStatus`: CREATING,
+    // UPDATING, DELETING, ARCHIVED — AVAILABLE and ACTIVE are the associable ones,
+    // covered above).
+    for status_under_test in ["CREATING", "UPDATING", "DELETING", "ARCHIVED"] {
+        let id = match status_under_test {
+            // Read straight after the create, before the clock settles it.
+            "CREATING" => create_feed(&router, "transient-feed", feed_outputs.clone()).await,
+            "UPDATING" => {
+                let id = available_feed(&router, "updating-feed", feed_outputs.clone()).await;
+                let (status, _) = call(
+                    &router,
+                    "PUT",
+                    &format!("/v1/feed/{id}"),
+                    Some(json!({"name": "updating-feed", "outputs": feed_outputs})),
+                )
+                .await;
+                assert_eq!(status, 200, "case {status_under_test:?}: UpdateFeed answers 200");
+                id
+            }
+            "DELETING" => {
+                let id = available_feed(&router, "deleting-feed", feed_outputs.clone()).await;
+                let (status, _) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;
+                assert_eq!(status, 202, "case {status_under_test:?}: DeleteFeed answers 202");
+                id
+            }
+            "ARCHIVED" => {
+                let id = available_feed(&router, "archived-feed", feed_outputs.clone()).await;
+                let (status, _) = associate(&router, &id, "released-media", json!([])).await;
+                assert_eq!(status, 200, "case {status_under_test:?}: the claim is accepted");
+                let (status, _) = disassociate(&router, &id, "released-media").await;
+                assert_eq!(
+                    status, 200,
+                    "case {status_under_test:?}: DisassociateFeed answers 200"
+                );
+                id
+            }
+            other => panic!("no such status row: {other}"),
+        };
+
+        let feed = get_feed(&router, &id, status_under_test).await;
+        assert_eq!(
+            feed["status"],
+            json!(status_under_test),
+            "case {status_under_test:?}: the feed is in the status under test, got {feed}"
+        );
+
+        let (status, error) = associate(
+            &router,
+            &id,
+            "would-be-media",
+            json!([output("subs1", "subtitling", "ENABLED")]),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {status_under_test:?}: the association is a 400, got {status} with {error}"
+        );
+        assert_eq!(
+            error["__type"],
+            json!("ValidationException"),
+            "case {status_under_test:?}: that 400 is a ValidationException, got {error}"
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(status_under_test)),
+            "case {status_under_test:?}: the refusal names the status, got {}",
+            error["message"]
+        );
+
+        // Nothing was written: no association, and the outputs are untouched.
+        let (code, feed) = call(&router, "GET", &format!("/v1/feed/{id}"), None).await;
+        if code == 200 {
+            assert_eq!(
+                feed.get("association").cloned().unwrap_or(Value::Null),
+                Value::Null,
+                "case {status_under_test:?}: the refused call associated nothing, got {feed}"
+            );
+            assert_eq!(
+                feed["outputs"].as_array().map(Vec::len),
+                Some(1),
+                "case {status_under_test:?}: the refused outputs were not appended, got {}",
+                feed["outputs"]
+            );
+        }
+    }
+}
+
+/// `associatedResourceName` "must not resemble an ARN" — a rule its own pattern cannot
+/// express, since that pattern admits `:` and `/`.
+#[tokio::test]
+async fn a_resource_name_that_resembles_an_arn_is_refused() {
+    let router = router();
+    // (name, accepted) — the ARN-like rows open with the `arn:` prefix in any case; the
+    // accepted rows use the same characters without being an ARN, including non-ASCII
+    // word characters, which the member's `\w` class admits and which must be judged
+    // (not byte-sliced) by the ARN rule.
+    let cases = [
+        ("arn:aws:s3:::media-bucket/live.ts", false),
+        ("ARN:aws:elemental-inference:us-west-2:000000000000:feed/x", false),
+        ("arn:", false),
+        ("not-an-arn:just a name", true),
+        ("media/arn:aws:s3", true),
+        // Multi-byte from the first byte: no `arn:` prefix, and no byte boundary at 4.
+        ("日本語の素材", true),
+        // A multi-byte character STRADDLING byte offset 4.
+        ("ab日本語", true),
+        ("héllo-média", true),
+        // Shorter than the prefix it is compared against.
+        ("ar", true),
+    ];
+
+    for (name, accepted) in cases {
+        let id = available_feed(
+            &router,
+            "arn-name-feed",
+            json!([output("crop1", "cropping", "ENABLED")]),
+        )
+        .await;
+        let (status, body) = associate(&router, &id, name, json!([])).await;
+        assert!(
+            status == 200 || status == 400,
+            "case {name:?}: the name is judged, never crashing the handler, got {status} \
+             with {body}"
+        );
+        if accepted {
+            assert_eq!(
+                status, 200,
+                "case {name:?}: a name that is not an ARN is accepted, got {status} with {body}"
+            );
+            let feed = get_feed(&router, &id, name).await;
+            assert_eq!(
+                feed["association"],
+                json!({"associatedResourceName": name}),
+                "case {name:?}: the accepted name is what is stored, got {}",
+                feed["association"]
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {name:?}: a name resembling an ARN is a 400, got {status} with {body}"
+            );
+            assert_eq!(
+                body["__type"],
+                json!("ValidationException"),
+                "case {name:?}: that 400 is a ValidationException, got {body}"
+            );
+            let feed = get_feed(&router, &id, name).await;
+            assert_eq!(
+                feed.get("association").cloned().unwrap_or(Value::Null),
+                Value::Null,
+                "case {name:?}: the refused name was not stored, got {feed}"
+            );
+        }
+    }
+}
+
+/// A resource name outside the member's modelled `@length` 1..2048 never reaches the
+/// handler: the boundary refuses it, at each published bound and one past it.
+#[tokio::test]
+async fn a_resource_name_outside_the_modelled_length_is_refused() {
+    let router = router();
+    let id = available_feed(
+        &router,
+        "length-feed",
+        json!([output("crop1", "cropping", "ENABLED")]),
+    )
+    .await;
+
+    // (length, expected status): 1 and 2048 are the bounds the model publishes; 0 and
+    // 2049 are one past each.
+    for (length, expected) in [(0_usize, 400), (1, 200), (2048, 200), (2049, 400)] {
+        let name = "n".repeat(length);
+        // Each accepted row re-associates the SAME feed under a fresh name, so the
+        // rows after the first run against an ACTIVE feed; use a new feed per row.
+        let id = if expected == 200 {
+            available_feed(
+                &router,
+                "length-feed",
+                json!([output("crop1", "cropping", "ENABLED")]),
+            )
+            .await
+        } else {
+            id.clone()
+        };
+        let (status, body) = associate(&router, &id, &name, json!([])).await;
+        assert_eq!(
+            status, expected,
+            "case length {length}: expected HTTP {expected}, got {status} with {body}"
+        );
+    }
+}
+
+/// AssociateFeed can only APPEND outputs: one whose name an existing output already has
+/// would modify it, so the call is a `ConflictException` (HTTP 409) — as is a request
+/// that names one output twice.
+#[tokio::test]
+async fn an_output_name_that_already_exists_is_a_conflict() {
+    let router = router();
+    let feed_outputs = json!([
+        output("crop1", "cropping", "ENABLED"),
+        output("subs1", "subtitling", "DISABLED")
+    ]);
+
+    // The rows differ in where the collision is: with the feed's first output, with a
+    // later one, within the request itself, and (the control row) nowhere.
+    let cases = [
+        ("collides with the feed's first output", json!([output("crop1", "clipping", "ENABLED")]), 409),
+        ("collides with a later output of the feed", json!([output("subs1", "cropping", "ENABLED")]), 409),
+        (
+            "names one output twice in the request",
+            json!([
+                output("clip1", "clipping", "ENABLED"),
+                output("clip1", "cropping", "DISABLED")
+            ]),
+            409,
+        ),
+        ("collides with nothing", json!([output("clip1", "clipping", "ENABLED")]), 200),
+    ];
+
+    for (label, appended, expected) in cases {
+        let id = available_feed(&router, "conflict-feed", feed_outputs.clone()).await;
+        let (status, body) = associate(&router, &id, "source-media", appended).await;
+        assert_eq!(
+            status, expected,
+            "case {label:?}: expected HTTP {expected}, got {status} with {body}"
+        );
+        if expected == 409 {
+            assert_eq!(
+                body["__type"],
+                json!("ConflictException"),
+                "case {label:?}: that 409 is a ConflictException, got {body}"
+            );
+            let feed = get_feed(&router, &id, label).await;
+            assert_eq!(
+                feed["outputs"].as_array().map(Vec::len),
+                Some(2),
+                "case {label:?}: the conflicting call appended nothing, got {}",
+                feed["outputs"]
+            );
+            assert_eq!(
+                feed["status"],
+                json!("AVAILABLE"),
+                "case {label:?}: the conflicting call did not claim the feed, got {}",
+                feed["status"]
+            );
+        }
+    }
+}
+
+/// A feed's output list is bounded: an append that would exceed the quota answers the
+/// modelled `ServiceQuotaExceededException` (HTTP 402) instead of growing state.
+#[tokio::test]
+async fn associate_refuses_an_append_past_the_output_quota() {
+    let router = router();
+    let own: Vec<Value> = (0..MAX_OUTPUTS_PER_FEED - 1)
+        .map(|index| output(&format!("own{index}"), "cropping", "ENABLED"))
+        .collect();
+    let id = available_feed(&router, "quota-feed", json!(own)).await;
+
+    // The bound itself is accepted: MAX_OUTPUTS_PER_FEED - 1 own outputs plus one.
+    let (status, body) = associate(
+        &router,
+        &id,
+        "source-media",
+        json!([output("fill1", "subtitling", "ENABLED")]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case at the quota ({MAX_OUTPUTS_PER_FEED} outputs): the append is accepted, got {status} with {body}"
+    );
+
+    // One past it is not.
+    let (status, error) = associate(
+        &router,
+        &id,
+        "source-media",
+        json!([output("fill2", "subtitling", "ENABLED")]),
+    )
+    .await;
+    assert_eq!(
+        status, 402,
+        "case past the quota ({} outputs): the append is a 402, got {status} with {error}",
+        MAX_OUTPUTS_PER_FEED + 1
+    );
+    assert_eq!(
+        error["__type"],
+        json!("ServiceQuotaExceededException"),
+        "case past the quota: that 402 is a ServiceQuotaExceededException, got {error}"
+    );
+    let feed = get_feed(&router, &id, "past the quota").await;
+    assert_eq!(
+        feed["outputs"].as_array().map(Vec::len),
+        Some(MAX_OUTPUTS_PER_FEED),
+        "case past the quota: the refused append grew nothing, got {}",
+        feed["outputs"]
+    );
+
+    // A call that appends NOTHING grows nothing, so the quota never refuses it — not
+    // even on a feed whose own outputs are already at or past the bound, which
+    // CreateFeed can produce in one request.
+    let over: Vec<Value> = (0..MAX_OUTPUTS_PER_FEED + 5)
+        .map(|index| output(&format!("own{index}"), "cropping", "ENABLED"))
+        .collect();
+    let over_count = over.len();
+    let id = available_feed(&router, "over-quota-feed", json!(over)).await;
+    let (status, body) = associate(&router, &id, "source-media", json!([])).await;
+    assert_eq!(
+        status, 200,
+        "case {over_count} own outputs, appending none: the claim is accepted, got {status} \
+         with {body}"
+    );
+    let feed = get_feed(&router, &id, "appending none").await;
+    assert_eq!(
+        (&feed["status"], feed["outputs"].as_array().map(Vec::len)),
+        (&json!("ACTIVE"), Some(over_count)),
+        "case {over_count} own outputs, appending none: the feed is claimed and unchanged \
+         otherwise, got {feed}"
+    );
+}
+
+/// DisassociateFeed releases the named resource, disables every output and archives the
+/// feed; the archive is irreversible.
+#[tokio::test]
+async fn disassociate_releases_the_resource_and_archives_the_feed_irreversibly() {
+    let router = router();
+
+    for case in association_cases() {
+        let label = case.label;
+        let id = available_feed(&router, "release-feed", case.feed_outputs.clone()).await;
+        let (status, _) = associate(&router, &id, &case.resource, case.appended.clone()).await;
+        assert_eq!(status, 200, "case {label:?}: the claim is accepted");
+
+        let (status, released) = disassociate(&router, &id, &case.resource).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: DisassociateFeed answers 200, got {status} with {released}"
+        );
+        assert_eq!(
+            released,
+            json!({"arn": expected_arn(&id), "id": id}),
+            "case {label:?}: the response is the feed's arn and id, got {released}"
+        );
+
+        let feed = get_feed(&router, &id, label).await;
+        assert_eq!(
+            feed["status"],
+            json!("ARCHIVED"),
+            "case {label:?}: a released feed reports ARCHIVED, got {feed}"
+        );
+        assert_eq!(
+            feed.get("association").cloned().unwrap_or(Value::Null),
+            Value::Null,
+            "case {label:?}: the resource is released, got {}",
+            feed["association"]
+        );
+        let statuses: Vec<&str> = feed["outputs"]
+            .as_array()
+            .expect("the outputs are a list")
+            .iter()
+            .map(|output| output["status"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            !statuses.is_empty() && statuses.iter().all(|status| *status == "DISABLED"),
+            "case {label:?}: every output in the feed becomes DISABLED, got {statuses:?}"
+        );
+
+        // Irreversible: the feed takes no further association, and cannot be released
+        // again.
+        let (status, error) = associate(&router, &id, &case.resource, json!([])).await;
+        assert_eq!(
+            status, 400,
+            "case {label:?}: re-associating an ARCHIVED feed is a 400, got {status} with {error}"
+        );
+        let (status, error) = disassociate(&router, &id, &case.resource).await;
+        assert_eq!(
+            status, 400,
+            "case {label:?}: releasing it again is a 400, got {status} with {error}"
+        );
+        assert_eq!(
+            error["__type"],
+            json!("ValidationException"),
+            "case {label:?}: that 400 is a ValidationException, got {error}"
+        );
+    }
+}
+
+/// DisassociateFeed takes "the name of the resource CURRENTLY associated with the feed":
+/// any other name is refused and the association stands.
+#[tokio::test]
+async fn disassociate_with_a_name_that_is_not_the_associated_resource_is_refused() {
+    let router = router();
+    let holder = "source-media-holder";
+    // The rows differ in how the name differs from the holder's: an unrelated name, one
+    // differing only in case, a prefix, and the shortest name the member admits.
+    for other in [
+        "source-media-other",
+        "Source-Media-Holder",
+        "source-media",
+        "a",
+    ] {
+        let id = available_feed(
+            &router,
+            "wrong-name-feed",
+            json!([output("crop1", "cropping", "ENABLED")]),
+        )
+        .await;
+        let (status, _) = associate(&router, &id, holder, json!([])).await;
+        assert_eq!(status, 200, "case {other:?}: the claim is accepted");
+
+        let (status, error) = disassociate(&router, &id, other).await;
+        assert_eq!(
+            status, 400,
+            "case {other:?}: the wrong resource name is a 400, got {status} with {error}"
+        );
+        assert_eq!(
+            error["__type"],
+            json!("ValidationException"),
+            "case {other:?}: that 400 is a ValidationException, got {error}"
+        );
+
+        let feed = get_feed(&router, &id, other).await;
+        assert_eq!(
+            (&feed["status"], &feed["association"]),
+            (
+                &json!("ACTIVE"),
+                &json!({"associatedResourceName": holder})
+            ),
+            "case {other:?}: the refused release left the association in place, got {feed}"
+        );
+        assert_eq!(
+            feed["outputs"][0]["status"],
+            json!("ENABLED"),
+            "case {other:?}: the refused release disabled nothing, got {}",
+            feed["outputs"]
+        );
+    }
+}
+
+/// A feed that is not currently associated has nothing to release, so DisassociateFeed
+/// is refused with the modelled `ValidationException` naming the status.
+#[tokio::test]
+async fn disassociate_is_refused_from_every_status_that_holds_no_resource() {
+    let router = router();
+    let feed_outputs = json!([output("crop1", "cropping", "ENABLED")]);
+
+    for status_under_test in ["CREATING", "AVAILABLE", "DELETING"] {
+        let id = match status_under_test {
+            "CREATING" => create_feed(&router, "never-associated", feed_outputs.clone()).await,
+            "AVAILABLE" => available_feed(&router, "never-associated", feed_outputs.clone()).await,
+            "DELETING" => {
+                let id = available_feed(&router, "never-associated", feed_outputs.clone()).await;
+                let (status, _) = call(&router, "DELETE", &format!("/v1/feed/{id}"), None).await;
+                assert_eq!(status, 202, "case {status_under_test:?}: DeleteFeed answers 202");
+                id
+            }
+            other => panic!("no such status row: {other}"),
+        };
+
+        let (status, error) = disassociate(&router, &id, "never-associated-media").await;
+        assert_eq!(
+            status, 400,
+            "case {status_under_test:?}: releasing an unassociated feed is a 400, got {status} with {error}"
+        );
+        assert_eq!(
+            error["__type"],
+            json!("ValidationException"),
+            "case {status_under_test:?}: that 400 is a ValidationException, got {error}"
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(status_under_test)),
+            "case {status_under_test:?}: the refusal names the status, got {}",
+            error["message"]
+        );
+    }
+}
+
+/// `dryRun` validates the request and persists NOTHING, on either operation and whether
+/// the real call would succeed or fail.
+#[tokio::test]
+async fn a_dry_run_changes_nothing() {
+    let router = router();
+    let feed_outputs = json!([output("crop1", "cropping", "ENABLED")]);
+
+    // (label, uri suffix, body, expected status) — a dry-run associate on an
+    // associable feed, on a feed that already holds another resource, and a dry-run
+    // release of the resource that does hold it.
+    let resource = "source-media-dry";
+    let dry_cases: Vec<(&str, &str, Value, u16, bool)> = vec![
+        (
+            "dry-run associate on an AVAILABLE feed",
+            "associate",
+            json!({"associatedResourceName": resource, "outputs": [output("subs1", "subtitling", "ENABLED")], "dryRun": true}),
+            200,
+            false,
+        ),
+        (
+            "dry-run associate of a second resource",
+            "associate",
+            json!({"associatedResourceName": "other-media", "outputs": [], "dryRun": true}),
+            400,
+            true,
+        ),
+        (
+            "dry-run disassociate of the associated resource",
+            "disassociate",
+            json!({"associatedResourceName": resource, "dryRun": true}),
+            200,
+            true,
+        ),
+        (
+            "dry-run disassociate under the wrong name",
+            "disassociate",
+            json!({"associatedResourceName": "other-media", "dryRun": true}),
+            400,
+            true,
+        ),
+    ];
+
+    for (label, verb, body, expected, pre_associate) in dry_cases {
+        let id = available_feed(&router, "dry-run-feed", feed_outputs.clone()).await;
+        if pre_associate {
+            let (status, _) = associate(&router, &id, resource, json!([])).await;
+            assert_eq!(status, 200, "case {label:?}: the setup claim is accepted");
+        }
+        let before = get_feed(&router, &id, label).await;
+
+        let (status, answered) = call(
+            &router,
+            "POST",
+            &format!("/v1/feed/{id}/{verb}"),
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            status, expected,
+            "case {label:?}: expected HTTP {expected}, got {status} with {answered}"
+        );
+        if expected == 200 {
+            assert_eq!(
+                answered,
+                json!({"arn": expected_arn(&id), "id": id}),
+                "case {label:?}: a dry run answers the same arn and id, got {answered}"
+            );
+        }
+
+        let after = get_feed(&router, &id, label).await;
+        assert_eq!(
+            after, before,
+            "case {label:?}: a dry run persists nothing, got {after}"
+        );
+    }
+}
+
+/// An id no live feed has is a 404 `ResourceNotFoundException` on both association
+/// operations, and the refusal never reports the id that was probed.
+#[tokio::test]
+async fn an_unknown_feed_id_is_a_404_on_both_association_operations() {
+    let router = router();
+    // One live feed, so the 404 is about the id and not about an empty store.
+    let live_id = available_feed(
+        &router,
+        "the-only-feed",
+        json!([output("crop1", "cropping", "ENABLED")]),
+    )
+    .await;
+
+    // Every id below satisfies ^[a-z0-9]{19}$, so the boundary admits it and the
+    // handler is what refuses it.
+    for id in [
+        "0000000000000000000",
+        "zzzzzzzzzzzzzzzzzzz",
+        "abcdefghij123456789",
+    ] {
+        assert_ne!(id, live_id, "the unknown ids must not be the live feed's");
+        for (verb, body) in [
+            (
+                "associate",
+                json!({"associatedResourceName": "source-media", "outputs": []}),
+            ),
+            (
+                "disassociate",
+                json!({"associatedResourceName": "source-media"}),
+            ),
+        ] {
+            let label = format!("POST /v1/feed/{id}/{verb}");
+            let (status, error) = call(
+                &router,
+                "POST",
+                &format!("/v1/feed/{id}/{verb}"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(
+                status, 404,
+                "case {label:?}: an unknown feed id is a 404, got {status} with {error}"
+            );
+            assert_eq!(
+                error["__type"],
+                json!("ResourceNotFoundException"),
+                "case {label:?}: that 404 is a ResourceNotFoundException, got {error}"
+            );
+            assert!(
+                error["message"].as_str().is_some_and(|m| !m.contains(id)),
+                "case {label:?}: the refusal does not report the probed id, got {}",
+                error["message"]
+            );
+        }
+    }
+}
+
+/// Concurrent associations on ONE feed resolve to exactly one winner: the claim is taken
+/// under the state lock, so every other caller is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_associations_on_one_feed_have_exactly_one_winner() {
+    let router = Arc::new(router());
+    // The rows differ in how many callers race for the one feed.
+    for racers in [2_usize, 4, 8] {
+        let id = available_feed(
+            &router,
+            "race-feed",
+            json!([output("crop1", "cropping", "ENABLED")]),
+        )
+        .await;
+
+        let mut tasks = Vec::new();
+        for racer in 0..racers {
+            let router = Arc::clone(&router);
+            let id = id.clone();
+            tasks.push(tokio::spawn(async move {
+                let resource = format!("racing-media-{racer}");
+                let (status, body) = associate(
+                    &router,
+                    &id,
+                    &resource,
+                    json!([output(&format!("out{racer}"), "subtitling", "ENABLED")]),
+                )
+                .await;
+                (resource, status, body)
+            }));
+        }
+
+        let mut winners = Vec::new();
+        let mut losers = Vec::new();
+        for task in tasks {
+            let (resource, status, body) = task.await.expect("the racing task completed");
+            match status {
+                200 => winners.push(resource),
+                400 => {
+                    assert_eq!(
+                        body["__type"],
+                        json!("ValidationException"),
+                        "case {racers} racers: a loser is refused with ValidationException, got {body}"
+                    );
+                    losers.push(resource);
+                }
+                other => panic!(
+                    "case {racers} racers: a racer answered HTTP {other} with {body}"
+                ),
+            }
+        }
+        assert_eq!(
+            winners.len(),
+            1,
+            "case {racers} racers: expected exactly 1 winner, got {winners:?} with losers {losers:?}"
+        );
+        assert_eq!(
+            losers.len(),
+            racers - 1,
+            "case {racers} racers: every other racer is a loser, got {losers:?}"
+        );
+
+        // The feed holds the winner's claim, and only the winner's output was appended.
+        let feed = get_feed(&router, &id, "the race").await;
+        assert_eq!(
+            feed["association"],
+            json!({"associatedResourceName": winners[0]}),
+            "case {racers} racers: the feed holds the winner's resource, got {feed}"
+        );
+        assert_eq!(
+            feed["outputs"].as_array().map(Vec::len),
+            Some(2),
+            "case {racers} racers: only the winner's output was appended, got {}",
+            feed["outputs"]
+        );
+    }
+}
