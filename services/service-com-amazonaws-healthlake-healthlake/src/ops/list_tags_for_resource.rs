@@ -149,14 +149,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The modelled `AmazonResourceName` pattern also admits a
         // `dataTransformationProfile` ARN, which names a different resource;
-        // anything that is not a data store ARN resolves to no data store.
+        // anything that is not a data store ARN resolves to no data store, and
+        // this service's not-found text names no identifier.
         let Some(id) = crate::state::datastore_id_from_arn(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource {} is not a HealthLake data store",
-                        input.resource_arn
-                    )),
+                    message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -177,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Resource {} does not exist", input.resource_arn)),
+                    message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

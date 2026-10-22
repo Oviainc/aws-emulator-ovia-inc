@@ -153,13 +153,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // recomputed per call.
         store.settle_lifecycle();
 
+        // The not-found answer is this service's FIXED text: it names no
+        // identifier, so a well-formed id no data store carries reads the same
+        // whatever the caller asked about.
         let Some(datastore) = store.datastores.get(&input.datastore_id) else {
             return Err(DescribeFHIRDatastoreErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Datastore with ID {} does not exist",
-                        input.datastore_id
-                    )),
+                    message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

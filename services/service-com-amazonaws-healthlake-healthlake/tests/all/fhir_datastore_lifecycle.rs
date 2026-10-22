@@ -16,15 +16,18 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// Long enough that every lifecycle transition `crate::state::LIFECYCLE_TRANSITION`
 /// owes (500 ms) has fallen due by the time the next call runs.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+///
+/// `pub(crate)` so the sibling suites in `tests/all/` drive the lifecycle through
+/// the same harness rather than each writing its own.
+pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The emulated HealthLake service behind the production router.
-struct HealthLake {
+pub(crate) struct HealthLake {
     router: MultiServiceRouter,
 }
 
 impl HealthLake {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(
@@ -34,7 +37,7 @@ impl HealthLake {
     }
 
     /// Dispatch one awsJson1_0 call, returning the HTTP status and the parsed body.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -55,7 +58,7 @@ impl HealthLake {
     }
 
     /// Dispatch a call that must succeed, returning its body.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, payload) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -65,7 +68,7 @@ impl HealthLake {
     }
 
     /// Create a data store and return `(DatastoreId, DatastoreArn)`.
-    async fn create(&self, request: &Value) -> (String, String) {
+    pub(crate) async fn create(&self, request: &Value) -> (String, String) {
         let created = self.ok("CreateFHIRDatastore", request).await;
         (
             string_at(&created, "DatastoreId"),
@@ -88,7 +91,7 @@ impl HealthLake {
 }
 
 /// A required string member of a response body.
-fn string_at(body: &Value, member: &str) -> String {
+pub(crate) fn string_at(body: &Value, member: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("response must carry a string {member}, got {body}"))
@@ -96,7 +99,7 @@ fn string_at(body: &Value, member: &str) -> String {
 }
 
 /// The modelled shape name in an awsJson error envelope's `__type`.
-fn error_code(payload: &Value) -> String {
+pub(crate) fn error_code(payload: &Value) -> String {
     payload["__type"]
         .as_str()
         .unwrap_or("<no __type>")
@@ -1086,9 +1089,10 @@ async fn an_unimplemented_operation_still_answers_501() {
 
     // The rest of the surface is deliberately still scaffolded: for a request
     // that satisfies every modelled constraint it must answer "nobody has
-    // written it yet", never an empty success.
+    // written it yet", never an empty success. (`UpdateFHIRDatastore` is NOT in
+    // this list any more — it is implemented; see
+    // `control_plane_error_semantics`.)
     let cases = [
-        ("UpdateFHIRDatastore", json!({ "DatastoreId": &id })),
         ("ListFHIRExportJobs", json!({ "DatastoreId": &id })),
         ("ListFHIRImportJobs", json!({ "DatastoreId": &id })),
         (

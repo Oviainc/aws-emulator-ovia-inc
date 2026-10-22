@@ -166,13 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_lifecycle();
 
+        // This service's not-found answer is one fixed text that quotes neither
+        // the requested id nor anything else from the request.
         let Some(datastore) = store.datastores.get_mut(&input.datastore_id) else {
             return Err(DeleteFHIRDatastoreErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Datastore with ID {} does not exist",
-                        input.datastore_id
-                    )),
+                    message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -187,9 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DatastoreStatus::Creating | crate::state::DatastoreStatus::Deleting => {
                 return Err(DeleteFHIRDatastoreErrorModeled::ConflictException(
                     ConflictException {
+                        // The status is the SERVICE's own state, so the sentence
+                        // states it; the requested id is caller input, which this
+                        // service's error text never quotes back.
                         message: Some(format!(
-                            "Datastore with ID {} is in status {} and cannot be deleted",
-                            input.datastore_id,
+                            "Specified datastore is in status {} and cannot be deleted.",
                             datastore.status.as_wire()
                         )),
                     },
@@ -200,10 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DatastoreStatus::Deleted => {
                 return Err(DeleteFHIRDatastoreErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Datastore with ID {} does not exist",
-                            input.datastore_id
-                        )),
+                        message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into());

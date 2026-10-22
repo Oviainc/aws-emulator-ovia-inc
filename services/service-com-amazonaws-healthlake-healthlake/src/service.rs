@@ -41,9 +41,81 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service refuses a request that failed a modelled
+/// constraint with: `ValidationException`, the service-common client error the
+/// model declares at HTTP 400 (`smithy_query(query="service_info")` lists it
+/// among the common errors, and every operation carries it).
+const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+
+/// How this service states a set of constraint violations the framework refused
+/// before any handler ran.
+///
+/// The code is [`VALIDATION_EXCEPTION_CODE`] and the message is the AWS
+/// `N validation error(s) detected` envelope — the same framing the framework
+/// renders — with ONE difference, in the enum clause: see [`clause_for`].
+fn refused_for(violations: &[Violation]) -> Refused {
+    Refused {
+        code: VALIDATION_EXCEPTION_CODE.to_string(),
+        message: validation_envelope(violations),
+    }
+}
+
+/// `1 validation error detected: <clause>` / `N validation errors detected:
+/// <clause>; <clause>`, each clause as [`clause_for`] words it.
+///
+/// `pub(crate)` because a handler re-stating a modelled constraint of its own
+/// has to answer in the SAME words as the boundary validator; see
+/// [`crate::ops::create_fhir_datastore`].
+pub(crate) fn validation_envelope(violations: &[Violation]) -> String {
+    let clauses: Vec<String> = violations.iter().map(clause_for).collect();
+    match clauses.len() {
+        // The framework only calls this with at least one violation; an empty
+        // set still has to read as a refusal rather than as an empty sentence.
+        0 => "1 validation error detected".to_string(),
+        1 => format!("1 validation error detected: {}", clauses[0]),
+        n => format!("{n} validation errors detected: {}", clauses.join("; ")),
+    }
+}
+
+/// One violation as this service states it.
+///
+/// A value outside an enumerated type's value set is the one class whose clause
+/// states the member and the permitted set ALONE — `Value at '<member>' failed
+/// to satisfy constraint: Member must satisfy enum value set: [...]` — with no
+/// echo of what the caller sent: an unknown enum name never becomes a value of
+/// the modelled type, so there is no value for the refusal to quote. Every
+/// other class (length, range, pattern, uniqueness, absence) keeps the
+/// framework's own clause, which quotes the offending value as AWS does.
+fn clause_for(violation: &Violation) -> String {
+    match &violation.kind {
+        ViolationKind::EnumValue(allowed) => format!(
+            "Value at '{}' failed to satisfy constraint: Member must satisfy enum value set: [{}]",
+            violation.path,
+            allowed.join(", ")
+        ),
+        // `ViolationKind` is `#[non_exhaustive]`: anything else — including a
+        // class added later — keeps the framework's wording rather than being
+        // dropped or reworded on no evidence.
+        _ => violation.message(),
+    }
+}
+
+/// The message this service answers a value outside `allowed` at the member
+/// `path` with, for a handler that re-states an enum constraint the boundary
+/// validator has already applied. Worded by [`clause_for`], so the handler's
+/// answer and the validator's are the same sentence.
+pub(crate) fn enum_violation_message(path: &str, allowed: &[&str]) -> String {
+    validation_envelope(&[Violation {
+        path: path.to_string(),
+        kind: ViolationKind::EnumValue(allowed.iter().map(|value| value.to_string()).collect()),
+        // Deliberately absent: this service's enum clause quotes no value.
+        value: None,
+    }])
+}
 
 /// The `com-amazonaws-healthlake-healthlake` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -105,8 +177,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // for the rest. Replace BOTH the code and the message: a client branches
         // on the code, so a message without its matching code is worse than
         // leaving both alone.
-        let _ = refusal;
-        None
+        match refusal {
+            // Constraint violations are stated the way this service states them
+            // — code and message together; see `refused_for`.
+            Refusal::Invalid(violations) => Some(refused_for(violations)),
+            // Authentication is the framework's answer to give; this service
+            // words it no differently.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

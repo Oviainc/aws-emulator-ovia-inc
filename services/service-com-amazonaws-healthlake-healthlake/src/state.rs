@@ -40,6 +40,25 @@ pub const DELETED_RETENTION: Duration = Duration::from_secs(60);
 /// SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The sentence this service's `ResourceNotFoundException` carries when the
+/// request names a data store no record holds.
+///
+/// It is a FIXED service text: the same sentence whatever `DatastoreId` or ARN
+/// was asked about, so a not-found answer never quotes the request back at the
+/// caller. The model documents the error itself only as "The requested data
+/// store was not found."; this is the wording the service answers with. Every
+/// data-store not-found path in this crate states it through this one constant,
+/// so none of them can drift into echoing the identifier.
+pub const DATASTORE_NOT_FOUND_MESSAGE: &str = "Could not find specified datastore.";
+
+/// The sentence this service refuses a mutation with when the target data store
+/// exists but its `DatastoreStatus` is not `ACTIVE` (`CREATING`, `DELETING` or
+/// the terminal `DELETED`), beside `AccessDeniedException` (HTTP 403).
+///
+/// Like [`DATASTORE_NOT_FOUND_MESSAGE`] it names no identifier and no status: it
+/// is one fixed text for "the data store cannot be written to right now".
+pub const DATASTORE_NOT_ACTIVE_MESSAGE: &str = "Specified datastore is not active.";
+
 /// The most data stores this emulator holds at once.
 ///
 /// A ceiling, not a claim about any AWS quota: it exists so a `CreateFHIRDatastore`

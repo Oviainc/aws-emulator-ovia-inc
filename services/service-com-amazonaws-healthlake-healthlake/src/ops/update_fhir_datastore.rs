@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFHIRDatastore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFHIRDatastore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFHIRDatastore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members this call carries to the data store `CreateFHIRDatastore`
+//! persisted in [`crate::state`] and reports the record that resulted, so a
+//! later `Describe`/`List` reads exactly what this call wrote. A data store no
+//! record holds is a 404; one whose status is not `ACTIVE` is refused with 403
+//! `AccessDeniedException` rather than mutated.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +158,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFHIRDatastore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFHIRDatastoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFHIRDatastore"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFHIRDatastoreErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the HealthLake data store registry is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // A transition the clock already made due is materialised before the
+        // status gate below reads it, so this call agrees with `Describe` about
+        // what the data store's status is at this instant.
+        store.settle_lifecycle();
+
+        let Some(datastore) = store.datastores.get_mut(&input.datastore_id) else {
+            return Err(UpdateFHIRDatastoreErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A mutation is only accepted by a data store that is ACTIVE. Anything
+        // else — still `CREATING`, on its way out in `DELETING`, or already in
+        // the terminal `DELETED` — is refused with 403 `AccessDeniedException`,
+        // so nothing can edit or resurrect a record the caller cannot use. The
+        // gate comes BEFORE any write, so a refused call leaves the record
+        // exactly as it was.
+        if datastore.status != crate::state::DatastoreStatus::Active {
+            return Err(UpdateFHIRDatastoreErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A partial update: every member besides the id is optional, and one the
+        // request omits leaves the stored value alone rather than clearing it.
+        if let Some(name) = input.datastore_name {
+            datastore.name = Some(name);
+        }
+        if let Some(configuration) = input.analytics_configuration {
+            datastore.analytics_configuration = Some(configuration);
+        }
+        if let Some(configuration) = input.nlp_configuration {
+            datastore.nlp_configuration = Some(configuration);
+        }
+        if let Some(configuration) = input.profile_configuration {
+            datastore.profile_configuration = Some(configuration);
+        }
+        if let Some(configuration) = input.identity_provider_configuration {
+            datastore.identity_provider_configuration = Some(configuration);
+        }
+        if let Some(configuration) = input.backup_configuration {
+            datastore.backup_configuration = Some(configuration);
+        }
+
+        // The data store stays `ACTIVE`: the update is in the record by the time
+        // this call answers, so there is no later transition the clock owes and
+        // nothing for a caller to poll. (`UPDATING` / `UPDATE_FAILED` describe
+        // work that outlives its own call; nothing here performs any, so neither
+        // status is invented.)
+        Ok(UpdateFHIRDatastoreOutput {
+            datastore_properties: datastore.properties(),
+        })
     }
 }

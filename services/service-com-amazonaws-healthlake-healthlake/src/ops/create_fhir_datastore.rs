@@ -95,6 +95,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The validation path of this operation's `DatastoreTypeVersion` member, as the
+/// envelope spells a member name (lowerCamel; see
+/// `smithy_query(query="operation", operation="CreateFHIRDatastore")` for the
+/// modelled name).
+const DATASTORE_TYPE_VERSION_PATH: &str = "datastoreTypeVersion";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -178,14 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `FHIRVersion` models exactly one value, so the boundary validator has
         // already refused anything else; this re-states the rule rather than
         // trusting it, because a release version the service cannot host must
-        // never be recorded on a data store.
+        // never be recorded on a data store. It answers in the SAME words as the
+        // validator — member and permitted set, no echo of the rejected value.
         if !F_H_I_R_VERSION_VALUES.contains(&input.datastore_type_version.as_str()) {
             return Err(CreateFHIRDatastoreErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "DatastoreTypeVersion must be one of {}, got '{}'",
-                        F_H_I_R_VERSION_VALUES.join(", "),
-                        input.datastore_type_version
+                    message: Some(crate::service::enum_violation_message(
+                        DATASTORE_TYPE_VERSION_PATH,
+                        F_H_I_R_VERSION_VALUES,
                     )),
                 },
             )
