@@ -12,17 +12,15 @@
 //! configuration shape, name form, page size, filter criterion), and the recorded
 //! `demo`/`ACCOUNT`/`resourceType eq AWS::S3::Bucket` case from the issue is one row.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use service_com_amazonaws_accessanalyzer_accessanalyzer::state::{
     MAX_ANALYZERS, MAX_ARCHIVE_RULES_PER_ANALYZER, MAX_PAGE_SIZE,
 };
-use service_com_amazonaws_accessanalyzer_accessanalyzer::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region the test signs for; it is the region every expected ARN carries.
-const REGION: &str = "us-east-1";
+// The wire harness is shared by every suite in this target; see `tests/all/harness.rs`.
+use crate::harness::{
+    expected_arn, is_timestamp, listed_names, listed_rule_names, Emulator, Reply,
+};
 
 /// Every `Type` the model's `Type` enum accepts, from
 /// `smithy_query(query="operation", operation="CreateAnalyzer")`'s `type` member.
@@ -34,200 +32,6 @@ const ANALYZER_TYPES: &[&str] = &[
     "ORGANIZATION_INTERNAL_ACCESS",
     "ORGANIZATION_UNUSED_ACCESS",
 ];
-
-/// One response, reduced to what the assertions read.
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    /// The wire error code: restJson1 resolves an error shape from
-    /// `x-amzn-errortype`, falling back to the body's `__type`.
-    error_code: Option<String>,
-    body: Value,
-}
-
-impl Reply {
-    fn code(&self) -> &str {
-        self.error_code.as_deref().unwrap_or("")
-    }
-
-    /// A member of the response body, treating JSON `null` as absent the way an
-    /// omitted optional member is.
-    fn member(&self, name: &str) -> Option<&Value> {
-        self.body.get(name).filter(|value| !value.is_null())
-    }
-}
-
-/// The emulator under test: one engine, one mounted service, one router.
-struct Emulator {
-    router: MultiServiceRouter,
-}
-
-impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
-    }
-
-    async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
-        let payload = match body {
-            Some(value) => serde_json::to_vec(&value).expect("the request body serializes"),
-            None => Vec::new(),
-        };
-        let request = http::Request::builder()
-            .method(method)
-            .uri(format!("https://access-analyzer.{REGION}.amazonaws.com{path}"))
-            // The SigV4 credential scope is what routes the request to this service
-            // and what names the region its ARNs carry. Signatures are not verified
-            // unless the process turns authentication on.
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/access-analyzer/aws4_request, SignedHeaders=host, Signature=0000"
-                ),
-            )
-            .header("content-type", "application/json")
-            .body(bytes::Bytes::from(payload))
-            .expect("a well-formed request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error_code = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let body: Value = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        let error_code = error_code.or_else(|| {
-            body.get("__type")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-        Reply {
-            status,
-            error_code,
-            body,
-        }
-    }
-
-    async fn create_analyzer(&self, body: Value) -> Reply {
-        self.send("PUT", "/analyzer", Some(body)).await
-    }
-
-    async fn get_analyzer(&self, name: &str) -> Reply {
-        self.send("GET", &format!("/analyzer/{name}"), None).await
-    }
-
-    async fn delete_analyzer(&self, name: &str) -> Reply {
-        self.send("DELETE", &format!("/analyzer/{name}"), None).await
-    }
-
-    async fn list_analyzers(&self, query: &str) -> Reply {
-        self.send("GET", &format!("/analyzer{query}"), None).await
-    }
-
-    async fn create_archive_rule(&self, analyzer: &str, body: Value) -> Reply {
-        self.send(
-            "PUT",
-            &format!("/analyzer/{analyzer}/archive-rule"),
-            Some(body),
-        )
-        .await
-    }
-
-    async fn get_archive_rule(&self, analyzer: &str, rule: &str) -> Reply {
-        self.send(
-            "GET",
-            &format!("/analyzer/{analyzer}/archive-rule/{rule}"),
-            None,
-        )
-        .await
-    }
-
-    async fn list_archive_rules(&self, analyzer: &str, query: &str) -> Reply {
-        self.send(
-            "GET",
-            &format!("/analyzer/{analyzer}/archive-rule{query}"),
-            None,
-        )
-        .await
-    }
-}
-
-/// The ARN an analyzer of `name` must carry:
-/// `arn:aws:access-analyzer:<region>:<account>:analyzer/<name>`, with the account
-/// segment taken from the core's single source of truth.
-fn expected_arn(name: &str) -> String {
-    format!(
-        "arn:aws:access-analyzer:{REGION}:{}:analyzer/{name}",
-        engine::emulator_account_id()
-    )
-}
-
-/// Whether a `Timestamp` member carries an instant from this run's clock.
-///
-/// The instant itself is generated per call, so only its shape and plausibility are
-/// asserted. Both encodings are accepted — so the assertion pins the handler's
-/// behaviour rather than the codec's choice — and both apply the same lower bound of
-/// 2020-09-13 (epoch 1_600_000_000), which is what rules out a zero/default stand-in:
-/// the framework's JSON codec renders a timestamp as epoch seconds, while an RFC3339
-/// rendering must carry a four-digit year of 2020 or later.
-fn is_timestamp(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::Number(seconds)) => seconds.as_f64().is_some_and(|s| s > 1_600_000_000.0),
-        Some(Value::String(text)) => {
-            let year = text
-                .get(..4)
-                .and_then(|year| year.parse::<u32>().ok())
-                .unwrap_or(0);
-            year >= 2020 && text.contains('T') && text.ends_with('Z')
-        }
-        _ => false,
-    }
-}
-
-/// Every analyzer name a listing reports, in the order it reports them.
-fn listed_names(reply: &Reply) -> Vec<String> {
-    reply
-        .member("analyzers")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| {
-                    item.get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string()
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Every rule name a listing reports, in the order it reports them.
-fn listed_rule_names(reply: &Reply) -> Vec<String> {
-    reply
-        .member("archiveRules")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| {
-                    item.get("ruleName")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string()
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 /// One row of the create/read-back table.
 #[derive(Debug)]

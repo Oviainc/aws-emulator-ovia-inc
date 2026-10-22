@@ -13,5 +13,9 @@
 // points it into `tests/all/`.
 #[path = "all/analyzer_lifecycle.rs"]
 mod analyzer_lifecycle;
+#[path = "all/archive_rule_update.rs"]
+mod archive_rule_update;
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
