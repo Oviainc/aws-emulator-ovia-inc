@@ -114,6 +114,19 @@ pub const MAX_RESULTS: i32 = 50;
 /// workflow an emulator serves.
 pub const AGREEMENT_REQUEST_QUOTA: usize = 1_000;
 
+/// How many billing adjustment requests the store holds before
+/// `BatchCreateBillingAdjustmentRequest` stops accepting entries.
+///
+/// The same kind of bound as [`AGREEMENT_REQUEST_QUOTA`], and for the same
+/// reason: AWS publishes no number, so this is the emulator's OWN bound on the
+/// store — what stops the records growing without end across calls, however
+/// many calls are made — rather than a claim about an account's quota. It is far
+/// above any workflow an emulator serves. [`BILLING_ADJUSTMENT_BATCH_LIMIT`]
+/// bounds ONE call; this bounds the store. Past it an entry is refused on
+/// `BatchCreateBillingAdjustmentRequest`'s own per-entry `errors` channel, so a
+/// call whose other entries still fit is answered rather than refused.
+pub const BILLING_ADJUSTMENT_REQUEST_QUOTA: usize = 1_000;
+
 /// The `quotaCode` reported with that refusal. Named for what it bounds: a real
 /// quota code is an identifier Service Quotas issues, which this emulator does
 /// not model and so must not invent one of.
@@ -217,6 +230,16 @@ pub const BILLING_ADJUSTMENT_ERROR_VALIDATION: &str = "VALIDATION_EXCEPTION";
 pub const BILLING_ADJUSTMENT_ERROR_NOT_FOUND: &str = "RESOURCE_NOT_FOUND_EXCEPTION";
 /// See [`BILLING_ADJUSTMENT_ERROR_VALIDATION`].
 pub const BILLING_ADJUSTMENT_ERROR_CONFLICT: &str = "CONFLICT_EXCEPTION";
+
+/// The message `BatchCreateBillingAdjustmentError$message` carries for an entry
+/// whose `agreementId` names no agreement.
+///
+/// A per-entry error carries only its code, its message and the entry's
+/// `clientToken`, so the message is the service's own sentence for the code —
+/// the same one whatever entry hit it — and the entry it is about is the one its
+/// `clientToken` names.
+pub const BILLING_ADJUSTMENT_AGREEMENT_NOT_FOUND_MESSAGE: &str =
+    "Provided agreement does not exist.";
 
 /// Whether `amount` is the positive amount `PositiveAmountUpto8Decimals` is
 /// named for.

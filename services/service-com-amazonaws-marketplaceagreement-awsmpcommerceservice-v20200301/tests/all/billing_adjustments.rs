@@ -237,11 +237,6 @@ async fn every_filter_selects_on_the_stored_request() {
             expected: late.clone(),
         },
         Listing {
-            case: "an agreementId naming no agreement selects nothing".to_string(),
-            request: json!({"agreementId": "agmt-absent"}),
-            expected: vec![],
-        },
-        Listing {
             case: "catalog selects the catalog the agreements were created in".to_string(),
             request: json!({"catalog": CATALOG}),
             expected: every.clone(),
@@ -913,3 +908,208 @@ async fn a_created_request_reads_back_through_get() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A listing's agreementId names an agreement
+// ---------------------------------------------------------------------------
+
+/// `ListBillingAdjustmentRequestsInput$agreementId` must name an agreement this
+/// service holds: an id it holds none for is refused as an invalid value for
+/// the member, not accepted as a filter that selects nothing.
+///
+/// The rows differ along the form of the id that names no agreement, and along
+/// which other members the call combines it with — the value is refused before
+/// anything is filtered. The last case is the agreement that DOES exist, which
+/// still lists.
+#[tokio::test]
+async fn a_listing_agreement_id_must_name_a_stored_agreement() {
+    let router = emulator();
+    let agreement = agreement_over(&router, "ap-listagreement", vec![term("eula.v1")]).await;
+    let created = submit_all(&router, &agreement, &[("inv-1", "1")], "tok-listagreement").await;
+
+    let absent: Vec<(&str, Value)> = vec![
+        ("a short id", json!({"agreementId": "agmt-absent"})),
+        (
+            "an id shaped like one this service mints",
+            json!({"agreementId": "agmt-0000000000000000"}),
+        ),
+        (
+            "an id using every character AgreementId's pattern allows",
+            json!({"agreementId": "A_z/0-9"}),
+        ),
+        (
+            "an absent id beside a status filter",
+            json!({"agreementId": "agmt-absent", "status": "PENDING"}),
+        ),
+        (
+            "an absent id beside a page size",
+            json!({"agreementId": "agmt-absent", "maxResults": 1}),
+        ),
+    ];
+
+    for (case, request) in &absent {
+        let answer = list(&router, request.clone()).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected 400, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.reason(),
+            "INVALID_AGREEMENT_ID",
+            "case {case:?}: expected reason INVALID_AGREEMENT_ID, got {:?}",
+            answer.body
+        );
+    }
+
+    let answer = list(&router, json!({"agreementId": agreement})).await;
+    assert_eq!(
+        answer.status, 200,
+        "case \"the agreement that exists\": expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        item_ids(&answer),
+        created,
+        "case \"the agreement that exists\": expected its own requests, got {:?}",
+        answer.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The bound on the store
+// ---------------------------------------------------------------------------
+/// The largest number of billing adjustment requests the store holds, which is
+/// the emulator's own documented bound (`state::BILLING_ADJUSTMENT_REQUEST_QUOTA`),
+/// spelled out so a change to it has to be made deliberately.
+const STORE_QUOTA: usize = 1_000;
+
+/// However many calls are made, the store holds at most [`STORE_QUOTA`]
+/// requests: `BATCH_LIMIT` bounds ONE call, and this bounds the store across
+/// all of them.
+///
+/// The rows differ along WHERE the bound falls relative to the call: a batch
+/// that crosses it partway through (the entries that still fit are stored, the
+/// rest are refused on the batch's own per-entry channel), and a call made when
+/// the store is already full (every entry refused, nothing created).
+#[tokio::test]
+async fn the_store_holds_at_most_its_quota_however_many_calls_are_made() {
+    let router = emulator();
+    let agreement = agreement_over(&router, "ap-quota", vec![term("eula.v1")]).await;
+
+    // Fill the store to one slot short of the bound, in batches of the largest
+    // size one call accepts.
+    let mut stored = 0usize;
+    let mut first_id = String::new();
+    while stored < STORE_QUOTA - 1 {
+        let count = BATCH_LIMIT.min(STORE_QUOTA - 1 - stored);
+        let entries: Vec<Value> = (0..count)
+            .map(|index| {
+                entry(
+                    &agreement,
+                    &format!("inv-{stored}-{index}"),
+                    "1",
+                    &format!("tok-fill-{stored}-{index}"),
+                )
+            })
+            .collect();
+        let answer = submit(&router, entries).await;
+        assert_eq!(
+            answer.status, 200,
+            "case \"filling the store at {stored}\": expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let ids = item_ids(&answer);
+        assert_eq!(
+            ids.len(),
+            count,
+            "case \"filling the store at {stored}\": expected {count} items, got {:?}",
+            answer.body
+        );
+        if first_id.is_empty() {
+            first_id = ids[0].clone();
+        }
+        stored += count;
+    }
+
+    // A batch that crosses the bound: one slot is free, so one entry is stored
+    // and the other two are refused, each under its own clientToken.
+    let crossing: Vec<Value> = (0..3)
+        .map(|index| {
+            entry(
+                &agreement,
+                &format!("inv-cross-{index}"),
+                "1",
+                &format!("tok-cross-{index}"),
+            )
+        })
+        .collect();
+    let crossed = submit(&router, crossing).await;
+    assert_eq!(
+        crossed.status, 200,
+        "case \"a batch crossing the bound\": expected 200, got {} with {:?}",
+        crossed.status, crossed.body
+    );
+    assert_eq!(
+        item_ids(&crossed).len(),
+        1,
+        "case \"a batch crossing the bound\": only the entry that still fits is stored, got {:?}",
+        crossed.body
+    );
+    let refusals = batch_errors(&crossed);
+    assert_eq!(
+        refusals.len(),
+        2,
+        "case \"a batch crossing the bound\": expected one error per entry that does not fit, \
+         got {:?}",
+        crossed.body
+    );
+    for refusal in &refusals {
+        assert_eq!(
+            refusal["code"].as_str(),
+            Some("VALIDATION_EXCEPTION"),
+            "case \"a batch crossing the bound\": expected VALIDATION_EXCEPTION, got {refusal:?}"
+        );
+    }
+
+    // The store is now full, so no entry of a further call is accepted: each is
+    // refused under its own clientToken, and the call creates nothing.
+    let refused = submit(
+        &router,
+        vec![entry(&agreement, "inv-full", "1", "tok-full")],
+    )
+    .await;
+    assert_eq!(
+        refused.status, 200,
+        "case \"a call against a full store\": the batch is answered per entry, got {} with {:?}",
+        refused.status, refused.body
+    );
+    assert!(
+        items(&refused).is_empty(),
+        "case \"a call against a full store\": nothing may be created, got {:?}",
+        refused.body
+    );
+    assert_eq!(
+        batch_errors(&refused)
+            .first()
+            .and_then(|error| error["code"].as_str()),
+        Some("VALIDATION_EXCEPTION"),
+        "case \"a call against a full store\": expected VALIDATION_EXCEPTION, got {:?}",
+        refused.body
+    );
+
+    // And nothing already stored was lost to either refusal.
+    let still_there = get(&router, &agreement, &first_id).await;
+    assert_eq!(
+        still_there.status, 200,
+        "case \"after the refusals\": {first_id} must still read back, got {} with {:?}",
+        still_there.status, still_there.body
+    );
+}
+
