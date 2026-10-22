@@ -286,6 +286,16 @@ pub const MAX_SCALING_POLICIES: usize = 20_000;
 /// does and are keyed by a free-form name. See [`MAX_SCALABLE_TARGETS`].
 pub const MAX_SCHEDULED_ACTIONS: usize = 20_000;
 
+/// How many metric specifications a predictive scaling policy configuration carries.
+///
+/// The MODEL's own bound, stated in prose rather than as a `@length` on the list: "This is
+/// an array, but we currently only support a single metric specification. That is, you can
+/// specify a target value and a single metric pair, or a target value and one scaling
+/// metric and one load metric" (`PredictiveScalingPolicyConfiguration$MetricSpecifications`).
+/// A configuration carrying none describes no load to forecast at all, so the count is
+/// exactly one — which is also what bounds the work a forecast of that policy does.
+pub const MAX_PREDICTIVE_METRIC_SPECIFICATIONS: usize = 1;
+
 /// How many scaling activities the log keeps before the oldest are dropped.
 ///
 /// The same emulator-own bound as [`MAX_SCALABLE_TARGETS`], for the same reason: the log
@@ -1153,6 +1163,10 @@ pub struct AlarmSpec {
     pub metric_namespace: String,
     pub metric_name: String,
     pub statistic: String,
+    /// The unit the watched series is measured in, when the policy's metric specification
+    /// names one. `None` leaves the alarm unit-less, which is CloudWatch's own "any unit":
+    /// a predefined metric type publishes no unit, so none is invented for it.
+    pub unit: Option<String>,
     pub dimensions: Vec<(String, String)>,
     pub period: i32,
     pub evaluation_periods: i32,
@@ -1352,6 +1366,129 @@ pub fn customized_metric_supported(scalable_dimension: &str) -> bool {
     !matches!(
         scalable_dimension.split(':').next(),
         Some("dynamodb" | "cassandra")
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Predictive scaling: the series a forecast is computed from
+// ---------------------------------------------------------------------------
+
+/// One CloudWatch time series, as a forecast reads it: the series' identity plus the
+/// statistic its observations are aggregated with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricSeries {
+    pub namespace: String,
+    pub metric_name: String,
+    pub statistic: String,
+    pub dimensions: Vec<(String, String)>,
+}
+
+/// What CloudWatch series a `PredictiveScalingMetricType` names.
+///
+/// Hand-written from the model's own list of "the predefined metrics […] available for
+/// predictive scaling"
+/// (`smithy_query(query="shape",shape="PredictiveScalingPredefinedMetricPairSpecification")`),
+/// one row per value: the namespace and metric name, and the statistic the LOAD series
+/// aggregates the metric with — a "Total" or request-count metric is the load SUMMED over
+/// the interval, while an "Average" metric is the per-capacity-unit utilisation and is
+/// averaged.
+struct PredictiveMetric {
+    metric_type: &'static str,
+    namespace: &'static str,
+    metric_name: &'static str,
+    statistic: &'static str,
+}
+
+/// The CloudWatch namespace of the load-balancer metrics among them, whose series is
+/// dimensioned by the target group a `ResourceLabel` names rather than by the scalable
+/// target's own resource.
+const APPLICATION_ELB_NAMESPACE: &str = "AWS/ApplicationELB";
+
+const PREDICTIVE_METRICS: &[PredictiveMetric] = &[
+    predictive_metric("ECSServiceAverageCPUUtilization", "AWS/ECS", "CPUUtilization", "Average"),
+    predictive_metric("ECSServiceAverageMemoryUtilization", "AWS/ECS", "MemoryUtilization", "Average"),
+    predictive_metric("ECSServiceCPUUtilization", "AWS/ECS", "CPUUtilization", "Sum"),
+    predictive_metric("ECSServiceMemoryUtilization", "AWS/ECS", "MemoryUtilization", "Sum"),
+    predictive_metric("ECSServiceTotalCPUUtilization", "AWS/ECS", "CPUUtilization", "Sum"),
+    predictive_metric("ECSServiceTotalMemoryUtilization", "AWS/ECS", "MemoryUtilization", "Sum"),
+    predictive_metric("ALBRequestCount", APPLICATION_ELB_NAMESPACE, "RequestCount", "Sum"),
+    predictive_metric("ALBRequestCountPerTarget", APPLICATION_ELB_NAMESPACE, "RequestCountPerTarget", "Sum"),
+    predictive_metric("TotalALBRequestCount", APPLICATION_ELB_NAMESPACE, "RequestCount", "Sum"),
+];
+
+/// One [`PREDICTIVE_METRICS`] row, so the table above reads as a table.
+const fn predictive_metric(
+    metric_type: &'static str,
+    namespace: &'static str,
+    metric_name: &'static str,
+    statistic: &'static str,
+) -> PredictiveMetric {
+    PredictiveMetric {
+        metric_type,
+        namespace,
+        metric_name,
+        statistic,
+    }
+}
+
+/// The series a predefined predictive-scaling metric type names FOR this scalable target,
+/// or `None` when the type is not one of [`PREDICTIVE_SCALING_METRIC_TYPE_VALUES`].
+///
+/// A service metric is dimensioned by the scalable target's own resource
+/// ([`target_metric_dimensions`]); a load-balancer metric is dimensioned by the load
+/// balancer, and the per-target one additionally by the target group, which is what the
+/// metric specification's `ResourceLabel` "uniquely identifies".
+pub fn predictive_metric_series(
+    target: &TargetKey,
+    metric_type: &str,
+    resource_label: Option<&str>,
+) -> Option<MetricSeries> {
+    let row = PREDICTIVE_METRICS
+        .iter()
+        .find(|metric| metric.metric_type == metric_type)?;
+    let dimensions = if row.namespace == APPLICATION_ELB_NAMESPACE {
+        resource_label_dimensions(resource_label, row.metric_name == "RequestCountPerTarget")
+    } else {
+        target_metric_dimensions(target)
+    };
+    Some(MetricSeries {
+        namespace: row.namespace.to_string(),
+        metric_name: row.metric_name.to_string(),
+        statistic: row.statistic.to_string(),
+        dimensions,
+    })
+}
+
+/// The CloudWatch dimensions a `ResourceLabel` names.
+///
+/// The label is documented as "the resource label […] in the format
+/// app/<load-balancer-name>/<load-balancer-id>/targetgroup/<target-group-name>/<target-group-id>",
+/// which is exactly the `LoadBalancer` dimension followed by the `TargetGroup` dimension of
+/// Application Load Balancer metrics. A label that is not in that form names no series, so
+/// it contributes no dimension rather than a guessed one.
+fn resource_label_dimensions(resource_label: Option<&str>, per_target: bool) -> Vec<(String, String)> {
+    let Some((load_balancer, target_group)) =
+        resource_label.and_then(|label| label.split_once("/targetgroup/"))
+    else {
+        return Vec::new();
+    };
+    let mut dimensions = vec![("LoadBalancer".to_string(), load_balancer.to_string())];
+    if per_target {
+        dimensions.push((
+            "TargetGroup".to_string(),
+            format!("targetgroup/{target_group}"),
+        ));
+    }
+    dimensions
+}
+
+/// The CloudWatch dimensions that identify the resource `target` names, by its key rather
+/// than by its three members. See [`metric_dimensions`].
+fn target_metric_dimensions(target: &TargetKey) -> Vec<(String, String)> {
+    metric_dimensions(
+        &target.service_namespace,
+        &target.resource_id,
+        &target.scalable_dimension,
     )
 }
 
@@ -1610,12 +1747,19 @@ pub fn target_tracking_alarms(
     // The metric the two utilisation alarms watch: the predefined metric's own series, or
     // the one the caller described. A customised specification that carries only a metric
     // math query names no single series, so there is no static-threshold alarm to mint.
-    let (metric_namespace, metric_name, statistic, dimensions, period, consumed_units) =
+    //
+    // A customised specification describes the series COMPLETELY — namespace, metric name,
+    // dimensions, statistic and unit — so every one of those five is carried onto the
+    // alarms; an alarm that aggregated the series differently from the specification would
+    // measure a different signal from the one the policy declared.
+    let (metric_namespace, metric_name, statistic, unit, dimensions, period, consumed_units) =
         match (predefined, customized) {
             (Some(metric), _) => (
                 metric.namespace.to_string(),
                 metric.metric_name.to_string(),
                 metric.statistic.to_string(),
+                // The published predefined-metric table names no unit for any row.
+                None,
                 metric_dimensions(
                     &key.target.service_namespace,
                     &key.target.resource_id,
@@ -1638,6 +1782,7 @@ pub fn target_tracking_alarms(
                         .statistic
                         .clone()
                         .unwrap_or_else(|| "Average".to_string()),
+                    specification.unit.clone(),
                     specification
                         .dimensions
                         .clone()
@@ -1687,12 +1832,16 @@ pub fn target_tracking_alarms(
         if kind.watches_capacity() && !consumed_units {
             continue;
         }
-        let (metric_namespace, metric_name, statistic, period, threshold, comparison_operator) =
+        let (metric_namespace, metric_name, statistic, unit, period, threshold, comparison_operator) =
             if kind.watches_capacity() {
                 (
                     metric_namespace.clone(),
                     provisioned_capacity_metric_name(&key.target.scalable_dimension),
                     "Average".to_string(),
+                    // A different series from the tracked metric — the resource's own
+                    // provisioned capacity — so the specification's unit does not describe
+                    // it.
+                    None,
                     CAPACITY_ALARM_PERIOD,
                     provisioned_capacity as f64,
                     if kind.scales_out() {
@@ -1707,6 +1856,7 @@ pub fn target_tracking_alarms(
                     metric_namespace.clone(),
                     metric_name.clone(),
                     statistic.clone(),
+                    unit.clone(),
                     period,
                     utilisation_threshold(if kind.scales_out() {
                         1.0
@@ -1727,6 +1877,7 @@ pub fn target_tracking_alarms(
             metric_namespace,
             metric_name,
             statistic,
+            unit,
             dimensions: dimensions.clone(),
             period,
             evaluation_periods: if kind.watches_capacity() {
@@ -1951,6 +2102,7 @@ fn apply_alarms<Eng: Send + Sync + 'static>(
             metric_name: Some(spec.metric_name.clone()),
             namespace: Some(spec.metric_namespace.clone()),
             statistic: Some(spec.statistic.clone()),
+            unit: spec.unit.clone(),
             dimensions: Some(
                 spec.dimensions
                     .iter()
