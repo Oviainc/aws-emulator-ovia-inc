@@ -35,9 +35,21 @@
 //! round-trips through `DescribeVpcs` without a field-by-field copy that can silently
 //! drop one. The store is keyed by `VpcId` in a [`BTreeMap`], which gives the describe
 //! path one stable order and lets a pagination token name the id the next page starts
-//! at. Further caller-created resources (subnets, security groups, …) belong beside it
-//! as they are implemented, and should be validated against
+//! at. [`ComAmazonawsEc2Amazonec2State::subnets`] holds the account's subnets the same
+//! way, keyed by `SubnetId`. Further caller-created resources (security groups, …)
+//! belong beside them as they are implemented, and should be validated against
 //! [`availability_zones_in_region`] rather than against a second zone list.
+//!
+//! ## The default VPC's default subnets
+//!
+//! "When we create a default VPC, we create a default subnet in each Availability Zone
+//! in the Region" (Amazon VPC User Guide, "Default VPCs"), so the subnet store starts
+//! with one default subnet per zone of the seeded default VPC rather than empty — the
+//! same reason the VPC store starts with that VPC. This store is per ACCOUNT, not per
+//! Region (a `Vpc` carries no Region member, so nothing in `DescribeVpcs` could say
+//! which Region its VPC belongs to), and a subnet's zone and ARN do name a Region, so
+//! the seeded subnets are the ones of [`DEFAULT_REGION`]. Everything a later writer
+//! stores names the Region its own request was signed for.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -45,8 +57,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AvailabilityZone, AvailabilityZoneMessage, BlockPublicAccessStates, GroupIdentifier,
     INSTANCE_TYPE_VALUES, Instance, InstanceState, InstanceTypeOffering, LOCATION_TYPE_VALUES,
-    Monitoring, Placement, RunInstancesOutput, StateReason, Tag, Vpc, VpcCidrBlockAssociation,
-    VpcCidrBlockState,
+    Monitoring, Placement, PrivateDnsNameOptionsOnLaunch, RunInstancesOutput, StateReason, Subnet,
+    Tag, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState,
 };
 
 /// The `Reservation` shape, under the name the scaffold generated for it.
@@ -428,6 +440,9 @@ pub const DRY_RUN_OPERATION: &str = "DryRunOperation";
 /// EC2's error code for a request that named a VPC id no VPC of the account has.
 pub const INVALID_VPC_ID_NOT_FOUND: &str = "InvalidVpcID.NotFound";
 
+/// EC2's error code for a request that named a subnet id no subnet of the account has.
+pub const INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
+
 /// EC2's error code for a pagination token this service did not issue.
 pub const INVALID_PAGINATION_TOKEN: &str = "InvalidPaginationToken";
 
@@ -474,6 +489,30 @@ pub const VPC_STATE_AVAILABLE: &str = "available";
 /// `associated` member.
 pub const CIDR_BLOCK_STATE_ASSOCIATED: &str = "associated";
 
+/// A subnet AWS has finished creating: the `SubnetState` enum's `available` member
+/// (`smithy_query(query="shape",shape="SubnetState")`).
+pub const SUBNET_STATE_AVAILABLE: &str = "available";
+
+/// How many IPv4 addresses of a subnet's CIDR block are NOT available to a network
+/// interface.
+///
+/// "AWS reserves five IP addresses in each subnet CIDR block" — the network address, the
+/// VPC router, the Amazon DNS address, one reserved for future use, and the broadcast
+/// address (Amazon VPC User Guide, "Subnet CIDR blocks"). It is what makes
+/// `Subnet$AvailableIpAddressCount` smaller than the block itself.
+pub const SUBNET_RESERVED_ADDRESSES: u32 = 5;
+
+/// The prefix length of each default subnet of a default VPC: "a size /20 IPv4 CIDR
+/// block" (Amazon VPC User Guide, "Default VPCs"), carved out of the default VPC's
+/// [`DEFAULT_VPC_CIDR_BLOCK`].
+pub const DEFAULT_SUBNET_PREFIX_LENGTH: u32 = 20;
+
+/// The hostname type a subnet assigns at launch unless something changes it: an instance
+/// DNS name based on its IPv4 address, which is the `HostnameType` enum's `ip-name`
+/// member and the default for an IPv4 subnet
+/// (`PrivateDnsNameOptionsOnLaunch$HostnameType`).
+pub const HOSTNAME_TYPE_IP_NAME: &str = "ip-name";
+
 /// VPC Block Public Access turned off — "`off`: VPC BPA is not enabled and traffic is
 /// allowed to and from internet gateways and egress-only internet gateways in this
 /// Region" (`BlockPublicAccessStates$InternetGatewayBlockMode`), which is the state of an
@@ -508,6 +547,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs). Further caller-created resources go beside this field as they
     /// land.
     pub vpcs: BTreeMap<String, Vpc>,
+    /// Every subnet the account holds, by `SubnetId`, as the modelled [`Subnet`] shape
+    /// itself — so a member a writer sets round-trips through `DescribeSubnets` without a
+    /// field-by-field copy. Ordered by id, which is the order the describe reports and
+    /// pages over.
+    pub subnets: BTreeMap<String, Subnet>,
     /// Monotonic source of generated resource-id suffixes, so an id is unique within a
     /// run and deterministic across runs.
     pub id_counter: u64,
@@ -527,15 +571,17 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             next_reservation: 0,
             next_private_ip: 0,
             vpcs: BTreeMap::new(),
+            subnets: BTreeMap::new(),
             id_counter: 0,
         };
-        state.insert_vpc(
+        let default_vpc = state.insert_vpc(
             DEFAULT_VPC_CIDR_BLOCK,
             true,
             DEFAULT_INSTANCE_TENANCY,
             VPC_STATE_AVAILABLE,
             Vec::new(),
         );
+        state.insert_default_subnets(&default_vpc, DEFAULT_VPC_CIDR_BLOCK, DEFAULT_REGION);
         state
     }
 }
@@ -598,6 +644,190 @@ impl ComAmazonawsEc2Amazonec2State {
         self.vpcs.insert(vpc_id.clone(), vpc);
         vpc_id
     }
+
+    /// Insert a subnet, and answer the `SubnetId` it was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller: the id, the ARN built from it, the owning account, and
+    /// `AvailableIpAddressCount` computed from the CIDR block — so two writers cannot
+    /// report the same subnet differently.
+    pub fn insert_subnet(&mut self, spec: SubnetSpec) -> String {
+        let subnet_id = self.next_id("subnet");
+        let subnet = Subnet {
+            availability_zone_id: Some(spec.availability_zone_id),
+            // Local network interfaces are an Outpost feature nothing here enables, so no
+            // device index is reported rather than a made-up one.
+            enable_lni_at_device_index: None,
+            map_customer_owned_ip_on_launch: Some(false),
+            // A customer-owned IPv4 pool exists only on an Outpost subnet.
+            customer_owned_ipv4_pool: None,
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            assign_ipv6_address_on_creation: Some(false),
+            // No IPv6 CIDR block is associated until something associates one.
+            ipv6_cidr_block_association_set: Some(Vec::new()),
+            tags: Some(spec.tags),
+            subnet_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("subnet/{subnet_id}"),
+            )),
+            // A subnet is on an Outpost only when one was asked for.
+            outpost_arn: None,
+            enable_dns64: Some(false),
+            ipv6_native: Some(false),
+            private_dns_name_options_on_launch: Some(PrivateDnsNameOptionsOnLaunch {
+                hostname_type: Some(HOSTNAME_TYPE_IP_NAME.to_string()),
+                enable_resource_name_dns_a_record: Some(false),
+                enable_resource_name_dns_aaaa_record: Some(false),
+            }),
+            block_public_access_states: Some(BlockPublicAccessStates {
+                internet_gateway_block_mode: Some(BLOCK_PUBLIC_ACCESS_OFF.to_string()),
+            }),
+            // "Indicates if this is a subnet used with Amazon Elastic VMware Service
+            // (EVS). Possible values are `Elastic VMware Service` or no value"
+            // (`Subnet$Type`): no value, this being an ordinary subnet.
+            r#type: None,
+            subnet_id: Some(subnet_id.clone()),
+            state: Some(spec.state),
+            vpc_id: Some(spec.vpc_id),
+            available_ip_address_count: Some(available_ipv4_addresses(&spec.cidr_block)),
+            cidr_block: Some(spec.cidr_block),
+            availability_zone: Some(spec.availability_zone),
+            default_for_az: Some(spec.default_for_az),
+            map_public_ip_on_launch: Some(spec.map_public_ip_on_launch),
+        };
+        self.subnets.insert(subnet_id.clone(), subnet);
+        subnet_id
+    }
+
+    /// Give `vpc_id` the default subnet AWS creates in each Availability Zone of
+    /// `region`, and answer their ids in zone order.
+    ///
+    /// "When we create a default VPC, we create a default subnet in each Availability
+    /// Zone in the Region … we add a size /20 IPv4 CIDR block" with "the auto-assign
+    /// public IPv4 address attribute set to `true`" (Amazon VPC User Guide, "Default
+    /// VPCs"), so each zone's subnet is the n-th [`DEFAULT_SUBNET_PREFIX_LENGTH`] block of
+    /// the VPC's own CIDR block, `DefaultForAz`, and public-IP-on-launch. A zone whose
+    /// block does not fit inside `vpc_cidr_block` gets no subnet, rather than one with a
+    /// block outside its VPC.
+    pub fn insert_default_subnets(
+        &mut self,
+        vpc_id: &str,
+        vpc_cidr_block: &str,
+        region: &str,
+    ) -> Vec<String> {
+        let mut inserted = Vec::new();
+        for (index, zone) in availability_zones_in_region(region).into_iter().enumerate() {
+            let Ok(offset) = u32::try_from(index) else {
+                break;
+            };
+            let Some(cidr_block) =
+                nth_subnet_cidr_block(vpc_cidr_block, DEFAULT_SUBNET_PREFIX_LENGTH, offset)
+            else {
+                continue;
+            };
+            inserted.push(self.insert_subnet(SubnetSpec {
+                vpc_id: vpc_id.to_string(),
+                cidr_block,
+                availability_zone: zone.zone_name,
+                availability_zone_id: zone.zone_id,
+                region: region.to_string(),
+                state: SUBNET_STATE_AVAILABLE.to_string(),
+                default_for_az: true,
+                map_public_ip_on_launch: true,
+                tags: Vec::new(),
+            }));
+        }
+        inserted
+    }
+}
+
+/// One subnet as a writer asks for it: the members a creator chooses. Everything the
+/// service derives — the subnet id, its ARN, the owning account and the available-address
+/// count — is minted by [`ComAmazonawsEc2Amazonec2State::insert_subnet`].
+#[derive(Debug, Clone)]
+pub struct SubnetSpec {
+    /// The VPC the subnet is in.
+    pub vpc_id: String,
+    /// The subnet's IPv4 CIDR block.
+    pub cidr_block: String,
+    /// The zone name (`us-east-1a`) the subnet is in.
+    pub availability_zone: String,
+    /// That zone's id (`use1-az1`).
+    pub availability_zone_id: String,
+    /// The Region the subnet's ARN names.
+    pub region: String,
+    /// One value of the `SubnetState` enum.
+    pub state: String,
+    /// Whether this is the default subnet for its Availability Zone.
+    pub default_for_az: bool,
+    /// Whether instances launched here receive a public IPv4 address.
+    pub map_public_ip_on_launch: bool,
+    /// The tags the subnet carries.
+    pub tags: Vec<Tag>,
+}
+
+/// The number of IPv4 addresses of `cidr_block` a network interface may take: the block's
+/// own size less the [`SUBNET_RESERVED_ADDRESSES`] AWS reserves in it.
+///
+/// A block this emulator cannot read counts no available addresses, rather than a guess.
+pub fn available_ipv4_addresses(cidr_block: &str) -> i32 {
+    let Some((_, prefix_length)) = parse_ipv4_cidr_block(cidr_block) else {
+        return 0;
+    };
+    let addresses = 1u64 << (32 - u64::from(prefix_length));
+    let available = addresses.saturating_sub(u64::from(SUBNET_RESERVED_ADDRESSES));
+    i32::try_from(available).unwrap_or(i32::MAX)
+}
+
+/// The `index`-th block of `prefix_length` bits inside `cidr_block`, or `None` when
+/// `cidr_block` is unreadable, `prefix_length` is not a longer prefix than its own, or the
+/// block at `index` runs past its end.
+///
+/// Subnetting is this arithmetic: the parent block's base address plus `index` whole
+/// child blocks, as long as that stays inside the parent.
+pub fn nth_subnet_cidr_block(
+    cidr_block: &str,
+    prefix_length: u32,
+    index: u32,
+) -> Option<String> {
+    let (base, parent_prefix_length) = parse_ipv4_cidr_block(cidr_block)?;
+    if prefix_length < parent_prefix_length || prefix_length > 32 {
+        return None;
+    }
+    let child_size = 1u64 << (32 - u64::from(prefix_length));
+    let parent_size = 1u64 << (32 - u64::from(parent_prefix_length));
+    let offset = child_size.checked_mul(u64::from(index))?;
+    if offset.checked_add(child_size)? > parent_size {
+        return None;
+    }
+    let address = u32::try_from(u64::from(base).checked_add(offset)?).ok()?;
+    Some(format!(
+        "{}/{prefix_length}",
+        ::std::net::Ipv4Addr::from(address)
+    ))
+}
+
+/// `cidr_block` as its base address and prefix length, or `None` when it is not an IPv4
+/// CIDR block: the address is parsed by the standard library's own `Ipv4Addr` parser, and
+/// the prefix must be a decimal 0..=32 whose host bits are clear.
+fn parse_ipv4_cidr_block(cidr_block: &str) -> Option<(u32, u32)> {
+    let (address, prefix_length) = cidr_block.split_once('/')?;
+    let base = u32::from(address.parse::<::std::net::Ipv4Addr>().ok()?);
+    let prefix_length: u32 = prefix_length.parse().ok()?;
+    if prefix_length > 32 {
+        return None;
+    }
+    // A block whose host bits are set (`172.31.0.1/16`) names no block; refusing it here
+    // keeps the arithmetic above exact.
+    let host_bits = 32 - prefix_length;
+    if host_bits < 32 && base & ((1u32 << host_bits) - 1) != 0 {
+        return None;
+    }
+    if host_bits == 32 && base != 0 {
+        return None;
+    }
+    Some((base, prefix_length))
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -1511,6 +1741,16 @@ pub fn invalid_vpc_id_not_found<E>(vpc_id: &str) -> crate::scaffolded::Scaffolde
         INVALID_VPC_ID_NOT_FOUND,
         400,
         format!("The vpc ID '{vpc_id}' does not exist"),
+    )
+}
+
+/// Refuse a request that named a subnet id no subnet of the account has, the way EC2
+/// does: HTTP 400 `InvalidSubnetID.NotFound`.
+pub fn invalid_subnet_id_not_found<E>(subnet_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SUBNET_ID_NOT_FOUND,
+        400,
+        format!("The subnet ID '{subnet_id}' does not exist"),
     )
 }
 

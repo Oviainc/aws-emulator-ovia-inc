@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/availability_zones.rs"]
 mod availability_zones;
+#[path = "all/describe_subnets.rs"]
+mod describe_subnets;
 #[path = "all/describe_vpcs.rs"]
 mod describe_vpcs;
 // The shared ec2Query plumbing every describe drives the service through.
