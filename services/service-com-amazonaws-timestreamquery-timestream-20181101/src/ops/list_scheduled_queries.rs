@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListScheduledQueries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListScheduledQueries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListScheduledQueries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the stored scheduled queries in ARN order. A reporting
+//! operation: it reads the store and writes nothing.
+//!
+//! The handler reaches this service's state through [`crate::state::service_state`].
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +75,30 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How many scheduled queries a page carries when the request names no `MaxResults`.
+///
+/// CHOSEN, not documented: the modelled range is 1..1000 (`MaxScheduledQueriesResults`),
+/// and this sits at its top so an unparameterised List returns everything it can in one
+/// page, as the real service's default page does.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// Encode the page cursor — the ARN the page ended on — as an opaque token.
+///
+/// Hex of the ARN's bytes: opaque to a client (which must only hand it back), and exact
+/// for the server, so the next page resumes at the first ARN strictly after it even if
+/// queries were created or deleted in between.
+fn encode_token(arn: &str) -> String {
+    ::hex::encode(arn)
+}
+
+/// The cursor a `NextToken` carries, or `None` when the token is not one this service
+/// issued: it must decode to a scheduled-query ARN of this service's own shape, so an
+/// invented token is refused rather than silently resuming from whatever it decoded to.
+fn decode_token(token: &str) -> Option<String> {
+    let cursor = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    crate::state::is_scheduled_query_arn(&cursor).then_some(cursor)
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +172,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListScheduledQueries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListScheduledQueriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListScheduledQueries"))
+        let _ = ctx;
+        // `MaxResults`' modelled 1..1000 range is already enforced by the boundary
+        // validator, so any value reaching here is in range.
+        let max_results = input
+            .max_results
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListScheduledQueriesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "NextToken is not a pagination token this service issued"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListScheduledQueriesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The store is a BTreeMap keyed by ARN, so this walk is in one stable total
+        // order and a cursor resumes exactly after the ARN the last page ended on.
+        let mut remaining = store
+            .scheduled_queries
+            .iter()
+            .filter(|(arn, _)| cursor.as_ref().is_none_or(|cursor| *arn > cursor));
+        let page: Vec<ScheduledQuery> = remaining
+            .by_ref()
+            .take(max_results)
+            .map(|(_, record)| record.summary(now))
+            .collect();
+        // A token only when something is actually left: the last page carries none.
+        let next_token = remaining
+            .next()
+            .and(page.last())
+            .map(|last| encode_token(&last.arn));
+
+        Ok(ListScheduledQueriesOutput {
+            scheduled_queries: page,
+            next_token,
+        })
     }
 }

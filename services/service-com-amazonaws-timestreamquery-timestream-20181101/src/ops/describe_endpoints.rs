@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: endpoint discovery, answered with the address this emulator is actually
+//! serving on, so an SDK that discovers an endpoint before its first real call keeps
+//! talking to the emulator instead of being sent off-box to real AWS.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +68,33 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How long a client may cache a discovered endpoint, in minutes (`Endpoint`'s
+/// `CachePeriodInMinutes`: "The TTL for the endpoint, in minutes").
+///
+/// CHOSEN, not documented: the emulator's address does not move while it runs, so a
+/// 24-hour TTL keeps endpoint discovery to one call per client without ever handing out
+/// an address that goes stale.
+const ENDPOINT_CACHE_PERIOD_MINUTES: i64 = 24 * 60;
+
+/// The address this request reached the emulator on — host and, when present, port, with
+/// no scheme, exactly as the modelled `Address` is shaped ("An endpoint address.").
+///
+/// The `Host` header is what the client actually dialled, so it is read first; an HTTP/2
+/// request carries the same value as the URI authority instead. With neither (a bare
+/// origin-form request), fall back to loopback on the port the emulator serves, which is
+/// the only other address that reaches this process.
+fn serving_address(parts: &::http::request::Parts) -> String {
+    parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| parts.uri.authority().map(|authority| authority.to_string()))
+        .unwrap_or_else(|| format!("127.0.0.1:{}", ::emulator_server::data_port_from_env()))
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -144,18 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEndpoints"))
+        // `DescribeEndpointsRequest` has no members, and the answer is a property of the
+        // endpoint this request arrived on — not of the store — so no state is read or
+        // written here.
+        let _ = (&input, &self.engine);
+        Ok(DescribeEndpointsOutput {
+            endpoints: vec![Endpoint {
+                address: serving_address(ctx.parts()),
+                cache_period_in_minutes: ENDPOINT_CACHE_PERIOD_MINUTES,
+            }],
+        })
     }
 }

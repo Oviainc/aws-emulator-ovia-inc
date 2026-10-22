@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateScheduledQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateScheduledQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateScheduledQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a scheduled query and PERSISTS it, so `DescribeScheduledQuery`,
+//! `ListScheduledQueries`, `UpdateScheduledQuery` and `DeleteScheduledQuery` all work off
+//! the one record this operation stored.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +184,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateScheduledQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScheduledQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateScheduledQuery"))
+        // Modelled length/pattern/range constraints on the input are already refused by
+        // the boundary validator. What is left to this handler is the rule the model
+        // cannot express: the schedule expression's own grammar. Parsed once here, and
+        // kept on the record, so a later read computes the next invocation without
+        // re-parsing.
+        let schedule = match crate::state::parse_schedule_expression(
+            &input.schedule_configuration.schedule_expression,
+        ) {
+            Ok(schedule) => schedule,
+            Err(message) => {
+                return Err(CreateScheduledQueryErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateScheduledQueryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: a repeat of the call with the same `ClientToken` answers
+        // with the ARN the first one minted, and stores nothing new. A token whose record
+        // has since been deleted is treated as a new request — answering with an ARN that
+        // names no stored record would make the very next Describe answer 404.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(arn) = store.create_tokens.get(token) {
+                if store.scheduled_queries.contains_key(arn) {
+                    return Ok(CreateScheduledQueryOutput { arn: arn.clone() });
+                }
+            }
+        }
+
+        // One live scheduled query per name.
+        if let Some(existing) = store.names.get(&input.name) {
+            return Err(CreateScheduledQueryErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "a scheduled query named {} already exists: {existing}",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        // The store holds at most `MAX_SCHEDULED_QUERIES` records; one more is over quota,
+        // which the model has its own error for.
+        if store.scheduled_queries.len() >= crate::state::MAX_SCHEDULED_QUERIES {
+            return Err(
+                CreateScheduledQueryErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the maximum of {} scheduled queries already exists; delete one \
+                             before creating another",
+                            crate::state::MAX_SCHEDULED_QUERIES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let arn = store.mint_scheduled_query_arn(&region, &input.name);
+        let record = crate::state::ScheduledQueryRecord {
+            arn: arn.clone(),
+            name: input.name.clone(),
+            query_string: input.query_string.clone(),
+            schedule_expression: input
+                .schedule_configuration
+                .schedule_expression
+                .trim()
+                .to_string(),
+            schedule,
+            notification_configuration: input.notification_configuration.clone(),
+            target_configuration: input.target_configuration.clone(),
+            error_report_configuration: input.error_report_configuration.clone(),
+            execution_role_arn: input.scheduled_query_execution_role_arn.clone(),
+            kms_key_id: input.kms_key_id.clone(),
+            // A scheduled query AWS returns is live immediately: `ScheduledQueryState`
+            // models no transient value, only ENABLED and DISABLED.
+            state: crate::state::SCHEDULED_QUERY_STATE_ENABLED.to_string(),
+            creation_time: ::std::time::SystemTime::now(),
+            previous_invocation_time: None,
+            last_run_status: None,
+            last_run_summary: None,
+            recently_failed_runs: Vec::new(),
+            tags: crate::state::tag_map(input.tags.as_ref()),
+        };
+        store.insert_scheduled_query(record, input.client_token.as_deref());
+
+        Ok(CreateScheduledQueryOutput { arn })
     }
 }

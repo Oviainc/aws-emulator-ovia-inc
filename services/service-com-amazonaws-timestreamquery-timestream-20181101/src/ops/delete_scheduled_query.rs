@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteScheduledQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteScheduledQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteScheduledQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored scheduled query, so a following Describe answers 404
+//! and List no longer carries it.
+//!
+//! The handler reaches this service's state through [`crate::state::service_state`].
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteScheduledQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteScheduledQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteScheduledQuery"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteScheduledQueryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+        // `@idempotent` describes the EFFECT — the query is gone either way — not the
+        // answer: deleting an ARN that names no live scheduled query is a 404, the same
+        // as describing one.
+        if store
+            .remove_scheduled_query(&input.scheduled_query_arn)
+            .is_none()
+        {
+            return Err(DeleteScheduledQueryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no scheduled query with ARN {}",
+                        input.scheduled_query_arn
+                    )),
+                    scheduled_query_arn: Some(input.scheduled_query_arn.clone()),
+                },
+            )
+            .into());
+        }
+        Ok(DeleteScheduledQueryOutput)
     }
 }
