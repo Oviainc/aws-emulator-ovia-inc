@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the `Integration` of a stored `Method`, completed with the values
+//! the service fills in (`connectionType`, `cacheNamespace`, `timeoutInMillis`,
+//! `passthroughBehavior`), so a later `GetIntegration`/`GetMethod` surfaces it. Answers
+//! from the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -207,6 +202,325 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::MethodEntry;
+
+use super::put_method::{method_key, HTTP_METHODS};
+
+/// The integration type that invokes no backend at all: `MOCK` is "for testing without
+/// actually invoking the backend" (`IntegrationType`). It is the one type that needs
+/// neither an endpoint `uri` nor an `integrationHttpMethod` — `httpMethod`'s own
+/// documentation says "if you specify MOCK, this property is optional".
+pub const MOCK_INTEGRATION_TYPE: &str = "MOCK";
+
+/// The integration types whose `uri` is an AWS integration ARN: `uri` documents it as
+/// "of the form arn:aws:apigateway:{region}:{subdomain.service|service}:path|action/
+/// {service_api}" "for AWS or AWS_PROXY integrations".
+pub const AWS_INTEGRATION_TYPES: &[&str] = &["AWS", "AWS_PROXY"];
+
+/// The integration types whose `uri` is an HTTP(S) endpoint: `uri` documents it as "a
+/// fully formed, encoded HTTP(S) URL according to the RFC-3986 specification" "for HTTP
+/// or HTTP_PROXY integrations" — for the standard integration, "where connectionType is
+/// not VPC_LINK".
+pub const HTTP_INTEGRATION_TYPES: &[&str] = &["HTTP", "HTTP_PROXY"];
+
+/// The Lambda proxy integration, which `IntegrationType` defines as "AWS_PROXY for
+/// integrating with the Lambda proxy integration".
+pub const LAMBDA_PROXY_INTEGRATION_TYPE: &str = "AWS_PROXY";
+
+/// The integration method a Lambda integration takes: `httpMethod` documents "For Lambda
+/// integrations, you must set the integration method to POST".
+pub const LAMBDA_INTEGRATION_METHOD: &str = "POST";
+
+/// The `connectionType` an integration carries when the request sets none:
+/// `connectionType` documents "The default value is INTERNET".
+pub const DEFAULT_CONNECTION_TYPE: &str = "INTERNET";
+
+/// The `connectionType` of a private integration, the only one that takes a
+/// `connectionId`: `connectionId` documents "Specify this value only if you specify
+/// VPC_LINK as the connection type".
+pub const VPC_LINK_CONNECTION_TYPE: &str = "VPC_LINK";
+
+/// The values `passthroughBehavior` takes. Hand-written because the model types the
+/// member as a bare `String`; the set is the one the member's own documentation lists:
+/// "The valid value is one of the following: WHEN_NO_MATCH … WHEN_NO_TEMPLATES … NEVER".
+pub const PASSTHROUGH_BEHAVIORS: &[&str] = &["WHEN_NO_MATCH", "WHEN_NO_TEMPLATES", "NEVER"];
+
+/// The `passthroughBehavior` an integration carries when the request sets none: the
+/// behaviour that passes an unmapped body through rather than rejecting it, which is the
+/// first of the three documented values and the one API Gateway applies by default.
+pub const DEFAULT_PASSTHROUGH_BEHAVIOR: &str = "WHEN_NO_MATCH";
+
+/// The `timeoutInMillis` an integration carries when the request sets none: from the
+/// member's own documentation, "The default value is 29,000 milliseconds or 29 seconds".
+pub const DEFAULT_TIMEOUT_IN_MILLIS: i32 = 29_000;
+
+/// The smallest `timeoutInMillis` the member documents: "Custom timeout between 50 and
+/// 29,000 milliseconds".
+pub const MIN_TIMEOUT_IN_MILLIS: i32 = 50;
+
+/// The largest `timeoutInMillis` the member documents; see [`MIN_TIMEOUT_IN_MILLIS`].
+/// ("You can increase the default value to longer than 29 seconds for Regional or
+/// private APIs only" describes a quota increase, which this account does not carry.)
+pub const MAX_TIMEOUT_IN_MILLIS: i32 = 29_000;
+
+/// Emulator resource guard, NOT an AWS quota: the longest single mapping template this
+/// emulator stores for one content type. API Gateway's published mapping-template limit
+/// is far larger, so this bounds the store without refusing a realistic template.
+pub const MAX_TEMPLATE_CHARS: usize = 32 * 1024;
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all.
+fn bound_input(input: &PutIntegrationInput) -> Result<(), String> {
+    use crate::state::{bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS};
+
+    for (member, value) in [
+        ("uri", &input.uri),
+        ("credentials", &input.credentials),
+        ("cacheNamespace", &input.cache_namespace),
+        ("passthroughBehavior", &input.passthrough_behavior),
+        ("integrationHttpMethod", &input.integration_http_method),
+        ("integrationTarget", &input.integration_target),
+        ("connectionId", &input.connection_id),
+    ] {
+        if let Some(value) = value {
+            bound_chars(member, value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(parameters) = &input.request_parameters {
+        bound_entries("requestParameters", parameters.len(), MAX_COLLECTION_ENTRIES)?;
+        for (key, value) in parameters {
+            bound_chars("a requestParameters key", key, MAX_STRING_CHARS)?;
+            bound_chars("a requestParameters value", value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(templates) = &input.request_templates {
+        bound_entries("requestTemplates", templates.len(), MAX_COLLECTION_ENTRIES)?;
+        for (key, value) in templates {
+            bound_chars("a requestTemplates key", key, MAX_STRING_CHARS)?;
+            bound_chars("a requestTemplates value", value, MAX_TEMPLATE_CHARS)?;
+        }
+    }
+    if let Some(parameters) = &input.cache_key_parameters {
+        bound_entries(
+            "cacheKeyParameters",
+            parameters.len(),
+            MAX_COLLECTION_ENTRIES,
+        )?;
+        for value in parameters {
+            bound_chars("cacheKeyParameters", value, MAX_STRING_CHARS)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `Integration` record `input` asks for, as it must be STORED: every member the
+/// request set, plus the ones the service fills in, and nothing else.
+///
+/// `Err` carries the `BadRequestException` message for a request that breaks one of the
+/// rules the `Integration` members publish — the type-dependent `uri` and
+/// `integrationHttpMethod`, the `connectionId` that belongs only to a `VPC_LINK`, the
+/// `passthroughBehavior` value set, the documented `timeoutInMillis` range, and a
+/// `cacheKeyParameters` entry that is not also a request parameter of `method`.
+///
+/// Validation happens here, before anything is written, so a refused request leaves the
+/// method's integration as it was.
+fn integration_of(
+    input: &PutIntegrationInput,
+    method: &MethodEntry,
+    resource_id: &str,
+) -> Result<GetIntegrationOutput, String> {
+    // `type`, `connectionType`, `contentHandling` and `responseTransferMode` are modelled
+    // enums, so the boundary validator has already refused anything outside their value
+    // sets by the time this runs.
+    let integration_type = input.r#type.as_str();
+    let is_mock = integration_type == MOCK_INTEGRATION_TYPE;
+
+    let connection_type = input
+        .connection_type
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CONNECTION_TYPE.to_string());
+    let private = connection_type == VPC_LINK_CONNECTION_TYPE;
+    let connection_id = match (&input.connection_id, private) {
+        (Some(id), true) => Some(id.clone()),
+        (None, true) => {
+            return Err(format!(
+                "connectionId is required when connectionType is {VPC_LINK_CONNECTION_TYPE}"
+            ))
+        }
+        (Some(_), false) => {
+            return Err(format!(
+                "connectionId may be specified only when connectionType is \
+                 {VPC_LINK_CONNECTION_TYPE}, got connectionType {connection_type}"
+            ))
+        }
+        (None, false) => None,
+    };
+
+    let integration_method = match &input.integration_http_method {
+        Some(verb) => {
+            let verb = method_key(verb);
+            if !HTTP_METHODS.contains(&verb.as_str()) {
+                return Err(format!(
+                    "Invalid integration HTTP method specified: {}; expected one of {}",
+                    verb,
+                    HTTP_METHODS.join(", ")
+                ));
+            }
+            if integration_type == LAMBDA_PROXY_INTEGRATION_TYPE
+                && verb != LAMBDA_INTEGRATION_METHOD
+            {
+                return Err(format!(
+                    "An integration of type {integration_type} is a Lambda integration, whose \
+                     integration method must be {LAMBDA_INTEGRATION_METHOD}, got {verb}"
+                ));
+            }
+            Some(verb)
+        }
+        None if is_mock => None,
+        None => {
+            return Err(format!(
+                "integrationHttpMethod is required for an integration of type {integration_type}"
+            ))
+        }
+    };
+
+    let uri = match input.uri.as_deref().map(str::trim) {
+        Some("") => {
+            return Err(
+                "uri, when specified, names the integration endpoint and may not be empty"
+                    .to_string(),
+            )
+        }
+        Some(uri) => {
+            if AWS_INTEGRATION_TYPES.contains(&integration_type) && !uri.starts_with("arn:") {
+                return Err(format!(
+                    "Invalid integration URI specified: an integration of type {integration_type} \
+                     takes an AWS integration ARN of the form \
+                     arn:{{partition}}:apigateway:{{region}}:{{service}}:path|action/{{service_api}}, \
+                     got {uri}"
+                ));
+            }
+            // A private HTTP integration's URI "is not used for routing" and names the
+            // load balancer rather than a formed URL, so the HTTP(S) form is required
+            // only of the standard integration.
+            if HTTP_INTEGRATION_TYPES.contains(&integration_type)
+                && !private
+                && !(uri.starts_with("http://") || uri.starts_with("https://"))
+            {
+                return Err(format!(
+                    "Invalid integration URI specified: an integration of type {integration_type} \
+                     takes a fully formed HTTP(S) URL, got {uri}"
+                ));
+            }
+            Some(uri.to_string())
+        }
+        None if is_mock => None,
+        None => {
+            return Err(format!(
+                "uri is required for an integration of type {integration_type}: it names the \
+                 integration endpoint"
+            ))
+        }
+    };
+
+    let passthrough_behavior = match input.passthrough_behavior.as_deref() {
+        Some(behavior) if !PASSTHROUGH_BEHAVIORS.contains(&behavior) => {
+            return Err(format!(
+                "Invalid passthroughBehavior specified: {behavior}; expected one of {}",
+                PASSTHROUGH_BEHAVIORS.join(", ")
+            ))
+        }
+        Some(behavior) => behavior.to_string(),
+        None => DEFAULT_PASSTHROUGH_BEHAVIOR.to_string(),
+    };
+
+    let timeout_in_millis = input.timeout_in_millis.unwrap_or(DEFAULT_TIMEOUT_IN_MILLIS);
+    if !(MIN_TIMEOUT_IN_MILLIS..=MAX_TIMEOUT_IN_MILLIS).contains(&timeout_in_millis) {
+        return Err(format!(
+            "timeoutInMillis must be between {MIN_TIMEOUT_IN_MILLIS} and \
+             {MAX_TIMEOUT_IN_MILLIS} milliseconds, got {timeout_in_millis}"
+        ));
+    }
+
+    // `cacheKeyParameters`: "To be valid values for cacheKeyParameters, these parameters
+    // must also be specified for Method requestParameters."
+    let cache_key_parameters: Vec<String> = input.cache_key_parameters.clone().unwrap_or_default();
+    for parameter in &cache_key_parameters {
+        if !method.request_parameters.contains_key(parameter) {
+            return Err(format!(
+                "Invalid cache key parameter specified: {parameter}; a cache key parameter must \
+                 also be a request parameter of the {} method",
+                method.http_method
+            ));
+        }
+    }
+
+    Ok(GetIntegrationOutput {
+        r#type: Some(integration_type.to_string()),
+        http_method: integration_method,
+        uri,
+        connection_type: Some(connection_type),
+        connection_id,
+        credentials: input.credentials.clone(),
+        // The caller-sized maps are reported only when the caller set one; the cache
+        // configuration is materialised by the service — `cacheNamespace` defaults to
+        // the resource id ("By default, API Gateway uses the resource ID as the
+        // cacheNamespace") — so its parameter list is reported as stored, empty included.
+        request_parameters: non_empty(input.request_parameters.clone()),
+        request_templates: non_empty(input.request_templates.clone()),
+        passthrough_behavior: Some(passthrough_behavior),
+        content_handling: input.content_handling.clone(),
+        timeout_in_millis,
+        cache_namespace: Some(
+            input
+                .cache_namespace
+                .clone()
+                .unwrap_or_else(|| resource_id.to_string()),
+        ),
+        cache_key_parameters: Some(cache_key_parameters),
+        // An integration's responses are `PutIntegrationResponse`'s records, and this
+        // call creates the integration: a freshly created one carries none.
+        integration_responses: None,
+        tls_config: input.tls_config.clone(),
+        response_transfer_mode: input.response_transfer_mode.clone(),
+        integration_target: input.integration_target.clone(),
+    })
+}
+
+/// A caller-supplied map as it is reported: absent when the caller set no entry, so an
+/// empty map in the request does not become an empty map in every later read.
+fn non_empty(
+    map: Option<::std::collections::HashMap<String, String>>,
+) -> Option<::std::collections::HashMap<String, String>> {
+    map.filter(|entries| !entries.is_empty())
+}
+
+/// The stored `Integration` as THIS operation's output shape. Both are the model's
+/// `Integration`, so a stored record is rendered the same way by every reader of it.
+fn output_of(stored: GetIntegrationOutput) -> PutIntegrationOutput {
+    PutIntegrationOutput {
+        r#type: stored.r#type,
+        http_method: stored.http_method,
+        uri: stored.uri,
+        connection_type: stored.connection_type,
+        connection_id: stored.connection_id,
+        credentials: stored.credentials,
+        request_parameters: stored.request_parameters,
+        request_templates: stored.request_templates,
+        passthrough_behavior: stored.passthrough_behavior,
+        content_handling: stored.content_handling,
+        timeout_in_millis: stored.timeout_in_millis,
+        cache_namespace: stored.cache_namespace,
+        cache_key_parameters: stored.cache_key_parameters,
+        integration_responses: stored.integration_responses,
+        tls_config: stored.tls_config,
+        response_transfer_mode: stored.response_transfer_mode,
+        integration_target: stored.integration_target,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -242,6 +556,23 @@ impl From<PutIntegrationErrorModeled> for PutIntegrationError {
     fn from(modeled: PutIntegrationErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Refuse a request that breaks one of the `Integration` rules; see [`integration_of`].
+fn bad_request(message: String) -> PutIntegrationError {
+    PutIntegrationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: &str) -> PutIntegrationError {
+    PutIntegrationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
 
 /// The `PutIntegration` operation.
@@ -280,18 +611,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutIntegration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        bound_input(&input).map_err(bad_request)?;
+
+        let mut store = state.lock();
+
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_REST_API))?;
+        let resource = api
+            .resources
+            .get_mut(&input.resource_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        let resource_id = resource.id.clone();
+        // An integration belongs to a METHOD: the verb in the URI must already name one
+        // on the resource, or there is nothing to attach it to.
+        let method = resource
+            .methods
+            .get_mut(&method_key(&input.http_method))
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+
+        let integration = integration_of(&input, method, &resource_id).map_err(bad_request)?;
+        // A PUT replaces whatever integration the method had, so the stored record is
+        // exactly what this request asks for.
+        method.integration = Some(integration.clone());
+        Ok(output_of(integration))
     }
 }
