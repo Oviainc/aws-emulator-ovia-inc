@@ -2,13 +2,14 @@
 
 //! Engine state for the com-amazonaws-wafregional-awswaf-regional-20161128 service.
 //!
-//! AWS WAF Classic's `IPSet`, `Rule`, `SqlInjectionMatchSet`, `WebACL` and
-//! `XssMatchSet` records and the change tokens every mutating call consumes live here,
-//! so `GetChangeToken`, `GetChangeTokenStatus` and the `Create*`, `Update*`, `Get*`,
-//! `List*` and `Delete*` handlers of every resource kind all read and write ONE copy
-//! of each resource. The helpers below (id minting, the change-token protocol, CIDR
-//! parsing, metric-name validation, filter identity, the `IPSet`/`IPSetSummary`,
-//! `Rule`, `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet`/`XssMatchSetSummary`
+//! AWS WAF Classic's `IPSet`, `Rule`, `SqlInjectionMatchSet`, `WebACL`, `XssMatchSet`
+//! and `RuleGroup` records and the change tokens every mutating call consumes live
+//! here, so `GetChangeToken`, `GetChangeTokenStatus` and the `Create*`, `Update*`,
+//! `Get*`, `List*` and `Delete*` handlers of every resource kind all read and write ONE
+//! copy of each resource. The helpers below (id minting, the change-token protocol,
+//! CIDR parsing, metric-name validation, filter identity, the `IPSet`/`IPSetSummary`,
+//! `Rule`, `SqlInjectionMatchSet`, `WebACL`, `XssMatchSet`/`XssMatchSetSummary` and
+//! `RuleGroup`
 //! projections) are shared by those handlers rather than duplicated per operation.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +17,7 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, Rule,
+    ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, Rule, RuleGroup,
     SqlInjectionMatchSet, SqlInjectionMatchTuple, WafAction, WebACL, XssMatchSet,
     XssMatchSetSummary, XssMatchTuple,
 };
@@ -90,6 +91,14 @@ pub const MAX_IP_SET_DESCRIPTORS: usize = 10_000;
 /// account (100 conditions of each type, a `SqlInjectionMatchSet` being one condition),
 /// which keeps the match-set state a caller can grow bounded.
 pub const MAX_SQL_INJECTION_MATCH_SETS: usize = 100;
+
+/// The most `RuleGroup`s this emulator stores for the account before
+/// `CreateRuleGroup` answers its modelled `WAFLimitsExceededException`.
+///
+/// Source: `CreateRuleGroup`'s own documentation — "Rule groups are subject to the
+/// following limits: Three rule groups per account. You can request an increase to
+/// this limit by contacting customer support."
+pub const MAX_RULE_GROUPS: usize = 3;
 
 /// The most change-token records kept before the oldest settled ones are dropped.
 ///
@@ -655,6 +664,49 @@ impl SqlInjectionMatchSetEntry {
     }
 }
 
+/// One stored `RuleGroup`.
+///
+/// A rule group's activated rules are not held here: `CreateRuleGroup` documents that
+/// it creates "An empty RuleGroup" and that "You use UpdateRuleGroup to add rules to
+/// the rule group", and the modelled `RuleGroup` shape carries only the id, the name
+/// and the metric name.
+#[derive(Debug, Clone)]
+pub struct RuleGroupEntry {
+    pub rule_group_id: String,
+    pub name: String,
+    /// The metric name, fixed at creation: "You can't change the name of the metric
+    /// after you create the RuleGroup."
+    pub metric_name: String,
+    /// The tags the create request carried, keyed by `Key` as `RuleEntry::tags` is, so
+    /// a key repeated in one request keeps the last value given for it. NOTHING READS
+    /// THIS YET: `TagResource`, `UntagResource` and `ListTagsForResource` are still
+    /// scaffold stubs, so no test exercises it — whoever implements them reads the tags
+    /// from here.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl RuleGroupEntry {
+    /// A new rule group holding no rules and no tags.
+    pub fn new(rule_group_id: String, name: String, metric_name: String) -> Self {
+        Self {
+            rule_group_id,
+            name,
+            metric_name,
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// This record projected onto the modelled `RuleGroup` shape the Create and Get
+    /// responses carry: the stored record's own fields, never request input.
+    pub fn to_modelled(&self) -> RuleGroup {
+        RuleGroup {
+            rule_group_id: self.rule_group_id.clone(),
+            name: Some(self.name.clone()),
+            metric_name: Some(self.metric_name.clone()),
+        }
+    }
+}
+
 /// One minted change token.
 #[derive(Debug, Clone)]
 pub struct ChangeTokenRecord {
@@ -690,6 +742,9 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// `ListXssMatchSets` walks them in one stable order and a `NextMarker` taken on one
     /// page resumes at the right place on the next.
     pub xss_match_sets: BTreeMap<String, XssMatchSetEntry>,
+    /// Every stored `RuleGroup`, keyed by its `RuleGroupId`. A `BTreeMap` for the same
+    /// reason as [`Self::ip_sets`]: one stable order for a paginated listing.
+    pub rule_groups: BTreeMap<String, RuleGroupEntry>,
     /// Every change token this service minted and has not yet dropped, keyed by the
     /// token value, so `GetChangeTokenStatus` can report one and a mutating call can
     /// tell a fresh token from a used one.
