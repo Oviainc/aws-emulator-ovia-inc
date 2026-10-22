@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !guard.clusters.contains_key(&cluster_name) {
             return Err(ListTasksErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
-                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -248,9 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(ListTasksErrorModeled::ServiceNotFoundException(
                     ServiceNotFoundException {
-                        message: Some(format!(
-                            "service {name:?} was not found in cluster {cluster_name:?}"
-                        )),
+                        message: Some(crate::state::SERVICE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -273,10 +271,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(ListTasksErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "container instance {reference:?} is not registered in cluster \
-                             {cluster_name:?}"
-                        )),
+                        message: Some(
+                            crate::state::CONTAINER_INSTANCE_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

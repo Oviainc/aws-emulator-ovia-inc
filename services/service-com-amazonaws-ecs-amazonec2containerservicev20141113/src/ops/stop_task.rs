@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !guard.clusters.contains_key(&cluster_name) {
             return Err(StopTaskErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
-                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -194,10 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !in_cluster {
             return Err(StopTaskErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "the referenced task {:?} was not found in cluster {cluster_name:?}",
-                        input.task
-                    )),
+                    message: Some(crate::state::TASK_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

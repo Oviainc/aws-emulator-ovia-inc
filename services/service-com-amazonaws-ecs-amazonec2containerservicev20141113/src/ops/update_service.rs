@@ -378,7 +378,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !guard.clusters.contains_key(&cluster_name) {
             return Err(UpdateServiceErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
-                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -388,9 +388,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = guard.services.get(&key) else {
             return Err(UpdateServiceErrorModeled::ServiceNotFoundException(
                 ServiceNotFoundException {
-                    message: Some(format!(
-                        "service {name:?} was not found in cluster {cluster_name:?}"
-                    )),
+                    message: Some(crate::state::SERVICE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -468,9 +466,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 let Some(found) = found.cloned() else {
                     return Err(UpdateServiceErrorModeled::ClientException(ClientException {
-                        message: Some(format!(
-                            "unable to describe task definition {reference:?}"
-                        )),
+                        message: Some(
+                            crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     })
                     .into());
                 };
