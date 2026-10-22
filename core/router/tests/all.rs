@@ -27,6 +27,8 @@ mod dynamodb_streams_routing;
 mod events_signing_name_routing;
 #[path = "all/iam_and_signer_signing_name_routing.rs"]
 mod iam_and_signer_signing_name_routing;
+#[path = "all/iam_role_id_agrees_with_sts.rs"]
+mod iam_role_id_agrees_with_sts;
 #[path = "all/iam_signing_name_routing.rs"]
 mod iam_signing_name_routing;
 #[path = "all/ivs_signing_name_routing.rs"]
