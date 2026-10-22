@@ -775,29 +775,42 @@ async fn unknown_resources_are_reported_as_not_found() {
     let absent = "env-0000000000";
     let absent_arn = format!("arn:aws:evs:{REGION}:{ACCOUNT}:environment/{absent}");
 
-    let rows: Vec<(&str, Value)> = vec![
-        ("GetEnvironment", json!({ "environmentId": absent })),
-        ("DeleteEnvironment", json!({ "environmentId": absent })),
-        ("ListEnvironmentVlans", json!({ "environmentId": absent })),
+    // Each row: an operation, its request, and the status it answers an absent
+    // resource with. An operation addressing an environment BY ID answers the modeled
+    // `ResourceNotFoundException` and its `@httpError(404)`; the ARN-addressed tagging
+    // surface answers 400 — see `tests/all/tagging_not_found.rs`, which pins the whole
+    // tagging rule including the `resourceArn` member.
+    let rows: Vec<(&str, Value, u16)> = vec![
+        ("GetEnvironment", json!({ "environmentId": absent }), 404),
+        ("DeleteEnvironment", json!({ "environmentId": absent }), 404),
+        (
+            "ListEnvironmentVlans",
+            json!({ "environmentId": absent }),
+            404,
+        ),
         (
             "ListTagsForResource",
             json!({ "resourceArn": absent_arn.clone() }),
+            400,
         ),
         (
             "TagResource",
             json!({ "resourceArn": absent_arn.clone(), "tags": { "k": "v" } }),
+            400,
         ),
         (
             "UntagResource",
             json!({ "resourceArn": absent_arn.clone(), "tagKeys": ["k"] }),
+            400,
         ),
     ];
 
-    for (operation, request) in rows {
+    for (operation, request, expected_status) in rows {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
-            status, 404,
-            "case {operation:?} on an absent resource: expected HTTP 404, got {status} {body}"
+            status, expected_status,
+            "case {operation:?} on an absent resource: expected HTTP {expected_status}, \
+             got {status} {body}"
         );
         assert!(
             error_type(&body).contains("ResourceNotFoundException"),

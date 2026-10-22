@@ -13,9 +13,13 @@
 // points it into `tests/all/`.
 #[path = "all/deployment_parameters.rs"]
 mod deployment_parameters;
+#[path = "all/not_found_error_code.rs"]
+mod not_found_error_code;
 #[path = "all/put_deployment_parameter_target.rs"]
 mod put_deployment_parameter_target;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/support.rs"]
+mod support;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;

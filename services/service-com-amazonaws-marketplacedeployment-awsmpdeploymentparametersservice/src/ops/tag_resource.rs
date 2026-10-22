@@ -5,7 +5,9 @@
 //! MERGES `tags` onto the tag map of the one stored deployment parameter whose
 //! `resourceArn` the `@httpLabel` names, so a key already present takes the new
 //! value and every other stored key is left alone. An ARN that names no stored
-//! record is a modelled `ResourceNotFoundException` (404).
+//! record is a 404 carrying this service's own `NotFoundException` code
+//! (`crate::state::parameter_not_found`), which is the code its recorded responses
+//! use rather than the modelled `ResourceNotFoundException` shape name.
 //!
 //! ## Shape of an operation
 //!
@@ -153,10 +155,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(record) = store.parameters.get_mut(&input.resource_arn) else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::parameter_not_found(&input.resource_arn),
-            )
-            .into());
+            // The not-found CODE this service emits is `NotFoundException`, not the
+            // modelled `ResourceNotFoundException` shape name; see
+            // `crate::state::parameter_not_found`.
+            return Err(crate::state::parameter_not_found());
         };
 
         // The merge is computed before anything is stored, so a request the service
