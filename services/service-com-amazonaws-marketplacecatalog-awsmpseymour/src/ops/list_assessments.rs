@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssessments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssessments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Returns a page of the assessments this catalog holds.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssessments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An assessment is the RESULT of evaluating an entity or a change set against a
+//! framework. No operation of this service performs such an evaluation and this
+//! emulator runs none, so nothing creates an assessment record and this list is
+//! empty — see `crate::state::AssessmentRecord`. The page is still computed from the
+//! store, through the filters and the order the model documents, so it reports
+//! whatever the store holds rather than a constant.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +162,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssessments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssessmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssessments"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAssessmentsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the marketplace catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every operation's `Catalog` member documents "Fixed value:
+        // AWSMarketplace", so any other catalog names nothing this service has.
+        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
+            return Err(ListAssessmentsErrorModeled::ValidationException(
+                crate::state::wrong_catalog(&input.catalog),
+            )
+            .into());
+        }
+
+        // "Filters the list of assessments to those performed against a specific
+        // entity or change set" — both members are optional, and one the filter
+        // leaves absent constrains nothing (`AssessmentRecord::matches_target`), so
+        // an empty filter structure selects everything rather than being refused.
+
+        // The token is the offset the next page resumes at; one this service
+        // never issued names no page.
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                match crate::state::decode_page_token(crate::state::ASSESSMENT_PAGE_PREFIX, token) {
+                    Some(offset) => offset,
+                    None => {
+                        return Err(ListAssessmentsErrorModeled::ValidationException(
+                            crate::state::validation(
+                                "NextToken",
+                                format!("{token:?} is not a token returned by ListAssessments"),
+                            ),
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        // `MaxResults` is modelled `@range(min: 1, max: 100)` with `@default(20)`,
+        // so the boundary has already applied the default and refused anything
+        // outside the range.
+        debug_assert!(
+            (1..=crate::state::LIST_ASSESSMENTS_PAGE_LIMIT).contains(&input.max_results),
+            "MaxResults {} should have been refused at the boundary",
+            input.max_results
+        );
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .clamp(1, crate::state::LIST_ASSESSMENTS_PAGE_LIMIT),
+        )
+        .expect("a page size clamped into 1..=100 fits in usize");
+
+        let store = state.lock();
+        let mut matched: Vec<&crate::state::AssessmentRecord> = store
+            .assessments
+            .values()
+            .filter(|record| {
+                input
+                    .framework_id
+                    .as_deref()
+                    .is_none_or(|framework_id| record.matches_framework_id(framework_id))
+                    && input
+                        .assessment_target_filter
+                        .as_ref()
+                        .is_none_or(|filter| record.matches_target(filter))
+                    && input
+                        .framework_filters
+                        .as_ref()
+                        .is_none_or(|filters| record.matches_framework_filters(filters))
+            })
+            .collect();
+        // "Results are sorted by assessment creation time in descending order."
+        // The id is the tie-break, so assessments that share an instant still come
+        // out in one stable total order and a page boundary never repeats or skips
+        // one.
+        matched.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+
+        let summaries: Vec<AssessmentSummary> =
+            matched.iter().map(|record| record.to_summary()).collect();
+        let page = crate::state::paginate(
+            summaries,
+            offset,
+            page_size,
+            crate::state::ASSESSMENT_PAGE_PREFIX,
+        );
+
+        Ok(ListAssessmentsOutput {
+            // The list is always present, empty when this catalog holds no
+            // assessment the filters select — never an absent member, which a
+            // client cannot tell from "this service does not report it".
+            assessment_summary_list: Some(page.items),
+            // `@paginated`: absent on the last page ("null if there are no more
+            // results").
+            next_token: page.next_token,
+        })
     }
 }

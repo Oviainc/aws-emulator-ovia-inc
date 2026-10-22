@@ -45,67 +45,6 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The service key `emulator_server::service_from_target` reads out of the
-/// `X-Amz-Target` header this service's awsJson1_1 operations carry: that reader takes
-/// the segment before the `.`, strips an `_<digits>` version suffix and lower-cases it,
-/// so `AWSMPEntitlementService.<OperationName>` (`OPERATIONS.md`, "Request routing")
-/// normalises to this key — while each Marketplace sibling's own target normalises to a
-/// different one (`AWSMPMeteringService.…`, `AWSMPCommerceService_v20200301.…`).
-const TARGET_SERVICE_KEY: &str = "awsmpentitlementservice";
-
-/// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
-/// first segment (`"/"`, `""`).
-fn first_path_segment(path: &str) -> Option<&str> {
-    let segment = path.trim_start_matches('/').split('/').next()?;
-    (!segment.is_empty()).then_some(segment)
-}
-
-/// Whether `parts` addresses a path inside `path_segments` — the model-derived first
-/// URI path segments this service declares (`crate::ROUTE_PATH_SEGMENTS`).
-///
-/// This mirrors the framework's own discriminator,
-/// `emulator_server::can_handle_based_on_route_key_and_path`, which the generated
-/// `can_handle` entry point uses. The framework helper takes a whole buffered
-/// `http::Request`, which the `Service::can_handle` seam below does not receive, so the
-/// rule is applied here over `Parts` instead of called. It is kept identical, including
-/// both edge cases: an EMPTY list means the model published no usable discriminator and
-/// is "no constraint", and the framework's own `ROOT_PATH_SEGMENT` sentinel is how a
-/// service that must answer `POST /` claims the root path without claiming every path.
-/// Matching is EXACT segment equality, deliberately never a prefix test.
-fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> bool {
-    if path_segments.is_empty() {
-        return true;
-    }
-    match first_path_segment(parts.uri.path()) {
-        Some(segment) => path_segments.contains(&segment),
-        None => path_segments.contains(&emulator_server::ROOT_PATH_SEGMENT),
-    }
-}
-
-/// The Smithy service shape's own name — the part of a shape id after the `#`. That is
-/// the `{Service}` label an `rpcv2Cbor` request carries in its path.
-fn service_shape_name(shape_id: &str) -> &str {
-    shape_id.split_once('#').map_or(shape_id, |(_, name)| name)
-}
-
-/// The `{Service}` label of an `rpcv2Cbor` request path, or `None` when `path` is not
-/// one. Every rpcv2Cbor request is `POST /service/{Service}/operation/{Operation}`.
-fn rpcv2_cbor_service_label(path: &str) -> Option<&str> {
-    let (service, operation) = path.strip_prefix("/service/")?.split_once("/operation/")?;
-    (!service.is_empty() && !operation.is_empty() && !service.contains('/')).then_some(service)
-}
-
-/// Whether `parts` addresses THIS service's RPC surface rather than a sibling's that
-/// shares the signing name: an awsJson request names its service in `X-Amz-Target`, and
-/// an rpcv2Cbor request (which carries no such header) names it in the `{Service}` label
-/// of its path.
-fn claims_own_rpc_surface(parts: &http::request::Parts, shape_id: &str) -> bool {
-    match emulator_server::service_from_target(&parts.headers) {
-        Some(target) => target == TARGET_SERVICE_KEY,
-        None => rpcv2_cbor_service_label(parts.uri.path()) == Some(service_shape_name(shape_id)),
-    }
-}
-
 /// The `com-amazonaws-marketplaceentitlementservice-awsmpentitlementservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -135,31 +74,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // This service signs as `aws-marketplace` — a signing name every AWS
-        // Marketplace-family service SHARES while each serves its own endpoint
-        // (`entitlement.marketplace` here, `catalog.marketplace` for Marketplace
-        // Catalog, `reporting-marketplace` for Marketplace Reporting, …). The
-        // router's routing key comes from the SigV4 credential scope first, so all of
-        // them resolve to `aws-marketplace` and matching on the signing name ALONE
-        // makes every one of them claim every request — which the router answers
-        // `500 AmbiguousService`, leaving all of them unreachable.
+        // This service signs as `aws-marketplace` — a signing name it SHARES with
+        // every other AWS Marketplace-family service (Catalog, Reporting, Deployment,
+        // Discovery, Agreement, Metering), each serving its own endpoint
+        // (`entitlement.marketplace` here). The router's routing key comes from the
+        // SigV4 credential scope first, so all of them resolve to `aws-marketplace`
+        // and matching on the signing name ALONE makes every one of them claim every
+        // request — which the router answers `500 AmbiguousService`.
         //
-        // So the claim is narrowed the way the framework narrows it for the other
-        // signing-name collisions: the signing name must match AND the request must
-        // address this service's own modeled URI path space (see `claims_modeled_path`),
-        // which for this RPC service is the root path it posts every operation to plus
-        // the `rpcv2Cbor` path its cbor clients use. Those two paths are shared with its
-        // RPC peers (Agreement, Metering) rather than owned, so the request must ALSO
-        // name this service out of band — `X-Amz-Target:
+        // So the claim is narrowed to this service's own modelled wire surface, by the
+        // one rule `service-common` states for every service under a shared signing
+        // name. This model is `awsJson1_1` + `rpcv2Cbor`, both RPC protocols: they post
+        // every operation to one path (`/`, or
+        // `/service/<Service>/operation/<Operation>`) and name the target service out
+        // of band. Those paths are shared with its RPC peers (Agreement, Metering)
+        // rather than owned, so `claims_request` claims a request only when the service
+        // it NAMES is this one — `X-Amz-Target:
         // AWSMPEntitlementService.<OperationName>` on awsJson1_1 (`OPERATIONS.md`), or
         // the `{Service}` label of an rpcv2Cbor path.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) if key == self.entry.identity().signing_name() => {
-                claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
-                    && claims_own_rpc_surface(parts, self.entry.identity().shape_id())
-            }
-            _ => false,
-        }
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            Some(self.entry.identity().shape_id()),
+        )
     }
 
     fn override_operation(
