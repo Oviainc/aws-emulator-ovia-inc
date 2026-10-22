@@ -61,6 +61,13 @@ pub const MAX_IMAGES_PER_REPOSITORY: usize = 1_000;
 /// push that introduces a tag the repository did not carry.
 pub const MAX_TAGS_PER_REPOSITORY: usize = 10_000;
 
+/// See [`MAX_REPOSITORIES`]: the same reasoning for the pull through cache rule table,
+/// which `CreatePullThroughCacheRule` grows by one entry per rule. The number is this
+/// emulator's own bound rather than a published AWS default (AWS publishes the pull
+/// through cache rule quota as adjustable), and a create past it is refused with the
+/// `LimitExceededException` the operation models.
+pub const MAX_PULL_THROUGH_CACHE_RULES: usize = 1_000;
+
 /// See [`MAX_REPOSITORIES`]. This one bounds `creation_templates`, which grows by one
 /// entry per `CreateRepositoryCreationTemplate` that introduces a new namespace prefix;
 /// past it the create is refused with the `LimitExceededException` that operation models.
@@ -1134,6 +1141,73 @@ impl CreationTemplate {
     }
 }
 
+/// `upstreamRepositoryPrefix`'s documented default: "When this field isn't specified,
+/// Amazon ECR will use the ROOT."
+pub const DEFAULT_UPSTREAM_REPOSITORY_PREFIX: &str = "ROOT";
+
+/// The upstream registries whose URL the `upstreamRegistryUrl` documentation gives as
+/// one fixed host, as `(registry, host)` pairs. The two it gives with a caller-chosen
+/// label — Amazon ECR (`<accountId>.dkr.ecr.<region>.amazonaws.com`) and Microsoft Azure
+/// Container Registry (`<custom>.azurecr.io`) — are matched by shape in
+/// [`upstream_registry_for_url`] instead, and `chainguard`, whose URL that
+/// documentation does not give, is named only by the caller.
+pub const DOCUMENTED_UPSTREAM_REGISTRY_URLS: [(&str, &str); 6] = [
+    ("ecr-public", "public.ecr.aws"),
+    ("docker-hub", "registry-1.docker.io"),
+    ("github-container-registry", "ghcr.io"),
+    ("gitlab-container-registry", "registry.gitlab.com"),
+    ("k8s", "registry.k8s.io"),
+    ("quay", "quay.io"),
+];
+
+/// The `UpstreamRegistry` a URL names, from the per-registry URL syntax the
+/// `upstreamRegistryUrl` member documents, or `None` when the URL matches none of them.
+pub fn upstream_registry_for_url(url: &str) -> Option<&'static str> {
+    let host = url.trim().trim_end_matches('/');
+    if let Some((registry, _)) = DOCUMENTED_UPSTREAM_REGISTRY_URLS
+        .iter()
+        .find(|(_, documented)| host.eq_ignore_ascii_case(documented))
+    {
+        return Some(registry);
+    }
+    let lower = host.to_ascii_lowercase();
+    // `<custom>.azurecr.io` and `<accountId>.dkr.ecr.<region>.amazonaws.com`: the label
+    // is the caller's, the rest of the host is the registry's, so each is matched by its
+    // documented label arrangement rather than by a substring.
+    if lower
+        .strip_suffix(".azurecr.io")
+        .is_some_and(|custom| !custom.is_empty())
+    {
+        return Some("azure-container-registry");
+    }
+    if is_ecr_registry_host(&lower) {
+        return Some("ecr");
+    }
+    None
+}
+
+/// Whether `host` is an `<accountId>.dkr.ecr.<region>.amazonaws.com` registry host, as
+/// the `upstreamRegistryUrl` doc spells Amazon ECR's: an account id, the two fixed
+/// labels, one region label, and nothing else. `host` is already lowercased.
+fn is_ecr_registry_host(host: &str) -> bool {
+    let Some(rest) = host.strip_suffix(".amazonaws.com") else {
+        return false;
+    };
+    let mut labels = rest.split('.');
+    let account_id_is_well_formed = labels.next().is_some_and(|account| {
+        account.len() == ACCOUNT_ID_LEN && account.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    account_id_is_well_formed
+        && labels.next() == Some("dkr")
+        && labels.next() == Some("ecr")
+        && labels.next().is_some_and(|region| !region.is_empty())
+        && labels.next().is_none()
+}
+
+/// The length of an Amazon Web Services account id, which the `registryId` member's own
+/// pattern gives as `^[0-9]{12}$`.
+const ACCOUNT_ID_LEN: usize = 12;
+
 /// Per-service state for com-amazonaws-ecr-amazonec2containerregistry-v20150921. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
@@ -1141,8 +1215,8 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// pagination token — has one deterministic order.
     pub repositories: BTreeMap<String, Repo>,
     /// This registry's pull through cache rules, by `ecrRepositoryPrefix` — the key AWS
-    /// addresses a rule by. `CreatePullThroughCacheRule` is the only operation that adds
-    /// one (still a 501 stub, filed separately); `UpdatePullThroughCacheRule`,
+    /// addresses a rule by, as [`normalize_prefix`] spells it. `CreatePullThroughCacheRule`
+    /// is the only operation that adds one; `UpdatePullThroughCacheRule`,
     /// `ValidatePullThroughCacheRule` and `DeletePullThroughCacheRule` resolve a prefix
     /// here rather than each keeping their own copy.
     pub pull_through_cache_rules: BTreeMap<String, PullThroughCacheRule>,
@@ -1204,6 +1278,13 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
         self.repositories
             .get_mut(name)
             .ok_or_else(|| Fault::RepositoryNotFound(repository_not_found_message(name)))
+    }
+
+    /// The rule registered for `prefix`, whichever way its trailing slash is written, or
+    /// `None` when the registry holds no rule for it.
+    pub fn pull_through_cache_rule(&self, prefix: &str) -> Option<&PullThroughCacheRule> {
+        self.pull_through_cache_rules
+            .get(&normalize_prefix(prefix))
     }
 
     /// The value of the account setting `name`: what was last set for it, or its
@@ -1347,13 +1428,14 @@ pub fn check_exclusion_filters(
     Ok(())
 }
 
-/// The identity of a repository creation template's namespace prefix.
+/// The identity of a namespace prefix: a repository creation template's `prefix`, and a
+/// pull through cache rule's `ecrRepositoryPrefix`, which documents the same rule.
 ///
 /// `Prefix`'s own documentation: "There is always an assumed / applied to the end of the
 /// prefix. If you specify ecr-public as the prefix, Amazon ECR treats that as
 /// ecr-public/." That assumed separator is a single one, so exactly one trailing slash
-/// is not part of the namespace's identity: `prod` and `prod/` name the same template
-/// and the stored record spells it one way.
+/// is not part of the namespace's identity: `prod` and `prod/` name the same template —
+/// or the same cache rule — and the stored record spells it one way.
 pub fn normalize_prefix(prefix: &str) -> String {
     prefix.strip_suffix('/').unwrap_or(prefix).to_string()
 }
