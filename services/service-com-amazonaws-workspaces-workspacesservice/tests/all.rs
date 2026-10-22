@@ -17,6 +17,9 @@ mod account_byol_configuration;
 #[path = "all/account_links.rs"]
 mod account_links;
 
+#[path = "all/connection_alias_lifecycle.rs"]
+mod connection_alias_lifecycle;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
