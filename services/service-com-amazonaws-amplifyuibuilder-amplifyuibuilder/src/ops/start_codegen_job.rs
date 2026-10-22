@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCodegenJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCodegenJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCodegenJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a code generation job for one Amplify app environment: the job is minted with
+//! the configuration the request supplied, reported `in_progress`, and moved to its
+//! terminal status by the CLOCK — see [`crate::state::StoredCodegenJob`]. The code
+//! generation RUN itself is not performed by this emulator, so the job settles into the
+//! modelled failure status carrying [`crate::state::CODEGEN_JOB_NOT_RUN`] as its reason
+//! rather than reporting an artifact nothing produced.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCodegenJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCodegenJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCodegenJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartCodegenJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the amplifyuibuilder codegen job store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let key = (input.app_id.clone(), input.environment_name.clone());
+        let data = input.codegen_job_to_create;
+        let mut store = state.lock();
+
+        // Report what the clock has already made due before answering, so the job a
+        // replayed token names carries the status it is owed rather than the one it
+        // was started with.
+        store.settle_codegen_jobs(now);
+
+        // `clientToken` is an `@idempotencyToken` — "the idempotency token used to
+        // ensure that the code generation job request completes only once" — so the
+        // same token names the same job and a retried start reports the first one
+        // instead of starting a second run. The token is scoped to the (appId,
+        // environmentName) it was used in, so reusing one against another app
+        // environment starts that environment's own job.
+        if let Some(replayed) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.replayed_codegen_job(&key, token))
+        {
+            return Ok(StartCodegenJobOutput {
+                entity: Some(replayed.to_codegen_job()),
+            });
+        }
+
+        // The store is bounded: past its quota a start is refused rather than adding
+        // another record. This operation models no quota error, so the refusal is the
+        // modelled `ThrottlingException` (HTTP 429) — the one client refusal whose
+        // semantics, the service declining to take more work, fit a store that cannot
+        // take another job; a `ValidationException` would blame the request, which is
+        // well formed.
+        if store.total_codegen_jobs() >= crate::state::CODEGEN_JOB_QUOTA {
+            return Err(StartCodegenJobErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} codegen jobs across all \
+                         app environments",
+                        crate::state::CODEGEN_JOB_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_codegen_job_id(&key);
+        let job = crate::state::StoredCodegenJob {
+            app_id: input.app_id,
+            environment_name: input.environment_name,
+            id: id.clone(),
+            render_config: data.render_config,
+            generic_data_schema: data.generic_data_schema,
+            auto_generate_forms: data.auto_generate_forms,
+            features: data.features,
+            tags: data.tags.unwrap_or_default(),
+            // A started job is `in_progress`: the status AWS reports until the run
+            // ends. The terminal status is owed by the clock, not by this call.
+            status: crate::state::CODEGEN_JOB_IN_PROGRESS.to_string(),
+            status_message: None,
+            created_at: now,
+            modified_at: now,
+            next_status_due: Some((
+                now + crate::state::CODEGEN_JOB_TRANSITION_DELAY,
+                crate::state::CODEGEN_JOB_FAILED,
+            )),
+        };
+
+        let entity = job.to_codegen_job();
+        store.insert_codegen_job(job);
+        if let Some(token) = input.client_token {
+            store.remember_codegen_job_token(key, token, id);
+        }
+
+        Ok(StartCodegenJobOutput {
+            entity: Some(entity),
+        })
     }
 }
