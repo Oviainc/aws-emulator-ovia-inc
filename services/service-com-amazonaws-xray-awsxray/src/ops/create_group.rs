@@ -180,6 +180,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same tag restrictions `TagResource` enforces, from the one place
+        // they are written down (`crate::state::validate_tag`): tags arrive the
+        // same way whichever operation carries them, so they are refused the
+        // same way. `CreateGroup` models no `TooManyTagsException`, so the
+        // per-resource cap is reported through the 400 it does model.
+        let submitted = input.tags.unwrap_or_default();
+        for tag in &submitted {
+            if let Err(rejection) = crate::state::validate_tag(&tag.key, &tag.value) {
+                return Err(CreateGroupErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(rejection.message()),
+                    },
+                )
+                .into());
+            }
+        }
+        // Keyed by tag key, so a key the request repeats ends at its last value
+        // rather than being stored twice — which is also what the cap counts.
+        let tags: ::std::collections::BTreeMap<String, String> = submitted
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateGroupErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "{} tags were supplied, past the maximum of {} per resource",
+                        tags.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let draft = crate::state::GroupRecordDraft {
             group_name: input.group_name,
@@ -188,12 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .insights_configuration
                 .as_ref()
                 .map(crate::state::InsightsConfigurationRecord::from_configuration),
-            tags: input
-                .tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect(),
+            tags,
         };
         let Some(group) = store.insert_group(&region, draft).map(GroupRecord::to_group) else {
             return Err(CreateGroupErrorModeled::InvalidRequestException(

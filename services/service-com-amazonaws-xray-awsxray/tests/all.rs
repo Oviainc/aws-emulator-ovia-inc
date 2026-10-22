@@ -17,6 +17,9 @@ mod encryption_config;
 #[path = "all/indexing_rules.rs"]
 mod indexing_rules;
 
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

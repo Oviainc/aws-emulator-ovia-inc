@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers the tag set the resource an `AmazonResourceName` names holds, read
+//! from that resource's stored record — never from the request that wrote it.
+//! Honours the `@paginated` contract: tags are listed in key order, a
+//! `NextToken` is emitted only when the listing was truncated at
+//! [`TAGS_PAGE_SIZE`], and resuming from that token returns the remainder
+//! exactly once. An ARN that names no stored resource is refused with
+//! `ResourceNotFoundException`, and a token this service did not issue with
+//! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,20 +148,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray group store is unavailable on this emulator engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let resource_arn = &input.resource_arn;
+        let Some(tags) = store.tags_for_resource(resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no X-Ray resource is named by ARN `{resource_arn}`")),
+                    resource_name: Some(input.resource_arn.clone()),
+                },
+            )
+            .into());
+        };
+
+        // A token this service issued names the key the next page starts at, so
+        // it is at most the last key stored; one beyond that never came from
+        // here. Checked against the keyspace rather than against the stored
+        // keys, so removing the very tag a token names does not fail an
+        // in-flight paginator — though a resource whose tags were ALL removed
+        // mid-listing holds no keyspace to check against, and refuses the token
+        // rather than answering an empty page.
+        if let Some(token) = input.next_token.as_deref() {
+            let within_keyspace = tags
+                .keys()
+                .next_back()
+                .is_some_and(|last| token <= last.as_str());
+            if !within_keyspace {
+                return Err(ListTagsForResourceErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "NextToken `{token}` was not issued by this service"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `tags` is a `BTreeMap`, so the listing is in tag-key order and a token
+        // naming the next key resumes exactly where the last page stopped.
+        let remaining: Vec<(&String, &String)> = match input.next_token.as_deref() {
+            // A `RangeFrom<String>` rather than a borrowed bound: a borrowed
+            // one needs `RangeBounds<str>`, which this map's key type does not
+            // satisfy here.
+            Some(token) => tags.range(token.to_string()..).collect(),
+            None => tags.iter().collect(),
+        };
+
+        let next_token = remaining
+            .get(TAGS_PAGE_SIZE)
+            .map(|(key, _)| (*key).clone());
+        let page = remaining
+            .iter()
+            .take(TAGS_PAGE_SIZE)
+            .map(|(key, value)| Tag {
+                key: (*key).clone(),
+                value: (*value).clone(),
+            })
+            .collect();
+
+        Ok(ListTagsForResourceOutput {
+            tags: Some(page),
+            next_token,
+        })
     }
 }
+
+/// How many `Tag` values one page carries.
+///
+/// The model declares `ListTagsForResource` `@paginated` but no page size, so
+/// this is the emulator's, as [`crate::ops::get_groups::GROUPS_PAGE_SIZE`] is
+/// for `GetGroups`: a `NextToken` is emitted only when the listing exceeded it,
+/// and resuming from that token returns the remainder.
+pub const TAGS_PAGE_SIZE: usize = 25;

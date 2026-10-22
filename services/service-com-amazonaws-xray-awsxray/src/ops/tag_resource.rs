@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies tags to the resource an `AmazonResourceName` names, as an upsert on
+//! the tag set that resource already holds: a key not yet present is added, a
+//! key already present has its value REPLACED, and every other tag is left
+//! alone. An ARN that names no stored resource is refused with
+//! `ResourceNotFoundException`; a call that would carry the resource past
+//! [`crate::state::MAX_TAGS_PER_RESOURCE`] with `TooManyTagsException`; and a
+//! key or value outside the documented character set, or a key using the
+//! reserved `aws:` prefix, with `InvalidRequestException`. Every tag in the
+//! request is checked BEFORE any of them is stored, so a refused call changes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,20 +150,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::ThrottledException(ThrottledException {
+                message: Some(
+                    "the X-Ray group store is unavailable on this emulator engine".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        // Every tag is checked before any is stored: a refused call leaves the
+        // resource's tag set exactly as it was.
+        for tag in &input.tags {
+            if let Err(rejection) = crate::state::validate_tag(&tag.key, &tag.value) {
+                return Err(TagResourceErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(rejection.message()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        let resource_arn = input.resource_arn;
+        let Some(tags) = store.tags_for_resource_mut(&resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no X-Ray resource is named by ARN `{resource_arn}`")),
+                    resource_name: Some(resource_arn),
+                },
+            )
+            .into());
+        };
+
+        // Only a key the resource does not already hold grows its tag set, so
+        // re-tagging an existing key can never exceed the cap. Distinct keys are
+        // counted once even when the request repeats one.
+        let added: ::std::collections::BTreeSet<&str> = input
+            .tags
+            .iter()
+            .map(|tag| tag.key.as_str())
+            .filter(|key| !tags.contains_key(*key))
+            .collect();
+        let resulting = tags.len() + added.len();
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "applying these tags would leave {resulting} tags on `{resource_arn}`, \
+                         past the maximum of {}",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                    resource_name: Some(resource_arn),
+                },
+            )
+            .into());
+        }
+
+        // An upsert, in request order: a repeated key ends at the last value the
+        // request gave it.
+        for tag in input.tags {
+            tags.insert(tag.key, tag.value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

@@ -12,6 +12,12 @@
 //! `UpdateIndexingRule` rewrites its configuration in place for
 //! `GetIndexingRules` to report.
 //!
+//! A group's tags are keyed by tag key ON its record, so `CreateGroup`,
+//! `TagResource`, `UntagResource` and `ListTagsForResource` read and write ONE
+//! set per resource rather than a tag store beside it, and the restrictions the
+//! model documents for a tag are written down once, in
+//! [`validate_tag`]/[`validate_tag_key`].
+//!
 //! The segment-document schema this module parses is the one `PutTraceSegments`
 //! documents (`smithy_query(query="doc",shape="PutTraceSegments")`): `name`,
 //! `id`, `trace_id` and `start_time` are required, `end_time`/`in_progress` say
@@ -258,6 +264,22 @@ pub const MAX_TRACES: usize = 1_000;
 
 /// The most groups the store keeps; `CreateGroup` past this is refused.
 pub const MAX_GROUPS: usize = 250;
+
+/// The most user-applied tags one taggable resource holds.
+///
+/// Published by the service, not chosen here: the `Tag` shape's own
+/// documentation (`smithy_query(query="shape",shape="Tag")`) says "Maximum
+/// number of user-applied tags per resource: 50". A `TagResource` call that
+/// would carry a resource past it is refused with `TooManyTagsException`, and a
+/// `CreateGroup` with `InvalidRequestException` (the only 400 it models).
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The prefix reserved for Amazon Web Services' own tag keys.
+///
+/// From `TagResource$Tags`' documentation: "Don't use aws: as a prefix for
+/// keys; it's reserved for Amazon Web Services use. You cannot edit or delete
+/// system tags." So a caller may neither apply nor remove a key carrying it.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
 // ---------------------------------------------------------------------------
 // Trace segment destination (Transaction Search)
@@ -592,8 +614,11 @@ pub struct GroupRecord {
     pub filter_expression: Option<String>,
     /// The group's insights configuration, when it has one.
     pub insights_configuration: Option<InsightsConfigurationRecord>,
-    /// The tags the group was created with, in submission order.
-    pub tags: Vec<(String, String)>,
+    /// The group's tags, keyed by tag key — so applying a key already present
+    /// REPLACES its value rather than storing the key twice. Tags live here, on
+    /// the resource record, rather than in a tag store beside it, so a group has
+    /// exactly one set of tags whichever operation reads or writes them.
+    pub tags: BTreeMap<String, String>,
 }
 
 /// A group's `InsightsConfiguration`, as stored.
@@ -626,6 +651,92 @@ impl GroupLookupError {
             ),
         }
     }
+}
+
+/// Why a tag a request carries cannot be applied to, or removed from, a
+/// resource. Becomes the `InvalidRequestException` message of whichever tagging
+/// operation carried it, so `CreateGroup`, `TagResource` and `UntagResource`
+/// cannot drift into three readings of one documented restriction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagRejection {
+    /// The key carries [`RESERVED_TAG_KEY_PREFIX`].
+    ReservedKeyPrefix {
+        /// The refused key.
+        key: String,
+    },
+    /// A key or a value carries a character outside the documented set.
+    InvalidCharacter {
+        /// `"key"` or `"value"` — which half of the tag is at fault.
+        member: &'static str,
+        /// The refused text.
+        text: String,
+        /// The first character of it that is not allowed.
+        character: char,
+    },
+}
+
+impl TagRejection {
+    /// What to tell the caller: the member at fault and the restriction it broke.
+    pub fn message(&self) -> String {
+        match self {
+            Self::ReservedKeyPrefix { key } => format!(
+                "tag key `{key}` uses the `{RESERVED_TAG_KEY_PREFIX}` prefix, which is reserved \
+                 for Amazon Web Services use"
+            ),
+            Self::InvalidCharacter {
+                member,
+                text,
+                character,
+            } => format!(
+                "tag {member} `{text}` carries {character:?}, which is not one of the letters, \
+                 numbers, space and `_ . : / = + - @` a tag {member} may use"
+            ),
+        }
+    }
+}
+
+/// Whether `c` is a character a tag key or a tag value may carry.
+///
+/// `TagResource$Tags` publishes the set — "Valid values for key and value: a-z,
+/// A-Z, 0-9, space, and the following characters: _ . : / = + - and @" — and the
+/// `Tag` shape widens its alphanumeric half to "Unicode letters, numbers",
+/// which is what [`char::is_alphanumeric`] answers.
+fn is_tag_character(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, ' ' | '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
+}
+
+/// Refuse a tag key a caller may not name.
+///
+/// The key's length bound (1..=128 characters) is modelled on `TagKey`, so the
+/// request boundary refuses an empty or over-long key before any handler runs;
+/// what is left is the character set and the reserved prefix.
+pub fn validate_tag_key(key: &str) -> Result<(), TagRejection> {
+    if let Some(character) = key.chars().find(|c| !is_tag_character(*c)) {
+        return Err(TagRejection::InvalidCharacter {
+            member: "key",
+            text: key.to_string(),
+            character,
+        });
+    }
+    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+        return Err(TagRejection::ReservedKeyPrefix {
+            key: key.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a whole tag whose key or value is outside what the model documents.
+pub fn validate_tag(key: &str, value: &str) -> Result<(), TagRejection> {
+    validate_tag_key(key)?;
+    if let Some(character) = value.chars().find(|c| !is_tag_character(*c)) {
+        return Err(TagRejection::InvalidCharacter {
+            member: "value",
+            text: value.to_string(),
+            character,
+        });
+    }
+    Ok(())
 }
 
 /// Why a submitted segment document could not be stored. Becomes one
@@ -1187,6 +1298,27 @@ impl ComAmazonawsXrayAwsxrayState {
         Some(record)
     }
 
+    /// The tags held by the resource `resource_arn` names, or `None` when it
+    /// names no resource this store holds.
+    ///
+    /// X-Ray tags attach to a group or a sampling rule; sampling rules are not
+    /// implemented in this emulator yet (`CreateSamplingRule` is still a
+    /// scaffold), so a stored group's ARN is the only one that resolves today,
+    /// and this lookup is the single place their branch goes when they land.
+    pub fn tags_for_resource(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        let group_name = self.group_arn_to_name.get(resource_arn)?;
+        Some(&self.groups.get(group_name)?.tags)
+    }
+
+    /// The same lookup, for a tagging operation that writes.
+    pub fn tags_for_resource_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        let group_name = self.group_arn_to_name.get(resource_arn)?.clone();
+        Some(&mut self.groups.get_mut(&group_name)?.tags)
+    }
+
     /// Materialise the destination change the clock already owes at `now`.
     ///
     /// Called by the reporting operation as well as the mutating one: the move
@@ -1243,8 +1375,8 @@ pub struct GroupRecordDraft {
     pub filter_expression: Option<String>,
     /// The requested insights configuration.
     pub insights_configuration: Option<InsightsConfigurationRecord>,
-    /// The requested tags.
-    pub tags: Vec<(String, String)>,
+    /// The requested tags, keyed by tag key.
+    pub tags: BTreeMap<String, String>,
 }
 
 /// What `UpdateGroup` supplies: the members of a group a caller may change.
