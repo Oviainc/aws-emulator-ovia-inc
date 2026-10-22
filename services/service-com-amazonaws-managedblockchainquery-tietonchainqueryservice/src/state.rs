@@ -16,7 +16,9 @@
 //! * every balance `GetTokenBalance`/`ListTokenBalances` reports is DERIVED from the
 //!   opening balances plus those events ([`derive_holdings`]) rather than written down
 //!   beside them, so a reported balance can never disagree with the transfers that
-//!   produced it.
+//!   produced it;
+//! * every contract `GetAssetContract` reports is one the network's ledger holds, so an
+//!   address no contract is deployed at is a not-found rather than an invented answer.
 //!
 //! The stored half is [`StoredTransaction`] / [`StoredEvent`] / [`StoredHolding`]; the
 //! wire half (`Transaction`, `TransactionOutputItem`, `TransactionEvent`,
@@ -430,14 +432,13 @@ impl StoredHolding {
     }
 }
 
-/// A stored asset contract.
-///
-/// Present now so the later `GetAssetContract`/`ListAssetContracts` slice reads the
-/// same store the transaction and balance operations do; those two operations are still
-/// scaffolded and answer 501.
+/// A stored asset contract: the state `GetAssetContract` answers from, and the state the
+/// modelled `AssetContract` is projected from.
 #[derive(Debug, Clone)]
 pub struct StoredContract {
     pub network: String,
+    /// The address as the ledger spells it. Lookups go through
+    /// [`normalize_contract_address`], so a caller may spell it either way.
     pub contract_address: String,
     /// One of the model's `QueryTokenStandard` values, listed in this crate as
     /// [`crate::ops::types::QUERY_TOKEN_STANDARD_VALUES`].
@@ -462,7 +463,9 @@ pub struct NetworkLedger {
     /// Every holding on this network, derived from the transactions by
     /// [`derive_holdings`].
     pub holdings: BTreeMap<HoldingKey, StoredHolding>,
-    /// Every asset contract on this network, keyed by contract address.
+    /// Every asset contract on this network, keyed by its [`normalize_contract_address`]
+    /// form so one address resolves however it is spelled; iteration is therefore in a
+    /// stable, address-major order.
     pub contracts: BTreeMap<String, StoredContract>,
 }
 
@@ -498,6 +501,11 @@ impl NetworkLedger {
     pub fn by_id(&self, id: &str) -> Option<&StoredTransaction> {
         let key = self.by_id.get(&normalize_hash(id))?;
         self.transactions.get(key)
+    }
+
+    /// The asset contract deployed at `address`, however the caller spelled it.
+    pub fn contract(&self, address: &str) -> Option<&StoredContract> {
+        self.contracts.get(&normalize_contract_address(address))
     }
 
     /// Every transaction `address` took part in, in chain order.
@@ -589,6 +597,21 @@ pub fn normalize_hash(value: &str) -> String {
         .strip_prefix("0x")
         .unwrap_or(value)
         .to_ascii_lowercase()
+}
+
+/// A contract address reduced to the form the ledger keys contracts by.
+///
+/// An asset contract lives on an EVM network (`GetAssetContract`'s documentation: "The
+/// Bitcoin blockchain networks do not support this operation"), where an address is 20
+/// bytes: the mixed case of an EIP-55 checksummed spelling and the `0x` prefix are
+/// presentation and not identity, and `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$` admits
+/// every one of those spellings, so a lookup has to see them as one contract.
+pub fn normalize_contract_address(value: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    lowercase
+        .strip_prefix("0x")
+        .unwrap_or(&lowercase)
+        .to_string()
 }
 
 /// One page of a listing: the items on it, and the token that resumes after them.
@@ -865,8 +888,84 @@ fn bitcoin_address(network: &str, label: &str) -> String {
     address
 }
 
-/// The Ethereum fixture: three wallets, two contracts and six transactions whose events
-/// move native Ether, an ERC-20 balance and two ERC-721 tokens.
+/// The value of the model's `QueryNetwork` enum (see
+/// [`crate::ops::types::QUERY_NETWORK_VALUES`]) that names the Ethereum mainnet.
+const ETHEREUM_MAINNET: &str = "ETHEREUM_MAINNET";
+
+/// The well-known ERC-20 token contracts of the Ethereum mainnet, as
+/// `(contractAddress, name, symbol, decimals)`.
+///
+/// `GetAssetContract`'s documentation: "Metadata is currently only available for some
+/// ERC-20 contracts" — the metadata this API serves is an index of the chain's
+/// well-known token contracts, so the emulator's mainnet ledger holds that same class of
+/// contract rather than only synthetic ones. Each row is a public property of the
+/// Ethereum mainnet: the address the contract is deployed at, and the `name`, `symbol`
+/// and `decimals` its ERC-20 interface reports.
+const ETHEREUM_MAINNET_ERC20: &[(&str, &str, &str, i32)] = &[
+    (
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "USD Coin",
+        "USDC",
+        6,
+    ),
+    (
+        "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        "Tether USD",
+        "USDT",
+        6,
+    ),
+    (
+        "0x6b175474e89094c44da98b954eedeac495271d0f",
+        "Dai Stablecoin",
+        "DAI",
+        18,
+    ),
+    (
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "Wrapped Ether",
+        "WETH",
+        18,
+    ),
+    (
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+        "Wrapped BTC",
+        "WBTC",
+        8,
+    ),
+    (
+        "0x514910771af9ca656af840dff83e8264ecf986ca",
+        "ChainLink Token",
+        "LINK",
+        18,
+    ),
+];
+
+/// [`ETHEREUM_MAINNET_ERC20`] as stored contracts.
+///
+/// `deployerAddress` ("the address of the deployer of contract") is a ledger-local
+/// address: this emulator indexes no historical deployment transaction, so the deployer
+/// is derived the way every other fixture address is, per contract and stable across
+/// runs.
+fn well_known_mainnet_erc20(network: &str) -> Vec<StoredContract> {
+    ETHEREUM_MAINNET_ERC20
+        .iter()
+        .map(|(address, name, symbol, decimals)| StoredContract {
+            network: network.to_string(),
+            contract_address: (*address).to_string(),
+            token_standard: "ERC20".to_string(),
+            deployer_address: ethereum_address(network, &format!("deployer-{symbol}")),
+            metadata: Some(ContractMetadata {
+                name: Some((*name).to_string()),
+                symbol: Some((*symbol).to_string()),
+                decimals: Some(*decimals),
+            }),
+        })
+        .collect()
+}
+
+/// The Ethereum fixture: three wallets, two synthetic contracts — plus, on the mainnet,
+/// the well-known token contracts of [`ETHEREUM_MAINNET_ERC20`] — and six transactions
+/// whose events move native Ether, an ERC-20 balance and two ERC-721 tokens.
 fn seed_ethereum_ledger(network: &str) -> NetworkLedger {
     let wallet_a = ethereum_address(network, "wallet-a");
     let wallet_b = ethereum_address(network, "wallet-b");
@@ -876,7 +975,7 @@ fn seed_ethereum_ledger(network: &str) -> NetworkLedger {
 
     let hash = |label: &str| format!("0x{}", digest_hex(&format!("{network}/tx/{label}")));
 
-    let contracts = vec![
+    let mut contracts = vec![
         StoredContract {
             network: network.to_string(),
             contract_address: erc20.clone(),
@@ -893,14 +992,18 @@ fn seed_ethereum_ledger(network: &str) -> NetworkLedger {
             contract_address: erc721.clone(),
             token_standard: "ERC721".to_string(),
             deployer_address: wallet_b.clone(),
-            metadata: Some(ContractMetadata {
-                name: Some("Emulated Collectible".to_string()),
-                symbol: Some("EMCOL".to_string()),
-                // ERC-721 tokens are non-fungible, so there is nothing to subdivide.
-                decimals: None,
-            }),
+            // `GetAssetContract`'s documentation: "Metadata is currently only available
+            // for some ERC-20 contracts", so this index holds metadata for ERC-20
+            // contracts only and a non-fungible contract carries none.
+            metadata: None,
         },
     ];
+
+    // The well-known token contracts of the Ethereum mainnet are deployments of THAT
+    // chain, so they belong to its ledger and to no other network's.
+    if network == ETHEREUM_MAINNET {
+        contracts.extend(well_known_mainnet_erc20(network));
+    }
 
     // The balances the ledger opens with, at `LEDGER_EPOCH`. Every later balance is
     // these plus the events below, never a number written down on its own.
@@ -1172,9 +1275,10 @@ fn build_ledger(
 ) -> NetworkLedger {
     let mut ledger = NetworkLedger::default();
     for contract in contracts {
-        ledger
-            .contracts
-            .insert(contract.contract_address.clone(), contract);
+        ledger.contracts.insert(
+            normalize_contract_address(&contract.contract_address),
+            contract,
+        );
     }
 
     let bitcoin = is_bitcoin(network);

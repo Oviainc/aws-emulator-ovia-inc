@@ -146,11 +146,127 @@ pub struct ValidationException {
     pub field_list: Option<Vec<ValidationExceptionField>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.invoicing#ValidationExceptionField")]
+/// `ValidationExceptionField` — hand-written rather than expanded from the model,
+/// because an element of a `ValidationException`'s `fieldList` carries a `__type`
+/// DISCRIMINATOR on the wire that no Smithy member declares.
+///
+/// Recorded behaviour: on the awsJson protocols the discriminator is how a client
+/// decides how to decode a JSON error document, and every recorded error body of this
+/// service carries one on each nested error structure as well as at the top level —
+/// without it, a client keying off the discriminator (a hand-rolled decoder, generic
+/// error-introspection or error-logging middleware, a protocol conformance harness)
+/// decodes the nested field detail as an untyped object. The framework writes the
+/// top-level one itself (`WithType` in `aws_smithy_schema_server::rpc`), reading the
+/// error code from the error channel; a NESTED structure is serialized through its own
+/// `SerializableStruct`, so the discriminator has to be written there — which the
+/// `#[smithy_macros::smithy(shape = …)]` expansion derives from the model and cannot be
+/// told.
+///
+/// Everything below is what that expansion emits for a structure that is written but
+/// never read from the wire — the member statics, the `SCHEMA` the enclosing list writes
+/// each element with, and `SerializableStruct` — plus the one member the model does not
+/// declare.
 #[derive(Debug, Clone, Default)]
 pub struct ValidationExceptionField {
     pub name: String,
     pub message: String,
+}
+
+/// The namespace the error bodies of this service stamp their `__type` discriminators
+/// in: Invoicing is served by the `awsinsightsindexservice` backend, and a shape id in
+/// an error body names the shape as THAT backend knows it rather than as this service's
+/// own model spells it (the same recorded detail the note on
+/// [`ResourceNotFoundException`] above reads off those bodies). One constant, so every
+/// nested error structure of this service stamps the one namespace.
+const ERROR_SHAPE_NAMESPACE: &str = "com.amazonaws.awsinsightsindexservice.v0";
+
+/// The `__type` discriminator a `fieldList` element carries: the shape id of the field
+/// structure, in [`ERROR_SHAPE_NAMESPACE`].
+static VALIDATION_EXCEPTION_FIELD_TYPE: ::std::sync::LazyLock<String> =
+    ::std::sync::LazyLock::new(|| {
+        format!(
+            "{ERROR_SHAPE_NAMESPACE}#{}",
+            ValidationExceptionField::SHAPE_NAME
+        )
+    });
+
+/// The discriminator member: not in the model, so its schema is spelled here the way
+/// the framework spells the top-level one — the member NAME is the wire key the awsJson
+/// codecs read, and `@jsonName` is carried as well so a codec that honours it (restJson1)
+/// spells the member the same way.
+static VALIDATION_EXCEPTION_FIELD_M_TYPE: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static("smithy.api#__type", "smithy.api", "__type"),
+        ::aws_smithy_schema::ShapeType::String,
+        "__type",
+        0,
+    )
+    .with_json_name("__type");
+
+static VALIDATION_EXCEPTION_FIELD_M_NAME: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ValidationExceptionField$name",
+            "com.amazonaws.invoicing",
+            "name",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "name",
+        0,
+    );
+
+static VALIDATION_EXCEPTION_FIELD_M_MESSAGE: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ValidationExceptionField$message",
+            "com.amazonaws.invoicing",
+            "message",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "message",
+        1,
+    )
+    .with_xml_name("Message");
+
+impl ValidationExceptionField {
+    /// The model's own name for this shape, which the discriminator names.
+    pub const SHAPE_NAME: &'static str = "ValidationExceptionField";
+
+    /// The schema the enclosing `fieldList` writes each element with. The modelled
+    /// members only: the discriminator is not a member of the shape, exactly as the
+    /// top-level `__type` is not a member of the error shape it is written into.
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.invoicing#ValidationExceptionField",
+            "com.amazonaws.invoicing",
+            "ValidationExceptionField",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        VALIDATION_EXCEPTION_FIELD_MEMBERS,
+    );
+}
+
+/// The modelled members of [`ValidationExceptionField`], as the one `'static` slice its
+/// `SCHEMA` borrows (an associated `const` cannot borrow a temporary one).
+static VALIDATION_EXCEPTION_FIELD_MEMBERS: &[&::aws_smithy_schema::Schema] = &[
+    &VALIDATION_EXCEPTION_FIELD_M_NAME,
+    &VALIDATION_EXCEPTION_FIELD_M_MESSAGE,
+];
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ValidationExceptionField {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // The discriminator first, as the framework writes the top-level one.
+        serializer.write_string(
+            &VALIDATION_EXCEPTION_FIELD_M_TYPE,
+            VALIDATION_EXCEPTION_FIELD_TYPE.as_str(),
+        )?;
+        serializer.write_string(&VALIDATION_EXCEPTION_FIELD_M_NAME, self.name.as_str())?;
+        serializer.write_string(&VALIDATION_EXCEPTION_FIELD_M_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.invoicing#InvoiceUnitRule")]

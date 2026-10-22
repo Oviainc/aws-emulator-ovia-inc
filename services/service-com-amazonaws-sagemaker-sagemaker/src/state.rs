@@ -5,7 +5,9 @@
 //! The inference-deployment lifecycle (model -> endpoint config -> endpoint) is kept
 //! here, in `BTreeMap`s keyed by the resource name AWS keys them by, so
 //! `ListModels` has one stable order to sort and paginate over and every
-//! `Describe*` replays exactly what the matching `Create*` stored.
+//! `Describe*` replays exactly what the matching `Create*` stored. The Git repositories
+//! `CreateCodeRepository` registers are kept the same way, keyed by
+//! `CodeRepositoryName`.
 //!
 //! Studio apps live here too, keyed by the [`AppKey`] their five input members name
 //! rather than by a bare name, because that tuple — domain, owning user profile or
@@ -16,8 +18,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     ArtifactSource, AsyncInferenceConfig, ContainerDefinition, DataCaptureConfig, ExplainerConfig,
-    IamIdentity, InferenceExecutionConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
-    ProductionVariant, ProductionVariantSummary, ResourceSpec, Tag, UserContext, VpcConfig,
+    GitConfig, IamIdentity, InferenceExecutionConfig, ManagedConfiguration, MetadataProperties,
+    MetricsConfig, ProductionVariant, ProductionVariantSummary, ResourceSpec, Tag, UserContext,
+    VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -47,8 +50,8 @@ pub const APP_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
 /// The most records each of this service's stores holds, after which a create is
 /// refused with the modelled `ResourceLimitExceeded`.
 ///
-/// SageMaker publishes adjustable per-account quotas on models, endpoint
-/// configurations and endpoints, and this emulator models neither Service Quotas nor an
+/// SageMaker publishes adjustable per-account quotas on the resources this service
+/// owns, and this emulator models neither Service Quotas nor an
 /// account's adjustments — so this is the emulator's OWN bound on each store rather than
 /// a claim about any account's limit. It sits far above any workflow an emulator serves,
 /// and it is what stops the state growing without end: every record it holds is released
@@ -58,6 +61,8 @@ pub const MODEL_QUOTA: usize = 1_000;
 pub const ENDPOINT_CONFIG_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const ENDPOINT_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`].
+pub const CODE_REPOSITORY_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const APP_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
@@ -184,6 +189,22 @@ impl Endpoint {
         }
         false
     }
+}
+
+/// A Git repository registered by `CreateCodeRepository`, as `DescribeCodeRepository`
+/// replays it.
+///
+/// `GitConfig` is required on create, so it is stored unconditionally; the reader's
+/// member is optional only because the model marks it so. `tags` is stored so a later
+/// `ListTags` reports what the create carried; no implemented operation surfaces it yet.
+#[derive(Debug, Clone)]
+pub struct CodeRepository {
+    pub name: String,
+    pub arn: String,
+    pub git_config: GitConfig,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
 }
 
 /// Which Studio principal a Studio app hangs off.
@@ -351,6 +372,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Keyed by `CodeRepositoryName`.
+    pub code_repositories: BTreeMap<String, CodeRepository>,
     /// Keyed by [`AppKey`] — an app is named by five members, not by one name.
     pub apps: BTreeMap<AppKey, App>,
     /// Keyed by `ModelPackageGroupName`.
@@ -375,6 +398,12 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// Whether another code repository fits, i.e. the store is below
+    /// [`CODE_REPOSITORY_QUOTA`].
+    pub fn code_repositories_below_quota(&self) -> bool {
+        self.code_repositories.len() < CODE_REPOSITORY_QUOTA
     }
 
     /// Whether another app fits, i.e. the store is below [`APP_QUOTA`].

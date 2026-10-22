@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAssetContract
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAssetContract`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the asset contract the network's ledger (`crate::state::NetworkLedger`) holds
+//! at the requested `contractIdentifier`: its `tokenStandard`, its `deployerAddress` and
+//! the metadata the index holds for it. A Bitcoin network is refused with a
+//! `ValidationException` (the operation's own documentation: "The Bitcoin blockchain
+//! networks do not support this operation") and an address no contract is deployed at is
+//! a `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAssetContract::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The service is read-only, so the contract comes out of the seeded ledger and this
+//! handler writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +160,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAssetContract` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAssetContractErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAssetContract"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAssetContractErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let state = state.lock();
+
+        let requested = &input.contract_identifier;
+
+        // This operation's own documentation: "The Bitcoin blockchain networks do not
+        // support this operation". `QueryNetwork` is one enum for every network, so the
+        // boundary validator admits a Bitcoin network here and only the operation can
+        // refuse it.
+        if crate::state::is_bitcoin(&requested.network) {
+            return Err(GetAssetContractErrorModeled::ValidationException(
+                crate::state::field_validation_exception(
+                    "contractIdentifier.network",
+                    format!(
+                        "the Bitcoin blockchain networks do not support GetAssetContract, \
+                         including {}",
+                        requested.network
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let contract = state
+            .ledger(&requested.network)
+            .and_then(|ledger| ledger.contract(&requested.contract_address))
+            .ok_or_else(|| {
+                GetAssetContractErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                    requested.contract_address.clone(),
+                    // This service keeps its not-found message generic and reports the
+                    // identity in `resourceId`/`resourceType`.
+                    "The requested resource was not found.",
+                ))
+            })?;
+
+        Ok(GetAssetContractOutput {
+            // The request named the contract, so the response identifies the same one:
+            // the identifier is echoed rather than respelled into the ledger's own
+            // casing, which `ChainAddress` leaves free.
+            contract_identifier: requested.clone(),
+            token_standard: contract.token_standard.clone(),
+            deployer_address: contract.deployer_address.clone(),
+            // `GetAssetContract`: "Metadata is currently only available for some ERC-20
+            // contracts", so a contract the index holds none for reports none.
+            metadata: contract.metadata.clone(),
+        })
     }
 }

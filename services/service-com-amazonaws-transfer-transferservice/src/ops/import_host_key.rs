@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportHostKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportHostKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds a host key to a STORED server: the key's `HostKeyId` is minted here and the
+//! record is dated with this call, so `DescribeHostKey` reports it from stored state.
+//! What the readers report about the key — its fingerprint and its algorithm `Type` —
+//! is parsed out of the supplied material (`state::read_host_key`), so material the
+//! emulator cannot read is refused with the modelled `InvalidRequestException` rather
+//! than stored under invented properties. An unknown server is a
+//! `ResourceNotFoundException`; material the server already holds is a
+//! `ResourceExistsException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportHostKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Importing a host key does NOT touch the server: it changes no `State` and begins no
+//! transition, so a server that was serving keeps serving.
+//!
+//! `StorageType` is kept as the request selected it (`SERVICE_MANAGED` when it selected
+//! none). `KmsKey` encrypts the Secrets Manager secret a `SECRETS_MANAGER` key's
+//! material would live in; this emulator stores no such secret, so it keeps neither the
+//! material nor a `SecretId` and the key is encrypted by nothing it could name.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +175,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportHostKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportHostKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportHostKey"))
+        use crate::state as st;
+
+        // The key's own properties come from the MATERIAL, read before anything is
+        // persisted: a body the emulator cannot parse as a private key has no
+        // fingerprint and no algorithm to report, and neither may be invented, so the
+        // import is refused with the modelled `InvalidRequestException` (HTTP 400) the
+        // model documents as "thrown when the client submits a malformed request".
+        let Some((fingerprint, key_type)) = st::read_host_key(&input.host_key_body) else {
+            return Err(ImportHostKeyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: "HostKeyBody must be a private key in OpenSSH format".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ImportHostKeyErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let region = st::request_region(ctx.parts());
+
+        let mut guard = state.lock();
+
+        if !guard.servers.contains_key(&input.server_id) {
+            return Err(st::not_found(
+                ImportHostKeyErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        }
+
+        // Key material the server already holds is not imported twice: the same
+        // material IS the same host key — its fingerprint identifies it, whatever the
+        // description or the tags sent with it — so the import is refused with the
+        // modelled `ResourceExistsException` rather than storing a second copy of one
+        // key under a second id.
+        if let Some(held) = guard
+            .host_keys_of(&input.server_id)
+            .find(|held| held.fingerprint == fingerprint)
+        {
+            let host_key_id = held.host_key_id.clone();
+            return Err(ImportHostKeyErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: format!(
+                        "Server {} already holds host key {} with fingerprint {}",
+                        input.server_id, host_key_id, fingerprint
+                    ),
+                    resource: host_key_id,
+                    resource_type: st::RESOURCE_TYPE_HOST_KEY.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Each server's host key set is BOUNDED: past its capacity an import is refused
+        // rather than adding another record. The refusal is the modelled
+        // `InvalidRequestException` — the service is available and the request is well
+        // formed for the wire, but it asks for a key the server cannot hold — and the
+        // capacity is released by `DeleteHostKey`, all of it by `DeleteServer`.
+        if !guard.server_has_host_key_capacity(&input.server_id) {
+            return Err(ImportHostKeyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: format!(
+                        "server {} already holds the maximum of {} host keys; \
+                         delete one before importing another",
+                        input.server_id,
+                        st::MAX_HOST_KEYS_PER_SERVER
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Minted and dated HERE, under the same lock the record is written through, so
+        // the answer never names a key the store does not hold.
+        let host_key_id = guard.mint_id("hostkey");
+        let arn = st::host_key_arn(&region, &input.server_id, &host_key_id);
+        let host_key = st::HostKey {
+            host_key_id: host_key_id.clone(),
+            arn,
+            fingerprint,
+            key_type,
+            description: input.description,
+            date_imported: ::std::time::SystemTime::now(),
+            // Resolved once, by the write, so a reader reports the storage the key has
+            // rather than re-applying the default.
+            storage_type: input
+                .storage_type
+                .unwrap_or_else(|| st::DEFAULT_HOST_KEY_STORAGE_TYPE.to_string()),
+            tags: input.tags.unwrap_or_default(),
+        };
+        guard
+            .host_keys
+            .insert((input.server_id.clone(), host_key_id.clone()), host_key);
+
+        Ok(ImportHostKeyOutput {
+            server_id: input.server_id,
+            host_key_id,
+        })
     }
 }
