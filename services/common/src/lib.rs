@@ -75,6 +75,12 @@
 //! sentinels) for all of them and they all keep claiming everything. The RPC
 //! conjunct is what separates them.
 //!
+//! When two REST peers' path spaces overlap at EVERY segment a prefix test can read, no
+//! segment index separates them either. What does is the whole modelled route: AWS
+//! dispatches a REST request on the endpoint host and then on the operation's method +
+//! URI, so a peer claims exactly the requests its OWN model binds a route for — the key
+//! half and that route half together are [`claims_modeled_route`].
+//!
 //! Two REST peers can also publish the same first path segment — the two SageMaker
 //! Runtime endpoints both bind `/endpoints/{EndpointName}/…` and even share an
 //! `endpointPrefix` — and then the first segment separates nothing either. The segment
@@ -251,11 +257,59 @@ fn claims_rpc_path(parts: &http::request::Parts) -> bool {
 /// `Parts`: that helper takes a whole buffered `http::Request`, which the
 /// `Service::can_handle` seam does not receive. Comparison is case-insensitive on a
 /// trimmed name, as there.
+///
+/// The one-key case of [`routes_to_any`], which it delegates to so the two cannot
+/// disagree about what "the key names this service" means.
 pub fn routes_to(parts: &http::request::Parts, signing_name: &str) -> bool {
+    routes_to_any(parts, &[signing_name])
+}
+
+/// Whether the routing key the framework resolves for `parts` is one of `route_keys`.
+///
+/// [`routes_to`] over the several keys ONE endpoint answers on. A service's SigV4
+/// signing name is not always the name its endpoint is addressed by: the framework
+/// resolves the routing key from the credential scope first (the signing name), and
+/// falls back to the `Host`/`:authority` label (the `endpointPrefix`) for a request
+/// that carries no scope. Both name the same endpoint, so both are its keys.
+pub fn routes_to_any(parts: &http::request::Parts, route_keys: &[&str]) -> bool {
     match resolve_route_key(parts) {
-        Some(key) => key.eq_ignore_ascii_case(signing_name.trim()),
+        Some(key) => route_keys
+            .iter()
+            .any(|route_key| key.eq_ignore_ascii_case(route_key.trim())),
         None => false,
     }
+}
+
+/// The claim rule for a service whose signing name is SHARED and whose peers' modelled
+/// path spaces OVERLAP: the request's resolved routing key names this endpoint, and this
+/// service's own model binds a route for the request.
+///
+/// * `route_keys` — the keys this endpoint answers on: its signing name
+///   (`definition().identity().signing_name()`) and its `endpointPrefix`, which the model
+///   states and a host-addressed request resolves to.
+/// * `definition` — this service's model-derived half (`Service::definition()`), whose
+///   protocol and routing table are the model's own statement of which requests this
+///   service serves. The route half is [`addresses_modeled_route`], so route matching
+///   stays in the one place that owns it.
+///
+/// This is [`claims_request`]'s rule with its path conjunct sharpened from "a first path
+/// segment my model declares" to "a whole route my model binds", which is how AWS itself
+/// dispatches a REST request once the endpoint host has chosen the service. Peers whose
+/// first path segments collide are therefore still separated, as long as their models
+/// bind no identical method + URI pattern; where two peers DO bind the same route, the
+/// request is ambiguous on this rule alone and needs a further discriminator read off
+/// the request (see [`addresses_runtime_bidirectional_stream`] and [`shared_path`] for
+/// that shape).
+///
+/// A request this service's model does not bind is NOT claimed, even when no peer binds
+/// it either: a path no emulated model publishes is the router's `404 UnknownService`,
+/// which is honest, rather than one peer answering for an endpoint it does not serve.
+pub fn claims_modeled_route(
+    parts: &http::request::Parts,
+    route_keys: &[&str],
+    definition: &dyn ErasedServiceDefinition,
+) -> bool {
+    routes_to_any(parts, route_keys) && addresses_modeled_route(parts, definition)
 }
 
 /// Whether `parts` addresses a path inside `path_segments` — the model-derived first
@@ -714,6 +768,82 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?}: {path:?} expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    /// The route half of [`claims_modeled_route`] is [`addresses_modeled_route`], which
+    /// reads a service's OWN generated protocol and routing table; it is exercised
+    /// end-to-end against the real models in
+    /// `core/router/tests/all/bedrock_agentcore_signing_name_routing.rs` and the owning
+    /// crates' own suites, where those tables exist. What is unit-testable here is the
+    /// KEY half, below.
+    #[allow(dead_code)]
+    fn route_half_is_covered_by_the_router_suites() {}
+
+    /// An endpoint answers on every key that names it: its signing name, and the
+    /// `endpointPrefix` an unsigned, host-addressed request resolves to.
+    #[test]
+    fn an_endpoint_answers_on_its_signing_name_and_on_its_endpoint_prefix() {
+        /// The keys ONE endpoint answers on: the signing name it shares with its peer,
+        /// and its own (longer) endpoint prefix.
+        const KEYS: &[&str] = &["shared", "shared-control"];
+
+        // (case, authorization scope, host, expected)
+        let rows: [(&str, Option<&str>, Option<&str>, bool); 7] = [
+            ("the shared signing name, signed", Some("shared"), None, true),
+            (
+                "its own endpoint prefix, signed for it",
+                Some("shared-control"),
+                None,
+                true,
+            ),
+            (
+                "its own endpoint prefix, host-addressed and unsigned",
+                None,
+                Some("shared-control.us-east-1.amazonaws.com"),
+                true,
+            ),
+            (
+                "the shared signing name as a host, unsigned",
+                None,
+                Some("shared.us-east-1.amazonaws.com"),
+                true,
+            ),
+            (
+                "another service's host, unsigned",
+                None,
+                Some("lambda.us-east-1.amazonaws.com"),
+                false,
+            ),
+            (
+                // The credential scope outranks the host, so a request signed for
+                // another service does not reach this endpoint however it is addressed.
+                "another service's scope on this endpoint's host",
+                Some("lambda"),
+                Some("shared-control.us-east-1.amazonaws.com"),
+                false,
+            ),
+            ("no routing signal at all", None, None, false),
+        ];
+
+        for (case, scope, host, expected) in rows {
+            let mut builder = http::Request::builder().method("POST").uri("/widgets/");
+            if let Some(scope) = scope {
+                builder = builder.header("authorization", authorization(scope));
+            }
+            if let Some(host) = host {
+                builder = builder.header("host", host);
+            }
+            let parts = builder
+                .body(())
+                .expect("a well-formed test request")
+                .into_parts()
+                .0;
+            let actual = routes_to_any(&parts, KEYS);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected routes_to_any == {expected}, got {actual}"
             );
         }
     }
