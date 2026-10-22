@@ -94,7 +94,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // is what made this service claim its peer's paths too. `claims_request` therefore
         // claims a request only when the service that target NAMES is this one, leaving
         // AppRegistry's `/applications/…`, `/attribute-groups/…`, `/configuration`,
-        // `/sync/…` and `/tags/…` space to it alone.
+        // `/sync/…` and `/tags/…` space to it alone — and a request that names THIS
+        // service while addressing one of those paths contradicts itself, so the shared
+        // rule gives it to neither.
         service_common::claims_request(
             parts,
             self.entry.identity().signing_name(),

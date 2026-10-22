@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +140,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagOptions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: listing TagOptions reports stored state and writes nothing,
+        // page tokens included — a token is derived from the id it resumes at.
+        let state = state.lock();
+
+        // A page token is this service's own opaque cursor: the id the next page
+        // resumes AT. Anything that is not one of ours is a bad parameter.
+        let resume_at = match input.page_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => match crate::state::decode_page_cursor(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(ListTagOptionsErrorModeled::InvalidParametersException(
+                        InvalidParametersException {
+                            message: Some("PageToken is not a valid page token.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // `PageSize` is modelled `0..20` with a default of 0, and 0 asks for no
+        // caller-imposed bound: the whole remaining set is returned, which the store's
+        // own bound caps.
+        let page_size = if input.page_size > 0 {
+            input.page_size as usize
+        } else {
+            crate::state::MAX_TAG_OPTIONS
+        };
+
+        // `Filters` narrows the set by key, by value and by active state; a filter
+        // the request does not carry constrains nothing.
+        let filters = input.filters.unwrap_or_default();
+        let matches = |option: &crate::state::TagOption| {
+            filters
+                .key
+                .as_ref()
+                .is_none_or(|key| key.is_empty() || option.key == *key)
+                && filters
+                    .value
+                    .as_ref()
+                    .is_none_or(|value| value.is_empty() || option.value == *value)
+                && filters.active.is_none_or(|active| option.active == active)
+        };
+
+        // The cursor is a map RANGE, not a scan: resuming costs the page, not the
+        // store — which is why the TagOptions live in an ordered map.
+        let lower = match &resume_at {
+            Some(start) => ::std::ops::Bound::Included(start.clone()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut tag_option_details = Vec::new();
+        let mut page_token = None;
+        for (id, option) in state
+            .tag_options
+            .range((lower, ::std::ops::Bound::Unbounded))
+            .filter(|(_, option)| matches(option))
+        {
+            if tag_option_details.len() == page_size {
+                // More remain: hand back a cursor that resumes at this id.
+                page_token = Some(crate::state::encode_page_cursor(id));
+                break;
+            }
+            tag_option_details.push(option.detail());
+        }
+
+        Ok(ListTagOptionsOutput {
+            tag_option_details: Some(tag_option_details),
+            page_token,
+        })
     }
 }

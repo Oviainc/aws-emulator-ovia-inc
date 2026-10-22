@@ -215,11 +215,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // Only the artifact the request DESCRIBES is created here. A Repo product's first
-        // artifact is whatever a sync fetches from the connected repository, and this
-        // emulator makes no outbound connections, so no sync has run and the product is
-        // stored with no version rather than with a fabricated one. Its control plane
-        // record — the product, its ARN, its tags — is real either way.
+
+        // The `Info` map that IS the template source must also NAME a source this
+        // service can resolve. `ProvisioningArtifactProperties$Info` states the
+        // contract: "Specify the template source with one of the following options, but
+        // not both. Keys accepted: [ LoadTemplateFromURL, ImportFromPhysicalId ]", with
+        // `LoadTemplateFromURL` "the URL of the CloudFormation template in Amazon S3 or
+        // GitHub in JSON format" and `ImportFromPhysicalId` "the physical id of the
+        // resource that contains the template. Currently only supports CloudFormation
+        // stack arn". A map that breaks that contract names no readable template, which
+        // is the same `InvalidParametersException` as above.
+        if let Some(info) = input
+            .provisioning_artifact_parameters
+            .as_ref()
+            .and_then(|properties| properties.info.as_ref())
+            .filter(|info| !info.is_empty())
+        {
+            if let Some(violation) = template_source_violation(info) {
+                return Err(CreateProductErrorModeled::InvalidParametersException(
+                    InvalidParametersException {
+                        message: Some(violation),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Only the artifact the request DESCRIBES is created here. A Repo product's
+        // first artifact is whatever a sync fetches from the connected repository, and
+        // this emulator makes no outbound connections, so no sync has run and the
+        // product is stored with no version rather than with a fabricated one. Its
+        // control plane record — the product, its ARN, its tags — is real either way.
         let artifact_properties = input
             .provisioning_artifact_parameters
             .filter(|_| has_artifact_info);
@@ -316,6 +342,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }),
             provisioning_artifacts,
+            // A new product lives in no portfolio until
+            // `AssociateProductWithPortfolio` puts it in one.
+            portfolio_ids: std::collections::BTreeSet::new(),
         };
 
         let product_view_detail = product.detail();
@@ -333,6 +362,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provisioning_artifact_detail,
             tags: Some(tag_list),
         })
+    }
+}
+
+/// The `Info` key naming a template to read from a URL
+/// (`ProvisioningArtifactProperties$Info`: "Keys accepted: [ `LoadTemplateFromURL`,
+/// `ImportFromPhysicalId` ]").
+const LOAD_TEMPLATE_FROM_URL: &str = "LoadTemplateFromURL";
+
+/// The `Info` key naming the physical id of a resource that contains the template.
+const IMPORT_FROM_PHYSICAL_ID: &str = "ImportFromPhysicalId";
+
+/// Why this `Info` map names no template this service can read, or `None` when it
+/// names one.
+///
+/// Two rules, both from `ProvisioningArtifactProperties$Info`'s own documentation:
+/// every key must be one of the two it accepts ("Keys accepted: [
+/// `LoadTemplateFromURL`, `ImportFromPhysicalId` ]"), and a `LoadTemplateFromURL` must
+/// be what that key takes — "the URL of the CloudFormation template in Amazon S3 or
+/// GitHub in JSON format". What the template CONTAINS is not judged here: reading it
+/// would mean fetching a document from outside the emulator, which this emulator does
+/// not do; nor is the FORM of an `ImportFromPhysicalId`, which names a resource only
+/// the stack behind it could resolve.
+fn template_source_violation(info: &std::collections::HashMap<String, String>) -> Option<String> {
+    if let Some(unknown) = info
+        .keys()
+        .find(|key| key.as_str() != LOAD_TEMPLATE_FROM_URL && key.as_str() != IMPORT_FROM_PHYSICAL_ID)
+    {
+        return Some(format!(
+            "Invalid ProvisioningArtifactParameters.Info key {unknown}: accepted keys are \
+             [{LOAD_TEMPLATE_FROM_URL}, {IMPORT_FROM_PHYSICAL_ID}]"
+        ));
+    }
+    if let Some(url) = info.get(LOAD_TEMPLATE_FROM_URL) {
+        if !is_template_url(url) {
+            return Some(format!(
+                "Invalid {LOAD_TEMPLATE_FROM_URL} {url}: it must be the http or https URL of the \
+                 template document"
+            ));
+        }
+    }
+    // `ImportFromPhysicalId`'s value is a physical resource id, which this service
+    // cannot resolve without the stack it names, so its FORM is not judged here — only
+    // that the key is one the model accepts and that it is not given beside the other.
+    None
+}
+
+/// Whether `value` is an absolute `http`/`https` URL with a host and a non-empty
+/// path — the form `LoadTemplateFromURL` takes ("the URL of the CloudFormation
+/// template in Amazon S3 or GitHub").
+fn is_template_url(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    match rest.split_once('/') {
+        Some((host, path)) => !host.is_empty() && !path.is_empty(),
+        None => false,
     }
 }
 

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +136,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeProduct"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: this operation reports the product `CreateProduct` stored and
+        // writes nothing, so a later caller sees exactly what this one saw.
+        let state = state.lock();
+
+        // Both `Id` and `Name` are optional: the product is addressed by its id, or by
+        // its name when no id is given. Neither names a product, so there is nothing
+        // to look up and the request is refused as invalid rather than as not found.
+        let product = match (
+            input.id.as_deref().filter(|id| !id.is_empty()),
+            input.name.as_deref().filter(|name| !name.is_empty()),
+        ) {
+            (Some(id), _) => state.products.get(id).ok_or_else(|| id.to_string()),
+            (None, Some(name)) => state
+                .products
+                .values()
+                .find(|product| product.name == name)
+                .ok_or_else(|| name.to_string()),
+            (None, None) => {
+                return Err(DescribeProductErrorModeled::InvalidParametersException(
+                    InvalidParametersException {
+                        message: Some(
+                            "Either Id or Name must be provided to identify the product."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
+        let product = match product {
+            Ok(product) => product,
+            Err(identifier) => {
+                return Err(DescribeProductErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "{identifier} does not exist or access was denied"
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        Ok(DescribeProductOutput {
+            product_view_summary: Some(product.view_summary()),
+            provisioning_artifacts: Some(
+                product
+                    .provisioning_artifacts
+                    .values()
+                    .map(crate::state::ProvisioningArtifact::listed)
+                    .collect(),
+            ),
+            // No budget can be associated with a product yet
+            // (`AssociateBudgetWithResource` is still scaffolded), so that set is
+            // empty rather than absent.
+            budgets: Some(Vec::new()),
+            // A launch path is a portfolio this product can be launched through, so
+            // the paths ARE the product's portfolio associations: one per associated
+            // portfolio, named by that portfolio. This is the same stored set
+            // `ProductViewSummary$HasDefaultPath` is derived from, so the two members
+            // of one response cannot contradict each other.
+            launch_paths: Some(
+                product
+                    .portfolio_ids
+                    .iter()
+                    .filter_map(|portfolio_id| state.portfolios.get(portfolio_id))
+                    .map(|portfolio| LaunchPath {
+                        id: Some(portfolio.id.clone()),
+                        name: Some(portfolio.display_name.clone()),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConstraintsForPortfolio
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConstraintsForPortfolio`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConstraintsForPortfolio::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +140,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConstraintsForPortfolio` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConstraintsForPortfolioErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConstraintsForPortfolio"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: the constraints are reported, never changed, by listing them.
+        let state = state.lock();
+
+        // The constraints belong TO the portfolio, so a portfolio this account does
+        // not hold has none to report: that is the not-found case, not an empty page.
+        if !state.portfolios.contains_key(&input.portfolio_id) {
+            return Err(
+                ListConstraintsForPortfolioErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Portfolio not found: {}", input.portfolio_id)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A page token is this service's own opaque cursor: the constraint id the
+        // next page resumes AT. Anything that is not one of ours is a bad parameter.
+        let resume_at = match input.page_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => match crate::state::decode_page_cursor(token) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(
+                        ListConstraintsForPortfolioErrorModeled::InvalidParametersException(
+                            InvalidParametersException {
+                                message: Some("PageToken is not a valid page token.".to_string()),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // `PageSize` is modelled `0..20` with a default of 0, and 0 asks for no
+        // caller-imposed bound: the whole remaining set is returned, which the
+        // store's own bound caps.
+        let page_size = if input.page_size > 0 {
+            input.page_size as usize
+        } else {
+            crate::state::MAX_CONSTRAINTS
+        };
+
+        // `ProductId` narrows the set to the constraints on one product within this
+        // portfolio; absent, every constraint of the portfolio is reported.
+        let product_id = input.product_id.as_deref().filter(|id| !id.is_empty());
+        let lower = match &resume_at {
+            Some(start) => ::std::ops::Bound::Included(start.clone()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut constraint_details = Vec::new();
+        let mut next_page_token = None;
+        for (id, constraint) in state
+            .constraints
+            .range((lower, ::std::ops::Bound::Unbounded))
+            .filter(|(_, constraint)| {
+                constraint.portfolio_id == input.portfolio_id
+                    && product_id.is_none_or(|product| constraint.product_id == product)
+            })
+        {
+            if constraint_details.len() == page_size {
+                // More remain: hand back a cursor that resumes at this id.
+                next_page_token = Some(crate::state::encode_page_cursor(id));
+                break;
+            }
+            constraint_details.push(constraint.detail());
+        }
+
+        Ok(ListConstraintsForPortfolioOutput {
+            constraint_details: Some(constraint_details),
+            next_page_token,
+        })
     }
 }
