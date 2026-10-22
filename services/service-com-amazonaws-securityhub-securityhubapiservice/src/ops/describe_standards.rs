@@ -4,10 +4,13 @@
 //! Reports Security Hub CSPM's published standards catalog
 //! ([`crate::state::STANDARDS_CATALOG`]) for the caller's Region: one `Standard` per
 //! published standard, with its Region-qualified ARN, name, description, provider,
-//! `EnabledByDefault` flag and managing product. The catalog is service metadata, so
-//! the response does not depend on what the account has enabled — but the account
-//! must be subscribed to call Security Hub CSPM at all, which is the modelled
-//! `InvalidAccessException` (401).
+//! `EnabledByDefault` flag and managing product. The catalog is service metadata and
+//! not account data, so it is served whatever the caller has enabled: there is no hub
+//! in the response and no subscription precondition in front of it — discovering the
+//! `StandardsArn` values `BatchEnableStandards` takes is what a caller does BEFORE it
+//! subscribes. Only the hub-scoped operations (the ones that read or write this
+//! account's hub, findings, insights, members or standards subscriptions) refuse an
+//! unsubscribed caller with the modelled `InvalidAccessException` (401).
 //!
 //! `Providers` selects the catalog entries whose `Provider` it names, `MaxResults`
 //! bounds the page and `NextToken` resumes where the previous page stopped. Purely
@@ -172,14 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            DescribeStandardsError::Modeled(DescribeStandardsErrorModeled::InternalException(
-                InternalException {
-                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
-                    code: Some("InternalException".to_string()),
-                },
-            ))
-        })?;
+        // The catalog is the service's own published metadata, identical for every
+        // caller, so this operation reads no account state at all: the engine stays on
+        // `self` as the constructor seam requires, unread.
+        let _ = &self.engine;
+
         let invalid_input = |message: String| {
             DescribeStandardsError::Modeled(DescribeStandardsErrorModeled::InvalidInputException(
                 InvalidInputException {
@@ -189,24 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
 
-        let (account_id, region) = crate::state::hub_key(ctx);
-        // Reporting the catalog still requires a subscription: an account that has
-        // not enabled Security Hub CSPM is not permitted to call it.
-        if !state
-            .lock()
-            .hubs
-            .contains_key(&(account_id.clone(), region.clone()))
-        {
-            return Err(DescribeStandardsErrorModeled::InvalidAccessException(
-                InvalidAccessException {
-                    message: Some(format!(
-                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
-                    )),
-                    code: Some("InvalidAccessException".to_string()),
-                },
-            )
-            .into());
-        }
+        // The catalog is the service's own metadata: it is the same list for every
+        // caller, so nothing here gates on a hub. The only thing the request
+        // contributes is the Region its ARNs are qualified with.
+        let region = crate::state::request_region(ctx);
 
         // A `Providers` list with no values constrains nothing, so it reads the same
         // as an omitted filter; any value the enum does not define is refused rather
