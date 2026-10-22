@@ -11,6 +11,14 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+//
+// `property_aggregates` is declared here, ahead of the sorted list, rather than in
+// its alphabetical place: every other suite this crate has gained was inserted
+// into that list or appended after it, so those are the two spots a concurrent
+// change also edits. Fold it into the list once the churn settles.
+#[path = "all/property_aggregates.rs"]
+mod property_aggregates;
+
 #[path = "all/asset_hierarchies.rs"]
 mod asset_hierarchies;
 #[path = "all/asset_lifecycle.rs"]
