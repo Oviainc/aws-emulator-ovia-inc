@@ -16,6 +16,13 @@
 //! activation becomes due and [`FunctionRecord::materialize`] brings it up to whatever
 //! the clock already made due. Nothing sleeps, and no read invents a transition that
 //! was not owed.
+//!
+//! `GetAccountSettings` reports on the same records at the account level:
+//! "Retrieves details about your account's limits and usage in an Amazon Web Services
+//! Region", so its usage is what the store holds and its unreserved concurrency is what
+//! those records reserve (see
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::account_usage`] and
+//! [`ComAmazonawsLambdaAwsgirapiserviceState::account_limit`]).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -24,8 +31,8 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 use crate::ops::types::{
-    CreateFunctionOutput, EnvironmentResponse, EphemeralStorage, FunctionCodeLocation,
-    PutFunctionConcurrencyOutput, ResolvedS3Object, TracingConfigResponse,
+    AccountLimit, AccountUsage, CreateFunctionOutput, EnvironmentResponse, EphemeralStorage,
+    FunctionCodeLocation, PutFunctionConcurrencyOutput, ResolvedS3Object, TracingConfigResponse,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -122,6 +129,37 @@ pub const MAX_PAGE_SIZE: usize = 50;
 /// `CodeStorageExceededException` rather than growing without bound. AWS caps the
 /// total code storage of an account and answers the same modelled error there.
 pub const MAX_FUNCTIONS: usize = 1_000;
+
+/// `AccountLimit$TotalCodeSize` — "The amount of storage space that you can use for all
+/// deployment packages and layer archives", in bytes.
+///
+/// AWS publishes this quota as 75 GB per account per Region ("Function and layer
+/// storage", Lambda quotas), which is 75 * 1024^3 bytes. It is adjustable on a real
+/// account; this emulator models neither Service Quotas nor an account's adjustments, so
+/// it reports the default.
+pub const TOTAL_CODE_SIZE_LIMIT: i64 = 80_530_636_800;
+
+/// `AccountLimit$CodeSizeUnzipped` — "The maximum size of a function's deployment
+/// package and layers when they're extracted", in bytes.
+///
+/// AWS publishes 250 MB (Lambda quotas, "Deployment package (.zip file archive) size …
+/// 250 MB (unzipped)"), which is 250 * 1024^2 bytes. Not adjustable.
+pub const CODE_SIZE_UNZIPPED_LIMIT: i64 = 262_144_000;
+
+/// `AccountLimit$CodeSizeZipped` — "The maximum size of a deployment package when it's
+/// uploaded directly to Lambda", in bytes.
+///
+/// AWS publishes 50 MB for a direct upload (Lambda quotas, "50 MB (zipped, for direct
+/// upload)"), which is 50 * 1024^2 bytes. Not adjustable.
+pub const CODE_SIZE_ZIPPED_LIMIT: i64 = 52_428_800;
+
+/// `AccountLimit$ConcurrentExecutions` — "The maximum number of simultaneous function
+/// executions".
+///
+/// AWS publishes a default of 1,000 per Region (Lambda quotas, "Concurrent executions"),
+/// adjustable on a real account; this emulator reports the default for the same reason
+/// as [`TOTAL_CODE_SIZE_LIMIT`].
+pub const CONCURRENT_EXECUTIONS_LIMIT: i32 = 1_000;
 
 /// Where the code of a function came from.
 ///
@@ -432,6 +470,61 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
         }
         entries.sort_by(|left, right| left.key.cmp(&right.key));
         entries
+    }
+
+    /// `AccountUsage`: "The number of functions and amount of storage in use", computed
+    /// from the functions this store holds.
+    ///
+    /// `FunctionCount` is "The number of Lambda functions", so it counts functions rather
+    /// than their versions. `TotalCodeSize` is "The amount of storage space, in bytes,
+    /// that's being used by deployment packages and layer archives": each published
+    /// version keeps its own package, and AWS counts every one of them against the code
+    /// storage quota, so the sum covers `$LATEST` and each published version. Layer
+    /// archives add their own term here once `PublishLayerVersion` persists one.
+    #[must_use]
+    pub fn account_usage(&self) -> AccountUsage {
+        let total_code_size = self
+            .functions
+            .values()
+            .flat_map(|function| {
+                std::iter::once(function.config.code_size).chain(
+                    function
+                        .versions
+                        .values()
+                        .map(|published| published.config.code_size),
+                )
+            })
+            .fold(0i64, i64::saturating_add);
+        AccountUsage {
+            total_code_size,
+            function_count: i64::try_from(self.functions.len()).unwrap_or(i64::MAX),
+        }
+    }
+
+    /// `AccountLimit`: the account's quotas, with the one limit that is not a constant
+    /// computed from the store.
+    ///
+    /// `UnreservedConcurrentExecutions` is modelled as "The maximum number of
+    /// simultaneous function executions, minus the capacity that's reserved for
+    /// individual functions with PutFunctionConcurrency", so it is the account's
+    /// concurrency limit less the concurrency the stored functions reserve. The member is
+    /// `@range(min: 0)`, so the subtraction is floored at zero.
+    #[must_use]
+    pub fn account_limit(&self) -> AccountLimit {
+        let reserved = self
+            .functions
+            .values()
+            .filter_map(|function| function.reserved_concurrent_executions)
+            .fold(0i32, i32::saturating_add);
+        AccountLimit {
+            total_code_size: TOTAL_CODE_SIZE_LIMIT,
+            code_size_unzipped: CODE_SIZE_UNZIPPED_LIMIT,
+            code_size_zipped: CODE_SIZE_ZIPPED_LIMIT,
+            concurrent_executions: CONCURRENT_EXECUTIONS_LIMIT,
+            unreserved_concurrent_executions: Some(
+                CONCURRENT_EXECUTIONS_LIMIT.saturating_sub(reserved).max(0),
+            ),
+        }
     }
 }
 
