@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the instances held in the shared store ([`crate::state`]),
+//! applying `instanceNameFilter` / `instanceStateFilter` and `maxResults`, and emits an
+//! opaque `nextToken` that names the record the next page resumes at. The store is a
+//! `BTreeMap` keyed by `instanceId`, so the order a page is cut from is stable and a
+//! token stays meaningful across calls.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInstances"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListInstancesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain instance store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Where this page resumes. The token is opaque on the wire (hex), so a client
+        // cannot read a store key out of it, and one it did not get from a previous
+        // page is a bad request rather than an empty page.
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListInstancesError::from(ListInstancesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "nextToken is not a pagination token this service issued".to_string(),
+                        ),
+                    },
+                ))
+            })?),
+            None => None,
+        };
+
+        let name_filter = input.instance_name_filter.unwrap_or_default();
+        let state_filter = input.instance_state_filter.unwrap_or_default();
+        // `maxResults` carries `@range(0..20)` and `@default(10)`, both applied before
+        // this handler runs, so the value is already in range here. A value outside the
+        // modelled range is therefore unreachable — and is refused as the modelled
+        // `ValidationException` rather than quietly read as a page of zero, so the
+        // invariant is stated where it is relied on.
+        let page_size = usize::try_from(input.max_results).map_err(|_| {
+            ListInstancesError::from(ListInstancesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "maxResults must be between 0 and 20, got {}",
+                        input.max_results
+                    )),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read performs: the transitions the clock owed at `now`.
+        store.materialize_due_transitions(now);
+
+        let mut instances = Vec::new();
+        let mut next_token = None;
+        for record in store.instances.values() {
+            if resume_at
+                .as_deref()
+                .is_some_and(|resume| record.instance_id.as_str() < resume)
+            {
+                continue;
+            }
+            if !name_filter.is_empty()
+                && !name_filter
+                    .iter()
+                    .any(|name| record.instance_name.as_deref() == Some(name.as_str()))
+            {
+                continue;
+            }
+            if !state_filter.is_empty() && !state_filter.contains(&record.state) {
+                continue;
+            }
+            if instances.len() >= page_size {
+                // One more record matches than fits: the token names it, so the next
+                // page resumes exactly where this one stopped. A page of zero gets NO
+                // token — a token that cannot advance would make a client paging in a
+                // loop spin forever.
+                if page_size > 0 {
+                    next_token = Some(encode_page_token(&record.instance_id));
+                }
+                break;
+            }
+            instances.push(record.to_wire());
+        }
+
+        Ok(ListInstancesOutput {
+            instances,
+            next_token,
+        })
     }
+}
+
+/// The stamp every token this operation issues carries: this service, the token format
+/// version, and the list it is a boundary for.
+const PAGE_STAMP: &str = "scn:1:instance:";
+
+/// The page token naming the record keyed `instance_id`.
+///
+/// `InstanceNextToken` is modelled as an opaque string of length 1..1024 and nothing
+/// else, so the token is the stamped resume key hex-encoded: opaque to a client (it
+/// carries no readable store key), 104 characters for a 36-character UUID — inside the
+/// modelled bound — and readable only through [`decode_page_token`]. The stamp is what
+/// lets a forged or foreign value be refused instead of honoured as a boundary.
+fn encode_page_token(instance_id: &str) -> String {
+    ::hex::encode(format!("{PAGE_STAMP}{instance_id}").as_bytes())
+}
+
+/// The resume key a token names, or `None` when `token` is not one this operation
+/// issued — which the caller is told as a `ValidationException`, never as a silently
+/// truncated page.
+fn decode_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let key = decoded.strip_prefix(PAGE_STAMP)?;
+    // Every key this operation pages on is an `instanceId`, so anything else is a
+    // boundary this service could not have issued.
+    crate::state::is_modelled_uuid(key).then(|| key.to_string())
 }

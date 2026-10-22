@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Encodes the opaque `nextToken` ListInstances pages with.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
+# `tokio::time::sleep` lets the tests wait out the clock-owed instance transition; no
+# handler sleeps, so the feature stays out of the production build.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

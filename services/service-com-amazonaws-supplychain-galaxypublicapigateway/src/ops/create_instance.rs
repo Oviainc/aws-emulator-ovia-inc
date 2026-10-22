@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation mints an AWS Supply Chain instance in the shared store
+//! ([`crate::state`]) and answers from the persisted record. Its sibling instance
+//! operations (`GetInstance`, `ListInstances`, `UpdateInstance`, `DeleteInstance`) read
+//! and write the same store, so what this one persists is what they report.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +169,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstance"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateInstanceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the supplychain instance store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due_transitions(now);
+
+        // `clientToken` is an `@idempotencyToken` on an `@idempotent` operation: a
+        // replay carrying the same token answers with the instance the first call
+        // created rather than creating a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store.idempotency.get(token).cloned() {
+                if let Some(record) = store.instances.get(&existing) {
+                    return Ok(CreateInstanceOutput {
+                        instance: record.to_wire(),
+                    });
+                }
+            }
+        }
+
+        // "You can set this [webAppDnsDomain] to a custom value, as long as the domain
+        // isn't already being used by someone else" (the member's own documentation), so
+        // a subdomain a live instance already holds is a conflict.
+        if let Some(domain) = input.web_app_dns_domain.as_deref() {
+            if let Some(holder) = store
+                .instances
+                .values()
+                .find(|record| record.web_app_dns_domain.as_deref() == Some(domain))
+            {
+                return Err(CreateInstanceErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "webAppDnsDomain {domain} is already used by instance {}",
+                        holder.instance_id
+                    )),
+                })
+                .into());
+            }
+        }
+
+        // The store holds its instances for the life of the process and this is the only
+        // operation that adds one, so the record count is capped here and a create past
+        // the cap is refused with the modelled quota error rather than stored.
+        if store.at_capacity() {
+            return Err(CreateInstanceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of instances has reached the quota of {}",
+                        crate::state::MAX_INSTANCES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(instance_id) = store.fresh_instance_id() else {
+            return Err(CreateInstanceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("could not mint a fresh instanceId".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut record = crate::state::InstanceRecord::new(instance_id.clone(), now);
+        record.instance_name = input.instance_name;
+        record.instance_description = input.instance_description;
+        record.kms_key_arn = input.kms_key_arn;
+        record.web_app_dns_domain = input.web_app_dns_domain;
+        if let Some(tags) = input.tags {
+            record.tags = tags.into_iter().collect();
+        }
+
+        // The response is projected from the record that is about to be persisted, so
+        // nothing in it can differ from what a later GetInstance reports.
+        let instance = record.to_wire();
+        store.instances.insert(instance_id.clone(), record);
+        if let Some(token) = input.client_token {
+            store.idempotency.insert(token, instance_id);
+        }
+
+        Ok(CreateInstanceOutput { instance })
     }
 }
