@@ -257,7 +257,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let configuration = input.certificate_authority_configuration;
         let record = crate::state::CertificateAuthorityRecord {
-            csr_pem: crate::state::derive_csr_pem(&arn, &configuration),
+            csr_pem: crate::state::derive_csr_pem(&arn, &configuration).ok_or_else(|| {
+                invalid_args(
+                    "CertificateAuthorityConfiguration.Subject cannot be encoded as an X.500 \
+                     distinguished name",
+                )
+            })?,
             owner_account: ::emulator_server::emulator_account_id().to_string(),
             ca_type: input.certificate_authority_type,
             // A new CA is returned in CREATING and settles into PENDING_CERTIFICATE on
@@ -314,6 +319,38 @@ fn validate_configuration(
             "CertificateAuthorityConfiguration.Subject must carry at least one X.500 \
              distinguished name attribute",
         ));
+    }
+    validate_algorithms(configuration)?;
+    Ok(())
+}
+
+/// A CA signs with the key it was created with, so the signing algorithm has to be one
+/// of that key's.
+///
+/// "The specified signing algorithm family (RSA or ECDSA) must match the algorithm family
+/// of the CA's secret key." (`IssueCertificateRequest` documentation, the rule the CA's
+/// own `CertificateAuthorityConfiguration` is built under: `SigningAlgorithm` is the
+/// "name of the algorithm your private CA uses to sign certificate requests", and it can
+/// only be an algorithm that key can sign with.) The pairing is refused before the CA is
+/// persisted, and the message names the rejected algorithm, the key it cannot be used
+/// with and the algorithms that key can sign with.
+fn validate_algorithms(
+    configuration: &CertificateAuthorityConfiguration,
+) -> Result<(), CreateCertificateAuthorityError> {
+    let key_algorithm = configuration.key_algorithm.as_str();
+    let signing_algorithm = configuration.signing_algorithm.as_str();
+    let (Some(key_family), Some(signing_family)) = (
+        crate::state::algorithm_family(key_algorithm),
+        crate::state::algorithm_family(signing_algorithm),
+    ) else {
+        return Ok(());
+    };
+    if key_family != signing_family {
+        return Err(invalid_args(format!(
+            "Signing algorithm {signing_algorithm} cannot be used with key type \
+             {key_algorithm}. Valid signing algorithms are: {}.",
+            crate::state::signing_algorithms_for_key(key_algorithm).join(", ")
+        )));
     }
     Ok(())
 }
@@ -381,10 +418,7 @@ fn validate_tags(tags: Option<&[Tag]>) -> Result<(), CreateCertificateAuthorityE
     let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
     for tag in tags.unwrap_or_default() {
         if tag.key.starts_with("aws:") {
-            return Err(invalid_tag(format!(
-                "the tag key '{}' uses the reserved 'aws:' prefix",
-                tag.key
-            )));
+            return Err(invalid_tag(crate::state::RESERVED_TAG_MESSAGE));
         }
         if !seen.insert(tag.key.as_str()) {
             return Err(invalid_tag(format!(

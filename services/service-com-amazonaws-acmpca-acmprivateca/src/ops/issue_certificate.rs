@@ -223,9 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::parse_certificate_authority_arn(&ca_arn).is_none() {
             return Err(IssueCertificateErrorModeled::InvalidArnException(
                 InvalidArnException {
-                    message: Some(format!(
-                        "'{ca_arn}' does not refer to a certificate authority in this service"
-                    )),
+                    message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -234,31 +232,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !template_arn.contains(":template/") {
                 return Err(IssueCertificateErrorModeled::InvalidArnException(
                     InvalidArnException {
-                        message: Some(format!(
-                            "'{template_arn}' does not refer to a certificate template"
-                        )),
+                        message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
                     },
                 )
                 .into());
             }
-        }
-
-        // The certification request the CA is asked to answer has to be a PKCS#10 PEM
-        // block; anything else is malformed, whatever the CA's state.
-        if ::std::str::from_utf8(&input.csr)
-            .ok()
-            .and_then(|text| crate::state::parse_pem_block(text, crate::state::PEM_LABEL_CSR))
-            .is_none()
-        {
-            return Err(IssueCertificateErrorModeled::MalformedCSRException(
-                MalformedCSRException {
-                    message: Some(
-                        "Csr must be a PEM-encoded CERTIFICATE REQUEST block whose body is base64"
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -283,19 +261,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Only a CA that holds its own certificate can sign with it.
+        // Only a CA that holds its own certificate can sign with it. The CA's state is
+        // judged before the body of the request: whether this CA may issue at all does
+        // not depend on what was asked of it, and the service answers the state error
+        // for a CA that has not been activated whatever the request carries.
         if record.status != crate::state::STATUS_ACTIVE {
             return Err(IssueCertificateErrorModeled::InvalidStateException(
                 InvalidStateException {
-                    message: Some(format!(
-                        "the certificate authority {ca_arn} is in state {}, which cannot issue \
-                         certificates",
-                        record.status
-                    )),
+                    message: Some(crate::state::ISSUANCE_INVALID_STATE_MESSAGE.to_string()),
                 },
             )
             .into());
         }
+
+        // The certification request the CA is asked to answer has to be a PEM-framed
+        // DER PKCS#10 certification request; anything else is malformed.
+        let Some(request) = ::std::str::from_utf8(&input.csr)
+            .ok()
+            .and_then(|text| crate::state::parse_pem_block(text, crate::state::PEM_LABEL_CSR))
+            .and_then(|der| crate::state::parse_certification_request(&der))
+        else {
+            return Err(IssueCertificateErrorModeled::MalformedCSRException(
+                MalformedCSRException {
+                    message: Some(
+                        "Csr must be a PEM-encoded CERTIFICATE REQUEST block carrying a DER \
+                         PKCS#10 certification request"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
 
         // @idempotent: a repeat of the same token inside the five-minute window answers
         // with the certificate the first call issued instead of issuing a second one.
@@ -335,9 +331,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let (Some(key_family), Some(signature_family)) = (key_family, signature_family) {
             if key_family != signature_family {
                 return Err(invalid_args(format!(
-                    "SigningAlgorithm {} does not match the {key_algorithm} key of certificate \
-                     authority {ca_arn}",
-                    input.signing_algorithm
+                    "Signing algorithm {} cannot be used with key type {key_algorithm}. Valid \
+                     signing algorithms are: {}.",
+                    input.signing_algorithm,
+                    crate::state::signing_algorithms_for_key(&key_algorithm).join(", ")
                 )));
             }
         }
@@ -377,16 +374,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let serial = crate::state::mint_serial(&format!("{ca_arn}|{}", record.next_serial));
         let arn = format!("{ca_arn}/certificate/{serial}");
+        // `TemplateArn` is persisted on the issued certificate but is deliberately not
+        // materialised in the certificate's DER: a template is a named set of X.509
+        // extensions (basic constraints, key usage, extended key usage, the policies a
+        // template implies), and this emulator does not hold those definitions, so
+        // synthesising extensions for one would be inventing the content a template
+        // carries. The certificate therefore carries no extensions, and the template the
+        // caller named stays readable on the resource.
+        let Some(certificate_pem) = crate::state::derive_certificate_pem(
+            record,
+            &serial,
+            &request.info,
+            &input.signing_algorithm,
+            not_before,
+            not_after,
+        ) else {
+            return Err(invalid_args(
+                "the certificate this request asks for cannot be encoded: the certification \
+                 request's subject, or the resolved validity window, is not one a certificate \
+                 can carry",
+            ));
+        };
         let certificate = crate::state::IssuedCertificate {
-            certificate_pem: crate::state::derive_certificate_pem(
-                record,
-                &serial,
-                &input.csr,
-                &input.signing_algorithm,
-                input.template_arn.as_ref(),
-                not_before,
-                not_after,
-            ),
+            certificate_pem,
             certificate_chain_pem: record.issued_chain(),
             signing_algorithm: input.signing_algorithm,
             template_arn: input.template_arn,

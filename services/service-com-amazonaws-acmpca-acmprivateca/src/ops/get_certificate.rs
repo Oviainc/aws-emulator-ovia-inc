@@ -158,18 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let ca_arn = input.certificate_authority_arn;
         if crate::state::parse_certificate_authority_arn(&ca_arn).is_none() {
-            return Err(invalid_arn(format!(
-                "'{ca_arn}' does not refer to a certificate authority in this service"
-            )));
+            return Err(invalid_arn(crate::state::INVALID_ARN_MESSAGE.to_string()));
         }
         let certificate_arn = input.certificate_arn;
         let Some((issuing_ca_arn, _serial)) =
             crate::state::parse_certificate_arn(&certificate_arn)
         else {
-            return Err(invalid_arn(format!(
-                "'{certificate_arn}' does not refer to a certificate issued by a certificate \
-                 authority"
-            )));
+            return Err(invalid_arn(crate::state::INVALID_ARN_MESSAGE.to_string()));
         };
 
         // A certificate ARN carries the ARN of the CA that issued it as its prefix, so
@@ -201,18 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if record.status == crate::state::STATUS_CREATING {
             return Err(GetCertificateErrorModeled::RequestInProgressException(
                 RequestInProgressException {
-                    message: Some(format!(
-                        "the certificate authority {ca_arn} is still being created"
-                    )),
+                    message: Some(crate::state::CREATE_IN_PROGRESS_MESSAGE.to_string()),
                 },
             )
             .into());
         }
 
         let Some(certificate) = record.certificates.get(&certificate_arn) else {
-            return Err(not_found(format!(
-                "the certificate {certificate_arn} was not found"
-            )));
+            return Err(not_found(
+                crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
+            ));
         };
         // Issuance is asynchronous: until it completes the request is still in progress.
         if !certificate.is_available(now) {
