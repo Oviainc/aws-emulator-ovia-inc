@@ -11,9 +11,11 @@
 //! `GlobalSecondaryIndexes` and `LocalSecondaryIndexes` are stored with the table and
 //! reported back in its `TableDescription` — a local index with the table's own
 //! partition key and its own sort key, and no status or throughput of its own, as the
-//! model's `LocalSecondaryIndexDescription` declares it; vector indexes, streams, SSE,
-//! resource policies and the other members this slice does not store are refused with
-//! the scaffold's 501 and filed as their own gap issues.
+//! model's `LocalSecondaryIndexDescription` declares it; a `ResourcePolicy` is parsed
+//! and attached to the stored table, so the data plane enforces it from the table's
+//! first request ("the policy application is strongly consistent"); vector indexes,
+//! streams, SSE and the other members this slice does not store are refused with the
+//! scaffold's 501 and filed as their own gap issues.
 //!
 //! The table is stored under the REGION the request was signed for, because that is
 //! the scope a table name is unique in ("table names must be unique within each
@@ -290,6 +292,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let tags = crate::state::tag_set_from_request(requested_tags).map_err(lift)?;
 
+        // "When you attach a resource-based policy while creating a table, the policy
+        // application is strongly consistent" (`CreateTable$ResourcePolicy`), so the
+        // policy is parsed here, attached to the stored table and effective at once —
+        // the table's first data-plane request already sees it.
+        let resource_policy = match input.resource_policy.as_deref() {
+            Some(document) => Some(
+                crate::state::AttachedPolicy::attach(document, now)
+                    .map_err(|fault| lift_policy_fault(&input.table_name, fault))?,
+            ),
+            None => None,
+        };
+
         let key_schema = validated_key_schema(&input).map_err(lift)?;
         let (billing_mode, provisioned_throughput) = validated_throughput(&input).map_err(lift)?;
         let region = crate::state::request_region(ctx.parts());
@@ -367,6 +381,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: None,
             pay_per_request_at,
             removed_at: None,
+            resource_policy,
             items: ::std::collections::BTreeMap::new(),
             stored_bytes: 0,
         };
@@ -428,6 +443,27 @@ fn too_many_tags(requested: usize) -> CreateTableError {
     .into()
 }
 
+/// Lift a refusal of the `ResourcePolicy` document into this operation's error
+/// channel: the documented size limit is a modelled limit error, and a document that
+/// is not a policy is a bad request.
+fn lift_policy_fault(resource: &str, fault: crate::state::PolicyFault) -> CreateTableError {
+    match fault {
+        crate::state::PolicyFault::TooLarge(size) => {
+            CreateTableErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(format!(
+                    "Policy size exceeds the maximum supported size of {} bytes for resource \
+                     {resource}: {size} bytes",
+                    crate::state::MAX_RESOURCE_POLICY_BYTES
+                )),
+            })
+            .into()
+        }
+        crate::state::PolicyFault::Invalid(detail) => {
+            crate::scaffolded::Scaffolded::validation(detail)
+        }
+    }
+}
+
 /// The first input member present that this slice does not store, if any.
 fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
     if input
@@ -452,9 +488,6 @@ fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
         .is_some_and(|specification| specification.enabled.unwrap_or(false))
     {
         return Some("SSESpecification");
-    }
-    if input.resource_policy.is_some() {
-        return Some("ResourcePolicy");
     }
     if input.global_table_source_arn.is_some() {
         return Some("GlobalTableSourceArn");
