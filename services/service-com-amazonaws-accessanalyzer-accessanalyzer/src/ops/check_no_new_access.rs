@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CheckNoNewAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CheckNoNewAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CheckNoNewAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Decides whether an updated policy document allows any access the existing policy
+//! document does not. The answer is COMPUTED from the two documents the request
+//! carries: both are parsed as IAM policies and compared by evaluating them, with IAM's
+//! own evaluation rules, over a finite set of access requests derived from the patterns
+//! and condition values the two documents themselves name (see [`policy`]). Nothing is
+//! keyed to a particular document, and no result is hardcoded.
+//!
+//! The operation is `@readonly` in the model (`smithy_query(query="operation",
+//! operation="CheckNoNewAccess")`) and names no resource: it is a pure function of the
+//! request, so it reads nothing out of [`crate::state`] and — being a report — writes
+//! nothing into it either.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +131,21 @@ impl From<CheckNoNewAccessErrorModeled> for CheckNoNewAccessError {
     }
 }
 
+/// The `result` value for "no new access": one of the model's own
+/// `CheckNoNewAccessResult` values, listed in this crate as
+/// [`CHECK_NO_NEW_ACCESS_RESULT_VALUES`].
+const RESULT_PASS: &str = "PASS";
+
+/// The `result` value for "the updated policy allows access the existing one does not",
+/// from the same modelled value list.
+const RESULT_FAIL: &str = "FAIL";
+
+/// The `existingPolicyDocument` member name, as a validation refusal reports it.
+const EXISTING_MEMBER: &str = "existingPolicyDocument";
+
+/// The `newPolicyDocument` member name, as a validation refusal reports it.
+const NEW_MEMBER: &str = "newPolicyDocument";
+
 /// The `CheckNoNewAccess` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +182,1577 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CheckNoNewAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CheckNoNewAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CheckNoNewAccess"))
+        // A pure comparison of the two documents: no request metadata and no stored
+        // state take part in it (see this module's docs).
+        let _ = (ctx, &self.engine);
+
+        let flavor = policy::Flavor::from_policy_type(&input.policy_type).ok_or_else(|| {
+            field_validation(
+                "policyType",
+                format!(
+                    "policyType must be one of {}",
+                    ACCESS_CHECK_POLICY_TYPE_VALUES.join(", ")
+                ),
+            )
+        })?;
+
+        let existing = policy::parse(&input.existing_policy_document, EXISTING_MEMBER, flavor)
+            .map_err(render_engine_error)?;
+        let updated =
+            policy::parse(&input.new_policy_document, NEW_MEMBER, flavor).map_err(render_engine_error)?;
+
+        // The comparison is a bounded but CPU-bound search (see `policy`'s budgets), so
+        // it runs on the blocking pool: a comparison at the top of its budget cannot
+        // starve the async worker that serves health checks and other requests.
+        let comparison =
+            ::tokio::task::spawn_blocking(move || policy::new_access(&existing, &updated, flavor))
+                .await;
+        let new_access = match comparison {
+            Ok(outcome) => outcome.map_err(render_engine_error)?,
+            // A panic or a cancellation on the pool says nothing about the policies, so
+            // it is reported as the server fault it is rather than as a result.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = Self::NAME,
+                    error = %error,
+                    "the policy comparison did not complete"
+                );
+                return Err(CheckNoNewAccessErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the policy comparison did not complete".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into());
+            }
+        };
+
+        // An access record for the call: the operation, the outcome and how many
+        // statements were reported. At INFO, so the trail is there under the default
+        // subscriber filter, and never the documents, which are `@sensitive`.
+        ::tracing::info!(
+            operation = Self::NAME,
+            result = if new_access.is_empty() {
+                RESULT_PASS
+            } else {
+                RESULT_FAIL
+            },
+            reasons = new_access.len(),
+            "compared an updated policy against an existing one"
+        );
+
+        if new_access.is_empty() {
+            return Ok(CheckNoNewAccessOutput {
+                result: Some(RESULT_PASS.to_string()),
+                message: Some("The modified permissions do not grant new access.".to_string()),
+                // Nothing in the updated policy grants new access, so there is no
+                // statement to report a reason about.
+                reasons: None,
+            });
+        }
+
+        Ok(CheckNoNewAccessOutput {
+            result: Some(RESULT_FAIL.to_string()),
+            message: Some("The modified permissions grant new access.".to_string()),
+            reasons: Some(
+                new_access
+                    .into_iter()
+                    .map(|found| ReasonSummary {
+                        description: Some(format!(
+                            "New access in the statement with index: {}.",
+                            found.statement_index
+                        )),
+                        statement_index: Some(found.statement_index),
+                        statement_id: found.statement_id,
+                    })
+                    .collect(),
+            ),
+        })
+    }
+}
+
+/// Refuse a request member as invalid, with this service's OWN modelled
+/// `ValidationException` (HTTP 400) rather than the scaffold's synthetic one: the
+/// modelled shape carries the `reason` and the `fieldList` a client reads.
+fn field_validation(member: &str, message: String) -> CheckNoNewAccessError {
+    CheckNoNewAccessErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }]),
+    })
+    .into()
+}
+
+/// Render a comparison failure as the modelled error that says what happened.
+///
+/// A document that is not JSON, or not a policy, is a bad request member: HTTP 400
+/// `ValidationException`, with the model's own `cannotParse` / `fieldValidationFailed`
+/// reason and the member named in `fieldList`. A policy the engine cannot decide
+/// FAITHFULLY (a condition operator it does not model, or a comparison past its
+/// evaluation budget) is answered with the modelled HTTP 422
+/// `UnprocessableEntityException` — "the specified entity could not be processed" — and
+/// never with a guessed PASS or FAIL.
+fn render_engine_error(error: policy::EngineError) -> CheckNoNewAccessError {
+    // A refusal record for the call: which member, and which kind of refusal. At INFO
+    // beside the success record, and the details are structural (a member name, a JSON
+    // position, a budget), never document content.
+    ::tracing::info!(
+        operation = "CheckNoNewAccess",
+        refusal = error.kind(),
+        member = error.member().unwrap_or("-"),
+        "refused a policy comparison"
+    );
+    match error {
+        policy::EngineError::Unparseable { member, detail } => {
+            CheckNoNewAccessErrorModeled::ValidationException(ValidationException {
+                message: format!("{member} is not a JSON document: {detail}"),
+                reason: VALIDATION_REASON_CANNOT_PARSE.to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: member.to_string(),
+                    message: format!("not a JSON document: {detail}"),
+                }]),
+            })
+            .into()
+        }
+        policy::EngineError::Invalid { member, detail } => {
+            field_validation(member, format!("{member} is not a valid policy: {detail}"))
+        }
+        policy::EngineError::Unsupported { detail } => {
+            CheckNoNewAccessErrorModeled::UnprocessableEntityException(UnprocessableEntityException {
+                message: detail,
+            })
+            .into()
+        }
+    }
+}
+
+/// The `ValidationExceptionReason` for a document that could not be parsed at all, from
+/// the model's own [`VALIDATION_EXCEPTION_REASON_VALUES`].
+const VALIDATION_REASON_CANNOT_PARSE: &str = "cannotParse";
+
+/// A self-contained IAM policy comparison engine: does an updated policy allow any
+/// access the existing policy does not?
+///
+/// ## How the decision is reached
+///
+/// Both documents are parsed into statements, and then evaluated with IAM's own
+/// evaluation rules (an explicit `Deny` wins; otherwise an access is allowed when some
+/// `Allow` statement matches it; otherwise it is implicitly denied) over a FINITE set of
+/// access requests — an action, a resource, a principal and a request context — that is
+/// derived from the two documents themselves:
+///
+/// * every literal pattern either document names is a candidate value, so two documents
+///   that name the same thing are compared on it;
+/// * every pattern that carries a wildcard contributes WITNESS values: the pattern with
+///   `*` replaced by a token that occurs nowhere in either document, and the pattern with
+///   `*` deleted. A wildcard that is wider in one document than in the other is what
+///   those witnesses expose;
+/// * every condition key either document constrains contributes a set of candidate
+///   values (its literals, the witnesses of its `StringLike` patterns, the numbers and
+///   timestamps either side of its bounds, `true`/`false` for `Bool`) plus the case where
+///   the key is absent from the request.
+///
+/// The result is `new access` exactly when some access request in that set is allowed by
+/// the updated policy and not allowed by the existing one. The set is finite by
+/// construction, so the decision terminates; it is derived from the request, so no
+/// answer is keyed to a particular document.
+///
+/// ## What it does not model
+///
+/// The candidate set is an abstraction of the infinite set of real access requests:
+/// it exposes a widened wildcard, action, resource, principal, effect or condition, but
+/// two policies whose difference is only visible on a string no pattern in either
+/// document suggests can compare equal. Where the engine would have to GUESS it refuses
+/// instead, with [`EngineError::Unsupported`]: the multivalued set operators
+/// (`ForAllValues:`/`ForAnyValue:`), condition operators it does not model
+/// (`IpAddress`, `BinaryEquals`, …) and a comparison larger than its evaluation budget.
+/// Policy variables (`${aws:username}`) are compared as the literal text they are.
+///
+/// It also does NOT perform the document-level validation the real service performs
+/// beyond the policy grammar and the ceilings below: it does not require or check the
+/// `Version` element, does not check that an `Action` has the `service:Action` form,
+/// does not check that a `Resource` is a well-formed ARN, and its document-size ceiling
+/// is the emulator's own, well above the sizes IAM publishes, so a document the real
+/// service would refuse on size is compared here. Those are deliberate omissions —
+/// guessing those grammars would refuse documents the real service accepts — and none of
+/// them changes the answer for a document that satisfies them.
+///
+/// ## What it refuses rather than grows into
+///
+/// Every dimension of the work is derived from the two caller-supplied documents, so
+/// each one is CLAMPED BEFORE anything is allocated or evaluated: the document length,
+/// the statement count, the values per element, the condition clauses per statement, the
+/// values per clause and the LENGTH of each one, and the distinct condition keys (all at
+/// parse time, HTTP 400), then the request-context product, the access-request count, a
+/// step budget charged for every character comparison and a wall-clock deadline that
+/// covers the candidate derivation as well as the search (all HTTP 422). A request
+/// context holds shared handles rather than copies of the values, so its size does not
+/// depend on how long they are, and the comparison itself allocates nothing per
+/// decision.
+pub mod policy {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use serde_json::Value;
+
+    /// The longest policy document this emulator will compare.
+    ///
+    /// `AccessCheckPolicyDocument` carries no `@length` in the model
+    /// (`smithy_query(query="shape", shape="AccessCheckPolicyDocument")`), so nothing in
+    /// the model bounds it: this is the emulator's OWN ceiling, above every policy size
+    /// IAM itself publishes (10,240 characters for a managed policy, 20 KB for an S3
+    /// bucket policy), so no realistic document meets it.
+    pub const MAX_DOCUMENT_BYTES: usize = 65_536;
+
+    /// The most statements one document may carry.
+    pub const MAX_STATEMENTS: usize = 256;
+
+    /// The most values one `Action`/`Resource`/`Principal` element may list.
+    pub const MAX_ELEMENT_VALUES: usize = 512;
+
+    /// The most condition clauses (operator and key pairs) one statement may carry.
+    pub const MAX_CONDITION_CLAUSES: usize = 64;
+
+    /// The most values one condition clause may list.
+    pub const MAX_CONDITION_VALUES: usize = 512;
+
+    /// The longest one condition value may be.
+    ///
+    /// A condition value is an org id, an account id, an ARN, a tag value or a
+    /// timestamp; this ceiling is far above all of them. It bounds the BYTES a candidate
+    /// value can contribute, so the request contexts are bounded in size as well as in
+    /// number.
+    pub const MAX_CONDITION_VALUE_BYTES: usize = 2_048;
+
+    /// The most distinct condition keys the two documents together may constrain.
+    ///
+    /// The request contexts are the product over these keys, so this is the first factor
+    /// of that product.
+    pub const MAX_CONDITION_KEYS: usize = 12;
+
+    /// How many request contexts the comparison will enumerate before refusing.
+    ///
+    /// The contexts are the product over every condition key the two documents
+    /// constrain, so this is the bound that keeps a document with many keys from
+    /// exploding; a comparison past it is refused, not approximated. Checked BEFORE the
+    /// vector for the next key is allocated.
+    pub const MAX_CONTEXTS: usize = 4_096;
+
+    /// How many access decisions one comparison will make before refusing.
+    pub const MAX_ACCESS_REQUESTS: usize = 400_000;
+
+    /// How many comparison steps one request may spend.
+    ///
+    /// A step is one character comparison inside a pattern match, one statement visited
+    /// or one condition clause evaluated, so this bounds the real work of a comparison —
+    /// not just the NUMBER of decisions — whatever the statement, pattern and value
+    /// lengths the documents carry.
+    pub const MAX_COMPARISON_STEPS: u64 = 50_000_000;
+
+    /// How long one comparison may take before it is refused.
+    ///
+    /// A backstop beside [`MAX_COMPARISON_STEPS`]: the step budget bounds the work and
+    /// this bounds the time it takes on any machine.
+    pub const MAX_COMPARISON_TIME: Duration = Duration::from_secs(2);
+
+    /// How many access requests the search walks between two deadline checks.
+    const DEADLINE_CHECK_EVERY: u32 = 512;
+
+    /// The principal types a `Principal` map may key.
+    ///
+    /// From the IAM JSON policy grammar's `Principal` element.
+    const PRINCIPAL_KINDS: &[&str] = &["aws", "service", "federated", "canonicaluser"];
+
+    /// Which policy grammar the two documents follow, from the request's `policyType`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Flavor {
+        /// `IDENTITY_POLICY`: permissions attached to a principal, so a statement names
+        /// no `Principal` at all.
+        Identity,
+        /// `RESOURCE_POLICY`: permissions attached to a resource, so a statement names
+        /// the principals it grants to.
+        Resource,
+    }
+
+    impl Flavor {
+        /// The flavor a modelled `AccessCheckPolicyType` value selects, or `None` for a
+        /// value the enum does not list.
+        pub fn from_policy_type(policy_type: &str) -> Option<Self> {
+            match policy_type {
+                "IDENTITY_POLICY" => Some(Self::Identity),
+                "RESOURCE_POLICY" => Some(Self::Resource),
+                _ => None,
+            }
+        }
+    }
+
+    /// Why a comparison could not be made.
+    #[derive(Debug)]
+    pub enum EngineError {
+        /// The document is not JSON.
+        Unparseable {
+            /// The request member that carried it.
+            member: &'static str,
+            /// What the JSON parser reported (a position, never document content).
+            detail: String,
+        },
+        /// The document is JSON, but not a policy.
+        Invalid {
+            /// The request member that carried it.
+            member: &'static str,
+            /// Which element is wrong, in the policy grammar's own words.
+            detail: String,
+        },
+        /// The comparison cannot be decided faithfully.
+        Unsupported {
+            /// What the engine cannot decide, and why.
+            detail: String,
+        },
+    }
+
+    impl EngineError {
+        /// Which kind of refusal this is, for a log line that carries no document
+        /// content.
+        pub fn kind(&self) -> &'static str {
+            match self {
+                Self::Unparseable { .. } => "unparseable",
+                Self::Invalid { .. } => "invalid",
+                Self::Unsupported { .. } => "unsupported",
+            }
+        }
+
+        /// The request member to blame, when the refusal names one.
+        pub fn member(&self) -> Option<&'static str> {
+            match self {
+                Self::Unparseable { member, .. } | Self::Invalid { member, .. } => Some(member),
+                Self::Unsupported { .. } => None,
+            }
+        }
+    }
+
+    /// What a comparison may still spend.
+    ///
+    /// Charged for every character comparison, statement visit and condition evaluation,
+    /// so a document with few patterns but long ones, or with many statements, is bounded
+    /// by the same budget as one with many patterns.
+    #[derive(Debug)]
+    struct Budget {
+        remaining: u64,
+    }
+
+    impl Budget {
+        /// A budget of `steps` steps.
+        fn new(steps: u64) -> Self {
+            Self { remaining: steps }
+        }
+
+        /// Charge `steps`; `false` once the budget is spent, which every caller turns
+        /// into [`EngineError::Unsupported`].
+        fn spend(&mut self, steps: u64) -> bool {
+            self.remaining = self.remaining.saturating_sub(steps);
+            self.remaining > 0
+        }
+    }
+
+    /// The refusal for a comparison that ran out of budget or time.
+    fn exhausted() -> EngineError {
+        EngineError::Unsupported {
+            detail: format!(
+                "comparing these policies takes more work than this emulator's evaluation budget of {MAX_COMPARISON_STEPS} steps and {} seconds allows",
+                MAX_COMPARISON_TIME.as_secs()
+            ),
+        }
+    }
+
+    /// A statement's `Effect`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Effect {
+        /// `Allow`.
+        Allow,
+        /// `Deny`.
+        Deny,
+    }
+
+    /// An `Action`/`NotAction` or `Resource`/`NotResource` element: the patterns, and
+    /// whether the element was the negated one.
+    #[derive(Debug, Clone)]
+    pub struct Patterns {
+        /// True for `NotAction`/`NotResource`, where a statement matches everything the
+        /// patterns do NOT match.
+        pub negated: bool,
+        /// The patterns as written, with IAM's `*` and `?` wildcards.
+        pub values: Vec<String>,
+    }
+
+    impl Patterns {
+        /// Whether this element matches `value`. `None` when the budget ran out.
+        fn matches(
+            &self,
+            value: &str,
+            case_sensitive: bool,
+            budget: &mut Budget,
+        ) -> Option<bool> {
+            let mut hit = false;
+            for pattern in &self.values {
+                if matches_pattern(pattern, value, case_sensitive, budget)? {
+                    hit = true;
+                    break;
+                }
+            }
+            Some(hit != self.negated)
+        }
+    }
+
+    /// A `Principal`/`NotPrincipal` element.
+    #[derive(Debug, Clone)]
+    pub struct Principals {
+        /// True for `NotPrincipal`.
+        pub negated: bool,
+        /// True when the element is `"*"` (or lists `"*"`), which matches any principal.
+        pub any: bool,
+        /// The principals named, normalised so the two spellings of an account root
+        /// (the bare account id and its `:root` ARN) compare equal.
+        pub values: Vec<String>,
+    }
+
+    impl Principals {
+        /// Whether this element matches `principal`.
+        ///
+        /// Principal values are matched literally: the IAM grammar gives `Principal` no
+        /// partial wildcards, only the whole-element `"*"`.
+        fn matches(&self, principal: &str) -> bool {
+            let hit = self.any || self.values.iter().any(|known| known == principal);
+            hit != self.negated
+        }
+    }
+
+    /// How a numeric or date condition operator compares.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Compare {
+        /// `…Equals`.
+        Equals,
+        /// `…LessThan`.
+        LessThan,
+        /// `…LessThanEquals`.
+        LessThanEquals,
+        /// `…GreaterThan`.
+        GreaterThan,
+        /// `…GreaterThanEquals`.
+        GreaterThanEquals,
+    }
+
+    impl Compare {
+        /// Whether `actual` stands in this relation to `expected`.
+        fn holds(self, expected: f64, actual: f64) -> bool {
+            match self {
+                Self::Equals => actual == expected,
+                Self::LessThan => actual < expected,
+                Self::LessThanEquals => actual <= expected,
+                Self::GreaterThan => actual > expected,
+                Self::GreaterThanEquals => actual >= expected,
+            }
+        }
+    }
+
+    /// A condition operator, reduced to the comparison it performs. The `Not…` spellings
+    /// are the same comparison with [`ConditionClause::negated`] set, which is also what
+    /// makes a missing key satisfy them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Operator {
+        /// `StringEquals` / `StringEqualsIgnoreCase` and their `Not…` spellings.
+        StringEquals {
+            /// Set for the `…IgnoreCase` spellings.
+            ignore_case: bool,
+        },
+        /// `StringLike`, and `ArnLike`/`ArnEquals`, which the IAM docs define as
+        /// behaving identically; both take `*` and `?` wildcards.
+        StringLike,
+        /// The `Numeric…` family.
+        Numeric(Compare),
+        /// The `Date…` family.
+        Date(Compare),
+        /// `Bool`.
+        Bool,
+        /// `Null`, which tests only whether the key is present.
+        Null,
+    }
+
+    impl Operator {
+        /// Whether a request-context `actual` satisfies this operator against one
+        /// policy-supplied `expected` value. `None` when the budget ran out.
+        fn matches(self, expected: &str, actual: &str, budget: &mut Budget) -> Option<bool> {
+            if let Self::StringLike = self {
+                return matches_pattern(expected, actual, true, budget);
+            }
+            if !budget.spend(1) {
+                return None;
+            }
+            Some(match self {
+                Self::StringEquals { ignore_case: false } => expected == actual,
+                Self::StringEquals { ignore_case: true } => expected.eq_ignore_ascii_case(actual),
+                // Charged and handled above.
+                Self::StringLike => false,
+                Self::Numeric(compare) => match (parse_number(expected), parse_number(actual)) {
+                    (Some(expected), Some(actual)) => compare.holds(expected, actual),
+                    // A value that is not a finite number satisfies no numeric
+                    // comparison.
+                    _ => false,
+                },
+                Self::Date(compare) => match (parse_timestamp(expected), parse_timestamp(actual)) {
+                    (Some(expected), Some(actual)) => compare.holds(expected, actual),
+                    _ => false,
+                },
+                Self::Bool => expected.eq_ignore_ascii_case(actual),
+                // Handled by `ConditionClause::satisfied`: `Null` reads presence only.
+                Self::Null => false,
+            })
+        }
+    }
+
+    /// One condition key's constraint: an operator, the key it reads and the values it
+    /// accepts. A statement's `Condition` block is a conjunction of these, and the values
+    /// of one clause are a disjunction, exactly as IAM evaluates them.
+    #[derive(Debug, Clone)]
+    pub struct ConditionClause {
+        /// The condition key, lowercased: IAM condition key names are case-insensitive.
+        pub key: String,
+        /// The comparison the operator performs.
+        pub operator: Operator,
+        /// Set for the reversed (`Not…`) spellings, which a missing key satisfies.
+        pub negated: bool,
+        /// Set for the `…IfExists` suffix, which a missing key satisfies.
+        pub if_exists: bool,
+        /// The values the policy supplied, as strings (a JSON number or boolean is
+        /// rendered as the text IAM compares).
+        pub values: Vec<String>,
+    }
+
+    impl ConditionClause {
+        /// Whether `context` satisfies this clause. `None` when the budget ran out.
+        fn satisfied(&self, context: &Context, budget: &mut Budget) -> Option<bool> {
+            if !budget.spend(1) {
+                return None;
+            }
+            let present = context.get(self.key.as_str());
+            if self.operator == Operator::Null {
+                // `"Null": {"key": "true"}` asks for the key to be ABSENT; `"false"`
+                // asks for it to be present.
+                return Some(self.values.iter().any(|value| {
+                    if value.eq_ignore_ascii_case("true") {
+                        present.is_none()
+                    } else {
+                        present.is_some()
+                    }
+                }));
+            }
+            match present {
+                // A key the request does not carry fails a positive operator, and
+                // satisfies a reversed one or an `…IfExists` one.
+                None => Some(self.negated || self.if_exists),
+                Some(actual) => {
+                    let mut hit = false;
+                    for expected in &self.values {
+                        if self.operator.matches(expected, actual, budget)? {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    Some(hit != self.negated)
+                }
+            }
+        }
+
+        /// The candidate values for this clause's key: enough to expose any difference
+        /// between two policies that constrain it.
+        fn candidate_values(&self, fresh: &str) -> Vec<String> {
+            // A value neither document mentions: what a key carries when the request is
+            // not the one the policy was written for.
+            let mut values = vec![fresh.to_string()];
+            match self.operator {
+                // Only presence is read, so the value itself does not matter.
+                Operator::Null => {}
+                Operator::Bool => {
+                    values.push("true".to_string());
+                    values.push("false".to_string());
+                }
+                Operator::Numeric(_) => {
+                    for value in &self.values {
+                        values.push(value.clone());
+                        if let Some(number) = parse_number(value) {
+                            // The neighbours of a bound are what separates `LessThan`
+                            // from `LessThanEquals`, and a bound from a point value.
+                            values.push(format_number(number - 1.0));
+                            values.push(format_number(number + 1.0));
+                        }
+                    }
+                }
+                Operator::Date(_) => {
+                    for value in &self.values {
+                        values.push(value.clone());
+                        if let Some(seconds) = parse_timestamp(value) {
+                            values.push(format_timestamp(seconds - 1.0));
+                            values.push(format_timestamp(seconds + 1.0));
+                        }
+                    }
+                }
+                Operator::StringLike => {
+                    for value in &self.values {
+                        values.extend(witnesses(value, fresh));
+                    }
+                }
+                Operator::StringEquals { .. } => values.extend(self.values.iter().cloned()),
+            }
+            values
+        }
+    }
+
+    /// One statement of a policy.
+    #[derive(Debug, Clone)]
+    pub struct Statement {
+        /// The statement's position in the document's `Statement` element, counted from
+        /// zero — what a `ReasonSummary` reports as `statementIndex`.
+        pub index: i32,
+        /// The statement's `Sid`, when it carries one.
+        pub sid: Option<String>,
+        /// `Allow` or `Deny`.
+        pub effect: Effect,
+        /// The `Action`/`NotAction` element. Required: a statement that names no action
+        /// grants nothing in particular, and the grammar requires it.
+        pub actions: Patterns,
+        /// The `Resource`/`NotResource` element, absent when the statement names none —
+        /// in which case it constrains no resource.
+        pub resources: Option<Patterns>,
+        /// The `Principal`/`NotPrincipal` element, absent when the statement names none.
+        /// Always absent for [`Flavor::Identity`], whose grammar has no such element.
+        pub principals: Option<Principals>,
+        /// The `Condition` block, flattened to one clause per operator and key.
+        pub conditions: Vec<ConditionClause>,
+    }
+
+    impl Statement {
+        /// Whether this statement applies to `request`. `None` when the budget ran out.
+        fn matches(&self, request: &AccessRequest<'_>, budget: &mut Budget) -> Option<bool> {
+            // One step for visiting the statement at all, so a document made of many
+            // statements is charged for them.
+            if !budget.spend(1) {
+                return None;
+            }
+            // IAM action names are case-insensitive; ARNs are not.
+            if !self.actions.matches(request.action, false, budget)? {
+                return Some(false);
+            }
+            if let Some(resources) = &self.resources {
+                if !resources.matches(request.resource, true, budget)? {
+                    return Some(false);
+                }
+            }
+            if let Some(principals) = &self.principals {
+                if !budget.spend(principals.values.len() as u64 + 1) {
+                    return None;
+                }
+                if !principals.matches(request.principal) {
+                    return Some(false);
+                }
+            }
+            for clause in &self.conditions {
+                if !clause.satisfied(request.context, budget)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
+        }
+    }
+
+    /// A parsed policy document.
+    #[derive(Debug, Clone)]
+    pub struct Policy {
+        /// Its statements, in document order.
+        pub statements: Vec<Statement>,
+    }
+
+    /// The request context an access request carries: condition key -> value, holding
+    /// only the keys that are present.
+    ///
+    /// The key and the value are shared handles, not copies: the contexts are the product
+    /// over every constrained key, so a context that copied its values would cost their
+    /// length times that product.
+    pub type Context = BTreeMap<Rc<str>, Rc<str>>;
+
+    /// One access request, as both policies are evaluated against it.
+    #[derive(Debug, Clone, Copy)]
+    struct AccessRequest<'a> {
+        action: &'a str,
+        resource: &'a str,
+        principal: &'a str,
+        context: &'a Context,
+    }
+
+    /// What a policy answers for one access request.
+    #[derive(Debug)]
+    enum Decision<'a> {
+        /// An `Allow` statement matched and no `Deny` did; this is the first such
+        /// statement in document order.
+        Allowed(&'a Statement),
+        /// A `Deny` statement matched.
+        Denied,
+        /// Nothing matched: the implicit deny.
+        NotAllowed,
+    }
+
+    impl Policy {
+        /// Evaluate this policy for `request`, with IAM's own rules: an explicit `Deny`
+        /// beats every `Allow`, and an access nothing allows is denied. `None` when the
+        /// budget ran out.
+        fn decide(&self, request: &AccessRequest<'_>, budget: &mut Budget) -> Option<Decision<'_>> {
+            let mut allowed: Option<&Statement> = None;
+            for statement in &self.statements {
+                if !statement.matches(request, budget)? {
+                    continue;
+                }
+                match statement.effect {
+                    Effect::Deny => return Some(Decision::Denied),
+                    Effect::Allow => {
+                        if allowed.is_none() {
+                            allowed = Some(statement);
+                        }
+                    }
+                }
+            }
+            Some(match allowed {
+                Some(statement) => Decision::Allowed(statement),
+                None => Decision::NotAllowed,
+            })
+        }
+
+        /// How many `Allow` statements the policy carries — the most statements a
+        /// comparison can ever report as granting new access.
+        fn allow_count(&self) -> usize {
+            self.statements
+                .iter()
+                .filter(|statement| statement.effect == Effect::Allow)
+                .count()
+        }
+
+        /// How much work ONE decision over this policy takes, counted in statements and
+        /// the element values each of them matches — the factor the access-request count
+        /// alone would miss.
+        fn weight(&self) -> usize {
+            self.statements
+                .iter()
+                .map(|statement| {
+                    let resources = statement
+                        .resources
+                        .as_ref()
+                        .map_or(0, |element| element.values.len());
+                    let principals = statement
+                        .principals
+                        .as_ref()
+                        .map_or(0, |element| element.values.len());
+                    let conditions: usize = statement
+                        .conditions
+                        .iter()
+                        .map(|clause| clause.values.len() + 1)
+                        .sum();
+                    1 + statement.actions.values.len() + resources + principals + conditions
+                })
+                .fold(0usize, usize::saturating_add)
+        }
+    }
+
+    /// A statement of the updated policy that allows access the existing policy does not.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NewAccess {
+        /// Its zero-based position in the updated document's `Statement` element.
+        pub statement_index: i32,
+        /// Its `Sid`, when it carries one.
+        pub statement_id: Option<String>,
+    }
+
+    /// Parse `document` as an IAM policy of `flavor`, blaming `member` for anything
+    /// wrong with it.
+    ///
+    /// Every ceiling that bounds the comparison's work is applied HERE, before the
+    /// document is turned into anything larger than itself.
+    pub fn parse(
+        document: &str,
+        member: &'static str,
+        flavor: Flavor,
+    ) -> Result<Policy, EngineError> {
+        if document.len() > MAX_DOCUMENT_BYTES {
+            return Err(EngineError::Invalid {
+                member,
+                detail: format!(
+                    "a policy document this emulator compares is at most {MAX_DOCUMENT_BYTES} bytes, and this one is {}",
+                    document.len()
+                ),
+            });
+        }
+        let root: Value = serde_json::from_str(document).map_err(|error| EngineError::Unparseable {
+            member,
+            detail: error.to_string(),
+        })?;
+        let elements = lower_keyed(&root).ok_or_else(|| EngineError::Invalid {
+            member,
+            detail: "a policy document is a JSON object".to_string(),
+        })?;
+        let statements = elements.get("statement").ok_or_else(|| EngineError::Invalid {
+            member,
+            detail: "a policy document carries a Statement element".to_string(),
+        })?;
+        let listed: Vec<&Value> = match statements {
+            Value::Array(items) => items.iter().collect(),
+            Value::Object(_) => vec![*statements],
+            _ => {
+                return Err(EngineError::Invalid {
+                    member,
+                    detail: "the Statement element is a statement object or an array of them"
+                        .to_string(),
+                })
+            }
+        };
+        if listed.len() > MAX_STATEMENTS {
+            return Err(EngineError::Invalid {
+                member,
+                detail: format!(
+                    "a policy document this emulator compares carries at most {MAX_STATEMENTS} statements, and this one carries {}",
+                    listed.len()
+                ),
+            });
+        }
+        if listed.is_empty() {
+            return Err(EngineError::Invalid {
+                member,
+                detail: "a policy document carries at least one statement".to_string(),
+            });
+        }
+        let mut parsed = Vec::with_capacity(listed.len());
+        for (index, statement) in listed.into_iter().enumerate() {
+            parsed.push(parse_statement(statement, index, member, flavor)?);
+        }
+        Ok(Policy { statements: parsed })
+    }
+
+    /// Parse one statement.
+    fn parse_statement(
+        statement: &Value,
+        index: usize,
+        member: &'static str,
+        flavor: Flavor,
+    ) -> Result<Statement, EngineError> {
+        let invalid = |detail: &str| EngineError::Invalid {
+            member,
+            detail: format!("statement {index}: {detail}"),
+        };
+        let elements = lower_keyed(statement).ok_or_else(|| invalid("a statement is a JSON object"))?;
+
+        let effect = match elements.get("effect").and_then(|value| value.as_str()) {
+            Some(text) if text.eq_ignore_ascii_case("allow") => Effect::Allow,
+            Some(text) if text.eq_ignore_ascii_case("deny") => Effect::Deny,
+            _ => return Err(invalid("the Effect element is either \"Allow\" or \"Deny\"")),
+        };
+
+        let sid = match elements.get("sid") {
+            None => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(_) => return Err(invalid("the Sid element is a string")),
+        };
+
+        let actions = patterns(&elements, ("action", "Action"), ("notaction", "NotAction"))
+            .map_err(|detail| invalid(&detail))?
+            .ok_or_else(|| invalid("a statement carries an Action or a NotAction element"))?;
+        let resources = patterns(
+            &elements,
+            ("resource", "Resource"),
+            ("notresource", "NotResource"),
+        )
+        .map_err(|detail| invalid(&detail))?;
+        let principals = principals(&elements).map_err(|detail| invalid(&detail))?;
+        // The grammar differs by flavor, and so does what the real service accepts: an
+        // identity policy statement names resources and no principal, a resource policy
+        // statement names principals (and may leave the resource implicit, as an IAM
+        // trust policy does).
+        match flavor {
+            Flavor::Identity => {
+                if principals.is_some() {
+                    return Err(invalid(
+                        "an identity policy statement carries no Principal element",
+                    ));
+                }
+                if resources.is_none() {
+                    return Err(invalid(
+                        "an identity policy statement carries a Resource or a NotResource element",
+                    ));
+                }
+            }
+            Flavor::Resource => {
+                if principals.is_none() {
+                    return Err(invalid(
+                        "a resource policy statement carries a Principal or a NotPrincipal element",
+                    ));
+                }
+            }
+        }
+
+        let mut conditions = Vec::new();
+        if let Some(block) = elements.get("condition") {
+            let block = block
+                .as_object()
+                .ok_or_else(|| invalid("the Condition element maps operators to condition keys"))?;
+            for (name, keys) in block {
+                let Some((operator, negated, if_exists)) = parse_operator(name) else {
+                    return Err(EngineError::Unsupported {
+                        detail: format!(
+                            "the condition operator {name} is not one this emulator evaluates, so it cannot decide whether the updated policy allows new access"
+                        ),
+                    });
+                };
+                let keys = keys.as_object().ok_or_else(|| {
+                    invalid("a Condition operator maps condition keys to the values it accepts")
+                })?;
+                for (key, values) in keys {
+                    if conditions.len() >= MAX_CONDITION_CLAUSES {
+                        return Err(invalid(&format!(
+                            "a statement this emulator compares carries at most {MAX_CONDITION_CLAUSES} condition keys"
+                        )));
+                    }
+                    let values = condition_values(values).ok_or_else(|| {
+                        invalid("a condition value is a string, number or boolean, or an array of them")
+                    })?;
+                    if values.len() > MAX_CONDITION_VALUES {
+                        return Err(invalid(&format!(
+                            "a condition key this emulator compares lists at most {MAX_CONDITION_VALUES} values, and this one lists {}",
+                            values.len()
+                        )));
+                    }
+                    if let Some(oversized) = values
+                        .iter()
+                        .find(|value| value.len() > MAX_CONDITION_VALUE_BYTES)
+                    {
+                        return Err(invalid(&format!(
+                            "a condition value this emulator compares is at most {MAX_CONDITION_VALUE_BYTES} bytes, and one here is {}",
+                            oversized.len()
+                        )));
+                    }
+                    conditions.push(ConditionClause {
+                        key: key.to_ascii_lowercase(),
+                        operator,
+                        negated,
+                        if_exists,
+                        values,
+                    });
+                }
+            }
+        }
+
+        Ok(Statement {
+            index: i32::try_from(index).unwrap_or(i32::MAX),
+            sid,
+            effect,
+            actions,
+            resources,
+            principals,
+            conditions,
+        })
+    }
+
+    /// The members of a JSON object, keyed by lowercased element name, or `None` when
+    /// the value is not an object.
+    ///
+    /// Lowercased because the policy elements are looked up case-insensitively, so a
+    /// document that spells an element in another casing is compared rather than
+    /// refused.
+    fn lower_keyed(value: &Value) -> Option<BTreeMap<String, &Value>> {
+        let object = value.as_object()?;
+        Some(
+            object
+                .iter()
+                .map(|(name, member)| (name.to_ascii_lowercase(), member))
+                .collect(),
+        )
+    }
+
+    /// Read a positive/negated element pair (`Action`/`NotAction`,
+    /// `Resource`/`NotResource`): at most one of the two, each a string or a list of
+    /// them.
+    fn patterns(
+        elements: &BTreeMap<String, &Value>,
+        positive: (&str, &str),
+        negative: (&str, &str),
+    ) -> Result<Option<Patterns>, String> {
+        let (negated, value) = match (elements.get(positive.0), elements.get(negative.0)) {
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "a statement carries {} or {}, not both",
+                    positive.1, negative.1
+                ))
+            }
+            (None, None) => return Ok(None),
+            (Some(value), None) => (false, *value),
+            (None, Some(value)) => (true, *value),
+        };
+        let values = string_list(value).ok_or_else(|| {
+            format!(
+                "the {} element is a string or an array of strings",
+                if negated { negative.1 } else { positive.1 }
+            )
+        })?;
+        if values.len() > MAX_ELEMENT_VALUES {
+            return Err(format!(
+                "the {} element this emulator compares lists at most {MAX_ELEMENT_VALUES} values, and this one lists {}",
+                if negated { negative.1 } else { positive.1 },
+                values.len()
+            ));
+        }
+        Ok(Some(Patterns { negated, values }))
+    }
+
+    /// Read the `Principal`/`NotPrincipal` element.
+    fn principals(elements: &BTreeMap<String, &Value>) -> Result<Option<Principals>, String> {
+        let (negated, value) = match (elements.get("principal"), elements.get("notprincipal")) {
+            (Some(_), Some(_)) => {
+                return Err("a statement carries Principal or NotPrincipal, not both".to_string())
+            }
+            (None, None) => return Ok(None),
+            (Some(value), None) => (false, *value),
+            (None, Some(value)) => (true, *value),
+        };
+        let mut any = false;
+        let mut values = Vec::new();
+        /// Record one principal: `"*"` widens the element to every principal, anything
+        /// else is a principal named literally.
+        fn note(principal: &str, values: &mut Vec<String>, any: &mut bool) {
+            if principal == "*" {
+                *any = true;
+            } else {
+                values.push(normalize_principal(principal));
+            }
+        }
+        match value {
+            Value::String(text) => note(text, &mut values, &mut any),
+            Value::Object(map) => {
+                for (kind, listed) in map {
+                    if !PRINCIPAL_KINDS.contains(&kind.to_ascii_lowercase().as_str()) {
+                        return Err(
+                            "a Principal map keys only the AWS, Service, Federated and CanonicalUser principal types"
+                                .to_string(),
+                        );
+                    }
+                    let listed = string_list(listed).ok_or_else(|| {
+                        "a Principal entry is a string or an array of strings".to_string()
+                    })?;
+                    for principal in listed {
+                        if values.len() >= MAX_ELEMENT_VALUES {
+                            return Err(format!(
+                                "the Principal element this emulator compares lists at most {MAX_ELEMENT_VALUES} principals"
+                            ));
+                        }
+                        note(&principal, &mut values, &mut any);
+                    }
+                }
+            }
+            _ => {
+                return Err(
+                    "the Principal element is \"*\" or a map of principal types".to_string()
+                )
+            }
+        }
+        Ok(Some(Principals {
+            negated,
+            any,
+            values,
+        }))
+    }
+
+    /// The two spellings of an account root principal are the same principal: IAM's own
+    /// docs say a bare 12-digit account id in a `Principal` is equivalent to that
+    /// account's `:root` ARN, so both are stored as the ARN.
+    fn normalize_principal(principal: &str) -> String {
+        if principal.len() == 12 && principal.bytes().all(|byte| byte.is_ascii_digit()) {
+            return format!("arn:aws:iam::{principal}:root");
+        }
+        principal.to_string()
+    }
+
+    /// A string or an array of strings, as the policy grammar accepts for `Action`,
+    /// `Resource` and `Principal` entries.
+    fn string_list(value: &Value) -> Option<Vec<String>> {
+        match value {
+            Value::String(text) => Some(vec![text.clone()]),
+            Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect(),
+            _ => None,
+        }
+    }
+
+    /// The values of one condition clause: strings, or the text of a JSON number or
+    /// boolean, which IAM compares the same way.
+    fn condition_values(value: &Value) -> Option<Vec<String>> {
+        fn scalar(value: &Value) -> Option<String> {
+            match value {
+                Value::String(text) => Some(text.clone()),
+                Value::Bool(flag) => Some(flag.to_string()),
+                Value::Number(number) => Some(number.to_string()),
+                _ => None,
+            }
+        }
+        match value {
+            Value::Array(items) => items.iter().map(scalar).collect(),
+            other => scalar(other).map(|one| vec![one]),
+        }
+    }
+
+    /// Parse a condition operator name into the comparison it performs, whether it is a
+    /// reversed (`Not…`) operator, and whether it carries the `…IfExists` suffix.
+    ///
+    /// `None` for an operator this engine does not model — including the multivalued set
+    /// operators, which qualify an operator with a `ForAllValues:`/`ForAnyValue:` prefix.
+    fn parse_operator(name: &str) -> Option<(Operator, bool, bool)> {
+        if name.contains(':') {
+            return None;
+        }
+        let lowered = name.to_ascii_lowercase();
+        let (base, if_exists) = match lowered.strip_suffix("ifexists") {
+            Some(base) => (base, true),
+            None => (lowered.as_str(), false),
+        };
+        let (operator, negated) = match base {
+            "stringequals" => (Operator::StringEquals { ignore_case: false }, false),
+            "stringnotequals" => (Operator::StringEquals { ignore_case: false }, true),
+            "stringequalsignorecase" => (Operator::StringEquals { ignore_case: true }, false),
+            "stringnotequalsignorecase" => (Operator::StringEquals { ignore_case: true }, true),
+            "stringlike" => (Operator::StringLike, false),
+            "stringnotlike" => (Operator::StringLike, true),
+            // The IAM docs define ArnEquals and ArnLike as behaving identically, and
+            // both accept wildcards.
+            "arnequals" | "arnlike" => (Operator::StringLike, false),
+            "arnnotequals" | "arnnotlike" => (Operator::StringLike, true),
+            "numericequals" => (Operator::Numeric(Compare::Equals), false),
+            "numericnotequals" => (Operator::Numeric(Compare::Equals), true),
+            "numericlessthan" => (Operator::Numeric(Compare::LessThan), false),
+            "numericlessthanequals" => (Operator::Numeric(Compare::LessThanEquals), false),
+            "numericgreaterthan" => (Operator::Numeric(Compare::GreaterThan), false),
+            "numericgreaterthanequals" => (Operator::Numeric(Compare::GreaterThanEquals), false),
+            "dateequals" => (Operator::Date(Compare::Equals), false),
+            "datenotequals" => (Operator::Date(Compare::Equals), true),
+            "datelessthan" => (Operator::Date(Compare::LessThan), false),
+            "datelessthanequals" => (Operator::Date(Compare::LessThanEquals), false),
+            "dategreaterthan" => (Operator::Date(Compare::GreaterThan), false),
+            "dategreaterthanequals" => (Operator::Date(Compare::GreaterThanEquals), false),
+            "bool" => (Operator::Bool, false),
+            "null" => (Operator::Null, false),
+            _ => return None,
+        };
+        Some((operator, negated, if_exists))
+    }
+
+    /// The statements of `updated` that allow access `existing` does not allow, in
+    /// document order.
+    ///
+    /// Empty exactly when the updated policy allows no access the existing one does not
+    /// — the `PASS` case.
+    pub fn new_access(
+        existing: &Policy,
+        updated: &Policy,
+        flavor: Flavor,
+    ) -> Result<Vec<NewAccess>, EngineError> {
+        // The work and the time one comparison may take. Both are armed BEFORE the
+        // candidate values are derived, so the derivation is covered too, and the step
+        // budget is checked DURING the search, so a comparison heavier than its request
+        // count suggested is refused rather than run to completion.
+        let mut budget = Budget::new(MAX_COMPARISON_STEPS);
+        let deadline = Instant::now() + MAX_COMPARISON_TIME;
+        let universe = Universe::build(existing, updated, flavor, deadline)?;
+        let reportable = updated.allow_count();
+        let mut until_deadline_check = DEADLINE_CHECK_EVERY;
+        let mut found: BTreeMap<i32, Option<String>> = BTreeMap::new();
+        'search: for context in &universe.contexts {
+            for principal in &universe.principals {
+                for action in &universe.actions {
+                    for resource in &universe.resources {
+                        until_deadline_check -= 1;
+                        if until_deadline_check == 0 {
+                            until_deadline_check = DEADLINE_CHECK_EVERY;
+                            if Instant::now() > deadline {
+                                return Err(exhausted());
+                            }
+                        }
+                        let request = AccessRequest {
+                            action,
+                            resource,
+                            principal,
+                            context,
+                        };
+                        let Some(decision) = updated.decide(&request, &mut budget) else {
+                            return Err(exhausted());
+                        };
+                        if let Decision::Allowed(statement) = decision {
+                            let Some(before) = existing.decide(&request, &mut budget) else {
+                                return Err(exhausted());
+                            };
+                            if !matches!(before, Decision::Allowed(_)) {
+                                found.insert(statement.index, statement.sid.clone());
+                                // Every statement that can be reported already is.
+                                if found.len() >= reportable {
+                                    break 'search;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(found
+            .into_iter()
+            .map(|(statement_index, statement_id)| NewAccess {
+                statement_index,
+                statement_id,
+            })
+            .collect())
+    }
+
+    /// The finite set of access requests a comparison decides over.
+    #[derive(Debug)]
+    struct Universe {
+        actions: Vec<String>,
+        resources: Vec<String>,
+        principals: Vec<String>,
+        contexts: Vec<Context>,
+    }
+
+    impl Universe {
+        /// Derive the candidate values from the two documents themselves.
+        fn build(
+            existing: &Policy,
+            updated: &Policy,
+            flavor: Flavor,
+            deadline: Instant,
+        ) -> Result<Self, EngineError> {
+            let policies = [existing, updated];
+            let fresh = fresh_token(policies)?;
+
+            // A value neither document names stands for "everything else", which is what
+            // a widened wildcard reaches and a narrow one does not.
+            let mut actions: BTreeSet<String> = BTreeSet::new();
+            actions.insert(fresh.clone());
+            let mut resources: BTreeSet<String> = BTreeSet::new();
+            resources.insert(fresh.clone());
+            let mut principals: BTreeSet<String> = BTreeSet::new();
+            principals.insert(fresh.clone());
+            let mut keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+            for policy in policies {
+                for statement in &policy.statements {
+                    for pattern in &statement.actions.values {
+                        actions.extend(witnesses(pattern, &fresh));
+                    }
+                    if let Some(element) = &statement.resources {
+                        for pattern in &element.values {
+                            resources.extend(witnesses(pattern, &fresh));
+                        }
+                    }
+                    if let Some(element) = &statement.principals {
+                        principals.extend(element.values.iter().cloned());
+                    }
+                    for clause in &statement.conditions {
+                        keys.entry(clause.key.clone())
+                            .or_default()
+                            .extend(clause.candidate_values(&fresh));
+                    }
+                }
+            }
+
+            // An identity policy names no principal, so one placeholder stands for every
+            // caller: no statement reads it.
+            if flavor == Flavor::Identity {
+                principals = BTreeSet::from([fresh.clone()]);
+            }
+
+            if keys.len() > MAX_CONDITION_KEYS {
+                return Err(EngineError::Unsupported {
+                    detail: format!(
+                        "these policies constrain {} condition keys, more than the {MAX_CONDITION_KEYS} this emulator enumerates request contexts over",
+                        keys.len()
+                    ),
+                });
+            }
+            let mut contexts: Vec<Context> = vec![Context::new()];
+            for (key, values) in &keys {
+                // The deadline covers the derivation as well as the search, so the
+                // pre-flight phase has the same backstop.
+                if Instant::now() > deadline {
+                    return Err(exhausted());
+                }
+                // The clamp comes BEFORE the allocation: the next generation of contexts
+                // is the product of what is held and this key's values, and a product
+                // past the ceiling is refused without being built.
+                let next = contexts.len().saturating_mul(values.len().saturating_add(1));
+                if next > MAX_CONTEXTS {
+                    return Err(EngineError::Unsupported {
+                        detail: format!(
+                            "these policies constrain more condition keys and values than this emulator evaluates ({MAX_CONTEXTS} request contexts)"
+                        ),
+                    });
+                }
+                // The key and each value are interned ONCE, so growing the product copies
+                // shared handles rather than the values themselves: a context costs one
+                // pointer pair per key, whatever the values' length.
+                let key: Rc<str> = Rc::from(key.as_str());
+                let values: Vec<Rc<str>> = values
+                    .iter()
+                    .map(|value| Rc::from(value.as_str()))
+                    .collect();
+                let mut grown: Vec<Context> = Vec::with_capacity(next);
+                for context in &contexts {
+                    // The key absent from the request is a case of its own: it is what
+                    // a `Null` check and a reversed operator read.
+                    grown.push(context.clone());
+                    for value in &values {
+                        let mut carrying = context.clone();
+                        carrying.insert(Rc::clone(&key), Rc::clone(value));
+                        grown.push(carrying);
+                    }
+                }
+                contexts = grown;
+            }
+
+            // The pre-flight estimate counts the work of ONE decision, not just how many
+            // decisions there are: each one walks every statement of both documents and
+            // every pattern those statements list.
+            let per_decision = policies
+                .iter()
+                .map(|policy| policy.weight())
+                .fold(1usize, usize::saturating_add);
+            let total = actions
+                .len()
+                .saturating_mul(resources.len())
+                .saturating_mul(principals.len())
+                .saturating_mul(contexts.len())
+                .saturating_mul(per_decision);
+            if total > MAX_ACCESS_REQUESTS {
+                return Err(EngineError::Unsupported {
+                    detail: format!(
+                        "comparing these policies takes {total} statement decisions, more than this emulator's budget of {MAX_ACCESS_REQUESTS}"
+                    ),
+                });
+            }
+
+            Ok(Self {
+                actions: actions.into_iter().collect(),
+                resources: resources.into_iter().collect(),
+                principals: principals.into_iter().collect(),
+                contexts,
+            })
+        }
+    }
+
+    /// A token that occurs in NEITHER document, so a pattern's wildcard instantiated
+    /// with it is matched by that pattern and by no narrower literal either document
+    /// names.
+    /// Derived in ONE pass over the documents' values rather than searched for: the
+    /// characters they use are collected, and the token is built from the first glyph of
+    /// [`FRESH_GLYPHS`] they do not use — a character the documents do not contain cannot
+    /// occur in them in any combination. Refused (rather than searched for ever longer)
+    /// in the impossible case that they use every one.
+    fn fresh_token(policies: [&Policy; 2]) -> Result<String, EngineError> {
+        let mut used: BTreeSet<char> = BTreeSet::new();
+        let mut note = |value: &String| {
+            for glyph in value.chars() {
+                // Actions are compared case-insensitively, so an upper-case glyph counts
+                // as its lower-case self being used.
+                used.insert(glyph.to_lowercase().next().unwrap_or(glyph));
+            }
+        };
+        for policy in policies {
+            for statement in &policy.statements {
+                statement.actions.values.iter().for_each(&mut note);
+                if let Some(element) = &statement.resources {
+                    element.values.iter().for_each(&mut note);
+                }
+                if let Some(element) = &statement.principals {
+                    element.values.iter().for_each(&mut note);
+                }
+                for clause in &statement.conditions {
+                    clause.values.iter().for_each(&mut note);
+                }
+            }
+        }
+        let glyph = FRESH_GLYPHS
+            .iter()
+            .copied()
+            .find(|glyph| !used.contains(glyph))
+            .ok_or_else(|| EngineError::Unsupported {
+                detail: "these policies use every character this emulator builds a comparison witness from, so it cannot derive a value outside both of them"
+                    .to_string(),
+            })?;
+        Ok(std::iter::repeat_n(glyph, 3).collect())
+    }
+
+    /// The characters a comparison witness may be built from: letters that are rare in
+    /// an ARN first, then Unicode private-use code points, which carry no meaning in a
+    /// policy document.
+    const FRESH_GLYPHS: &[char] = &[
+        'z', 'q', 'j', 'x', '\u{e000}', '\u{e001}', '\u{e002}', '\u{e003}', '\u{e004}',
+        '\u{e005}', '\u{e006}', '\u{e007}', '\u{e008}', '\u{e009}', '\u{e00a}', '\u{e00b}',
+        '\u{e00c}', '\u{e00d}', '\u{e00e}', '\u{e00f}',
+    ];
+
+    /// The candidate values a pattern contributes.
+    ///
+    /// A literal contributes itself. A pattern with wildcards contributes two witnesses:
+    /// the wildcards filled with the fresh token, and `*` deleted — the shortest string
+    /// it matches. Both are matched by the pattern, so a policy that is wider than
+    /// another on that pattern is exposed by one of them.
+    fn witnesses(pattern: &str, fresh: &str) -> Vec<String> {
+        if !pattern.contains('*') && !pattern.contains('?') {
+            return vec![pattern.to_string()];
+        }
+        let single = fresh.chars().next().unwrap_or('z').to_string();
+        vec![
+            pattern.replace('*', fresh).replace('?', &single),
+            pattern.replace('*', "").replace('?', &single),
+        ]
+    }
+
+    /// IAM's wildcard match: `*` stands for any sequence of characters, `?` for exactly
+    /// one.
+    ///
+    /// Allocation-free, so a comparison allocates nothing per decision, and bounded: a
+    /// single match may spend at most one comparison's worth of steps, so no caller gets
+    /// an unbounded matcher through this surface.
+    pub fn wildcard_match(pattern: &str, value: &str, case_sensitive: bool) -> bool {
+        matches_pattern(
+            pattern,
+            value,
+            case_sensitive,
+            &mut Budget::new(MAX_COMPARISON_STEPS),
+        )
+        .unwrap_or(false)
+    }
+
+    /// [`wildcard_match`], charged to a comparison's budget: one step per character
+    /// comparison, so a long pattern against a long value cannot outrun the budget.
+    /// `None` once it is spent.
+    fn matches_pattern(
+        pattern: &str,
+        value: &str,
+        case_sensitive: bool,
+        budget: &mut Budget,
+    ) -> Option<bool> {
+        let mut at_pattern = 0usize;
+        let mut at_value = 0usize;
+        // The last `*` seen, and how much of the value it has consumed: where the match
+        // resumes when the rest of the pattern fails.
+        let mut star: Option<(usize, usize)> = None;
+        loop {
+            if !budget.spend(1) {
+                return None;
+            }
+            let from_pattern = pattern[at_pattern..].chars().next();
+            let from_value = value[at_value..].chars().next();
+            match (from_pattern, from_value) {
+                // The value is consumed: whatever is left of the pattern has to be
+                // wildcards, which match the empty rest.
+                (_, None) => return Some(pattern[at_pattern..].chars().all(|glyph| glyph == '*')),
+                (Some('*'), Some(_)) => {
+                    star = Some((at_pattern, at_value));
+                    at_pattern += '*'.len_utf8();
+                }
+                (Some(expected), Some(actual))
+                    if expected == '?' || same_glyph(expected, actual, case_sensitive) =>
+                {
+                    at_pattern += expected.len_utf8();
+                    at_value += actual.len_utf8();
+                }
+                _ => match star {
+                    // Let the last `*` swallow one more character of the value.
+                    Some((star_pattern, star_value)) => {
+                        let consumed = value[star_value..].chars().next().map_or(1, char::len_utf8);
+                        let resumed = star_value + consumed;
+                        if resumed > value.len() {
+                            return Some(false);
+                        }
+                        star = Some((star_pattern, resumed));
+                        at_pattern = star_pattern + '*'.len_utf8();
+                        at_value = resumed;
+                    }
+                    None => return Some(false),
+                },
+            }
+        }
+    }
+
+    /// Whether two characters are the same one, for a case-sensitive or a
+    /// case-insensitive match.
+    fn same_glyph(left: char, right: char, case_sensitive: bool) -> bool {
+        if case_sensitive || left == right {
+            return left == right;
+        }
+        left.to_lowercase().eq(right.to_lowercase())
+    }
+
+    /// A condition value read as a number: a FINITE one, so a spelling `f64` accepts but
+    /// a policy cannot mean (`inf`, `NaN`) satisfies no comparison.
+    ///
+    /// Deliberately NOT bounded by the timestamp range: a numeric condition value (a byte
+    /// count, an object count) is a number of any magnitude, and only the date family has
+    /// a formatter whose range matters.
+    fn parse_number(value: &str) -> Option<f64> {
+        value.parse::<f64>().ok().filter(|number| number.is_finite())
+    }
+
+    /// A condition value read as a point in time: epoch seconds, or an ISO 8601
+    /// timestamp, the two forms IAM's date condition operators accept.
+    ///
+    /// Bounded as well as finite: a value outside the range a timestamp can be rendered
+    /// in is no timestamp, so it never reaches the formatter.
+    fn parse_timestamp(value: &str) -> Option<f64> {
+        if let Some(epoch) = parse_number(value) {
+            // A number out of timestamp range is not retried as a formatted timestamp:
+            // it is not one.
+            return (epoch.abs() <= MAX_TIMESTAMP_SECONDS).then_some(epoch);
+        }
+        if value.parse::<f64>().is_ok() {
+            return None;
+        }
+        ::aws_smithy_types::DateTime::from_str(value, ::aws_smithy_types::date_time::Format::DateTime)
+            .ok()
+            .map(|when| when.as_secs_f64())
+            .filter(|seconds| seconds.is_finite() && seconds.abs() <= MAX_TIMESTAMP_SECONDS)
+    }
+
+    /// The largest magnitude, in epoch seconds, this engine treats as a point in time:
+    /// about the year 33658, far outside any policy's bounds and well inside what a
+    /// timestamp can be rendered from, so the formatter is never handed a value it
+    /// cannot represent.
+    const MAX_TIMESTAMP_SECONDS: f64 = 1e12;
+
+    /// Render a point in time back as an ISO 8601 timestamp, for a candidate value
+    /// derived from a policy's own bound.
+    ///
+    /// Whole seconds only, and only for a value [`parse_timestamp`] accepted, so the
+    /// subsecond precondition of the constructor cannot be violated.
+    fn format_timestamp(seconds: f64) -> String {
+        if !seconds.is_finite() || seconds.abs() > MAX_TIMESTAMP_SECONDS {
+            return format_number(seconds);
+        }
+        ::aws_smithy_types::DateTime::from_secs(seconds.trunc() as i64)
+            .fmt(::aws_smithy_types::date_time::Format::DateTime)
+            .unwrap_or_else(|_| format_number(seconds))
+    }
+
+    /// Render a number the way a policy writes one: without a fractional part when it
+    /// has none.
+    fn format_number(number: f64) -> String {
+        if number.fract() == 0.0 && number.abs() < 1e15 {
+            format!("{}", number as i64)
+        } else {
+            format!("{number}")
+        }
     }
 }

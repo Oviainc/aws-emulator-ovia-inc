@@ -21,5 +21,7 @@ mod archive_rule_update;
 mod error_payloads;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/policy_checks.rs"]
+mod policy_checks;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
