@@ -47,6 +47,17 @@ async fn described_encryption(emulator: &Emulator, name: &str) -> Value {
     .clone()
 }
 
+/// The SSE state `DescribeDeliveryStream` reports for a stream no encryption call has
+/// touched.
+///
+/// Firehose always carries `DeliveryStreamEncryptionConfiguration` with a status — the
+/// member is readable without calling `StartDeliveryStreamEncryption` first — and with
+/// SSE off that status is `DISABLED` and no CMK is named. So "nothing was written" is
+/// exactly this block, not an absent member.
+fn never_configured_encryption() -> Value {
+    json!({ "Status": "DISABLED" })
+}
+
 #[tokio::test]
 async fn start_encryption_records_the_requested_key_and_the_clock_settles_it_to_enabled() {
     // (case, the request's DeliveryStreamEncryptionConfigurationInput, the KeyType and
@@ -89,11 +100,11 @@ async fn start_encryption_records_the_requested_key_and_the_clock_settles_it_to_
         let name = format!("start-encryption-{index}");
         active_stream(&emulator, &name).await;
 
-        // Before the call the stream reports no encryption configuration at all.
+        // Before the call the stream reports the disabled SSE state.
         assert_eq!(
             described_encryption(&emulator, &name).await,
-            Value::Null,
-            "case {case:?}: an untouched stream reports no encryption configuration"
+            never_configured_encryption(),
+            "case {case:?}: an untouched stream reports the disabled SSE state"
         );
 
         let mut request = json!({ "DeliveryStreamName": name });
@@ -473,7 +484,7 @@ async fn the_combined_encryption_call_limit_is_counted_per_stream_over_its_windo
             );
             assert_eq!(
                 described_encryption(&emulator, &name).await,
-                Value::Null,
+                never_configured_encryption(),
                 "case {case:?}: a refused call must not start the change"
             );
         }
@@ -491,7 +502,7 @@ async fn describing_a_stream_does_not_spend_its_encryption_call_budget() {
         let described = described_encryption(&emulator, "polled-stream").await;
         assert_eq!(
             described,
-            Value::Null,
+            never_configured_encryption(),
             "poll {poll}: no encryption has been asked for yet"
         );
         let (status, listed) = emulator.call("ListDeliveryStreams", json!({})).await;
@@ -566,7 +577,7 @@ async fn the_encryption_call_budget_is_per_stream() {
     );
     assert_eq!(
         described_encryption(&emulator, "stream-a").await,
-        Value::Null,
+        never_configured_encryption(),
         "the refused call left stream-a alone"
     );
 }

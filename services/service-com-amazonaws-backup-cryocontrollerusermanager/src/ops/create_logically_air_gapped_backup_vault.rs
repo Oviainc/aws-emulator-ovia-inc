@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLogicallyAirGappedBackupVault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLogicallyAirGappedBackupVault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLogicallyAirGappedBackupVault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a vault record into [`crate::state`] — the SAME store
+//! `DescribeBackupVault`, `ListBackupVaults` and `DeleteBackupVault` read — with
+//! `VaultType` `LOGICALLY_AIR_GAPPED_BACKUP_VAULT`, the retention bounds the
+//! request carries, `Locked` set (an air-gapped vault is immutable by
+//! construction) and the non-terminal `VaultState` `CREATING` this operation's
+//! output models, which the clock settles to `AVAILABLE`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +173,199 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLogicallyAirGappedBackupVault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLogicallyAirGappedBackupVaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLogicallyAirGappedBackupVault"))
+        // `BackupVaultName`'s `@pattern` is refused by the framework BEFORE this
+        // handler runs, and `crate::service` words that refusal as this
+        // service's own `InvalidParameterValueException`, so reaching here means
+        // the name is one the model admits.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLogicallyAirGappedBackupVaultErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The model types `EncryptionKeyArn` as `ARN` with no pattern, so the
+        // framework cannot refuse a malformed one; AWS does, rather than
+        // storing a key reference that names nothing.
+        if input
+            .encryption_key_arn
+            .as_deref()
+            .is_some_and(|arn| !crate::state::is_arn(arn))
+        {
+            return Err(
+                CreateLogicallyAirGappedBackupVaultErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "EncryptionKeyArn must be an ARN of the form \
+                             arn:<partition>:<service>:<region>:<account>:<resource>"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+        // `MinRetentionDays` carries a documented floor the model expresses no
+        // `@range` for, and a retention window whose maximum is below its
+        // minimum admits no lifecycle at all: both are parameter values AWS
+        // refuses rather than vault settings it stores.
+        if input.min_retention_days < crate::state::MIN_RETENTION_DAYS_FLOOR {
+            return Err(
+                CreateLogicallyAirGappedBackupVaultErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "MinRetentionDays must be at least {} days",
+                            crate::state::MIN_RETENTION_DAYS_FLOOR
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+        if input.max_retention_days < input.min_retention_days {
+            return Err(
+                CreateLogicallyAirGappedBackupVaultErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "MaxRetentionDays must be greater than or equal to \
+                             MinRetentionDays"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+        let tags: ::std::collections::BTreeMap<String, String> = input
+            .backup_vault_tags
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        let mut store = state.lock();
+        // A vault name is unique across vault types, so a repeat create naming a
+        // stored vault is answered from the stored one: a retry of the original
+        // request only when it carries the same idempotency token and the same
+        // creation parameters, `AlreadyExistsException` otherwise.
+        if let Some(existing) = store.vaults.get(&input.backup_vault_name) {
+            let named_key = existing.named_encryption_key_arn().map(ToString::to_string);
+            let lock = existing.lock.as_ref();
+            let is_retry = input.creator_request_id.is_some()
+                && existing.creator_request_id == input.creator_request_id
+                && existing.vault_type
+                    == crate::state::VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT
+                && named_key == input.encryption_key_arn
+                && lock.and_then(|lock| lock.min_retention_days) == Some(input.min_retention_days)
+                && lock.and_then(|lock| lock.max_retention_days) == Some(input.max_retention_days)
+                && existing.tags == tags;
+            if !is_retry {
+                // The collision is reported with the condition's own `Code` and
+                // sentence, and discloses nothing about the vault that is
+                // already there — the same answer `CreateBackupVault` gives,
+                // because it is the same condition.
+                return Err(
+                    CreateLogicallyAirGappedBackupVaultErrorModeled::AlreadyExistsException(
+                        crate::state::vault_already_exists(),
+                    )
+                    .into(),
+                );
+            }
+            // A retry reports the vault as it stands now, including the state
+            // the clock has since made due.
+            store.settle_vault(&input.backup_vault_name, now);
+            let existing = store
+                .vaults
+                .get(&input.backup_vault_name)
+                .expect("the vault resolved just above");
+            return Ok(CreateLogicallyAirGappedBackupVaultOutput {
+                backup_vault_name: Some(existing.name.clone()),
+                backup_vault_arn: Some(existing.arn.clone()),
+                creation_date: Some(::aws_smithy_types::DateTime::from(existing.creation_date)),
+                vault_state: existing.vault_state.clone(),
+            });
+        }
+
+        // The store is in memory and every request can add to it, so the number
+        // of vaults it keeps is bounded. AWS answers the same modelled error
+        // once an account reaches its own vault quota.
+        if store.vaults.len() >= crate::state::MAX_VAULTS {
+            return Err(
+                CreateLogicallyAirGappedBackupVaultErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this emulator keeps at most {} backup vaults",
+                            crate::state::MAX_VAULTS
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every vault is encrypted by a KMS key: the one this request named,
+        // or — "if you do not specify a key, Backup creates a KMS key for you
+        // by default" (model doc for `EncryptionKeyArn`) — this service's own
+        // default key for the region, so a read always has a key to report.
+        let customer_managed_key = input.encryption_key_arn.is_some();
+        let encryption_key_arn = match input.encryption_key_arn {
+            Some(arn) => arn,
+            None => store.default_encryption_key_arn(&region, now),
+        };
+        let vault = crate::state::BackupVault {
+            name: input.backup_vault_name.clone(),
+            arn: crate::state::backup_vault_arn(&region, &input.backup_vault_name),
+            encryption_key_arn,
+            customer_managed_key,
+            // Unlike a standard `BACKUP_VAULT`, an air-gapped vault reports its
+            // `EncryptionKeyType` and its `VaultState`: both are members this
+            // vault type carries, and the create's own output models the state.
+            encryption_key_type: Some(
+                if customer_managed_key {
+                    crate::state::ENCRYPTION_KEY_TYPE_CUSTOMER_MANAGED
+                } else {
+                    crate::state::ENCRYPTION_KEY_TYPE_AWS_OWNED
+                }
+                .to_string(),
+            ),
+            creator_request_id: input.creator_request_id,
+            creation_date: now,
+            vault_type: crate::state::VAULT_TYPE_LOGICALLY_AIR_GAPPED_BACKUP_VAULT.to_string(),
+            // This operation's output models `VaultState`, so the vault is
+            // reported in the non-terminal state first and the clock owes it the
+            // move to `AVAILABLE`.
+            vault_state: Some(crate::state::VAULT_STATE_CREATING.to_string()),
+            settles_at: now.checked_add(crate::state::VAULT_SETTLE_AFTER),
+            tags,
+            // A logically air-gapped vault is locked by construction: its
+            // recovery points cannot be deleted before the retention period
+            // this request fixes, and that lock admits no changeable window, so
+            // it is immutable from the instant the vault was created.
+            lock: Some(crate::state::VaultLock {
+                min_retention_days: Some(input.min_retention_days),
+                max_retention_days: Some(input.max_retention_days),
+                lock_date: Some(now),
+            }),
+        };
+        let output = CreateLogicallyAirGappedBackupVaultOutput {
+            backup_vault_name: Some(vault.name.clone()),
+            backup_vault_arn: Some(vault.arn.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
+            vault_state: vault.vault_state.clone(),
+        };
+        store
+            .recovery_points_by_vault
+            .entry(vault.name.clone())
+            .or_default();
+        store.vaults.insert(vault.name.clone(), vault);
+        Ok(output)
     }
 }
+

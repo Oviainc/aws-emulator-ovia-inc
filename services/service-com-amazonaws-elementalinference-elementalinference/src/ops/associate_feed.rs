@@ -264,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The feed's status is the precondition: only a feed with no resource yet
         // (AVAILABLE), or the resource that already holds it (ACTIVE), may associate.
-        // A transient feed (CREATING / UPDATING / DELETING) and a released one
+        // A transient feed (CREATING / DELETING) and a released one
         // (ARCHIVED) take no association, and "you can associate only one resource with
         // each feed" rules out a second, different resource on an ACTIVE feed.
         //

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGroupMembershipId
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGroupMembershipId`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGroupMembershipId::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the `MembershipId` of the membership this identity store holds for the
+//! (group, member) pair the request names: a pure read of the membership records
+//! `CreateGroupMembership` persisted (`@readonly`,
+//! `smithy_query(query="operation",operation="GetGroupMembershipId")`), answered with
+//! the modelled `ResourceNotFoundException` when the store holds no such membership.
 //!
 //! ## Shape of an operation
 //!
@@ -107,11 +104,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-identitystore-awsidenti
 // here — hence the `GetGroupMembershipIdError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.identitystore#GetGroupMembershipId")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.identitystore#GetGroupMembershipId",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetGroupMembershipIdErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// The service-common server error, widened in because the model declares it on
+    /// the service rather than on this operation. Answered when the store is
+    /// unreachable.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -127,6 +131,24 @@ impl From<GetGroupMembershipIdErrorModeled> for GetGroupMembershipIdError {
     fn from(modeled: GetGroupMembershipIdErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for a (group, member) pair this
+/// identity store holds no membership for — including a group, a member or an identity
+/// store nothing ever created, since in each of those cases there is no membership
+/// whose id could be resolved.
+///
+/// Built with the shared helper for a resource an ALTERNATE identifier names: the pair
+/// is the ONLY way this operation names a membership, so what the caller sent is not a
+/// `MembershipId` and `ResourceId` stays unset rather than echoing it. The message
+/// names the identifiers that failed to resolve, not their values.
+fn membership_not_found() -> GetGroupMembershipIdErrorModeled {
+    GetGroupMembershipIdErrorModeled::ResourceNotFoundException(
+        crate::state::not_found_by_alternate_identifier(
+            crate::state::ResourceKind::Membership,
+            "GroupId and MemberId",
+        ),
+    )
 }
 
 /// The `GetGroupMembershipId` operation.
@@ -163,20 +185,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGroupMembershipId` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGroupMembershipIdErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGroupMembershipId"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetGroupMembershipIdErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the identity store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        // A read: it looks the store up rather than vivifying one, so resolving a
+        // membership id can never change what a later caller sees.
+        let state = state.lock();
+        let store = state
+            .store(&input.identity_store_id)
+            .ok_or_else(membership_not_found)?;
+
+        // The membership is named by the pair that identifies it, not by an id: the
+        // modelled `MemberId` union declares exactly one variant, `UserId`
+        // (`smithy_query(query="shape",shape="MemberId")`), so the pair is
+        // (GroupId, MemberId.UserId). Both members also accept the resource's ARN and
+        // either letter case, which `resource_key` reduces to the stored key.
+        let MemberId::UserId(member) = &input.member_id;
+        let membership = store
+            .membership_of(
+                &crate::state::resource_key(&input.group_id),
+                &crate::state::resource_key(member),
+            )
+            .ok_or_else(membership_not_found)?;
+
+        Ok(GetGroupMembershipIdOutput {
+            identity_store_id: store.identity_store_id.clone(),
+            membership_id: membership.membership_id.clone(),
+            membership_arn: membership.membership_arn.clone(),
+        })
     }
 }

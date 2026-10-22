@@ -585,13 +585,16 @@ fn source_description(
     }
 }
 
-/// The stored encryption state for a create that asked for server-side encryption.
+/// The stored encryption state of a new stream.
 ///
 /// The configuration itself is judged by [`crate::state::check_encryption_configuration_input`],
 /// which every operation taking a `DeliveryStreamEncryptionConfigurationInput` shares;
 /// only the mapping onto THIS operation's modelled errors lives here.
 ///
 /// Enabling SSE is asynchronous, so it starts `ENABLING` and the clock owes it `ENABLED`.
+/// A create that asked for no encryption stores none: `DescribeDeliveryStream` reports
+/// the documented disabled state ([`crate::state::disabled_encryption`]) for such a
+/// stream, so its SSE status is always readable.
 fn encryption_configuration(
     input: Option<&DeliveryStreamEncryptionConfigurationInput>,
     region: &str,

@@ -5,6 +5,13 @@
 //! Reports the stored `DeliveryStreamDescription`, rendering each destination from the
 //! configuration its create supplied.
 //!
+//! A member whose default the service documents is reported with that default
+//! MATERIALISED rather than omitted: the stream's SSE state (`DISABLED` for a stream that
+//! was never encrypted), a destination's `CompressionFormat`, `BufferingHints`,
+//! `EncryptionConfiguration` and `S3BackupMode`. A client comparing desired against
+//! actual configuration, or round-tripping a description back into `UpdateDestination`,
+//! then reads an explicit value where AWS reports one.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -197,7 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing in this emulator fails a create, a delete or an encryption
                 // change, so no stream carries a KMS failure description.
                 failure_description: None,
-                delivery_stream_encryption_configuration: stream.encryption.clone(),
+                // Always reported: a stream always has an SSE state, and a stream SSE was
+                // never configured on reports the documented disabled one.
+                delivery_stream_encryption_configuration: Some(
+                    stream
+                        .encryption
+                        .clone()
+                        .unwrap_or_else(crate::state::disabled_encryption),
+                ),
                 delivery_stream_type: stream.stream_type.clone(),
                 version_id: stream.version_id.to_string(),
                 create_timestamp: Some(::aws_smithy_types::DateTime::from(
@@ -220,6 +234,19 @@ const DEFAULT_COMPRESSION_FORMAT: &str = "UNCOMPRESSED";
 const DEFAULT_BUFFERING_SIZE_IN_MBS: i32 = 5;
 /// `BufferingHints.IntervalInSeconds`: "The default value is 300."
 const DEFAULT_BUFFERING_INTERVAL_IN_SECONDS: i32 = 300;
+/// The `S3BackupMode` of an Amazon S3 or Amazon Redshift destination created without one:
+/// "After you create a Firehose stream, you can update it to enable Amazon S3 backup if
+/// it is disabled" (`ExtendedS3DestinationConfiguration$S3BackupMode`,
+/// `RedshiftDestinationConfiguration$S3BackupMode`) — so a destination that never asked
+/// for backup has it disabled, the first value of the `S3BackupMode` /
+/// `RedshiftS3BackupMode` enums.
+const DEFAULT_S3_BACKUP_MODE: &str = "Disabled";
+/// `ElasticsearchDestinationConfiguration$S3BackupMode`: "Default value is
+/// FailedDocumentsOnly."
+const DEFAULT_ELASTICSEARCH_S3_BACKUP_MODE: &str = "FailedDocumentsOnly";
+/// `SplunkDestinationConfiguration$S3BackupMode`: "The default value is
+/// FailedEventsOnly."
+const DEFAULT_SPLUNK_S3_BACKUP_MODE: &str = "FailedEventsOnly";
 
 /// Render one stored destination: its assigned id plus the `*DestinationDescription`
 /// matching the configuration variant the create supplied.
@@ -248,7 +275,10 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 ),
                 cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
                 processing_configuration: config.processing_configuration.clone(),
-                s3_backup_mode: config.s3_backup_mode.clone(),
+                s3_backup_mode: Some(s3_backup_mode(
+                    config.s3_backup_mode.as_ref(),
+                    DEFAULT_S3_BACKUP_MODE,
+                )),
                 s3_backup_description: config
                     .s3_backup_configuration
                     .as_ref()
@@ -273,7 +303,10 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 retry_options: config.retry_options.clone(),
                 s3_destination_description: s3_description(&config.s3_configuration),
                 processing_configuration: config.processing_configuration.clone(),
-                s3_backup_mode: config.s3_backup_mode.clone(),
+                s3_backup_mode: Some(s3_backup_mode(
+                    config.s3_backup_mode.as_ref(),
+                    DEFAULT_S3_BACKUP_MODE,
+                )),
                 s3_backup_description: config
                     .s3_backup_configuration
                     .as_ref()
@@ -293,7 +326,10 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 index_rotation_period: config.index_rotation_period.clone(),
                 buffering_hints: config.buffering_hints.clone(),
                 retry_options: config.retry_options.clone(),
-                s3_backup_mode: config.s3_backup_mode.clone(),
+                s3_backup_mode: Some(s3_backup_mode(
+                    config.s3_backup_mode.as_ref(),
+                    DEFAULT_ELASTICSEARCH_S3_BACKUP_MODE,
+                )),
                 s3_destination_description: Some(s3_description(&config.s3_configuration)),
                 processing_configuration: config.processing_configuration.clone(),
                 cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
@@ -331,7 +367,10 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 hec_acknowledgment_timeout_in_seconds: config
                     .hec_acknowledgment_timeout_in_seconds,
                 retry_options: config.retry_options.clone(),
-                s3_backup_mode: config.s3_backup_mode.clone(),
+                s3_backup_mode: Some(s3_backup_mode(
+                    config.s3_backup_mode.as_ref(),
+                    DEFAULT_SPLUNK_S3_BACKUP_MODE,
+                )),
                 s3_destination_description: Some(s3_description(&config.s3_configuration)),
                 processing_configuration: config.processing_configuration.clone(),
                 cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
@@ -455,6 +494,18 @@ fn buffering_hints(hints: Option<&BufferingHints>) -> BufferingHints {
 
 fn compression_format(format: Option<&String>) -> String {
     format.cloned().unwrap_or_else(|| DEFAULT_COMPRESSION_FORMAT.to_string())
+}
+
+/// The `S3BackupMode` a destination description reports: the one the configuration
+/// supplied, else the `default` its own documentation gives that destination kind.
+///
+/// Firehose materialises a documented default into the description it reports rather than
+/// leaving the member unset, so a client comparing desired against actual configuration
+/// (or round-tripping a description back into `UpdateDestination`) reads an explicit
+/// value. Only the destination kinds whose model documents a default get one here — for
+/// the rest there is no value to materialise.
+fn s3_backup_mode(mode: Option<&String>, default: &str) -> String {
+    mode.cloned().unwrap_or_else(|| default.to_string())
 }
 
 /// "The encryption configuration. If no value is specified, the default is no

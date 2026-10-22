@@ -178,9 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
             return Err(DeleteGraphErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("graph {} not found", input.graph_identifier),
-                },
+                crate::state::graph_not_found(&input.graph_identifier),
             )
             .into());
         };
@@ -221,9 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(mut deleted) = store.remove_graph(&input.graph_identifier) else {
             // Unreachable: the lookup above resolved under the same lock.
             return Err(DeleteGraphErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("graph {} not found", input.graph_identifier),
-                },
+                crate::state::graph_not_found(&input.graph_identifier),
             )
             .into());
         };

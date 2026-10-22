@@ -23,3 +23,5 @@ mod batch_get_latest_values;
 mod property_value_history;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/time_series.rs"]
+mod time_series;

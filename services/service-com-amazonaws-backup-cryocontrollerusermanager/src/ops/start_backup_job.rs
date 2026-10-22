@@ -221,9 +221,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
-        // A logically air-gapped destination vault is reached only through
-        // `CreateLogicallyAirGappedBackupVault`, which is still unimplemented, so
-        // this emulator cannot honour the copy that member asks for.
+        // This member asks the job to ALSO copy the backup it takes into a
+        // logically air-gapped vault. This emulator's `StartBackupJob` takes one
+        // backup into the vault it names and runs no copy of it, so the copy
+        // the member asks for would be reported without anything performing it:
+        // it is refused with the modelled error instead.
         if input.logically_air_gapped_backup_vault_arn.is_some() {
             return Err(StartBackupJobErrorModeled::InvalidRequestException(
                 InvalidRequestException {
@@ -302,6 +304,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A vault receives backups only once it is available: for a vault type
+        // that reports a `VaultState`, the transition the clock owes is
+        // materialised first, and a vault still in a non-terminal state is
+        // refused for its STATE rather than reported as absent. A standard
+        // vault reports no state at all and is ready from creation.
+        store.settle_vault(&input.backup_vault_name, now);
+        let pending_state = store
+            .vaults
+            .get(&input.backup_vault_name)
+            .and_then(|vault| vault.vault_state.clone())
+            .filter(|state| state != crate::state::VAULT_STATE_AVAILABLE);
+        if let Some(pending_state) = pending_state {
+            return Err(StartBackupJobErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Backup vault {} is in {pending_state} state and cannot \
+                         receive a backup",
+                        input.backup_vault_name
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
 
         // A replayed idempotency token answers with the job it already created:
         // no second job, no second recovery point. The token identifies ONE

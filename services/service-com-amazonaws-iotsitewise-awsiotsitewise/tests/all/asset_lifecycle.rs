@@ -21,7 +21,7 @@ use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
 use service_com_amazonaws_iotsitewise_awsiotsitewise::EmulatedService;
 
 /// The region the test signs for; every ARN the emulator mints must carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// A router with just this service mounted on a fresh shared engine.
 ///
@@ -102,7 +102,7 @@ fn hex_token(asset_id: &str) -> String {
 
 /// `true` when `id` has the shape every `ID` member models: a lowercase
 /// hyphenated UUID that is not the all-zero one.
-fn is_modelled_id(id: &str) -> bool {
+pub(crate) fn is_modelled_id(id: &str) -> bool {
     id.len() == 36
         && id != "00000000-0000-0000-0000-000000000000"
         && id
