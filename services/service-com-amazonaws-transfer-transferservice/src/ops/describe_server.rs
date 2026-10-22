@@ -186,6 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             host_key_fingerprint: Some(stored.host_key_fingerprint.clone()),
             identity_provider_details: stored.identity_provider_details.clone(),
             identity_provider_type: Some(stored.identity_provider_type.clone()),
+            // The logging members are reported ONLY when the server has them
+            // configured: a server with a `LoggingRole` and no structured destination
+            // publishes to the service-managed log group, and the ABSENCE of
+            // `StructuredLogDestinations` is what tells the caller so. See
+            // `state::configured_log_destinations`.
             logging_role: stored.logging_role.clone(),
             post_authentication_login_banner: stored.post_authentication_login_banner.clone(),
             pre_authentication_login_banner: stored.pre_authentication_login_banner.clone(),
@@ -200,11 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: Some(stored.tags.clone()),
             user_count: Some(user_count),
             workflow_details: stored.workflow_details.clone(),
-            // Unlike `HomeDirectoryMappings`, `StructuredLogDestinations` is
-            // modelled `len 0..1` — an empty list is a legal value and is how the real
-            // service reports structured logging turned off — so it is reported as an
-            // empty list rather than as absent.
-            structured_log_destinations: Some(stored.structured_log_destinations.clone()),
+            structured_log_destinations: stored.structured_log_destinations.clone(),
             s3_storage_options: Some(stored.s3_storage_options.clone()),
             // Egress IPs are only meaningful for AS2 servers and the emulator runs no
             // AS2 transport, so there is nothing to report.

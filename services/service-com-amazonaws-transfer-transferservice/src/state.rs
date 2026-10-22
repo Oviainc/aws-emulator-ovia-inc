@@ -383,7 +383,16 @@ pub struct Server {
     /// [`mint_host_key_fingerprint`]. Never invented: it is the real fingerprint of
     /// real key material.
     pub host_key_fingerprint: String,
-    pub structured_log_destinations: Vec<String>,
+    /// The log group structured logging is configured to publish to, or `None` when
+    /// the server has NO structured-logging configuration.
+    ///
+    /// "Not configured" and "configured with nothing" are not the same server: a
+    /// reader reports the first by OMITTING `StructuredLogDestinations` and the second
+    /// cannot exist, because the model documents an empty value as what CLEARS the
+    /// setting ("you can clear it, and in effect turn off structured logging, by
+    /// providing an empty value for this parameter"). See
+    /// [`configured_log_destinations`].
+    pub structured_log_destinations: Option<Vec<String>>,
     /// The S3 storage settings, defaulted at create time like
     /// [`Self::protocol_details`].
     pub s3_storage_options: S3StorageOptions,
@@ -546,6 +555,29 @@ pub fn resolve_protocol_details(requested: Option<ProtocolDetails>) -> ProtocolD
             ),
         }),
     }
+}
+
+/// The STORED form of the structured-logging destination a request supplied.
+///
+/// `StructuredLogDestinations` is a configuration setting that is either SET or NOT
+/// SET: the model documents an EMPTY value as what turns it off ("If you have
+/// previously specified a log group for a server, you can clear it, and in effect turn
+/// off structured logging, by providing an empty value for this parameter"), so an
+/// empty list is stored as `None` — not configured — rather than as a configured empty
+/// list, and a reader omits the member for it.
+pub fn configured_log_destinations(requested: Option<Vec<String>>) -> Option<Vec<String>> {
+    requested.filter(|destinations| !destinations.is_empty())
+}
+
+/// The STORED form of the logging role a request supplied, on the same rule as
+/// [`configured_log_destinations`].
+///
+/// `LoggingRole` targets `NullableRole`, whose pattern `^(|arn:.*role/\S+)$` admits the
+/// EMPTY STRING for exactly one purpose — clearing the role — so an empty value is
+/// stored as not configured and reported absent, like any other logging member the
+/// server does not have.
+pub fn configured_logging_role(requested: Option<String>) -> Option<String> {
+    requested.filter(|role| !role.is_empty())
 }
 
 /// Resolve the `S3StorageOptions` a server is created with, on the same rule as

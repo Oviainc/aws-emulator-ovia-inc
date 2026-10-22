@@ -394,8 +394,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(identity_provider_type) = input.identity_provider_type {
             stored.identity_provider_type = identity_provider_type;
         }
+        // An empty value CLEARS a logging member (`NullableRole`'s empty string, an
+        // empty `StructuredLogDestinations`), leaving the server with no such
+        // configuration — which a reader reports by omitting the member.
         if let Some(logging_role) = input.logging_role {
-            stored.logging_role = Some(logging_role);
+            stored.logging_role = st::configured_logging_role(Some(logging_role));
         }
         if let Some(banner) = input.post_authentication_login_banner {
             stored.post_authentication_login_banner = Some(banner);
@@ -415,9 +418,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stored.workflow_details = Some(workflow_details);
         }
         // "You can clear it, and in effect turn off structured logging, by providing an
-        // empty value for this parameter" — so an empty list is a value, not an absence.
+        // empty value for this parameter" — so an empty list leaves the server with NO
+        // structured-logging configuration, not with a configured empty one.
         if let Some(destinations) = input.structured_log_destinations {
-            stored.structured_log_destinations = destinations;
+            stored.structured_log_destinations = st::configured_log_destinations(Some(destinations));
         }
         if let Some(s3_storage_options) = input.s3_storage_options {
             stored.s3_storage_options =

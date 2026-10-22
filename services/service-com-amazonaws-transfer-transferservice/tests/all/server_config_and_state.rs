@@ -835,10 +835,12 @@ async fn update_server_changes_only_the_members_it_names() {
         ),
         (
             // "You can clear it ... by providing an empty value for this parameter."
+            // Cleared means NOT CONFIGURED, so the member goes absent; the dedicated
+            // table for the logging members is in `server_logging_configuration.rs`.
             "an empty StructuredLogDestinations clears structured logging",
             json!({"StructuredLogDestinations": []}),
             json!({
-                "StructuredLogDestinations": [],
+                "StructuredLogDestinations": null,
                 "Protocols": ["SFTP", "FTPS"],
             }),
         ),

@@ -363,7 +363,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // materialised at create time, so no reader has to re-apply one and a
             // configuration read-back reports the server as configured.
             protocol_details: st::resolve_protocol_details(input.protocol_details),
-            logging_role: input.logging_role,
+            // The two logging members are stored as CONFIGURED or NOT CONFIGURED: an
+            // empty value is the documented way to have no logging configuration, and
+            // a reader omits what is not configured.
+            logging_role: st::configured_logging_role(input.logging_role),
             security_policy_name,
             pre_authentication_login_banner: input.pre_authentication_login_banner,
             post_authentication_login_banner: input.post_authentication_login_banner,
@@ -375,7 +378,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_deref()
                 .and_then(st::supplied_host_key_fingerprint)
                 .unwrap_or_else(st::mint_host_key_fingerprint),
-            structured_log_destinations: input.structured_log_destinations.unwrap_or_default(),
+            structured_log_destinations: st::configured_log_destinations(
+                input.structured_log_destinations,
+            ),
             s3_storage_options: st::resolve_s3_storage_options(input.s3_storage_options),
             ip_address_type,
             workflow_details: input.workflow_details,

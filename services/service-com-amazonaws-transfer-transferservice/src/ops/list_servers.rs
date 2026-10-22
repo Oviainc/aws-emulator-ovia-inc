@@ -193,14 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 domain: Some(stored.domain.clone()),
                 identity_provider_type: Some(stored.identity_provider_type.clone()),
                 endpoint_type: Some(stored.endpoint_type.clone()),
-                // `ListedServer.LoggingRole` targets `Role` (`len 20..2048`, pattern
-                // `^arn:.*role/\S+$`), not the nullable `NullableRole` that
-                // `DescribedServer` uses, so a server whose logging role was cleared to
-                // the empty string reports it absent here rather than as `""`.
-                logging_role: stored
-                    .logging_role
-                    .clone()
-                    .filter(|role| !role.is_empty()),
+                // Reported only when the server HAS a logging role: the stored member
+                // is `None` for a server that never had one and for one whose role was
+                // cleared with `NullableRole`'s empty value (see
+                // `state::configured_logging_role`), and `ListedServer.LoggingRole`
+                // targets `Role` (`len 20..2048`, pattern `^arn:.*role/\S+$`), which
+                // has no empty form to report anyway.
+                logging_role: stored.logging_role.clone(),
                 server_id: Some(stored.server_id.clone()),
                 state: Some(stored.state.clone()),
                 user_count: Some(

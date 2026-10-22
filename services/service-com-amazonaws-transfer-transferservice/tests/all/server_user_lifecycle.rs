@@ -51,6 +51,9 @@ async fn describe_server_rebuilds_every_created_member_from_stored_state() {
                 "Tags": [],
                 "Certificate": null,
                 "LoggingRole": null,
+                // Not configured, so absent — `server_logging_configuration.rs` holds
+                // the whole table for the two logging members.
+                "StructuredLogDestinations": null,
                 "PreAuthenticationLoginBanner": null,
                 "PostAuthenticationLoginBanner": null,
             }),

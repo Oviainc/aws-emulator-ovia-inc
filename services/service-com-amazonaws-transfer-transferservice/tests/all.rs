@@ -21,6 +21,8 @@ mod not_found_errors;
 mod profile_lifecycle;
 #[path = "all/server_config_and_state.rs"]
 mod server_config_and_state;
+#[path = "all/server_logging_configuration.rs"]
+mod server_logging_configuration;
 #[path = "all/server_user_lifecycle.rs"]
 mod server_user_lifecycle;
 #[path = "all/state_roundtrip.rs"]
