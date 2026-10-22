@@ -32,6 +32,9 @@ mod insight_summaries;
 #[path = "all/request_deserialization.rs"]
 mod request_deserialization;
 
+#[path = "all/request_validation_before_resolution.rs"]
+mod request_validation_before_resolution;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 

@@ -21,17 +21,19 @@
 //! * an insight is selected by the OVERLAP of its own interval with the
 //!   requested window, not by containment, and a bound the insight does not
 //!   report bounds nothing;
-//! * a group selector narrows the listing to the insights of that group, by
-//!   either `GroupName` or `GroupARN`, and `States` narrows it to one
-//!   `InsightState`;
+//! * insight summaries are scoped TO A GROUP: `GroupARN` is "required if the
+//!   GroupName isn't provided" and the other way about, so EXACTLY ONE selector
+//!   is required — a request naming neither, or both, is refused — and the
+//!   selector narrows the listing to the insights of that group, while `States`
+//!   narrows it to one `InsightState`;
 //! * the operation is `@paginated`: `MaxResults` bounds a page, a `NextToken`
 //!   appears only when the listing was truncated, and resuming from it yields
 //!   the remainder exactly once;
 //! * a request the operation cannot satisfy — a window naming no interval of
-//!   recorded traffic, a selector naming no group or naming two, a `States`
-//!   value outside `InsightState`, a token this service never issued — is
-//!   REFUSED with `InvalidRequestException` at HTTP 400, never answered with a
-//!   200 that ignored it.
+//!   recorded traffic, a request naming no group selector or naming two, a
+//!   selector naming no group, a `States` value outside `InsightState`, a token
+//!   this service never issued — is REFUSED with `InvalidRequestException` at
+//!   HTTP 400, never answered with a 200 that ignored it.
 
 use std::collections::BTreeSet;
 
@@ -136,11 +138,23 @@ async fn create_group(xray: &Xray, label: &str, name: &str) -> String {
         .to_string()
 }
 
+/// The group the seeded insights below belong to, and the one a row that is not
+/// about the selector is scoped to.
+const SCOPE_GROUP: &str = "watched";
+
 /// `GetInsightSummaries` over `[start, end]`, plus any extra members.
+///
+/// The operation is scoped to a group (a request naming neither selector is
+/// refused — see `a_request_the_operation_cannot_satisfy_is_refused_as_invalid`),
+/// so a row that names no selector of its own is scoped to [`SCOPE_GROUP`],
+/// which the seeds of these cases belong to.
 async fn summaries(xray: &Xray, start: f64, end: f64, extra: &Value) -> Answer {
     let mut body = json!({"StartTime": start, "EndTime": end});
     for (member, value) in extra.as_object().into_iter().flatten() {
         body[member] = value.clone();
+    }
+    if body.get("GroupName").is_none() && body.get("GroupARN").is_none() {
+        body["GroupName"] = json!(SCOPE_GROUP);
     }
     xray.call("/InsightSummaries", &body).await
 }
@@ -174,6 +188,7 @@ fn impact(insight: &Value, member: &str) -> (i64, i64, i64) {
 #[tokio::test]
 async fn an_empty_insight_store_lists_nothing_over_any_window() {
     let xray = Xray::new();
+    create_group(&xray, "empty store", SCOPE_GROUP).await;
     // Rows differ in the width and the age of the window; none of them can
     // invent an insight, because nothing in the API creates one.
     for (label, start, end) in [
@@ -202,7 +217,7 @@ async fn an_empty_insight_store_lists_nothing_over_any_window() {
 #[tokio::test]
 async fn every_listed_member_is_the_stored_insights_and_resolves_through_get_insight() {
     let (xray, engine) = Xray::with_engine();
-    let arn = create_group(&xray, "members", "watched").await;
+    let arn = create_group(&xray, "members", SCOPE_GROUP).await;
 
     // Rows differ in state, in which bounds the insight reports, and in its
     // counts — so no single shape of insight can satisfy them all.
@@ -415,6 +430,7 @@ async fn the_window_selects_an_insight_whose_interval_overlaps_it() {
     ];
 
     let (xray, engine) = Xray::with_engine();
+    create_group(&xray, "overlap", SCOPE_GROUP).await;
     seed(
         &engine,
         &[
@@ -518,13 +534,9 @@ async fn a_group_selector_and_states_narrow_the_listing() {
     );
 
     // Rows differ in which selector names the group and which state is asked
-    // for, including both together and neither.
+    // for — each row names exactly one selector, because the operation is scoped
+    // to a group.
     let rows: Vec<(&str, Value, Vec<&str>)> = vec![
-        (
-            "no selector and no States",
-            json!({}),
-            vec![alpha_active, alpha_closed, beta_active],
-        ),
         (
             "GroupName",
             json!({"GroupName": "alpha"}),
@@ -541,25 +553,34 @@ async fn a_group_selector_and_states_narrow_the_listing() {
             vec![alpha_active, alpha_closed],
         ),
         (
+            "the other group by GroupARN",
+            json!({"GroupARN": beta_arn.clone()}),
+            vec![beta_active],
+        ),
+        (
             "the reserved Default group, which holds no insight",
             json!({"GroupName": "Default"}),
             vec![],
         ),
         (
             "States ACTIVE",
-            json!({"States": ["ACTIVE"]}),
-            vec![alpha_active, beta_active],
+            json!({"GroupName": "alpha", "States": ["ACTIVE"]}),
+            vec![alpha_active],
+        ),
+        (
+            "States ACTIVE in the other group",
+            json!({"GroupARN": beta_arn.clone(), "States": ["ACTIVE"]}),
+            vec![beta_active],
         ),
         (
             "States CLOSED",
-            json!({"States": ["CLOSED"]}),
-            vec![alpha_closed],
-        ),
-        ("an empty States list", json!({"States": []}), vec![alpha_active, alpha_closed, beta_active]),
-        (
-            "a group and a state together",
             json!({"GroupName": "alpha", "States": ["CLOSED"]}),
             vec![alpha_closed],
+        ),
+        (
+            "an empty States list",
+            json!({"GroupName": "alpha", "States": []}),
+            vec![alpha_active, alpha_closed],
         ),
         (
             "a group and a state that select nothing together",
@@ -607,6 +628,7 @@ async fn a_next_token_appears_only_when_truncated_and_resumes_exactly_once() {
         for max_results in [None, Some(1), Some(2), Some(100)] {
             let label = format!("{count} insight(s), MaxResults {max_results:?}");
             let (xray, engine) = Xray::with_engine();
+            create_group(&xray, &label, SCOPE_GROUP).await;
             let all = ids_for(count);
             {
                 let state = engine.state::<ComAmazonawsXrayAwsxrayState>();
@@ -618,7 +640,7 @@ async fn a_next_token_appears_only_when_truncated_and_resumes_exactly_once() {
                         id.clone(),
                         Insight {
                             insight_id: Some(id.clone()),
-                            group_name: Some("watched".to_string()),
+                            group_name: Some(SCOPE_GROUP.to_string()),
                             state: Some("ACTIVE".to_string()),
                             start_time: Some(::aws_smithy_types::DateTime::from_secs_f64(started)),
                             ..Insight::default()
@@ -696,7 +718,7 @@ async fn a_request_the_operation_cannot_satisfy_is_refused_as_invalid() {
     use service_com_amazonaws_xray_awsxray::state::MAX_WINDOW_FUTURE_SKEW_SECONDS;
 
     let (xray, engine) = Xray::with_engine();
-    let arn = create_group(&xray, "refusals", "watched").await;
+    let arn = create_group(&xray, "refusals", SCOPE_GROUP).await;
     let stored = "99999999-aaaa-4bbb-8ccc-dddddddddddd";
     seed(
         &engine,
@@ -768,6 +790,21 @@ async fn a_request_the_operation_cannot_satisfy_is_refused_as_invalid() {
             json!({"StartTime": now() * 1_000.0, "EndTime": now() * 1_000.0 + 60.0}),
         ),
         (
+            "neither group selector",
+            "InvalidRequestException",
+            json!({"StartTime": now() - 1.0, "EndTime": now()}),
+        ),
+        (
+            "neither group selector, with every other member supplied",
+            "InvalidRequestException",
+            json!({
+                "StartTime": now() - 1.0,
+                "EndTime": now(),
+                "States": ["ACTIVE"],
+                "MaxResults": 10,
+            }),
+        ),
+        (
             "GroupName naming no group",
             "InvalidRequestException",
             json!({"StartTime": now() - 1.0, "EndTime": now(), "GroupName": "absent"}),
@@ -799,7 +836,12 @@ async fn a_request_the_operation_cannot_satisfy_is_refused_as_invalid() {
         (
             "a NextToken this service never issued",
             "InvalidRequestException",
-            json!({"StartTime": now() - 1.0, "EndTime": now(), "NextToken": "never-issued"}),
+            json!({
+                "StartTime": now() - 1.0,
+                "EndTime": now(),
+                "GroupName": SCOPE_GROUP,
+                "NextToken": "never-issued",
+            }),
         ),
         (
             // Well formed as an id, and past every stored one.
@@ -808,6 +850,7 @@ async fn a_request_the_operation_cannot_satisfy_is_refused_as_invalid() {
             json!({
                 "StartTime": now() - 3_600.0,
                 "EndTime": now(),
+                "GroupName": SCOPE_GROUP,
                 "NextToken": "ffffffff-ffff-4fff-bfff-ffffffffffff",
             }),
         ),

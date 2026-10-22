@@ -4,9 +4,17 @@
 //!
 //! Rewrites the named indexing rule's configuration in the store and answers
 //! the stored record, so `GetIndexingRules` reports the new configuration on
-//! the next call. A name the account does not hold is refused with
-//! `ResourceNotFoundException`: X-Ray models no operation that creates an
-//! indexing rule, so an update never adds one.
+//! the next call.
+//!
+//! Only the account's DEFAULT indexing rule may be updated
+//! ([`crate::state::DEFAULT_INDEXING_RULE_NAME`]): X-Ray models no operation
+//! that creates an indexing rule, so no other name can ever name one, and the
+//! restriction is reported as what it is — an invalid request
+//! (`InvalidRequestException`, HTTP 400, "Invalid update request as only
+//! default rule updates are allowed") rather than as a resource that happens to
+//! be missing. The distinction is wire-visible, because the operation models
+//! `ResourceNotFoundException` (404) too and a client branches on it: a 404
+//! would tell it to create or wait for a rule that can never exist.
 //!
 //! ## Shape of an operation
 //!
@@ -177,6 +185,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Only the default rule is updatable, and no operation in this API
+        // creates another — so a `Name` that is not it names a rule that cannot
+        // exist, which is a mistake in the REQUEST and is refused before the
+        // store is consulted at all. The modelled `ResourceNotFoundException`
+        // below is kept for a rule the store really has lost.
+        if input.name != crate::state::DEFAULT_INDEXING_RULE_NAME {
+            return Err(UpdateIndexingRuleErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(ONLY_DEFAULT_RULE_IS_UPDATABLE.to_string()),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         let Some(rule) = store
             .indexing_rules
@@ -200,3 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// What X-Ray answers a request naming any rule but the default one: the
+/// restriction, stated as the fixed sentence the service uses. It carries no
+/// value from the request — the refusal is about the rule the account has, not
+/// about the text that was submitted.
+pub const ONLY_DEFAULT_RULE_IS_UPDATABLE: &str =
+    "Invalid update request as only default rule updates are allowed";

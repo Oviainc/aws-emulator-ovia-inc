@@ -834,16 +834,22 @@ fn collect_annotations<'a>(
     }
 }
 
-/// The annotations of a subsegment tree, indexed by key. Recurses once per level
-/// of nesting, which the ingest bounds at [`super::MAX_SUBSEGMENT_DEPTH`].
+/// The annotations of a subsegment tree, indexed by key.
+///
+/// Walked with an explicit worklist rather than by recursion, so the nesting a
+/// submitted document carries costs heap and not call stack (the ingest also
+/// refuses a document nested deeper than [`super::MAX_SUBSEGMENT_DEPTH`]). The
+/// order is the recursion's: a node, then its children left to right, which is
+/// the order a key's values are indexed in.
 fn walk_annotations<'a>(
     at: usize,
     subsegments: &'a [SubsegmentRecord],
     out: &mut BTreeMap<&'a str, Vec<(usize, &'a serde_json::Value)>>,
 ) {
-    for subsegment in subsegments {
+    let mut pending: Vec<&'a SubsegmentRecord> = subsegments.iter().rev().collect();
+    while let Some(subsegment) = pending.pop() {
         collect_annotations(at, &subsegment.annotations, out);
-        walk_annotations(at, &subsegment.subsegments, out);
+        pending.extend(subsegment.subsegments.iter().rev());
     }
 }
 

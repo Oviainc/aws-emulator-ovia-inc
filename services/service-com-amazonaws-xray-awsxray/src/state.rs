@@ -1264,11 +1264,24 @@ pub fn default_group(region: &str) -> GroupRecord {
     }
 }
 
-/// The refusal X-Ray answers when a request supplies BOTH group selectors.
+/// What a read whose `FilterExpression` spent its whole work budget
+/// ([`filter::MAX_QUERY_STEPS`]) answers.
+///
+/// The request is well formed; what it would COST is the problem, so every
+/// reader that evaluates an expression lifts this one sentence into its own
+/// modelled THROTTLING error rather than into one that blames the input — and it
+/// is an error rather than a short answer, because a derivation that stopped
+/// halfway is indistinguishable from one that found nothing more.
+pub const FILTER_BUDGET_SPENT_MESSAGE: &str = "the FilterExpression could not be evaluated over every trace in [StartTime, EndTime) within the work one request may do; narrow the time range or simplify the expression";
+
+/// The refusal X-Ray answers when a request does not supply EXACTLY ONE group
+/// selector — neither of them, or both at once.
 ///
 /// A group is identified by exactly one of `GroupName` or `GroupARN`, so a
-/// request carrying both states two identities at once; the service refuses it
-/// with this fixed wording rather than servicing one of them.
+/// request carrying both states two identities at once and one carrying neither
+/// names no group at all; X-Ray words both halves of that one rule the same way
+/// ("Provide either GroupName or GroupARN") rather than servicing one selector
+/// or widening the call to every group.
 pub const CONFLICTING_GROUP_SELECTORS_MESSAGE: &str = "Provide either GroupName or GroupARN";
 
 /// The reserved [`DEFAULT_GROUP_NAME`] group `resource_arn` names, when it names
@@ -1305,8 +1318,11 @@ impl GroupLookupError {
     /// the caller.
     pub fn message(self) -> &'static str {
         match self {
-            Self::NoSelector => "either GroupName or GroupARN must be specified",
-            Self::ConflictingSelectors => CONFLICTING_GROUP_SELECTORS_MESSAGE,
+            // One sentence for both halves of "exactly one selector": a request
+            // naming neither is as unresolvable as one naming two, and X-Ray
+            // states them identically (see
+            // [`CONFLICTING_GROUP_SELECTORS_MESSAGE`]).
+            Self::NoSelector | Self::ConflictingSelectors => CONFLICTING_GROUP_SELECTORS_MESSAGE,
             Self::NotFound => "Group not found",
         }
     }
@@ -1723,24 +1739,11 @@ fn inferred_segment_id(trace_id: &str, remote_id: &str) -> String {
 /// building a service map sees the downstream node the caller recorded. Its
 /// times, `http` block, outcome flags and `cause` are the subsegment's: the
 /// remote subsegment is the only record of what the downstream service did.
+///
+/// The tree is walked with an explicit worklist rather than by recursion, so the
+/// nesting a submitted document carries costs heap and not call stack; the order
+/// is the recursion's, a node then its children left to right.
 pub fn inferred_segments(trace_id: &str, segment: &SegmentRecord) -> Vec<SegmentRecord> {
-    fn walk(
-        trace_id: &str,
-        subsegments: &[SubsegmentRecord],
-        timed_from: f64,
-        out: &mut Vec<SegmentRecord>,
-    ) {
-        for subsegment in subsegments {
-            if let (Some(remote_id), true) = (
-                subsegment.id.as_deref(),
-                subsegment.namespace.as_deref() == Some(REMOTE_NAMESPACE),
-            ) {
-                out.push(inferred_segment(trace_id, remote_id, subsegment, timed_from));
-            }
-            walk(trace_id, &subsegment.subsegments, timed_from, out);
-        }
-    }
-
     let mut out = Vec::new();
     if segment.inferred {
         // A synthesised segment never derives further segments from itself. It
@@ -1748,12 +1751,21 @@ pub fn inferred_segments(trace_id: &str, segment: &SegmentRecord) -> Vec<Segment
         // `inferred_segment` sets the flag, never a submitted document.
         return out;
     }
-    walk(
-        trace_id,
-        &segment.subsegments,
-        segment.start_time,
-        &mut out,
-    );
+    let mut pending: Vec<&SubsegmentRecord> = segment.subsegments.iter().rev().collect();
+    while let Some(subsegment) = pending.pop() {
+        if let (Some(remote_id), true) = (
+            subsegment.id.as_deref(),
+            subsegment.namespace.as_deref() == Some(REMOTE_NAMESPACE),
+        ) {
+            out.push(inferred_segment(
+                trace_id,
+                remote_id,
+                subsegment,
+                segment.start_time,
+            ));
+        }
+        pending.extend(subsegment.subsegments.iter().rev());
+    }
     out
 }
 
@@ -2279,6 +2291,19 @@ impl TraceRecord {
             .find(|segment| segment.parent_id.is_none())
     }
 
+    /// Whether any stored segment of this trace STARTED inside the half-open
+    /// window [`start`, `end`) — the selection every windowed derivation of this
+    /// crate makes, segment by segment.
+    ///
+    /// Asked BEFORE a group's `FilterExpression` is evaluated over a trace, so a
+    /// trace that cannot contribute to the answer costs none of the query budget
+    /// ([`filter::QueryBudget`]) however large the store grows.
+    pub fn touches_window(&self, start: f64, end: f64) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| segment.start_time >= start && segment.start_time < end)
+    }
+
     /// The segment stored under `id`, in O(log n) through the id index rather
     /// than a scan \u2014 which is how a graph resolves a segment's `parent_id`.
     pub fn segment(&self, id: &str) -> Option<&SegmentRecord> {
@@ -2750,6 +2775,50 @@ impl ComAmazonawsXrayAwsxrayState {
             return Ok(default);
         }
         Err(GroupLookupError::NotFound)
+    }
+
+    /// The compiled `FilterExpression` a `(GroupName, GroupARN)` pair narrows a
+    /// derived read by — the ONE resolution every read over a group makes, so
+    /// `GetServiceGraph` and `GetTimeSeriesServiceStatistics` cannot drift into
+    /// two readings of one rule.
+    ///
+    /// `Ok(None)` is "nothing narrows this read": the request named no group, or
+    /// the group it named carries no expression (the reserved
+    /// [`DEFAULT_GROUP_NAME`] group is the one such group, since `CreateGroup`
+    /// requires an expression). `Ok(Some(expression))` selects a SUBSET of the
+    /// stored traces, which is an answer over less data and never a refusal.
+    ///
+    /// `Err` carries the refusal message, which each caller lifts into its own
+    /// modelled client-input error: a selector that resolves no single group
+    /// ([`GroupLookupError::message`]), or an expression the evaluator cannot
+    /// answer — refused naming it, because answering a filtered request with the
+    /// UNFILTERED derivation would be a wrong answer rather than a missing one.
+    pub fn group_filter(
+        &self,
+        region: &str,
+        group_name: Option<&str>,
+        group_arn: Option<&str>,
+    ) -> Result<Option<filter::FilterExpression>, String> {
+        if group_name.is_none() && group_arn.is_none() {
+            return Ok(None);
+        }
+        let group = self
+            .find_group(region, group_name, group_arn)
+            .map_err(|failure| failure.message().to_string())?;
+        let Some(source) = group
+            .filter_expression
+            .as_deref()
+            .map(str::trim)
+            .filter(|expression| !expression.is_empty())
+        else {
+            return Ok(None);
+        };
+        filter::parse(source).map(Some).map_err(|error| {
+            format!(
+                "the FilterExpression of group `{}` could not be evaluated: {}",
+                group.group_name, error.message
+            )
+        })
     }
 
     /// Every group a caller in `region` sees, in `GroupName` order: the reserved
@@ -4034,6 +4103,41 @@ impl ComAmazonawsXrayAwsxrayState {
         end_time.to_bits().hash(&mut hasher);
         format!("{:016x}{:016x}", self.retrieval_seq, hasher.finish())
     }
+}
+
+/// How many hexadecimal digits a `RetrievalToken` this service mints carries
+/// ([`ComAmazonawsXrayAwsxrayState::mint_retrieval_token`]).
+pub const RETRIEVAL_TOKEN_HEX_DIGITS: usize = 32;
+
+/// Whether `token` has the FORM a `RetrievalToken` this service issues has.
+///
+/// The only retrieval tokens that exist are the ones `StartTraceRetrieval`
+/// minted, and every one of them is [`RETRIEVAL_TOKEN_HEX_DIGITS`] hexadecimal
+/// digits, so text of any other form could never have named a retrieval: it is a
+/// malformed parameter rather than a retrieval that is gone. That distinction is
+/// what lets the retrieval readers answer a malformed token with
+/// `InvalidRequestException` (HTTP 400) and reserve `ResourceNotFoundException`
+/// (HTTP 404) for a well-formed token whose retrieval was never started, has
+/// been evicted, or has timed out.
+///
+/// Case-insensitive: the mint emits lowercase, but a token differing only in the
+/// case of its digits is still of the form, so it is answered as a retrieval
+/// that is not there rather than as a request that is wrong.
+pub fn is_retrieval_token_form(token: &str) -> bool {
+    token.len() == RETRIEVAL_TOKEN_HEX_DIGITS && token.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// What a `RetrievalToken` that is not of [`is_retrieval_token_form`] is refused
+/// with, before any lookup: the name the operation gives the member, the value
+/// the request submitted, and why it could not be read.
+///
+/// X-Ray words this refusal as "Invalid <member> <value> passed: Invalid
+/// Execution Id" — recorded as "Invalid execution id <token> passed: Invalid
+/// Execution Id" from `GetRetrievedTracesGraph` and "Invalid retrieval token
+/// <token> passed: Invalid Execution Id" from `CancelTraceRetrieval` — so the
+/// sentence is built here once and each reader passes the member name it uses.
+pub fn malformed_retrieval_token_message(member: &str, token: &str) -> String {
+    format!("Invalid {member} {token} passed: Invalid Execution Id")
 }
 
 // ---------------------------------------------------------------------------

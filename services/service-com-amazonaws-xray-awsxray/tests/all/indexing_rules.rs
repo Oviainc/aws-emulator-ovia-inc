@@ -17,9 +17,10 @@
 //! * `UpdateIndexingRule` persists the submitted `DesiredSamplingPercentage`
 //!   under the named rule and answers the stored record, so a read afterwards
 //!   reports exactly what was written (latest write wins);
-//! * a rule name the account does not hold is refused with
-//!   `ResourceNotFoundException` (HTTP 404) and creates nothing — X-Ray models
-//!   no operation that adds an indexing rule;
+//! * a rule name other than the account's default one is refused with
+//!   `InvalidRequestException` (HTTP 400) and creates nothing — only the default
+//!   rule is updatable and X-Ray models no operation that adds an indexing rule,
+//!   so no other name can ever name one;
 //! * a `DesiredSamplingPercentage` outside the published 0..=100 percentage
 //!   range is refused with `InvalidRequestException` (HTTP 400) and leaves the
 //!   stored rule as it was;
@@ -30,6 +31,8 @@
 //!   moves forward only when the rule is modified.
 
 use serde_json::Value;
+
+use service_com_amazonaws_xray_awsxray::ops::update_indexing_rule::ONLY_DEFAULT_RULE_IS_UPDATABLE;
 
 use crate::xray_wire::{Answer, Xray};
 
@@ -309,9 +312,10 @@ async fn a_percentage_outside_the_range_is_refused_and_stores_nothing() {
 }
 
 #[tokio::test]
-async fn an_unknown_rule_name_is_refused_and_creates_nothing() {
-    // The rows differ in how the name misses: case, surrounding space, the
-    // empty string, and a name of another shape entirely.
+async fn a_name_other_than_the_default_rule_is_refused_and_creates_nothing() {
+    // The rows differ in how the name misses the one updatable rule: case,
+    // surrounding space, the empty string, and a name of another shape
+    // entirely.
     let unknown = ["default", "DEFAULT", "Default ", "", "SamplingRule", "Other"];
 
     for name in unknown {
@@ -320,15 +324,21 @@ async fn an_unknown_rule_name_is_refused_and_creates_nothing() {
 
         let answer = xray.update_rule(name, 50.0).await;
         assert_eq!(
-            answer.status, 404,
-            "case {case}: expected HTTP 404, got {} with body {}",
+            answer.status, 400,
+            "case {case}: expected HTTP 400, got {} with body {}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.error_type.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case}: expected ResourceNotFoundException, got {:?}",
+            Some("InvalidRequestException"),
+            "case {case}: expected InvalidRequestException, got {:?}",
             answer.error_type
+        );
+        assert_eq!(
+            answer.message(),
+            Some(ONLY_DEFAULT_RULE_IS_UPDATABLE),
+            "case {case}: expected the restriction to be stated, got {}",
+            answer.body
         );
 
         // Nothing was created: the listing still carries the one rule, with its
