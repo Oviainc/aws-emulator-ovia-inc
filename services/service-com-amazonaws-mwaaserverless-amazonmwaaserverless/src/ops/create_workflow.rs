@@ -251,6 +251,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
+        // Every member whose declared constraint this operation's input struct
+        // hands over (`skip_validation`) is checked here, so a bad value is
+        // refused with the modelled `ValidationException` — a top-level
+        // `Message`, `Reason: fieldValidationFailed`, and a `FieldList` entry
+        // naming each offending member — rather than the framework's generic
+        // 400, which carries none of those.
+        validate_input(&input).map_err(|refusal| {
+            CreateWorkflowError::from(CreateWorkflowErrorModeled::ValidationException(refusal))
+        })?;
+
         let region = crate::state::request_region(ctx.parts());
         let now = SystemTime::now();
         let fingerprint = request_fingerprint(&input);
@@ -381,6 +391,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// used on two different operations records two entries.
 fn token_key(client_token: &str) -> String {
     format!("CreateWorkflow:{client_token}")
+}
+
+/// Check every `CreateWorkflow` input member whose modelled constraint this
+/// operation took over from the framework boundary (see the `skip_validation`
+/// list on `CreateWorkflowInput`).
+///
+/// The check is `::aws_smithy_schema_server::constraints::validate` — the SAME
+/// walk the request boundary runs — driven over the member schemas
+/// `crate::state` re-declares, so the clause, the elision of a long value, the
+/// violation cap and the path are the framework's, not this crate's.
+fn validate_input(input: &CreateWorkflowInput) -> Result<(), ValidationException> {
+    use crate::state::ConstrainedValue::{Entries, Nested, Text};
+
+    let code = crate::state::constrained_code(input.code.as_ref());
+    let encryption =
+        crate::state::constrained_encryption_configuration(input.encryption_configuration.as_ref());
+    let network =
+        crate::state::constrained_network_configuration(input.network_configuration.as_ref());
+
+    let mut members: Vec<(&'static ::aws_smithy_schema::Schema, crate::state::ConstrainedValue)> =
+        vec![
+            (&crate::state::M_NAME, Text(&input.name)),
+            (&crate::state::M_ROLE_ARN, Text(&input.role_arn)),
+        ];
+    if let Some(token) = input.client_token.as_deref() {
+        members.push((&crate::state::M_CLIENT_TOKEN, Text(token)));
+    }
+    if let Some(description) = input.description.as_deref() {
+        members.push((&crate::state::M_DESCRIPTION, Text(description)));
+    }
+    if let Some(trigger_mode) = input.trigger_mode.as_deref() {
+        members.push((&crate::state::M_TRIGGER_MODE, Text(trigger_mode)));
+    }
+    if let Some(tags) = input.tags.as_ref() {
+        members.push((&crate::state::M_TAGS, Entries(tags)));
+    }
+    if let Some(code) = code.as_ref() {
+        members.push((&crate::state::M_CODE, Nested(code)));
+    }
+    if let Some(encryption) = encryption.as_ref() {
+        members.push((&crate::state::M_ENCRYPTION_CONFIGURATION, Nested(encryption)));
+    }
+    if let Some(network) = network.as_ref() {
+        members.push((&crate::state::M_NETWORK_CONFIGURATION, Nested(network)));
+    }
+
+    let violations = crate::state::validate_members(&members);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(crate::state::constraint_validation_exception(&violations))
 }
 
 /// The modelled server error for a store this handler could not reach.

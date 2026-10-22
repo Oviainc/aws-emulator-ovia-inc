@@ -34,6 +34,9 @@ const ECHOED_MEMBERS: &[&str] = &[
 ];
 
 /// One emulator, reached exactly the way the production router reaches it.
+///
+/// `pub(crate)` so the other suites of this test target drive the same wire path
+/// rather than each building a harness of its own.
 pub(crate) struct Harness {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,

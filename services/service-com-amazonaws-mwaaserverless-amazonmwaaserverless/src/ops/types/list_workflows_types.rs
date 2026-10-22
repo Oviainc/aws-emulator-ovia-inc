@@ -11,6 +11,10 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mwaaserverless-amazonmwaaserverless.json");
 
+// `ListWorkflows` has no input member this handler validates: `NextToken` targets
+// a plain `String` with no modelled constraint, and `MaxResults`'s `@range` stays
+// with the framework boundary (see the note in `crate::state`), which is the
+// envelope AWS was recorded answering an out-of-range page size with.
 #[smithy_macros::smithy(shape = "com.amazonaws.mwaaserverless#ListWorkflowsRequest")]
 #[derive(Debug, Clone, Default)]
 pub struct ListWorkflowsInput {

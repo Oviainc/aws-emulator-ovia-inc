@@ -169,6 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; a read needs none of it.
         let _ = ctx;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListWorkflowsErrorModeled::InternalServerException(InternalServerException {
                 message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
@@ -184,22 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(token) => Some(
                 crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
-                    ListWorkflowsErrorModeled::ValidationException(ValidationException {
-                        message: "NextToken is not a token this service issued".to_string(),
-                        reason: "fieldValidationFailed".to_string(),
-                        field_list: Some(vec![ValidationExceptionField {
-                            name: "NextToken".to_string(),
-                            message: "Pass back the NextToken from the previous ListWorkflows \
-                                      response unchanged"
-                                .to_string(),
-                        }]),
-                    })
+                    ListWorkflowsErrorModeled::ValidationException(
+                        crate::state::invalid_page_token("ListWorkflows"),
+                    )
                 })?,
             ),
         };
 
-        // `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied before
-        // this handler runs, so the value is already a usable page size.
+        // `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied
+        // before this handler runs, so the value is already a usable page size.
         let page_size = usize::try_from(input.max_results).unwrap_or(0);
 
         let lower = match after.as_deref() {

@@ -181,6 +181,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; the run is identified by its input.
         let _ = ctx;
+
+        // Every member whose declared constraint this operation's input struct
+        // hands over (`skip_validation`) is checked here, so a bad value is
+        // refused with the modelled `ValidationException` — `Message`,
+        // `Reason: fieldValidationFailed` and a `FieldList` entry per offending
+        // member — rather than the framework's generic 400.
+        validate_input(&input).map_err(|refusal| {
+            GetWorkflowRunError::from(GetWorkflowRunErrorModeled::ValidationException(refusal))
+        })?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetWorkflowRunErrorModeled::InternalServerException(InternalServerException {
                 message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
@@ -241,4 +251,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
         })
     }
+}
+
+/// Check every `GetWorkflowRun` input member whose modelled constraint this
+/// operation took over from the framework boundary (see the `skip_validation`
+/// list on `GetWorkflowRunInput`).
+///
+/// The check is `::aws_smithy_schema_server::constraints::validate` — the SAME
+/// walk the request boundary runs — driven over the member schemas
+/// `crate::state` re-declares, so the clause, the elision of a long value, the
+/// violation cap and the path are the framework's, not this crate's.
+fn validate_input(input: &GetWorkflowRunInput) -> Result<(), ValidationException> {
+    use crate::state::ConstrainedValue::Text;
+
+    let violations = crate::state::validate_members(&[
+        (&crate::state::M_WORKFLOW_ARN, Text(&input.workflow_arn)),
+        (&crate::state::M_RUN_ID, Text(&input.run_id)),
+    ]);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(crate::state::constraint_validation_exception(&violations))
 }

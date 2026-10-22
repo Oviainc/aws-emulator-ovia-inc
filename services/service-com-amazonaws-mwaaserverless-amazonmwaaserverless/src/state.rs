@@ -17,14 +17,21 @@
 //! idempotency ledger is capped and evicted on its own terms (see [`IdempotencyLedger`]).
 //! A listing's response is bounded too, by the modelled `MaxResults` range.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{
+    validate, ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, Violation,
+};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Code, DefinitionS3Location, EncryptionConfiguration, LoggingConfiguration,
-    NetworkConfiguration, ResourceNotFoundException,
+    NetworkConfiguration, ResourceNotFoundException, ValidationException,
+    ValidationExceptionField, ENCRYPTION_TYPE_VALUES,
 };
 
 /// The region used in minted ARNs when the request carries no usable SigV4
@@ -514,4 +521,798 @@ pub fn lookup_miss<E>(error: E) -> crate::scaffolded::Scaffolded<E> {
 /// A `SystemTime` as the modelled `TimestampValue`.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
+}
+
+// ===========================================================================
+// Request validation: the modelled `ValidationException` for a bad member value
+// ===========================================================================
+//
+// Every operation of this service models `ValidationException` (HTTP 400) with
+// `Message` and `Reason` @required and an optional `FieldList`
+// (`smithy_query(query="shape", shape="ValidationException,ValidationExceptionField")`).
+// A member value that fails a constraint the model declares for it is therefore
+// answered with that shape — a top-level `Message`, `Reason` =
+// `fieldValidationFailed`, and one `FieldList` entry per offending member — and
+// NOT with the framework's generic refusal envelope, which carries none of them.
+//
+// NOTHING about constraint checking is re-implemented here. The constraints a
+// member's `skip_validation` strips off its generated member schema are
+// RE-DECLARED below in the framework's own representation — a
+// [`TraitMap`](::aws_smithy_schema::TraitMap) of
+// [`LengthTrait`]/[`PatternTrait`]/[`EnumTrait`]/[`ElementConstraintsTrait`], the
+// exact form `vendor/smithy-macros` would have attached — hung on a member schema
+// of the same name, and the check itself is
+// [`::aws_smithy_schema_server::constraints::validate`], the SAME walk the request
+// boundary runs. So the clause, the elision of a long value, the violation cap and
+// the lowerCamel path are all the framework's, and a request refused here reads
+// identically to one refused at the boundary.
+//
+// An operation declares `skip_validation = [...]` on its input struct in
+// `src/ops/types/` and hands the matching member schemas from this module to
+// [`validate_members`]; its violations become the modelled error through
+// [`constraint_validation_exception`].
+//
+// ONE member is deliberately NOT covered: the paginated operations' `MaxResults`
+// and its `@range(1..100)`. The recorded AWS answer for an out-of-range page size
+// is the request-validation layer's own envelope — a 400 whose body carries a
+// lowercase `message` and neither `Reason` nor `FieldList` — so that bound is
+// left where the framework boundary already refuses it, exactly as recorded.
+
+/// The `ValidationExceptionReason` a bad member value carries.
+///
+/// `smithy_query(query="shape", shape="ValidationExceptionReason")` lists
+/// `unknownOperation | cannotParse | fieldValidationFailed | other`; a value
+/// that failed the constraint declared for its member is the third.
+pub const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+
+/// This service's Smithy namespace, for the shadow schemas below.
+const NAMESPACE: &str = "com.amazonaws.mwaaserverless";
+
+/// The workflow-ARN `@pattern`, shared by `WorkflowArn` and
+/// `TaggableResourceArn` (`smithy_query(query="shape", shape="WorkflowArn")`).
+const WORKFLOW_ARN_PATTERN: &str = r"^arn:aws(?:-(?:cn|us-gov|iso|iso-b|iso-e|iso-f))?:airflow-serverless:([a-z]{2}-[a-z]+-[0-9]{1}):([0-9]{12}):workflow/([a-zA-Z0-9][a-zA-Z0-9\.\-_]{0,254}-[a-zA-Z0-9]{10})$";
+
+/// The identifier `@pattern`, shared by `NameString` and `IdString`.
+const IDENTIFIER_PATTERN: &str = r"^[a-zA-Z0-9]+[a-zA-Z0-9\.\-_]*$";
+
+/// `WorkflowArn`: `@length(1..2048)` plus the workflow-ARN `@pattern`
+/// (`smithy_query(query="shape", shape="WorkflowArn")`).
+static WORKFLOW_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(2048))));
+    traits.insert(Box::new(PatternTrait::new(WORKFLOW_ARN_PATTERN)));
+    traits
+});
+
+/// `TaggableResourceArn`: `@length(1..1011)` plus the workflow-ARN `@pattern`.
+static TAGGABLE_RESOURCE_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(1011))));
+    traits.insert(Box::new(PatternTrait::new(WORKFLOW_ARN_PATTERN)));
+    traits
+});
+
+/// `RoleARN`: `@length(1..2048)` plus the IAM role-ARN `@pattern`.
+static ROLE_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(2048))));
+    traits.insert(Box::new(PatternTrait::new(
+        r"^arn:aws(?:-(?:cn|us-gov|iso|iso-b|iso-e|iso-f))?:iam::[0-9]{12}:role(/[a-zA-Z0-9+=,.@_\-]{1,512})*?/[a-zA-Z0-9+=,.@_\-]{1,64}$",
+    )));
+    traits
+});
+
+/// `NameString`: `@length(1..255)` plus the identifier `@pattern`.
+static NAME_STRING_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(255))));
+    traits.insert(Box::new(PatternTrait::new(IDENTIFIER_PATTERN)));
+    traits
+});
+
+/// `IdString`: `@length(1..255)` plus the identifier `@pattern`.
+static ID_STRING_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(255))));
+    traits.insert(Box::new(PatternTrait::new(IDENTIFIER_PATTERN)));
+    traits
+});
+
+/// `IdempotencyTokenString`: `@length(1..128)` plus printable-ASCII `@pattern`.
+static IDEMPOTENCY_TOKEN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(128))));
+    traits.insert(Box::new(PatternTrait::new(r"^[\x21-\x7E]+$")));
+    traits
+});
+
+/// `DescriptionString`: `@length(1..1024)` plus `@pattern(^.+$)`.
+static DESCRIPTION_STRING_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(1024))));
+    traits.insert(Box::new(PatternTrait::new(r"^.+$")));
+    traits
+});
+
+/// `GenericString`: `@length(1..255)` plus `@pattern(^.*$)`.
+static GENERIC_STRING_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(255))));
+    traits.insert(Box::new(PatternTrait::new(r"^.*$")));
+    traits
+});
+
+/// `VersionId`: `@length(1..2048)` plus `@pattern(^.+$)`.
+static VERSION_ID_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(2048))));
+    traits.insert(Box::new(PatternTrait::new(r"^.+$")));
+    traits
+});
+
+/// `WorkflowVersion`: `@length(32..32)` plus `@pattern(^[a-z0-9]{32}$)`.
+static WORKFLOW_VERSION_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(32), Some(32))));
+    traits.insert(Box::new(PatternTrait::new(r"^[a-z0-9]{32}$")));
+    traits
+});
+
+/// `TagKey`: `@length(1..128)` plus `@pattern(^.*$)`.
+static TAG_KEY_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(128))));
+    traits.insert(Box::new(PatternTrait::new(r"^.*$")));
+    traits
+});
+
+/// `TagValue`: `@length(0..256)` plus `@pattern(^.*$)`.
+static TAG_VALUE_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(0), Some(256))));
+    traits.insert(Box::new(PatternTrait::new(r"^.*$")));
+    traits
+});
+
+/// `SecurityGroupString`: `@length(1..255)` plus `@pattern(^sg-[a-z0-9]*$)`.
+static SECURITY_GROUP_STRING_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(255))));
+    traits.insert(Box::new(PatternTrait::new(r"^sg-[a-z0-9]*$")));
+    traits
+});
+
+/// `SubnetString`: `@length(1..255)` plus `@pattern(^subnet-[a-z0-9]*$)`.
+static SUBNET_STRING_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(255))));
+    traits.insert(Box::new(PatternTrait::new(r"^subnet-[a-z0-9]*$")));
+    traits
+});
+
+/// `S3Location$Bucket`: `@length(3..63)`, no pattern
+/// (`smithy_query(query="shape", shape="S3Location")`).
+static S3_BUCKET_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(3), Some(63))));
+    traits
+});
+
+/// `S3Location$ObjectKey`: `@length(1..1024)`, no pattern.
+static S3_OBJECT_KEY_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(1024))));
+    traits
+});
+
+/// `S3Location$VersionId`: `@length(1..1024)`, no pattern.
+static S3_VERSION_ID_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(1024))));
+    traits
+});
+
+/// `EncryptionConfiguration$Type`: the `EncryptionType` value set.
+static ENCRYPTION_TYPE_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(EnumTrait::new(ENCRYPTION_TYPE_VALUES)));
+    traits
+});
+
+/// `Tags`: `@length(0..50)` ENTRIES, with `TagValue`'s own constraints carried
+/// for each value exactly as codegen carries them
+/// (`smithy_query(query="shape", shape="Tags")`). A map KEY is not walked, which
+/// is the framework's own rule, not a choice made here.
+static TAGS_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(0), Some(50))));
+    traits.insert(Box::new(ElementConstraintsTrait::new(&TAG_VALUE_TRAITS)));
+    traits
+});
+
+/// `TagKeys`: `@length(1..50)` ENTRIES, with `TagKey`'s own constraints carried
+/// for each element (`smithy_query(query="shape", shape="TagKeys")`).
+static TAG_KEYS_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(50))));
+    traits.insert(Box::new(ElementConstraintsTrait::new(&TAG_KEY_TRAITS)));
+    traits
+});
+
+/// `SecurityGroupIds`: no entry-count bound; each element carries
+/// `SecurityGroupString`'s constraints.
+static SECURITY_GROUP_IDS_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(ElementConstraintsTrait::new(
+        &SECURITY_GROUP_STRING_TRAITS,
+    )));
+    traits
+});
+
+/// `SubnetIds`: no entry-count bound; each element carries `SubnetString`'s
+/// constraints.
+static SUBNET_IDS_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(ElementConstraintsTrait::new(&SUBNET_STRING_TRAITS)));
+    traits
+});
+
+// --- The member schemas the walk reads ------------------------------------
+//
+// One per (member name, target shape) pair this service hands to the handler,
+// shared across every operation that declares that member: the walk reads only
+// a member schema's NAME (for the violation path) and its TRAIT MAP, so one
+// declaration serves every operation whose model gives that member the same
+// target shape. `WorkflowVersion` appears twice because two operations give it
+// two different target shapes.
+
+/// `WorkflowArn`, as `CreateWorkflow`'s sibling operations declare it.
+pub static M_WORKFLOW_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$WorkflowArn",
+        NAMESPACE,
+        "WorkflowArn",
+    ),
+    ShapeType::String,
+    "WorkflowArn",
+    0,
+)
+.with_traits(&WORKFLOW_ARN_TRAITS);
+
+/// `ResourceArn`, which targets `TaggableResourceArn`.
+pub static M_RESOURCE_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$ResourceArn",
+        NAMESPACE,
+        "ResourceArn",
+    ),
+    ShapeType::String,
+    "ResourceArn",
+    1,
+)
+.with_traits(&TAGGABLE_RESOURCE_ARN_TRAITS);
+
+/// `RoleArn`, which targets `RoleARN`.
+pub static M_ROLE_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$RoleArn",
+        NAMESPACE,
+        "RoleArn",
+    ),
+    ShapeType::String,
+    "RoleArn",
+    2,
+)
+.with_traits(&ROLE_ARN_TRAITS);
+
+/// `Name`, which targets `NameString`.
+pub static M_NAME: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$Name",
+        NAMESPACE,
+        "Name",
+    ),
+    ShapeType::String,
+    "Name",
+    3,
+)
+.with_traits(&NAME_STRING_TRAITS);
+
+/// `ClientToken`, which targets `IdempotencyTokenString`.
+pub static M_CLIENT_TOKEN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$ClientToken",
+        NAMESPACE,
+        "ClientToken",
+    ),
+    ShapeType::String,
+    "ClientToken",
+    4,
+)
+.with_traits(&IDEMPOTENCY_TOKEN_TRAITS);
+
+/// `Description`, which targets `DescriptionString`.
+pub static M_DESCRIPTION: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$Description",
+        NAMESPACE,
+        "Description",
+    ),
+    ShapeType::String,
+    "Description",
+    5,
+)
+.with_traits(&DESCRIPTION_STRING_TRAITS);
+
+/// `TriggerMode`, which targets `GenericString`.
+pub static M_TRIGGER_MODE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$TriggerMode",
+        NAMESPACE,
+        "TriggerMode",
+    ),
+    ShapeType::String,
+    "TriggerMode",
+    6,
+)
+.with_traits(&GENERIC_STRING_TRAITS);
+
+/// `RunId`, which targets `IdString`.
+pub static M_RUN_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$RunId",
+        NAMESPACE,
+        "RunId",
+    ),
+    ShapeType::String,
+    "RunId",
+    7,
+)
+.with_traits(&ID_STRING_TRAITS);
+
+/// `TaskInstanceId`, which targets `IdString`.
+pub static M_TASK_INSTANCE_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$TaskInstanceId",
+        NAMESPACE,
+        "TaskInstanceId",
+    ),
+    ShapeType::String,
+    "TaskInstanceId",
+    8,
+)
+.with_traits(&ID_STRING_TRAITS);
+
+/// `WorkflowVersion` where the operation targets `WorkflowVersion` — a version
+/// IDENTIFIER, exactly 32 characters (`GetWorkflow`, `DeleteWorkflow`).
+pub static M_WORKFLOW_VERSION_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$WorkflowVersionId",
+        NAMESPACE,
+        "WorkflowVersion",
+    ),
+    ShapeType::String,
+    "WorkflowVersion",
+    9,
+)
+.with_traits(&WORKFLOW_VERSION_TRAITS);
+
+/// `WorkflowVersion` where the operation targets `VersionId` — a version
+/// SELECTOR, 1..2048 characters (`ListWorkflowRuns`, `StartWorkflowRun`).
+pub static M_WORKFLOW_VERSION_SELECTOR: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$WorkflowVersionSelector",
+        NAMESPACE,
+        "WorkflowVersion",
+    ),
+    ShapeType::String,
+    "WorkflowVersion",
+    10,
+)
+.with_traits(&VERSION_ID_TRAITS);
+
+/// `Tags`, the `Tags` map.
+pub static M_TAGS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$Tags",
+        NAMESPACE,
+        "Tags",
+    ),
+    ShapeType::Map,
+    "Tags",
+    11,
+)
+.with_traits(&TAGS_TRAITS);
+
+/// `TagKeys`, the `TagKeys` list.
+pub static M_TAG_KEYS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$TagKeys",
+        NAMESPACE,
+        "TagKeys",
+    ),
+    ShapeType::List,
+    "TagKeys",
+    12,
+)
+.with_traits(&TAG_KEYS_TRAITS);
+
+/// `Code`, the union whose `S3Location` members carry the constraints.
+pub static M_CODE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$Code",
+        NAMESPACE,
+        "Code",
+    ),
+    ShapeType::Union,
+    "Code",
+    13,
+);
+
+/// `EncryptionConfiguration`, whose `Type` carries the value set.
+pub static M_ENCRYPTION_CONFIGURATION: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$EncryptionConfiguration",
+        NAMESPACE,
+        "EncryptionConfiguration",
+    ),
+    ShapeType::Structure,
+    "EncryptionConfiguration",
+    14,
+);
+
+/// `NetworkConfiguration`, whose two id lists carry their element constraints.
+pub static M_NETWORK_CONFIGURATION: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput$NetworkConfiguration",
+        NAMESPACE,
+        "NetworkConfiguration",
+    ),
+    ShapeType::Structure,
+    "NetworkConfiguration",
+    15,
+);
+
+/// `Code$S3Location`.
+pub static M_S3_LOCATION: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#Code$S3Location",
+        NAMESPACE,
+        "S3Location",
+    ),
+    ShapeType::Structure,
+    "S3Location",
+    0,
+);
+
+/// `S3Location$Bucket`.
+pub static M_BUCKET: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#S3Location$Bucket",
+        NAMESPACE,
+        "Bucket",
+    ),
+    ShapeType::String,
+    "Bucket",
+    0,
+)
+.with_traits(&S3_BUCKET_TRAITS);
+
+/// `S3Location$ObjectKey`.
+pub static M_OBJECT_KEY: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#S3Location$ObjectKey",
+        NAMESPACE,
+        "ObjectKey",
+    ),
+    ShapeType::String,
+    "ObjectKey",
+    1,
+)
+.with_traits(&S3_OBJECT_KEY_TRAITS);
+
+/// `S3Location$VersionId`.
+pub static M_S3_VERSION_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#S3Location$VersionId",
+        NAMESPACE,
+        "VersionId",
+    ),
+    ShapeType::String,
+    "VersionId",
+    2,
+)
+.with_traits(&S3_VERSION_ID_TRAITS);
+
+/// `EncryptionConfiguration$Type`.
+pub static M_ENCRYPTION_TYPE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#EncryptionConfiguration$Type",
+        NAMESPACE,
+        "Type",
+    ),
+    ShapeType::String,
+    "Type",
+    0,
+)
+.with_traits(&ENCRYPTION_TYPE_TRAITS);
+
+/// `NetworkConfiguration$SecurityGroupIds`.
+pub static M_SECURITY_GROUP_IDS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#NetworkConfiguration$SecurityGroupIds",
+        NAMESPACE,
+        "SecurityGroupIds",
+    ),
+    ShapeType::List,
+    "SecurityGroupIds",
+    0,
+)
+.with_traits(&SECURITY_GROUP_IDS_TRAITS);
+
+/// `NetworkConfiguration$SubnetIds`.
+pub static M_SUBNET_IDS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#NetworkConfiguration$SubnetIds",
+        NAMESPACE,
+        "SubnetIds",
+    ),
+    ShapeType::List,
+    "SubnetIds",
+    1,
+)
+.with_traits(&SUBNET_IDS_TRAITS);
+
+/// The root of the shadow input the walk is driven over. Its member list is
+/// empty on purpose: the walk visits what [`ConstrainedMembers`] WRITES, which
+/// is whichever members the calling operation handed over, and a root struct
+/// schema carries no member name so it contributes no path segment.
+static CONSTRAINED_INPUT_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.mwaaserverless#ConstrainedInput",
+        NAMESPACE,
+        "ConstrainedInput",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One value handed to the validating walk, written the way the codec writes
+/// that shape so the walk builds the same path and runs the same checks.
+pub enum ConstrainedValue<'a> {
+    /// A string leaf.
+    Text(&'a str),
+    /// A list of strings; the walk names each element `<member>.<n>.member`.
+    Texts(&'a [String]),
+    /// A `String -> String` map; the walk names each value `<member>.<key>.member`.
+    Entries(&'a HashMap<String, String>),
+    /// A nested structure or union that writes its own leaves.
+    Nested(&'a dyn SerializableStruct),
+}
+
+/// The members of ONE request whose constraints their operation handed over,
+/// written for [`::aws_smithy_schema_server::constraints::validate`].
+pub struct ConstrainedMembers<'a> {
+    members: &'a [(&'static Schema, ConstrainedValue<'a>)],
+}
+
+impl SerializableStruct for ConstrainedMembers<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        for (schema, value) in self.members {
+            write_constrained(s, schema, value)?;
+        }
+        Ok(())
+    }
+}
+
+/// Write one member for the walk. Mirrors what `vendor/smithy-macros` emits for
+/// each shape kind, including passing the collection member schema for a scalar
+/// element or map value — which is how the walk tells a collection's entry-count
+/// bound from its elements' own bounds.
+fn write_constrained(
+    s: &mut dyn ShapeSerializer,
+    schema: &'static Schema,
+    value: &ConstrainedValue<'_>,
+) -> Result<(), SerdeError> {
+    match value {
+        ConstrainedValue::Text(text) => s.write_string(schema, text),
+        ConstrainedValue::Texts(texts) => s.write_list(schema, &|sl| {
+            for text in texts.iter() {
+                sl.write_string(schema, text)?;
+            }
+            Ok(())
+        }),
+        ConstrainedValue::Entries(entries) => s.write_map(schema, &|sm| {
+            for (key, entry) in entries.iter() {
+                sm.write_string(schema, key)?;
+                sm.write_string(schema, entry)?;
+            }
+            Ok(())
+        }),
+        ConstrainedValue::Nested(nested) => s.write_struct(schema, *nested),
+    }
+}
+
+/// Run the framework's own constraint walk over the members an operation handed
+/// over, and report every violation it found.
+pub fn validate_members(
+    members: &[(&'static Schema, ConstrainedValue<'_>)],
+) -> Vec<Violation> {
+    validate(&ConstrainedMembers { members }, &CONSTRAINED_INPUT_SCHEMA)
+}
+
+/// `Code`'s `S3Location` variant, for the walk.
+pub struct ConstrainedS3Location<'a> {
+    /// `S3Location$Bucket`.
+    pub bucket: &'a str,
+    /// `S3Location$ObjectKey`.
+    pub object_key: &'a str,
+    /// `S3Location$VersionId`, when the request carries one.
+    pub version_id: Option<&'a str>,
+}
+
+impl SerializableStruct for ConstrainedS3Location<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&M_BUCKET, self.bucket)?;
+        s.write_string(&M_OBJECT_KEY, self.object_key)?;
+        if let Some(version_id) = self.version_id {
+            s.write_string(&M_S3_VERSION_ID, version_id)?;
+        }
+        Ok(())
+    }
+}
+
+/// The `Code` union, for the walk.
+pub struct ConstrainedCode<'a> {
+    /// The union's one modelled variant.
+    pub s3_location: ConstrainedS3Location<'a>,
+}
+
+impl SerializableStruct for ConstrainedCode<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_struct(&M_S3_LOCATION, &self.s3_location)
+    }
+}
+
+/// The `Code` union of a request, ready for the walk, or `None` when the
+/// request carries none.
+pub fn constrained_code(code: Option<&Code>) -> Option<ConstrainedCode<'_>> {
+    let Code::S3Location(location) = code?;
+    Some(ConstrainedCode {
+        s3_location: ConstrainedS3Location {
+            bucket: &location.bucket,
+            object_key: &location.object_key,
+            version_id: location.version_id.as_deref(),
+        },
+    })
+}
+
+/// `EncryptionConfiguration`, for the walk. `KmsKeyId` targets a plain `String`
+/// and declares no constraint, so it is not written.
+pub struct ConstrainedEncryptionConfiguration<'a> {
+    /// `EncryptionConfiguration$Type`.
+    pub r#type: &'a str,
+}
+
+impl SerializableStruct for ConstrainedEncryptionConfiguration<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&M_ENCRYPTION_TYPE, self.r#type)
+    }
+}
+
+/// A request's `EncryptionConfiguration`, ready for the walk.
+pub fn constrained_encryption_configuration(
+    config: Option<&EncryptionConfiguration>,
+) -> Option<ConstrainedEncryptionConfiguration<'_>> {
+    config.map(|config| ConstrainedEncryptionConfiguration {
+        r#type: &config.r#type,
+    })
+}
+
+/// `NetworkConfiguration`, for the walk.
+pub struct ConstrainedNetworkConfiguration<'a> {
+    /// `NetworkConfiguration$SecurityGroupIds`.
+    pub security_group_ids: Option<&'a [String]>,
+    /// `NetworkConfiguration$SubnetIds`.
+    pub subnet_ids: Option<&'a [String]>,
+}
+
+impl SerializableStruct for ConstrainedNetworkConfiguration<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        if let Some(ids) = self.security_group_ids {
+            write_constrained(s, &M_SECURITY_GROUP_IDS, &ConstrainedValue::Texts(ids))?;
+        }
+        if let Some(ids) = self.subnet_ids {
+            write_constrained(s, &M_SUBNET_IDS, &ConstrainedValue::Texts(ids))?;
+        }
+        Ok(())
+    }
+}
+
+/// A request's `NetworkConfiguration`, ready for the walk.
+pub fn constrained_network_configuration(
+    config: Option<&NetworkConfiguration>,
+) -> Option<ConstrainedNetworkConfiguration<'_>> {
+    config.map(|config| ConstrainedNetworkConfiguration {
+        security_group_ids: config.security_group_ids.as_deref(),
+        subnet_ids: config.subnet_ids.as_deref(),
+    })
+}
+
+/// This service's modelled `ValidationException` for the violations the walk
+/// reported.
+///
+/// The `Message` is the framework's own envelope, so a refusal made here reads
+/// exactly like one the boundary made; `Reason` is the `@required`
+/// `fieldValidationFailed` the boundary cannot carry; and `FieldList` names
+/// every member that failed.
+///
+/// A violation `path` is the walk's lowerCamel rendering (`roleArn`,
+/// `subnetIds.0.member`), which is the form AWS validation messages use, so it
+/// is kept verbatim in the clause. `FieldList$Name` is documented as "the name
+/// of the field that failed validation", so its FIRST segment is restored to the
+/// spelling the model gives that member by [`model_member_name`].
+pub fn constraint_validation_exception(violations: &[Violation]) -> ValidationException {
+    ValidationException {
+        message: ::aws_smithy_schema_server::envelope(violations)
+            .unwrap_or_else(|| "invalid request".to_string()),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(
+            violations
+                .iter()
+                .map(|violation| ValidationExceptionField {
+                    name: model_member_name(&violation.path),
+                    message: violation.message(),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// A violation path whose FIRST segment is spelled as the model spells that
+/// member (`roleArn` -> `RoleArn`), which is the inverse of the walk's single
+/// first-character lowering and so exact for this service, whose every member
+/// name begins with an uppercase letter.
+///
+/// Only the first segment is restored. A later segment may be a map KEY the
+/// CALLER chose, which must be echoed exactly as sent — the same rule the
+/// framework states where it builds those paths — and re-casing it would report
+/// a tag key the request never carried.
+fn model_member_name(path: &str) -> String {
+    let (head, rest) = match path.split_once('.') {
+        Some((head, rest)) => (head, Some(rest)),
+        None => (path, None),
+    };
+    let mut chars = head.chars();
+    let head: String = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    };
+    match rest {
+        Some(rest) => format!("{head}.{rest}"),
+        None => head,
+    }
+}
+
+/// The modelled `ValidationException` for a pagination cursor this service did
+/// not issue.
+///
+/// `NextToken` targets a plain `String` and so declares no constraint the
+/// boundary could check; the token's validity is a service rule, and it is
+/// refused with the same shape, reason and `FieldList` as a constraint failure.
+pub fn invalid_page_token(operation: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "1 validation error detected: Value at 'NextToken' failed to satisfy \
+             constraint: Member must be a pagination token issued by {operation}"
+        ),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "NextToken".to_string(),
+            message: format!(
+                "Value at 'NextToken' failed to satisfy constraint: Member must be a \
+                 pagination token issued by {operation}"
+            ),
+        }]),
+    }
 }

@@ -165,7 +165,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
+        let _ = (ctx, &self.engine);
+
+        // A member value that fails the constraint its model declares is refused
+        // first, with the modelled `ValidationException` — `Message`,
+        // `Reason: fieldValidationFailed` and a `FieldList` entry naming each
+        // offending member. A well-formed request still reaches the 501 below:
+        // the operation itself is not implemented yet.
+        validate_input(&input).map_err(|refusal| {
+            ListTagsForResourceError::from(
+                ListTagsForResourceErrorModeled::ValidationException(refusal),
+            )
+        })?;
+
         // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
         // this file. Return modeled failures as
         // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
@@ -173,8 +185,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // To refuse a bad request this operation models no error for, return
         // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
         // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        // not "bad request". The members listed in `skip_validation` on
+        // `ListTagsForResourceInput` are checked by `validate_input` below; every other
+        // modeled constraint is refused BEFORE this handler runs.
         Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
     }
+}
+
+/// Check every `ListTagsForResource` input member whose modelled constraint this
+/// operation took over from the framework boundary (see the `skip_validation`
+/// list on `ListTagsForResourceInput`).
+///
+/// The check is `::aws_smithy_schema_server::constraints::validate` — the SAME
+/// walk the request boundary runs — driven over the member schemas
+/// `crate::state` re-declares, so the clause, the elision of a long value, the
+/// violation cap and the path are the framework's, not this crate's.
+fn validate_input(input: &ListTagsForResourceInput) -> Result<(), ValidationException> {
+    use crate::state::ConstrainedValue::Text;
+
+    let violations = crate::state::validate_members(&[(
+        &crate::state::M_RESOURCE_ARN,
+        Text(&input.resource_arn),
+    )]);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(crate::state::constraint_validation_exception(&violations))
 }

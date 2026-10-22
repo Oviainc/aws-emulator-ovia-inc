@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mwaaserverless-amazonmwaaserverless.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mwaaserverless#ListTaskInstancesRequest")]
+// Members whose modelled constraints the handler checks itself, by driving the
+// framework's own constraint walk over the shadow member schemas `crate::state`
+// re-declares, so a bad value is answered with the modelled
+// `ValidationException` instead of the framework's generic boundary refusal.
+// `NextToken` targets a plain `String` and declares no constraint; `MaxResults`'s
+// `@range` stays with the framework boundary (see the note in `crate::state`).
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.mwaaserverless#ListTaskInstancesRequest",
+    skip_validation = ["WorkflowArn", "RunId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListTaskInstancesInput {
     pub workflow_arn: String,
