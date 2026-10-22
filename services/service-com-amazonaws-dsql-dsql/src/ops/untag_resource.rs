@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -61,6 +52,20 @@
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — The resource could not be found.
+//!
+//! ## How this emulator serves it
+//!
+//! `tagKeys` names an END STATE: the resource carries none of those keys afterwards.
+//! So the operation is `@idempotent` in the model and here — a key the resource never
+//! carried is already absent, which is a success that removes nothing, and repeating
+//! the call changes nothing further. The keys it does carry are dropped from the
+//! persisted resource, so `ListTagsForResource` and `GetCluster` report the remainder.
+//!
+//! The resource is addressed by ARN, read through [`crate::state::parse_resource_arn`]
+//! (the same read `ListTagsForResource` makes): a value that names no Aurora DSQL
+//! resource at all is refused as a bad request (the modelled 400 `ValidationException`,
+//! carrying its `reason` and `fieldList`), and one that names a resource this service
+//! does not hold answers the modelled 404 `ResourceNotFoundException`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -100,10 +105,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceOutput {
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#UntagResource")]
+// Plus the service-common `InternalServerException` and `ValidationException`, widened
+// in with `extra_errors`: the service declares both for every operation (its
+// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
+// per-operation list the macro checks against does not repeat them.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#UntagResource",
+    extra_errors = ["InternalServerException", "ValidationException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -157,18 +171,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The ARN carries everything this handler addresses the resource with, so
+        // `ctx` (request metadata) is unused.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The ARN is read BEFORE anything is looked up: `Arn`'s modelled pattern is
+        // only `^arn:.+$`, so a value naming no Aurora DSQL resource at all reaches
+        // this handler, and that is a bad request rather than a resource that happens
+        // to be absent.
+        let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                crate::state::invalid_resource_arn("resourceArn", &input.resource_arn),
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        // A status change the clock already owes is materialised first: it was due at
+        // this instant even if nobody had called, and a settled deletion is what
+        // decides whether the named cluster is still addressable at all.
+        state.settle(::std::time::SystemTime::now());
+
+        let Some(tags) = state.resource_tags_mut(&resource) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    &input.resource_arn,
+                    &resource.resource_id,
+                    &resource.resource_type,
+                ),
+            )
+            .into());
+        };
+
+        // `tagKeys` asks for an end state, not for the deletion of a specific entry,
+        // so a key the resource does not carry is simply absent afterwards too and
+        // naming it is not an error.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput)
     }
 }

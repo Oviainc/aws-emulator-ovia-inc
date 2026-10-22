@@ -4,18 +4,20 @@
 //! plus the small helpers every handler of this crate shares.
 //!
 //! The pipeline definition lifecycle (`CreatePipeline` / `GetPipeline` /
-//! `ListPipelines` / `DeletePipeline`) and the execution records
-//! `StartPipelineExecution` mints both live in the one store reached through
-//! [`service_state`], so every handler computes its answer from persisted state
-//! rather than from the request it is answering.
+//! `ListPipelines` / `DeletePipeline`), the execution records
+//! `StartPipelineExecution` mints and the stage-transition states
+//! `DisableStageTransition` / `EnableStageTransition` change all live in the one
+//! store reached through [`service_state`], so every handler computes its answer
+//! from persisted state rather than from the request it is answering.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ActionConfigurationProperty, ActionType, ActionTypeId, ActionTypeSettings, ArtifactDetails,
-    ExecutionTrigger, PipelineDeclaration, PipelineExecution, PipelineExecutionSummary,
-    PipelineMetadata, PipelineSummary, ResolvedPipelineVariable, SourceRevision, Tag,
+    ActionConfigurationProperty, ActionState, ActionType, ActionTypeId, ActionTypeSettings,
+    ArtifactDetails, ExecutionTrigger, PipelineDeclaration, PipelineExecution,
+    PipelineExecutionSummary, PipelineMetadata, PipelineSummary, ResolvedPipelineVariable,
+    SourceRevision, StageState, Tag, TransitionState,
 };
 
 /// The region an ARN carries when the request names none.
@@ -56,6 +58,31 @@ pub const TRIGGER_TYPE_START_PIPELINE_EXECUTION: &str = "StartPipelineExecution"
 /// model's enum (`smithy_query query="shape" shape="ExecutionType"` -> `STANDARD`,
 /// `ROLLBACK`).
 pub const EXECUTION_TYPE_STANDARD: &str = "STANDARD";
+
+/// The `StageTransitionType` values the model declares
+/// (`smithy_query query="shape" shape="StageTransitionType"` -> `Inbound`,
+/// `Outbound`), in the order the enum lists them.
+pub const STAGE_TRANSITION_TYPES: [&str; 2] = ["Inbound", "Outbound"];
+
+/// The `StageTransitionType` naming the transition artifacts cross INTO a stage —
+/// the only one `StageState` models a reporting member for
+/// (`StageState$inboundTransitionState`).
+pub const TRANSITION_TYPE_INBOUND: &str = STAGE_TRANSITION_TYPES[0];
+
+/// The refusal message for a `transitionType` the `StageTransitionType` enum does
+/// not declare, or `None` when the value is one of them.
+///
+/// One source for both `DisableStageTransition` and `EnableStageTransition` — each
+/// owns its error enum, but neither owns the rule — so the two cannot drift on which
+/// values they accept or on what they say about a value they do not.
+pub fn invalid_transition_type_message(transition_type: &str) -> Option<String> {
+    (!STAGE_TRANSITION_TYPES.contains(&transition_type)).then(|| {
+        format!(
+            "transitionType: {transition_type} is not a StageTransitionType, which is one of {}",
+            STAGE_TRANSITION_TYPES.join(" | ")
+        )
+    })
+}
 
 /// The version number a freshly created pipeline carries.
 ///
@@ -516,6 +543,23 @@ pub struct Pipeline {
     pub tags: Vec<Tag>,
     /// Every version of the declaration, keyed by version number.
     pub versions: BTreeMap<i32, PipelineDeclaration>,
+    /// The transitions a caller has changed the state of, keyed by
+    /// `(stage name, StageTransitionType)`. A transition with no entry has never
+    /// been changed, which is the enabled state — so the map holds exactly the
+    /// changes `DisableStageTransition` / `EnableStageTransition` persisted.
+    pub transitions: BTreeMap<(String, String), StageTransition>,
+}
+
+/// The state of ONE stage transition, as the call that last changed it left it.
+#[derive(Debug, Clone)]
+pub struct StageTransition {
+    /// Whether artifacts may cross this transition.
+    pub enabled: bool,
+    /// The `reason` the disabling call gave; absent on an enabled transition,
+    /// which no caller gave a reason for.
+    pub disabled_reason: Option<String>,
+    /// When the transition's state was last changed.
+    pub last_changed_at: SystemTime,
 }
 
 impl Pipeline {
@@ -548,7 +592,125 @@ impl Pipeline {
             updated: now,
             tags,
             versions,
+            // A new pipeline has changed no transition, so every one of them is
+            // enabled.
+            transitions: BTreeMap::new(),
         }
+    }
+
+    /// Whether this pipeline declares a stage named `stage_name`.
+    pub fn declares_stage(&self, stage_name: &str) -> bool {
+        self.declaration
+            .stages
+            .iter()
+            .any(|stage| stage.name == stage_name)
+    }
+
+    /// Record that `transition_type` of `stage_name` is now enabled or disabled,
+    /// with the reason the disabling caller gave, changed at `now`.
+    ///
+    /// One writer for both `DisableStageTransition` and `EnableStageTransition`, so
+    /// the two cannot disagree about where the state lives: the later call replaces
+    /// the earlier one's record for that transition and leaves every other
+    /// transition of the pipeline alone.
+    pub fn set_transition(
+        &mut self,
+        stage_name: &str,
+        transition_type: &str,
+        enabled: bool,
+        disabled_reason: Option<String>,
+        now: SystemTime,
+    ) {
+        self.transitions.insert(
+            (stage_name.to_string(), transition_type.to_string()),
+            StageTransition {
+                enabled,
+                disabled_reason,
+                last_changed_at: now,
+            },
+        );
+    }
+
+    /// The `TransitionState` of `transition_type` of `stage_name`, as stored.
+    ///
+    /// A transition no call has changed is enabled and carries neither a change
+    /// instant nor a reason, so the members stay absent rather than carrying an
+    /// invented instant.
+    pub fn transition_state(&self, stage_name: &str, transition_type: &str) -> TransitionState {
+        match self
+            .transitions
+            .get(&(stage_name.to_string(), transition_type.to_string()))
+        {
+            Some(transition) => TransitionState {
+                enabled: transition.enabled,
+                // `TransitionState$lastChangedBy` carries the ID of the user who
+                // changed the transition; this emulator does not resolve a caller
+                // identity, so the member is absent rather than invented.
+                last_changed_by: None,
+                last_changed_at: Some(to_date_time(transition.last_changed_at)),
+                disabled_reason: transition.disabled_reason.clone(),
+            },
+            None => TransitionState {
+                enabled: true,
+                last_changed_by: None,
+                last_changed_at: None,
+                disabled_reason: None,
+            },
+        }
+    }
+
+    /// This pipeline's `StageState` list, as `GetPipelineState` reports it, in the
+    /// order the declaration lists the stages.
+    ///
+    /// Every member is read from stored state: the stage and action names from the
+    /// stored declaration, the inbound transition state from what the transition
+    /// calls persisted. The members the stage- and action-execution plane owns
+    /// (`latestExecution`, `inboundExecution(s)`, an action's revision and
+    /// execution, the condition states) are absent, because this slice runs no such
+    /// plane and so has no outcome to report for them.
+    pub fn stage_states(&self) -> Vec<StageState> {
+        self.declaration
+            .stages
+            .iter()
+            .enumerate()
+            .map(|(index, stage)| StageState {
+                stage_name: Some(stage.name.clone()),
+                inbound_execution: None,
+                inbound_executions: None,
+                inbound_transition_state: self.inbound_transition_state(index, &stage.name),
+                action_states: Some(
+                    stage
+                        .actions
+                        .iter()
+                        .map(|action| ActionState {
+                            action_name: Some(action.name.clone()),
+                            current_revision: None,
+                            latest_execution: None,
+                            entity_url: None,
+                            revision_url: None,
+                        })
+                        .collect(),
+                ),
+                latest_execution: None,
+                before_entry_condition_state: None,
+                on_success_condition_state: None,
+                on_failure_condition_state: None,
+                retry_stage_metadata: None,
+            })
+            .collect()
+    }
+
+    /// The inbound `TransitionState` to report for the stage at `index`.
+    ///
+    /// An inbound transition is the edge artifacts cross INTO a stage from the stage
+    /// before it, so the first stage has none to report — unless a caller has
+    /// changed one for it, in which case the state that call persisted is what the
+    /// reader reports rather than silently dropping it.
+    fn inbound_transition_state(&self, index: usize, stage_name: &str) -> Option<TransitionState> {
+        let changed = self
+            .transitions
+            .contains_key(&(stage_name.to_string(), TRANSITION_TYPE_INBOUND.to_string()));
+        (index > 0 || changed).then(|| self.transition_state(stage_name, TRANSITION_TYPE_INBOUND))
     }
 
     /// The declaration at `version`, or the current one when `version` is absent.

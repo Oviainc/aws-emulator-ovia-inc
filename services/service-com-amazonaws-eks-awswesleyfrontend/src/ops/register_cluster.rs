@@ -423,10 +423,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kube_controller_manager_config: None,
             connector_config: Some(connector_config),
             activation_expires_at: Some(activation_expiry),
-            // No asynchronous update has been started against this cluster, and no
-            // identity provider is associated with it. (A connected cluster is not
-            // one those operations act on today; each is still a 501 with its own
-            // gap issue.)
+            // No access entry, no asynchronous update and no identity provider
+            // config: each is written by the operation that creates it, and a
+            // connected cluster is not one those operations act on today (each is
+            // still a 501 with its own gap issue, where it is not implemented).
+            access_entries: ::std::collections::BTreeMap::new(),
             updates: ::std::collections::BTreeMap::new(),
             identity_provider_configs: ::std::collections::BTreeMap::new(),
         };
