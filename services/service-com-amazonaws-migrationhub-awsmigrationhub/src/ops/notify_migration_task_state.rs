@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op NotifyMigrationTaskState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `NotifyMigrationTaskState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`NotifyMigrationTaskState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: overwrites the addressed migration task's latest state and appends the
+//! notification to that task's update history, in the store held by [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +167,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `NotifyMigrationTaskState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(NotifyMigrationTaskStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("NotifyMigrationTaskState"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(NotifyMigrationTaskStateErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "the Migration Hub progress update stream store is unavailable".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // A notification addresses an ALREADY REGISTERED task: `ImportMigrationTask` is
+        // the prerequisite, so an unknown stream or task is reported, never created.
+        let Some(task_record) =
+            state.task_mut(&input.progress_update_stream, &input.migration_task_name)
+        else {
+            return Err(NotifyMigrationTaskStateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "migration task {} does not exist in progress update stream {}",
+                        input.migration_task_name, input.progress_update_stream
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // An authorized dry run is answered with `DryRunOperation` and writes nothing
+        // — resolved target first, so a dry run against an absent task still reports
+        // the absence.
+        if input.dry_run {
+            return Err(NotifyMigrationTaskStateErrorModeled::DryRunOperation(
+                DryRunOperation {
+                    message: Some(format!(
+                        "dry run: notifying migration task {} in progress update stream {} would have succeeded",
+                        input.migration_task_name, input.progress_update_stream
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The notification REPLACES the task's latest state — a task has exactly one
+        // current status — and is APPENDED to its history, which is what lets the
+        // history keep every intermediate state the tool reported. The history is the
+        // one store that grows per REQUEST, so `record_update` keeps it bounded to
+        // `crate::state::MAX_UPDATES_PER_TASK`, evicting the OLDEST entries.
+        task_record.task = Some(input.task.clone());
+        task_record.update_date_time = Some(input.update_date_time);
+        task_record.next_update_seconds = Some(input.next_update_seconds);
+        task_record.record_update(MigrationTaskUpdate {
+            update_date_time: Some(input.update_date_time),
+            // `MIGRATION_TASK_STATE_UPDATED` is the only value the `UpdateType` enum
+            // models (see `UPDATE_TYPE_VALUES` in `types::shared_types`), and a state
+            // notification is exactly what produced this entry.
+            update_type: Some("MIGRATION_TASK_STATE_UPDATED".to_string()),
+            migration_task_state: Some(input.task),
+        });
+
+        Ok(NotifyMigrationTaskStateOutput {})
     }
 }

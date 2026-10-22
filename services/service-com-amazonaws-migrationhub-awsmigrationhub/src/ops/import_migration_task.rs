@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportMigrationTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportMigrationTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportMigrationTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers an empty migration task inside an existing progress update
+//! stream, in the registry held by [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +159,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportMigrationTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportMigrationTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ImportMigrationTaskErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "the Migration Hub progress update stream store is unavailable".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // A migration task lives INSIDE a progress update stream, so the stream is
+        // resolved first: without it there is no namespace to register the task in.
+        if state.stream(&input.progress_update_stream).is_none() {
+            return Err(ImportMigrationTaskErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "progress update stream {} does not exist",
+                        input.progress_update_stream
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An authorized dry run is answered with `DryRunOperation` and writes nothing
+        // — after the target was resolved, so a dry run against an absent stream still
+        // reports the absence.
+        if input.dry_run {
+            return Err(ImportMigrationTaskErrorModeled::DryRunOperation(
+                DryRunOperation {
+                    message: Some(format!(
+                        "dry run: importing migration task {} into progress update stream {} would have succeeded",
+                        input.migration_task_name, input.progress_update_stream
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `(stream, name)` is the task's identity, so a repeat import is idempotent:
+        // the task already registered keeps the state notified against it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportMigrationTask"))
+        // A new name grows the stream, so the per-stream task map is CAPPED
+        // (`crate::state::MAX_TASKS_PER_STREAM`): at its bound a further new task is
+        // refused with the modelled `ServiceUnavailableException` rather than letting
+        // a caller grow the store without limit.
+        let stream = input.progress_update_stream.clone();
+        if let Some(stream_record) = state.stream_mut(&stream) {
+            if stream_record
+                .import_task(&input.migration_task_name)
+                .is_err()
+            {
+                return Err(ImportMigrationTaskErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some(format!(
+                            "progress update stream {stream} already holds the maximum of {} migration tasks",
+                            crate::state::MAX_TASKS_PER_STREAM
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        Ok(ImportMigrationTaskOutput {})
     }
 }
