@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeGlobalClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeGlobalClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the Aurora global database clusters out of this
+//! service's store, narrowed by `GlobalClusterIdentifier` and the documented `region`
+//! filter and paged by `MaxRecords` / `Marker`. It is the ONLY file to touch for this
+//! operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeGlobalClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +118,28 @@ impl From<DescribeGlobalClustersErrorModeled> for DescribeGlobalClustersError {
     }
 }
 
+/// The one filter name this operation's `Filters` member documents: "This parameter is
+/// case-sensitive. Currently, the only supported filter is `region`. If used, the request
+/// returns information about any global cluster with at least one member (primary or
+/// secondary) in the specified Amazon Web Services Regions." Any other name is refused
+/// rather than ignored, because ignoring it would report global clusters the caller
+/// excluded.
+const SUPPORTED_FILTER_NAME: &str = "region";
+
+/// Refuse a filter this operation does not support; see [`SUPPORTED_FILTER_NAME`].
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if filter.name != SUPPORTED_FILTER_NAME {
+            return Err(format!(
+                "unrecognized filter name: {}; the only supported filter is \
+                 {SUPPORTED_FILTER_NAME}",
+                filter.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The `DescribeGlobalClusters` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +176,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeGlobalClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeGlobalClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeGlobalClusters"))
+        // The region the request was signed for is not a filter on this report: a global
+        // cluster is an account-scoped resource that spans the regions of its members. It
+        // is still read, so a malformed credential scope is refused here as it is
+        // everywhere else in this service.
+        let _region = crate::state::request_region(ctx)
+            .map_err(DescribeGlobalClustersError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeGlobalClustersError::validation)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters).map_err(DescribeGlobalClustersError::validation)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeGlobalClustersError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. 501 is the honest answer, never a fabricated
+        // empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let store = state.lock();
+
+        // `GlobalClusterIdentifier` names one global cluster, and "this parameter isn't
+        // case-sensitive"; an identifier that names nothing in state is the modelled 404
+        // rather than an empty page.
+        let candidates: Vec<&crate::state::GlobalClusterRecord> =
+            match &input.global_cluster_identifier {
+                Some(requested) => {
+                    let found = store
+                        .global_clusters
+                        .values()
+                        .find(|record| record.identifier.eq_ignore_ascii_case(requested));
+                    let Some(record) = found else {
+                        return Err(
+                            DescribeGlobalClustersErrorModeled::GlobalClusterNotFoundFault(
+                                GlobalClusterNotFoundFault {
+                                    // RDS words this fault per operation; here it quotes
+                                    // the identifier the request asked for.
+                                    message: Some(format!(
+                                        "Global cluster '{requested}' not found"
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    };
+                    vec![record]
+                }
+                None => store.global_clusters.values().collect(),
+            };
+
+        // The `region` filter selects a global cluster with at least one member in ANY of
+        // the regions the filter names.
+        let matching: Vec<(String, GlobalCluster)> = candidates
+            .into_iter()
+            .filter(|record| {
+                filters.iter().all(|filter| {
+                    filter
+                        .values
+                        .iter()
+                        .any(|wanted| record.has_member_in(wanted))
+                })
+            })
+            .map(|record| (record.identifier.clone(), record.to_wire()))
+            .collect();
+
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        Ok(DescribeGlobalClustersOutput {
+            marker: page.next_marker,
+            global_clusters: Some(page.items),
+        })
     }
 }

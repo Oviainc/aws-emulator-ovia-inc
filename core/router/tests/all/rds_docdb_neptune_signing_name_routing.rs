@@ -96,7 +96,14 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
             // kind of discriminator: ONLY the RDS model declares that action, so the
             // shared name answers it (its modelled `OptionGroupNotFoundFault` for a group
             // nothing holds) while each peer's own key answers its own `InvalidAction`.
-            let calls: [Call; 12] = [
+            //
+            // The last eight rows are the resource-lookup paths of the shared front door:
+            // every operation that takes a resource NAME answers that resource's own
+            // modelled not-found fault — the status and `awsQueryError` code ITS model
+            // declares — in the awsQuery `<ErrorResponse>` envelope, carrying the
+            // `<RequestId>` AWS puts in one. Each was a `500 AmbiguousService` JSON
+            // refusal before, so each row also pins that one service served it.
+            let calls: [Call; 20] = [
                 Call {
                     // The request the issue reports as `500 AmbiguousService`.
                     case: "rds DescribeDBEngineVersions",
@@ -230,6 +237,97 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
                         "<EngineName>mysql</EngineName>",
                         "<MajorEngineVersion>8.0</MajorEngineVersion>",
                     ],
+                },
+                Call {
+                    case: "rds DescribeDBInstances for a missing instance",
+                    addressed: Addressed::Signed("rds"),
+                    action: "DescribeDBInstances",
+                    params: &[("DBInstanceIdentifier", "no-such-instance")],
+                    expected_status: Some(404),
+                    expected_code: Some("DBInstanceNotFound"),
+                    expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                },
+                Call {
+                    case: "rds DeleteDBInstance for a missing instance",
+                    addressed: Addressed::Signed("rds"),
+                    action: "DeleteDBInstance",
+                    params: &[
+                        ("DBInstanceIdentifier", "no-such-instance"),
+                        ("SkipFinalSnapshot", "true"),
+                    ],
+                    expected_status: Some(404),
+                    expected_code: Some("DBInstanceNotFound"),
+                    expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                },
+                Call {
+                    case: "rds RebootDBInstance for a missing instance",
+                    addressed: Addressed::Signed("rds"),
+                    action: "RebootDBInstance",
+                    params: &[("DBInstanceIdentifier", "no-such-instance")],
+                    expected_status: Some(404),
+                    expected_code: Some("DBInstanceNotFound"),
+                    expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                },
+                Call {
+                    // The failure is attributed to the CLUSTER, not to the instance being
+                    // created.
+                    case: "rds CreateDBInstance naming a missing cluster",
+                    addressed: Addressed::Signed("rds"),
+                    action: "CreateDBInstance",
+                    params: &[
+                        ("DBInstanceIdentifier", "router-probe-member"),
+                        ("Engine", "aurora-postgresql"),
+                        ("DBInstanceClass", "db.r6g.large"),
+                        ("DBClusterIdentifier", "no-such-cluster"),
+                    ],
+                    expected_status: Some(404),
+                    expected_code: Some("DBClusterNotFoundFault"),
+                    expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                },
+                Call {
+                    case: "rds ApplyPendingMaintenanceAction on a missing resource ARN",
+                    addressed: Addressed::Signed("rds"),
+                    action: "ApplyPendingMaintenanceAction",
+                    params: &[
+                        (
+                            "ResourceIdentifier",
+                            "arn:aws:rds:us-east-1:000000000000:db:no-such-instance",
+                        ),
+                        ("ApplyAction", "system-update"),
+                        ("OptInType", "immediate"),
+                    ],
+                    expected_status: Some(404),
+                    expected_code: Some("ResourceNotFoundFault"),
+                    expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                },
+                Call {
+                    case: "rds DescribeGlobalClusters for a missing global cluster",
+                    addressed: Addressed::Signed("rds"),
+                    action: "DescribeGlobalClusters",
+                    params: &[("GlobalClusterIdentifier", "no-such-global-cluster")],
+                    expected_status: Some(404),
+                    expected_code: Some("GlobalClusterNotFoundFault"),
+                    expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                },
+                Call {
+                    case: "rds DescribeEventSubscriptions for a missing subscription",
+                    addressed: Addressed::Signed("rds"),
+                    action: "DescribeEventSubscriptions",
+                    params: &[("SubscriptionName", "no-such-subscription")],
+                    expected_status: Some(404),
+                    expected_code: Some("SubscriptionNotFound"),
+                    expected_body_contains: &["<ErrorResponse", "<RequestId>"],
+                },
+                Call {
+                    // The same operation answers 200 for an unfiltered call (the rows
+                    // above prove the catalog reads), so a 404 here is about the NAME.
+                    case: "rds DescribeCertificates for a missing certificate",
+                    addressed: Addressed::Signed("rds"),
+                    action: "DescribeCertificates",
+                    params: &[("CertificateIdentifier", "rds-ca-no-such-g9")],
+                    expected_status: Some(404),
+                    expected_code: Some("CertificateNotFound"),
+                    expected_body_contains: &["<ErrorResponse", "<RequestId>"],
                 },
             ];
 
