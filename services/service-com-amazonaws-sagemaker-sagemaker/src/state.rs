@@ -1040,6 +1040,11 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub hubs: BTreeMap<String, Hub>,
     /// Every stored hub content VERSION, keyed by [`HubContentKey`].
     pub hub_contents: BTreeMap<HubContentKey, HubContent>,
+    /// Keyed by `TrialComponentName`, case-folded with [`entity_key`] (the name "is not
+    /// case-sensitive" per its model doc), so one component cannot be stored twice under
+    /// two spellings. See [`TrialComponent`], at the end of this module with the rest of
+    /// the experiment-tracking slice.
+    pub trial_components: BTreeMap<String, TrialComponent>,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -1885,4 +1890,110 @@ impl ComAmazonawsSagemakerSagemakerState {
     pub fn ai_workload_configs_below_quota(&self) -> bool {
         self.ai_workload_configs.len() < AI_WORKLOAD_CONFIG_QUOTA
     }
+}
+
+// ---------------------------------------------------------------------------
+// The experiment-tracking slice: `CreateTrialComponent` and `DescribeTrialComponent`.
+// Kept together at the end of this module, the way the AI-benchmarking slice above is,
+// rather than spread through the blocks at the top.
+// ---------------------------------------------------------------------------
+
+/// The ARN resource kind a trial component carries, i.e. the `<kind>` in
+/// [`resource_arn`]. Fixed by `TrialComponentArn`'s modelled pattern
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:experiment-trial-component/`), and
+/// named once here so the create and the describe mint and match the same ARN.
+pub const TRIAL_COMPONENT_KIND: &str = "experiment-trial-component";
+
+/// See [`MODEL_QUOTA`]. Bounds the trial-component store the same way, and is what
+/// `CreateTrialComponent` answers `ResourceLimitExceeded` past.
+pub const TRIAL_COMPONENT_QUOTA: usize = 1_000;
+
+/// A trial component created by `CreateTrialComponent`, as `DescribeTrialComponent`
+/// replays it.
+///
+/// `start_time` / `end_time` keep the modelled `Timestamp` the CALLER sent rather than a
+/// `SystemTime`, so a describe replays the instant bit-for-bit however much precision the
+/// request carried; `creation_time` / `last_modified_time` are the emulator's own clock
+/// readings, so they are `SystemTime` like every other record here. `created_by` is stored
+/// at creation rather than rebuilt per read, so every later read reports the identity that
+/// actually created the component.
+#[derive(Debug, Clone)]
+pub struct TrialComponent {
+    pub name: String,
+    pub arn: String,
+    /// Never `None`: `DisplayName`'s model doc says "If DisplayName isn't specified,
+    /// TrialComponentName is displayed", so a create without one stores the name.
+    pub display_name: String,
+    pub status: Option<crate::ops::types::TrialComponentStatus>,
+    pub start_time: Option<::aws_smithy_types::DateTime>,
+    pub end_time: Option<::aws_smithy_types::DateTime>,
+    pub parameters: Option<HashMap<String, crate::ops::types::TrialComponentParameterValue>>,
+    pub input_artifacts: Option<HashMap<String, crate::ops::types::TrialComponentArtifact>>,
+    pub output_artifacts: Option<HashMap<String, crate::ops::types::TrialComponentArtifact>>,
+    pub metadata_properties: Option<MetadataProperties>,
+    pub created_by: UserContext,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another trial component fits, i.e. the store is below
+    /// [`TRIAL_COMPONENT_QUOTA`]. A second inherent `impl` block, beside this slice's own
+    /// types rather than in the one above.
+    pub fn trial_components_below_quota(&self) -> bool {
+        self.trial_components.len() < TRIAL_COMPONENT_QUOTA
+    }
+}
+
+/// The store key a `TrialComponentName` (or any other `ExperimentEntityName`) maps to.
+///
+/// The member's model doc says the name "must be unique in your Amazon Web Services
+/// account and is not case-sensitive", so two names differing only in case are ONE
+/// entity: the store is keyed by the case-folded name, while the record keeps the casing
+/// the caller sent so a reader replays it. `ExperimentEntityName` is ASCII (pattern
+/// `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,119}$`), so ASCII folding is exact for every name the
+/// boundary validator lets through.
+pub fn entity_key(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// The entity NAME a member modelled `ExperimentEntityNameOrArn` denotes, or `None` when
+/// the value is an ARN that denotes something else.
+///
+/// Those members accept either the bare name or the entity's ARN, so a reader resolves
+/// both forms to one store key rather than keying the store by the string the caller
+/// typed. An ARN denotes an entity of THIS service only when it is an ARN this service
+/// mints: `arn:aws:sagemaker:<the request's region>:<the emulator's account>:<kind>/<name>`.
+/// An ARN naming another service, account, region or resource kind names no entity here —
+/// the caller gets the reader's not-found error rather than whatever entity happens to
+/// share the ARN's trailing path segment. That validation is why this is stricter than
+/// [`name_from_arn_or_name`], which serves the `ArnOrName` readers whose pattern admits
+/// one resource kind only: `ExperimentEntityNameOrArn` also admits the ARNs of OTHER
+/// entity kinds (experiment, trial, artifact, action, context), so the kind has to be
+/// checked rather than assumed.
+pub fn entity_name_from_name_or_arn<'v>(
+    value: &'v str,
+    region: &str,
+    kind: &str,
+) -> Option<&'v str> {
+    if !value.starts_with("arn:") {
+        return Some(value);
+    }
+    let fields: Vec<&str> = value.splitn(6, ':').collect();
+    let [prefix, partition, service, arn_region, account, resource] = fields[..] else {
+        return None;
+    };
+    // Only the `aws` partition: that is the one every ARN this emulator mints carries,
+    // and a partition is a closed world — an `aws-cn` ARN names no entity in `aws`.
+    if prefix != "arn"
+        || partition != "aws"
+        || service != ARN_SERVICE
+        || arn_region != region
+        || account != ::emulator_server::EMULATOR_ACCOUNT_ID
+    {
+        return None;
+    }
+    let name = resource.strip_prefix(kind)?.strip_prefix('/')?;
+    (!name.is_empty() && !name.contains('/')).then_some(name)
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTrialComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTrialComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTrialComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replays the trial component `CreateTrialComponent` stored in
+//! `crate::state`, resolving `TrialComponentName` given either as a name or as an ARN,
+//! and refusing an unknown one with the modelled `ResourceNotFound`. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTrialComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTrialComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTrialComponent"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `TrialComponentName` is modelled `ExperimentEntityNameOrArn`, so the caller may
+        // name the component or pass its ARN; both denote the one stored entity, while an
+        // ARN of another service, account, region or entity kind denotes none of them.
+        let region = crate::state::request_region(ctx);
+        let not_found = |identifier: &str| -> Self::Error {
+            // Never a 200 with empty members: a caller cannot tell that from a component
+            // that exists and carries nothing.
+            DescribeTrialComponentErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Could not find trial component \"{identifier}\".")),
+            })
+            .into()
+        };
+        let Some(name) = crate::state::entity_name_from_name_or_arn(
+            &input.trial_component_name,
+            &region,
+            crate::state::TRIAL_COMPONENT_KIND,
+        ) else {
+            return Err(not_found(&input.trial_component_name));
+        };
+
+        let store = state.lock();
+        // The name "is not case-sensitive" (`TrialComponentName`'s model doc), so the
+        // lookup goes through the same case-folded key the create stored the record under.
+        let Some(component) = store.trial_components.get(&crate::state::entity_key(name)) else {
+            return Err(not_found(&crate::state::resource_arn(
+                &region,
+                crate::state::TRIAL_COMPONENT_KIND,
+                name,
+            )));
+        };
+
+        Ok(DescribeTrialComponentOutput {
+            trial_component_name: Some(component.name.clone()),
+            trial_component_arn: Some(component.arn.clone()),
+            display_name: Some(component.display_name.clone()),
+            // `Source`/`Sources` carry the ARN of the JOB that produced the component;
+            // one created through this API has no source job, so AWS reports none.
+            source: None,
+            sources: None,
+            status: component.status.clone(),
+            start_time: component.start_time,
+            end_time: component.end_time,
+            creation_time: Some(crate::state::timestamp(component.creation_time)),
+            last_modified_time: Some(crate::state::timestamp(component.last_modified_time)),
+            // `CreatedBy`/`LastModifiedBy` name the identity behind the call. The one
+            // recorded at create is reported for both: nothing has modified the component
+            // since, so its last modifier is its creator.
+            created_by: Some(component.created_by.clone()),
+            last_modified_by: Some(component.created_by.clone()),
+            parameters: component.parameters.clone(),
+            input_artifacts: component.input_artifacts.clone(),
+            output_artifacts: component.output_artifacts.clone(),
+            metadata_properties: component.metadata_properties.clone(),
+            // Metrics are emitted by a running job through SageMaker Metrics; nothing has
+            // reported any for a component created through this API.
+            metrics: None,
+            // Lineage membership is reported only for the entities this emulator places
+            // in the default lineage group (`state::lineage_group_arn`, which the artifact
+            // handlers use); nothing places a trial component in one while
+            // `AssociateTrialComponent` and the rest of the lineage surface are stubs, so
+            // none is reported rather than claiming a membership that was never recorded.
+            lineage_group_arn: None,
+        })
     }
 }

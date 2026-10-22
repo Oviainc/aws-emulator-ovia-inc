@@ -47,3 +47,5 @@ mod pipeline_lifecycle;
 mod state_roundtrip;
 #[path = "all/studio_app_lifecycle.rs"]
 mod studio_app_lifecycle;
+#[path = "all/trial_component_tracking.rs"]
+mod trial_component_tracking;
