@@ -4,8 +4,10 @@
 //!
 //! One store per emulator, reached from a handler through [`service_state`]. Every
 //! modelled shape a handler answers with is BUILT FROM this state (see
-//! [`StoredCluster::to_api`] / [`StoredAcl::to_api`]), so a describe can only report
-//! what a create or update actually persisted.
+//! [`StoredCluster::to_api`] / [`StoredAcl::to_api`] / [`StoredUser::to_api`]), so a
+//! describe can only report what a create or update actually persisted — or, for the
+//! resources an AWS account already has, what
+//! [`ComAmazonawsMemorydbAmazonmemorydbState::ensure_builtin_users`] materialises.
 //!
 //! Besides the store itself this module owns the small amount of logic several
 //! operations share — the request's region, the ARN/endpoint naming, shard layout,
@@ -16,8 +18,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Cluster, Endpoint, EngineVersionInfo, Node, ParameterGroup, SecurityGroupMembership, Shard,
-    Tag, ACL,
+    Authentication, Cluster, Endpoint, EngineVersionInfo, Node, ParameterGroup,
+    SecurityGroupMembership, Shard, Tag, User, ACL,
 };
 
 /// The region an ARN or endpoint carries when the request is unsigned, matching the
@@ -188,6 +190,26 @@ pub mod acl_status {
     pub const ACTIVE: &str = "active";
 }
 
+/// `User$Status`: "Indicates the user status. Can be \"active\", \"modifying\" or
+/// \"deleting\"."
+pub mod user_status {
+    pub const ACTIVE: &str = "active";
+}
+
+/// The user every MemoryDB account already has: MemoryDB creates a user named
+/// `default` (an `open-access` member) in every account, so `DescribeUsers` answers
+/// with it before any `CreateUser` call ever runs.
+pub const DEFAULT_USER_NAME: &str = "default";
+
+/// The access string MemoryDB gives that built-in user: full access to every key
+/// (`~*`), every pub/sub channel (`&*`) and every command (`+@all`), in the Redis OSS /
+/// Valkey ACL syntax `User$AccessString` carries.
+pub const DEFAULT_USER_ACCESS_STRING: &str = "on ~* &* +@all";
+
+/// `AuthenticationType` (`password` | `no-password` | `iam`): the built-in user
+/// authenticates without a password, so it carries no password count.
+pub const NO_PASSWORD_AUTHENTICATION: &str = "no-password";
+
 /// The status a shard, a node and an attached security group report once the cluster
 /// carrying them is serving.
 const AVAILABLE: &str = "available";
@@ -211,6 +233,13 @@ pub struct ComAmazonawsMemorydbAmazonmemorydbState {
     pub clusters: BTreeMap<String, StoredCluster>,
     /// ACLs by `ACLName`.
     pub acls: BTreeMap<String, StoredAcl>,
+    /// Users by `UserName`, including the built-in `default` user
+    /// [`ComAmazonawsMemorydbAmazonmemorydbState::ensure_builtin_users`] materialises.
+    /// A `BTreeMap`, so every listing is in name order and pagination over it is stable.
+    pub users: BTreeMap<String, StoredUser>,
+    /// Whether the built-in users have already been materialised in this store, so
+    /// that materialising them is a one-off and never resurrects a deleted user.
+    pub builtin_users_materialised: bool,
     /// Parameter groups by `ParameterGroupName`, in name order like the maps above,
     /// so a listing over them pages stably.
     pub parameter_groups: BTreeMap<String, StoredParameterGroup>,
@@ -240,6 +269,33 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
         }
     }
 
+    /// Materialise the users this account ALREADY HAD before any call: MemoryDB
+    /// creates the `default` user in every account, so it is part of the store's
+    /// initial contents rather than something a caller made.
+    ///
+    /// The engine hands every service an EMPTY store, so the built-ins are written on
+    /// first touch instead of by a constructor; the flag makes that a one-off, so a
+    /// later delete of a built-in user is not undone by the next call. `region` is the
+    /// requesting caller's, exactly as every other resource in this store takes the
+    /// region of the call that brought it into being.
+    pub fn ensure_builtin_users(&mut self, region: &str) {
+        if self.builtin_users_materialised {
+            return;
+        }
+        self.builtin_users_materialised = true;
+        self.users.insert(
+            DEFAULT_USER_NAME.to_string(),
+            StoredUser {
+                name: DEFAULT_USER_NAME.to_string(),
+                status: user_status::ACTIVE.to_string(),
+                access_string: DEFAULT_USER_ACCESS_STRING.to_string(),
+                authentication_type: NO_PASSWORD_AUTHENTICATION.to_string(),
+                password_count: None,
+                arn: user_arn(region, DEFAULT_USER_NAME),
+            },
+        );
+    }
+
     /// The names of the clusters currently referencing `acl_name`, in name order —
     /// what `ACL$Clusters` ("A list of clusters associated with the ACL") reports.
     pub fn clusters_using_acl(&self, acl_name: &str) -> Vec<String> {
@@ -261,6 +317,27 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
                 .entry(cluster.acl_name.as_str())
                 .or_default()
                 .push(cluster.name.clone());
+        }
+        membership
+    }
+
+    /// The names of the ACLs whose `UserNames` include each user, in name order —
+    /// what `User$ACLNames` ("The names of the Access Control Lists to which the user
+    /// belongs") reports. DERIVED from the ACLs, exactly as `ACL$Clusters` is derived
+    /// from the clusters, so one membership cannot disagree with the other.
+    ///
+    /// ONE pass over the ACLs answers EVERY user, so describing N users costs one scan
+    /// of the ACLs rather than N; a single-user describe takes its own entry out of
+    /// the result rather than scanning again under a second copy of this rule.
+    pub fn user_membership(&self) -> BTreeMap<&str, Vec<String>> {
+        let mut membership: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for acl in self.acls.values() {
+            for user_name in &acl.user_names {
+                membership
+                    .entry(user_name.as_str())
+                    .or_default()
+                    .push(acl.name.clone());
+            }
         }
         membership
     }
@@ -358,6 +435,47 @@ pub struct StoredAcl {
     pub settles_at: Option<Instant>,
     pub user_names: Vec<String>,
     pub arn: String,
+}
+
+/// A user as this emulator persists it. `ACLNames` is NOT stored: it is derived from
+/// the ACLs currently listing the user (see
+/// [`ComAmazonawsMemorydbAmazonmemorydbState::user_membership`]).
+#[derive(Debug, Clone)]
+pub struct StoredUser {
+    pub name: String,
+    pub status: String,
+    pub access_string: String,
+    /// `Authentication$Type`, one of [`AUTHENTICATION_TYPE_VALUES`].
+    ///
+    /// [`AUTHENTICATION_TYPE_VALUES`]: crate::ops::types::AUTHENTICATION_TYPE_VALUES
+    pub authentication_type: String,
+    /// `Authentication$PasswordCount`: "The number of passwords belonging to the
+    /// user", absent for a user that authenticates without one.
+    pub password_count: Option<i32>,
+    pub arn: String,
+}
+
+impl StoredUser {
+    /// The modelled `User` for this stored user. `acl_names` is the derived membership
+    /// list, which only the state as a whole can compute.
+    pub fn to_api(&self, acl_names: Vec<String>) -> User {
+        User {
+            name: Some(self.name.clone()),
+            status: Some(self.status.clone()),
+            access_string: Some(self.access_string.clone()),
+            acl_names: Some(acl_names),
+            // Left ABSENT deliberately: nothing in this slice tracks the engine
+            // versions a user is usable with, and reporting one would be a
+            // plausible-looking value for state nothing keeps — the same choice
+            // `ACL$MinimumEngineVersion` makes.
+            minimum_engine_version: None,
+            authentication: Some(Authentication {
+                r#type: Some(self.authentication_type.clone()),
+                password_count: self.password_count,
+            }),
+            arn: Some(self.arn.clone()),
+        }
+    }
 }
 
 impl StoredCluster {
@@ -505,6 +623,11 @@ pub fn cluster_arn(region: &str, name: &str) -> String {
 /// `arn:aws:memorydb:<region>:<account>:acl/<name>`.
 pub fn acl_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("acl/{name}"))
+}
+
+/// `arn:aws:memorydb:<region>:<account>:user/<name>`.
+pub fn user_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("user/{name}"))
 }
 
 /// `arn:aws:memorydb:<region>:<account>:parametergroup/<name>`.

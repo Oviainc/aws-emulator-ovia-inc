@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUsers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUsers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeUsers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads the users [`crate::state`] holds — including the built-in
+//! `default` user every MemoryDB account already has — deriving each one's `ACLNames`
+//! from the ACLs that list it, narrowing the listing by `UserName` and `Filters`, and
+//! paging it with `MaxResults`/`NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +77,36 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::StoredUser;
+
+/// The user property a `Filters` entry may name to match a user's own name.
+///
+/// `Filter$Name` is "The property being filtered. For example, UserName.", so the
+/// filterable properties are the ones `User` exposes; this slice exposes a user's name
+/// (`User$Name`) and the ACLs it belongs to (`User$ACLNames`, [`FILTER_ACL_NAME`]).
+const FILTER_USER_NAME: &str = "UserName";
+
+/// The user property a `Filters` entry may name to match one of the ACLs the user
+/// belongs to (`User$ACLNames`).
+const FILTER_ACL_NAME: &str = "ACLName";
+
+/// Whether `user` satisfies EVERY filter: one filter matches when the property it
+/// names carries one of that filter's values, and the filters combine conjunctively.
+///
+/// `acl_names` is the user's derived `ACLNames`, so a filter on ACL membership sees
+/// exactly what the response reports.
+fn matches_filters(user: &StoredUser, acl_names: &[String], filters: &[Filter]) -> bool {
+    filters.iter().all(|filter| {
+        filter.values.iter().any(|value| match filter.name.as_str() {
+            FILTER_USER_NAME => user.name == *value,
+            FILTER_ACL_NAME => acl_names.iter().any(|acl_name| acl_name == value),
+            // Unreachable: a filter naming any other property is refused before the
+            // listing is built, so no unknown name can silently match everything.
+            _ => false,
+        })
+    })
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -151,18 +176,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUsers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUsersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUsers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than answered with a canned user list.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        if input.max_results.is_some_and(|max| max < 1) {
+            // The same refusal the other listings in this slice make for a page size
+            // below 1; this operation models no `InvalidParameterValueException`, so
+            // the framework's 400 `ValidationException` carries it.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "MaxResults must be at least 1.",
+            ));
+        }
+        let filters = input.filters.unwrap_or_default();
+        if let Some(unknown) = filters
+            .iter()
+            .find(|filter| !matches!(filter.name.as_str(), FILTER_USER_NAME | FILTER_ACL_NAME))
+        {
+            // A filter on a property a user does not have cannot select anything, so
+            // it is reported rather than silently matching nothing.
+            return Err(
+                DescribeUsersErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "Unknown filter name {}. Valid filter names are \
+                             {FILTER_ACL_NAME} and {FILTER_USER_NAME}.",
+                            unknown.name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        // The writes a describe makes, neither of them asked for by this caller: the
+        // status transitions the clock already owed at this instant, and the users the
+        // account ALREADY HAD before any call (MemoryDB's built-in `default` user),
+        // which this store materialises on first touch because the engine hands every
+        // service an empty one.
+        state.settle(std::time::Instant::now());
+        state.ensure_builtin_users(&region);
+
+        if input
+            .user_name
+            .as_deref()
+            .is_some_and(|name| !state.users.contains_key(name))
+        {
+            let name = input.user_name.unwrap_or_default();
+            return Err(DescribeUsersErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                message: Some(format!("User {name} not found.")),
+            })
+            .into());
+        }
+
+        // ONE pass over the ACLs builds every user's membership, so listing N users
+        // does not scan the ACLs N times.
+        let mut membership = state.user_membership();
+        let mut entries: Vec<(String, User)> = Vec::new();
+        for user in state.users.values() {
+            if input
+                .user_name
+                .as_deref()
+                .is_some_and(|name| user.name != name)
+            {
+                continue;
+            }
+            let acl_names = membership.remove(user.name.as_str()).unwrap_or_default();
+            if !matches_filters(user, &acl_names, &filters) {
+                continue;
+            }
+            entries.push((user.name.clone(), user.to_api(acl_names)));
+        }
+
+        let (users, next_token) = crate::state::paginate(
+            entries,
+            crate::state::page_limit(input.max_results),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(
+                "NextToken does not name a position in this listing.",
+            )
+        })?;
+        Ok(DescribeUsersOutput {
+            users: Some(users),
+            next_token,
+        })
     }
 }
+
