@@ -179,14 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(rule) = store.rules.get_mut(&input.identifier) else {
+            // Composed from the identifier the request addressed, by the one place this
+            // service words a rule that does not exist.
             return Err(GetRuleErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Retention rule with ID {} not found",
-                        input.identifier
-                    )),
-                    reason: Some("RULE_NOT_FOUND".to_string()),
-                },
+                crate::state::rule_not_found(&input.identifier),
             )
             .into());
         };

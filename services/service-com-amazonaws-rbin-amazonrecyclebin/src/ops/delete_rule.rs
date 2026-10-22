@@ -149,28 +149,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(rule) = store.rules.get(&input.identifier) else {
             return Err(DeleteRuleErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Retention rule with ID {} not found",
-                        input.identifier
-                    )),
-                    reason: Some("RULE_NOT_FOUND".to_string()),
-                },
+                crate::state::rule_not_found(&input.identifier),
             )
             .into());
         };
         // A locked rule "can't be modified or deleted", and an unlocked one still
         // inside its unlock delay can be deleted "only after the unlock delay period
-        // has expired".
+        // has expired" — to the caller, both are a rule that is locked.
         if rule.is_lock_protected(now) {
-            return Err(DeleteRuleErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Retention rule with ID {} can't be deleted while its lock state is {}",
-                    rule.identifier,
-                    rule.lock_state.as_deref().unwrap_or("locked")
-                )),
-                reason: Some("INVALID_RULE_STATE".to_string()),
-            })
+            return Err(DeleteRuleErrorModeled::ConflictException(
+                crate::state::rule_state_conflict(
+                    crate::state::BlockedAction::Delete,
+                    &rule.identifier,
+                    crate::state::BlockingCondition::Locked,
+                ),
+            )
             .into());
         }
         store.remove_rule(&input.identifier);
