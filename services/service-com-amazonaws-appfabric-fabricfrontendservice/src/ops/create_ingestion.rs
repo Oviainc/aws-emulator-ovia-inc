@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIngestion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIngestion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIngestion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an ingestion UNDER an app bundle and PERSISTS it there: the response is
+//! built from the stored record (see
+//! [`crate::state::IngestionRecord::to_ingestion`]), so `GetIngestion` and
+//! `ListIngestions` answer from the same bytes this call wrote. A new ingestion
+//! starts `disabled` — `StartIngestion` is what enables it, so the clock owes no
+//! transition here.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +84,10 @@
 //!   parameters and try again.
 //! * `InternalServerException` (HTTP 500) — The request processing has failed because of an
 //!   unknown error, exception, or failure with an internal server.
+//! * `ResourceNotFoundException` (HTTP 404) — The specified resource does not exist. Widened
+//!   in through `extra_errors`: the model's own `errors` list for this operation omits it,
+//!   while `appBundleIdentifier` can name a bundle that does not exist. See the
+//!   `#[operation_error]` note below.
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request exceeds a service quota.
 //! * `ThrottlingException` (HTTP 429) — The request rate exceeds the limit.
 //! * `ValidationException` (HTTP 400) — The request has invalid or missing parameters.
@@ -100,17 +101,25 @@ use super::types::*;
 // `CreateIngestionError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-appfabric-fabricfrontendservice.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `CreateIngestionError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.appfabric#CreateIngestion")]
+// The operation's MODELED errors, widened with `ResourceNotFoundException`.
+//
+// `appBundleIdentifier` names a parent that may not exist, and every sibling
+// operation that takes it (`CreateAppAuthorization`, `ListIngestions`,
+// `GetIngestion`) declares `ResourceNotFoundException` for exactly that case;
+// this operation's `errors` list omits it, so it is widened in here through
+// `extra_errors` rather than answered as some other status. The shape is this
+// service's own (`com.amazonaws.appfabric#ResourceNotFoundException`, HTTP 404),
+// declared in `types/shared_types.rs`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.appfabric#CreateIngestion",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateIngestionErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -167,18 +176,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIngestion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIngestionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIngestion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateIngestionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AppFabric emulator could not reach its state store".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The model closes `ingestionType` over `IngestionType`, whose only value
+        // is `auditLog` (see `INGESTION_TYPE_VALUES`), so the boundary validator
+        // has already refused anything else before this handler runs.
+
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        let Some(bundle_key) = store.bundle_key(&input.app_bundle_identifier) else {
+            return Err(CreateIngestionErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+        let Some(app_bundle_arn) = store
+            .app_bundles
+            .get(&bundle_key)
+            .map(|bundle| bundle.arn.clone())
+        else {
+            return Err(CreateIngestionErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+
+        // The PARENT is one of this request's parameters, so it belongs in the
+        // fingerprint: the same token under a different bundle is a different
+        // request, not a retry of this one.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                ("appBundleArn", app_bundle_arn.as_str()),
+                ("app", input.app.as_str()),
+                ("tenantId", input.tenant_id.as_str()),
+                ("ingestionType", input.ingestion_type.as_str()),
+            ],
+            input.tags.as_deref(),
+        );
+
+        // @idempotencyToken: the same token replays the ingestion the first call
+        // created; the same token with different parameters is the conflict AWS
+        // documents as IdempotentParameterMismatch.
+        if let Some(token) = input.client_token.as_deref() {
+            let key = crate::state::client_token_key(Self::NAME, token);
+            if let Some(spent) = store.client_tokens.get(&key).cloned() {
+                if spent.fingerprint != fingerprint {
+                    return Err(CreateIngestionErrorModeled::ConflictException(
+                        crate::state::idempotent_parameter_mismatch(token, "Ingestion"),
+                    )
+                    .into());
+                }
+                let replayed = store
+                    .app_bundles
+                    .get(&bundle_key)
+                    .and_then(|bundle| bundle.resolve_ingestion(&spent.arn))
+                    .map(crate::state::IngestionRecord::to_ingestion);
+                if let Some(ingestion) = replayed {
+                    return Ok(CreateIngestionOutput { ingestion });
+                }
+                // The replayed ingestion was deleted since; the token is spent on
+                // nothing, so this call creates a new one under a new token.
+                store.client_tokens.remove(&key);
+            }
+        }
+
+        let sequence = store.next_sequence();
+        let created_at = ::std::time::SystemTime::now();
+        let id = crate::state::new_uuid();
+        let Some(bundle) = store.app_bundles.get_mut(&bundle_key) else {
+            return Err(CreateIngestionErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+        // A RESOURCE GUARD on the store, answered with the quota error this
+        // operation models. Checked AFTER the idempotent replay above, so a retry
+        // of an ingestion that already exists is never refused by it.
+        if bundle.ingestions.len() >= crate::state::MAX_INGESTIONS_PER_APP_BUNDLE {
+            return Err(CreateIngestionErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    &app_bundle_arn,
+                    "Ingestion",
+                    "IngestionsPerAppBundle",
+                    crate::state::MAX_INGESTIONS_PER_APP_BUNDLE,
+                ),
+            )
+            .into());
+        }
+        // An ingestion's ARN is nested under the bundle that owns it, the way
+        // AppFabric's own resource chain nests them.
+        let arn = crate::state::appfabric_arn(
+            &region,
+            &format!("appbundle/{}/ingestion/{id}", bundle.id),
+        );
+        let record = crate::state::IngestionRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            app_bundle_arn: app_bundle_arn.clone(),
+            app: input.app,
+            tenant_id: input.tenant_id,
+            ingestion_type: input.ingestion_type,
+            // IngestionState = enabled | disabled. A new ingestion is created
+            // disabled and only StartIngestion enables it.
+            state: "disabled".to_string(),
+            created_at,
+            updated_at: created_at,
+            tags: input.tags.unwrap_or_default(),
+            sequence,
+            destinations: ::std::collections::HashMap::new(),
+        };
+        bundle.ingestions.insert(id.clone(), record);
+        // Read the response back out of the store, so what the caller sees is
+        // exactly what a later Get or List will see.
+        let stored = bundle
+            .ingestions
+            .get(&id)
+            .map(crate::state::IngestionRecord::to_ingestion);
+
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_client_token(
+                crate::state::client_token_key(Self::NAME, token),
+                arn,
+                fingerprint,
+            );
+        }
+
+        let Some(ingestion) = stored else {
+            return Err(CreateIngestionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the created ingestion could not be read back".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        crate::state::audit_resource_change(ctx.parts(), Self::NAME, "Ingestion", &id, "created");
+        Ok(CreateIngestionOutput { ingestion })
     }
 }

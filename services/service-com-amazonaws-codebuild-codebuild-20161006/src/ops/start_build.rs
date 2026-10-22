@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartBuild
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartBuild`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartBuild::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a build of a stored project and persists it: this is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -261,18 +254,400 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartBuild` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartBuildErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartBuild"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartBuild (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let initiator = crate::state::request_initiator(ctx.parts());
+        let now = crate::state::now_millis();
+        // The request as sent, hashed to a fixed size, so a repeat carrying the same
+        // idempotency token can be told apart from one that changed a parameter
+        // without retaining a request-sized value per token. `Debug` on the generated
+        // input is the plain derive — it prints every member in full and redacts
+        // nothing — and no member of StartBuild's input closure is `@sensitive`
+        // anyway, so a difference in ANY member changes the fingerprint.
+        let fingerprint = crate::state::request_fingerprint(&format!("{input:?}"));
+
+        // Refused BEFORE the state lock is taken, because the model puts no `@length`
+        // on `EnvironmentVariables`: the count is the caller's alone, and it is the
+        // one factor of the per-request work below that nothing else bounds. The
+        // ceiling is this emulator's own growth-site guard, not an AWS limit — see
+        // `crate::state::MAX_ENVIRONMENT_VARIABLES`.
+        let override_count = input
+            .environment_variables_override
+            .as_ref()
+            .map_or(0, Vec::len);
+        if override_count > crate::state::MAX_ENVIRONMENT_VARIABLES {
+            return Err(StartBuildErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Value at 'environmentVariablesOverride' failed to satisfy constraint: \
+                         Member must have length less than or equal to {}",
+                        crate::state::MAX_ENVIRONMENT_VARIABLES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // READ PASS: take the shared lock only long enough to copy the project and
+        // settle the idempotency question, then release it so none of the
+        // caller-driven resolution below runs inside the critical section every other
+        // CodeBuild request shares. Both are re-asserted in the WRITE PASS, so a
+        // concurrent delete or a concurrent request carrying the same token cannot
+        // slip through the gap.
+        let token_key = input
+            .idempotency_token
+            .clone()
+            .map(|token| (input.project_name.clone(), token));
+        let project = {
+            let mut guard = state.lock();
+            let Some(project) = guard
+                .projects
+                .get(&input.project_name)
+                .map(|stored| stored.project.clone())
+            else {
+                return Err(StartBuildErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Project cannot be found: {}",
+                            crate::state::project_arn(&region, &input.project_name)
+                        )),
+                    },
+                )
+                .into());
+            };
+            if let Some(build) = resolve_idempotency_token(
+                &mut guard,
+                token_key.as_ref(),
+                &fingerprint,
+                now,
+            )? {
+                return Ok(StartBuildOutput { build: Some(build) });
+            }
+            project
+        };
+
+        // Every member below is resolved from the stored project with this request's
+        // `*Override` applied — never echoed from the request alone. None of it needs
+        // the state lock, so none of it is done while holding it.
+        let source = resolve_source(project.source.clone().unwrap_or_default(), &input);
+        let environment =
+            resolve_environment(project.environment.clone().unwrap_or_default(), &input);
+        let logs_config = input
+            .logs_config_override
+            .clone()
+            .or_else(|| project.logs_config.clone());
+
+        let mut build = Build {
+            // id, arn and buildNumber are filled in by the WRITE PASS below: the
+            // number is allocated there, and the id is derived from it.
+            id: None,
+            arn: None,
+            build_number: None,
+            start_time: Some(crate::state::datetime(now)),
+            end_time: None,
+            current_phase: Some("QUEUED".to_string()),
+            build_status: Some("IN_PROGRESS".to_string()),
+            source_version: input.source_version.clone().or(project.source_version),
+            // The commit the source version resolved to. Nothing clones a repository
+            // here, so there is no resolved revision to report.
+            resolved_source_version: None,
+            project_name: Some(input.project_name.clone()),
+            phases: Some(crate::state::in_progress_phases(now)),
+            source: Some(source),
+            secondary_sources: input
+                .secondary_sources_override
+                .clone()
+                .or(project.secondary_sources),
+            secondary_source_versions: input
+                .secondary_sources_version_override
+                .clone()
+                .or(project.secondary_source_versions),
+            artifacts: input
+                .artifacts_override
+                .clone()
+                .or_else(|| project.artifacts.clone())
+                .map(build_artifacts_of),
+            secondary_artifacts: input
+                .secondary_artifacts_override
+                .clone()
+                .or(project.secondary_artifacts)
+                .map(|list| list.into_iter().map(build_artifacts_of).collect()),
+            cache: input.cache_override.clone().or(project.cache),
+            environment: Some(environment),
+            service_role: input
+                .service_role_override
+                .clone()
+                .or(project.service_role),
+            logs: logs_config.as_ref().map(logs_location_of),
+            timeout_in_minutes: input
+                .timeout_in_minutes_override
+                .or(project.timeout_in_minutes),
+            queued_timeout_in_minutes: input
+                .queued_timeout_in_minutes_override
+                .or(project.queued_timeout_in_minutes),
+            build_complete: false,
+            initiator: Some(initiator),
+            vpc_config: project.vpc_config,
+            // Allocated when a build container joins the project's VPC; no container
+            // is provisioned here.
+            network_interface: None,
+            encryption_key: input
+                .encryption_key_override
+                .clone()
+                .or(project.encryption_key),
+            // Exported by a buildspec's `env/exported-variables` while it runs, and
+            // reports and artifacts are produced by a running build.
+            exported_environment_variables: None,
+            report_arns: None,
+            file_system_locations: project.file_system_locations,
+            debug_session: input.debug_session_enabled.map(|enabled| DebugSession {
+                session_enabled: Some(enabled),
+                session_target: None,
+            }),
+            // Set only for a build started as part of a batch (StartBuildBatch).
+            build_batch_arn: None,
+            auto_retry_config: input
+                .auto_retry_limit_override
+                .or(project.auto_retry_limit)
+                .map(|limit| AutoRetryConfig {
+                    auto_retry_limit: Some(limit),
+                    auto_retry_number: None,
+                    next_auto_retry: None,
+                    previous_auto_retry: None,
+                }),
+        };
+
+        // WRITE PASS: one critical section that re-asserts what the read pass saw and
+        // then does every write together, so allocating the build number, inserting
+        // the build and recording the token are atomic with respect to each other.
+        let mut guard = state.lock();
+        if !guard.projects.contains_key(&input.project_name) {
+            // The project was deleted while this request was resolving: no build is
+            // persisted for a project that no longer exists.
+            return Err(StartBuildErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Project cannot be found: {}",
+                        crate::state::project_arn(&region, &input.project_name)
+                    )),
+                },
+            )
+            .into());
+        }
+        // A concurrent request carrying the same token may have won the race; it is
+        // the same request, so it resolves to the build that one started.
+        if let Some(build) =
+            resolve_idempotency_token(&mut guard, token_key.as_ref(), &fingerprint, now)?
+        {
+            return Ok(StartBuildOutput { build: Some(build) });
+        }
+        let build_number = guard.allocate_build_number(&input.project_name);
+        let id = format!(
+            "{}:{}",
+            input.project_name,
+            crate::state::build_uuid(&input.project_name, build_number, now)
+        );
+        build.build_number = Some(build_number);
+        build.id = Some(id.clone());
+        build.arn = Some(crate::state::build_arn(&region, &id));
+        guard.insert_build(
+            id.clone(),
+            crate::state::StoredBuild {
+                build: build.clone(),
+                start_millis: now,
+                settle_due_millis: now + crate::state::BUILD_SETTLE_MILLIS,
+            },
+        );
+        if let Some(key) = token_key {
+            guard.record_start_build_token(
+                key,
+                crate::state::StartBuildToken {
+                    build_id: id,
+                    request_fingerprint: fingerprint,
+                    issued_millis: now,
+                },
+                now,
+            );
+        }
+
+        Ok(StartBuildOutput { build: Some(build) })
+    }
+}
+
+/// What an idempotency token already in force resolves to.
+///
+/// AWS documents the token as "valid for 5 minutes": a repeat of the SAME request
+/// inside that window resolves to the build the first one started (`Ok(Some(build))`),
+/// and the same token with a changed request is a parameter mismatch, which AWS
+/// documents as a refusal rather than a second build. `Ok(None)` means this request
+/// has to start one.
+fn resolve_idempotency_token(
+    state: &mut crate::state::ComAmazonawsCodebuildCodebuild20161006State,
+    token_key: Option<&(String, String)>,
+    fingerprint: &str,
+    now: i64,
+) -> Result<Option<Build>, StartBuildError> {
+    let Some(key) = token_key else {
+        return Ok(None);
+    };
+    let in_force = state
+        .start_build_tokens
+        .get(key)
+        .filter(|issued| {
+            now - issued.issued_millis < crate::state::IDEMPOTENCY_TOKEN_TTL_MILLIS
+        })
+        .cloned();
+    let Some(issued) = in_force else {
+        return Ok(None);
+    };
+    if issued.request_fingerprint != fingerprint {
+        return Err(StartBuildErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(
+                    "Parameter mismatch: idempotencyToken was already used for a StartBuild \
+                     request with different parameters"
+                        .to_string(),
+                ),
+            },
+        )
+        .into());
+    }
+    Ok(state
+        .settled_build(&issued.build_id, now)
+        .map(|stored| stored.build.clone()))
+}
+
+/// The project's source with this request's source `*Override` members applied.
+fn resolve_source(mut source: ProjectSource, input: &StartBuildInput) -> ProjectSource {
+    if let Some(source_type) = input.source_type_override.clone() {
+        source.r#type = source_type;
+    }
+    if let Some(location) = input.source_location_override.clone() {
+        source.location = Some(location);
+    }
+    if let Some(buildspec) = input.buildspec_override.clone() {
+        source.buildspec = Some(buildspec);
+    }
+    if let Some(depth) = input.git_clone_depth_override {
+        source.git_clone_depth = Some(depth);
+    }
+    if let Some(submodules) = input.git_submodules_config_override.clone() {
+        source.git_submodules_config = Some(submodules);
+    }
+    if let Some(auth) = input.source_auth_override.clone() {
+        source.auth = Some(auth);
+    }
+    if let Some(report) = input.report_build_status_override {
+        source.report_build_status = Some(report);
+    }
+    if let Some(config) = input.build_status_config_override.clone() {
+        source.build_status_config = Some(config);
+    }
+    if let Some(insecure) = input.insecure_ssl_override {
+        source.insecure_ssl = Some(insecure);
+    }
+    source
+}
+
+/// The project's environment with this request's environment `*Override` members
+/// applied. `environmentVariablesOverride` "overrides, for this build only, the latest
+/// ones already defined in the build project", so it replaces a project variable of the
+/// same name and adds the rest.
+///
+/// The merge is keyed by a name -> position index rather than a scan per entry, so it
+/// stays linearithmic in the number of variables (the handler has already refused a
+/// request past [`crate::state::MAX_ENVIRONMENT_VARIABLES`]) while keeping the list
+/// order the model defines: a replaced variable stays where the project put it, and a
+/// new one is appended in the order the request listed it.
+fn resolve_environment(
+    mut environment: ProjectEnvironment,
+    input: &StartBuildInput,
+) -> ProjectEnvironment {
+    if let Some(environment_type) = input.environment_type_override.clone() {
+        environment.r#type = environment_type;
+    }
+    if let Some(image) = input.image_override.clone() {
+        environment.image = image;
+    }
+    if let Some(compute_type) = input.compute_type_override.clone() {
+        environment.compute_type = compute_type;
+    }
+    if let Some(certificate) = input.certificate_override.clone() {
+        environment.certificate = Some(certificate);
+    }
+    if let Some(privileged) = input.privileged_mode_override {
+        environment.privileged_mode = Some(privileged);
+    }
+    if let Some(credential) = input.registry_credential_override.clone() {
+        environment.registry_credential = Some(credential);
+    }
+    if let Some(pull_credentials) = input.image_pull_credentials_type_override.clone() {
+        environment.image_pull_credentials_type = Some(pull_credentials);
+    }
+    if let Some(fleet) = input.fleet_override.clone() {
+        environment.fleet = Some(fleet);
+    }
+    if let Some(host_kernel) = input.host_kernel_override.clone() {
+        environment.host_kernel = Some(host_kernel);
+    }
+    if let Some(overrides) = input.environment_variables_override.clone() {
+        let mut resolved = environment.environment_variables.unwrap_or_default();
+        let mut position_of: ::std::collections::BTreeMap<String, usize> = resolved
+            .iter()
+            .enumerate()
+            .map(|(position, held)| (held.name.clone(), position))
+            .collect();
+        for variable in overrides {
+            match position_of.get(&variable.name) {
+                Some(&position) => resolved[position] = variable,
+                None => {
+                    position_of.insert(variable.name.clone(), resolved.len());
+                    resolved.push(variable);
+                }
+            }
+        }
+        environment.environment_variables = Some(resolved);
+    }
+    environment
+}
+
+/// The build's view of its output artifacts: the configured destination, with the
+/// checksums and the resolved location left absent because nothing was uploaded.
+fn build_artifacts_of(artifacts: ProjectArtifacts) -> BuildArtifacts {
+    BuildArtifacts {
+        location: artifacts.location,
+        sha256sum: None,
+        md5sum: None,
+        override_artifact_name: artifacts.override_artifact_name,
+        encryption_disabled: artifacts.encryption_disabled,
+        artifact_identifier: artifacts.artifact_identifier,
+        bucket_owner_access: artifacts.bucket_owner_access,
+    }
+}
+
+/// The build's log location, from the resolved logs configuration. The deep links and
+/// the stream ARNs are created with the log stream during PROVISIONING, which an
+/// emulated build never reaches.
+fn logs_location_of(config: &LogsConfig) -> LogsLocation {
+    LogsLocation {
+        group_name: config
+            .cloud_watch_logs
+            .as_ref()
+            .and_then(|logs| logs.group_name.clone()),
+        stream_name: config
+            .cloud_watch_logs
+            .as_ref()
+            .and_then(|logs| logs.stream_name.clone()),
+        deep_link: None,
+        s3_deep_link: None,
+        cloud_watch_logs_arn: None,
+        s3_logs_arn: None,
+        cloud_watch_logs: config.cloud_watch_logs.clone(),
+        s3_logs: config.s3_logs.clone(),
     }
 }

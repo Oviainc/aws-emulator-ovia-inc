@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAppMonitor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAppMonitor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAppMonitor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +163,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAppMonitor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAppMonitorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing in this operation depends on request metadata: the monitor it changes
+        // is named by the path, and its ARN was derived once at create time.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAppMonitorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The same prose-only rules `CreateAppMonitor` enforces: a monitor's domain
+        // authority is held in exactly one of Domain/DomainList (this call may name
+        // neither and leave the stored choice alone), and a configuration cannot carry
+        // both IncludedPages and ExcludedPages.
+        if let Some(message) = crate::state::domain_choice_refusal(
+            input.domain.as_deref(),
+            input.domain_list.as_deref(),
+            false,
+        ) {
+            return Err(
+                UpdateAppMonitorErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+        if let Some(message) = input
+            .app_monitor_configuration
+            .as_ref()
+            .and_then(crate::state::app_monitor_configuration_refusal)
+        {
+            return Err(
+                UpdateAppMonitorErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let modified = crate::state::current_iso_timestamp();
+        let mut store = state.lock();
+        let Some(record) = store.app_monitors.get_mut(&input.name) else {
+            return Err(UpdateAppMonitorErrorModeled::ResourceNotFoundException(
+                crate::state::app_monitor_not_found(&input.name),
+            )
+            .into());
+        };
+
+        // "When you use this operation, only the parts of the app monitor configuration
+        // that you specify in this structure are changed": an absent member leaves the
+        // stored value alone, so each is applied only when the request carried it. `Id`
+        // and `Created` are not updatable members at all.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAppMonitor"))
+        // Domain and DomainList are the two forms of ONE stored choice ("either the
+        // domain or the domain list"), so naming one replaces the other rather than
+        // leaving the monitor carrying both.
+        let mut changed = false;
+        if let Some(domain) = input.domain {
+            record.domain = Some(domain);
+            record.domain_list = None;
+            changed = true;
+        }
+        if let Some(domain_list) = input.domain_list {
+            record.domain_list = Some(domain_list);
+            record.domain = None;
+            changed = true;
+        }
+        if let Some(configuration) = input.app_monitor_configuration {
+            record.app_monitor_configuration = configuration;
+            changed = true;
+        }
+        if let Some(cw_log_enabled) = input.cw_log_enabled {
+            record.cw_log_enabled = cw_log_enabled;
+            changed = true;
+        }
+        if let Some(custom_events) = input.custom_events {
+            record.custom_events = custom_events;
+            changed = true;
+        }
+        if let Some(deobfuscation) = input.deobfuscation_configuration {
+            record.deobfuscation_configuration = Some(deobfuscation);
+            changed = true;
+        }
+        // `LastModified` is "the date and time of the most recent changes to this app
+        // monitor's configuration", so it moves to the instant of this call — and only
+        // when this call actually changed something: a request that carries no updatable
+        // member leaves the monitor, timestamp included, exactly as it was.
+        if changed {
+            record.last_modified = modified;
+        }
+
+        // `UpdateAppMonitorResponse` models no members: a later `GetAppMonitor` is what
+        // reports the new values, off the record this call just wrote.
+        Ok(UpdateAppMonitorOutput {})
     }
 }

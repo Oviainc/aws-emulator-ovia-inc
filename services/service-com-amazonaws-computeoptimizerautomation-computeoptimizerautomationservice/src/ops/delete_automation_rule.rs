@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DeleteAutomationRuleErrorModeled::IdempotentParameterMismatchException(
                         IdempotentParameterMismatchException {
                             message: Some(
-                                "The same client token was used with different parameters.".into(),
+                                crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.into(),
                             ),
                         },
                     )
@@ -204,26 +204,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(rule) = guard.rules.get(&input.rule_arn) else {
             return Err(DeleteAutomationRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No automation rule found with ARN '{}'.",
-                        input.rule_arn
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
         };
         // `ruleRevision` is the rule's optimistic-concurrency token here too: a
         // delete carrying a stale revision is refused rather than applied to a
-        // rule that has changed since the caller read it.
+        // rule that has changed since the caller read it, and the rejection
+        // reports the rule's CURRENT revision.
         if rule.rule_revision != input.rule_revision {
             return Err(
                 DeleteAutomationRuleErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(format!(
-                            "Value '{}' at 'ruleRevision' failed to satisfy constraint: Member \
-                             must match the current revision of rule '{}'",
-                            input.rule_revision, input.rule_arn
-                        )),
+                        message: Some(crate::state::revision_mismatch_message(rule.rule_revision)),
                     },
                 )
                 .into(),

@@ -5,12 +5,15 @@
 //! and ARN minting, resolving the `id OR ARN` identifier forms the modelled
 //! `@httpLabel` patterns accept, projecting a resource's tag map and an Outpost's
 //! two Availability Zone identities, materialising the Outpost lifecycle transition
-//! the clock owes, and cutting an ordered list into pages with the modelled `Token`
-//! the next page resumes from.
+//! the clock owes, cutting an ordered list into pages with the modelled `Token` the
+//! next page resumes from, and the two rules this service words its refusals by —
+//! the `NotFoundException` identifier echo and the value-omitting
+//! `ValidationException` report.
 
 use std::collections::{BTreeMap, HashMap};
 
 use sha2::{Digest, Sha256};
+use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{Address, Outpost, Site};
 
@@ -377,6 +380,161 @@ pub fn availability_zone(zone_id: &str) -> Option<String> {
 /// `OutpostDescription`, so an empty one is omitted rather than stored.
 pub fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// How this service words a refused request
+//
+// Two rules, each applied to every operation in this crate that states that
+// class of failure, so no handler can word one its own way:
+//
+// * `NotFoundException` — the body is the IDENTIFIER ECHO
+//   `<member>=<value as supplied>`. See [`identifier_not_found`].
+// * `ValidationException` — the body is the standard AWS validation report, and
+//   it never renders the offending value. See [`validation_report`].
+// ---------------------------------------------------------------------------
+
+/// How this service states that an identifier names no resource it holds.
+///
+/// The body is the identifier ECHO: the name of the input member the identifier
+/// arrived in, `=`, and the value EXACTLY as the client sent it — so a caller
+/// that sent the ARN form reads its ARN back, not the bare id the service
+/// resolved it to, and a caller can parse the identifier it sent out of the
+/// message. It is not an English sentence, and it never normalises the value.
+///
+/// `member` is the member's validation-path name (see [`SITE_ID_MEMBER`]);
+/// `supplied` is the raw input member, before [`resolve_id`] touches it.
+pub fn identifier_not_found(member: &str, supplied: &str) -> String {
+    format!("{member}={supplied}")
+}
+
+/// The validation-path name of the `SiteId` input member.
+///
+/// Both message rules name a member the way AWS's validation report names one:
+/// lowerCamel, which is the report's own casing convention applied to the Smithy
+/// member name (`SiteId` -> `siteId`), not a fact of the model.
+pub const SITE_ID_MEMBER: &str = "siteId";
+
+/// The validation-path name of the `OutpostId` input member. See [`SITE_ID_MEMBER`].
+pub const OUTPOST_ID_MEMBER: &str = "outpostId";
+
+/// The validation-path name of the `NextToken` input member every list takes.
+/// See [`SITE_ID_MEMBER`].
+pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
+/// The `@pattern` the model declares on `SiteId`, verbatim: a report names a
+/// pattern exactly as the model spells it, anchors included.
+pub const SITE_ID_PATTERN: &str =
+    r"^(arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:site/)?(os-[a-f0-9]{17})$";
+
+/// The `@pattern` the model declares on `OutpostId`. See [`SITE_ID_PATTERN`].
+pub const OUTPOST_ID_PATTERN: &str =
+    r"^(arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:outpost/)?op-[a-f0-9]{17}$";
+
+/// The error code every refusal this service rewords answers with — the same
+/// code the modelled `ValidationException` (HTTP 400) carries, so rewording the
+/// body never moves a client off the code it branches on.
+pub const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The text [`Violation::message`] puts between the offending value's position
+/// and the requirement it failed.
+///
+/// The LAST occurrence is the real separator: a requirement never contains this
+/// text, while a caller-supplied value interpolated before it might.
+const CONSTRAINT_SEPARATOR: &str = " failed to satisfy constraint: ";
+
+/// One clause of the validation report: WHERE the offending value was, and WHAT
+/// it had to satisfy. The value itself is never part of a clause.
+pub fn clause(member: &str, requirement: &str) -> String {
+    format!("Value at '{member}' failed to satisfy constraint: {requirement}")
+}
+
+/// The standard AWS validation report around `clauses`: the count, then every
+/// clause joined with `; `.
+///
+/// Callers pass at least one clause — a report with nothing to report is not a
+/// refusal — and the plural arm renders whatever it is given rather than
+/// panicking on an empty slice.
+pub fn validation_report(clauses: &[String]) -> String {
+    match clauses {
+        [single] => format!("1 validation error detected: {single}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
+}
+
+/// The clause a single [`Violation`] states under this service's rule.
+///
+/// The requirement is lifted out of the framework's OWN rendering of the
+/// violation instead of being re-spelled here, so a constraint this service
+/// reports is worded exactly as the boundary validator words it — the same
+/// bound text, and a `@pattern` reproduced verbatim from the model. What this
+/// drops is the rendering of the value: the report names the member and the
+/// constraint only.
+fn violation_clause(violation: &Violation) -> String {
+    let rendered = violation.message();
+    match rendered.rsplit_once(CONSTRAINT_SEPARATOR) {
+        // A member that was ABSENT has no value to omit, and the framework's own
+        // clause already says exactly that (`Value null at '<member>' …`), so it
+        // stands unchanged.
+        Some((_, requirement)) if violation.value.is_some() => {
+            clause(&violation.path, requirement)
+        }
+        _ => rendered,
+    }
+}
+
+/// The report for every constraint violation the boundary validator found,
+/// in the order it found them. This is what `override_refusal` answers with.
+pub fn refusal_report(violations: &[Violation]) -> String {
+    let clauses: Vec<String> = violations.iter().map(violation_clause).collect();
+    validation_report(&clauses)
+}
+
+/// The report for one member that failed `kind`, for a handler that has to state
+/// a modelled constraint itself.
+pub fn constraint_report(member: &str, kind: ViolationKind) -> String {
+    validation_report(&[violation_clause(&Violation {
+        path: member.to_string(),
+        kind,
+        // A PRESENT value selects the value-omitting clause rather than the
+        // `Value null` one an absent member gets. What it holds is irrelevant:
+        // the value never reaches the body.
+        value: Some(String::new()),
+    })])
+}
+
+/// The report a `SiteId` that is neither a site id nor a site ARN states.
+pub fn site_id_pattern_report() -> String {
+    constraint_report(
+        SITE_ID_MEMBER,
+        ViolationKind::Pattern(SITE_ID_PATTERN.to_string()),
+    )
+}
+
+/// The report an `OutpostId` that is neither an Outpost id nor an Outpost ARN
+/// states. See [`site_id_pattern_report`].
+pub fn outpost_id_pattern_report() -> String {
+    constraint_report(
+        OUTPOST_ID_MEMBER,
+        ViolationKind::Pattern(OUTPOST_ID_PATTERN.to_string()),
+    )
+}
+
+/// The report an unusable pagination token states.
+///
+/// No modelled constraint covers it — the modelled `Token` pattern has already
+/// passed by the time the token is decoded — so the requirement is this
+/// service's own rule, stated in the report's grammar and naming `operation`,
+/// the list the token had to belong to.
+pub fn page_token_report(operation: &str) -> String {
+    validation_report(&[clause(
+        NEXT_TOKEN_MEMBER,
+        &format!("Member must be a pagination token this service issued for {operation}"),
+    )])
 }
 
 /// The stamp a `ListOutposts` page token carries, so a token issued for one list

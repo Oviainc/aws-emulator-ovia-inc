@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a project in a space and persists it in [`crate::state`], then reports the
+//! project it stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The project's API-visible `name` is DERIVED from the requested `displayName`
+//! (`crate::state::derived_project_name`): `ProjectDisplayName` admits a space as a
+//! separator where `NameString` admits only `-`, `_` and `.`, so each separating space
+//! becomes a hyphen. A request naming a space that does not exist is refused with the
+//! modelled `ResourceNotFoundException` (404).
+//!
+//! The operation is `@idempotent`, so re-issuing a request whose project is already
+//! stored exactly as it would be created is a success reporting that project rather
+//! than a second project; a request that would have to CHANGE a stored project of the
+//! same name (a different display name or description) is the conflict the modelled
+//! `ConflictException` (409) describes. A create that would take the space past
+//! `crate::state::EMULATOR_MAX_PROJECTS_PER_SPACE` is refused with the modelled
+//! `ServiceQuotaExceededException` (402).
 //!
 //! ## Shape of an operation
 //!
@@ -86,9 +93,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codecatalyst-codecataly
 // here — hence the `CreateProjectError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codecatalyst#CreateProject")]
+//
+// CodeCatalyst declares its errors on the SERVICE shape, not per operation, so the
+// ones this handler answers with are widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codecatalyst#CreateProject",
+    extra_errors = ["ResourceNotFoundException", "ConflictException", "ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateProjectErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
+    ConflictException(ConflictException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,18 +158,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProject"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Not a service behaviour: the engine this service was constructed with
+            // holds no state store, so the operation cannot be served at all.
+            crate::scaffolded::Scaffolded::not_implemented(
+                "CreateProject (the engine this service was built with provides no state store)",
+            )
+        })?;
+        let mut state = state.lock();
+
+        let space = state.space_mut(&input.space_name).ok_or_else(|| {
+            CreateProjectErrorModeled::ResourceNotFoundException(not_found(
+                "space",
+                &input.space_name,
+            ))
+        })?;
+
+        let name = crate::state::derived_project_name(&input.display_name);
+        let stored = crate::state::Project {
+            space_name: space.name.clone(),
+            name: name.clone(),
+            display_name: Some(input.display_name.clone()),
+            description: input.description.clone(),
+            source_repositories: std::collections::BTreeMap::new(),
+        };
+
+        let project = match space.projects.get(&name) {
+            // `@idempotent`: the stored project is already what this request asks for,
+            // so the request's effect is in place and no second project is created.
+            Some(existing)
+                if existing.display_name == stored.display_name
+                    && existing.description == stored.description =>
+            {
+                existing
+            }
+            // A project of this name exists but differs: serving the request would have
+            // to change it, which is the conflict the model declares.
+            Some(existing) => {
+                return Err(CreateProjectErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "The request was denied because the requested operation would cause \
+                             a conflict with the current state of a service resource associated \
+                             with the request: project {} already exists in space {}.",
+                            existing.name, existing.space_name
+                        ),
+                    },
+                )
+                .into());
+            }
+            None => {
+                // The one caller-driven growth site in this operation: refuse past
+                // the space's stated maximum rather than letting the store grow for
+                // the life of the process.
+                if space.projects.len() >= crate::state::EMULATOR_MAX_PROJECTS_PER_SPACE {
+                    return Err(CreateProjectErrorModeled::ServiceQuotaExceededException(
+                        quota_exceeded(
+                            "projects",
+                            &format!("space {}", space.name),
+                            crate::state::EMULATOR_MAX_PROJECTS_PER_SPACE,
+                        ),
+                    )
+                    .into());
+                }
+                space.projects.entry(name).or_insert(stored)
+            }
+        };
+
+        Ok(CreateProjectOutput {
+            space_name: Some(project.space_name.clone()),
+            name: project.name.clone(),
+            display_name: project.display_name.clone(),
+            description: project.description.clone(),
+        })
     }
 }

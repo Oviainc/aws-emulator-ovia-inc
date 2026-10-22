@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hashes the store's ordinal and the call's instant into the `dataSetRequestId`
+# each accepted publication request is correlated with (`state::mint_request_id`).
+sha2 = { workspace = true }
+# Renders those bytes as the id's hexadecimal.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

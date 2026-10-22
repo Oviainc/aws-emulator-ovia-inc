@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeJobDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeJobDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeJobDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers from the job-definition revisions [`crate::state`] holds — the records
+//! `RegisterJobDefinition` inserted. A REPORTING operation: it writes nothing.
+//!
+//! Every filter the request names is applied, and what is left is returned in
+//! `(name, revision)` order, one `maxResults` page at a time with an opaque
+//! `nextToken` cursor to the next.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +161,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeJobDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeJobDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeJobDefinitions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeJobDefinitionsErrorModeled::ServerException(ServerException {
+                message: Some("the job definition registry is unavailable".to_string()),
+            })
+        })?;
+
+        // "A list of up to 100 job definitions" (`jobDefinitions`).
+        let selectors = input.job_definitions.unwrap_or_default();
+        if selectors.len() > crate::state::MAX_DESCRIBE_FILTER_ENTRIES {
+            return Err(client_exception(&format!(
+                "jobDefinitions accepts at most {} entries, not {}",
+                crate::state::MAX_DESCRIBE_FILTER_ENTRIES,
+                selectors.len()
+            )));
+        }
+
+        // "This value can be between 1 and 100. If this parameter isn't used, then
+        // DescribeJobDefinitions returns up to 100 results" (`maxResults`). The
+        // member targets a plain `Integer`, so the framework enforces no range.
+        let page_size = match input.max_results {
+            Some(requested) => {
+                if !(crate::state::MIN_DESCRIBE_PAGE_SIZE..=crate::state::MAX_DESCRIBE_PAGE_SIZE)
+                    .contains(&requested)
+                {
+                    return Err(client_exception(&format!(
+                        "maxResults must be between {} and {}",
+                        crate::state::MIN_DESCRIBE_PAGE_SIZE,
+                        crate::state::MAX_DESCRIBE_PAGE_SIZE
+                    )));
+                }
+                requested
+            }
+            None => crate::state::MAX_DESCRIBE_PAGE_SIZE,
+        };
+        let page_size = usize::try_from(page_size).unwrap_or(1);
+
+        // The cursor names the first key of THIS page; a token this service did not
+        // mint names no key and is refused rather than silently restarting the scan.
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                client_exception("nextToken is not a token returned by DescribeJobDefinitions")
+            })?),
+            None => None,
+        };
+
+        let store = state.lock();
+        let mut page: Vec<JobDefinition> = Vec::new();
+        let mut next_token = None;
+        // `job_definitions` is keyed by `(name, revision)`, so this walk is already
+        // in name-then-revision order and a cursor is a `>=` bound on that key.
+        for (key, definition) in &store.job_definitions {
+            if cursor.as_ref().is_some_and(|start| key < start) {
+                continue;
+            }
+            if !selectors.is_empty()
+                && !selectors
+                    .iter()
+                    .any(|selector| selects(selector, definition))
+            {
+                continue;
+            }
+            // "The name of the job definition to describe" (`jobDefinitionName`):
+            // every revision registered under that name.
+            if input
+                .job_definition_name
+                .as_deref()
+                .is_some_and(|name| name != definition.job_definition_name)
+            {
+                continue;
+            }
+            // "The status used to filter job definitions" (`status`). With no
+            // status named, every stored revision qualifies, whatever its status.
+            if input
+                .status
+                .as_deref()
+                .is_some_and(|status| Some(status) != definition.status.as_deref())
+            {
+                continue;
+            }
+            if page.len() == page_size {
+                // One past the page: the cursor the caller continues from.
+                next_token = Some(crate::state::encode_page_token(&key.0, key.1));
+                break;
+            }
+            page.push(definition.clone());
+        }
+
+        Ok(DescribeJobDefinitionsOutput {
+            job_definitions: Some(page),
+            next_token,
+        })
     }
+}
+
+/// Whether one `jobDefinitions` entry names `definition`.
+///
+/// The member's doc gives two forms: "an ARN in the format
+/// `arn:aws:batch:${Region}:${Account}:job-definition/${JobDefinitionName}:${Revision}`
+/// or a short version using the form `${JobDefinitionName}:${Revision}`". An entry
+/// carrying no revision names the job definition itself, so it selects every
+/// revision of that name — the same set `jobDefinitionName` selects.
+fn selects(selector: &str, definition: &JobDefinition) -> bool {
+    if selector.starts_with("arn:") {
+        return selector == definition.job_definition_arn;
+    }
+    match selector.rsplit_once(':') {
+        Some((name, revision)) => {
+            name == definition.job_definition_name
+                && revision.parse::<i32>() == Ok(definition.revision)
+        }
+        None => selector == definition.job_definition_name,
+    }
+}
+
+/// A refusal of a request this service understood but cannot accept: the modelled
+/// `ClientException` (HTTP 400), worded as Batch's frontend words one.
+fn client_exception(detail: &str) -> DescribeJobDefinitionsError {
+    DescribeJobDefinitionsErrorModeled::ClientException(ClientException {
+        message: Some(crate::state::client_exception_message(detail)),
+    })
+    .into()
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op JoinStorageSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `JoinStorageSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`JoinStorageSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Joins the caller to a signaling channel's WebRTC storage session as the **video
+//! producing device** (the master), creating the session when the channel has none.
+//! The call is not idempotent: every call counts as a join, and the most recent
+//! producer takes precedence over the incumbent one. State lives in
+//! [`crate::state`]; this operation is also where a channel ARN becomes a channel
+//! this emulator knows (see `known_channels` there).
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +184,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `JoinStorageSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(JoinStorageSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata; this operation reads the presented access
+        // key id from it for the audit record below, and decides everything else
+        // from the input and the shared store.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("JoinStorageSession"))
+        // The store is this service's slice of the shared engine. `None` means the
+        // emulator was assembled on an engine that holds no state for this service,
+        // so the operation cannot be served at all — answer the scaffold's 501
+        // rather than a success that persisted nothing.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "JoinStorageSession",
+            ));
+        };
+
+        // The modelled `@pattern` is refused before `handle` runs, so this parse
+        // succeeds for every request that reaches here; it is the semantic half of
+        // the check the schema cannot express that refuses below.
+        let Some(arn) = crate::state::parse_channel_arn(&input.channel_arn) else {
+            return Err(JoinStorageSessionErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(format!(
+                        "channelArn '{}' is not a Kinesis Video signaling channel ARN",
+                        input.channel_arn
+                    )),
+                },
+            )
+            .into());
+        };
+        if arn.resource_type != crate::state::SIGNALING_CHANNEL_RESOURCE_TYPE {
+            return Err(JoinStorageSessionErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(format!(
+                        "channelArn must name a '{}' resource, but '{}' names a '{}' resource",
+                        crate::state::SIGNALING_CHANNEL_RESOURCE_TYPE,
+                        input.channel_arn,
+                        arn.resource_type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // This call provides the ARN of the signaling channel, so the channel is
+        // one this emulator knows from here on; the session is created when the
+        // channel has none, and a join of an existing session rotates the producer,
+        // because "the most recent client request takes precedence". A join that
+        // would take the store past its channel limit is refused instead.
+        let generation = match store.join_as_producer(&input.channel_arn, now) {
+            Ok(generation) => generation,
+            Err(refused) => {
+                return Err(
+                    JoinStorageSessionErrorModeled::ClientLimitExceededException(
+                        ClientLimitExceededException {
+                            message: Some(refused.message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+        drop(store);
+
+        // Audit record for a state-changing call: who was presented, what was
+        // joined, and the outcome. The access key id is the one the request
+        // presented, never a secret.
+        tracing::info!(
+            operation = "JoinStorageSession",
+            channel_arn = %input.channel_arn,
+            access_key_id = %::engine::extract_akid(&ctx.parts().headers),
+            generation,
+            outcome = "joined",
+            "the video producing device joined the channel's storage session"
+        );
+
+        Ok(JoinStorageSessionOutput)
     }
 }

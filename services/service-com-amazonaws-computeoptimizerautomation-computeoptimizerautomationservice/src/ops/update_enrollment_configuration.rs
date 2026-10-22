@@ -187,15 +187,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Pending and Failed options cannot be used to update the enrollment
         // status of an account. They are returned in the response". Both are
         // legal members of `EnrollmentStatus`, so the protocol boundary admits
-        // them and the refusal belongs here.
-        if input.status == "Pending" || input.status == "Failed" {
+        // them and the refusal belongs here. The rejection names the rejected
+        // value and the statuses a caller may send instead.
+        if !crate::state::SETTABLE_ENROLLMENT_STATUSES.contains(&input.status.as_str()) {
             return Err(
                 UpdateEnrollmentConfigurationErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(format!(
-                            "The status '{}' cannot be used to update the enrollment status of an \
-                             account.",
-                            input.status
+                        message: Some(crate::state::invalid_enrollment_status_message(
+                            &input.status,
                         )),
                     },
                 )
@@ -230,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     UpdateEnrollmentConfigurationErrorModeled::IdempotentParameterMismatchException(
                         IdempotentParameterMismatchException {
                             message: Some(
-                                "The same client token was used with different parameters.".into(),
+                                crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.into(),
                             ),
                         },
                     )
