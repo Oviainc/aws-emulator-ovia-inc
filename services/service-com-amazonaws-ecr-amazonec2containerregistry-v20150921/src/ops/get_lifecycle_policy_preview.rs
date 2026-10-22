@@ -159,10 +159,12 @@ fn fault_error(fault: crate::state::Fault) -> GetLifecyclePolicyPreviewErrorMode
         // A pagination token that was not issued here, and a registry that is not this
         // one, are each a parameter this operation cannot honour. The remaining kinds are
         // unreachable: this operation models no image-not-found failure, so an identifier
-        // naming no stored image selects nothing instead (see `handle`), and it carries
-        // no tags.
+        // naming no stored image selects nothing instead (see `handle`), it carries no
+        // tags, and it resolves no stored lifecycle policy — it reads the preview's own
+        // document, whose absence is `LifecyclePolicyPreviewNotFoundException`.
         crate::state::Fault::InvalidParameter(_)
         | crate::state::Fault::ImageNotFound(_)
+        | crate::state::Fault::LifecyclePolicyNotFound(_)
         | crate::state::Fault::InvalidTagParameter(_)
         | crate::state::Fault::TooManyTags(_) => {
             GetLifecyclePolicyPreviewErrorModeled::InvalidParameterException(
