@@ -23,6 +23,8 @@ mod certificate_not_found_message;
 mod certificate_revocation;
 #[path = "all/certificate_validation_state_machine.rs"]
 mod certificate_validation_state_machine;
+#[path = "all/resend_validation_email.rs"]
+mod resend_validation_email;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_domain_superdomain.rs"]

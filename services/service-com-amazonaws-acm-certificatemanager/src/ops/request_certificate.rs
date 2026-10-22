@@ -369,7 +369,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cert_type: crate::state::TYPE_AMAZON_ISSUED.to_string(),
             key_algorithm,
             key_pair_origin: crate::state::KEY_PAIR_ORIGIN_AWS_MANAGED.to_string(),
-            validation_method: Some(validation_method),
+            validation_method: Some(validation_method.clone()),
             domain_validations,
             options: input.options.clone(),
             certificate_authority_arn: input.certificate_authority_arn.clone(),
@@ -391,6 +391,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             key_usages: Vec::new(),
             extended_key_usages: Vec::new(),
             exported: false,
+            // ACM sent this certificate's validation mail now, for a request that
+            // asked for email validation; the documented 72-hour resend window
+            // (`crate::state::RESEND_VALIDATION_WINDOW`) runs from here.
+            validation_email_sent_at: (validation_method
+                == crate::state::VALIDATION_METHOD_EMAIL)
+                .then_some(now),
             // Nothing is revoked: `RevokedAt` and `RevocationReason` "exist only when
             // the certificate status is REVOKED" (`CertificateDetail` docs).
             revoked_at: None,
@@ -554,10 +560,7 @@ fn domain_validation_record(
                 .map(crate::state::validation_target)
                 .unwrap_or(target);
             record.validation_domain = Some(mailed.to_string());
-            record.validation_emails = crate::state::VALIDATION_EMAIL_LOCAL_PARTS
-                .iter()
-                .map(|local_part| format!("{local_part}@{mailed}"))
-                .collect();
+            record.validation_emails = crate::state::validation_mailboxes(mailed);
         }
     }
     record

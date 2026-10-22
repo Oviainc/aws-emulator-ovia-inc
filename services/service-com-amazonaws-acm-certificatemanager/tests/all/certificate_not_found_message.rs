@@ -25,12 +25,13 @@ use crate::certificate_lifecycle::{
 
 /// The implemented operations that resolve `CertificateArn` and model
 /// `ResourceNotFoundException`
-/// (`smithy_query(query="operation", operation="DescribeCertificate,DeleteCertificate,AddTagsToCertificate,ListTagsForCertificate,RevokeCertificate")`).
+/// (`smithy_query(query="operation", operation="DescribeCertificate,DeleteCertificate,AddTagsToCertificate,ListTagsForCertificate,ResendValidationEmail,RevokeCertificate")`).
 const CERTIFICATE_LOOKUPS: &[&str] = &[
     "AddTagsToCertificate",
     "DeleteCertificate",
     "DescribeCertificate",
     "ListTagsForCertificate",
+    "ResendValidationEmail",
     "RevokeCertificate",
 ];
 
@@ -52,6 +53,14 @@ fn request_body(operation: &str, arn: &str) -> Value {
         // `Tags` is required and `TagList` has a minimum length of 1, so the request
         // has to carry one to reach the certificate lookup at all.
         body["Tags"] = json!([{ "Key": "env", "Value": "test" }]);
+    }
+    if operation == "ResendValidationEmail" {
+        // `Domain` and `ValidationDomain` are both required, and the pair has to
+        // satisfy the superdomain rule the handler checks before it looks the ARN up —
+        // a domain validated through itself does, so the lookup is what this row
+        // reaches.
+        body["Domain"] = json!("lookup.example.com");
+        body["ValidationDomain"] = json!("lookup.example.com");
     }
     if operation == "RevokeCertificate" {
         // `RevocationReason` is required, so the request has to carry a modelled value
