@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hex codec for the opaque `ListConnections` page token and for rendering the
+# digest a connection's resource id is minted from.
+hex = { workspace = true }
+# The digest behind a connection's opaque resource id (see `state::connection_resource_id`).
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
