@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNamespaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNamespaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the namespaces this emulator holds, one page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNamespaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## How this listing answers
+//!
+//! * The stored namespaces are scanned in namespace-id order, which is this listing's
+//!   stable order, and the page `MaxResults` asks for is taken from that scan
+//!   (`page_size` defaults it to the documented 100). The `NextToken` a truncated page
+//!   hands back is an opaque token naming the first id NOT served, so a resumed call
+//!   continues there and a token this listing never issued is refused with the
+//!   modelled `InvalidInput`.
+//! * `Filters` are applied to the namespaces the page SCANNED, which is what
+//!   `MaxResults` documents ("Cloud Map gets MaxResults namespaces and then filters
+//!   them based on the specified criteria"), so a page can come back empty while
+//!   namespaces remain.
+//! * A filter the model does not allow — an unknown `Name`, a `Condition` other than
+//!   `EQ`/`BEGINS_WITH`, more or fewer than one value, a `TYPE` or `RESOURCE_OWNER`
+//!   value outside its enumeration — is refused with `InvalidInput` (HTTP 400).
+//! * Nothing here writes: the listing reports the records the create operations
+//!   persisted, with `ServiceCount` derived from the service map.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +131,126 @@ impl From<ListNamespacesErrorModeled> for ListNamespacesError {
     }
 }
 
+/// The scope the `NextToken` this operation issues is tagged with, so a token minted by
+/// another paginated read is not honoured here.
+const NEXT_TOKEN_SCOPE: &str = "ListNamespaces";
+
+/// The values `NamespaceFilter$Values` documents for `RESOURCE_OWNER`: "Specify one of
+/// `SELF` or `OTHER_ACCOUNTS`." The other filter names compare against a namespace
+/// member rather than an enumeration, and `TYPE`'s values are the generated
+/// `NAMESPACE_TYPE_VALUES`.
+const RESOURCE_OWNERS: [&str; 2] = ["SELF", "OTHER_ACCOUNTS"];
+
+/// The filter name whose values name an account rather than a namespace field.
+const FILTER_RESOURCE_OWNER: &str = "RESOURCE_OWNER";
+
+/// `EQ`, the condition `NamespaceFilter$Condition` documents as "the default condition
+/// and can be omitted". It and [`CONDITION_BEGINS_WITH`] are the two of the generated
+/// `FILTER_CONDITION_VALUES` that a NAMESPACE filter declares support for.
+const CONDITION_EQ: &str = "EQ";
+
+/// `BEGINS_WITH`, the only other condition `NamespaceFilter$Condition` documents as
+/// supported, "for `TYPE`, `NAME`, and `HTTP_NAME`".
+const CONDITION_BEGINS_WITH: &str = "BEGINS_WITH";
+
+/// Refuse the request with the modelled `InvalidInput` (HTTP 400), the only client
+/// error this operation declares.
+fn invalid_input(message: String) -> ListNamespacesError {
+    ListNamespacesErrorModeled::InvalidInput(InvalidInput {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Why `filter` cannot be applied, or `Ok(())` when it can.
+///
+/// Every rule here comes from the documentation on `NamespaceFilter`: the filter names
+/// are the modelled `NamespaceFilterName` enum, `EQ` and `BEGINS_WITH` are the
+/// conditions it declares supported (`EQ` being the default when `Condition` is
+/// omitted), each takes exactly one value ("you can specify only one value"),
+/// `BEGINS_WITH` is supported "for `TYPE`, `NAME`, and `HTTP_NAME`" and so not for
+/// `RESOURCE_OWNER`, and the values an equality comparison accepts for `TYPE` and
+/// `RESOURCE_OWNER` are the enumerated ones.
+fn filter_rejection(filter: &NamespaceFilter) -> Result<(), String> {
+    if !NAMESPACE_FILTER_NAME_VALUES.contains(&filter.name.as_str()) {
+        return Err(format!(
+            "Filters.Name {} isn't valid. Valid values are {}.",
+            filter.name,
+            NAMESPACE_FILTER_NAME_VALUES.join(", ")
+        ));
+    }
+    let condition = filter.condition.as_deref().unwrap_or(CONDITION_EQ);
+    if condition != CONDITION_EQ && condition != CONDITION_BEGINS_WITH {
+        return Err(format!(
+            "Filters.Condition {condition} isn't supported for a namespace filter. Valid \
+             values are {CONDITION_EQ} and {CONDITION_BEGINS_WITH}."
+        ));
+    }
+    if condition == CONDITION_BEGINS_WITH && filter.name == FILTER_RESOURCE_OWNER {
+        return Err(format!(
+            "Filters.Condition {CONDITION_BEGINS_WITH} isn't supported for the \
+             {FILTER_RESOURCE_OWNER} filter."
+        ));
+    }
+    if filter.values.len() != 1 {
+        return Err(format!(
+            "Filters.Values must contain exactly one value, but {} were specified.",
+            filter.values.len()
+        ));
+    }
+    let value = filter.values[0].as_str();
+    // Only an equality comparison names a whole enumerated value; a `BEGINS_WITH`
+    // value is a PREFIX of one (`DNS_` matches both DNS types), so the catalog does
+    // not apply to it.
+    if condition == CONDITION_EQ
+        && filter.name == "TYPE"
+        && !NAMESPACE_TYPE_VALUES.contains(&value)
+    {
+        return Err(format!(
+            "Filters.Values {value} isn't a valid namespace type. Valid values are {}.",
+            NAMESPACE_TYPE_VALUES.join(", ")
+        ));
+    }
+    if filter.name == FILTER_RESOURCE_OWNER && !RESOURCE_OWNERS.contains(&value) {
+        return Err(format!(
+            "Filters.Values {value} isn't a valid resource owner. Valid values are {}.",
+            RESOURCE_OWNERS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `record` satisfies one validated filter.
+///
+/// `TYPE`, `NAME` and `HTTP_NAME` compare the namespace member
+/// `NamespaceFilter$Values` names for them — `Namespace.Type`, `Namespace.Name` and
+/// `Namespace.Properties.HttpProperties.HttpName` — for equality or by prefix.
+/// `RESOURCE_OWNER` selects by who created the namespace: every namespace this
+/// emulator holds was created through this account, so `SELF` matches all of them and
+/// `OTHER_ACCOUNTS` (a namespace shared from another account) matches none.
+fn matches_filter(record: &crate::state::NamespaceRecord, filter: &NamespaceFilter) -> bool {
+    let condition = filter.condition.as_deref().unwrap_or(CONDITION_EQ);
+    filter.values.iter().any(|value| {
+        if filter.name == FILTER_RESOURCE_OWNER {
+            return value == "SELF";
+        }
+        let member = match filter.name.as_str() {
+            "TYPE" => Some(record.namespace_type.as_str()),
+            "NAME" => Some(record.name.as_str()),
+            // A namespace with no `HttpName` matches no `HTTP_NAME` filter.
+            "HTTP_NAME" => record.http_name.as_deref(),
+            _ => None,
+        };
+        member.is_some_and(|member| {
+            if condition == CONDITION_BEGINS_WITH {
+                member.starts_with(value.as_str())
+            } else {
+                member == value.as_str()
+            }
+        })
+    })
+}
+
 /// The `ListNamespaces` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +287,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNamespaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNamespacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNamespaces"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(invalid_input(
+                crate::state::UNREACHABLE_STATE_MESSAGE.to_string(),
+            ));
+        };
+
+        for filter in input.filters.iter().flatten() {
+            if let Err(message) = filter_rejection(filter) {
+                return Err(invalid_input(message));
+            }
+        }
+
+        // A `NextToken` is opaque, so the only tokens this listing can resume from are
+        // the ones it issued; anything else is a bad request rather than an empty page.
+        // The modelled length is 0..4096, so the empty token is legal and means "start
+        // at the beginning".
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => {
+                match crate::state::decode_next_token(NEXT_TOKEN_SCOPE, token) {
+                    Some(key) => Some(key),
+                    None => {
+                        // The rejected token is NOT echoed: it is the caller's own
+                        // opaque bytes (up to the modelled 4096 characters), so
+                        // repeating it tells the caller nothing and makes the error
+                        // envelope's size caller-controlled.
+                        return Err(invalid_input(
+                            "The NextToken isn't a token ListNamespaces issued.".to_string(),
+                        ))
+                    }
+                }
+            }
+        };
+
+        let state = state.lock();
+        // The namespace id is this listing's stable order: a token names the first id
+        // NOT returned, so a resumed call continues at the first id at or after it even
+        // if that namespace was deleted between the two calls.
+        let mut ordered: Vec<(&String, &crate::state::NamespaceRecord)> =
+            state.namespaces.iter().collect();
+        ordered.sort_by_key(|(id, _)| *id);
+
+        let (records, next_token) = crate::state::page(
+            ordered,
+            resume_at.as_deref(),
+            crate::state::page_size(input.max_results),
+            NEXT_TOKEN_SCOPE,
+        );
+
+        // The page is taken first and filtered afterwards, as `MaxResults` documents:
+        // "Cloud Map gets MaxResults namespaces and then filters them based on the
+        // specified criteria", so a page can come back empty while `NextToken` still
+        // points at namespaces that may match.
+        let namespaces = records
+            .iter()
+            .filter(|record| {
+                input
+                    .filters
+                    .iter()
+                    .flatten()
+                    .all(|filter| matches_filter(record, filter))
+            })
+            .map(|record| {
+                crate::state::namespace_summary_view(record, state.service_count(&record.id))
+            })
+            .collect();
+
+        Ok(ListNamespacesOutput {
+            namespaces: Some(namespaces),
+            next_token,
+        })
     }
 }

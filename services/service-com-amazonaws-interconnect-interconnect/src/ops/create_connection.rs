@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -92,9 +83,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // here — hence the `CreateConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.interconnect#CreateConnection")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.interconnect#CreateConnection",
+    extra_errors = [
+        "ResourceNotFoundException",
+        "InterconnectValidationException",
+        "InterconnectClientException",
+        "ServiceQuotaExceededException",
+        "InterconnectServerException",
+    ]
+)]
 #[derive(Debug)]
 pub enum CreateConnectionErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectValidationException(InterconnectValidationException),
+    InterconnectClientException(InterconnectClientException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
+    InterconnectServerException(InterconnectServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,18 +153,221 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateConnectionErrorModeled::InterconnectServerException(
+                InterconnectServerException {
+                    message: "the Interconnect connection store is not mounted on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        // Every ARN this call mints carries the region the request was signed for.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+
+        let mut store = state.lock();
+        store.materialise_due_transitions(now);
+
+        // @idempotencyToken: a retry carrying a client token that already created a
+        // connection replays THAT connection instead of allocating a second one —
+        // but only when it is the SAME request. A token reused with different
+        // parameters names a different connection than the one it created, so it is
+        // refused, naming the token, rather than answered with an unrelated record.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(created) = store.idempotency_tokens.get(token) {
+                if !created.matches(
+                    &input.environment_id,
+                    &input.bandwidth,
+                    &input.attach_point,
+                    input.description.as_ref(),
+                    input.tags.as_ref(),
+                ) {
+                    return Err(CreateConnectionErrorModeled::InterconnectValidationException(
+                        InterconnectValidationException {
+                            message: format!(
+                                "clientToken '{token}' was already used to create connection '{}' with different parameters",
+                                created.connection_id
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                let replay = store
+                    .connections
+                    .get(&created.connection_id)
+                    .map(|stored| stored.connection.clone());
+                if let Some(connection) = replay {
+                    return Ok(CreateConnectionOutput {
+                        connection: Some(connection),
+                    });
+                }
+            }
+        }
+
+        // The Environment dictates the partner, the location and the product type,
+        // none of which the request carries. An unknown environment has nothing to
+        // create a connection across.
+        let Some(environment) = store.environments.get(&input.environment_id).cloned() else {
+            return Err(CreateConnectionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no environment with id '{}'",
+                        input.environment_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `EnvironmentState`: only an environment that is not `unavailable` can take
+        // new connections ("available: the environment is available and new
+        // Connection objects can be requested" / "unavailable: the environment is
+        // currently unavailable").
+        if environment.state == "unavailable" {
+            return Err(CreateConnectionErrorModeled::InterconnectClientException(
+                InterconnectClientException {
+                    message: format!(
+                        "environment '{}' is {} and cannot take new connections",
+                        environment.environment_id, environment.state
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `Environment$bandwidths.available` is "the list of currently available
+        // bandwidths": a bandwidth outside it cannot be allocated, even when the
+        // environment `supported`s it (which is exactly what `limited` means).
+        let available = environment.bandwidths.available.clone().unwrap_or_default();
+        if !available.contains(&input.bandwidth) {
+            return Err(CreateConnectionErrorModeled::InterconnectValidationException(
+                InterconnectValidationException {
+                    message: format!(
+                        "bandwidth '{}' is not available on environment '{}'; available bandwidths are [{}]",
+                        input.bandwidth,
+                        environment.environment_id,
+                        available.join(", ")
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The account's connection quota, which counts the connections the account
+        // HOLDS: a quota is about live resources, so a record already in the
+        // terminal `deleted` state does not consume it, even though the store keeps
+        // it readable until its retention elapses. Checked BEFORE anything is
+        // stored, so an accepted call is the only thing that can grow the store.
+        let live_connections = store
+            .connections
+            .values()
+            .filter(|stored| stored.connection.state != "deleted")
+            .count();
+        if live_connections >= crate::state::MAX_CONNECTIONS {
+            return Err(CreateConnectionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the account already holds the maximum of {} connections",
+                        crate::state::MAX_CONNECTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Server-owned identity. The prefix comes from the environment's provider
+        // kind and the suffix is random, so a candidate that is already taken is
+        // re-rolled — a bounded number of times, so the loop cannot spin.
+        let prefix = crate::state::connection_id_prefix(&environment.provider);
+        let id = (0..crate::state::ID_ALLOCATION_ATTEMPTS)
+            .map(|_| crate::state::new_connection_id(prefix))
+            .find(|candidate| !store.connections.contains_key(candidate));
+        let Some(id) = id else {
+            return Err(CreateConnectionErrorModeled::InterconnectServerException(
+                InterconnectServerException {
+                    message: "could not allocate a free connection identifier".to_string(),
+                },
+            )
+            .into());
+        };
+        let activation_key = crate::state::new_activation_key();
+
+        let connection = Connection {
+            id: id.clone(),
+            arn: ::emulator_server::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("connection/{id}"),
+            ),
+            // `Connection$description` is required while the input's is optional, so
+            // the server supplies one when the caller does not: the connection's own
+            // id, which satisfies the member's `^[-a-zA-Z0-9_ ]+$` pattern.
+            description: input.description.clone().unwrap_or_else(|| id.clone()),
+            bandwidth: input.bandwidth.clone(),
+            attach_point: input.attach_point.clone(),
+            environment_id: environment.environment_id.clone(),
+            // Copied from the Environment, which is where these three live; the
+            // request has no such members.
+            provider: environment.provider.clone(),
+            location: environment.location.clone(),
+            r#type: environment.r#type.clone(),
+            // "requested: the initial state of a connection. The state will remain
+            // here until the Connection is accepted on the Partner portal" — so no
+            // transition is owed: the move out of `requested` is the partner's, not
+            // the clock's.
+            state: "requested".to_string(),
+            shared_id: crate::state::new_shared_id(),
+            // `billingTier` is OPTIONAL and the rule AWS assigns it by is not
+            // published anywhere — not in the model, which gives only the
+            // `@range(min: 0, max: 8)` ordinal, and not in the service's docs. A
+            // tier invented here would be plausible and wrong for every real
+            // input, so the member is left unset rather than synthesised; the day
+            // the rule is known it is computed from the bandwidth here.
+            billing_tier: None,
+            owner_account: ::emulator_server::emulator_account_id().to_string(),
+            activation_key: activation_key.clone(),
+            tags: input.tags.clone(),
+        };
+
+        // Keep the record count bounded as well as the live-connection count: at
+        // the store's cap the oldest terminal record leaves to make room, taking its
+        // index entries with it. The connection is stored FIRST and the two indexes
+        // after it, so every index entry names a connection that is in the store —
+        // which is what bounds those indexes by the record cap rather than by how
+        // many `clientToken`s a caller invents.
+        store.make_room_for_one();
+        store.connections.insert(
+            id.clone(),
+            crate::state::StoredConnection {
+                connection: connection.clone(),
+                remote_account: input.remote_account.clone(),
+                pending_transition: None,
+                evict_due: None,
+            },
+        );
+        store
+            .activation_keys
+            .insert(activation_key, id.clone());
+        if let Some(token) = input.client_token.clone() {
+            store.idempotency_tokens.insert(
+                token,
+                crate::state::IdempotentCreate {
+                    connection_id: id,
+                    environment_id: input.environment_id.clone(),
+                    bandwidth: input.bandwidth.clone(),
+                    attach_point: input.attach_point.clone(),
+                    description: input.description.clone(),
+                    tags: input.tags.clone(),
+                },
+            );
+        }
+        // Both indexes hold only entries that name a stored connection, so they are
+        // bounded by the same cap the record store is.
+        store.drop_dangling_index_entries();
+
+        Ok(CreateConnectionOutput {
+            connection: Some(connection),
+        })
     }
 }

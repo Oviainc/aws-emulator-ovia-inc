@@ -3,11 +3,12 @@
 //! Engine state for the com-amazonaws-ecs-amazonec2containerservicev20141113 service.
 //!
 //! The ECS task lifecycle, held in one place: clusters, container instances,
-//! task-definition revisions and tasks. Every handler computes its response from what is
-//! stored here — the cluster counters (`runningTasksCount`, `pendingTasksCount`,
-//! `registeredContainerInstancesCount`) are DERIVED from the task and container-instance
-//! maps rather than being bumped by whoever happened to call, so they cannot drift from
-//! the records that actually exist.
+//! task-definition revisions, services and tasks. Every handler computes its response
+//! from what is stored here — the cluster counters (`runningTasksCount`,
+//! `pendingTasksCount`, `registeredContainerInstancesCount`, `activeServicesCount`) and
+//! a service's own (`runningCount`, `pendingCount`) are DERIVED from the task,
+//! container-instance and service maps rather than being bumped by whoever happened to
+//! call, so they cannot drift from the records that actually exist.
 //!
 //! Resource ids are minted from monotonic counters held here, so every ARN this
 //! service emits is both unique and recorded against the record it names.
@@ -23,6 +24,14 @@
 //! `DEACTIVATING` with `stoppingAt` set (the `Task$stoppingAt` doc: "the time when the
 //! task transitions from the `RUNNING` state to `STOPPING`") and reaches `STOPPED`
 //! [`TRANSITION_SPAN`] later. Nothing sleeps: the due instant is stored and compared.
+//!
+//! A service's task set is placed by the CALL that changes what the service wants
+//! ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::scale_service`], driven by
+//! `CreateService` and `UpdateService`), and each task it places then crosses `PENDING`
+//! -> `RUNNING` on the same clock. The scheduler's steady-state work beyond that —
+//! replacing a task somebody else stopped, re-placing a daemon's task when a container
+//! instance registers later — is not modelled: nothing runs between calls, and a
+//! reporting operation may not place a task nobody asked for.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -31,9 +40,12 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     Attribute, CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterSetting,
-    Container, ContainerDefinition, ContainerInstance, EphemeralStorage, Failure, KeyValuePair,
-    PlatformDevice, ProxyConfiguration, Resource, RuntimePlatform, Tag, Task, TaskDefinition,
-    TaskDefinitionPlacementConstraint, TaskOverride, VersionInfo, Volume,
+    Container, ContainerDefinition, ContainerInstance, Deployment, DeploymentConfiguration,
+    DeploymentController, EphemeralStorage, Failure, KeyValuePair, LoadBalancer,
+    NetworkConfiguration, PlacementConstraint, PlacementStrategy, PlatformDevice,
+    ProxyConfiguration, Resource, RuntimePlatform, Service, ServiceConnectConfiguration,
+    ServiceRegistry, ServiceVolumeConfiguration, Tag, Task, TaskDefinition,
+    TaskDefinitionPlacementConstraint, TaskOverride, VersionInfo, Volume, VpcLatticeConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
@@ -156,6 +168,90 @@ pub const STOP_CODE_USER_INITIATED: &str = "UserInitiated";
 /// the health status as UNKNOWN." Nothing executes a container here, so no container
 /// ever reports a health result and the status stays `UNKNOWN`.
 pub const HEALTH_UNKNOWN: &str = "UNKNOWN";
+
+/// `Service$status` for a live service — the member's doc: "The valid values are
+/// `ACTIVE`, `DRAINING`, or `INACTIVE`."
+pub const SERVICE_ACTIVE: &str = "ACTIVE";
+/// See [`SERVICE_ACTIVE`]: the status of a service that is being drained away.
+pub const SERVICE_DRAINING: &str = "DRAINING";
+/// See [`SERVICE_ACTIVE`]: the status of a service that has been deleted.
+pub const SERVICE_INACTIVE: &str = "INACTIVE";
+
+/// `Deployment$status` for the service's current deployment — the member's doc:
+/// "`PRIMARY`: The most recent deployment of a service."
+pub const DEPLOYMENT_PRIMARY: &str = "PRIMARY";
+
+/// `Deployment$rolloutState` while the deployment is still placing tasks — the member's
+/// doc: "When a service deployment is started, it begins in an `IN_PROGRESS` state."
+pub const ROLLOUT_IN_PROGRESS: &str = "IN_PROGRESS";
+/// `Deployment$rolloutState` once the service holds the tasks it wants — the same doc:
+/// "When the service reaches a steady state, the deployment transitions to a
+/// `COMPLETED` state."
+pub const ROLLOUT_COMPLETED: &str = "COMPLETED";
+
+/// The scheduling strategy a service takes when the request names none. The
+/// `CreateService$desiredCount` doc — "This is required if schedulingStrategy is
+/// `REPLICA` or isn't specified" — makes `REPLICA` the unspecified case.
+pub const SCHEDULING_REPLICA: &str = "REPLICA";
+/// See [`SCHEDULING_REPLICA`]: "The daemon scheduling strategy deploys exactly one task
+/// on each active container instance".
+pub const SCHEDULING_DAEMON: &str = "DAEMON";
+
+/// The deployment controller a service takes when the request names none. The
+/// `CreateService$deploymentController` doc: "If no deployment controller is specified,
+/// the default value of ECS is used."
+pub const DEPLOYMENT_CONTROLLER_ECS: &str = "ECS";
+
+/// `propagateTags` when the request names none. The member's doc: "If no value is
+/// specified, the tags aren't propagated. ... The default is NONE."
+pub const PROPAGATE_TAGS_NONE: &str = "NONE";
+/// See [`PROPAGATE_TAGS_NONE`]: propagate the SERVICE's tags to its tasks.
+pub const PROPAGATE_TAGS_SERVICE: &str = "SERVICE";
+/// See [`PROPAGATE_TAGS_NONE`]: propagate the task DEFINITION's tags to the task.
+pub const PROPAGATE_TAGS_TASK_DEFINITION: &str = "TASK_DEFINITION";
+
+/// `availabilityZoneRebalancing` a CREATE takes when the request names none — the
+/// member's doc: "For create service requests, when no value is specified for
+/// AvailabilityZoneRebalancing, Amazon ECS defaults the value to ENABLED."
+pub const AZ_REBALANCING_ENABLED: &str = "ENABLED";
+
+/// `maximumPercent` of a `REPLICA` service's deployment configuration when the request
+/// supplies none. The member's doc: "The default maximumPercent value for a service
+/// using the REPLICA service scheduler is 200%."
+pub const REPLICA_MAXIMUM_PERCENT: i32 = 200;
+/// `minimumHealthyPercent` of a `REPLICA` service's deployment configuration when the
+/// request supplies none. The member's doc: "The default value for a replica service
+/// for minimumHealthyPercent is 100%."
+pub const REPLICA_MINIMUM_HEALTHY_PERCENT: i32 = 100;
+/// `maximumPercent` of a `DAEMON` service: a daemon runs exactly one task per container
+/// instance, so a deployment cannot exceed the desired count.
+pub const DAEMON_MAXIMUM_PERCENT: i32 = 100;
+/// `minimumHealthyPercent` of a `DAEMON` service's deployment configuration when the
+/// request supplies none. The member's doc: "The default minimumHealthyPercent value
+/// for a service using the DAEMON service schedule is 0% for the CLI, the Amazon Web
+/// Services SDKs, and the APIs".
+pub const DAEMON_MINIMUM_HEALTHY_PERCENT: i32 = 0;
+
+/// `stopCode` for a task the service scheduler stopped (scaling in, or replacing the
+/// task set of a superseded deployment), from the `TaskStopCode` enum.
+pub const STOP_CODE_SERVICE_SCHEDULER: &str = "ServiceSchedulerInitiated";
+
+/// `resourceManagementType` of a service a client created through `CreateService`. The
+/// member's doc: "Identifies whether an ECS Service is an Express Service managed by
+/// ECS, or managed by the customer. The valid values are ECS and CUSTOMER."
+pub const RESOURCE_MANAGEMENT_CUSTOMER: &str = "CUSTOMER";
+
+/// How many services this emulator holds, across every cluster. EMULATOR-CHOSEN, for
+/// the same reason as [`MAX_CLUSTERS`].
+pub const MAX_SERVICES: usize = 64;
+
+/// The longest a `clientToken` may be: "Up to 36 ASCII characters in the range of
+/// 33-126 (inclusive) are allowed" — the `CreateService$clientToken` doc.
+pub const MAX_CLIENT_TOKEN_LENGTH: usize = 36;
+
+/// How many services one `DescribeServices` request may name. The member's doc: "You
+/// may specify up to 10 services to describe in a single operation."
+pub const MAX_DESCRIBE_SERVICES: usize = 10;
 
 /// A cluster, as `CreateCluster` left it.
 #[derive(Debug, Clone)]
@@ -452,6 +548,10 @@ pub struct TaskRecord {
     pub platform_version: Option<String>,
     pub started_by: Option<String>,
     pub group: String,
+    /// The service whose scheduler placed this task, if any. `None` for a standalone
+    /// `RunTask`/`StartTask` task, so a service's counts are read off the tasks its own
+    /// scheduler placed rather than off whatever shares its `group`.
+    pub service_name: Option<String>,
     pub tags: Vec<Tag>,
     pub enable_execute_command: bool,
     pub created_at: DateTime,
@@ -516,6 +616,123 @@ impl TaskRecord {
     }
 }
 
+/// An ECS service, as `CreateService` created it and `UpdateService` left it.
+///
+/// The record holds the service's CONFIGURATION only. Everything a response counts —
+/// `runningCount`, `pendingCount`, the deployment's `rolloutState` — is derived from the
+/// tasks its scheduler actually placed (see
+/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::service_view`]), so a
+/// reported count can never drift from the task records that exist.
+#[derive(Debug, Clone)]
+pub struct ServiceRecord {
+    pub arn: String,
+    pub name: String,
+    pub cluster_name: String,
+    pub cluster_arn: String,
+    pub status: String,
+    /// `Service$desiredCount`: "The desired number of instantiations of the task
+    /// definition to keep running on the service."
+    pub desired_count: i32,
+    pub task_definition_arn: Option<String>,
+    /// The family and revision the ARN above names, kept so the scheduler can read the
+    /// revision back when it places a task.
+    pub task_definition: Option<(String, i32)>,
+    pub launch_type: Option<String>,
+    pub capacity_provider_strategy: Vec<CapacityProviderStrategyItem>,
+    pub platform_version: Option<String>,
+    pub role_arn: Option<String>,
+    pub load_balancers: Vec<LoadBalancer>,
+    pub service_registries: Vec<ServiceRegistry>,
+    pub deployment_configuration: DeploymentConfiguration,
+    pub deployment_controller: DeploymentController,
+    pub placement_constraints: Vec<PlacementConstraint>,
+    pub placement_strategy: Vec<PlacementStrategy>,
+    pub network_configuration: Option<NetworkConfiguration>,
+    pub service_connect_configuration: Option<ServiceConnectConfiguration>,
+    pub volume_configurations: Vec<ServiceVolumeConfiguration>,
+    pub vpc_lattice_configurations: Vec<VpcLatticeConfiguration>,
+    pub health_check_grace_period_seconds: Option<i32>,
+    pub scheduling_strategy: String,
+    pub propagate_tags: String,
+    pub enable_ecs_managed_tags: bool,
+    pub enable_execute_command: bool,
+    pub availability_zone_rebalancing: String,
+    pub tags: Vec<Tag>,
+    /// The `clientToken` the create carried, so repeating that create is idempotent
+    /// ("An identifier that you provide to ensure the idempotency of the request").
+    pub client_token: Option<String>,
+    pub created_at: DateTime,
+    /// The id of the service's current (`PRIMARY`) deployment. Every task the scheduler
+    /// places for it carries this id as its `startedBy`, which is how a superseded
+    /// deployment's tasks are told apart from the current one's.
+    pub deployment_id: String,
+    pub deployment_created_at: DateTime,
+    pub deployment_updated_at: DateTime,
+}
+
+impl ServiceRecord {
+    /// The deployment controller the service uses, defaulting to `ECS`.
+    pub fn controller(&self) -> &str {
+        self.deployment_controller.r#type.as_str()
+    }
+
+    /// Whether the ECS service scheduler places this service's tasks itself.
+    ///
+    /// Only the `ECS` deployment controller does: the `Service$taskSets` doc describes
+    /// the other two as holding "a set of Amazon ECS tasks in either an CodeDeploy or an
+    /// `EXTERNAL` deployment", whose tasks come from `CreateTaskSet` rather than from
+    /// the service.
+    pub fn places_tasks(&self) -> bool {
+        self.controller() == DEPLOYMENT_CONTROLLER_ECS
+    }
+
+    /// Whether this service counts towards the cluster's `activeServicesCount`.
+    pub fn is_active(&self) -> bool {
+        self.status == SERVICE_ACTIVE
+    }
+}
+
+/// Which optional service fields a response carries, as `DescribeServices$include`
+/// (the `ServiceField` enum: `TAGS`) selects them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServiceFields {
+    pub tags: bool,
+}
+
+impl ServiceFields {
+    /// Every optional field — what the operation that CREATED or MUTATED the service
+    /// returns, since the caller just supplied them and `CreateService`/`UpdateService`
+    /// have no `include` member to narrow them with.
+    pub fn all() -> Self {
+        Self { tags: true }
+    }
+
+    /// The fields the `include` list of a describe request asks for. Unknown entries
+    /// cannot reach here: `include` targets the closed `ServiceField` enum.
+    pub fn from_include(include: Option<&Vec<String>>) -> Self {
+        let mut fields = Self::default();
+        for field in include.into_iter().flatten() {
+            if field == "TAGS" {
+                fields.tags = true;
+            }
+        }
+        fields
+    }
+}
+
+/// What [`ComAmazonawsEcsAmazonec2containerservicev20141113State::scale_service`]
+/// answers when the placement it was asked for would push this emulator past
+/// [`MAX_TASKS`]: nothing was changed, so the caller refuses the whole request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskCapacityExceeded;
+
+/// What one pass over the task map counts for ONE service.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServiceTally {
+    pub running: i32,
+    pub pending: i32,
+}
+
 /// Per-service state for com-amazonaws-ecs-amazonec2containerservicev20141113. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -532,6 +749,10 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     pub tasks: HashMap<String, TaskRecord>,
     /// `containerInstanceArn` -> the registered container instance.
     pub container_instances: HashMap<String, ContainerInstanceRecord>,
+    /// `(clusterName, serviceName)` -> the service. Service names are unique within a
+    /// cluster ("Service names must be unique within a cluster, but you can have
+    /// similarly named services in multiple clusters"), which is exactly this key.
+    pub services: HashMap<(String, String), ServiceRecord>,
     /// Monotonic source of task ids, so every task ARN is distinct.
     next_task_seq: u64,
     /// Monotonic source of container ids, so every container ARN is distinct.
@@ -539,6 +760,9 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Monotonic source of container-instance ids, so every container-instance ARN and
     /// every minted instance id is distinct.
     next_container_instance_seq: u64,
+    /// Monotonic source of service-deployment ids, so every deployment of every service
+    /// is distinct.
+    next_deployment_seq: u64,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -605,6 +829,50 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         format!("mi-{:017x}", self.next_container_instance_seq)
     }
 
+    /// Mint the id of a service's next deployment. `Deployment$id` is an `ecs-svc/`
+    /// identifier; the counter is what makes every deployment of every service distinct.
+    pub fn next_deployment_id(&mut self) -> String {
+        self.next_deployment_seq += 1;
+        format!("ecs-svc/{:019}", self.next_deployment_seq)
+    }
+
+    /// Mint the container records of ONE task of `definition`, each with its own ARN and
+    /// id. Shared by every path that places a task — `RunTask` and the service
+    /// scheduler — so a task's containers are derived from the stored revision the same
+    /// way whoever placed it.
+    pub fn mint_containers(
+        &mut self,
+        region: &str,
+        cluster_name: &str,
+        task_id: &str,
+        task_arn: &str,
+        definition: &TaskDefinitionRecord,
+        last_status: &str,
+    ) -> Vec<ContainerRecord> {
+        definition
+            .container_definitions
+            .iter()
+            .map(|container| {
+                let container_id = self.next_container_id();
+                ContainerRecord {
+                    container_arn: container_arn(region, cluster_name, task_id, &container_id),
+                    task_arn: task_arn.to_string(),
+                    name: container.name.clone(),
+                    image: container.image.clone(),
+                    last_status: last_status.to_string(),
+                    // `Container$cpu`: "The value is 0 if no value was specified in the
+                    // container definition" — which is what the modelled non-optional
+                    // `cpu` already holds.
+                    cpu: Some(container.cpu.to_string()),
+                    memory: container.memory.map(|memory| memory.to_string()),
+                    memory_reservation: container
+                        .memory_reservation
+                        .map(|memory| memory.to_string()),
+                }
+            })
+            .collect()
+    }
+
     /// How many container instances `cluster_name` holds in a registered status.
     pub fn registered_container_instances(&self, cluster_name: &str) -> usize {
         self.container_instances
@@ -621,8 +889,346 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .max_by_key(|record| record.revision)
     }
 
-    /// Count every number a described cluster reports in ONE pass over the task map,
-    /// so describing a cluster costs one scan rather than one scan per reported number.
+    /// What the task map counts for ONE service: the tasks its scheduler placed and
+    /// still wants, split by lifecycle status. `Service$runningCount` is "the number of
+    /// tasks in the cluster that are in the RUNNING state" and `pendingCount` the same
+    /// for `PENDING`; a task that has been asked to stop is no longer one of them.
+    pub fn service_tally(&self, cluster_name: &str, service_name: &str) -> ServiceTally {
+        let mut tally = ServiceTally::default();
+        for task in self.tasks.values().filter(|task| {
+            task.cluster_name == cluster_name
+                && task.service_name.as_deref() == Some(service_name)
+                && task.desired_status == STATUS_RUNNING
+        }) {
+            if task.last_status == STATUS_RUNNING {
+                tally.running += 1;
+            } else if task.last_status == STATUS_PENDING {
+                tally.pending += 1;
+            }
+        }
+        tally
+    }
+
+    /// The `Service` every service-returning operation reports, built from what is
+    /// stored.
+    ///
+    /// `runningCount` and `pendingCount` are COUNTED off the task map, so they always
+    /// agree with the tasks the scheduler actually placed, and the deployment's
+    /// `rolloutState` follows from them rather than being asserted.
+    ///
+    /// The `CreateService$service` doc decides which deployment members are reported:
+    /// "If a service is using the ECS deployment controller, the deploymentController
+    /// and taskSets parameters will not be returned. if the service uses the CODE_DEPLOY
+    /// deployment controller, the deploymentController, taskSets and deployments
+    /// parameters will be returned, however the deployments parameter will be an empty
+    /// list."
+    pub fn service_view(&self, service: &ServiceRecord, fields: ServiceFields) -> Service {
+        let tally = self.service_tally(&service.cluster_name, &service.name);
+        let scheduler_owned = service.places_tasks();
+        // "A service will return either a capacityProviderStrategy or launchType
+        // parameter, but not both, depending where one was specified when it was
+        // created."
+        let (launch_type, capacity_provider_strategy) = match &service.launch_type {
+            Some(launch_type) => (Some(launch_type.clone()), None),
+            None => (None, Some(service.capacity_provider_strategy.clone())),
+        };
+        let deployment = Deployment {
+            id: Some(service.deployment_id.clone()),
+            status: Some(DEPLOYMENT_PRIMARY.to_string()),
+            task_definition: service.task_definition_arn.clone(),
+            desired_count: service.desired_count,
+            pending_count: tally.pending,
+            running_count: tally.running,
+            // Nothing executes a container here, so no task of a deployment ever fails
+            // to start: the count is a true zero rather than an invented number.
+            failed_tasks: 0,
+            created_at: Some(service.deployment_created_at),
+            updated_at: Some(service.deployment_updated_at),
+            capacity_provider_strategy: capacity_provider_strategy.clone(),
+            launch_type: launch_type.clone(),
+            platform_version: service.platform_version.clone(),
+            platform_family: None,
+            network_configuration: service.network_configuration.clone(),
+            rollout_state: Some(
+                if tally.running >= service.desired_count {
+                    ROLLOUT_COMPLETED
+                } else {
+                    ROLLOUT_IN_PROGRESS
+                }
+                .to_string(),
+            ),
+            rollout_state_reason: Some(if tally.running >= service.desired_count {
+                format!("ECS deployment {} completed.", service.deployment_id)
+            } else {
+                format!("ECS deployment {} in progress.", service.deployment_id)
+            }),
+            service_connect_configuration: service.service_connect_configuration.clone(),
+            // A Service Connect resource is registered in Cloud Map, which this
+            // emulator does not provision, so a deployment has none.
+            service_connect_resources: Some(Vec::new()),
+            volume_configurations: Some(service.volume_configurations.clone()),
+            fargate_ephemeral_storage: None,
+            vpc_lattice_configurations: Some(service.vpc_lattice_configurations.clone()),
+        };
+        Service {
+            service_arn: Some(service.arn.clone()),
+            service_name: Some(service.name.clone()),
+            cluster_arn: Some(service.cluster_arn.clone()),
+            load_balancers: Some(service.load_balancers.clone()),
+            service_registries: Some(service.service_registries.clone()),
+            status: Some(service.status.clone()),
+            desired_count: service.desired_count,
+            running_count: tally.running,
+            pending_count: tally.pending,
+            launch_type,
+            capacity_provider_strategy,
+            platform_version: service.platform_version.clone(),
+            // `platformFamily` is "the operating system that your tasks in the service
+            // run on ... specified only for tasks using the Fargate launch type", which
+            // nothing here resolves, so it stays absent.
+            platform_family: None,
+            task_definition: service.task_definition_arn.clone(),
+            deployment_configuration: Some(service.deployment_configuration.clone()),
+            task_sets: if scheduler_owned {
+                None
+            } else {
+                Some(Vec::new())
+            },
+            deployments: Some(if scheduler_owned {
+                vec![deployment]
+            } else {
+                Vec::new()
+            }),
+            role_arn: service.role_arn.clone(),
+            // "The event stream for your service": the scheduler's own narrative, which
+            // this emulator writes none of, so there is no event to report.
+            events: Some(Vec::new()),
+            created_at: Some(service.created_at),
+            // A service deployment resource (`ListServiceDeployments`) is not part of
+            // this slice, so there is no deployment ARN or service revision to name.
+            current_service_deployment: None,
+            current_service_revisions: None,
+            placement_constraints: Some(service.placement_constraints.clone()),
+            placement_strategy: Some(service.placement_strategy.clone()),
+            network_configuration: service.network_configuration.clone(),
+            health_check_grace_period_seconds: service.health_check_grace_period_seconds,
+            scheduling_strategy: Some(service.scheduling_strategy.clone()),
+            deployment_controller: if scheduler_owned {
+                None
+            } else {
+                Some(service.deployment_controller.clone())
+            },
+            tags: if fields.tags {
+                Some(service.tags.clone())
+            } else {
+                None
+            },
+            // "The principal that created the service": the request's own principal,
+            // which this emulator does not resolve, so it stays absent.
+            created_by: None,
+            enable_ecs_managed_tags: service.enable_ecs_managed_tags,
+            propagate_tags: Some(service.propagate_tags.clone()),
+            enable_execute_command: service.enable_execute_command,
+            availability_zone_rebalancing: Some(service.availability_zone_rebalancing.clone()),
+            resource_management_type: Some(RESOURCE_MANAGEMENT_CUSTOMER.to_string()),
+        }
+    }
+
+    /// Whether `cluster_name` still holds a service that has not gone `INACTIVE`.
+    /// `DeleteCluster`'s `ClusterContainsServicesException`: "You can't delete a cluster
+    /// that contains services."
+    pub fn cluster_has_active_services(&self, cluster_name: &str) -> bool {
+        self.services
+            .values()
+            .any(|service| service.cluster_name == cluster_name && service.status != SERVICE_INACTIVE)
+    }
+
+    /// Place or stop tasks so the service holds exactly the `desiredCount` tasks it
+    /// wants, from `definition`.
+    ///
+    /// This is the ECS service scheduler's job — the `CreateService` doc: "Runs and
+    /// maintains your desired number of tasks from a specified task definition" — and it
+    /// runs on the call that CHANGES what the service wants, never on a read. A task of
+    /// a superseded deployment is no longer wanted, so a new deployment replaces the
+    /// task set it inherited.
+    ///
+    /// `Err` means the placement would push this emulator past [`MAX_TASKS`]; nothing is
+    /// changed in that case.
+    pub fn scale_service(
+        &mut self,
+        key: &(String, String),
+        definition: &TaskDefinitionRecord,
+        region: &str,
+        now: SystemTime,
+    ) -> Result<(), TaskCapacityExceeded> {
+        let Some(service) = self.services.get(key).cloned() else {
+            return Ok(());
+        };
+        if !service.places_tasks() {
+            return Ok(());
+        }
+
+        // Task ids are minted from a fixed-width monotonic counter and the ARN ends with
+        // the id, so sorting the ARNs orders the task set oldest first.
+        let mut wanted: Vec<String> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.cluster_name == service.cluster_name
+                    && task.service_name.as_deref() == Some(service.name.as_str())
+                    && task.desired_status == STATUS_RUNNING
+                    && task.is_active()
+            })
+            .map(|task| task.task_arn.clone())
+            .collect();
+        wanted.sort();
+
+        let (superseded, live): (Vec<String>, Vec<String>) = wanted.into_iter().partition(|arn| {
+            self.tasks
+                .get(arn)
+                .and_then(|task| task.started_by.clone())
+                .as_deref()
+                != Some(service.deployment_id.as_str())
+        });
+        let desired = usize::try_from(service.desired_count).unwrap_or(0);
+        let to_place = desired.saturating_sub(live.len());
+        // Nothing is changed when the placement would not fit: the cap is checked before
+        // the first task is touched.
+        if self.tasks.len() + to_place > MAX_TASKS {
+            return Err(TaskCapacityExceeded);
+        }
+        for arn in &superseded {
+            self.stop_service_task(
+                arn,
+                now,
+                &format!("Task stopped by deployment {}", service.deployment_id),
+            );
+        }
+        if live.len() > desired {
+            // Scaling in stops the newest tasks of the deployment first: nothing here
+            // runs on a container instance or in an Availability Zone, so there is no
+            // placement balance to break the tie, and newest-first is deterministic.
+            for arn in live[desired..].iter().rev() {
+                self.stop_service_task(
+                    arn,
+                    now,
+                    &format!(
+                        "Scaling activity initiated by deployment {}",
+                        service.deployment_id
+                    ),
+                );
+            }
+            return Ok(());
+        }
+
+        for _ in 0..to_place {
+            self.place_service_task(&service, definition, region, now);
+        }
+        Ok(())
+    }
+
+    /// Place ONE task of `service`, `PENDING` with its start owed by the clock
+    /// [`TRANSITION_SPAN`] from now, exactly as `RunTask` leaves a task it placed.
+    fn place_service_task(
+        &mut self,
+        service: &ServiceRecord,
+        definition: &TaskDefinitionRecord,
+        region: &str,
+        now: SystemTime,
+    ) {
+        let task_id = self.next_task_id();
+        let task_arn = task_arn(region, &service.cluster_name, &task_id);
+        let containers = self.mint_containers(
+            region,
+            &service.cluster_name,
+            &task_id,
+            &task_arn,
+            definition,
+            STATUS_PENDING,
+        );
+        // "Determines whether to propagate the tags from the task definition or the
+        // service to the task. If no value is specified, the tags aren't propagated."
+        let tags = match service.propagate_tags.as_str() {
+            PROPAGATE_TAGS_SERVICE => service.tags.clone(),
+            PROPAGATE_TAGS_TASK_DEFINITION => definition.tags.clone(),
+            _ => Vec::new(),
+        };
+        let (launch_type, capacity_provider_name) = match &service.launch_type {
+            Some(launch_type) => (Some(launch_type.clone()), None),
+            None => (
+                None,
+                service
+                    .capacity_provider_strategy
+                    .first()
+                    .map(|item| item.capacity_provider.clone()),
+            ),
+        };
+        let record = TaskRecord {
+            task_arn: task_arn.clone(),
+            task_id,
+            cluster_name: service.cluster_name.clone(),
+            cluster_arn: service.cluster_arn.clone(),
+            task_definition_arn: definition.arn.clone(),
+            family: definition.family.clone(),
+            last_status: STATUS_PENDING.to_string(),
+            desired_status: STATUS_RUNNING.to_string(),
+            containers,
+            cpu: definition.cpu.clone(),
+            memory: definition.memory.clone(),
+            overrides: None,
+            launch_type,
+            capacity_provider_name,
+            platform_version: service.platform_version.clone(),
+            // `Task$startedBy`: for a task the service scheduler placed, the id of the
+            // deployment that placed it.
+            started_by: Some(service.deployment_id.clone()),
+            // `Task$group`: "The name of the task group associated with the task", which
+            // for a service's task is `service:<service name>`.
+            group: format!("service:{}", service.name),
+            service_name: Some(service.name.clone()),
+            tags,
+            enable_execute_command: service.enable_execute_command,
+            created_at: DateTime::from(now),
+            started_at: None,
+            stopping_at: None,
+            stopped_at: None,
+            execution_stopped_at: None,
+            stopped_reason: None,
+            stop_code: None,
+            version: 1,
+            running_due_at: Some(now + TRANSITION_SPAN),
+            stopped_due_at: None,
+        };
+        self.tasks.insert(task_arn, record);
+    }
+
+    /// Ask one of a service's tasks to stop, with `STOPPED` owed by the clock
+    /// [`TRANSITION_SPAN`] from now — the same two-step stop `StopTask` records.
+    fn stop_service_task(&mut self, task_arn: &str, now: SystemTime, reason: &str) {
+        let Some(task) = self.tasks.get_mut(task_arn) else {
+            return;
+        };
+        if task.desired_status == STATUS_STOPPED {
+            return;
+        }
+        task.desired_status = STATUS_STOPPED.to_string();
+        task.last_status = STATUS_DEACTIVATING.to_string();
+        task.stopping_at = Some(DateTime::from(now));
+        task.stopped_reason = Some(reason.to_string());
+        task.stop_code = Some(STOP_CODE_SERVICE_SCHEDULER.to_string());
+        task.stopped_due_at = Some(now + TRANSITION_SPAN);
+        // A task asked to stop never reaches RUNNING: the start it was still waiting for
+        // is cancelled, not merely overtaken.
+        task.running_due_at = None;
+        task.version += 1;
+        for container in &mut task.containers {
+            container.last_status = STATUS_DEACTIVATING.to_string();
+        }
+    }
+
+    /// Count every number a described cluster reports in ONE pass over the task map and
+    /// one over the service map, so describing a cluster costs one scan each rather than
+    /// one scan per reported number.
     fn tally(&self, cluster_name: &str) -> TaskTally {
         let mut tally = TaskTally::default();
         for task in self
@@ -647,6 +1253,27 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
             }
         }
+        for service in self
+            .services
+            .values()
+            .filter(|service| service.cluster_name == cluster_name)
+        {
+            let launch_type = service.launch_type.as_deref();
+            if service.is_active() {
+                tally.active_services += 1;
+                match launch_type {
+                    Some("EC2") => tally.active_ec2_services += 1,
+                    Some("FARGATE") => tally.active_fargate_services += 1,
+                    _ => {}
+                }
+            } else if service.status == SERVICE_DRAINING {
+                match launch_type {
+                    Some("EC2") => tally.draining_ec2_services += 1,
+                    Some("FARGATE") => tally.draining_fargate_services += 1,
+                    _ => {}
+                }
+            }
+        }
         tally
     }
 
@@ -659,11 +1286,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
 
     /// The `Cluster` a cluster-returning operation reports.
     ///
-    /// The counters are COMPUTED from the task map, so they always agree with the tasks
-    /// that exist: `runningTasksCount` is "the number of tasks in the cluster that are
-    /// in the RUNNING state" and `pendingTasksCount` the same for `PENDING`. Services
-    /// are not part of this slice — nothing creates one — so their count is a true zero
-    /// rather than an invented number.
+    /// The counters are COMPUTED from the task, container-instance and service maps, so
+    /// they always agree with the records that exist: `runningTasksCount` is "the number
+    /// of tasks in the cluster that are in the RUNNING state", `pendingTasksCount` the
+    /// same for `PENDING`, and `activeServicesCount` the services the cluster holds in
+    /// an `ACTIVE` status.
     ///
     /// `registeredContainerInstancesCount` is counted off the container-instance map the
     /// same way: "the number of container instances registered into the cluster. This
@@ -684,7 +1311,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .unwrap_or(i32::MAX),
             running_tasks_count: i32::try_from(tally.running).unwrap_or(i32::MAX),
             pending_tasks_count: i32::try_from(tally.pending).unwrap_or(i32::MAX),
-            active_services_count: 0,
+            active_services_count: i32::try_from(tally.active_services).unwrap_or(i32::MAX),
             capacity_providers: Some(cluster.capacity_providers.clone()),
             default_capacity_provider_strategy: Some(
                 cluster.default_capacity_provider_strategy.clone(),
@@ -724,13 +1351,18 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
 
 }
 
-/// What one pass over the task map counts for a cluster: the lifecycle counts the
-/// `Cluster` members report, and the same numbers split by launch type that
-/// `Cluster$statistics` reports.
+/// What one pass over the task map and one over the service map count for a cluster:
+/// the lifecycle counts the `Cluster` members report, and the same numbers split by
+/// launch type that `Cluster$statistics` reports.
 #[derive(Debug, Clone, Copy, Default)]
 struct TaskTally {
     running: usize,
     pending: usize,
+    active_services: usize,
+    active_ec2_services: usize,
+    active_fargate_services: usize,
+    draining_ec2_services: usize,
+    draining_fargate_services: usize,
     running_ec2: usize,
     running_fargate: usize,
     pending_ec2: usize,
@@ -738,18 +1370,29 @@ struct TaskTally {
 }
 
 /// `Cluster$statistics`: "the task and service count ... separated by launch type".
-/// Read off the single pass in [`ComAmazonawsEcsAmazonec2containerservicev20141113State::tally`];
-/// the service counts are zero because services are not part of this slice.
+/// Read off the single pass in [`ComAmazonawsEcsAmazonec2containerservicev20141113State::tally`].
 fn cluster_statistics(tally: &TaskTally) -> Vec<KeyValuePair> {
     vec![
         pair("runningEC2TasksCount", tally.running_ec2.to_string()),
         pair("runningFargateTasksCount", tally.running_fargate.to_string()),
         pair("pendingEC2TasksCount", tally.pending_ec2.to_string()),
         pair("pendingFargateTasksCount", tally.pending_fargate.to_string()),
-        pair("activeEC2ServiceCount", "0".to_string()),
-        pair("activeFargateServiceCount", "0".to_string()),
-        pair("drainingEC2ServiceCount", "0".to_string()),
-        pair("drainingFargateServiceCount", "0".to_string()),
+        pair(
+            "activeEC2ServiceCount",
+            tally.active_ec2_services.to_string(),
+        ),
+        pair(
+            "activeFargateServiceCount",
+            tally.active_fargate_services.to_string(),
+        ),
+        pair(
+            "drainingEC2ServiceCount",
+            tally.draining_ec2_services.to_string(),
+        ),
+        pair(
+            "drainingFargateServiceCount",
+            tally.draining_fargate_services.to_string(),
+        ),
     ]
 }
 
@@ -878,6 +1521,69 @@ pub fn container_instance_arn_from_reference(
     } else {
         container_instance_arn(region, cluster_name, reference)
     }
+}
+
+/// The deployment configuration a service stores: what the request supplied, with the
+/// documented defaults materialised for the two percentages a response always carries.
+///
+/// `maximumPercent`: "The default maximumPercent value for a service using the REPLICA
+/// service scheduler is 200%" — a daemon runs exactly one task per container instance,
+/// so its deployment cannot exceed the desired count. `minimumHealthyPercent`: "The
+/// default value for a replica service for minimumHealthyPercent is 100%. The default
+/// minimumHealthyPercent value for a service using the DAEMON service schedule is 0% for
+/// the CLI, the Amazon Web Services SDKs, and the APIs".
+pub fn deployment_configuration(
+    requested: Option<DeploymentConfiguration>,
+    daemon: bool,
+) -> DeploymentConfiguration {
+    let mut configuration = requested.unwrap_or_default();
+    configuration.maximum_percent = Some(configuration.maximum_percent.unwrap_or(if daemon {
+        DAEMON_MAXIMUM_PERCENT
+    } else {
+        REPLICA_MAXIMUM_PERCENT
+    }));
+    configuration.minimum_healthy_percent =
+        Some(
+            configuration
+                .minimum_healthy_percent
+                .unwrap_or(if daemon {
+                    DAEMON_MINIMUM_HEALTHY_PERCENT
+                } else {
+                    REPLICA_MINIMUM_HEALTHY_PERCENT
+                }),
+        );
+    configuration
+}
+
+/// The ARN of a service: `arn:aws:ecs:<region>:<account>:service/<cluster>/<name>`.
+pub fn service_arn(region: &str, cluster_name: &str, service_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("service/{cluster_name}/{service_name}"),
+    )
+}
+
+/// The CLUSTER and the service NAME a `service`/`services` entry refers to.
+///
+/// Every such member accepts "the short name or full Amazon Resource Name (ARN)" of the
+/// service, and a service ARN carries the cluster that hosts it
+/// (`service/<cluster>/<name>`), so an ARN names the cluster as well as the service. A
+/// short name, or the old single-segment ARN form, names no cluster.
+pub fn cluster_and_service_from_reference(reference: &str) -> (Option<String>, String) {
+    match reference.rsplit_once(":service/") {
+        Some((_, tail)) => match tail.split_once('/') {
+            Some((cluster, name)) => (Some(cluster.to_string()), name.to_string()),
+            None => (None, tail.to_string()),
+        },
+        None => (None, reference.trim().to_string()),
+    }
+}
+
+/// The service NAME a `service`/`services` entry refers to: the value as given when it
+/// is a short name, otherwise the last segment of a service ARN.
+pub fn service_name_from_reference(reference: &str) -> String {
+    cluster_and_service_from_reference(reference).1
 }
 
 /// The ARN of a task: `arn:aws:ecs:<region>:<account>:task/<cluster>/<id>`.

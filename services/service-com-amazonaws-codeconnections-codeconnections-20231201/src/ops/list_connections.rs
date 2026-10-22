@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConnections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConnections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConnections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -93,10 +84,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codeconnections-codecon
 // here — hence the `ListConnectionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codeconnections#ListConnections")]
+//
+// `InternalServerException` (503) is widened in from the SERVICE's shapes: it is the
+// modelled server fault for a state store this handler cannot reach, which must never
+// be reported as a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codeconnections#ListConnections",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListConnectionsErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,18 +149,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConnections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConnectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConnections"))
+        // A pure report over the stored connections.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListConnectionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A token this service did not issue names no position, so the request is
+        // refused rather than silently answered from the top of the list.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(format!(
+                    "NextToken is not a token this service issued: '{token}'"
+                ))
+            })?),
+            None => None,
+        };
+
+        let store = state.lock();
+        // Walked in `ConnectionArn` order (the `BTreeMap` key order), so the page a
+        // token resumes is the continuation of the page that issued it.
+        let matching: Vec<&crate::state::StoredConnection> = store
+            .connections
+            .values()
+            .filter(|connection| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| connection.connection_arn.as_str() > after)
+            })
+            .filter(|connection| {
+                input
+                    .provider_type_filter
+                    .as_deref()
+                    .is_none_or(|wanted| connection.provider_type.as_deref() == Some(wanted))
+            })
+            .filter(|connection| {
+                input
+                    .host_arn_filter
+                    .as_deref()
+                    .is_none_or(|wanted| connection.host_arn.as_deref() == Some(wanted))
+            })
+            .collect();
+
+        // Server-side page bound. `MaxResults` is modelled with `range 0..100,
+        // default: 0`, so a caller that omits it reaches here with zero; neither zero
+        // nor an over-large value is read as "render the whole store" — the modelled
+        // maximum is the service's own page size either way, and the remainder is
+        // reported through `NextToken`.
+        let page_size = if input.max_results > 0 {
+            (input.max_results as usize).min(crate::state::MAX_PAGE_SIZE)
+        } else {
+            crate::state::MAX_PAGE_SIZE
+        }
+        .min(matching.len());
+        let (page, remaining) = matching.split_at(page_size);
+
+        // A token only when items are actually left: the contract is that the caller
+        // stops when no `NextToken` comes back.
+        let next_token = match (remaining.is_empty(), page.last()) {
+            (false, Some(last)) => Some(crate::state::encode_page_token(&last.connection_arn)),
+            _ => None,
+        };
+
+        Ok(ListConnectionsOutput {
+            connections: Some(
+                page.iter()
+                    .map(|connection| connection.to_modeled())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

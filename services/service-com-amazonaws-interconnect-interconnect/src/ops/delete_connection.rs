@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -79,9 +70,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // here — hence the `DeleteConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.interconnect#DeleteConnection")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.interconnect#DeleteConnection",
+    extra_errors = ["ResourceNotFoundException", "InterconnectServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteConnectionErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectServerException(InterconnectServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -135,18 +131,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteConnectionErrorModeled::InterconnectServerException(
+                InterconnectServerException {
+                    message: "the Interconnect connection store is not mounted on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::Instant::now();
+
+        let mut store = state.lock();
+        store.materialise_due_transitions(now);
+
+        let Some(stored) = store.connections.get_mut(&input.identifier) else {
+            return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no connection with identifier '{}'",
+                        input.identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "deleting: the connection is being deleted" -> "deleted: the connection has
+        // been deleted". The call starts the first and the clock owes the second, so
+        // a caller reading straight back still sees `deleting`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnection"))
+        // @idempotent: a connection already in one of those two states is left
+        // exactly as it is, and the same record is returned — a retried delete
+        // neither restarts the transition nor fails.
+        if stored.connection.state != "deleting" && stored.connection.state != "deleted" {
+            stored.connection.state = "deleting".to_string();
+            stored.pending_transition = Some(crate::state::PendingTransition {
+                due: now + crate::state::PROVISIONING_SPAN,
+                state: "deleted".to_string(),
+            });
+        }
+
+        // The record is kept rather than dropped: the terminal state is what a later
+        // GetConnection / ListConnections must report.
+        //
+        // `clientToken` needs no replay index: the branch above makes a repeated
+        // delete a no-op that returns the same record, which is what the
+        // @idempotent/@idempotencyToken pair asks for here.
+        Ok(DeleteConnectionOutput {
+            connection: stored.connection.clone(),
+        })
     }
 }

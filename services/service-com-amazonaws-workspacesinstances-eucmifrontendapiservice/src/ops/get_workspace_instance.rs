@@ -167,10 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at the same instant whether or not anybody read the instance.
         let Some(record) = state.settled(&input.workspace_instance_id, std::time::Instant::now())
         else {
-            return Err(GetWorkspaceInstanceErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.workspace_instance_id),
-            )
-            .into());
+            return Err(crate::state::instance_not_found_error(
+                &input.workspace_instance_id,
+                GetWorkspaceInstanceErrorModeled::ResourceNotFoundException,
+            ));
         };
 
         Ok(GetWorkspaceInstanceOutput {

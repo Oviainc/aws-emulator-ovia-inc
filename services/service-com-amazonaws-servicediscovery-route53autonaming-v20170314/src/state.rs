@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DnsConfig, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties, Instance, Namespace,
-    NamespaceProperties, Operation, Service, ServiceAttributes, Tag, SOA,
+    NamespaceProperties, NamespaceSummary, Operation, Service, ServiceAttributes, Tag, SOA,
 };
 
 /// The region an ARN carries when the request is unsigned, matching the region a
@@ -87,6 +87,14 @@ pub const MAX_SERVICES_PER_NAMESPACE: usize = 1_000;
 /// gives. Re-registering an instance that already exists is a replace, so it is never
 /// refused by this bound.
 pub const MAX_INSTANCES_PER_SERVICE: usize = 1_000;
+
+/// How many records a listing returns when the caller names no `MaxResults`.
+///
+/// From the documented default on `ListNamespacesRequest$MaxResults` — "If you don't
+/// specify a value for MaxResults, Cloud Map returns up to 100 namespaces" — which is
+/// also the top of the modelled `MaxResults` range (1..100), shared by every list
+/// operation in this service.
+pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 
 /// How many service-level attributes one service holds, from the documentation of
 /// `ServiceAttributes$Attributes`: "You can specify a total of 30 attributes." The
@@ -712,6 +720,67 @@ pub fn namespace_view(record: &NamespaceRecord, service_count: i32) -> Namespace
         create_date: Some(timestamp(record.create_date)),
         creator_request_id: record.creator_request_id.clone(),
     }
+}
+
+/// The modelled `NamespaceSummary` for a stored namespace — the same record
+/// [`namespace_view`] renders, minus the members `NamespaceSummary` does not carry
+/// (`CreatorRequestId`), so a listing and `GetNamespace` can never disagree.
+pub fn namespace_summary_view(record: &NamespaceRecord, service_count: i32) -> NamespaceSummary {
+    let namespace = namespace_view(record, service_count);
+    NamespaceSummary {
+        id: namespace.id,
+        arn: namespace.arn,
+        // Absent for the same reason as on `Namespace`: this emulator shares no
+        // namespace across accounts, so no listing reports a different owner.
+        resource_owner: namespace.resource_owner,
+        name: namespace.name,
+        r#type: namespace.r#type,
+        description: namespace.description,
+        service_count: namespace.service_count,
+        properties: namespace.properties,
+        create_date: namespace.create_date,
+    }
+}
+
+/// The page size a listing serves for a request whose `MaxResults` is `max_results`.
+///
+/// An absent `MaxResults` asks for as many records as the documented default allows
+/// ([`MAX_LIST_PAGE_SIZE`]), never an empty page. A caller-supplied bound is already
+/// inside the modelled `@range(1..100)` by the time a handler runs; clamping again
+/// costs nothing and keeps this total.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    let bound = max_results
+        .unwrap_or(MAX_LIST_PAGE_SIZE)
+        .clamp(1, MAX_LIST_PAGE_SIZE);
+    usize::try_from(bound).unwrap_or(1)
+}
+
+/// One page of an ordered `(key, record)` sequence, plus the `NextToken` that continues
+/// it — `None` when the page reached the end.
+///
+/// The token names the KEY OF THE FIRST RECORD NOT RETURNED, scoped to the operation
+/// that issued it by [`encode_next_token`], and a resumed call starts at the first key
+/// at or after that cursor, so resuming stays well defined even when the record the
+/// token named was deleted between the two calls: the scan simply continues at the next
+/// key. Together with a stable key order that is what makes a paging client see each
+/// record exactly once.
+pub fn page<'a, T: Clone + 'a>(
+    ordered: impl IntoIterator<Item = (&'a String, &'a T)>,
+    resume_at: Option<&str>,
+    page_size: usize,
+    scope: &str,
+) -> (Vec<T>, Option<String>) {
+    let mut records = Vec::new();
+    for (key, record) in ordered {
+        if resume_at.is_some_and(|from| key.as_str() < from) {
+            continue;
+        }
+        if records.len() == page_size {
+            return (records, Some(encode_next_token(scope, key)));
+        }
+        records.push(record.clone());
+    }
+    (records, None)
 }
 
 /// The modelled `Service` for a stored service.

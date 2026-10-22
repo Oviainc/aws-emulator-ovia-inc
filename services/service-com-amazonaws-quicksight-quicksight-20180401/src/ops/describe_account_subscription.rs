@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one account's QuickSight subscription, as this service holds it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! QuickSight is enabled in every account this emulator serves, so the subscription
+//! reported is the sign-up `CreateAccountSubscription` stored for the account, or this
+//! service's defaults for an account that never signed up. Both live in
+//! [`crate::state::ComAmazonawsQuicksightQuicksight20180401State::account_info`], so
+//! every reader of an account reports it from that one record.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +157,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccountSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountSubscription"))
+        // A report on stored state: nothing here writes to the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeAccountSubscriptionErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+        // The subscription of the account the request addresses: the sign-up
+        // `CreateAccountSubscription` stored for it, or this service's defaults for an
+        // account that never signed up. The modelled `ResourceNotFoundException` is
+        // what an account without a QuickSight subscription answers; this emulator
+        // serves QuickSight in every account, as every other operation in this crate
+        // does, so no account reaches that case here.
+        let account_info = state.lock().account_info(&input.aws_account_id);
+
+        Ok(DescribeAccountSubscriptionOutput {
+            account_info: Some(account_info),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

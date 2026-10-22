@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the request's tags into the tag set of the schedule group its
+//! `ResourceArn` identifies, in [`crate::state`]. A key the group already
+//! carries takes the new value; a key it does not is added. A key under the
+//! reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] is refused, and so is a
+//! merge that would carry the group past
+//! [`crate::state::MAX_TAGS_PER_RESOURCE`].
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the scheduler state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Request validation comes before the resource lookup, so a reserved key
+        // is refused the same way whether or not the ARN names a live group.
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}.",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(group_name) = store.group_name_for_arn(&input.resource_arn, &region) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Resource not found: {}", input.resource_arn),
+                },
+            )
+            .into());
+        };
+
+        // The ACCUMULATED tag set is bounded: `TagList` is modelled 0..200, so a
+        // group holding more tags than that could not be reported by
+        // `ListTagsForResource`. Refuse the merge instead of storing what cannot
+        // be read back.
+        let resulting =
+            crate::state::tag_keys_after(store.group_tags(&group_name), &input.tags).len();
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "A resource holds at most {} tags; this request would leave it with {resulting}.",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `TagList` is modelled `length 0..200`, so an empty list is a legal
+        // request — and it writes nothing, so it never materialises a row for the
+        // built-in `default` group either.
+        if input.tags.is_empty() {
+            return Ok(TagResourceOutput {});
+        }
+
+        let group = store.group_for_write(&group_name, &region);
+        if group.merge_tags(input.tags) {
+            // Tagging is a modification of the schedule group, so the group's
+            // last-modification reading moves only when the stored tag set
+            // really changed.
+            group.last_modification_date = now;
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

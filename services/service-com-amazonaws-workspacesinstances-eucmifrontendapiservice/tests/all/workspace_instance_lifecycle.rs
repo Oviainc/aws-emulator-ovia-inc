@@ -778,9 +778,12 @@ async fn delete_removes_the_instance_from_every_view() {
             json!({ "WorkspaceInstanceId": doomed }),
         )
         .await;
+        // This service answers `ResourceNotFoundException` with HTTP 400, not the 404
+        // its shape declares — see `crate::state::RESOURCE_NOT_FOUND_STATUS`, and the
+        // table in `tests/all/wire_error_responses.rs` that spans this rule.
         assert_eq!(
-            status, 404,
-            "case {operation} after delete: expected HTTP 404, got {status} with {payload}"
+            status, 400,
+            "case {operation} after delete: expected HTTP 400, got {status} with {payload}"
         );
         assert_eq!(
             error_code(&payload),
@@ -849,8 +852,8 @@ async fn a_well_formed_but_unknown_id_is_not_found() {
         ] {
             let (status, payload) = call(&router, operation, body).await;
             assert_eq!(
-                status, 404,
-                "case {operation} on {id:?}: expected HTTP 404, got {status} with {payload}"
+                status, 400,
+                "case {operation} on {id:?}: expected HTTP 400, got {status} with {payload}"
             );
             assert_eq!(
                 error_code(&payload),
@@ -998,8 +1001,9 @@ async fn state_is_shared_across_requests_not_per_call() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case cross-engine read: expected HTTP 404, got {status} with {payload}"
+        status, 400,
+        "case cross-engine read: expected HTTP 400 ResourceNotFoundException, got \
+         {status} with {payload}"
     );
     assert_eq!(
         list_all_ids(&first, json!({})).await,

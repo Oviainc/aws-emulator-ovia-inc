@@ -33,13 +33,16 @@ const SECRET_PASSWORD: &str = "pw-never-echoed-42";
 
 /// One emulator: the router a request is dispatched to, plus the shared engine, so a
 /// case can also read the store the handlers wrote to.
-struct Harness {
+///
+/// `pub(crate)` because every suite in this test target drives the emulator the same
+/// way; a sibling suite reuses this one rather than standing up a second harness.
+pub(crate) struct Harness {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These cases are about the handlers, not about signature verification.
@@ -49,7 +52,7 @@ impl Harness {
     }
 
     /// Dispatch one request and return its status and parsed JSON body.
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let payload = match &body {
             Some(value) => Bytes::from(serde_json::to_vec(value).expect("a JSON request body")),
             None => Bytes::new(),

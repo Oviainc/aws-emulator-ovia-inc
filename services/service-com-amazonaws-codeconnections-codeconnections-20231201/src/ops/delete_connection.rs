@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -76,10 +67,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codeconnections-codecon
 // here — hence the `DeleteConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codeconnections#DeleteConnection")]
+//
+// `InternalServerException` (503) is widened in from the SERVICE's shapes: it is the
+// modelled server fault for a state store this handler cannot reach, which must never
+// be reported as a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codeconnections#DeleteConnection",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteConnectionErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -133,18 +132,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteConnectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Removing the row is the whole delete: the ARN is never reused, so nothing
+        // is left behind to resolve it, and a second delete finds nothing.
+        if state
+            .lock()
+            .connections
+            .remove(&input.connection_arn)
+            .is_none()
+        {
+            return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Resource not found. Verify the connection resource ARN and try again: {}",
+                        input.connection_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Audit record for a destructive operation: who presented which access key
+        // id, what was removed, and the outcome. No secret is logged — the access key
+        // id is the public half the request already carries in its SigV4 scope.
+        ::tracing::info!(
+            operation = "DeleteConnection",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            connection_arn = %input.connection_arn,
+            outcome = "deleted",
+            "codeconnections state change"
+        );
+
+        Ok(DeleteConnectionOutput {})
     }
 }

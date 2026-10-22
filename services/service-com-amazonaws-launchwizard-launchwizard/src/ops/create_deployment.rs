@@ -186,7 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        if !workload.patterns.contains(&input.deployment_pattern_name) {
+        if !workload
+            .patterns
+            .contains_key(&input.deployment_pattern_name)
+        {
             return Err(CreateDeploymentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string()),

@@ -15,6 +15,8 @@
 mod container_instances;
 #[path = "all/ecs_wire.rs"]
 mod ecs_wire;
+#[path = "all/service_lifecycle.rs"]
+mod service_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/task_definition_projection.rs"]

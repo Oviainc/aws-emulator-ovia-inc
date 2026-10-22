@@ -1387,8 +1387,8 @@ async fn list_tasks_filters_and_pages_over_stored_tasks() {
         );
     }
 
-    // A service cannot exist yet, and an id that names no registered container
-    // instance names nothing in the cluster.
+    // A name that matches no service in the cluster names nothing, and neither does an
+    // id that names no registered container instance.
     refused(
         &router,
         "ListTasks",
