@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIndices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIndices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages over the indices stored in `crate::state`, one summary per
+//! stored index. `MaxResults` truncates the page and emits a `NextToken` that resumes
+//! exactly where the page stopped.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIndices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The page order is by `IndexId` ascending — the model documents no order, and a
+//! total order over a stable key is what lets the token resume without dropping or
+//! repeating an entry even when an index is created or deleted between pages.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +152,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIndices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIndicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIndices"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListIndicesError::Modeled(ListIndicesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the kendra emulator could not reach its state store".to_string(),
+                    ),
+                },
+            ))
+        })?;
+        let mut state = state.lock();
+        state.materialize_due_transitions(::std::time::SystemTime::now());
+
+        // `MaxResults` is modelled 1..100, so the boundary validator has already
+        // refused anything outside that range. A request that names none gets at
+        // most that same cap (and a `NextToken`), so no single response has to
+        // carry every index the emulator holds.
+        let page_size = input
+            .max_results
+            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(MAX_PAGE_SIZE));
+
+        let mut ids: Vec<String> = state.indices.keys().cloned().collect();
+        ids.sort();
+
+        // The token carries the id the next page starts at. Resuming at the first id
+        // that is NOT below it tolerates that index having been deleted meanwhile.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume_at = decode_token(token)?;
+                ids.iter()
+                    .position(|id| *id >= resume_at)
+                    .unwrap_or(ids.len())
+            }
+            None => 0,
+        };
+
+        let page: Vec<&String> = ids.iter().skip(start).take(page_size).collect();
+        let next_token = ids
+            .get(start + page.len())
+            .map(|id| crate::state::encode_page_token(OPERATION, id));
+
+        let items: Vec<IndexConfigurationSummary> = page
+            .into_iter()
+            .filter_map(|id| state.index(id))
+            .map(|index| IndexConfigurationSummary {
+                name: Some(index.name.clone()),
+                id: Some(index.id.clone()),
+                edition: Some(index.edition.clone()),
+                created_at: ::aws_smithy_types::DateTime::from(index.created_at),
+                updated_at: ::aws_smithy_types::DateTime::from(index.updated_at),
+                status: index.status.clone(),
+            })
+            .collect();
+
+        Ok(ListIndicesOutput {
+            index_configuration_summary_items: Some(items),
+            next_token,
+        })
     }
+}
+
+/// This operation's name, as the pagination-token envelope records it.
+const OPERATION: &str = "ListIndices";
+
+/// The most summaries one page carries: the modelled range of `MaxResults` is
+/// 1..100, so 100 is both the cap and the page size for a request that names none.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The index id a `NextToken` carries, or a modelled `ValidationException` (HTTP 400)
+/// when the token is not one this operation issued. The envelope itself lives in
+/// `crate::state`, which every paginated operation of this service shares.
+fn decode_token(token: &str) -> Result<String, ListIndicesError> {
+    crate::state::decode_page_token(OPERATION, token).ok_or_else(|| {
+        ListIndicesErrorModeled::ValidationException(ValidationException {
+            message: Some(
+                "NextToken is not a pagination token this operation issued".to_string(),
+            ),
+        })
+        .into()
+    })
 }

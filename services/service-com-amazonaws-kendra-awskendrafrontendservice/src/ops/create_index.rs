@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints an index into `crate::state` and answers with its stored `Id`.
+//! The index starts `CREATING` — creation is asynchronous — and the state's clock
+//! promotes it to `ACTIVE` once its activation instant passes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modeled failures are returned as `Err(CreateIndexErrorModeled::Variant(..).into())`.
 //!
 //! ## Shape of an operation
 //!
@@ -210,18 +206,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIndex"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateIndexError::Modeled(CreateIndexErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the kendra emulator could not reach its state store".to_string(),
+                    ),
+                },
+            ))
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due_transitions(now);
+
+        // `ClientToken` is an @idempotencyToken, and the model documents "Multiple
+        // calls to the CreateIndex API with the same client token will create only
+        // one index": a retry answers with the index the first call minted.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = state.index_ids_by_client_token.get(token) {
+                return Ok(CreateIndexOutput {
+                    id: Some(existing.clone()),
+                });
+            }
+        }
+
+        // `Edition` and `UserContextPolicy` are modelled enums, so a value outside
+        // either one was already refused by the boundary validator. The model's own
+        // doc for `Edition`: "The Edition parameter is optional. If you don't supply a
+        // value, the default is ENTERPRISE_EDITION."
+        let edition = input
+            .edition
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_INDEX_EDITION.to_string());
+
+        // Three rules the model documents for a Gen AI Enterprise Edition index: a
+        // USER_TOKEN user context policy, `UserTokenConfigurations` and
+        // `UserGroupResolutionConfiguration` are each refused with a
+        // `ValidationException`.
+        if edition == "GEN_AI_ENTERPRISE_EDITION" {
+            if input.user_context_policy.as_deref() == Some("USER_TOKEN") {
+                return Err(validation(
+                    "a GEN_AI_ENTERPRISE_EDITION index supports only the ATTRIBUTE_FILTER \
+                     UserContextPolicy",
+                ));
+            }
+            if input
+                .user_token_configurations
+                .as_ref()
+                .is_some_and(|configs| !configs.is_empty())
+            {
+                return Err(validation(
+                    "UserTokenConfigurations is not supported for a GEN_AI_ENTERPRISE_EDITION \
+                     index",
+                ));
+            }
+            if input.user_group_resolution_configuration.is_some() {
+                return Err(validation(
+                    "UserGroupResolutionConfiguration is not supported for a \
+                     GEN_AI_ENTERPRISE_EDITION index",
+                ));
+            }
+        }
+
+        if let Some(existing) = state.index_ids_by_name.get(&input.name) {
+            return Err(CreateIndexErrorModeled::ResourceAlreadyExistException(
+                ResourceAlreadyExistException {
+                    message: Some(format!(
+                        "an index named {} already exists (index {existing})",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account holds at most its indices quota: a caller cannot grow the
+        // store without end by naming a fresh index every time.
+        if state.indices.len() >= crate::state::MAX_INDICES {
+            return Err(CreateIndexErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the {} indices it is allowed; delete an \
+                         index before creating another",
+                        crate::state::MAX_INDICES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `IndexId` is 36 characters matching ^[a-zA-Z0-9][a-zA-Z0-9-]*$ — exactly a
+        // hyphenated UUID. Re-mint while the draw collides with a stored index, so an
+        // id is unique however the draw came out.
+        let id = loop {
+            let candidate = crate::state::mint_uuid();
+            if !state.indices.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let index = crate::state::Index {
+            id: id.clone(),
+            name: input.name.clone(),
+            edition,
+            role_arn: input.role_arn.clone(),
+            description: input.description.clone(),
+            status: crate::state::STATUS_CREATING.to_string(),
+            created_at: now,
+            updated_at: now,
+            user_context_policy: input.user_context_policy.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            server_side_encryption_configuration: input
+                .server_side_encryption_configuration
+                .clone(),
+            user_token_configurations: input.user_token_configurations.clone(),
+            user_group_resolution_configuration: input.user_group_resolution_configuration.clone(),
+            client_token: input.client_token.clone(),
+            documents: ::std::collections::HashMap::new(),
+            faq_count: 0,
+            active_at: Some(now + crate::state::INDEX_ACTIVATION_DELAY),
+            removed_at: None,
+        };
+
+        state
+            .index_ids_by_name
+            .insert(index.name.clone(), id.clone());
+        if let Some(token) = index.client_token.clone() {
+            state.index_ids_by_client_token.insert(token, id.clone());
+        }
+        state.indices.insert(id.clone(), index);
+
+        Ok(CreateIndexOutput { id: Some(id) })
     }
+}
+
+/// This operation's modeled `ValidationException` (HTTP 400), for a request the
+/// service refuses on a rule the model states but no modeled constraint expresses.
+fn validation(message: impl Into<String>) -> CreateIndexError {
+    CreateIndexErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
 }
