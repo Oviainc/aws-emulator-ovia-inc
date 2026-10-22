@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ConflictException, Milestone, MilestoneSummary, ResourceNotFoundException, ReviewTemplate,
-    Workload, WorkloadDiscoveryConfig, WorkloadJiraConfigurationInput,
+    ShareInvitationSummary, Workload, WorkloadDiscoveryConfig, WorkloadJiraConfigurationInput,
     WorkloadJiraConfigurationOutput, WorkloadShareSummary, WorkloadSummary, QUESTION_VALUES,
     RISK_VALUES,
 };
@@ -239,6 +239,15 @@ pub const WORKLOAD_SHARE_RESOURCE_TYPE: &str = "WORKLOAD_SHARE";
 /// it leaves `PENDING` only when the recipient answers the invitation
 /// (`UpdateShareInvitation`, still a stub with its own issue).
 pub const DEFAULT_SHARE_STATUS: &str = "PENDING";
+
+/// The `ShareResourceType` member that names a REVIEW TEMPLATE share
+/// (`smithy_query(query="shape", shape="ShareResourceType")` publishes `WORKLOAD`,
+/// `LENS`, `PROFILE` and `TEMPLATE`). Distinct from
+/// [`REVIEW_TEMPLATE_RESOURCE_TYPE`], which is how an exception names the template
+/// resource itself; the other three share resource types are spelled the same as the
+/// exception resource types, so [`WORKLOAD_RESOURCE_TYPE`], [`LENS_RESOURCE_TYPE`] and
+/// [`PROFILE_RESOURCE_TYPE`] serve for those.
+pub const TEMPLATE_SHARE_RESOURCE_TYPE: &str = "TEMPLATE";
 
 /// The most shares one workload holds in this emulator.
 ///
@@ -602,10 +611,11 @@ impl WorkloadRecord {
             architectural_design: self.architectural_design.clone(),
             review_owner: self.review_owner.clone(),
             // Only the workload AS THE RECIPIENT SEES IT carries these: they describe
-            // the share invitation the recipient was offered. A share can now be created
-            // (`CreateWorkloadShare`), but the invitation flow that accepts one —
-            // `ListShareInvitations` / `UpdateShareInvitation` — is still a stub with its
-            // own issue, so no caller here is ever a share recipient.
+            // the share invitation the recipient was offered. A share can be created
+            // (`CreateWorkloadShare`) and the invitations it raises are reported
+            // (`ListShareInvitations`), but accepting one — `UpdateShareInvitation` — is
+            // still a stub with its own issue, so no workload in this store is one the
+            // caller reached through an accepted invitation.
             review_restriction_date: None,
             share_invitation_id: None,
             is_review_owner_update_acknowledged: Some(self.is_review_owner_update_acknowledged),
@@ -1306,13 +1316,23 @@ pub struct CreateMilestoneToken {
 /// workload it shares — `shared_by` is that workload's owning account, the principal that
 /// did the sharing. It is recorded (rather than re-derived) because it is the modelled
 /// `WorkloadShare$SharedBy` member, which the `WorkloadShare` shape carries and
-/// `WorkloadShareSummary` does not: the operations that return that shape
-/// (`UpdateWorkloadShare`, `DeleteWorkloadShare`, the share-invitation flow) are still
+/// `WorkloadShareSummary` does not: `ShareInvitationSummary$SharedBy` is what
+/// `ListShareInvitations` reports it as, and the operations that return the
+/// `WorkloadShare` shape itself (`UpdateWorkloadShare`, `DeleteWorkloadShare`) are still
 /// stubs with their own issues, so the share the sharer created already remembers who
 /// shared it when one of them is implemented.
+///
+/// `share_invitation_id` is the id of the invitation the share's recipient has to answer.
+/// The invitation is 1:1 with the share and exists from the moment the share is created
+/// — "Shared access to a workload is not removed until the workload invitation is
+/// deleted" (`CreateWorkloadShare` doc) — but it is a resource of its OWN, named by its
+/// own `ShareInvitationId` rather than by the share's `ShareId`
+/// (`smithy_query(query="shape", shape="ShareInvitationSummary")` carries both), so it
+/// is minted and recorded beside it.
 #[derive(Debug, Clone)]
 pub struct WorkloadShareRecord {
     pub share_id: String,
+    pub share_invitation_id: String,
     pub workload_id: String,
     pub shared_by: String,
     pub shared_with: String,
@@ -1333,6 +1353,33 @@ impl WorkloadShareRecord {
             // (`WorkloadShareSummary$StatusMessage` doc): a share that is simply waiting
             // on its invitation has nothing to add to its status.
             status_message: self.status_message.clone(),
+        }
+    }
+
+    /// The `ShareInvitationSummary` projection `ListShareInvitations` pages over: this
+    /// share seen as the invitation its recipient was offered.
+    ///
+    /// `workload_name` is the name of the workload the share shares — the summary's
+    /// `WorkloadName` member, which the share record does not duplicate because the
+    /// workload owns it and `UpdateWorkload` can change it. Only the members of the
+    /// shared resource KIND are filled: a workload invitation names a workload, and the
+    /// lens, profile and review-template members of the shape belong to invitations of
+    /// those kinds.
+    pub fn to_invitation_summary(&self, workload_name: &str) -> ShareInvitationSummary {
+        ShareInvitationSummary {
+            share_invitation_id: Some(self.share_invitation_id.clone()),
+            shared_by: Some(self.shared_by.clone()),
+            shared_with: Some(self.shared_with.clone()),
+            permission_type: Some(self.permission_type.clone()),
+            share_resource_type: Some(WORKLOAD_RESOURCE_TYPE.to_string()),
+            workload_name: Some(workload_name.to_string()),
+            workload_id: Some(self.workload_id.clone()),
+            lens_name: None,
+            lens_arn: None,
+            profile_name: None,
+            profile_arn: None,
+            template_name: None,
+            template_arn: None,
         }
     }
 }
@@ -1442,6 +1489,26 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                 .values()
                 .any(|shares| shares.contains_key(&id))
             {
+                return id;
+            }
+        }
+    }
+
+    /// A fresh `ShareInvitationId`: 32 lowercase hex characters, as `^[0-9a-f]{32}$`
+    /// requires, and unused by any invitation this store holds. An invitation is named by
+    /// this id alone (`UpdateShareInvitation` resolves one by it), so uniqueness is
+    /// checked over every workload's shares — and against the `ShareId`s too, so the two
+    /// id spaces of one share can never hand out the same value and be mistaken for each
+    /// other.
+    pub fn mint_share_invitation_id(&mut self) -> String {
+        loop {
+            let id = self.next_hex_id();
+            if !self.workload_shares.values().any(|shares| {
+                shares.contains_key(&id)
+                    || shares
+                        .values()
+                        .any(|share| share.share_invitation_id == id)
+            }) {
                 return id;
             }
         }
@@ -1596,6 +1663,44 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.workload_shares.get(workload_id)?.get(share_id)
     }
 
+    /// Every share invitation addressed to `principal` that is still waiting on an
+    /// answer, in `ShareInvitationId` order — what `ListShareInvitations` reports.
+    ///
+    /// An invitation is offered to the principal a resource was shared WITH, so a share
+    /// is reported to that principal and not to the one that created it; it is
+    /// outstanding while its share is still in the status a new share carries
+    /// ([`DEFAULT_SHARE_STATUS`], `PENDING`), and is gone once the recipient has
+    /// answered it. `ShareInvitationId` order is the stable order the pages are cut on,
+    /// which is why the enumeration sorts here rather than at the caller.
+    ///
+    /// Only workload invitations can exist in this emulator so far: a lens, profile or
+    /// review-template share has no store because `CreateLensShare`,
+    /// `CreateProfileShare` and `CreateTemplateShare` are still stubs with their own
+    /// issues.
+    pub fn pending_share_invitations_for(&self, principal: &str) -> Vec<ShareInvitationSummary> {
+        let mut invitations: Vec<ShareInvitationSummary> = self
+            .workload_shares
+            .values()
+            .flat_map(|shares| shares.values())
+            .filter(|share| {
+                share.shared_with == principal && share.status == DEFAULT_SHARE_STATUS
+            })
+            .map(|share| {
+                let workload_name = self
+                    .workloads
+                    .get(&share.workload_id)
+                    .map(|workload| workload.workload_name.as_str())
+                    .unwrap_or_default();
+                share.to_invitation_summary(workload_name)
+            })
+            .collect();
+        invitations.sort_by(|left, right| {
+            left.share_invitation_id
+                .cmp(&right.share_invitation_id)
+        });
+        invitations
+    }
+
     /// The share of `workload_id` the principal `shared_with` already holds, if it holds
     /// one: a principal holds at most one share of one workload, so this is what a second
     /// share request for the same principal collides with.
@@ -1668,6 +1773,20 @@ pub fn encode_share_next_token(share_id: &str) -> String {
 /// token is not one this service issued.
 pub fn decode_share_next_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("s")?.as_str()?.to_string())
+}
+
+/// Encode a `ListShareInvitations` cursor: the last `ShareInvitationId` served, in the
+/// same opaque scheme as [`encode_next_token`]. Invitations are enumerated in
+/// `ShareInvitationId` order, so that id is the whole cursor. Its own key, so a cursor
+/// issued by another paginated operation is not a cursor here.
+pub fn encode_share_invitation_next_token(share_invitation_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "v": share_invitation_id }))
+}
+
+/// The `ShareInvitationId` a `ListShareInvitations` `NextToken` points just past, or
+/// `None` when the token is not one this service issued.
+pub fn decode_share_invitation_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("v")?.as_str()?.to_string())
 }
 
 /// Encode a `ListMilestones` cursor: the `MilestoneNumber` of the last milestone the
