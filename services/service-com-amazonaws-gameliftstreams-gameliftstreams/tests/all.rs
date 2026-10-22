@@ -21,3 +21,5 @@ mod stream_group_locations;
 mod stream_workflow;
 #[path = "all/tags.rs"]
 mod tags;
+#[path = "all/update_stream_group.rs"]
+mod update_stream_group;

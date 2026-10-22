@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStreamGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStreamGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStreamGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the configuration settings of a stored stream group: its `Description`, the
+//! capacity of the locations it already holds, and which of its associated applications
+//! is the default one. Everything it answers with is read back out of the stored record,
+//! so `GetStreamGroup` reports exactly what this call persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -256,18 +252,258 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStreamGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStreamGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStreamGroup"))
+        // `ctx` carries request metadata only; this operation names no region of its
+        // own, because it writes to a record whose ARN was minted when it was created.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateStreamGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the gameliftstreams emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize(now);
+
+        // ---- the request, checked before a single byte of state is written ----
+        let configurations = input.location_configurations.unwrap_or_default();
+        let mut configured: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+        for configuration in &configurations {
+            // A `LocationConfiguration` whose capacities this service cannot store is
+            // refused by the operation that carries it, through the same rule
+            // `CreateStreamGroup` and `AddStreamGroupLocations` apply.
+            if let Some(message) = crate::state::unstorable_location_configuration(configuration) {
+                return Err(UpdateStreamGroupErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into());
+            }
+            // One location cannot be given two capacity configurations in one request:
+            // the list is modelled `@uniqueItems`, but two items that differ only in
+            // their capacities are distinct items naming the same location, and there
+            // is no order in which both could hold.
+            if !configured.insert(configuration.location_name.as_str()) {
+                return Err(UpdateStreamGroupErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "LocationConfigurations configures location {} more than once",
+                            configuration.location_name
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // ---- the stream group this call updates ----
+        let Some(group) = state.stream_group(&input.identifier) else {
+            return Err(UpdateStreamGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no stream group matches identifier {}", input.identifier),
+                },
+            )
+            .into());
+        };
+        // "To update a stream group, it must be in ACTIVE status." An expired group is
+        // one such status: "Expired stream groups cannot be updated." The gate also
+        // settles the per-location rule that "ACTIVATING: ... You cannot stream from,
+        // scale the capacity of, or remove this location yet": a group holding any
+        // location that is still activating or being removed reports
+        // `UPDATING_LOCATIONS`, not `ACTIVE` (`StreamGroup::has_settling_location`), so
+        // an `ACTIVE` group's locations are all provisioned and can be scaled.
+        if group.status != crate::state::STREAM_GROUP_ACTIVE {
+            return Err(UpdateStreamGroupErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "stream group {} is in {} status; UpdateStreamGroup requires {} status",
+                        group.id,
+                        group.status,
+                        crate::state::STREAM_GROUP_ACTIVE
+                    ),
+                },
+            )
+            .into());
+        }
+        let group_id = group.id.clone();
+        let associated_applications = group.associated_applications.clone();
+
+        // `LocationConfiguration` documentation: "To update the capacity for an existing
+        // stream group, call UpdateStreamGroup. To add a new location and specify its
+        // capacity, call AddStreamGroupLocations." So a configuration may only name a
+        // location the group already holds.
+        for configuration in &configurations {
+            let Some(slot) = group
+                .locations
+                .iter()
+                .find(|slot| slot.name == configuration.location_name)
+            else {
+                return Err(UpdateStreamGroupErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "stream group {group_id} holds no location {}; \
+                             use AddStreamGroupLocations to add a location",
+                            configuration.location_name
+                        ),
+                    },
+                )
+                .into());
+            };
+            // The `OnDemandCapacity` exclusion holds over the configuration the
+            // location is LEFT with, not just over the members one request carries:
+            // each member this call omits keeps its stored value, so a request that
+            // contributes either side of the forbidden pair is refused when the other
+            // side is already stored. A request that touches neither side is not
+            // refused for a pair it did not create.
+            let merged_on_demand = configuration
+                .on_demand_capacity
+                .or(slot.on_demand_capacity);
+            let touches_pair = configuration.on_demand_capacity.is_some()
+                || configuration.maximum_capacity.is_some()
+                || configuration.target_idle_capacity.is_some();
+            if touches_pair && merged_on_demand.is_some() {
+                for (member, merged) in [
+                    (
+                        "MaximumCapacity",
+                        configuration.maximum_capacity.or(slot.maximum_capacity),
+                    ),
+                    (
+                        "TargetIdleCapacity",
+                        configuration
+                            .target_idle_capacity
+                            .or(slot.target_idle_capacity),
+                    ),
+                ] {
+                    if merged.is_some() {
+                        return Err(UpdateStreamGroupErrorModeled::ValidationException(
+                            ValidationException {
+                                message: format!(
+                                    "LocationConfigurations[{}] would leave the location with \
+                                     both OnDemandCapacity and {member}, which cannot be used \
+                                     together",
+                                    configuration.location_name
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+
+        // ---- the new default application, if the request names one ----
+        let default_application = match input.default_application_identifier.as_deref() {
+            Some(identifier) => {
+                let Some(application) = state.application(identifier) else {
+                    return Err(UpdateStreamGroupErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "no application matches DefaultApplicationIdentifier {identifier}"
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                // "The application that you specify must be in READY status."
+                if application.status != crate::state::APPLICATION_READY {
+                    return Err(UpdateStreamGroupErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "application {} is in {} status; a default application must be \
+                                 in {} status",
+                                application.id,
+                                application.status,
+                                crate::state::APPLICATION_READY
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                // "Note that this parameter only sets the default application in a
+                // stream group. To associate a new application to an existing stream
+                // group, you must use AssociateApplications." So this call may only
+                // promote an application the group is already associated with; it never
+                // associates one itself.
+                if !associated_applications.contains(&application.arn) {
+                    return Err(UpdateStreamGroupErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "application {} is not associated with stream group {group_id}; \
+                                 use AssociateApplications to associate it first",
+                                application.id
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                Some(DefaultApplication {
+                    id: Some(application.id.clone()),
+                    arn: Some(application.arn.clone()),
+                })
+            }
+            None => None,
+        };
+
+        // ---- apply the update ----
+        let group = state
+            .stream_group_mut(&group_id)
+            .expect("the stream group resolved above is still stored under its id");
+        if let Some(description) = input.description {
+            group.description = description;
+        }
+        if let Some(default_application) = default_application {
+            group.default_application = Some(default_application);
+        }
+        // `PATCH /streamgroups/{Identifier}`: each capacity the configuration carries
+        // replaces the stored one, and a capacity it omits keeps the value the location
+        // already had. `VpcTransitConfiguration` is not part of this slice's stored
+        // location state (neither `CreateStreamGroup` nor `LocationState` carries it
+        // here), so it is not applied.
+        for configuration in configurations {
+            let Some(slot) = group
+                .locations
+                .iter_mut()
+                .find(|slot| slot.name == configuration.location_name)
+            else {
+                continue;
+            };
+            if configuration.always_on_capacity.is_some() {
+                slot.always_on_capacity = configuration.always_on_capacity;
+            }
+            if configuration.on_demand_capacity.is_some() {
+                slot.on_demand_capacity = configuration.on_demand_capacity;
+            }
+            if configuration.target_idle_capacity.is_some() {
+                slot.target_idle_capacity = configuration.target_idle_capacity;
+            }
+            if configuration.maximum_capacity.is_some() {
+                slot.maximum_capacity = configuration.maximum_capacity;
+            }
+        }
+        group.last_updated_at = now;
+
+        // "If the request is successful, Amazon GameLift Streams returns the complete
+        // updated metadata for the stream group" — read back out of the stored record,
+        // exactly as `GetStreamGroup` reports it.
+        let group = state
+            .stream_groups
+            .get(&group_id)
+            .expect("the stream group was just updated under this id");
+        Ok(UpdateStreamGroupOutput {
+            arn: group.arn.clone(),
+            description: Some(group.description.clone()),
+            default_application: group.default_application.clone(),
+            location_states: Some(group.location_states()),
+            stream_class: Some(group.stream_class.clone()),
+            id: Some(group.id.clone()),
+            status: Some(group.status.clone()),
+            status_reason: group.status_reason.clone(),
+            last_updated_at: Some(crate::state::timestamp(group.last_updated_at)),
+            created_at: Some(crate::state::timestamp(group.created_at)),
+            expires_at: Some(crate::state::timestamp(group.expires_at)),
+            associated_applications: Some(group.associated_applications.clone()),
+        })
     }
 }
