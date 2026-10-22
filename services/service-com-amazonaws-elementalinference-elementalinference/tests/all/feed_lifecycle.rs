@@ -15,7 +15,8 @@
 //!   record, and `GetFeed` returns that same record member for member;
 //! * `ListFeeds` enumerates the persisted feeds in one stable order, at most
 //!   `maxResults` per page (10 when the request omits it), resuming from `nextToken`;
-//! * `UpdateFeed` overwrites the stored feed, so later reads report the new values;
+//! * `UpdateFeed` overwrites the stored feed, so later reads report the new values,
+//!   and answers 200, so the response reports the feed's settled status;
 //! * `DeleteFeed` retires the feed, so once the deletion falls due `GetFeed` is a 404
 //!   and `ListFeeds` no longer lists it;
 //! * an id no live feed has is `ResourceNotFoundException` (HTTP 404) on every feed
@@ -473,6 +474,9 @@ async fn update_feed_overwrites_the_stored_feed() {
         )
         .await;
         let id = created["id"].as_str().unwrap().to_string();
+        // Let the creation fall due first, so what the update reports is about the
+        // UPDATE and not about a creation the feed was still waiting out.
+        past_the_transition_span();
 
         let (status, updated) = call(
             &router,
@@ -503,8 +507,9 @@ async fn update_feed_overwrites_the_stored_feed() {
         );
         assert_eq!(
             updated["status"],
-            json!("UPDATING"),
-            "case {label:?}: a feed being reconfigured is UPDATING, got {:?}",
+            json!("AVAILABLE"),
+            "case {label:?}: UpdateFeed answers 200, so the settled feed it reconfigured still \
+             reports AVAILABLE, got {:?}",
             updated["status"]
         );
         assert_eq!(
@@ -548,7 +553,7 @@ async fn update_feed_overwrites_the_stored_feed() {
         assert_eq!(
             settled["status"],
             json!("AVAILABLE"),
-            "case {label:?}: once the update is due the feed is AVAILABLE again, got {:?}",
+            "case {label:?}: the updated feed stays AVAILABLE, got {:?}",
             settled["status"]
         );
     }

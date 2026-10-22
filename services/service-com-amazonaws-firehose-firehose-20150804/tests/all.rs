@@ -17,6 +17,8 @@ mod delivery_stream_encryption;
 mod delivery_stream_lifecycle;
 #[path = "all/delivery_stream_tags.rs"]
 mod delivery_stream_tags;
+#[path = "all/description_defaults.rs"]
+mod description_defaults;
 #[path = "all/destination_update.rs"]
 mod destination_update;
 #[path = "all/refusal_messages.rs"]

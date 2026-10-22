@@ -8,9 +8,14 @@
 //! the shapes the handlers hand back are all built from it.
 //!
 //! The dictionary is this service's other resource — a named, language-tagged payload
-//! of custom words a subtitling output can reference. `CreateDictionary` mints one and
-//! `GetDictionary` reports it; both work on the single [`Dictionary`] record stored
-//! here, exactly as the feed handlers work on [`Feed`].
+//! of custom words a subtitling output can reference. `CreateDictionary` mints one,
+//! `GetDictionary` reports it, `UpdateDictionary` mutates it and `DeleteDictionary`
+//! retires it; all four work on the single [`Dictionary`] record stored here, exactly
+//! as the feed handlers work on [`Feed`]. WHICH feeds reference a dictionary is not
+//! stored on the dictionary: it is derived from the feed store
+//! ([`ComAmazonawsElementalinferenceElementalinferenceState::feeds_referencing`]), so
+//! one copy of that fact backs the dictionary's `references` list, its `REFERENCED`
+//! status and `DeleteDictionary`'s refusal alike.
 //!
 //! A FIXTURE is not one of those resources: no operation of this service creates,
 //! updates or deletes one. A fixture is a sports event "as provided by the data
@@ -62,8 +67,9 @@ const DICTIONARY_ID_LEN: usize = 19;
 const DICTIONARY_ID_ALPHABET: &[u8; 62] =
     b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-/// How long a clock-owed transition takes: a feed's `CREATING`/`UPDATING` ->
-/// `AVAILABLE` and `DELETING` -> gone, and a dictionary's `CREATING` -> `AVAILABLE`.
+/// How long a clock-owed transition takes: a feed's `CREATING` -> `AVAILABLE` and
+/// `DELETING` -> gone, and a dictionary's `CREATING` -> `AVAILABLE` and `DELETING` ->
+/// gone.
 ///
 /// AWS documents no duration for these, so this span is chosen rather than
 /// specified: it is non-zero, so a caller that reads a resource straight after
@@ -97,9 +103,13 @@ pub const MAX_DICTIONARIES: usize = 100;
 
 /// The `FeedStatus` values this slice of the service produces.
 ///
-/// The model's enum also carries `DELETED`; a feed whose deletion has completed is
-/// removed from the store instead (`GetFeed` then answers
-/// `ResourceNotFoundException`), so nothing ever reports that value.
+/// The model's enum also carries `DELETED` and `UPDATING`, and neither value is ever
+/// reported. A feed whose deletion has completed is removed from the store instead
+/// (`GetFeed` then answers `ResourceNotFoundException`). `UpdateFeed` answers HTTP
+/// 200 rather than 202 — "UpdateFeed is a PUT operation, which means that the payload
+/// that you specify completely overwrites the existing payload" and that overwrite is
+/// done when the call returns — so the update reports the feed's SETTLED status, as
+/// `AssociateFeed` (also 200) already does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedStatus {
     /// The feed has been accepted and is not serviceable yet.
@@ -109,8 +119,6 @@ pub enum FeedStatus {
     /// A resource (the source media) is associated with the feed: `AssociateFeed`
     /// claims the feed for one resource, and that claim is what `ACTIVE` reports.
     Active,
-    /// An `UpdateFeed` has been accepted and is being applied.
-    Updating,
     /// A `DeleteFeed` has been accepted; the feed disappears when it completes.
     Deleting,
     /// The feed's resource has been released by `DisassociateFeed`. Terminal: a
@@ -125,7 +133,6 @@ impl FeedStatus {
             Self::Creating => "CREATING",
             Self::Available => "AVAILABLE",
             Self::Active => "ACTIVE",
-            Self::Updating => "UPDATING",
             Self::Deleting => "DELETING",
             Self::Archived => "ARCHIVED",
         }
@@ -180,6 +187,21 @@ pub const FEED_NOT_ASSOCIATED_MESSAGE: &str =
 pub const FEED_BEING_DELETED_MESSAGE: &str =
     "You can't update this feed because it is being deleted.";
 
+/// `UpdateDictionary` on a dictionary whose deletion has already been accepted: as with
+/// [`FEED_BEING_DELETED_MESSAGE`], a property of the stored dictionary, so the sentence
+/// names neither the dictionary nor its status.
+pub const DICTIONARY_BEING_DELETED_MESSAGE: &str =
+    "You can't update this dictionary because it is being deleted.";
+
+/// `DeleteDictionary` on a dictionary a feed references ("You cannot delete a dictionary
+/// that is referenced by a feed. You must first remove the dictionary reference from the
+/// feed's subtitling configuration."): the rule is a property of the stored resources,
+/// so the sentence names neither the dictionary nor the feeds that hold it — which also
+/// keeps one caller's refusal from disclosing another caller's feed.
+pub const DICTIONARY_REFERENCED_MESSAGE: &str =
+    "You can't delete this dictionary because it is referenced by a feed. Remove the \
+     dictionary from the feed's subtitling configuration and try again.";
+
 /// `SearchFixtures` with `endDate` before `startDate`: the rule is the ORDER of the two
 /// members, so the recorded refusal names the members and not the dates they carried.
 pub const END_DATE_BEFORE_START_DATE_MESSAGE: &str = "endDate must not be earlier than startDate.";
@@ -201,16 +223,21 @@ pub const MAX_OUTPUTS_PER_FEED: usize = 20;
 
 /// The `DictionaryStatus` values this slice of the service produces.
 ///
-/// The model's enum also carries `REFERENCED` (a dictionary a feed output points at),
-/// `DELETING` and `DELETED`; nothing records a feed output's reference to a
-/// dictionary yet and `DeleteDictionary` is not implemented, so this enum names only
-/// the statuses a dictionary can actually reach today.
+/// These are the LIFECYCLE statuses a dictionary record holds. The model's enum also
+/// carries `REFERENCED` and `DELETED`, and neither is a stored value: `REFERENCED` is
+/// DERIVED from the feeds whose subtitling outputs name the dictionary (see
+/// [`Dictionary::reported_status`]), and a dictionary whose deletion has completed is
+/// removed from the store instead, so `GetDictionary` then answers
+/// `ResourceNotFoundException`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DictionaryStatus {
     /// The dictionary has been accepted and is not usable yet.
     Creating,
     /// The dictionary is settled and can be referenced by an output.
     Available,
+    /// A `DeleteDictionary` has been accepted; the dictionary disappears when the
+    /// removal falls due.
+    Deleting,
 }
 
 impl DictionaryStatus {
@@ -220,6 +247,7 @@ impl DictionaryStatus {
         match self {
             Self::Creating => "CREATING",
             Self::Available => "AVAILABLE",
+            Self::Deleting => "DELETING",
         }
     }
 }
@@ -235,15 +263,37 @@ pub struct Dictionary {
     /// The entries payload as submitted; empty when the request carried none.
     pub entries: String,
     pub status: DictionaryStatus,
-    /// The ids of the feeds whose outputs reference this dictionary. Empty until a
-    /// feed points at it.
-    pub references: Vec<String>,
     pub tags: BTreeMap<String, String>,
     /// When the clock owes this dictionary's transient status its next move, if any.
     pub transition_due_at: Option<Instant>,
 }
 
 impl Dictionary {
+    /// Put this dictionary into a transient status the clock will move on by itself,
+    /// and return the instant that move falls due — the dictionary's counterpart of
+    /// [`Feed::enter_transient`]. The caller hands that instant to
+    /// [`ComAmazonawsElementalinferenceElementalinferenceState::note_due`].
+    #[must_use]
+    pub fn enter_transient(&mut self, status: DictionaryStatus, now: Instant) -> Instant {
+        let due = now + TRANSITION_SPAN;
+        self.status = status;
+        self.transition_due_at = Some(due);
+        due
+    }
+
+    /// The `DictionaryStatus` this dictionary reports given `references`, the feeds
+    /// that currently reference it.
+    ///
+    /// A dictionary in a transient lifecycle status reports that status; a settled one
+    /// reports `REFERENCED` while any feed's subtitling output names it (which is also
+    /// why `DeleteDictionary` refuses it) and `AVAILABLE` while none does.
+    pub fn reported_status(&self, references: &[String]) -> &'static str {
+        match self.status {
+            DictionaryStatus::Available if !references.is_empty() => "REFERENCED",
+            status => status.as_wire(),
+        }
+    }
+
     /// The tags of this dictionary as the `TagMap` every dictionary response carries.
     ///
     /// A dictionary that carries no tags reports an EMPTY map, not an absent member:
@@ -252,13 +302,6 @@ impl Dictionary {
     /// moment the first tag is added.
     pub fn tag_map(&self) -> std::collections::HashMap<String, String> {
         self.tags.clone().into_iter().collect()
-    }
-
-    /// The `FeedReferences` list every dictionary response carries: the feeds that
-    /// reference it, which is an empty list rather than an absent member while none
-    /// do.
-    pub fn feed_references(&self) -> Vec<String> {
-        self.references.clone()
     }
 }
 
@@ -275,6 +318,21 @@ pub struct Output {
 }
 
 impl Output {
+    /// The id of the dictionary this output references, if it references one.
+    ///
+    /// Only a subtitling output can: `SubtitlingConfig$dictionary` is "the ID of a
+    /// custom dictionary to improve transcription accuracy", and no other member of
+    /// the `OutputConfig` union names a dictionary. An output whose subtitling config
+    /// carries no dictionary references none.
+    pub fn referenced_dictionary(&self) -> Option<&str> {
+        match &self.output_config {
+            OutputConfig::Subtitling(subtitling) => subtitling.dictionary.as_deref(),
+            OutputConfig::Cropping(_)
+            | OutputConfig::Clipping(_)
+            | OutputConfig::contextualMetadata(_) => None,
+        }
+    }
+
     /// One output of a feed as it is STORED, from the output a create or update
     /// request carried.
     ///
@@ -338,6 +396,14 @@ impl Feed {
         self.status = status;
         self.transition_due_at = Some(due);
         due
+    }
+
+    /// Whether any of this feed's outputs references `dictionary_id`, i.e. names it in
+    /// its subtitling config ([`Output::referenced_dictionary`]).
+    pub fn references_dictionary(&self, dictionary_id: &str) -> bool {
+        self.outputs
+            .iter()
+            .any(|output| output.referenced_dictionary() == Some(dictionary_id))
     }
 
     /// The outputs of this feed as the `GetOutputList` every feed response carries.
@@ -519,6 +585,41 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
         self.earliest_due = Some(self.earliest_due.map_or(due, |earliest| earliest.min(due)));
     }
 
+    /// The ids of the feeds that reference `dictionary_id`, in feed-id order — the
+    /// `FeedReferences` list every dictionary response carries.
+    ///
+    /// DERIVED from the feed store, which is the only place a reference lives: a feed
+    /// references a dictionary exactly while one of its outputs' subtitling configs
+    /// names that dictionary ([`Feed::references_dictionary`]). So a feed that is
+    /// created, reconfigured, associated or deleted changes the dictionaries it
+    /// references by that one write, with no second copy to keep in step, and this list
+    /// is a faithful view of the feeds `GetFeed`/`ListFeeds` report rather than a
+    /// separate opinion about them.
+    ///
+    /// Scans at most [`MAX_FEEDS`] feeds, each with at most [`MAX_OUTPUTS_PER_FEED`]
+    /// outputs.
+    pub fn feeds_referencing(&self, dictionary_id: &str) -> Vec<String> {
+        self.feeds
+            .values()
+            .filter(|feed| feed.references_dictionary(dictionary_id))
+            .map(|feed| feed.id.clone())
+            .collect()
+    }
+
+    /// Whether a feed that is not already retiring references `dictionary_id`, i.e.
+    /// whether "you cannot delete a dictionary that is referenced by a feed" bites.
+    ///
+    /// A feed whose deletion has been ACCEPTED (`DELETING`) is on its way out and so
+    /// holds nothing back: the dictionary it names may go as soon as the feed's own
+    /// deletion is accepted, which is what lets a caller tear down a feed and then its
+    /// dictionary without waiting for the feed's removal to fall due. It is still a
+    /// live record until then, so it stays in [`Self::feeds_referencing`].
+    pub fn delete_blocked_by_feed(&self, dictionary_id: &str) -> bool {
+        self.feeds.values().any(|feed| {
+            feed.status != FeedStatus::Deleting && feed.references_dictionary(dictionary_id)
+        })
+    }
+
     /// Materialise every transition the clock already owes at `now`, for feeds and
     /// for dictionaries alike.
     ///
@@ -541,7 +642,7 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                 // A feed whose deletion has completed is gone, so a later GetFeed
                 // answers ResourceNotFoundException.
                 FeedStatus::Deleting => false,
-                FeedStatus::Creating | FeedStatus::Updating => {
+                FeedStatus::Creating => {
                     // Where a transient lands depends on the feed's association, not
                     // on which call started it: a feed claimed by AssociateFeed while
                     // it was still settling becomes ACTIVE, an unclaimed one AVAILABLE.
@@ -560,17 +661,27 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                 }
             }
         });
-        for dictionary in self.dictionaries.values_mut() {
+        self.dictionaries.retain(|_, dictionary| {
             if dictionary.transition_due_at.is_none_or(|due| now < due) {
-                continue;
+                return true;
             }
             match dictionary.status {
+                // A dictionary whose deletion has completed is gone, so a later
+                // GetDictionary answers ResourceNotFoundException.
+                DictionaryStatus::Deleting => false,
                 // "After creation succeeds, the status will be AVAILABLE."
-                DictionaryStatus::Creating => dictionary.status = DictionaryStatus::Available,
-                DictionaryStatus::Available => {}
+                DictionaryStatus::Creating => {
+                    dictionary.status = DictionaryStatus::Available;
+                    dictionary.transition_due_at = None;
+                    true
+                }
+                // A settled status owes the clock nothing; clear the stale instant.
+                DictionaryStatus::Available => {
+                    dictionary.transition_due_at = None;
+                    true
+                }
             }
-            dictionary.transition_due_at = None;
-        }
+        });
         self.earliest_due = self
             .feeds
             .values()
@@ -612,6 +723,24 @@ pub fn names_another_account(arn: &str) -> bool {
     let is_account_id =
         account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit());
     is_account_id && *account != ::engine::emulator_account_id()
+}
+
+/// The refusal a `language` outside the modelled `DictionaryLanguage` enum earns, or
+/// `None` when the value is one the enum lists.
+///
+/// `language` is an enum member, so only the values the model lists are a dictionary
+/// language. The boundary validator refuses the rest, and this is the same refusal for
+/// a request that reaches a handler regardless — ONE copy, so `CreateDictionary` and
+/// `UpdateDictionary` cannot drift in which values they accept or in what they say
+/// about a value they do not.
+pub fn invalid_language_message(language: &str) -> Option<String> {
+    if crate::ops::types::DICTIONARY_LANGUAGE_VALUES.contains(&language) {
+        return None;
+    }
+    Some(format!(
+        "'{language}' is not a valid value for 'language'; it must be one of {}.",
+        crate::ops::types::DICTIONARY_LANGUAGE_VALUES.join(", ")
+    ))
 }
 
 /// The ARN of a dictionary in `region`:

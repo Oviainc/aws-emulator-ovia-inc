@@ -17,6 +17,9 @@ mod definition_versions;
 #[path = "all/endpoint.rs"]
 mod endpoint;
 
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 

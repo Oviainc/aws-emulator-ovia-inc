@@ -8,6 +8,11 @@
 //! transitions live here rather than in one of the operation files because all
 //! four batch operations apply the same rules to the same records.
 //!
+//! It also owns the IP access control groups `CreateIpGroup` mints and
+//! `DescribeIpGroups` reports: the registry keyed by `GroupId`, the name index
+//! that makes a group name unique across the account, and the creation order
+//! `DescribeIpGroups` paginates over.
+//!
 //! It owns the connection-alias lifecycle on the same terms: one record per
 //! alias, the creation order `DescribeConnectionAliases` paginates over, and the
 //! two transitions `CreateConnectionAlias` and `DeleteConnectionAlias` start.
@@ -35,11 +40,13 @@
 //! it has been registered.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AccountLink, ComputeType, ConnectionAlias, RootStorage, Tag, UserStorage, Workspace,
-    WorkspaceBundle, WorkspaceProperties, WorkspaceRequest, COMPUTE_VALUES,
+    AccountLink, ComputeType, ConnectionAlias, IpRuleItem, RootStorage, Tag, UserStorage,
+    Workspace, WorkspaceBundle, WorkspaceProperties, WorkspaceRequest, WorkspacesIpGroup,
+    COMPUTE_VALUES,
 };
 
 /// How long a lifecycle transition the clock owes stays in its transient state.
@@ -123,6 +130,12 @@ pub const MODELED_ERROR_ALREADY_EXISTS: &str = "ResourceAlreadyExistsException";
 /// with. See [`MODELED_ERROR_ALREADY_EXISTS`].
 pub const MODELED_ERROR_LIMIT_EXCEEDED: &str = "ResourceLimitExceededException";
 
+/// The most tags one WorkSpaces resource carries.
+///
+/// From the model's `CreateIpGroupRequest$Tags` doc: "The tags. Each WorkSpaces
+/// resource can have a maximum of 50 tags."
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// Per-item `ErrorType` code for a create request naming a directory that is not
 /// registered with WorkSpaces.
 ///
@@ -180,6 +193,37 @@ pub const MAX_REGISTERED_DIRECTORIES: usize = 50;
 /// a caller's terminate ever shrinks from growing without end, and sits far above
 /// anything a test or a client script creates.
 pub const MAX_STORED_WORKSPACES: usize = 2_000;
+
+/// The most IP access control groups this emulator stores at once.
+///
+/// AWS caps IP access control groups with a service quota and reports an exceeded
+/// cap as `ResourceLimitExceededException` ("Your resource limits have been
+/// exceeded"), which `CreateIpGroup` models. The NUMBER here is this emulator's
+/// own bound, not an AWS quota: it keeps an in-memory registry that only a
+/// caller's delete ever shrinks from growing without end, and sits far above
+/// anything a test or a client script creates.
+pub const MAX_STORED_IP_GROUPS: usize = 1_000;
+
+/// The most rules one IP access control group holds.
+///
+/// This service's model gives `IpRuleList` no length trait, so nothing refuses a
+/// caller-sized rule list before it is persisted. AWS publishes a
+/// rules-per-IP-access-control-group quota of 10 CIDR rules, and another AWS
+/// service spells the same `IpRuleList` as `len 1..100`; the NUMBER here is this
+/// emulator's own bound, set at the larger of the two so it cannot refuse a list
+/// AWS would accept, and small enough that a stored group's SIZE is bounded
+/// rather than caller-chosen.
+pub const MAX_RULES_PER_IP_GROUP: usize = 100;
+
+/// The longest free-text value this emulator stores for an IP access control
+/// group: its `GroupName`, its `GroupDesc` and a rule's `ruleDesc`.
+///
+/// The model gives `IpGroupName`, `IpGroupDesc` and `IpRuleDesc` no length trait
+/// either, so this is the emulator's own bound on what one record can retain. It
+/// is the 255 characters the model's own description-shaped member carries
+/// (`Tag$Value`, `len 0..255`), which is at or above every length AWS documents
+/// for these members, so a value AWS accepts is not refused here.
+pub const MAX_IP_GROUP_TEXT_CHARS: usize = 255;
 
 /// A per-item batch failure: the wire `ErrorCode` and `ErrorMessage` a
 /// `FailedCreateWorkspaceRequest` / `FailedWorkspaceChangeRequest` carries.
@@ -451,6 +495,31 @@ fn occupancy_key(directory_id: &str, user_name: &str, workspace_name: Option<&st
             "{directory_id}\u{1f}user\u{1f}{}",
             user_name.to_lowercase()
         )
+    }
+}
+
+/// One persisted IP access control group.
+#[derive(Debug, Clone)]
+pub struct IpGroupRecord {
+    /// Creation sequence number. The only ordering `DescribeIpGroups`
+    /// paginates over, so a page boundary is stable across calls.
+    pub seq: u64,
+    pub group_id: String,
+    pub group_name: String,
+    pub group_desc: Option<String>,
+    pub user_rules: Vec<IpRuleItem>,
+    pub tags: Vec<Tag>,
+}
+
+impl IpGroupRecord {
+    /// This record as the modelled `WorkspacesIpGroup` structure.
+    pub fn to_ip_group(&self) -> WorkspacesIpGroup {
+        WorkspacesIpGroup {
+            group_id: Some(self.group_id.clone()),
+            group_name: Some(self.group_name.clone()),
+            group_desc: self.group_desc.clone(),
+            user_rules: Some(self.user_rules.clone()),
+        }
     }
 }
 
@@ -810,6 +879,48 @@ impl AccountLinkRecord {
     }
 }
 
+/// Why an IP access control group could not be created.
+///
+/// Each variant names one of `CreateIpGroup`'s own modelled errors; the handler
+/// turns it into that error, so the decision lives next to the state it is made
+/// from and the wording next to the wire.
+#[derive(Debug, Clone)]
+pub enum IpGroupCreateError {
+    /// A stored group already carries the requested name; this is the
+    /// `GroupId` of the group that holds it. Answered as
+    /// `ResourceAlreadyExistsException`.
+    NameTaken(String),
+    /// The registry already holds [`MAX_STORED_IP_GROUPS`] groups. Answered as
+    /// `ResourceLimitExceededException`.
+    LimitExceeded,
+}
+
+/// Whether `value` is an IP address range in CIDR notation, or a single address.
+///
+/// The model's `IpRuleItem$ipRule` doc says "The IP address range, in CIDR
+/// notation", and constrains neither the family nor the prefix length, so both
+/// IPv4 and IPv6 are accepted, as is a bare address (the range holding just that
+/// address). Nothing is normalised: the value a caller sent is what
+/// `DescribeIpGroups` reports back.
+///
+/// The ADDRESS is parsed by `std`'s own `IpAddr` parser rather than by hand; all
+/// this adds is the prefix length, which is valid up to its family's address
+/// width (32 bits for IPv4, 128 for IPv6). No crate is pulled in for those two
+/// numbers.
+pub fn is_ip_range(value: &str) -> bool {
+    match value.split_once('/') {
+        Some((address, prefix)) => {
+            let Ok(address) = address.parse::<IpAddr>() else {
+                return false;
+            };
+            let width = if address.is_ipv4() { 32u8 } else { 128u8 };
+            prefix.parse::<u8>().is_ok_and(|bits| bits <= width)
+        }
+        // A bare address is the range holding just itself.
+        None => value.parse::<IpAddr>().is_ok(),
+    }
+}
+
 /// Whether `value` is a well-formed AWS account id.
 ///
 /// The model's `AwsAccount` is `^\d{12}$` (see
@@ -971,7 +1082,13 @@ fn catalog_user_capacity_gib(compute: &str) -> u32 {
 /// [`Self::workspace`], [`Self::workspace_count`] and
 /// [`Self::ordered_workspaces`].
 ///
-/// The connection-alias maps are the same arrangement for a second resource,
+/// The IP access control group maps are the same shape, and private for the same
+/// reason: a name index that outlived its group would make that group name
+/// permanently unusable. They are written only by [`Self::create_ip_group`] and
+/// read through [`Self::ip_group`], [`Self::ip_group_count`] and
+/// [`Self::ordered_ip_groups`].
+///
+/// The connection-alias maps are the same arrangement for a further resource,
 /// with [`Self::insert_alias_record`] / [`Self::remove_alias_record`] as the only
 /// writers and [`Self::connection_alias`], [`Self::connection_alias_count`] and
 /// [`Self::ordered_connection_aliases`] as the readers.
@@ -1003,6 +1120,19 @@ pub struct ComAmazonawsWorkspacesWorkspacesserviceState {
     /// Monotonic counter behind both the minted `WorkspaceId` and the creation
     /// order [`Self::ordered_workspaces`] reports.
     pub next_workspace_seq: u64,
+    /// Every stored IP access control group, keyed by its `GroupId`. Never
+    /// larger than [`MAX_STORED_IP_GROUPS`].
+    ip_groups: HashMap<String, IpGroupRecord>,
+    /// Which `GroupId` holds each taken group name: a group name is unique
+    /// across the account, so this index is what makes two creates on one name
+    /// leave exactly one group behind.
+    ip_group_names: HashMap<String, String>,
+    /// `GroupId` by creation sequence: the stable order
+    /// [`Self::ordered_ip_groups`] reports.
+    ip_group_order: BTreeMap<u64, String>,
+    /// Monotonic counter behind both the minted `GroupId` and the creation order
+    /// [`Self::ordered_ip_groups`] reports.
+    next_ip_group_seq: u64,
     /// Every stored connection alias, keyed by its `AliasId`. Never larger than
     /// [`MAX_STORED_CONNECTION_ALIASES`].
     connection_aliases: HashMap<String, ConnectionAliasRecord>,
@@ -1089,6 +1219,10 @@ impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
             occupancy: HashMap::new(),
             order: BTreeMap::new(),
             next_workspace_seq: 0,
+            ip_groups: HashMap::new(),
+            ip_group_names: HashMap::new(),
+            ip_group_order: BTreeMap::new(),
+            next_ip_group_seq: 0,
             connection_aliases: HashMap::new(),
             connection_strings: HashMap::new(),
             alias_order: BTreeMap::new(),
@@ -1484,6 +1618,68 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     fn next_seq(&mut self) -> u64 {
         self.next_workspace_seq += 1;
         self.next_workspace_seq
+    }
+
+    /// Every stored IP access control group in creation order.
+    pub fn ordered_ip_groups(&self) -> Vec<&IpGroupRecord> {
+        self.ip_group_order
+            .values()
+            .filter_map(|group_id| self.ip_groups.get(group_id))
+            .collect()
+    }
+
+    /// The stored IP access control group `group_id` names, if any.
+    pub fn ip_group(&self, group_id: &str) -> Option<&IpGroupRecord> {
+        self.ip_groups.get(group_id)
+    }
+
+    /// How many IP access control groups are stored.
+    pub fn ip_group_count(&self) -> usize {
+        self.ip_groups.len()
+    }
+
+    /// Create one IP access control group, or report why it could not be created.
+    ///
+    /// The name index is consulted and written under the same lock as the
+    /// registry, so of any number of creates racing on one name exactly one is
+    /// accepted and every other is told the name is taken.
+    ///
+    /// The returned record is a snapshot of what was persisted, so the caller
+    /// can answer from it without holding the map borrow.
+    pub fn create_ip_group(
+        &mut self,
+        group_name: &str,
+        group_desc: Option<String>,
+        user_rules: Vec<IpRuleItem>,
+        tags: Vec<Tag>,
+    ) -> Result<IpGroupRecord, IpGroupCreateError> {
+        if let Some(existing) = self.ip_group_names.get(group_name) {
+            return Err(IpGroupCreateError::NameTaken(existing.clone()));
+        }
+        // The registry is bounded: refuse rather than grow without end.
+        if self.ip_groups.len() >= MAX_STORED_IP_GROUPS {
+            return Err(IpGroupCreateError::LimitExceeded);
+        }
+
+        self.next_ip_group_seq += 1;
+        let seq = self.next_ip_group_seq;
+        // `IpGroupId` is `^wsipg-[0-9a-z]{8,63}$`: eight lowercase hex digits of
+        // the sequence number, which is strictly increasing and never reset, so
+        // no two groups in one run of the emulator can share an id.
+        let group_id = format!("wsipg-{seq:08x}");
+        let record = IpGroupRecord {
+            seq,
+            group_id: group_id.clone(),
+            group_name: group_name.to_string(),
+            group_desc,
+            user_rules,
+            tags,
+        };
+        self.ip_group_names
+            .insert(record.group_name.clone(), group_id.clone());
+        self.ip_group_order.insert(seq, group_id.clone());
+        self.ip_groups.insert(group_id, record.clone());
+        Ok(record)
     }
 
     /// Every stored connection alias in creation order.
@@ -2024,9 +2220,9 @@ fn invalid_state(
 /// between two pages then shifts nothing, so a paginating client cannot skip an
 /// item. The encoding is a fixed-width lowercase-hex rendering of that sequence
 /// number — deterministic, so resuming needs no stored token, and 16 characters
-/// long, inside the model's `PaginationToken` length of 1..2048. Both paginated
-/// readers (`DescribeWorkspaces` over WorkSpaces, `ListAccountLinks` over
-/// account links) share it, so one token format covers the service.
+/// long, inside the model's `PaginationToken` length of 1..2048. EVERY paginated
+/// reader in this service shares it, each over its own creation sequence, so one
+/// token format covers the service.
 pub fn encode_page_token(after_seq: u64) -> String {
     format!("{after_seq:016x}")
 }

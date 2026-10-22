@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the named `tagKeys` from the tags PERSISTED in [`crate::state`]
+//! for the resource `resourceArn` names — a suite definition or a suite run — so every
+//! later read of that resource (`ListTagsForResource`, `GetSuiteDefinition`,
+//! `GetSuiteRun`) answers without them. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Keys the resource does not carry are left alone rather than refused: removal is
+//! idempotent, so the call states what the resource must NOT carry afterwards. A
+//! `resourceArn` that is not one of this service's ARNs is refused with the modelled
+//! `ValidationException`, and one this store holds no resource for with
+//! `ResourceNotFoundException` — the same order `TagResource` and `ListTagsForResource`
+//! follow, and never a silently accepted no-op.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +140,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+            })
+        })?;
+
+        // A `resourceArn` that is not one of this service's ARNs is a bad REQUEST, not a
+        // missing resource: it is refused with the modelled client-input error before
+        // anything is looked up or written — the same order `TagResource` and
+        // `ListTagsForResource` follow.
+        let resource = crate::state::parse_resource_arn(&input.resource_arn).map_err(|message| {
+            UntagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // Tags live on a resource, so an ARN this store holds no resource for is the
+        // modelled 404, not a silently accepted no-op. Checked before anything is written,
+        // so a refused call leaves the store exactly as it was.
+        if !store.holds_tagged_resource(&input.resource_arn, &resource) {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No IoT Device Advisor resource with resourceArn {}",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Removal is idempotent: a key the resource does not carry is absent afterwards
+        // too, so the count below is for the audit trail only and never changes the
+        // answer. An empty `tagKeys` list is legal (`TagKeyList` is `len 0..50`) and
+        // removes nothing.
+        let removed =
+            store.remove_tags(&input.resource_arn, input.tag_keys.iter().map(String::as_str));
+
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            &region,
+            &input.resource_arn,
+            &format!("untagged {removed} of {} key(s)", input.tag_keys.len()),
+        );
+        Ok(UntagResourceOutput {})
     }
 }

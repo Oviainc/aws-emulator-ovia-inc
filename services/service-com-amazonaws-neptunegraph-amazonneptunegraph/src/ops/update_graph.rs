@@ -181,9 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(graph) = store.settled_graph_mut(&input.graph_identifier, now) else {
             return Err(UpdateGraphErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("graph {} not found", input.graph_identifier),
-                },
+                crate::state::graph_not_found(&input.graph_identifier),
             )
             .into());
         };

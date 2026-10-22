@@ -29,6 +29,9 @@ mod connection_alias_lifecycle;
 #[path = "all/create_workspaces_validation.rs"]
 mod create_workspaces_validation;
 
+#[path = "all/ip_access_control_groups.rs"]
+mod ip_access_control_groups;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
