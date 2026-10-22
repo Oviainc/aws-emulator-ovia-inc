@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateEnvironmentOperationsRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateEnvironmentOperationsRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateEnvironmentOperationsRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores the operations role on the named environment, so every later
+//! read of that environment reports it. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateEnvironmentOperationsRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateEnvironmentOperationsRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateEnvironmentOperationsRole"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateEnvironmentOperationsRoleError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // `EnvironmentName` is @required, so the boundary validator has already
+        // refused a request without one: only a name no environment answers to
+        // can reach here.
+        let environment_id = store
+            .environment_id_for(None, Some(input.environment_name.as_str()))
+            .map_err(|refusal| match refusal {
+                crate::state::EnvironmentRefusal::NoIdentifier => {
+                    AssociateEnvironmentOperationsRoleError::missing_required_parameter(
+                        "Must specify an EnvironmentName.",
+                    )
+                }
+                crate::state::EnvironmentRefusal::NotFound(message) => {
+                    AssociateEnvironmentOperationsRoleError::invalid_parameter_value(message)
+                }
+            })?;
+
+        let environment = store.environments.get_mut(&environment_id).ok_or_else(|| {
+            AssociateEnvironmentOperationsRoleError::invalid_parameter_value(
+                crate::state::missing_environment_message(Some(environment_id.as_str()), None),
+            )
+        })?;
+        // An environment in the shut-down process, or already shut down, acts on
+        // nothing downstream, so there is no role left to associate with it.
+        if environment.status == crate::state::STATUS_TERMINATING || environment.is_terminated() {
+            return Err(
+                AssociateEnvironmentOperationsRoleError::invalid_parameter_value(format!(
+                    "Environment {} is not in a state from which an operations role can be associated. Current status: {}.",
+                    environment.environment_name, environment.status
+                )),
+            );
+        }
+
+        // "Add or change the operations role used by an environment. After this
+        // call is made, Elastic Beanstalk uses the associated operations role
+        // … during subsequent calls acting on this environment" — so the role
+        // replaces whatever the environment carried and is what every later read
+        // of it reports.
+        environment.operations_role = Some(input.operations_role.clone());
+        environment.date_updated = crate::state::now();
+        Ok(AssociateEnvironmentOperationsRoleOutput)
     }
 }
