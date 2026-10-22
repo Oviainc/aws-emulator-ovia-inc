@@ -246,13 +246,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             template.queue = Some(queue);
         }
         if let Some(priority) = input.priority {
-            template.priority = Some(priority);
+            template.priority = priority;
         }
         if let Some(interval) = input.status_update_interval {
-            template.status_update_interval = Some(interval);
+            template.status_update_interval = interval;
         }
         if let Some(acceleration) = input.acceleration_settings {
-            template.acceleration_settings = Some(acceleration);
+            template.acceleration_settings = acceleration;
         }
         if let Some(hops) = input.hop_destinations {
             template.hop_destinations = hops;
