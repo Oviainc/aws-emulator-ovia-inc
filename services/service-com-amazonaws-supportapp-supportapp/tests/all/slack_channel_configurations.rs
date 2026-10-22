@@ -45,11 +45,14 @@ const ACCOUNT_ALIAS_MAX_LEN: usize = 30;
 const SEVERITY_LEVELS: [&str; 3] = ["none", "all", "high"];
 
 /// One wire answer, reduced to what a client branches on.
+///
+/// `pub(crate)` so the sibling suites in this test target (see `tests/all.rs`) drive
+/// the same wire harness instead of each building its own.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: String,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 impl Reply {
@@ -57,7 +60,7 @@ impl Reply {
         self.body.get(name).filter(|value| !value.is_null())
     }
 
-    fn string(&self, name: &str) -> Option<String> {
+    pub(crate) fn string(&self, name: &str) -> Option<String> {
         self.field(name)
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -73,12 +76,12 @@ impl Reply {
 
 /// An emulator with just this service mounted on a fresh engine, driven in-process
 /// through the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes by the
@@ -88,7 +91,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, path: &str, body: Value) -> Reply {
+    pub(crate) async fn call(&self, path: &str, body: Value) -> Reply {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/supportapp/aws4_request, \
              SignedHeaders=host, Signature=deadbeef"
@@ -125,15 +128,15 @@ impl Emulator {
         }
     }
 
-    async fn create(&self, body: Value) -> Reply {
+    pub(crate) async fn create(&self, body: Value) -> Reply {
         self.call("create-slack-channel-configuration", body).await
     }
 
-    async fn update(&self, body: Value) -> Reply {
+    pub(crate) async fn update(&self, body: Value) -> Reply {
         self.call("update-slack-channel-configuration", body).await
     }
 
-    async fn delete(&self, team_id: &str, channel_id: &str) -> Reply {
+    pub(crate) async fn delete(&self, team_id: &str, channel_id: &str) -> Reply {
         self.call(
             "delete-slack-channel-configuration",
             json!({ "teamId": team_id, "channelId": channel_id }),
@@ -149,7 +152,7 @@ impl Emulator {
         self.call("list-slack-channel-configurations", body).await
     }
 
-    async fn put_alias(&self, alias: &str) -> Reply {
+    pub(crate) async fn put_alias(&self, alias: &str) -> Reply {
         self.call("put-account-alias", json!({ "accountAlias": alias }))
             .await
     }
@@ -161,7 +164,7 @@ impl Emulator {
     /// The single stored configuration for `(team_id, channel_id)` as the listing
     /// reports it, or `None` when the listing does not hold it. Walks every page, so a
     /// configuration on a later page is still found.
-    async fn listed(&self, team_id: &str, channel_id: &str) -> Option<Value> {
+    pub(crate) async fn listed(&self, team_id: &str, channel_id: &str) -> Option<Value> {
         let mut token: Option<String> = None;
         loop {
             let page = self.list(token.as_deref()).await;
@@ -259,7 +262,7 @@ impl Case {
 
 /// A role ARN of `role_name`, matching `channelRoleArn`'s
 /// `pattern ^arn:aws:iam::[0-9]{12}:role/(.+)$`.
-fn role_arn(role_name: &str) -> String {
+pub(crate) fn role_arn(role_name: &str) -> String {
     format!(
         "arn:aws:iam::{account}:role/{role_name}",
         account = engine::EMULATOR_ACCOUNT_ID

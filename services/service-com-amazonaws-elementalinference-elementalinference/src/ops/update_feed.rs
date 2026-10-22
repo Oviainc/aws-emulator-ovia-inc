@@ -196,6 +196,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = std::time::Instant::now();
 
+        // The access role is evaluated by attempting to PASS it, which is an
+        // authorization decision and so is taken before the feed is touched: a role
+        // ARN that names another account is denied (HTTP 403), never reported as a
+        // malformed request.
+        if input
+            .access_role_arn
+            .as_deref()
+            .is_some_and(crate::state::names_another_account)
+        {
+            return Err(UpdateFeedErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
         let mut state = state.lock();
         state.settle_due_transitions(now);
 

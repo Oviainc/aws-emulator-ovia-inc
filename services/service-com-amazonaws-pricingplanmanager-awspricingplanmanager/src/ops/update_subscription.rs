@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes a subscription's plan tier under `If-Match`. An upgrade takes effect
+//! immediately; a downgrade is recorded as a pending `ScheduledChange` and the current
+//! tier stays put until the end of the billing cycle.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSubscription"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSubscriptionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let UpdateSubscriptionInput {
+            arn,
+            plan_tier,
+            usage_level,
+            if_match,
+            client_token: _,
+        } = input;
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        store.apply_due_changes(now);
+        let record = match store.resolve_for_mutation(&arn, &if_match) {
+            Ok(record) => record,
+            Err(crate::state::PreconditionFailure::NotFound) => {
+                return Err(UpdateSubscriptionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("no subscription with ARN {arn}"),
+                        resource_id: arn,
+                    },
+                )
+                .into());
+            }
+            Err(crate::state::PreconditionFailure::ETagMismatch) => {
+                return Err(UpdateSubscriptionErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::IF_MATCH_CONFLICT_MESSAGE.to_string(),
+                        resource_id: arn,
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "You cannot update a subscription while a scheduled change is pending. To make
+        // a new change, first cancel the pending change using CancelSubscriptionChange."
+        if record.scheduled_change.is_some() {
+            return Err(UpdateSubscriptionErrorModeled::ConflictException(
+                ConflictException {
+                    message: "the subscription has a scheduled change pending; cancel it \
+                              with CancelSubscriptionChange before making another change"
+                        .to_string(),
+                    resource_id: arn,
+                },
+            )
+            .into());
+        }
+
+        // "Upgrades take effect immediately. Downgrades are scheduled and the current
+        // tier remains unchanged until the end of the billing cycle (calendar month)."
+        // A tier the service docs do not publish has no rank, so it cannot be ordered
+        // against the current one and is applied immediately.
+        let is_downgrade = match (
+            crate::state::plan_tier_rank(&record.plan_tier),
+            crate::state::plan_tier_rank(&plan_tier),
+        ) {
+            (Some(current), Some(target)) => target < current,
+            _ => false,
+        };
+
+        if is_downgrade {
+            record.scheduled_change = Some(crate::state::ScheduledChangeRecord {
+                change_type: crate::state::ChangeType::Downgrade,
+                effective_date: Some(crate::state::end_of_billing_period(now)),
+                plan_tier: Some(plan_tier),
+                usage_level,
+            });
+        } else {
+            record.plan_tier = plan_tier;
+            // "This operation replaces the plan tier value. If you omit the optional
+            // usageLevel field, it is reset to the default."
+            record.usage_level = usage_level;
+        }
+        record.touch(now);
+
+        Ok(UpdateSubscriptionOutput {
+            subscription: record.to_subscription(),
+            e_tag: record.etag(),
+        })
     }
 }
+

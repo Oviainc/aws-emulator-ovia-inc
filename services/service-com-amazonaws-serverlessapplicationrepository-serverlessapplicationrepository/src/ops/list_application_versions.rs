@@ -130,10 +130,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListApplicationVersionsErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    error_code: Some("500".to_string()),
-                    message: Some("the service state is unavailable".to_string()),
-                },
+                crate::state::internal_server_error("the service state is unavailable"),
             )
             .into());
         };
@@ -141,13 +138,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(application) = store.applications.get(&input.application_id) else {
             return Err(ListApplicationVersionsErrorModeled::NotFoundException(
-                NotFoundException {
-                    error_code: Some("404".to_string()),
-                    message: Some(format!(
-                        "No application exists with the id {}.",
-                        input.application_id
-                    )),
-                },
+                crate::state::not_found(
+                    crate::state::ErrorCode::ApplicationNotFound,
+                    crate::state::application_not_found_message(&input.application_id),
+                ),
             )
             .into());
         };
@@ -159,10 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(|error| {
             ListApplicationVersionsError::from(
-                ListApplicationVersionsErrorModeled::BadRequestException(BadRequestException {
-                    error_code: Some("400".to_string()),
-                    message: Some(error.message().to_string()),
-                }),
+                ListApplicationVersionsErrorModeled::BadRequestException(
+                    crate::state::bad_request(error.message()),
+                ),
             )
         })?;
 

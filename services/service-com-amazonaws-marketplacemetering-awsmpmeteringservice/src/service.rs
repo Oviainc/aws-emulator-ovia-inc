@@ -45,6 +45,19 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The service key `emulator_server::service_from_target` reads out of the
+/// `X-Amz-Target` header this service's awsJson1_1 operations carry: that reader takes
+/// the segment before the `.`, strips an `_<digits>` version suffix and lower-cases it,
+/// so `AWSMPMeteringService.<OperationName>` (`OPERATIONS.md`, "Request routing")
+/// normalises to this key — while each Marketplace sibling's own target normalises to a
+/// different one (`AWSMPEntitlementService.…`, `AWSMPCommerceService_v20200301.…`).
+const TARGET_SERVICE_KEY: &str = "awsmpmeteringservice";
+
+/// Whether `parts` names THIS service in its `X-Amz-Target` header.
+fn target_names_this_service(parts: &http::request::Parts) -> bool {
+    emulator_server::service_from_target(&parts.headers).as_deref() == Some(TARGET_SERVICE_KEY)
+}
+
 /// Whether `parts` addresses the ROOT path, which is where every request to an
 /// `awsJson1_1` service arrives: the protocol posts every operation to `/` and
 /// carries the operation name in `X-Amz-Target` rather than in the URI.
@@ -97,12 +110,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // makes every one of them claim every request — which the router answers
         // `500 AmbiguousService`, leaving all of them unreachable.
         //
-        // So the claim is narrowed to this service's own wire path space: it speaks
+        // So the claim is narrowed to this service's own wire surface. It speaks
         // `awsJson1_1`, so every one of its requests is a `POST /` (see
-        // `claims_root_path`), and the REST peers that share its signing name each own
-        // a real path space of their own.
+        // `claims_root_path`), which already leaves the REST peers' path spaces alone —
+        // and because its RPC peers (Agreement, the Entitlement Service) post to that
+        // same root path, the request must ALSO name this service in the header its
+        // protocol routes by: `X-Amz-Target: AWSMPMeteringService.<OperationName>`
+        // (`OPERATIONS.md`). A request carrying no such target names no operation of
+        // this service, so it is not this service's traffic.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) if key == self.entry.identity().signing_name() => claims_root_path(parts),
+            Some(key) if key == self.entry.identity().signing_name() => {
+                claims_root_path(parts) && target_names_this_service(parts)
+            }
             _ => false,
         }
     }

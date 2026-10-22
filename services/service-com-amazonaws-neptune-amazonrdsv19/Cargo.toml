@@ -21,12 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256, used to mint the opaque resource ids and DNS labels the API reports
+# (DbClusterResourceId, DbiResourceId, endpoint shard labels) deterministically.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
+# `time` is enabled here (and only for tests) so a suite can await the clock-owed
+# `creating` -> `available` transition without blocking the runtime worker.
+tokio = { workspace = true, features = ["time"] }
 hex = { workspace = true }
 
 [lints]

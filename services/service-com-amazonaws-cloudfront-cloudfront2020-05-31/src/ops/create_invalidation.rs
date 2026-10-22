@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInvalidation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInvalidation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInvalidation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an invalidation under one distribution: stores the submitted batch with a
+//! generated id, `InProgress` until the clock owes it `Completed`, and reports the
+//! record it stored. A repeated `CallerReference` for the same batch is the same
+//! request again, so it reports the invalidation it already created.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +75,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::StoredInvalidation;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +154,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInvalidation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInvalidationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInvalidation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(stored) = store.distribution(&input.distribution_id) else {
+            return Err(CreateInvalidationErrorModeled::NoSuchDistribution(
+                crate::state::no_such_distribution(&input.distribution_id),
+            )
+            .into());
+        };
+
+        // "The value of Quantity and the size of Items don't match."
+        if let Some(message) = crate::state::batch_quantity_mismatch(&input.invalidation_batch) {
+            return Err(CreateInvalidationErrorModeled::InconsistentQuantities(
+                InconsistentQuantities {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // "Invalidation batch specified is too large." The batch is stored whole, so the
+        // number of paths one request may name is bounded before anything is stored.
+        let path_count = crate::state::batch_path_count(&input.invalidation_batch);
+        if path_count > crate::state::MAX_INVALIDATION_PATHS {
+            return Err(CreateInvalidationErrorModeled::BatchTooLarge(BatchTooLarge {
+                message: Some(format!(
+                    "An invalidation batch names at most {} paths; this one names {path_count}",
+                    crate::state::MAX_INVALIDATION_PATHS
+                )),
+            })
+            .into());
+        }
+
+        // "If you make a second invalidation request with the same value for
+        // CallerReference, and if the rest of the request is the same, CloudFront
+        // doesn't create a new invalidation request. Instead, CloudFront returns
+        // information about the invalidation request that you previously created with
+        // the same CallerReference."
+        let repeated = stored
+            .invalidations
+            .values()
+            .find(|existing| {
+                existing.batch.caller_reference == input.invalidation_batch.caller_reference
+            })
+            .cloned();
+        if let Some(existing) = repeated {
+            if crate::state::same_batch(&existing.batch, &input.invalidation_batch) {
+                return Ok(CreateInvalidationOutput {
+                    location: Some(crate::state::location_uri(
+                        ctx.parts(),
+                        &crate::state::invalidation_path(&input.distribution_id, &existing.id),
+                    )),
+                    invalidation: Some(existing.to_invalidation()),
+                });
+            }
+            // The same reference naming a DIFFERENT set of paths is not the same
+            // request again, and a caller reference identifies one invalidation for its
+            // whole life, so the second batch is refused rather than stored under a
+            // reference that is already taken.
+            return Err(CreateInvalidationErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(format!(
+                    "The CallerReference {} was already used for invalidation {} of this \
+                     distribution with different paths",
+                    input.invalidation_batch.caller_reference, existing.id
+                )),
+            })
+            .into());
+        }
+
+        // "You have exceeded the maximum number of allowable InProgress invalidation
+        // batch requests, or invalidation objects." The invalidations of one
+        // distribution grow only here and a record cannot be evicted (a later
+        // GetInvalidation has to answer with what this create returned), so the bound is
+        // an entry count refused BEFORE anything is stored.
+        if stored.invalidations.len() >= crate::state::MAX_INVALIDATIONS_PER_DISTRIBUTION {
+            return Err(
+                CreateInvalidationErrorModeled::TooManyInvalidationsInProgress(
+                    TooManyInvalidationsInProgress {
+                        message: Some(format!(
+                            "This emulator holds at most {} invalidations per distribution",
+                            crate::state::MAX_INVALIDATIONS_PER_DISTRIBUTION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.allocate_invalidation_id(&input.distribution_id);
+        let invalidation = StoredInvalidation {
+            id: id.clone(),
+            // An invalidation batch CloudFront has just accepted has not finished yet,
+            // so it reports the transient status until the clock owes it the terminal
+            // one.
+            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            create_time: now,
+            completed_due: now + crate::state::PROPAGATION_DELAY,
+            // Stored whole: a later read of this invalidation answers from the batch as
+            // submitted.
+            batch: input.invalidation_batch,
+        };
+        let reported = invalidation.to_invalidation();
+        let Some(owner) = store.distributions.get_mut(&input.distribution_id) else {
+            return Err(CreateInvalidationErrorModeled::NoSuchDistribution(
+                crate::state::no_such_distribution(&input.distribution_id),
+            )
+            .into());
+        };
+        owner.invalidations.insert(id.clone(), invalidation);
+
+        Ok(CreateInvalidationOutput {
+            // "The fully qualified URI of the distribution and invalidation batch
+            // request, including the Invalidation ID."
+            location: Some(crate::state::location_uri(
+                ctx.parts(),
+                &crate::state::invalidation_path(&input.distribution_id, &id),
+            )),
+            invalidation: Some(reported),
+        })
     }
 }

@@ -201,6 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — a feed that was never associated, one mid-transition, one already released —
         // has nothing to release. The refusal is a ValidationException (400): that is
         // what the recorded behaviour of a release on a never-associated feed answers.
+        //
+        // A feed whose deletion has been accepted is DELETING, so it is refused here
+        // too: the release can neither run nor discard the removal the clock owes.
         if feed.status != crate::state::FeedStatus::Active {
             return Err(DisassociateFeedErrorModeled::ValidationException(
                 ValidationException {

@@ -204,6 +204,7 @@ pub enum IdempotencyScope {
     CreateHttpNamespace,
     CreateService,
     RegisterInstance,
+    UpdateHttpNamespace,
 }
 impl IdempotencyScope {
     fn as_str(self) -> &'static str {
@@ -211,6 +212,7 @@ impl IdempotencyScope {
             Self::CreateHttpNamespace => "CreateHttpNamespace",
             Self::CreateService => "CreateService",
             Self::RegisterInstance => "RegisterInstance",
+            Self::UpdateHttpNamespace => "UpdateHttpNamespace",
         }
     }
 }
@@ -405,7 +407,8 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
     /// The id a previous call with this `CreatorRequestId` returned, if any.
     ///
     /// `request` identifies WHAT was asked for (the namespace name, the service's
-    /// namespace and name, the service and instance id), so a token reused for a
+    /// namespace and name, the service and instance id, the namespace and the change
+    /// asked of it), so a token reused for a
     /// different resource is not treated as a retry of the first one — a retry that
     /// silently stored nothing while answering 200 would be indistinguishable from a
     /// stored write.

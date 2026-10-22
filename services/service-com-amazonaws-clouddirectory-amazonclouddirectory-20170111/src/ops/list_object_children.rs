@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListObjectChildren
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListObjectChildren`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListObjectChildren::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists an object's children as a `LinkName -> ObjectIdentifier` map, read from the
+//! links `CreateObject` (and the other attach operations) recorded. The children are
+//! held in link-name order, so a `NextToken` names a stable offset into that order.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +172,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListObjectChildren` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListObjectChildrenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListObjectChildren"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListObjectChildrenErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Cloud Directory state store is unavailable".to_string()),
+            })
+        })?;
+
+        // A read: this handler only ever borrows the store immutably.
+        let store = state.lock();
+
+        let Some(directory) = store.directories.get(&input.directory_arn) else {
+            return Err(ListObjectChildrenErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no directory exists at {}", input.directory_arn)),
+                },
+            )
+            .into());
+        };
+        if directory.state != crate::state::DirectoryLifecycle::Enabled {
+            return Err(ListObjectChildrenErrorModeled::DirectoryNotEnabledException(
+                DirectoryNotEnabledException {
+                    message: Some(format!(
+                        "directory {} is {} and does not serve data operations",
+                        directory.arn,
+                        directory.state.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(selector) = input.object_reference.selector.as_deref() else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "ObjectReference.Selector is required",
+            ));
+        };
+        let object_identifier = match directory.resolve_selector(selector) {
+            Ok(identifier) => identifier,
+            Err(crate::state::SelectorError::Malformed(message)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(message))
+            }
+            Err(crate::state::SelectorError::NotFound(message)) => {
+                return Err(ListObjectChildrenErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+        let Some(object) = directory.objects.get(&object_identifier) else {
+            return Err(ListObjectChildrenErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no object with identifier {object_identifier} exists in directory {}",
+                        directory.arn
+                    )),
+                },
+            )
+            .into());
+        };
+        // Only a node holds children; asking a leaf node, a policy or an index for its
+        // children is the case `NotNodeException` is modelled for.
+        if !crate::state::object_is_node(&store.schemas, object) {
+            return Err(ListObjectChildrenErrorModeled::NotNodeException(
+                NotNodeException {
+                    message: Some(format!(
+                        "object {object_identifier} is not a NODE and holds no children"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let ordered: Vec<(&String, &String)> = object.children.iter().collect();
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                match crate::state::decode_page_token(token, &object_identifier)
+                    .filter(|offset| *offset <= ordered.len())
+                {
+                    Some(offset) => offset,
+                    None => {
+                        return Err(ListObjectChildrenErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "NextToken was not issued by this service for this listing"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        // `MaxResults` has a modelled minimum of 1 and no maximum; absent, the whole
+        // remainder is returned in one page. The clamp is defensive: a page size of 0
+        // would issue a NextToken for an empty page, which a paging client loops on
+        // forever.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(ordered.len())
+            .max(1);
+        let end = offset.saturating_add(page_size).min(ordered.len());
+        let children: std::collections::HashMap<String, String> = ordered[offset..end]
+            .iter()
+            .map(|(link_name, child)| ((*link_name).clone(), (*child).clone()))
+            .collect();
+        let next_token = (end < ordered.len())
+            .then(|| crate::state::encode_page_token(&object_identifier, end));
+
+        Ok(ListObjectChildrenOutput {
+            children: Some(children),
+            next_token,
+        })
     }
 }

@@ -254,6 +254,54 @@ pub fn resource_type_of(resource_arn: &str) -> Option<String> {
     is_modelled_resource_type(resource_type).then(|| resource_type.to_string())
 }
 
+/// The resource types this service supports, which is what
+/// `GetSupportedResourceTypes` reports and what every other operation that
+/// names a `ResourceType` is measured against.
+///
+/// SOURCE, for all but the last two entries: the model's own documentation for
+/// the member being reported —
+/// `smithy_query(query="doc", shape="GetSupportedResourceTypesOutput",
+/// member="ResourceTypes", model_path="services/service-com-amazonaws-backup-cryocontrollerusermanager/smithy-model/com-amazonaws-backup-cryocontrollerusermanager.json")`
+/// — which enumerates each supported type with the service it stands for.
+///
+/// The last two, `DSQL` (Aurora DSQL) and `Redshift Serverless`, are services
+/// AWS Backup supports whose types that member's documentation predates; AWS
+/// reports them in the list today. Membership is Region- and era-dependent at
+/// AWS — a Region that has a newer service adds its type — so the catalog is a
+/// set this emulator OWNS: it is what this emulator supports, and an operation
+/// that answers for a resource type reads it from here rather than carrying a
+/// list of its own.
+///
+/// Three of the spellings (`Storage Gateway`, `SAP HANA on Amazon EC2`,
+/// `Redshift Serverless`) contain spaces, which the `ResourceType` shape's own
+/// `@pattern` (`^[a-zA-Z0-9\-\_\.]{1,50}$`) refuses. That pattern governs what
+/// a CALLER may send — AWS reports these spellings and refuses them as input
+/// just the same — so they are reported here as AWS spells them. See
+/// `is_modelled_resource_type`, which is the other side of the same line: a
+/// type this service DERIVES for a stored resource is only reported in a form
+/// the pattern admits.
+pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
+    "Aurora",
+    "CloudFormation",
+    "DSQL",
+    "DocumentDB",
+    "DynamoDB",
+    "EBS",
+    "EC2",
+    "EFS",
+    "EKS",
+    "FSx",
+    "Neptune",
+    "RDS",
+    "Redshift",
+    "Redshift Serverless",
+    "S3",
+    "SAP HANA on Amazon EC2",
+    "Storage Gateway",
+    "Timestream",
+    "VirtualMachine",
+];
+
 /// A backup vault: the logical container `CreateBackupVault` inserts.
 #[derive(Debug, Clone)]
 pub struct BackupVault {

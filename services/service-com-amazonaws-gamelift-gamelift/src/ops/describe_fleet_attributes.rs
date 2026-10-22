@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFleetAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFleetAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFleetAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored fleets: every one of them when the request names no fleet, and
+//! only the named ones otherwise, a page at a time.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,20 +162,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFleetAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFleetAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFleetAttributes"))
+        // "Some API operations limit the number of fleet IDs that are allowed in one
+        // request. If a request exceeds this limit, the request fails and the error
+        // message contains the maximum allowed number." Refuse an oversized list HERE,
+        // before any state is locked and before a single record is cloned, so the size
+        // of the response can never be driven by the size of the request.
+        if let Some(requested) = input.fleet_ids.as_ref() {
+            if requested.len() > crate::state::MAX_FLEET_IDS_PER_REQUEST {
+                return Err(DescribeFleetAttributesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "FleetIds names {} fleet identifiers; the maximum allowed number is {}.",
+                            requested.len(),
+                            crate::state::MAX_FLEET_IDS_PER_REQUEST
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeFleetAttributesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        // "To get attributes for specific fleets, provide a list of fleet IDs or fleet
+        // ARNs. To get attributes for all fleets, do not provide a fleet identifier."
+        let Some(requested) = input.fleet_ids.as_ref() else {
+            let attributes: Vec<FleetAttributes> = state
+                .fleets_in_order()
+                .into_iter()
+                .map(crate::state::Fleet::attributes)
+                .collect();
+            let Some((page, next_token)) =
+                crate::state::paginate(
+                    crate::state::PageKind::Fleets,
+                    &attributes,
+                    input.limit,
+                    input.next_token.as_deref(),
+                )
+            else {
+                return Err(DescribeFleetAttributesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "NextToken is not a pagination token this service issued.".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            return Ok(DescribeFleetAttributesOutput {
+                fleet_attributes: Some(page),
+                next_token,
+            });
+        };
+
+        // Both `Limit` and `NextToken` document the same carve-out: "This parameter is
+        // ignored when the request specifies one or a list of fleet IDs." So a request
+        // that names fleets gets all of them, whole, and no token.
+        let mut selected = Vec::new();
+        let mut reported = ::std::collections::HashSet::new();
+        for id_or_arn in requested {
+            let fleet_id = state.resolve_fleet_id(id_or_arn);
+            let fleet = fleet_id
+                .as_ref()
+                .and_then(|fleet_id| state.fleets.get(fleet_id));
+            let (Some(fleet_id), Some(fleet)) = (fleet_id, fleet) else {
+                return Err(DescribeFleetAttributesErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!("The fleet {id_or_arn} was not found.")),
+                    },
+                )
+                .into());
+            };
+            // "a FleetAttributes object is returned for each fleet requested": one per
+            // distinct FLEET, so naming the same fleet twice — by id and by ARN, or just
+            // repeatedly — reports it once rather than copying the record per entry.
+            if reported.insert(fleet_id) {
+                selected.push(fleet.attributes());
+            }
+        }
+
+        Ok(DescribeFleetAttributesOutput {
+            fleet_attributes: Some(selected),
+            next_token: None,
+        })
     }
 }

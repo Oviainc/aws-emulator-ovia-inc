@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the subscriptions in the store as `SubscriptionSummary` values, a bounded
+//! page at a time, joined by an opaque `nextToken`. A reporting operation: the only write
+//! it makes is to materialise a scheduled change the clock had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +149,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSubscriptions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSubscriptionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The token is opaque to the caller: it only ever carries a resume ARN of this
+        // service's own shape, so anything else could not have come from here and is a
+        // bad request rather than a plausible-looking page. A token whose subscription
+        // has since been deleted is still valid — it is a cursor into the ordered store,
+        // not a handle on a record.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(arn) => Some(arn),
+                None => {
+                    return Err(ListSubscriptionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a token this service issued"
+                                .to_string(),
+                            resource_id: None,
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let mut store = state.lock();
+        // Bring the store up to the clock before reporting: a change whose effective
+        // instant has passed has already happened, with or without this call.
+        store.apply_due_changes(crate::state::now());
+        // The store is a BTreeMap keyed by ARN, so one page resumes strictly after the
+        // last ARN the previous page returned: no record is repeated and none is skipped.
+        let lower = match resume_after.as_deref() {
+            Some(arn) => ::std::ops::Bound::Excluded(arn),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut subscription_summaries: Vec<SubscriptionSummary> = store
+            .subscriptions
+            .range::<str, _>((lower, ::std::ops::Bound::Unbounded))
+            // One past the page, to learn whether a further page exists without
+            // walking the whole store.
+            .take(crate::state::LIST_PAGE_SIZE + 1)
+            .map(|(_, record)| record.to_summary())
+            .collect();
+
+        let next_token = if subscription_summaries.len() > crate::state::LIST_PAGE_SIZE {
+            subscription_summaries.truncate(crate::state::LIST_PAGE_SIZE);
+            subscription_summaries
+                .last()
+                .map(|summary| crate::state::encode_page_token(&summary.arn))
+        } else {
+            // Last page: the token is omitted so a paginating client stops.
+            None
+        };
+
+        Ok(ListSubscriptionsOutput {
+            subscription_summaries,
+            next_token,
+        })
     }
 }

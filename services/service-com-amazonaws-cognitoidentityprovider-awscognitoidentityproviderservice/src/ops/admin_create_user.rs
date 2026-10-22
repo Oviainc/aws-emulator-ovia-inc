@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminCreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminCreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a user in a user pool: stores the user with a generated `sub`, in
+//! `FORCE_CHANGE_PASSWORD` state, and answers with the STORED user.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminCreateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -272,18 +266,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminCreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminCreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminCreateUser"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // A temporary password has to satisfy the pool's password policy.
+        if let Some(message) = input
+            .temporary_password
+            .as_deref()
+            .and_then(|password| pool.check_password(password))
+        {
+            return Err(invalid_password(message));
+        }
+        // Every attribute written has to be one the pool's schema declares.
+        let requested_attributes = input.user_attributes.clone().unwrap_or_default();
+        let requested_names: Vec<String> = requested_attributes
+            .iter()
+            .map(|attribute| attribute.name.clone())
+            .collect();
+        if let Some(unknown) = pool.unknown_attribute(&requested_names) {
+            return Err(invalid_parameter(format!(
+                "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
+            )));
+        }
+
+        // "Set to RESEND to resend the invitation message to a user that already
+        // exists, and to reset the temporary-password duration with a new
+        // temporary password" (`AdminCreateUser.MessageAction`).
+        let resend = input.message_action.as_deref() == Some("RESEND");
+        let key = pool.user_key(&input.username);
+        if let Some(existing) = pool.users.get_mut(&key) {
+            if !resend {
+                return Err(username_exists(&input.username));
+            }
+            if let Some(temporary_password) = input.temporary_password.clone() {
+                existing.password = Some(temporary_password);
+                existing.password_permanent = false;
+                existing.password_set_at = Some(now);
+            }
+            existing.user_last_modified_date = now;
+            let stored = existing.to_user_type();
+            return Ok(AdminCreateUserOutput { user: Some(stored) });
+        }
+        if resend {
+            // There is no invitation to resend to a user that does not exist.
+            return Err(user_not_found(&input.username));
+        }
+        // This emulator holds a pool's users in memory, so the store is bounded.
+        if pool.users.len() >= crate::state::MAX_USERS_PER_POOL {
+            return Err(invalid_parameter(format!(
+                "User pool {} holds at most {} users.",
+                input.user_pool_id,
+                crate::state::MAX_USERS_PER_POOL
+            )));
+        }
+
+        let mut attributes: ::std::collections::BTreeMap<String, String> = requested_attributes
+            .into_iter()
+            .filter_map(|attribute| attribute.value.map(|value| (attribute.name, value)))
+            .collect();
+        let sub = crate::state::new_uuid();
+        // `sub` is the user's own id, not something the caller may set.
+        attributes.insert("sub".to_string(), sub.clone());
+        let user = crate::state::User {
+            username: input.username.clone(),
+            sub,
+            attributes,
+            // A temporary password Amazon Cognito would have messaged to the user
+            // is not minted here: this emulator delivers no mail or SMS, so a
+            // password nothing can read would be a credential that does not exist.
+            // The status below is the same either way.
+            password: input.temporary_password.clone(),
+            password_permanent: false,
+            password_set_at: input.temporary_password.as_ref().map(|_| now),
+            // An administrator-created user must change the password it signs in with.
+            status: crate::state::UserStatus::ForceChangePassword,
+            enabled: true,
+            mfa_options: Vec::new(),
+            preferred_mfa_setting: None,
+            mfa_setting_list: Vec::new(),
+            user_create_date: now,
+            user_last_modified_date: now,
+            groups: ::std::collections::BTreeSet::new(),
+        };
+        pool.users.insert(key.clone(), user);
+
+        // Rendered from the STORED user, so the response is what a later read sees.
+        let stored = pool
+            .users
+            .get(&key)
+            .ok_or_else(internal_error)?
+            .to_user_type();
+        Ok(AdminCreateUserOutput {
+            user: Some(stored),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminCreateUserError {
+    AdminCreateUserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user.
+fn user_not_found(username: &str) -> AdminCreateUserError {
+    AdminCreateUserErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(format!("User {username} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UsernameExistsException` for a username already taken.
+fn username_exists(username: &str) -> AdminCreateUserError {
+    AdminCreateUserErrorModeled::UsernameExistsException(UsernameExistsException {
+        message: Some(format!("User account already exists for {username}")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidPasswordException`, carrying `message`.
+fn invalid_password(message: String) -> AdminCreateUserError {
+    AdminCreateUserErrorModeled::InvalidPasswordException(InvalidPasswordException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> AdminCreateUserError {
+    AdminCreateUserErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminCreateUserError {
+    AdminCreateUserErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

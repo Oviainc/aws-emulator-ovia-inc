@@ -25,75 +25,11 @@
 //!   range is refused, so no request can ask for an unbounded page;
 //! * a feed whose deletion has been accepted cannot be updated (`ConflictException`).
 
+use crate::harness::{call, output_config, past_the_transition_span, router, REGION, SIGNING_NAME};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
     MAX_FEEDS, TRANSITION_SPAN,
 };
-use service_com_amazonaws_elementalinference_elementalinference::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
-use std::sync::Arc;
-
-/// The region every request below is signed for. The service reads it out of the SigV4
-/// credential scope, so the ARNs it mints must carry exactly this region.
-const REGION: &str = "us-west-2";
-
-/// This service's SigV4 signing name (`OPERATIONS.md`, "Wire protocol"): the router
-/// resolves the claiming service from it.
-const SIGNING_NAME: &str = "elemental-inference";
-
-/// Long enough for a clock-owed feed transition to have fallen due.
-fn past_the_transition_span() {
-    // A plain blocking sleep: the test's runtime has nothing else to run, and the
-    // service never sleeps for a transition — it stores the due instant.
-    std::thread::sleep(TRANSITION_SPAN + std::time::Duration::from_millis(250));
-}
-
-/// A router serving this service alone over one shared engine.
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // These requests carry an unsigned placeholder Authorization header, which is
-    // there only so the router can resolve the signing name.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Send one request and return its status and parsed body (`Value::Null` when empty).
-async fn call(
-    router: &MultiServiceRouter,
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let payload = body.map_or_else(Vec::new, |body| serde_json::to_vec(&body).unwrap());
-    let request = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/{SIGNING_NAME}/aws4_request, \
-                 SignedHeaders=host, Signature=deadbeef"
-            ),
-        )
-        .body(bytes::Bytes::from(payload))
-        .unwrap();
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or_else(|e| {
-            panic!(
-                "{method} {uri}: body is not JSON ({e}): {}",
-                String::from_utf8_lossy(response.body())
-            )
-        })
-    };
-    (status, parsed)
-}
 
 /// Whether `id` satisfies the modelled `FeedId` pattern `^[a-z0-9]{19}$`.
 fn is_feed_id(id: &str) -> bool {
@@ -132,31 +68,6 @@ fn expected_outputs(submitted: &Value) -> Value {
             })
             .collect(),
     )
-}
-
-/// One `outputConfig` of each kind the `OutputConfig` union models
-/// (`smithy_query(query="shape",shape="OutputConfig")`: cropping, clipping,
-/// subtitling, contextualMetadata).
-fn output_config(kind: &str) -> Value {
-    match kind {
-        "cropping" => json!({"cropping": {"templateGroups": [
-            {"name": "group1", "templateUris": ["s3://templates/wide.psd"]}
-        ]}}),
-        "clipping" => json!({"clipping": {
-            "callbackMetadata": "season opener",
-            "dataSourceConfiguration": {"fixtureId": "fixture-1"}
-        }}),
-        "subtitling" => json!({"subtitling": {
-            "language": "eng-gb",
-            "aspectRatio": {"width": 16, "height": 9},
-            "profanityFilter": "CENSOR"
-        }}),
-        "contextualMetadata" => json!({"contextualMetadata": {
-            "summaryGeneration": "ENABLED",
-            "extendedAnalysis": "DISABLED"
-        }}),
-        other => panic!("no such OutputConfig member: {other}"),
-    }
 }
 
 /// One row of the create/read table: a feed request that differs from the others along

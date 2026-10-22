@@ -163,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateApplicationVersionErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    error_code: Some("500".to_string()),
-                    message: Some("the service state is unavailable".to_string()),
-                },
+                crate::state::internal_server_error("the service state is unavailable"),
             )
             .into());
         };
@@ -175,15 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // results" — a sentence the model states in prose, so the service enforces it.
         if input.template_body.is_some() && input.template_url.is_some() {
             let (body_member, url_member) = Artifact::Template.members();
-            return Err(CreateApplicationVersionErrorModeled::BadRequestException(
-                BadRequestException {
-                    error_code: Some("400".to_string()),
-                    message: Some(format!(
-                        "You can specify only one of {body_member} and {url_member}."
-                    )),
-                },
-            )
-            .into());
+            return Err(bad_request(format!(
+                "You can specify only one of {body_member} and {url_member}."
+            )));
         }
 
         let region = crate::state::request_region(ctx);
@@ -206,26 +197,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(application) = store.applications.get_mut(&input.application_id) else {
             return Err(CreateApplicationVersionErrorModeled::NotFoundException(
-                NotFoundException {
-                    error_code: Some("404".to_string()),
-                    message: Some(format!(
-                        "No application exists with the id {}.",
-                        input.application_id
-                    )),
-                },
+                crate::state::not_found(
+                    crate::state::ErrorCode::ApplicationNotFound,
+                    crate::state::application_not_found_message(&input.application_id),
+                ),
             )
             .into());
         };
 
         if application.versions.contains_key(&input.semantic_version) {
+            // A duplicate version and a duplicate application are both 409
+            // `ConflictException`, so the condition named in `errorCode` is the only
+            // field that tells a client which of the two it hit.
             return Err(CreateApplicationVersionErrorModeled::ConflictException(
-                ConflictException {
-                    error_code: Some("409".to_string()),
-                    message: Some(format!(
-                        "Version {} already exists for application {}.",
+                crate::state::conflict(
+                    crate::state::ErrorCode::VersionAlreadyExists,
+                    format!(
+                        "Cannot publish version {} for application {} because it already exists",
                         input.semantic_version, input.application_id
-                    )),
-                },
+                    ),
+                ),
             )
             .into());
         }
@@ -261,10 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answer from the STORED version.
         let Some(stored) = application.versions.get(&input.semantic_version) else {
             return Err(CreateApplicationVersionErrorModeled::InternalServerErrorException(
-                InternalServerErrorException {
-                    error_code: Some("500".to_string()),
-                    message: Some("the created version was not persisted".to_string()),
-                },
+                crate::state::internal_server_error("the created version was not persisted"),
             )
             .into());
         };
@@ -285,9 +273,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The 400 this operation answers for a parameter outside the contract.
 fn bad_request(message: String) -> CreateApplicationVersionError {
-    CreateApplicationVersionErrorModeled::BadRequestException(BadRequestException {
-        error_code: Some("400".to_string()),
-        message: Some(message),
-    })
-    .into()
+    CreateApplicationVersionErrorModeled::BadRequestException(crate::state::bad_request(message))
+        .into()
 }

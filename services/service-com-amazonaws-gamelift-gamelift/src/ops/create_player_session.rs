@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePlayerSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePlayerSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reserves one open player slot in a stored game session: persists the reservation and
+//! raises the session's player count, so the describes report the slot as taken.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePlayerSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "New player sessions can be created in any game session with an open slot that is in
+//! ACTIVE status and has a player creation policy of ACCEPT_ALL."
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -178,20 +175,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePlayerSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePlayerSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePlayerSession"))
+        use crate::state::{
+            GAME_SESSION_STATUS_ACTIVE, MAX_PLAYERS_PER_GAME_SESSION,
+            PLAYER_SESSION_CREATION_POLICY_ACCEPT_ALL, PLAYER_SESSION_STATUS_RESERVED,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePlayerSessionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        let Some(session) = state.game_sessions.get(&input.game_session_id) else {
+            return Err(CreatePlayerSessionErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "The game session {} was not found.",
+                        input.game_session_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A slot can only be reserved in a session that is running.
+        if session.status != GAME_SESSION_STATUS_ACTIVE {
+            return Err(
+                CreatePlayerSessionErrorModeled::InvalidGameSessionStatusException(
+                    InvalidGameSessionStatusException {
+                        message: Some(format!(
+                            "Game session {} must be in ACTIVE status to reserve a player slot; \
+                             it is in {} status.",
+                            session.game_session_id, session.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // ... "and has a player creation policy of ACCEPT_ALL": a session closed to new
+        // players refuses the reservation.
+        if session.player_session_creation_policy != PLAYER_SESSION_CREATION_POLICY_ACCEPT_ALL {
+            return Err(
+                CreatePlayerSessionErrorModeled::InvalidGameSessionStatusException(
+                    InvalidGameSessionStatusException {
+                        message: Some(format!(
+                            "Game session {} is not accepting new players: its \
+                             PlayerSessionCreationPolicy is {}.",
+                            session.game_session_id, session.player_session_creation_policy
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "a game session with an open slot": the session is full once every slot it was
+        // created with is taken — and never past the service-wide ceiling of 200, which
+        // this operation's own doc calls not adjustable.
+        let open_slots = session
+            .maximum_player_session_count
+            .min(MAX_PLAYERS_PER_GAME_SESSION);
+        if session.current_player_session_count >= open_slots {
+            return Err(CreatePlayerSessionErrorModeled::GameSessionFullException(
+                GameSessionFullException {
+                    message: Some(format!(
+                        "Game session {} has no open player slots: {} of {} are taken.",
+                        session.game_session_id, session.current_player_session_count, open_slots
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The player connects to the instance and port the game session is running on.
+        // The session's fields are copied out first, so minting the id (which advances
+        // the store's counter) happens after every refusal above has been answered.
+        let session_id = session.game_session_id.clone();
+        let session_fleet_id = session.fleet_id.clone();
+        let session_fleet_arn = session.fleet_arn.clone();
+        let session_ip_address = session.ip_address.clone();
+        let session_port = session.port;
+        let session_dns_name = session.dns_name.clone();
+        let record = crate::state::PlayerSessionRecord {
+            // `PlayerSessionId` matches the modelled `^psess-\S+$`.
+            player_session_id: format!(
+                "psess-{}",
+                crate::state::mint_uuid(&mut state.minted_ids, "player-session")
+            ),
+            player_id: input.player_id.clone(),
+            game_session_id: session_id,
+            fleet_id: session_fleet_id,
+            fleet_arn: session_fleet_arn,
+            // "a slot is reserved in the game session for the player".
+            status: PLAYER_SESSION_STATUS_RESERVED.to_string(),
+            creation_time: now,
+            termination_time: None,
+            ip_address: session_ip_address,
+            port: session_port,
+            dns_name: session_dns_name,
+            player_data: input.player_data.clone(),
+        };
+        let player_session_id = record.player_session_id.clone();
+        let game_session_id = record.game_session_id.clone();
+        state
+            .player_sessions
+            .insert(player_session_id.clone(), record);
+        if let Some(session) = state.game_sessions.get_mut(&game_session_id) {
+            session.current_player_session_count += 1;
+        }
+
+        // Report the STORED reservation.
+        let Some(stored) = state.player_sessions.get(&player_session_id) else {
+            return Err(CreatePlayerSessionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the new player session could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreatePlayerSessionOutput {
+            player_session: Some(stored.to_modelled()),
+        })
     }
 }
