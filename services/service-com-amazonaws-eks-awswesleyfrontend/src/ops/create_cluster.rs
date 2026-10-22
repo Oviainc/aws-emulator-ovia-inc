@@ -10,6 +10,11 @@
 //! `createdAt`, `endpoint`, `platformVersion`, `identity`, `certificateAuthority`), so a
 //! later read returns exactly these bytes rather than recomputing them.
 //!
+//! It also seeds the certificate authority Amazon EKS provisions with a cluster — a
+//! [`crate::state::CertificateAuthorityRecord`] on the same record, already `IN_USE`
+//! and distributed — which is what the cluster's `certificateAuthority.data` reports
+//! and what `DescribeCertificateAuthority` reads.
+//!
 //! A new cluster is reported `CREATING` and the clock owes it `ACTIVE`
 //! [`crate::state::CLUSTER_ACTIVATION_DELAY`] later; the due instant is stored on the
 //! record and materialised by whichever read first runs after it.
@@ -165,7 +170,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, ClusterRecord, CLUSTER_ACTIVATION_DELAY, DEFAULT_AUTHENTICATION_MODE,
+    self, CertificateAuthorityRecord, ClusterRecord, CLUSTER_ACTIVATION_DELAY,
+    DEFAULT_AUTHENTICATION_MODE,
     DEFAULT_KUBERNETES_VERSION, DEFAULT_PUBLIC_ACCESS_CIDR_V4, DEFAULT_PUBLIC_ACCESS_CIDR_V6,
     DEFAULT_SERVICE_IPV4_CIDR, DEFAULT_SUPPORT_TYPE, INITIAL_PLATFORM_VERSION, IP_FAMILY_IPV4,
     IP_FAMILY_IPV6, MAX_CLUSTERS, MAX_STORED_CLUSTERS, STATUS_CREATING,
@@ -450,6 +456,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
+        // The certificate authority Amazon EKS provisions with the cluster: the root
+        // of trust its control plane signs with, so it is `IN_USE` and already
+        // distributed. It is stored as a CA record of its own — the resource
+        // `DescribeCertificateAuthority` reads and `CreateCertificateAuthority`
+        // counts against the cluster's two-CA ceiling — and the cluster's
+        // `certificateAuthority.data` is that record's `data`, not a second copy.
+        let initial_authority =
+            CertificateAuthorityRecord::initial_for_cluster(&arn, &resource_id, now);
+
         let record = ClusterRecord {
             name: input.name.clone(),
             endpoint: Some(state::derive_cluster_endpoint(&resource_id, &region)),
@@ -459,9 +474,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
             }),
             certificate_authority: Some(Certificate {
-                data: Some(state::derive_certificate_authority_data(&resource_id)),
+                data: Some(initial_authority.data.clone()),
                 active: None,
             }),
+            certificate_authorities: [(initial_authority.id.clone(), initial_authority)]
+                .into_iter()
+                .collect(),
+            certificate_authorities_created: 1,
             arn: arn.clone(),
             created_at: now,
             version: Some(

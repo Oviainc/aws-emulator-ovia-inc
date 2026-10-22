@@ -430,6 +430,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             access_entries: ::std::collections::BTreeMap::new(),
             updates: ::std::collections::BTreeMap::new(),
             identity_provider_configs: ::std::collections::BTreeMap::new(),
+            // A connected cluster has no Amazon EKS control plane, so Amazon EKS
+            // provisions no certificate authority for it and none can be appended:
+            // the CAs in this map are the ones that sign for an EKS-managed API
+            // server (`crate::state::CertificateAuthorityRecord`).
+            certificate_authorities: ::std::collections::BTreeMap::new(),
+            certificate_authorities_created: 0,
         };
 
         let cluster = record.to_cluster();

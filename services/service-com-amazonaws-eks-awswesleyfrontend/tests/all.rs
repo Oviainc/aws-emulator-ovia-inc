@@ -21,6 +21,8 @@ mod access_policy_catalog;
 mod cancel_update;
 #[path = "all/capability_lifecycle.rs"]
 mod capability_lifecycle;
+#[path = "all/certificate_authority.rs"]
+mod certificate_authority;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
 #[path = "all/cluster_versions.rs"]
