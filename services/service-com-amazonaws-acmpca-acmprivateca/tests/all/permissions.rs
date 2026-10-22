@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Permissions granted on a private CA, driven over the wire: `CreatePermission` records
-//! a grant and `ListPermissions` reports back exactly what was granted.
+//! a grant, `ListPermissions` reports back exactly what was granted, and
+//! `DeletePermission` revokes one.
 //!
 //! The harness — the router, the signed request and the success/refusal helpers — is the
 //! one `private_ca_lifecycle` drives the rest of this service with; only the cases here
@@ -445,7 +446,7 @@ async fn a_forged_next_token_is_refused() {
     );
 }
 
-/// Both permission operations read the CA ARN by the same rule the rest of the service
+/// Every permission operation reads the CA ARN by the same rule the rest of the service
 /// does: refused by form first, then by existence.
 #[tokio::test]
 async fn permission_operations_refuse_a_ca_arn_by_form_and_then_by_existence() {
@@ -475,6 +476,10 @@ async fn permission_operations_refuse_a_ca_arn_by_form_and_then_by_existence() {
             json!({"Principal": "acm.amazonaws.com", "Actions": ACTIONS}),
         ),
         ("ListPermissions", json!({})),
+        (
+            "DeletePermission",
+            json!({"Principal": "acm.amazonaws.com"}),
+        ),
     ] {
         for (case, arn) in &malformed {
             let case = format!("{operation}: {case}");
@@ -490,5 +495,248 @@ async fn permission_operations_refuse_a_ca_arn_by_form_and_then_by_existence() {
         emulator
             .refused(&case, operation, &body, "ResourceNotFoundException")
             .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeletePermission: a grant exists only between its grant and its revocation
+// ---------------------------------------------------------------------------
+
+/// A `DeletePermission` body: the CA, the principal and, when the case names one, the
+/// source account. `DeletePermission` models no `Actions` member — a revocation names the
+/// grant, not what it granted.
+fn revoke(arn: &str, principal: &str, source_account: Option<&str>) -> Value {
+    let mut body = json!({"CertificateAuthorityArn": arn, "Principal": principal});
+    if let Some(account) = source_account {
+        body["SourceAccount"] = json!(account);
+    }
+    body
+}
+
+/// Revoking a grant removes exactly the grant it names: the CA stops reporting that one,
+/// every other grant it holds stands, and the pair can be granted again afterwards.
+#[tokio::test]
+async fn a_revocation_removes_exactly_the_grant_it_names() {
+    let emulator = Emulator::new();
+    let arn = certificate_authority(&emulator, "revoked").await;
+    let long_principal = "p".repeat(128);
+
+    // The rows differ along what the rule generalises over: how many actions the grant
+    // named, whether the request names a source account, and which (principal, source
+    // account) pair identifies it — including one principal held under two accounts, so
+    // a revocation that ignored the account would take the wrong grant. `Principal` is
+    // len 0..128 (`smithy_query(query="operation",operation="DeletePermission")`), so the
+    // last row sits on that upper bound.
+    let rows: Vec<(&str, &str, Option<&str>, Vec<&str>)> = vec![
+        (
+            "one action, no source account",
+            "acm.amazonaws.com",
+            None,
+            vec![ACTIONS[0]],
+        ),
+        (
+            "the same principal, an explicit source account",
+            "acm.amazonaws.com",
+            Some("123456789012"),
+            vec![ACTIONS[1]],
+        ),
+        (
+            "every action, another principal",
+            "ram.amazonaws.com",
+            Some("210987654321"),
+            ACTIONS.to_vec(),
+        ),
+        (
+            "a principal at the modelled length bound",
+            long_principal.as_str(),
+            None,
+            vec![ACTIONS[2]],
+        ),
+    ];
+
+    for (case, principal, source_account, actions) in &rows {
+        emulator
+            .ok(
+                case,
+                "CreatePermission",
+                &grant(&arn, principal, *source_account, actions),
+            )
+            .await;
+    }
+
+    for revoked in 1..=rows.len() {
+        let (case, principal, source_account, _) = &rows[revoked - 1];
+        let answer = emulator
+            .ok(case, "DeletePermission", &revoke(&arn, principal, *source_account))
+            .await;
+        assert!(
+            answer.as_object().is_none_or(|members| members.is_empty()),
+            "case {case:?}: DeletePermission models no output members, got {answer:?}"
+        );
+
+        let permissions = all_permissions(&emulator, case, &arn).await;
+        assert_eq!(
+            permissions.len(),
+            rows.len() - revoked,
+            "case {case:?}: one revocation removes one grant, got {permissions:?}"
+        );
+        assert!(
+            reported(
+                &permissions,
+                principal,
+                source_account.unwrap_or(ACCOUNT)
+            )
+            .is_none(),
+            "case {case:?}: the revoked grant must be gone, got {permissions:?}"
+        );
+        // Every grant not yet revoked is still there, with the actions it was granted
+        // with: a revocation touches no other grant.
+        for (other, principal, source_account, actions) in &rows[revoked..] {
+            let expected_account = source_account.unwrap_or(ACCOUNT);
+            let permission = reported(&permissions, principal, expected_account)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: {other:?} must survive, got {permissions:?}")
+                });
+            assert_eq!(
+                permission["Actions"],
+                json!(actions),
+                "case {case:?}: {other:?} must keep its actions, got {permission:?}"
+            );
+        }
+        // The grant no longer exists, so revoking it again is refused.
+        emulator
+            .refused(
+                case,
+                "DeletePermission",
+                &revoke(&arn, principal, *source_account),
+                "ResourceNotFoundException",
+            )
+            .await;
+    }
+
+    // Every grant is gone, and the pair the first row named can be granted again — with
+    // the actions the NEW grant names, since the revoked one is no longer there.
+    assert!(
+        all_permissions(&emulator, "all revoked", &arn)
+            .await
+            .is_empty(),
+        "case \"all revoked\": a CA whose grants were all revoked lists none"
+    );
+    emulator
+        .ok(
+            "granted again",
+            "CreatePermission",
+            &grant(&arn, "acm.amazonaws.com", None, &ACTIONS),
+        )
+        .await;
+    let permissions = all_permissions(&emulator, "granted again", &arn).await;
+    let permission = reported(&permissions, "acm.amazonaws.com", ACCOUNT).unwrap_or_else(|| {
+        panic!("case \"granted again\": the new grant must be listed, got {permissions:?}")
+    });
+    assert_eq!(
+        permission["Actions"],
+        json!(ACTIONS),
+        "case \"granted again\": expected the new grant's actions, got {permission:?}"
+    );
+}
+
+/// A revocation naming a grant the CA does not hold is refused, whichever way the name
+/// misses — and the refusal revokes nothing.
+#[tokio::test]
+async fn revoking_a_grant_the_ca_does_not_hold_is_refused() {
+    let emulator = Emulator::new();
+    let arn = certificate_authority(&emulator, "missing").await;
+    let other_arn = certificate_authority(&emulator, "missing-other").await;
+    emulator
+        .ok(
+            "the one grant the CA holds",
+            "CreatePermission",
+            &grant(&arn, "acm.amazonaws.com", None, &[ACTIONS[0]]),
+        )
+        .await;
+
+    // Each row names a (CA, principal, source account) triple the store does not hold:
+    // another principal, a principal the granted one only starts with, the granted
+    // principal under another account, the granted principal in another case, and the
+    // granted triple on a CA it was not granted on.
+    let rows = [
+        (
+            "a principal that was never granted anything",
+            revoke(&arn, "s3.amazonaws.com", None),
+        ),
+        (
+            "a principal the granted one only starts with",
+            revoke(&arn, "acm.amazonaws.co", None),
+        ),
+        (
+            "the granted principal under another source account",
+            revoke(&arn, "acm.amazonaws.com", Some("210987654321")),
+        ),
+        (
+            "the granted principal in another case",
+            revoke(&arn, "ACM.amazonaws.com", None),
+        ),
+        (
+            "the granted principal on a CA it was not granted on",
+            revoke(&other_arn, "acm.amazonaws.com", None),
+        ),
+    ];
+
+    for (case, body) in &rows {
+        let refusal = emulator
+            .refused(case, "DeletePermission", body, "ResourceNotFoundException")
+            .await;
+        assert!(
+            !string(&refusal, "message", case).is_empty(),
+            "case {case:?}: the refusal carries a message, got {refusal:?}"
+        );
+    }
+
+    // None of those refusals touched the grant the CA does hold.
+    let permissions = all_permissions(&emulator, "after the refusals", &arn).await;
+    let permission = reported(&permissions, "acm.amazonaws.com", ACCOUNT).unwrap_or_else(|| {
+        panic!("case \"after the refusals\": the grant must stand, got {permissions:?}")
+    });
+    assert_eq!(
+        permission["Actions"],
+        json!([ACTIONS[0]]),
+        "case \"after the refusals\": the grant must keep its actions, got {permission:?}"
+    );
+}
+
+/// `SourceAccount` left out means the calling account, on the grant and on the
+/// revocation alike: either naming resolves to the one grant, in both directions.
+#[tokio::test]
+async fn a_grant_and_its_revocation_resolve_the_calling_account_the_same_way() {
+    let emulator = Emulator::new();
+    let arn = certificate_authority(&emulator, "defaults").await;
+
+    for (case, granted_with, revoked_with) in [
+        ("granted without, revoked with", None, Some(ACCOUNT)),
+        ("granted with, revoked without", Some(ACCOUNT), None),
+    ] {
+        emulator
+            .ok(
+                case,
+                "CreatePermission",
+                &grant(&arn, "acm.amazonaws.com", granted_with, &[ACTIONS[0]]),
+            )
+            .await;
+        let permissions = all_permissions(&emulator, case, &arn).await;
+        assert!(
+            reported(&permissions, "acm.amazonaws.com", ACCOUNT).is_some(),
+            "case {case:?}: the grant is assigned by the calling account, got {permissions:?}"
+        );
+        emulator
+            .ok(
+                case,
+                "DeletePermission",
+                &revoke(&arn, "acm.amazonaws.com", revoked_with),
+            )
+            .await;
+        assert!(
+            all_permissions(&emulator, case, &arn).await.is_empty(),
+            "case {case:?}: the revocation names the same grant the create made"
+        );
     }
 }

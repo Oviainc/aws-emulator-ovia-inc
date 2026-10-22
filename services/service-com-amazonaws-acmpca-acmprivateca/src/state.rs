@@ -88,6 +88,15 @@ pub const ISSUANCE_INVALID_STATE_MESSAGE: &str =
 /// the CA matches: one sentence about the certificate, naming no ARN of its own.
 pub const CERTIFICATE_NOT_FOUND_MESSAGE: &str = "Could not find specified certificate.";
 
+/// The sentence this service answers a permission-not-found refusal with: one sentence
+/// about the permission, in the form the service's other not-found refusals take
+/// ([`CERTIFICATE_NOT_FOUND_MESSAGE`]) and naming no principal of its own.
+///
+/// An EXAMPLE, not a requirement: the `ResourceNotFoundException` code and its HTTP 400
+/// are what the refusal has to be, and no rule for this sentence's wording is documented
+/// by AWS, stated by the model or derivable from the request.
+pub const PERMISSION_NOT_FOUND_MESSAGE: &str = "Could not find specified permission.";
+
 /// What Amazon Web Services Private CA answers when the resource-based policy a request
 /// asks for is not there.
 ///
