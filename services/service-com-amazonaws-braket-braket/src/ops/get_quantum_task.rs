@@ -130,14 +130,10 @@ impl From<GetQuantumTaskErrorModeled> for GetQuantumTaskError {
 /// The `additionalAttributeNames` value that asks for `queueInfo`.
 const ATTRIBUTE_QUEUE_INFO: &str = "QueueInfo";
 
-/// The `position` a task that has left the queue reports.
-///
-/// `QuantumTaskQueueInfo$position` is a string, and Braket reports this sentinel rather
-/// than a number once a task is no longer waiting — the Amazon Braket SDK documents
-/// `position` as "The current position of the quantum task in the queue. If the task is
-/// not in a queue, the position is 'None'". A number here would claim the task is still
-/// waiting.
-const POSITION_NOT_QUEUED: &str = "None";
+/// The `position` a task that has left the queue reports: the one sentinel this
+/// service reports for a resource that is no longer waiting in its queue, shared with
+/// the hybrid-job queue info in `crate::state`.
+use crate::state::QUEUE_POSITION_NOT_QUEUED as POSITION_NOT_QUEUED;
 
 /// Where the task sits in its device's queue, counted from the stored tasks.
 ///

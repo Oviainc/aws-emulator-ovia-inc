@@ -215,28 +215,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        if state.queues.contains_key(&name) {
-            return Err(CreateQueueErrorModeled::ConflictException(ConflictException {
-                message: Some(format!("Queue {name} already exists.")),
-            })
-            .into());
-        }
-        // Bounded growth: the store holds at most `MAX_QUEUES` queues, and a create past
-        // that is the quota refusal the model declares rather than more state.
-        if state.queues_at_capacity() {
-            return Err(CreateQueueErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "You have reached the maximum of {} queues.",
-                        crate::state::MAX_QUEUES
-                    )),
-                },
-            )
-            .into());
-        }
-
         let record = crate::state::QueueRecord {
-            name: name.clone(),
+            name,
             description: input.description,
             pricing_plan,
             // "Initial state of the queue" — ACTIVE unless the caller paused it.
@@ -270,10 +250,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         };
 
-        let (submitted, progressing) = state.job_counts(&name);
-        let queue = record.view(&region, submitted, progressing);
-        state.queues.insert(name, record);
-
-        Ok(CreateQueueOutput { queue: Some(queue) })
+        // The store owns the existence probe, the idempotent return and the insert
+        // together, under the lock this handler holds, so two creates of one name can
+        // never both insert and the decision cannot disagree with the stored state.
+        match state.create_queue(record, &region) {
+            // A `Name` already in the store answers the SAME 201 with the queue that is
+            // there: the create is idempotent on `Name`, so a provisioning path that runs
+            // twice is handed the resource instead of a failure. Nothing was changed, so
+            // the queue returned is the one the FIRST create persisted.
+            crate::state::CreateOutcome::Created(queue)
+            | crate::state::CreateOutcome::Existing(queue) => {
+                Ok(CreateQueueOutput { queue: Some(queue) })
+            }
+            // A built-in queue holding the name is not a resource any `CreateQueue`
+            // produced, so there is no earlier create for this one to repeat: the name
+            // conflicts with the current state of the store.
+            crate::state::CreateOutcome::SystemResource => {
+                Err(CreateQueueErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::system_resource_name_message("name")),
+                })
+                .into())
+            }
+            // Bounded growth: the store holds at most `MAX_QUEUES` queues, and a create
+            // past that is the quota refusal the model declares rather than more state.
+            crate::state::CreateOutcome::AtCapacity => {
+                Err(CreateQueueErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "You have reached the maximum of {} queues.",
+                            crate::state::MAX_QUEUES
+                        )),
+                    },
+                )
+                .into())
+            }
+        }
     }
 }

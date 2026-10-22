@@ -213,13 +213,17 @@ async fn seeded() -> (Emulator, Vec<Case>) {
             error_type: "NotFoundException",
         },
         Case {
-            label: "DeleteJobTemplate on a deleted template",
+            // A `DELETE` that is refused, not one that is a no-op: a delete of a template
+            // that is simply absent is this service's idempotent 202 (see
+            // `tests/all/idempotent_repeats.rs`), so the refusal to address here is the
+            // built-in template a caller may not delete at all.
+            label: "DeleteJobTemplate on a built-in template",
             method: "DELETE",
-            uri: format!("/2017-08-29/jobTemplates/{DELETED_TEMPLATE}"),
+            uri: format!("/2017-08-29/jobTemplates/{system_template}"),
             body: None,
             operation: "DeleteJobTemplate",
-            status: 404,
-            error_type: "NotFoundException",
+            status: 403,
+            error_type: "ForbiddenException",
         },
         Case {
             // A different status and code: a built-in queue cannot be deleted.

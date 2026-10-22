@@ -15,6 +15,8 @@
 mod arn_syntax;
 #[path = "all/device_capabilities.rs"]
 mod device_capabilities;
+#[path = "all/hybrid_job_loop.rs"]
+mod hybrid_job_loop;
 #[path = "all/quantum_task_loop.rs"]
 mod quantum_task_loop;
 #[path = "all/request_body_rejection.rs"]

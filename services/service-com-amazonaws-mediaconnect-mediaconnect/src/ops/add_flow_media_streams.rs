@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddFlowMediaStreams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddFlowMediaStreams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddFlowMediaStreams::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds media streams to a flow PERSISTED in [`crate::state`]: each requested stream is
+//! materialised into the flow's record, so DescribeFlow reports exactly what this
+//! operation wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +79,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{StoredMediaStream, MAX_FLOW_MEDIA_STREAMS};
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error".
+fn bad_request(message: impl Into<String>) -> AddFlowMediaStreamsError {
+    AddFlowMediaStreamsErrorModeled::BadRequestException(BadRequestException {
+        message: message.into(),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +163,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddFlowMediaStreams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddFlowMediaStreamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AddFlowMediaStreamsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect flow store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `MediaStreams` is required, so the member is present — but an empty list adds
+        // nothing, which is a semantic error in the request rather than a no-op success.
+        if input.media_streams.is_empty() {
+            return Err(bad_request(
+                "An add flow media streams request must include at least one media stream.",
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_due_transitions(now);
+
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(
+                AddFlowMediaStreamsErrorModeled::NotFoundException(NotFoundException {
+                    message: format!("Flow with ARN {} was not found.", input.flow_arn),
+                })
+                .into(),
+            );
+        };
+
+        // The whole request is checked before anything is stored, so a request with one
+        // bad entry adds none of its entries.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddFlowMediaStreams"))
+        // How many media streams a flow HOLDS is bounded (see
+        // `crate::state::MAX_FLOW_MEDIA_STREAMS`), so what it already holds counts towards
+        // the bound and no sequence of adds can grow a flow past it.
+        let held = flow.media_streams.len();
+        if held + input.media_streams.len() > MAX_FLOW_MEDIA_STREAMS {
+            return Err(bad_request(format!(
+                "A flow may hold at most {MAX_FLOW_MEDIA_STREAMS} media streams; this flow \
+                 holds {held} and the request adds {}.",
+                input.media_streams.len()
+            )));
+        }
+
+        // A media stream is addressed by name within its flow and its `MediaStreamId` is
+        // "a unique identifier for the media stream", so neither may repeat within one
+        // flow — including against another entry of the same request. The rule is stated
+        // once in `crate::state`, so CreateFlow refuses the same requests this does.
+        let mut names: ::std::collections::BTreeSet<String> = flow
+            .media_streams
+            .iter()
+            .map(|stream| stream.stream.media_stream_name.clone())
+            .collect();
+        let mut ids: ::std::collections::BTreeSet<i32> = flow
+            .media_streams
+            .iter()
+            .map(|stream| stream.stream.media_stream_id)
+            .collect();
+        for request in &input.media_streams {
+            if let Some(rejection) = crate::state::media_stream_rejection(request, &names, &ids) {
+                return Err(bad_request(rejection));
+            }
+            names.insert(request.media_stream_name.clone());
+            ids.insert(request.media_stream_id);
+        }
+
+        // Store each requested stream with the payload type the service assigns it,
+        // computed over the streams the flow holds so far so no two share one.
+        for request in &input.media_streams {
+            let fmt = crate::state::next_media_stream_fmt(&flow.media_streams);
+            flow.media_streams
+                .push(crate::state::materialise_media_stream(request, fmt));
+        }
+
+        // "The media streams that you added to the flow" — read back out of the STORED
+        // record, not echoed from the request.
+        Ok(AddFlowMediaStreamsOutput {
+            flow_arn: Some(flow.flow_arn.clone()),
+            media_streams: Some(
+                flow.media_streams[held..]
+                    .iter()
+                    .map(StoredMediaStream::to_media_stream)
+                    .collect(),
+            ),
+        })
     }
 }

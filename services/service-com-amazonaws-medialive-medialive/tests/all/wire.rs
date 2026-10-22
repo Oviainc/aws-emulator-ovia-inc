@@ -89,6 +89,16 @@ pub async fn call_in_region(
     (status, parsed)
 }
 
+/// The `message` member of a restJson1 error body (`jsonName: "message"` on
+/// every one of this service's error shapes), as a client reads it. One copy for
+/// every suite, beside [`error_code`].
+pub fn error_message(body: &Value) -> String {
+    body.get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The error code a restJson1 error response carries, as a client reads it.
 pub fn error_code(status: u16, body: &Value) -> String {
     body.get("__type")

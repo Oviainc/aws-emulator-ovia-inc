@@ -33,6 +33,19 @@ pub const DEFAULT_MANIFEST_NAME: &str = "index";
 /// redundant pair, so an encoder can push the same source to two ingest URLs.
 pub const INGEST_ENDPOINT_COUNT: usize = 2;
 
+/// Width, in BYTES, of every value MediaPackage system-generates for an ingest endpoint —
+/// its `Id`, its `Username` and its `Password` — rendered as lowercase hex, so each is
+/// `2 * INGEST_GENERATED_BYTES` = 32 characters.
+///
+/// `IngestEndpoint.Id` / `Username` / `Password` are documented as "system generated"
+/// and carry no `length` or `pattern` constraint in the Smithy model
+/// (`smithy_query(query="shape",shape="com.amazonaws.mediapackage#IngestEndpoint")`
+/// reports only `@sensitive` on the two credentials), so the shape is the one recorded
+/// MediaPackage responses show: a 32-character lowercase-hexadecimal token for each of
+/// the three generated members. One constant, because the service mints all three with
+/// the same generator and width.
+pub const INGEST_GENERATED_BYTES: usize = 16;
+
 /// Page size used when `MaxResults` is absent: the maximum the model allows
 /// (`MaxResults` range 1..1000), so an unpaged caller sees everything it can.
 pub const MAX_PAGE_SIZE: usize = 1000;
@@ -545,23 +558,25 @@ impl ComAmazonawsMediapackageMediapackageState {
 
     /// The redundant pair of ingest endpoints MediaPackage provisions for a new Channel.
     ///
-    /// Each endpoint's id and its ingest credentials — the model documents `Username` and
-    /// `Password` as "system generated" — are minted once, here, and stored on the channel
-    /// record, so every later read of the channel returns exactly these values. The URL
-    /// embeds the endpoint id, so it stays valid for exactly that endpoint.
+    /// Each endpoint's id and its ingest credentials — the model documents `Id`,
+    /// `Username` and `Password` as "system generated" — are minted once, here, with
+    /// MediaPackage's generated width ([`INGEST_GENERATED_BYTES`], i.e. 32 lowercase-hex
+    /// characters each), and stored on the channel record, so every later read of the
+    /// channel returns exactly these values. The URL embeds the endpoint id, so it stays
+    /// valid for exactly that endpoint.
     pub fn mint_ingest_endpoints(&mut self, region: &str, channel_id: &str) -> Vec<IngestEndpoint> {
         let account_label = stable_label(&[::emulator_server::emulator_account_id(), region]);
         let channel_label = stable_label(&[channel_id, region]);
         (0..INGEST_ENDPOINT_COUNT)
             .map(|_| {
-                let id = self.mint_hex("ingest-endpoint", 16);
+                let id = self.mint_hex("ingest-endpoint", INGEST_GENERATED_BYTES);
                 IngestEndpoint {
                     url: Some(format!(
                         "https://{account_label}.mediapackage.{region}.amazonaws.com/in/v2/{channel_label}/{id}/channel"
                     )),
                     id: Some(id),
-                    username: Some(self.mint_hex("ingest-username", 12)),
-                    password: Some(self.mint_hex("ingest-password", 24)),
+                    username: Some(self.mint_hex("ingest-username", INGEST_GENERATED_BYTES)),
+                    password: Some(self.mint_hex("ingest-password", INGEST_GENERATED_BYTES)),
                 }
             })
             .collect()

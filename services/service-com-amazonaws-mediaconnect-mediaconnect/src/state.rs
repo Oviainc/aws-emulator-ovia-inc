@@ -12,9 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AddOutputRequest, EncodingConfig, Encryption, Entitlement, FailoverConfig, Flow, ListedFlow,
-    Maintenance, MediaStream, MonitoringConfig, NdiConfig, Output, Source, Transport, VpcInterface,
-    VpcInterfaceAttachment,
+    AddMediaStreamRequest, AddOutputRequest, EncodingConfig, Encryption, Entitlement,
+    FailoverConfig, Flow, Fmtp, ListedFlow, Maintenance, MediaStream, MediaStreamAttributes,
+    MonitoringConfig, NdiConfig, Output, Source, Transport, VpcInterface, VpcInterfaceAttachment,
 };
 
 /// The `Status` enum the model declares for a flow
@@ -147,6 +147,18 @@ pub fn tag_pair_rejection(key: &str, value: &str) -> Option<String> {
 /// output".
 pub const MAX_FLOW_OUTPUTS: usize = 50;
 
+/// The ceiling on how many media streams ONE FLOW holds, however many calls fill it.
+///
+/// AWS publishes no count for a flow's media streams, so the number is
+/// [`MAX_FLOW_COLLECTION_ENTRIES`] — the bound CreateFlow applies to one request's
+/// `MediaStreams` — named once so the create side and the add side cannot drift apart.
+/// Like [`MAX_FLOW_OUTPUTS`] it is a different RULE from that per-request bound: this one
+/// bounds the STORED flow, so a sequence of adds cannot grow one past what a single
+/// create could store. AddFlowMediaStreams models no 420, so it refuses past this bound
+/// with `BadRequestException`, the error the model describes for "a semantic error" in
+/// the request.
+pub const MAX_FLOW_MEDIA_STREAMS: usize = MAX_FLOW_COLLECTION_ENTRIES;
+
 /// The first port handed to a source that did not ask for one. MediaConnect assigns an
 /// ingest port from its own pool when the request omits `IngestPort`; the emulator
 /// assigns from a WRAPPING pool that starts at this base, so a source's port is drawn
@@ -158,6 +170,27 @@ const INGEST_PORT_BASE: i32 = 5000;
 /// The highest port the ingest-port pool hands out, so the assignment stays inside the
 /// 16-bit port space however many sources are created.
 const INGEST_PORT_CEILING: i32 = 65_535;
+
+/// `MediaStreamType` (`smithy_query(query="shape",shape="MediaStreamType")`: video |
+/// audio | ancillary-data).
+pub const MEDIA_STREAM_TYPE_VIDEO: &str = "video";
+/// See [`MEDIA_STREAM_TYPE_VIDEO`].
+pub const MEDIA_STREAM_TYPE_AUDIO: &str = "audio";
+/// See [`MEDIA_STREAM_TYPE_VIDEO`].
+pub const MEDIA_STREAM_TYPE_ANCILLARY_DATA: &str = "ancillary-data";
+
+/// The sample rate the service applies to a video or ancillary-data media stream whose
+/// request names none: `AddMediaStreamRequest$ClockRate` documents "If the media stream
+/// type is video or ancillary data, set this value to 90000." Audio has two documented
+/// values (48000 or 96000) and so no single default — an audio stream that names no
+/// clock rate keeps none.
+pub const VIDEO_CLOCK_RATE_HZ: i32 = 90_000;
+
+/// The first dynamic RTP payload type (RFC 3551 §6: 96-127 are dynamic), and so the
+/// first `Fmt` this service hands a media stream. `MediaStream$Fmt` is "the format type
+/// number (sometimes referred to as RTP payload type) of the media stream. MediaConnect
+/// assigns this value to the media stream."
+pub const DYNAMIC_RTP_PAYLOAD_TYPE_BASE: i32 = 96;
 
 /// A status change the clock owes: at `due_at` the flow's status becomes `status`.
 #[derive(Debug, Clone)]
@@ -290,6 +323,132 @@ impl StoredOutput {
     }
 }
 
+/// A media stream of a stored flow: the modelled `MediaStream` the flow reports, plus
+/// the `MediaStreamTags` the request that added it carried.
+///
+/// `MediaStream` models no tag member and the tagging operations are still scaffolded,
+/// so — like [`StoredFlow::tags`] — the tags are written here and not yet read, rather
+/// than dropped on the floor when a request carries them.
+#[derive(Debug, Clone, Default)]
+pub struct StoredMediaStream {
+    pub stream: MediaStream,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl StoredMediaStream {
+    /// The modelled `MediaStream` for this record.
+    pub fn to_media_stream(&self) -> MediaStream {
+        self.stream.clone()
+    }
+}
+
+/// Why `request` is not a media stream this flow can hold beside the media stream names
+/// and ids in `names` / `ids`, as the message the refusal carries, or `None` when it is.
+///
+/// A media stream is addressed by name within its flow (RemoveFlowMediaStream and
+/// UpdateFlowMediaStream take `MediaStreamName` as an `@httpLabel`), so an empty name
+/// names no media stream, and its `MediaStreamId` is "a unique identifier for the media
+/// stream" — so neither the name nor the id may repeat within one flow. CreateFlow's
+/// `MediaStreams` and AddFlowMediaStreams both add media streams to a flow, so both
+/// refuse through this one function and with the same wording: no request can leave a
+/// flow in a state the other operation would never permit.
+pub fn media_stream_rejection(
+    request: &AddMediaStreamRequest,
+    names: &BTreeSet<String>,
+    ids: &BTreeSet<i32>,
+) -> Option<String> {
+    if request.media_stream_name.is_empty() {
+        return Some(
+            "A media stream name must not be empty: it is how the media stream is addressed \
+             within its flow."
+                .to_string(),
+        );
+    }
+    if names.contains(&request.media_stream_name) {
+        return Some(format!(
+            "More than one media stream of this flow would be named {:?}. A media stream name \
+             must be unique within its flow.",
+            request.media_stream_name
+        ));
+    }
+    if ids.contains(&request.media_stream_id) {
+        return Some(format!(
+            "More than one media stream of this flow would have ID {}. A media stream ID must \
+             be unique within its flow.",
+            request.media_stream_id
+        ));
+    }
+    None
+}
+
+/// The `Fmt` the service assigns the next media stream of a flow: the lowest RTP
+/// payload type, counting from [`DYNAMIC_RTP_PAYLOAD_TYPE_BASE`], that none of the
+/// flow's media streams already holds — so a flow's payload types stay unique however
+/// its streams were added or removed.
+///
+/// The dynamic range ends at 127, and a flow may hold more media streams than that
+/// range has slots (the ceiling is [`MAX_FLOW_COLLECTION_ENTRIES`]); such a flow is
+/// numbered past the range rather than reusing a payload type, because uniqueness is
+/// what identifies the stream to a receiver.
+pub fn next_media_stream_fmt(existing: &[StoredMediaStream]) -> i32 {
+    let mut fmt = DYNAMIC_RTP_PAYLOAD_TYPE_BASE;
+    while existing.iter().any(|stream| stream.stream.fmt == fmt) {
+        fmt += 1;
+    }
+    fmt
+}
+
+/// Materialise one `AddMediaStreamRequest` into the media stream a flow keeps, with the
+/// payload type `fmt` the service assigned it (see [`next_media_stream_fmt`]).
+///
+/// Both CreateFlow (`MediaStreams`) and AddFlowMediaStreams add media streams to a flow,
+/// and they store the same record: this function is the crate's ONE materialisation of
+/// an `AddMediaStreamRequest`.
+pub fn materialise_media_stream(request: &AddMediaStreamRequest, fmt: i32) -> StoredMediaStream {
+    StoredMediaStream {
+        stream: MediaStream {
+            fmt,
+            media_stream_id: request.media_stream_id,
+            media_stream_name: request.media_stream_name.clone(),
+            media_stream_type: request.media_stream_type.clone(),
+            clock_rate: request.clock_rate.or_else(|| {
+                matches!(
+                    request.media_stream_type.as_str(),
+                    MEDIA_STREAM_TYPE_VIDEO | MEDIA_STREAM_TYPE_ANCILLARY_DATA
+                )
+                .then_some(VIDEO_CLOCK_RATE_HZ)
+            }),
+            description: request.description.clone(),
+            video_format: request.video_format.clone(),
+            attributes: request
+                .attributes
+                .as_ref()
+                .map(|attributes| MediaStreamAttributes {
+                    lang: attributes.lang.clone(),
+                    fmtp: attributes
+                        .fmtp
+                        .as_ref()
+                        .map(|fmtp| Fmtp {
+                            channel_order: fmtp.channel_order.clone(),
+                            colorimetry: fmtp.colorimetry.clone(),
+                            exact_framerate: fmtp.exact_framerate.clone(),
+                            par: fmtp.par.clone(),
+                            range: fmtp.range.clone(),
+                            scan_mode: fmtp.scan_mode.clone(),
+                            tcs: fmtp.tcs.clone(),
+                        })
+                        .unwrap_or_default(),
+                }),
+        },
+        tags: request
+            .media_stream_tags
+            .iter()
+            .flatten()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    }
+}
+
 /// A flow, as the service holds it between calls. Every flow operation's response is
 /// computed from this record.
 #[derive(Debug, Clone)]
@@ -311,7 +470,7 @@ pub struct StoredFlow {
     pub sources: Vec<StoredSource>,
     pub outputs: Vec<StoredOutput>,
     pub entitlements: Vec<Entitlement>,
-    pub media_streams: Vec<MediaStream>,
+    pub media_streams: Vec<StoredMediaStream>,
     pub vpc_interfaces: Vec<VpcInterface>,
     /// The flow's tags: what CreateFlow's `FlowTags` put on it, as TagResource and
     /// UntagResource have since changed it. ListTagsForResource reports this map, and
@@ -399,7 +558,12 @@ impl StoredFlow {
                 .unwrap_or_default(),
             sources: (!self.sources.is_empty())
                 .then(|| self.sources.iter().map(StoredSource::to_source).collect()),
-            media_streams: (!self.media_streams.is_empty()).then(|| self.media_streams.clone()),
+            media_streams: (!self.media_streams.is_empty()).then(|| {
+                self.media_streams
+                    .iter()
+                    .map(StoredMediaStream::to_media_stream)
+                    .collect()
+            }),
             vpc_interfaces: (!self.vpc_interfaces.is_empty()).then(|| self.vpc_interfaces.clone()),
         }
     }

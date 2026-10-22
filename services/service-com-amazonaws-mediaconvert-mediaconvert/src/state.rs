@@ -19,7 +19,9 @@
 //!   [`MAX_JOB_TEMPLATES`], `presets` at [`MAX_PRESETS`] and `jobs_queries` at
 //!   [`MAX_JOBS_QUERIES`]; a create past the cap is
 //!   refused with the modelled `ServiceQuotaExceededException` (HTTP 402) instead of
-//!   growing the store. The built-in system templates `job_templates` is seeded with are
+//!   growing the store, and a create whose `Name` the store already holds stores nothing
+//!   at all (see [`CreateOutcome`]), so a client repeating a create cannot grow it
+//!   either. The built-in system templates `job_templates` is seeded with are
 //!   inside that cap, and no request path removes or re-seeds them: `UpdateJobTemplate`
 //!   and `DeleteJobTemplate` refuse a `SYSTEM` template with the modelled
 //!   `ForbiddenException`. `idempotency` holds at most one entry per stored job, so it is
@@ -366,12 +368,34 @@ pub fn system_resource_modify_message(member: &str) -> String {
     system_resource_message(member, "modify")
 }
 
-/// The one wording both built-in-resource refusals share, so the recorded sentence lives
-/// in a single format string and only the action the request asked for differs.
+/// How this service refuses a `Create*` whose `Name` a BUILT-IN resource already holds.
+///
+/// A create whose name is already taken by a resource the CALLER created is idempotent
+/// (see [`CreateOutcome`]), so the only name a create is refused for is one no `Create*`
+/// call ever minted — which is the modelled `ConflictException`. As with
+/// [`not_found_message`], the wording names the request member the name came from, never
+/// the value supplied.
+pub fn system_resource_name_message(member: &str) -> String {
+    format!(
+        "{} That name belongs to a system resource.",
+        invalid_value_sentence(member)
+    )
+}
+
+/// The sentence EVERY built-in-resource refusal opens with, so the recorded wording lives
+/// in one format string and only the clause that says what was wrong with the request
+/// differs.
+fn invalid_value_sentence(member: &str) -> String {
+    format!("You specified an invalid value for {member}.")
+}
+
+/// The wording the two refusals of an ACTION on a built-in resource share (deleting one
+/// and modifying one), built on [`invalid_value_sentence`]; only the action the request
+/// asked for differs.
 fn system_resource_message(member: &str, action: &str) -> String {
     format!(
-        "You specified an invalid value for {member}. You are not allowed to {action} \
-         system resources."
+        "{} You are not allowed to {action} system resources.",
+        invalid_value_sentence(member)
     )
 }
 
@@ -1244,9 +1268,13 @@ impl PolicyRecord {
 pub enum CancelOutcome {
     /// The job was `SUBMITTED` and is now `CANCELED`.
     Canceled,
+    /// The job was ALREADY `CANCELED`, so the request asked for the state it is in and
+    /// nothing was changed: the repeat is a no-op success, not a conflict.
+    AlreadyCanceled,
     /// No job is stored under that id.
     NotFound,
-    /// The job has left `SUBMITTED`, carrying the status it is in now.
+    /// The job has left `SUBMITTED` for a status other than `CANCELED`, carrying the
+    /// status it is in now.
     NotCancelable(String),
 }
 
@@ -1255,14 +1283,118 @@ pub enum CancelOutcome {
 pub enum DeleteQueueOutcome {
     /// The queue is gone from the store.
     Deleted,
-    /// No queue is stored under that name.
-    NotFound,
+    /// No queue was stored under that name, so the store is already in the state the
+    /// request asked for and nothing was removed: the repeat is a no-op success. The
+    /// READ paths are unaffected — `GetQueue` on that name is still the modelled 404.
+    AlreadyAbsent,
     /// The queue is built in. `Queue`'s `Type`: "System queues are built in. You can't
     /// modify or delete system queues."
     SystemQueue,
     /// The queue still holds jobs that have not reached a terminal status, carrying how
     /// many are `SUBMITTED` and how many `PROGRESSING`.
     HasActiveJobs { submitted: i32, progressing: i32 },
+}
+
+/// What the store did when asked to create a resource whose `Name` is its identity — a
+/// queue, a job template or a preset.
+///
+/// A create whose `Name` is already stored does NOT conflict: MediaConvert answers the
+/// repeat with the operation's success status and the resource that is already there, so
+/// a provisioning path that runs twice gets the resource back rather than a hard
+/// failure. The stored record is handed back UNCHANGED — a repeat create never edits the
+/// resource it finds, so a later read sees what the FIRST create persisted.
+#[derive(Debug)]
+pub enum CreateOutcome<V> {
+    /// Nothing held that name; the record is now stored, and this is its projection.
+    Created(V),
+    /// A resource the caller could have created already holds that name. This is the
+    /// projection of the record that was ALREADY stored, which the create left as it was.
+    Existing(V),
+    /// A BUILT-IN ([`TYPE_SYSTEM`]) resource holds that name. No `Create*` call ever
+    /// produced it, so there is no create for a repeat to be idempotent with, and the
+    /// name genuinely conflicts with the current state of the store.
+    SystemResource,
+    /// The store is at its capacity for that kind of record ([`MAX_QUEUES`] queues,
+    /// [`MAX_JOB_TEMPLATES`] job templates, [`MAX_PRESETS`] presets).
+    AtCapacity,
+}
+
+/// A record stored under the `Name` that is its identity.
+///
+/// Implemented by the three records a `Create*` operation mints — a queue, a job
+/// template and a preset — so [`create_named`] can own the one rule they share: the
+/// existence probe, the idempotent return and the insert, in a single map lookup.
+pub trait NamedRecord {
+    /// The `Name` this record is stored under.
+    fn record_name(&self) -> &str;
+
+    /// Whether this is a BUILT-IN resource, which no caller created and no caller can
+    /// re-create ([`TYPE_SYSTEM`]).
+    fn is_system(&self) -> bool;
+}
+
+impl NamedRecord for QueueRecord {
+    fn record_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_system(&self) -> bool {
+        self.queue_type == QUEUE_TYPE_SYSTEM
+    }
+}
+
+impl NamedRecord for JobTemplateRecord {
+    fn record_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_system(&self) -> bool {
+        self.template_type == TYPE_SYSTEM
+    }
+}
+
+impl NamedRecord for PresetRecord {
+    fn record_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_system(&self) -> bool {
+        self.preset_type == TYPE_SYSTEM
+    }
+}
+
+/// Store `record` under its own name, idempotently.
+///
+/// ONE rule for every named resource this service creates, so no two create paths can
+/// disagree about it:
+///
+/// * a name nothing holds stores the record and projects it — [`CreateOutcome::Created`];
+/// * a name a caller-created record already holds stores NOTHING and projects the record
+///   that is there — [`CreateOutcome::Existing`], the idempotent repeat;
+/// * a name a built-in record holds is [`CreateOutcome::SystemResource`];
+/// * a store already at `capacity` is [`CreateOutcome::AtCapacity`], so the idempotent
+///   repeat above is reached even when the store is full — it adds nothing.
+///
+/// The probe and the insert happen under the one `&mut` borrow the caller holds the state
+/// lock for, so two concurrent creates of the same name cannot both insert.
+fn create_named<R: NamedRecord, V>(
+    store: &mut BTreeMap<String, R>,
+    capacity: usize,
+    record: R,
+    view: impl Fn(&R) -> V,
+) -> CreateOutcome<V> {
+    if let Some(existing) = store.get(record.record_name()) {
+        if existing.is_system() {
+            return CreateOutcome::SystemResource;
+        }
+        return CreateOutcome::Existing(view(existing));
+    }
+    if store.len() >= capacity {
+        return CreateOutcome::AtCapacity;
+    }
+    let projection = view(&record);
+    store.insert(record.record_name().to_string(), record);
+    CreateOutcome::Created(projection)
 }
 
 /// What the store did when asked to accept a new record it mints the id of — a job, or
@@ -1549,6 +1681,13 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         let Some(job) = self.jobs.get_mut(id) else {
             return CancelOutcome::NotFound;
         };
+        // A job already `CANCELED` is in the state the request asks for, so the repeat
+        // changes nothing at all — not its status, not its finish time — and reports the
+        // success the first cancel reported. Idempotent, so a teardown path that runs
+        // twice does not have to tell "already cancelled" from a real failure.
+        if job.status == JOB_STATUS_CANCELED {
+            return CancelOutcome::AlreadyCanceled;
+        }
         if job.status != JOB_STATUS_SUBMITTED {
             return CancelOutcome::NotCancelable(job.status.clone());
         }
@@ -1572,6 +1711,11 @@ impl ComAmazonawsMediaconvertMediaconvertState {
 
     /// Delete a queue: "Permanently delete a queue you have created."
     ///
+    /// The delete is IDEMPOTENT on the name: a name the store does not hold is already in
+    /// the state the request asks for, so it is reported as such rather than as a
+    /// failure. The read paths are untouched — `GetQueue` on that name is still the
+    /// modelled 404.
+    ///
     /// Two refusals live here rather than in the handler, so the decision and the state
     /// it is read from cannot disagree:
     ///
@@ -1585,7 +1729,7 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// exactly as their `Queue` recorded them.
     pub fn delete_queue(&mut self, name: &str) -> DeleteQueueOutcome {
         let Some(record) = self.queues.get(name) else {
-            return DeleteQueueOutcome::NotFound;
+            return DeleteQueueOutcome::AlreadyAbsent;
         };
         if record.queue_type == QUEUE_TYPE_SYSTEM {
             return DeleteQueueOutcome::SystemQueue;
@@ -1627,19 +1771,39 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         )
     }
 
-    /// Whether the store is at [`MAX_QUEUES`] and can hold no further queue.
-    pub fn queues_at_capacity(&self) -> bool {
-        self.queues.len() >= MAX_QUEUES
+    /// Store a queue `CreateQueue` asked for, idempotently on its `Name`.
+    ///
+    /// See [`create_named`] for the one rule every named create here follows; the two
+    /// job counts the projection carries are read off `jobs`, so the queue a repeat
+    /// create returns reports the counts it has NOW, exactly as `GetQueue` would.
+    pub fn create_queue(&mut self, record: QueueRecord, region: &str) -> CreateOutcome<Queue> {
+        let (submitted, progressing) = self.job_counts(record.record_name());
+        create_named(&mut self.queues, MAX_QUEUES, record, |queue| {
+            queue.view(region, submitted, progressing)
+        })
     }
 
-    /// Whether the store is at [`MAX_JOB_TEMPLATES`] and can hold no further template.
-    pub fn job_templates_at_capacity(&self) -> bool {
-        self.job_templates.len() >= MAX_JOB_TEMPLATES
+    /// Store a job template `CreateJobTemplate` asked for, idempotently on its `Name`.
+    /// See [`create_named`].
+    pub fn create_job_template(
+        &mut self,
+        record: JobTemplateRecord,
+        region: &str,
+    ) -> CreateOutcome<JobTemplate> {
+        create_named(
+            &mut self.job_templates,
+            MAX_JOB_TEMPLATES,
+            record,
+            |template| template.view(region),
+        )
     }
 
-    /// Whether the store is at [`MAX_PRESETS`] and can hold no further preset.
-    pub fn presets_at_capacity(&self) -> bool {
-        self.presets.len() >= MAX_PRESETS
+    /// Store a preset `CreatePreset` asked for, idempotently on its `Name`.
+    /// See [`create_named`].
+    pub fn create_preset(&mut self, record: PresetRecord, region: &str) -> CreateOutcome<Preset> {
+        create_named(&mut self.presets, MAX_PRESETS, record, |preset| {
+            preset.view(region)
+        })
     }
 
     /// The tag set of the resource an ARN named, or `None` when this store holds no such

@@ -235,31 +235,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "A name you create for each job template. Each name must be unique within your
-        // account."
-        if state.job_templates.contains_key(&name) {
-            return Err(CreateJobTemplateErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!("Job template {name} already exists.")),
-                },
-            )
-            .into());
-        }
-        // Bounded growth: the store holds at most `MAX_JOB_TEMPLATES` templates, and a
-        // create past that is the quota refusal the model declares rather than more state.
-        if state.job_templates_at_capacity() {
-            return Err(CreateJobTemplateErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "You have reached the maximum of {} job templates.",
-                        crate::state::MAX_JOB_TEMPLATES
-                    )),
-                },
-            )
-            .into());
-        }
-
+        // account." A create under a name that is already in use does NOT conflict: see
+        // the match below.
         let record = crate::state::JobTemplateRecord {
-            name: name.clone(),
+            name,
             category: input.category,
             description: input.description,
             settings: input.settings,
@@ -283,11 +262,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         };
 
-        let view = record.view(&region);
-        state.job_templates.insert(name, record);
-
-        Ok(CreateJobTemplateOutput {
-            job_template: Some(view),
-        })
+        // The store owns the existence probe, the idempotent return and the insert
+        // together, under the lock this handler holds, so two creates of one name can
+        // never both insert and the decision cannot disagree with the stored state.
+        match state.create_job_template(record, &region) {
+            // A `Name` already in the store answers the SAME 201 with the template that is
+            // there: the create is idempotent on `Name`, so a deploy that declares its
+            // templates on every run is handed the template instead of a failure. Nothing
+            // was changed, so this is the template the FIRST create persisted.
+            crate::state::CreateOutcome::Created(view)
+            | crate::state::CreateOutcome::Existing(view) => Ok(CreateJobTemplateOutput {
+                job_template: Some(view),
+            }),
+            // A built-in template holding the name is not a resource any
+            // `CreateJobTemplate` produced, so there is no earlier create for this one to
+            // repeat: the name conflicts with the current state of the store.
+            crate::state::CreateOutcome::SystemResource => {
+                Err(CreateJobTemplateErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::system_resource_name_message("name")),
+                    },
+                )
+                .into())
+            }
+            // Bounded growth: the store holds at most `MAX_JOB_TEMPLATES` templates, and a
+            // create past that is the quota refusal the model declares rather than more
+            // state.
+            crate::state::CreateOutcome::AtCapacity => {
+                Err(CreateJobTemplateErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "You have reached the maximum of {} job templates.",
+                            crate::state::MAX_JOB_TEMPLATES
+                        )),
+                    },
+                )
+                .into())
+            }
+        }
     }
 }

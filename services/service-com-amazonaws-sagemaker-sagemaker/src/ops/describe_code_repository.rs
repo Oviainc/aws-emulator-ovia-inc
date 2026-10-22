@@ -142,14 +142,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(repository) = store.code_repositories.get(&input.code_repository_name) else {
             // Never a 200 with empty fields: a caller cannot tell that from a
-            // repository that exists and carries nothing.
+            // repository that exists and carries nothing. The refusal is built from the
+            // request — SageMaker names the ARN of the repository asked for — so it is
+            // the same message whatever name and region the caller sent.
             let arn = crate::state::resource_arn(
                 &crate::state::request_region(ctx),
                 "code-repository",
                 &input.code_repository_name,
             );
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find code repository \"{arn}\"."
+                "Cannot find CodeRepository: {arn}"
             )));
         };
 

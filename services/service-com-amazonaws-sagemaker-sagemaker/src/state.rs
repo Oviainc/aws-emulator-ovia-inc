@@ -254,6 +254,8 @@ pub struct AppImageConfig {
 /// `GitConfig` is required on create, so it is stored unconditionally; the reader's
 /// member is optional only because the model marks it so. `tags` is stored so a later
 /// `ListTags` reports what the create carried; no implemented operation surfaces it yet.
+/// `last_modified_time` is carried separately from `creation_time` because the modelled
+/// output reports both; a repository nothing has changed reports the creation instant.
 #[derive(Debug, Clone)]
 pub struct CodeRepository {
     pub name: String,

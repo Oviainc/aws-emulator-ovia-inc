@@ -17,3 +17,5 @@ mod permissions;
 mod private_ca_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_listing.rs"]
+mod tag_listing;

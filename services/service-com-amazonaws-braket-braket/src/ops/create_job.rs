@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates an Amazon Braket hybrid job: the record every later `GetJob` answers from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `clientToken` is an `@idempotencyToken`: replaying it with the same request returns
+//! the first `jobArn`, and reusing it for a different request is refused — through the
+//! one token index this service keeps, with this operation's name in the fingerprint,
+//! so a token presented to two different creates is a reuse rather than a replay. A
+//! job's ARN carries its NAME, so a second job of the same name in the same account and
+//! region would be the same resource and is refused as a conflict.
+//!
+//! A job this emulator accepts is returned in the non-terminal `QUEUED` status; the
+//! statuses after it are owed by the clock (`crate::state::JOB_RUNNING_SPAN` /
+//! `JOB_TERMINAL_SPAN`) and materialised by the next call that reads the record.
+//! Nothing provisions an instance or executes the algorithm here, so the job ends in
+//! the modelled failure status with `crate::state::JOB_NOT_EXECUTED_FAILURE_REASON`
+//! rather than claiming artifacts that were never written.
 //!
 //! ## Shape of an operation
 //!
@@ -150,6 +156,62 @@ impl From<CreateJobErrorModeled> for CreateJobError {
     }
 }
 
+/// Refuse the request the way the model's own `ValidationException` words it.
+fn refuse(message: String) -> CreateJobError {
+    CreateJobErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        reason: None,
+        program_set_validation_failures: None,
+    })
+    .into()
+}
+
+/// The digest that decides whether a repeated `clientToken` is a replay of the same
+/// request (the same ARN comes back) or a reuse of the token for a different one
+/// (refused). Every member that lands in the stored record takes part.
+fn request_digest(input: &CreateJobInput) -> String {
+    let sorted_pairs = |map: Option<&::std::collections::HashMap<String, String>>| {
+        map.map_or_else(String::new, |entries| {
+            let mut pairs: Vec<String> = entries.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            pairs.sort();
+            pairs.join(",")
+        })
+    };
+    let hyper_parameters = sorted_pairs(input.hyper_parameters.as_ref());
+    let tags = sorted_pairs(input.tags.as_ref());
+    let associations = input.associations.as_deref().map_or_else(String::new, |list| {
+        list.iter()
+            .map(|a| format!("{}={}", a.r#type, a.arn))
+            .collect::<Vec<String>>()
+            .join(",")
+    });
+    // The structural members have no canonical string form of their own, so each one
+    // takes part through its `Debug` rendering, which prints every member it holds.
+    let algorithm_specification = format!("{:?}", input.algorithm_specification);
+    let input_data_config = format!("{:?}", input.input_data_config);
+    let output_data_config = format!("{:?}", input.output_data_config);
+    let checkpoint_config = format!("{:?}", input.checkpoint_config);
+    let stopping_condition = format!("{:?}", input.stopping_condition);
+    let instance_config = format!("{:?}", input.instance_config);
+    crate::state::digest(&[
+        // The operation takes part, so one token presented to two different creates is
+        // a reuse of the token rather than a replay of this request.
+        "CreateJob",
+        &input.job_name,
+        &input.role_arn,
+        &input.device_config.device,
+        &algorithm_specification,
+        &input_data_config,
+        &output_data_config,
+        &checkpoint_config,
+        &stopping_condition,
+        &instance_config,
+        &hyper_parameters,
+        &tags,
+        &associations,
+    ])
+}
+
 /// The `CreateJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -186,18 +248,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJob"))
+        // Input validation comes before any state access: `DeviceConfig$device` is a
+        // `String256` the model gives no `@pattern`, so a value that is not a device
+        // ARN at all reaches this handler and is refused here as invalid input.
+        if !crate::state::is_braket_arn(
+            &input.device_config.device,
+            crate::state::ARN_RESOURCE_DEVICE,
+        ) {
+            return Err(refuse(crate::state::invalid_arn_message(
+                "deviceConfig.device",
+                crate::state::ARN_RESOURCE_DEVICE,
+                &input.device_config.device,
+            )));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateJobError::from(CreateJobErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Braket service store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let fingerprint = request_digest(&input);
+        let mut guard = state.lock();
+        guard.apply_due_transitions(now);
+
+        // `@idempotencyToken`: the same token with the same request is the same job.
+        // Checked against the surviving entries, so a token whose job has aged out of
+        // the store is not replayed to an ARN that no longer resolves.
+        guard.prune_idempotency(now);
+        if let Some(seen) = guard.idempotency.get(&input.client_token) {
+            if seen.fingerprint != fingerprint {
+                return Err(refuse(format!(
+                    "The clientToken {} was already used to create a hybrid job with \
+                     different request parameters",
+                    input.client_token
+                )));
+            }
+            return Ok(CreateJobOutput {
+                job_arn: seen.resource_arn.clone(),
+            });
+        }
+
+        let Some(device) = guard.devices.get(&input.device_config.device).cloned() else {
+            // `CreateJob` models no `ResourceNotFoundException`, so a device the
+            // inventory does not publish is refused as an invalid `deviceConfig`.
+            return Err(refuse(format!(
+                "Device {} not found",
+                input.device_config.device
+            )));
+        };
+        if device.device_status == crate::state::DEVICE_RETIRED {
+            return Err(CreateJobErrorModeled::DeviceRetiredException(
+                DeviceRetiredException {
+                    message: Some(format!("Device {} has been retired", device.device_arn)),
+                },
+            )
+            .into());
+        }
+        if device.device_status != crate::state::DEVICE_ONLINE {
+            return Err(CreateJobErrorModeled::DeviceOfflineException(
+                DeviceOfflineException {
+                    message: Some(format!("Device {} is offline", device.device_arn)),
+                },
+            )
+            .into());
+        }
+
+        // A hybrid job's ARN carries its NAME, so a second job of the same name in the
+        // same account and region would BE the first job: that is the conflict this
+        // operation models.
+        let region = crate::state::request_region(ctx);
+        let job_arn = ::emulator_server::emulator_arn(
+            "braket",
+            &region,
+            &format!("{}/{}", crate::state::ARN_RESOURCE_JOB, input.job_name),
+        );
+        if guard.jobs.contains_key(&job_arn) {
+            return Err(CreateJobErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A hybrid job named {} already exists: {job_arn}",
+                    input.job_name
+                )),
+            })
+            .into());
+        }
+
+        // The concurrency quota. Counted after the due transitions above, so a job the
+        // clock has already finished does not hold a slot.
+        if guard.jobs_in_flight() >= crate::state::MAX_JOBS_IN_FLIGHT {
+            return Err(CreateJobErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "This account already has {} hybrid jobs in flight, which is its limit",
+                        crate::state::MAX_JOBS_IN_FLIGHT
+                    )),
+                },
+            )
+            .into());
+        }
+        // Keep both stores bounded: past its capacity the job store drops its oldest
+        // terminal records, and the token index drops the entries that can no longer
+        // serve a replay (`prune_idempotency` above, which also ran before the
+        // lookup).
+        guard.evict_finished_jobs_over_capacity();
+        guard.prune_idempotency(now);
+
+        let job = crate::state::HybridJob {
+            job_arn: job_arn.clone(),
+            job_name: input.job_name.clone(),
+            status: crate::state::STATUS_QUEUED.to_string(),
+            role_arn: input.role_arn.clone(),
+            algorithm_specification: input.algorithm_specification.clone(),
+            input_data_config: input.input_data_config.clone().unwrap_or_default(),
+            output_data_config: input.output_data_config.clone(),
+            checkpoint_config: input.checkpoint_config.clone(),
+            stopping_condition: input.stopping_condition.clone(),
+            instance_config: input.instance_config.clone(),
+            hyper_parameters: input
+                .hyper_parameters
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            device_config: input.device_config.clone(),
+            associations: input.associations.clone().unwrap_or_default(),
+            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            started_at: None,
+            ended_at: None,
+            failure_reason: None,
+            running_due: now + crate::state::JOB_RUNNING_SPAN,
+            terminal_due: now + crate::state::JOB_TERMINAL_SPAN,
+        };
+        guard.jobs.insert(job_arn.clone(), job);
+        guard.idempotency.insert(
+            input.client_token.clone(),
+            crate::state::IdempotencyRecord {
+                fingerprint,
+                resource_arn: job_arn.clone(),
+                recorded_at: now,
+            },
+        );
+
+        Ok(CreateJobOutput { job_arn })
     }
 }
