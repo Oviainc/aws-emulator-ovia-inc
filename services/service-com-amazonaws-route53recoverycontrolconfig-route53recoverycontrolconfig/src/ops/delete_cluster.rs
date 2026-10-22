@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the cluster, together with the default control panel created
+//! with it, from [`crate::state`] once nothing else is left under it, so a following
+//! `DescribeCluster` answers 404; an ARN no cluster is stored under is
+//! `ResourceNotFoundException` (404), and a cluster that still holds a control panel the
+//! caller created, or any routing control, is `ConflictException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCluster"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        let Some(cluster) = guard.clusters.get(&input.cluster_arn) else {
+            return Err(DeleteClusterErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no cluster is stored under {}", input.cluster_arn),
+                },
+            )
+            .into());
+        };
+        let default_panel_arn = cluster.default_control_panel_arn.clone();
+
+        // A parent is only removable once its children are gone. The default control
+        // panel is part of the cluster, so it does not count as a child here.
+        let user_panels = guard
+            .ordered_control_panels(&input.cluster_arn)
+            .iter()
+            .filter(|panel| !panel.default_control_panel)
+            .count();
+        if user_panels > 0 {
+            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "cluster {} still has {user_panels} control panel(s)",
+                    input.cluster_arn
+                ),
+            })
+            .into());
+        }
+
+        let remaining_controls = guard
+            .routing_controls
+            .values()
+            .filter(|rc| rc.cluster_arn == input.cluster_arn)
+            .count();
+        if remaining_controls > 0 {
+            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "cluster {} still has {remaining_controls} routing control(s)",
+                    input.cluster_arn
+                ),
+            })
+            .into());
+        }
+
+        guard.control_panels.remove(&default_panel_arn);
+        guard.clusters.remove(&input.cluster_arn);
+        // Both resources are gone, so the tokens that created them are released too.
+        guard.forget_tokens_for(&default_panel_arn);
+        guard.forget_tokens_for(&input.cluster_arn);
+        Ok(DeleteClusterOutput {})
     }
 }

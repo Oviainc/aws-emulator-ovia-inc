@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDocumentVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDocumentVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDocumentVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Commits an `INITIALIZED` version: flips the stored version to `ACTIVE` and makes it
+//! the document's latest version.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +177,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDocumentVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDocumentVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDocumentVersion"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDocumentVersionErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("One or more of the dependencies is unavailable.".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        if !state.documents.contains_key(&input.document_id) {
+            return Err(not_exists(&input.document_id));
+        }
+        let version_exists = state
+            .documents
+            .get(&input.document_id)
+            .is_some_and(|document| document.versions.contains_key(&input.version_id));
+        if !version_exists {
+            return Err(not_exists(&input.version_id));
+        }
+
+        // `VersionStatus` models exactly one value, `ACTIVE`; a request that names none
+        // asks for no transition, so nothing is written.
+        let Some(requested) = input.version_status.clone() else {
+            return Ok(UpdateDocumentVersionOutput);
+        };
+        if requested != crate::state::DOCUMENT_STATUS_ACTIVE {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "VersionStatus must be ACTIVE, got {requested}"
+            )));
+        }
+
+        let current_status = state
+            .documents
+            .get(&input.document_id)
+            .and_then(|document| document.versions.get(&input.version_id))
+            .map(|version| version.status.clone())
+            .unwrap_or_default();
+        // `ProhibitedStateException`'s own documentation in this model: "The specified
+        // document version is not in the INITIALIZED state."
+        if current_status != crate::state::DOCUMENT_STATUS_INITIALIZED {
+            return Err(UpdateDocumentVersionErrorModeled::ProhibitedStateException(
+                ProhibitedStateException {
+                    message: Some(
+                        "The specified document version is not in the INITIALIZED state."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let now = state.now();
+        let Some(document) = state.documents.get_mut(&input.document_id) else {
+            return Err(UpdateDocumentVersionErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("One or more of the dependencies is unavailable.".to_string()),
+                },
+            )
+            .into());
+        };
+        if let Some(version) = document.versions.get_mut(&input.version_id) {
+            version.status = crate::state::DOCUMENT_STATUS_ACTIVE.to_string();
+            version.modified = now;
+        }
+        // The committed version is now the one `LatestVersionMetadata` reports, and the
+        // document itself changed, so its `ModifiedTimestamp` advances. "Amazon WorkDocs
+        // also sets its document container to ACTIVE" (this operation's documentation).
+        document.latest_version_id = input.version_id.clone();
+        document.modified = now;
+        document.resource_state = crate::state::RESOURCE_STATE_ACTIVE.to_string();
+
+        Ok(UpdateDocumentVersionOutput)
     }
+}
+
+/// The modelled 404 naming the resource that does not exist.
+fn not_exists(entity_id: &str) -> UpdateDocumentVersionError {
+    UpdateDocumentVersionErrorModeled::EntityNotExistsException(EntityNotExistsException {
+        message: Some("The resource does not exist.".to_string()),
+        entity_ids: Some(vec![entity_id.to_string()]),
+    })
+    .into()
 }

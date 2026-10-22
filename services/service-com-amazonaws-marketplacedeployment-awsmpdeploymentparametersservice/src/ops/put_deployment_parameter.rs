@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDeploymentParameter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDeploymentParameter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDeploymentParameter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes one deployment parameter into [`crate::state`] and reports it back from
+//! what was stored.
+//!
+//! A deployment parameter is keyed on (catalog, productId, agreementId,
+//! deploymentParameter.name): the model's own doc for
+//! `DeploymentParameterInput$name` says the name "is the identifier on which
+//! deployment parameters are keyed for a given buyer and product. If this name
+//! matches an existing deployment parameter, this request will update the existing
+//! resource." So a second call for the same identity UPDATES in place and reports
+//! the SAME `deploymentParameterId` and `resourceArn`; it never mints a second one.
+//!
+//! `tags` is applied on the CREATE only — `PutDeploymentParameterRequest$tags`
+//! documents that "Tags will only be applied for create operations, and they'll be
+//! ignored if the resource already exists" — and the response's `tags` is the
+//! resource's stored tag map, which `TagResource` and `UntagResource` also write.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +182,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDeploymentParameter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDeploymentParameterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDeploymentParameter"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutDeploymentParameterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the deployment-parameter store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `clientToken` is the `@idempotencyToken`: a token already bound to a write
+        // replays that write rather than performing it again, and the SAME token aimed
+        // at a DIFFERENT parameter is a conflicting request.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(arn) = store.client_tokens.get(token).cloned() {
+                if let Some(record) = store.parameters.get(&arn) {
+                    if record.catalog == input.catalog
+                        && record.product_id == input.product_id
+                        && record.agreement_id == input.agreement_id
+                        && record.name == input.deployment_parameter.name
+                    {
+                        return Ok(output_of(record));
+                    }
+                    return Err(PutDeploymentParameterErrorModeled::ConflictException(
+                        crate::state::client_token_conflict(
+                            token,
+                            &record.deployment_parameter_id,
+                        ),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let key: crate::state::ParameterKey = (
+            input.catalog.clone(),
+            input.product_id.clone(),
+            input.agreement_id.clone(),
+            input.deployment_parameter.name.clone(),
+        );
+
+        let resource_arn = match store.by_name.get(&key).cloned() {
+            // The parameter already exists: this call rewrites its content in place.
+            // `tags` is NOT applied — the member documents that it is ignored when the
+            // resource already exists — so the tag map stays whatever the create and
+            // the tagging operations left on the record.
+            Some(resource_arn) => {
+                let Some(record) = store.parameters.get_mut(&resource_arn) else {
+                    // The two indexes are written together, so this cannot happen; a
+                    // missing record is a store fault, not a client error.
+                    return Err(PutDeploymentParameterErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: "the deployment-parameter store is inconsistent".to_string(),
+                        },
+                    )
+                    .into());
+                };
+                record.secret_string = input.deployment_parameter.secret_string;
+                record.expiration_date = input.expiration_date;
+                record.updated_at = now;
+                resource_arn
+            }
+            None => {
+                let tags = match crate::state::merge_tags(
+                    &::std::collections::BTreeMap::new(),
+                    &input.tags.clone().unwrap_or_default(),
+                ) {
+                    Ok(tags) => tags,
+                    Err(why) => {
+                        return Err(PutDeploymentParameterErrorModeled::ValidationException(why)
+                            .into())
+                    }
+                };
+                if !store.has_capacity() {
+                    return Err(
+                        PutDeploymentParameterErrorModeled::ServiceQuotaExceededException(
+                            crate::state::parameter_quota_exceeded(store.parameters.len()),
+                        )
+                        .into(),
+                    );
+                }
+                let deployment_parameter_id = store.mint_id();
+                let resource_arn =
+                    crate::state::deployment_parameter_arn(&region, &deployment_parameter_id);
+                store.parameters.insert(
+                    resource_arn.clone(),
+                    crate::state::DeploymentParameterRecord {
+                        resource_arn: resource_arn.clone(),
+                        deployment_parameter_id,
+                        catalog: input.catalog,
+                        product_id: input.product_id,
+                        agreement_id: input.agreement_id,
+                        name: input.deployment_parameter.name,
+                        secret_string: input.deployment_parameter.secret_string,
+                        expiration_date: input.expiration_date,
+                        tags,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                );
+                store.by_name.insert(key, resource_arn.clone());
+                resource_arn
+            }
+        };
+
+        if let Some(token) = input.client_token {
+            store.remember_client_token(token, resource_arn.clone());
+        }
+
+        let Some(record) = store.parameters.get(&resource_arn) else {
+            return Err(PutDeploymentParameterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the deployment-parameter store is inconsistent".to_string(),
+                },
+            )
+            .into());
+        };
+        Ok(output_of(record))
+    }
+}
+
+/// The response for `record`, read entirely out of the stored record.
+fn output_of(record: &crate::state::DeploymentParameterRecord) -> PutDeploymentParameterOutput {
+    PutDeploymentParameterOutput {
+        resource_arn: record.resource_arn.clone(),
+        agreement_id: record.agreement_id.clone(),
+        deployment_parameter_id: record.deployment_parameter_id.clone(),
+        tags: Some(record.tags_map()),
     }
 }

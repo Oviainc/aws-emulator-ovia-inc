@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRoutingControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRoutingControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: validates the cluster and (when named) the control panel are stored,
+//! mints a routing-control ARN under the owning control panel and persists it in
+//! [`crate::state`]; `DescribeRoutingControl` and `ListRoutingControls` project the same
+//! stored record, and the panel's `RoutingControlCount` counts it from that moment.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRoutingControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! When the request names no `ControlPanelArn` the routing control is attached to the
+//! cluster's default control panel — the one `CreateCluster` created with the cluster.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRoutingControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRoutingControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRoutingControl"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRoutingControlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let fingerprint = format!(
+            "{}|{}|{}",
+            input.cluster_arn,
+            input.control_panel_arn.as_deref().unwrap_or_default(),
+            input.routing_control_name
+        );
+        let mut guard = state.lock();
+
+        match guard.token_outcome(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenOutcome::Replay(arn) => {
+                if let Some(record) = guard.routing_controls.get(&arn) {
+                    return Ok(CreateRoutingControlOutput {
+                        routing_control: Some(record.to_routing_control()),
+                    });
+                }
+            }
+            crate::state::TokenOutcome::Mismatch => {
+                return Err(CreateRoutingControlErrorModeled::ConflictException(
+                    ConflictException {
+                        message: "ClientToken was already used for a CreateRoutingControl \
+                                  request with different parameters"
+                            .to_string(),
+                    },
+                )
+                .into());
+            }
+            crate::state::TokenOutcome::Fresh => {}
+        }
+
+        let Some(cluster) = guard.clusters.get(&input.cluster_arn) else {
+            return Err(CreateRoutingControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no cluster is stored under {}", input.cluster_arn),
+                },
+            )
+            .into());
+        };
+        // `ControlPanelArn` is optional: without it the routing control belongs to the
+        // cluster's default control panel.
+        let panel_arn = match input.control_panel_arn.clone() {
+            Some(arn) => arn,
+            None => cluster.default_control_panel_arn.clone(),
+        };
+
+        let Some(panel) = guard.control_panels.get(&panel_arn) else {
+            return Err(CreateRoutingControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no control panel is stored under {panel_arn}"),
+                },
+            )
+            .into());
+        };
+        // A routing control's cluster and control panel have to be the same resource
+        // hierarchy; a panel in another cluster is a contradictory request.
+        if panel.cluster_arn != input.cluster_arn {
+            return Err(CreateRoutingControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "control panel {panel_arn} belongs to cluster {}, not to {}",
+                        panel.cluster_arn, input.cluster_arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A routing control name identifies the control within its control panel.
+        if guard
+            .ordered_routing_controls(&panel_arn)
+            .iter()
+            .any(|rc| rc.name == input.routing_control_name)
+        {
+            return Err(CreateRoutingControlErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a routing control named \"{}\" already exists in {panel_arn}",
+                        input.routing_control_name
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded, so a repeated create cannot grow it without limit.
+        if guard.routing_controls_full() {
+            return Err(CreateRoutingControlErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account may hold at most {} routing controls",
+                        crate::state::MAX_ROUTING_CONTROLS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // AWS nests a routing control's ARN inside its control panel's, so the panel
+        // ARN is the prefix of the routing-control ARN.
+        let control_id = guard.mint_id();
+        let routing_control_arn = format!("{panel_arn}/routingcontrol/{control_id}");
+        let seq = guard.next_seq();
+
+        guard.routing_controls.insert(
+            routing_control_arn.clone(),
+            crate::state::RoutingControlRecord {
+                seq,
+                arn: routing_control_arn.clone(),
+                control_panel_arn: panel_arn,
+                cluster_arn: input.cluster_arn,
+                name: input.routing_control_name,
+                owner: ::engine::emulator_account_id().to_string(),
+                deploy_due: crate::state::deploy_due(),
+            },
+        );
+
+        guard.remember_token(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &routing_control_arn,
+        );
+
+        // Answer from the STORED record.
+        Ok(CreateRoutingControlOutput {
+            routing_control: guard
+                .routing_controls
+                .get(&routing_control_arn)
+                .map(crate::state::RoutingControlRecord::to_routing_control),
+        })
     }
 }

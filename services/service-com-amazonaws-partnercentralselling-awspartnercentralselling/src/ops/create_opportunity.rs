@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOpportunity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOpportunity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOpportunity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints the opportunity's `^O[0-9]{1,19}$` id, stores the whole request
+//! under (Catalog, Id) in [`crate::state`], and is idempotent on `ClientToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -234,18 +227,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOpportunity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOpportunityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOpportunity"))
+        use crate::state;
+
+        state::check_catalog(&input.catalog)
+            .map_err(CreateOpportunityErrorModeled::ValidationException)?;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(CreateOpportunityErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let fingerprint = request_fingerprint(&input);
+        let replay_key = (input.catalog.clone(), input.client_token.clone());
+        let mut store = store.lock();
+
+        // @idempotencyToken: the same token with the same body resolves to the record the
+        // first call minted; the same token with a different body is the conflict the
+        // `ClientToken` doc names ("Conflicting client token submitted for a new request
+        // body.").
+        if let Some(replay) = store.create_replays.get(&replay_key).cloned() {
+            if replay.request_fingerprint != fingerprint {
+                return Err(CreateOpportunityErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            "Conflicting client token submitted for a new request body."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            let key = (input.catalog.clone(), replay.opportunity_id.clone());
+            let Some(existing) = store.opportunities.get(&key) else {
+                return Err(CreateOpportunityErrorModeled::ResourceNotFoundException(
+                    state::opportunity_not_found(&input.catalog, &replay.opportunity_id),
+                )
+                .into());
+            };
+            return Ok(CreateOpportunityOutput {
+                id: existing.id.clone(),
+                partner_opportunity_identifier: existing.partner_opportunity_identifier.clone(),
+                last_modified_date: Some(state::date_time(existing.last_modified_date_ms)),
+            });
+        }
+
+        // The store is bounded, so repeated creates cannot grow this process's memory
+        // without limit; a replay above still succeeds, because it mints nothing.
+        if store.opportunities.len() >= state::MAX_OPPORTUNITIES {
+            return Err(CreateOpportunityErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "This emulator holds at most {} opportunities and already holds {}; \
+                         review the provided quotas and adapt your usage.",
+                        state::MAX_OPPORTUNITIES,
+                        store.opportunities.len(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = state::now_ms();
+        let id = store.mint_opportunity_id();
+        let arn = state::opportunity_arn(&state::request_region(ctx.parts()), &input.catalog, &id);
+        let record = state::StoredOpportunity {
+            id: id.clone(),
+            arn,
+            catalog: input.catalog.clone(),
+            partner_opportunity_identifier: input.partner_opportunity_identifier,
+            customer: input.customer,
+            project: input.project,
+            life_cycle: Some(created_life_cycle(input.life_cycle, now)),
+            opportunity_type: input.opportunity_type,
+            origin: input.origin,
+            marketing: input.marketing,
+            software_revenue: input.software_revenue,
+            primary_needs_from_aws: input.primary_needs_from_aws,
+            national_security: input.national_security,
+            opportunity_team: input.opportunity_team,
+            assignee: None,
+            involvement_type: None,
+            visibility: None,
+            // Required on the `GetOpportunity` response: nothing is associated with a
+            // freshly created opportunity, so every list starts out empty.
+            related_entity_identifiers: RelatedEntityIdentifiers {
+                aws_marketplace_offers: Some(Vec::new()),
+                aws_marketplace_offer_sets: Some(Vec::new()),
+                solutions: Some(Vec::new()),
+                aws_products: Some(Vec::new()),
+                aws_marketplace_solutions: Some(Vec::new()),
+                aws_marketplace_products: Some(Vec::new()),
+            },
+            tags: input.tags.unwrap_or_default(),
+            created_date_ms: now,
+            // "When the Opportunity is created, its value is CreatedDate."
+            last_modified_date_ms: now,
+        };
+
+        let output = CreateOpportunityOutput {
+            id: record.id.clone(),
+            partner_opportunity_identifier: record.partner_opportunity_identifier.clone(),
+            last_modified_date: Some(state::date_time(record.last_modified_date_ms)),
+        };
+        store
+            .opportunities
+            .insert((input.catalog.clone(), id.clone()), record);
+        store.create_replays.record(
+            replay_key,
+            state::CreateReplay {
+                opportunity_id: id,
+                request_fingerprint: fingerprint,
+            },
+        );
+        Ok(output)
     }
+}
+
+/// The lifecycle a created opportunity carries.
+///
+/// `ReviewStatus` is service-owned ("This field is read-only") and the create doc
+/// fixes its initial value: "Creating an opportunity sets Lifecycle.ReviewStatus to
+/// Pending Submission". `ReviewComments`/`ReviewStatusReason` are AWS's own review
+/// output, so a client-sent value for any of the three is dropped rather than stored.
+/// `NextStepsHistory` is the service's chronological record of `NextSteps`, so a
+/// created opportunity's `NextSteps` is its first history entry.
+fn created_life_cycle(requested: Option<LifeCycle>, now_ms: i64) -> LifeCycle {
+    let requested = requested.unwrap_or_default();
+    let next_steps_history = requested.next_steps.clone().map(|value| {
+        vec![NextStepsHistory {
+            value,
+            time: crate::state::date_time(now_ms),
+        }]
+    });
+    LifeCycle {
+        stage: requested.stage,
+        closed_lost_reason: requested.closed_lost_reason,
+        next_steps: requested.next_steps,
+        target_close_date: requested.target_close_date,
+        review_status: Some(crate::state::REVIEW_STATUS_PENDING_SUBMISSION.to_string()),
+        review_comments: None,
+        review_status_reason: None,
+        next_steps_history,
+    }
+}
+
+/// What makes two `CreateOpportunity` calls carrying one `ClientToken` the same
+/// request.
+///
+/// The token's own value is excluded, so what is compared is the rest of the request;
+/// the `Debug` rendering of the deserialized input is a total, deterministic encoding
+/// of exactly the members the model declares, which is what a fingerprint needs. Only
+/// its SHA-256 digest is kept, so remembering a token costs a fixed 32 bytes however
+/// large the request was. It is never returned to a caller.
+fn request_fingerprint(input: &CreateOpportunityInput) -> [u8; 32] {
+    use sha2::Digest;
+
+    let mut body = input.clone();
+    body.client_token = String::new();
+    sha2::Sha256::digest(format!("{body:?}")).into()
 }

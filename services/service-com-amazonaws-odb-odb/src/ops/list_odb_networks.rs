@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOdbNetworks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOdbNetworks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOdbNetworks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every persisted ODB network, ordered by `odbNetworkId`, in pages of
+//! `maxResults` with an opaque `nextToken` that resumes where the previous page stopped.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOdbNetworks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOdbNetworksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOdbNetworks"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListOdbNetworksErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the odb emulator is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` is `@range(1..1000)` and the framework refuses an out-of-range
+        // value before `handle` runs. The model declares no default, so an absent
+        // member imposes no caller page size: the whole store fits one page, since a
+        // create beyond `MAX_ODB_NETWORKS_PER_ACCOUNT` is refused.
+        let page_size = match input.max_results {
+            Some(requested) if requested > 0 => requested as usize,
+            _ => MAX_PAGE_SIZE,
+        };
+
+        // A token names the position the previous page stopped at: the page that
+        // follows it holds the networks whose id sorts after that one.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_token(token) {
+                Some(odb_network_id) => Some(odb_network_id),
+                None => {
+                    let message = "the pagination token is not one this service issued";
+                    return Err(ListOdbNetworksErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!("nextToken: {message}"),
+                            reason: "fieldValidationFailed".to_string(),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: message.to_string(),
+                            }]),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let mut guard = state.lock();
+        let ordered = guard.odb_networks_by_id();
+        let remaining = ordered
+            .iter()
+            .filter(|record| match resume_after.as_deref() {
+                Some(last) => record.odb_network_id.as_str() > last,
+                None => true,
+            });
+
+        let mut odb_networks: Vec<OdbNetworkSummary> = Vec::new();
+        let mut truncated_after: Option<String> = None;
+        for record in remaining {
+            if odb_networks.len() == page_size {
+                // At least one network is left unreported, so this page carries a token.
+                truncated_after = odb_networks
+                    .last()
+                    .map(|last| last.odb_network_id.clone());
+                break;
+            }
+            odb_networks.push(record.to_summary());
+        }
+
+        Ok(ListOdbNetworksOutput {
+            odb_networks,
+            // Omitted on the last page: the `@paginated` contract is that an absent
+            // token ends the iteration.
+            next_token: truncated_after.as_deref().map(encode_token),
+        })
     }
+}
+
+/// The page size an absent `maxResults` falls back to: the model's own upper bound on
+/// `maxResults` (`@range(min: 1, max: 1000)`), which is above the per-account network
+/// quota, so one page reports the whole store.
+const MAX_PAGE_SIZE: usize = 1000;
+
+/// The version marker an issued token carries, so a token from elsewhere — or from a
+/// future encoding — is refused rather than half-understood.
+const TOKEN_PREFIX: &str = "odb-networks/v1:";
+
+/// Encode the position a page stopped at (the last `odbNetworkId` it reported) as the
+/// opaque token the next call passes back.
+fn encode_token(last_odb_network_id: &str) -> String {
+    ::hex::encode(format!("{TOKEN_PREFIX}{last_odb_network_id}"))
+}
+
+/// The `odbNetworkId` a token resumes after, or `None` when the token is not one
+/// [`encode_token`] produced.
+fn decode_token(token: &str) -> Option<String> {
+    let decoded = ::hex::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let odb_network_id = decoded.strip_prefix(TOKEN_PREFIX)?;
+    (!odb_network_id.is_empty()).then(|| odb_network_id.to_string())
 }

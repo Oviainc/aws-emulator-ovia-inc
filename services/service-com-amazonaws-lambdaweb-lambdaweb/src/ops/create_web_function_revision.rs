@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWebFunctionRevision
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWebFunctionRevision`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWebFunctionRevision::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists an immutable revision under a stored web function, with the model's
+//! `serviceConfig` defaults applied, and reports it back out of the store.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +188,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWebFunctionRevision` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWebFunctionRevisionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWebFunctionRevision"))
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWebFunctionRevisionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the web function store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialise_due_transitions(now);
+
+        // The caller may name the function by name or by ARN; both resolve to the
+        // one stored record.
+        let name = crate::state::resolve_function_name(&input.function_name).to_string();
+        let Some(function) = state.functions.get(&name) else {
+            return Err(
+                CreateWebFunctionRevisionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "The web function {} doesn't exist.",
+                            input.function_name
+                        ),
+                        resource_id: Some(input.function_name.clone()),
+                        resource_type: Some("WebFunction".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        if function.revisions.len() >= crate::state::MAX_REVISIONS_PER_FUNCTION {
+            return Err(
+                CreateWebFunctionRevisionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The request would exceed the maximum number of revisions ({}) for web function {}",
+                            crate::state::MAX_REVISIONS_PER_FUNCTION, function.function_name
+                        ),
+                        resource_id: Some(function.function_arn.clone()),
+                        resource_type: Some("Revision".to_string()),
+                        service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The revision's own ARN is derived from the FUNCTION's stored ARN, so the two
+        // always name the same function, region and account.
+        let revision_id = state
+            .add_revision(
+                &name,
+                crate::state::NewRevision {
+                    description: input.description,
+                    kms_key_arn: input.kms_key_arn,
+                    build_config: input.build_config,
+                    service_config: input.service_config,
+                },
+                now,
+            )
+            .expect("the function found above is in the store");
+
+        let function = state
+            .functions
+            .get(&name)
+            .expect("the function found above is in the store");
+        let revision = function
+            .revisions
+            .get(&revision_id)
+            .expect("the revision stored above is under that function");
+        // The audit record for a state change: who, what, outcome. No secret and no
+        // credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        ::tracing::info!(
+            operation = "CreateWebFunctionRevision",
+            akid = %akid,
+            function_name = %function.function_name,
+            revision_arn = %revision.revision_arn,
+            outcome = "created",
+            "web function revision created"
+        );
+        Ok(CreateWebFunctionRevisionOutput {
+            function_arn: function.function_arn.clone(),
+            revision_arn: revision.revision_arn.clone(),
+            revision_id: revision.revision_id.clone(),
+            description: revision.description.clone(),
+            kms_key_arn: revision.kms_key_arn.clone(),
+            // The stored configuration verbatim, defaults included.
+            build_config: revision.build_config.clone(),
+            service_config: revision.service_config.clone(),
+            state: revision.state.wire().to_string(),
+            state_reason: revision.state_reason.clone(),
+            errors: revision.modeled_errors(),
+            created_at: ::aws_smithy_types::DateTime::from(revision.created_at),
+        })
     }
 }

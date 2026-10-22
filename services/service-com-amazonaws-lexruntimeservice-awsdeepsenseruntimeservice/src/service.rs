@@ -96,17 +96,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Amazon Lex states a request it could parse but cannot act on as
+        // `BadRequestException` — "Request validation failed, there is no usable
+        // message in the context, or the bot build failed" — which every operation
+        // of this service models at HTTP 400. The framework's own wording would
+        // name `ValidationException`, a code no Lex client branches on, so the
+        // code and the message are replaced together here. An authentication
+        // refusal is left to the framework: it is a 403 the service does not model.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "Request validation failed".to_string()),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

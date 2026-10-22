@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartReplicationTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartReplicationTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartReplicationTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the persisted task into `starting` and records its start date in
+//! [`crate::state`], so a following `DescribeReplicationTasks` observes the new status.
+//! The notes below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartReplicationTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartReplicationTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartReplicationTask"))
+        // Every answer comes from the store; `ctx` carries nothing this operation needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(invalid_state(
+                "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+            ));
+        };
+
+        // "Specifying both values results in an error" (`CdcStartPosition` doc).
+        if input.cdc_start_time.is_some() && input.cdc_start_position.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "CdcStartTime and CdcStartPosition must not both be specified",
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(task) = store.replication_tasks.get_mut(&input.replication_task_arn) else {
+            return Err(StartReplicationTaskErrorModeled::ResourceNotFoundFault(
+                ResourceNotFoundFault {
+                    message: Some(format!(
+                        "ReplicationTaskArn {} does not name a replication task in this account",
+                        input.replication_task_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A task only starts from a status that is not already a run: `ready` (created,
+        // never run) or `stopped` (run before and stopped).
+        if !STARTABLE_STATUSES.contains(&task.status.as_str()) {
+            return Err(invalid_state(format!(
+                "replication task {} is {} and must be one of {} to be started",
+                task.arn,
+                task.status,
+                STARTABLE_STATUSES.join(", ")
+            )));
+        }
+
+        // "start-replication is the only valid action that can be used for the first
+        // time a task ... is run" and "resume-processing is only available for
+        // previously executed tasks" (`StartReplicationTaskType` doc).
+        if task.start_date.is_none() && input.start_replication_task_type != START_REPLICATION {
+            return Err(invalid_state(format!(
+                "replication task {} has never run, so {} is the only valid \
+                 StartReplicationTaskType for it",
+                task.arn, START_REPLICATION
+            )));
+        }
+
+        task.status = crate::state::TASK_STARTING.to_string();
+        task.start_date = Some(now);
+        // A task that is starting again carries neither the reason it stopped nor the
+        // failure of its last run.
+        task.stop_reason = None;
+        task.last_failure_message = None;
+        if let Some(position) = input.cdc_start_position {
+            task.cdc_start_position = Some(position);
+        } else if let Some(at) = input.cdc_start_time {
+            if let Ok(position) = at.fmt(::aws_smithy_types::date_time::Format::DateTime) {
+                task.cdc_start_position = Some(position);
+            }
+        }
+        if let Some(position) = input.cdc_stop_position {
+            task.cdc_stop_position = Some(position);
+        }
+        // `starting` is not terminal: the task is owed `running`.
+        task.pending = Some(crate::state::Pending::after(
+            now,
+            crate::state::Owed::ToStatus(crate::state::TASK_RUNNING),
+        ));
+
+        Ok(StartReplicationTaskOutput {
+            replication_task: Some(task.to_shape(false)),
+        })
     }
+}
+
+/// The statuses a task can be started from: one created and never run, and one that
+/// ran and was stopped.
+const STARTABLE_STATUSES: &[&str] = &[crate::state::TASK_READY, crate::state::TASK_STOPPED];
+
+/// The `StartReplicationTaskTypeValue` a task that has never run accepts.
+const START_REPLICATION: &str = "start-replication";
+
+/// The error this operation models for a resource that cannot be used for a migration
+/// in the state it is in. The DMS model declares no server-side fault, so the
+/// unreachable "no store" branch uses it too rather than a 501, which would claim the
+/// operation is unimplemented.
+fn invalid_state(message: String) -> StartReplicationTaskError {
+    StartReplicationTaskErrorModeled::InvalidResourceStateFault(InvalidResourceStateFault {
+        message: Some(message),
+    })
+    .into()
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SubmitOpportunity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SubmitOpportunity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SubmitOpportunity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the stored record's `LifeCycle.ReviewStatus` to `Submitted`,
+//! records the involvement type and visibility, and refuses an opportunity that is
+//! already under review.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +186,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SubmitOpportunity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SubmitOpportunityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SubmitOpportunity"))
+        use crate::state;
+
+        // Request metadata only; the submission's terms come from the body.
+        let _ = ctx;
+
+        state::check_catalog(&input.catalog)
+            .map_err(SubmitOpportunityErrorModeled::ValidationException)?;
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(SubmitOpportunityErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+        let key = (input.catalog.clone(), input.identifier.clone());
+        let Some(record) = store.opportunities.get_mut(&key) else {
+            return Err(SubmitOpportunityErrorModeled::ResourceNotFoundException(
+                state::opportunity_not_found(&input.catalog, &input.identifier),
+            )
+            .into());
+        };
+
+        // "After you perform this action, the Opportunity becomes non-editable until it is
+        // reviewed by AWS": an opportunity already in a review-owned status has nothing to
+        // submit, so submitting it again is refused rather than silently repeated.
+        if let Some(status) = record.review_status() {
+            if state::READ_ONLY_REVIEW_STATUSES.contains(&status) {
+                return Err(SubmitOpportunityErrorModeled::ValidationException(
+                    state::invalid_resource_state(
+                        "Identifier",
+                        format!(
+                            "Opportunity `{}` cannot be submitted while LifeCycle.ReviewStatus \
+                             is `{status}`.",
+                            record.id,
+                        ),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let life_cycle = record.life_cycle.get_or_insert_with(LifeCycle::default);
+        life_cycle.review_status = Some(state::REVIEW_STATUS_SUBMITTED.to_string());
+        record.involvement_type = Some(input.involvement_type);
+        record.visibility = input.visibility;
+        record.touch();
+
+        Ok(SubmitOpportunityOutput)
     }
 }

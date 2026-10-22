@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReplicationInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReplicationInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReplicationInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a replication instance and persists it in [`crate::state`], so
+//! `DescribeReplicationInstances` and `CreateReplicationTask` read the same record. The
+//! notes below are the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -227,18 +221,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReplicationInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReplicationInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReplicationInstance"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        // "This parameter is stored as a lowercase string" (`ReplicationInstanceIdentifier`
+        // doc), so the identifier is folded before it is validated, indexed or echoed.
+        let identifier = input.replication_instance_identifier.to_lowercase();
+        if let Some(refusal) = crate::state::identifier_refusal(
+            "ReplicationInstanceIdentifier",
+            &identifier,
+            Some(crate::state::INSTANCE_IDENTIFIER_MAX_LEN),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
+        // "You can't set the AvailabilityZone parameter if the Multi-AZ parameter is set
+        // to true" (`MultiAZ` doc).
+        let multi_az = input.multi_az.unwrap_or_default();
+        if multi_az && input.availability_zone.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "AvailabilityZone must not be set when MultiAZ is true",
+            ));
+        }
+
+        // The caller may name the last field of the ARN itself; the doc bounds it at 31
+        // characters and the same identifier shape as the resource identifiers.
+        if let Some(resource_identifier) = &input.resource_identifier {
+            if let Some(refusal) = crate::state::identifier_refusal(
+                "ResourceIdentifier",
+                resource_identifier,
+                Some(crate::state::RESOURCE_IDENTIFIER_MAX_LEN),
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation(refusal));
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.settle(now);
+
+        if let Some(existing) = store.instance_arn_by_identifier.get(&identifier) {
+            return Err(
+                CreateReplicationInstanceErrorModeled::ResourceAlreadyExistsFault(
+                    ResourceAlreadyExistsFault {
+                        message: Some(format!(
+                            "replication instance {identifier} already exists as {existing}"
+                        )),
+                        resource_arn: Some(existing.clone()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The emulator keeps every instance in memory for the life of the process and
+        // this is the only operation that adds one, so the store keeps a ceiling on
+        // itself.
+        if store.replication_instances.len() >= crate::state::MAX_REPLICATION_INSTANCES {
+            return Err(
+                CreateReplicationInstanceErrorModeled::ResourceQuotaExceededFault(
+                    ResourceQuotaExceededFault {
+                        message: Some(format!(
+                            "this emulator already holds the maximum of {} replication instances",
+                            crate::state::MAX_REPLICATION_INSTANCES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let resource_id = match input.resource_identifier {
+            Some(resource_identifier) => resource_identifier,
+            None => store.mint_resource_id("rep"),
+        };
+        let arn = crate::state::dms_arn(&region, "rep", &resource_id);
+        if store.replication_instances.contains_key(&arn) {
+            return Err(
+                CreateReplicationInstanceErrorModeled::ResourceAlreadyExistsFault(
+                    ResourceAlreadyExistsFault {
+                        message: Some(format!("{arn} already names a replication instance")),
+                        resource_arn: Some(arn),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let sequence = store.next_sequence();
+        let availability_zone = input
+            .availability_zone
+            .unwrap_or_else(|| crate::state::availability_zone_for(&region, 0));
+        let record = crate::state::ReplicationInstanceRecord {
+            arn: arn.clone(),
+            identifier: identifier.clone(),
+            instance_class: input.replication_instance_class,
+            status: crate::state::INSTANCE_CREATING.to_string(),
+            allocated_storage: input
+                .allocated_storage
+                .unwrap_or(crate::state::DEFAULT_ALLOCATED_STORAGE),
+            create_time: now,
+            // A Multi-AZ deployment has a standby in a second zone of the same region.
+            secondary_availability_zone: multi_az
+                .then(|| crate::state::availability_zone_for(&region, 1)),
+            availability_zone,
+            engine_version: input
+                .engine_version
+                .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_VERSION.to_string()),
+            multi_az,
+            publicly_accessible: input
+                .publicly_accessible
+                .unwrap_or(crate::state::DEFAULT_PUBLICLY_ACCESSIBLE),
+            auto_minor_version_upgrade: input
+                .auto_minor_version_upgrade
+                .unwrap_or(crate::state::DEFAULT_AUTO_MINOR_VERSION_UPGRADE),
+            preferred_maintenance_window: input
+                .preferred_maintenance_window
+                .unwrap_or_else(|| crate::state::DEFAULT_MAINTENANCE_WINDOW.to_string()),
+            kms_key_id: input.kms_key_id,
+            dns_name_servers: input.dns_name_servers,
+            network_type: input.network_type,
+            vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
+            tags: crate::state::tags_for(&arn, input.tags),
+            // `creating` is not terminal: the instance is owed `available`, so a caller
+            // that creates a task straight away still sees the transient status.
+            pending: Some(crate::state::Pending::after(
+                now,
+                crate::state::Owed::ToStatus(crate::state::INSTANCE_AVAILABLE),
+            )),
+            sequence,
+        };
+
+        let replication_instance = record.to_shape();
+        store.instance_arn_by_identifier.insert(identifier, arn.clone());
+        store.replication_instances.insert(arn, record);
+
+        Ok(CreateReplicationInstanceOutput {
+            replication_instance: Some(replication_instance),
+        })
     }
+}
+
+/// The DMS model declares no server-side fault, and this emulator always mounts the
+/// in-memory engine, so the unreachable "no store" branch is answered with the state
+/// error the operation does model rather than a 501, which would claim the operation
+/// is unimplemented.
+fn store_unavailable() -> CreateReplicationInstanceError {
+    CreateReplicationInstanceErrorModeled::InvalidResourceStateFault(InvalidResourceStateFault {
+        message: Some(
+            "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+        ),
+    })
+    .into()
 }
