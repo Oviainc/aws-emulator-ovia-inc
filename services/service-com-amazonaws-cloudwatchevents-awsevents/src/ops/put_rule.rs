@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates a rule on an event bus: the record is persisted in
+//! [`crate::state`] and the returned `RuleArn` is the stored rule's own ARN. A second
+//! call naming an existing rule REPLACES its fields rather than adding a second rule —
+//! "If you omit arguments in PutRule, the old values for those arguments are not kept" —
+//! while leaving its tags and its targets, which `TagResource` and `PutTargets` own,
+//! alone.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +200,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRuleErrorModeled::InternalException(InternalException {
+                message: Some("the events rule store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // "A rule must contain at least an EventPattern or ScheduleExpression." The
+        // model cannot express that pair, and declares no `ValidationException` for
+        // this operation, so it is refused through the service's own 400 channel.
+        let pattern = input.event_pattern.as_deref().filter(|p| !p.is_empty());
+        let schedule = input
+            .schedule_expression
+            .as_deref()
+            .filter(|s| !s.is_empty());
+        if pattern.is_none() && schedule.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Parameter(s) EventPattern or ScheduleExpression must be specified: a rule \
+                 must contain at least an EventPattern or a ScheduleExpression",
+            ));
+        }
+
+        // An event pattern this service cannot match is refused HERE rather than
+        // stored and then silently never fired, and the parse result is KEPT, so
+        // `PutEvents` never re-parses a stored pattern.
+        // `InvalidEventPatternException` is the modelled refusal for exactly this.
+        let stored_pattern = match pattern {
+            None => None,
+            Some(pattern) => match crate::state::event_pattern::parse(pattern) {
+                Ok(parsed) => Some(crate::state::StoredPattern {
+                    source: pattern.to_string(),
+                    parsed: ::std::sync::Arc::new(parsed),
+                }),
+                Err(reason) => {
+                    return Err(PutRuleErrorModeled::InvalidEventPatternException(
+                        InvalidEventPatternException {
+                            message: Some(format!("Event pattern is not valid. Reason: {reason}")),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        if let Some(schedule) = schedule {
+            if !crate::state::is_schedule_expression(schedule) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Parameter ScheduleExpression is not valid: {schedule:?} is neither a \
+                     rate(<value> <unit>) nor a cron(<six fields>) expression"
+                )));
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let bus_name = crate::state::resolve_bus_name(input.event_bus_name.as_deref());
+        let mut store = state.lock();
+        let Some(bus) = store.bus_for_write(&bus_name, &region) else {
+            return Err(PutRuleErrorModeled::ResourceNotFoundException(
+                crate::state::bus_not_found(&bus_name),
+            )
+            .into());
+        };
+        let rule_state = input
+            .state
+            .unwrap_or_else(|| crate::state::DEFAULT_RULE_STATE.to_string());
+
+        if let Some(existing) = bus.rules.get_mut(&input.name) {
+            // An update REPLACES the rule with what this call specifies, so an
+            // omitted member clears the stored one. `Tags` are excluded ("If you are
+            // updating an existing rule, any tags you specify in the PutRule
+            // operation are ignored"), and so are the rule's targets, which this
+            // request carries no member for.
+            existing.event_pattern = stored_pattern;
+            existing.schedule_expression = schedule.map(str::to_string);
+            existing.state = rule_state;
+            existing.description = input.description;
+            existing.role_arn = input.role_arn;
+            // One record has ONE ARN: the rule was named when it was created, so
+            // an update answers with the ARN the reports also carry rather than
+            // one rebuilt from this request.
+            return Ok(PutRuleOutput {
+                rule_arn: Some(existing.arn.clone()),
+            });
+        }
+
+        // The store is bounded: past the per-bus rule quota a create is refused
+        // rather than adding another record — which is also what bounds the work
+        // `PutEvents` does matching one event against this bus.
+        if bus.rules.len() >= crate::state::MAX_RULES_PER_BUS {
+            return Err(PutRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Event bus {bus_name} already holds the maximum of {} rules",
+                        crate::state::MAX_RULES_PER_BUS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::rule_arn(&bus.name, &input.name, &region);
+        bus.rules.insert(
+            input.name.clone(),
+            crate::state::StoredRule {
+                name: input.name,
+                arn: arn.clone(),
+                event_pattern: stored_pattern,
+                schedule_expression: schedule.map(str::to_string),
+                state: rule_state,
+                description: input.description,
+                role_arn: input.role_arn,
+                // Only an Amazon Web Services service creating a rule on the
+                // account's behalf sets `ManagedBy`, and this emulator creates
+                // no managed rules.
+                managed_by: None,
+                event_bus_name: bus_name.clone(),
+                created_by: Some(::engine::emulator_account_id().to_string()),
+                tags: input.tags.unwrap_or_default(),
+                targets: Vec::new(),
+            },
+        );
+
+        Ok(PutRuleOutput {
+            rule_arn: Some(arn),
+        })
     }
 }

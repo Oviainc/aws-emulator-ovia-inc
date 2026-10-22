@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the rules of an event bus, in rule-name order, filtered by `NamePrefix`,
+//! bounded by `Limit` and resumed by `NextToken`. Every row is a projection of the
+//! stored rule, so the list holds exactly the rules `PutRule` created and `DeleteRule`
+//! has not removed.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +143,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRules"))
+        // A report reads the store and nothing else: no ARN is minted here, so the
+        // request's own region is not needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRulesErrorModeled::InternalException(InternalException {
+                message: Some("the events rule store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // `Limit` is modelled `@range(min: 1, max: 100)` and the boundary validator
+        // refused anything outside it before this handler ran, so the only case left
+        // is an absent value: serve the largest page the model allows.
+        let requested = input.limit.unwrap_or(crate::state::PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::PAGE_LIMIT).contains(&requested),
+            "Limit {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::PAGE_LIMIT))
+            .expect("a page size clamped into 1..=100 fits in usize");
+
+        let bus_name = crate::state::resolve_bus_name(input.event_bus_name.as_deref());
+        let store = state.lock();
+        if !store.bus_exists(&bus_name) {
+            return Err(ListRulesErrorModeled::ResourceNotFoundException(
+                crate::state::bus_not_found(&bus_name),
+            )
+            .into());
+        }
+
+        let mut rules = Vec::new();
+        let mut next_token = None;
+        // An absent bus record is an EMPTY default bus, not a missing one: the
+        // default bus is materialised by the first call that changes it.
+        if let Some(bus) = store.bus(&bus_name) {
+            for (name, rule) in &bus.rules {
+                // The token is the name the next page starts at, so a page is still
+                // served when the rule the token named was deleted meanwhile.
+                if input
+                    .next_token
+                    .as_deref()
+                    .is_some_and(|token| name.as_str() < token)
+                {
+                    continue;
+                }
+                if input
+                    .name_prefix
+                    .as_deref()
+                    .is_some_and(|prefix| !name.starts_with(prefix))
+                {
+                    continue;
+                }
+                if rules.len() == page_size {
+                    next_token = Some(name.clone());
+                    break;
+                }
+                rules.push(rule.to_summary());
+            }
+        }
+
+        Ok(ListRulesOutput {
+            rules: Some(rules),
+            next_token,
+        })
     }
 }

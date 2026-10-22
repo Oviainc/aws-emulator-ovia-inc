@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTargetsByRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTargetsByRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTargetsByRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the targets of a stored rule, in the order `PutTargets` added them, bounded
+//! by `Limit` and resumed by `NextToken`. The answer is read from the rule's own target
+//! list, so it is exactly what `PutTargets` persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTargetsByRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTargetsByRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTargetsByRule"))
+        // A report reads the store and nothing else: no ARN is minted here, so the
+        // request's own region is not needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTargetsByRuleErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the events rule store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The token is the index the next page starts at. A rule's targets are
+        // insertion-ordered rather than sorted, so the position is what identifies
+        // where a page resumes. This operation models no `ValidationException`, so a
+        // token that is not one this operation issued is refused through the
+        // service's own 400 channel.
+        let start = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(start) => start,
+                Err(_) => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "NextToken {token:?} is not a token returned by ListTargetsByRule"
+                    )))
+                }
+            },
+        };
+
+        // `Limit` is modelled `@range(min: 1, max: 100)` and the boundary validator
+        // refused anything outside it before this handler ran, so the only case left
+        // is an absent value: serve the largest page the model allows.
+        let requested = input.limit.unwrap_or(crate::state::PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::PAGE_LIMIT).contains(&requested),
+            "Limit {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::PAGE_LIMIT))
+            .expect("a page size clamped into 1..=100 fits in usize");
+
+        let bus_name = crate::state::resolve_bus_name(input.event_bus_name.as_deref());
+        let store = state.lock();
+        if !store.bus_exists(&bus_name) {
+            return Err(ListTargetsByRuleErrorModeled::ResourceNotFoundException(
+                crate::state::bus_not_found(&bus_name),
+            )
+            .into());
+        }
+        let Some(rule) = store.rule(&bus_name, &input.rule) else {
+            return Err(ListTargetsByRuleErrorModeled::ResourceNotFoundException(
+                crate::state::rule_not_found(&bus_name, &input.rule),
+            )
+            .into());
+        };
+
+        // A token this operation issued always names a position that still holds
+        // a target, so one past the end is no more a token of ours than a
+        // non-numeric one is, and it is refused in the same words.
+        if start > 0 && start >= rule.targets.len() {
+            let token = input.next_token.as_deref().unwrap_or_default();
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "NextToken {token:?} is not a token returned by ListTargetsByRule"
+            )));
+        }
+
+        let targets: Vec<Target> = rule
+            .targets
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .cloned()
+            .collect();
+        let served = start.saturating_add(targets.len());
+        let next_token = (served < rule.targets.len()).then(|| served.to_string());
+
+        Ok(ListTargetsByRuleOutput {
+            targets: Some(targets),
+            next_token,
+        })
     }
 }

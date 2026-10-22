@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sends events to an event bus. Each accepted entry is RECORDED on the bus it names
+//! — with the id this call answered for it and the names of the bus's enabled rules
+//! whose event pattern the event matched — so what the call reports is what the store
+//! holds. `FailedEntryCount` counts the entries that were refused: an entry whose
+//! `Detail` is not a JSON object, an entry over the documented 256 KB entry size, and
+//! an entry addressed to a bus the account does not own. The bus's log is bounded, so
+//! recording the newest event evicts the oldest once the retention window is full.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +138,218 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutEventsErrorModeled::InternalException(InternalException {
+                message: Some("the events rule store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // Nothing but the two writes this request makes touches the state lock:
+        // the four phases below are screen the entries (no lock), resolve their
+        // buses and snapshot the rules to match against (lock), match (no lock),
+        // record (lock). Parsing a 256 KB `Detail` and walking a pattern are the
+        // expensive parts, and neither holds the lock.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEvents"))
+        // Phase 1: screen each entry, holding no lock.
+        let mut outcomes: Vec<Outcome> = Vec::with_capacity(input.entries.len());
+        for entry in input.entries {
+            // `Detail` is "a valid JSON string... The JSON string may contain
+            // fields and nested subobjects": it is the event's own document, so
+            // it has to be a JSON OBJECT for a pattern to be able to descend
+            // into it. An entry carrying anything else is the one malformed
+            // entry this operation can name, and it fails on its own row rather
+            // than taking the batch down.
+            let detail = match entry.detail.as_deref().filter(|raw| !raw.trim().is_empty()) {
+                None => None,
+                Some(raw) => match ::serde_json::from_str::<::serde_json::Value>(raw) {
+                    Ok(value) if value.is_object() => Some(raw.to_string()),
+                    _ => {
+                        outcomes.push(Outcome::Refused(PutEventsResultEntry {
+                            event_id: None,
+                            error_code: Some("InvalidArgument".to_string()),
+                            error_message: Some(
+                                "Parameter Detail is not valid. Reason: Detail is malformed."
+                                    .to_string(),
+                            ),
+                        }));
+                        continue;
+                    }
+                },
+            };
+
+            let resources = entry.resources.unwrap_or_default();
+
+            // The entry is bounded the way EventBridge documents in
+            // "Calculating PutEvents event entry size": `Detail` carries no
+            // modelled length bound, so this is what stops one call storing an
+            // arbitrarily large document. It too fails on its own row.
+            let size = crate::state::event_entry_size(
+                entry.time.is_some(),
+                entry.source.as_deref(),
+                entry.detail_type.as_deref(),
+                &resources,
+                detail.as_deref(),
+            );
+            if size > crate::state::MAX_EVENT_ENTRY_BYTES {
+                outcomes.push(Outcome::Refused(PutEventsResultEntry {
+                    event_id: None,
+                    error_code: Some("InvalidArgument".to_string()),
+                    error_message: Some(format!(
+                        "Total size of the entry is {size} bytes, over the {}-byte limit.",
+                        crate::state::MAX_EVENT_ENTRY_BYTES
+                    )),
+                }));
+                continue;
+            }
+
+            // "If no time stamp is provided, the time stamp of the PutEvents
+            // call is used."
+            let time = entry.time.map_or(now, crate::state::to_system_time);
+            outcomes.push(Outcome::Accepted(crate::state::RecordedEvent {
+                // Minted in phase 2, where the store that owns the counter is
+                // reachable; nothing reads it before then.
+                event_id: String::new(),
+                source: entry.source,
+                detail_type: entry.detail_type,
+                detail,
+                resources,
+                time,
+                region: region.clone(),
+                bus_name: crate::state::resolve_bus_name(entry.event_bus_name.as_deref()),
+                matched_rules: Vec::new(),
+            }));
+        }
+
+        // Phase 2: resolve each entry's bus and snapshot the rules it has to be
+        // matched against, under the lock. "Only the rules that are associated
+        // with this event bus are used to match the event", and a disabled rule
+        // matches nothing. A rule with no event pattern (a pure schedule) is not
+        // matched against either: it self-triggers rather than observing events.
+        // The patterns are SHARED, so this snapshot copies none of them.
+        let mut candidates: ::std::collections::BTreeMap<
+            String,
+            Vec<(String, ::std::sync::Arc<::serde_json::Value>)>,
+        > = ::std::collections::BTreeMap::new();
+        {
+            let mut store = state.lock();
+            for outcome in &mut outcomes {
+                let Outcome::Accepted(recorded) = outcome else {
+                    continue;
+                };
+                let bus_name = recorded.bus_name.clone();
+                if store.bus_for_write(&bus_name, &region).is_none() {
+                    *outcome = Outcome::Refused(PutEventsResultEntry {
+                        event_id: None,
+                        error_code: Some("ResourceNotFoundException".to_string()),
+                        error_message: Some(format!("Event bus {bus_name} does not exist.")),
+                    });
+                    continue;
+                }
+                candidates
+                    .entry(bus_name.clone())
+                    .or_insert_with(|| store.match_candidates(&bus_name));
+                recorded.event_id = store.mint_event_id();
+            }
+        }
+
+        // Phase 3: match, holding no lock. ONE budget is shared by the whole
+        // request, so its total matching work is capped however many entries it
+        // carries and however many rules their buses hold.
+        let mut budget = crate::state::event_pattern::MatchBudget::new(
+            crate::state::event_pattern::MAX_MATCH_STEPS_PER_REQUEST,
+        );
+        for outcome in &mut outcomes {
+            let Outcome::Accepted(recorded) = outcome else {
+                continue;
+            };
+            let event = recorded.envelope();
+            let Some(rules) = candidates.get(&recorded.bus_name) else {
+                continue;
+            };
+            for (name, pattern) in rules {
+                if budget.exhausted() {
+                    // The cap is orders of magnitude above what a real rule set
+                    // costs, so reaching it means the remaining rules were not
+                    // evaluated. Say so, rather than letting a short
+                    // `matched_rules` look like a complete verdict.
+                    ::tracing::warn!(
+                        event_id = %recorded.event_id,
+                        bus = %recorded.bus_name,
+                        evaluated = recorded.matched_rules.len(),
+                        "the PutEvents match budget was exhausted; the remaining rules of this \
+                         bus were not evaluated for this event"
+                    );
+                    break;
+                }
+                if crate::state::event_pattern::matches_within(pattern, &event, &mut budget) {
+                    recorded.matched_rules.push(name.clone());
+                }
+            }
+        }
+
+        // Phase 4: record, under the lock again.
+        let mut entries = Vec::with_capacity(outcomes.len());
+        let mut failed_entry_count = 0i32;
+        {
+            let mut store = state.lock();
+            for outcome in outcomes {
+                match outcome {
+                    Outcome::Refused(entry) => {
+                        failed_entry_count += 1;
+                        entries.push(entry);
+                    }
+                    Outcome::Accepted(recorded) => {
+                        // Phase 2 resolved this bus and nothing can remove one
+                        // (`DeleteEventBus` is still a stub), so the bus is
+                        // there; a request that somehow found it gone is
+                        // refused rather than answered with an id for an event
+                        // nothing holds.
+                        let event_id = recorded.event_id.clone();
+                        let bus_name = recorded.bus_name.clone();
+                        let recorded_now = store
+                            .bus_for_write(&bus_name, &region)
+                            .map(|bus| {
+                                // The log is bounded: recording the newest event
+                                // evicts the oldest once the bus is at its
+                                // retention window.
+                                bus.record(recorded);
+                            })
+                            .is_some();
+                        if recorded_now {
+                            entries.push(PutEventsResultEntry {
+                                event_id: Some(event_id),
+                                error_code: None,
+                                error_message: None,
+                            });
+                        } else {
+                            failed_entry_count += 1;
+                            entries.push(PutEventsResultEntry {
+                                event_id: None,
+                                error_code: Some("ResourceNotFoundException".to_string()),
+                                error_message: Some(format!(
+                                    "Event bus {bus_name} does not exist."
+                                )),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(PutEventsOutput {
+            failed_entry_count,
+            entries: Some(entries),
+        })
     }
+}
+
+/// What phase 1 decided about one entry: the row it already failed on, or the
+/// event to match and record.
+enum Outcome {
+    Refused(PutEventsResultEntry),
+    Accepted(crate::state::RecordedEvent),
 }

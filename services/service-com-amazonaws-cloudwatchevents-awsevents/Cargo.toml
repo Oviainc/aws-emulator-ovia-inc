@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The `EventId` `PutEvents` answers with is derived from the store's own
+# counter through SHA-256 and laid out as a UUID; these two do that.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

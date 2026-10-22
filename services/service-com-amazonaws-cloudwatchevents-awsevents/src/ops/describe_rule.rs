@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a stored rule: every member of the answer is read from the record
+//! [`crate::state`] holds, so it is exactly what the last `PutRule` persisted. A name
+//! that is on no rule of the named bus answers `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRule"))
+        // A report reads the store and nothing else: no ARN is minted here, so the
+        // request's own region is not needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeRuleErrorModeled::InternalException(InternalException {
+                message: Some("the events rule store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let bus_name = crate::state::resolve_bus_name(input.event_bus_name.as_deref());
+        let store = state.lock();
+        if !store.bus_exists(&bus_name) {
+            return Err(DescribeRuleErrorModeled::ResourceNotFoundException(
+                crate::state::bus_not_found(&bus_name),
+            )
+            .into());
+        }
+        let Some(rule) = store.rule(&bus_name, &input.name) else {
+            return Err(DescribeRuleErrorModeled::ResourceNotFoundException(
+                crate::state::rule_not_found(&bus_name, &input.name),
+            )
+            .into());
+        };
+
+        Ok(DescribeRuleOutput {
+            name: Some(rule.name.clone()),
+            arn: Some(rule.arn.clone()),
+            event_pattern: rule.event_pattern_source(),
+            schedule_expression: rule.schedule_expression.clone(),
+            state: Some(rule.state.clone()),
+            description: rule.description.clone(),
+            role_arn: rule.role_arn.clone(),
+            managed_by: rule.managed_by.clone(),
+            event_bus_name: Some(rule.event_bus_name.clone()),
+            created_by: rule.created_by.clone(),
+        })
     }
 }
