@@ -10,6 +10,10 @@
 //! `AwsSecurityFindingIdentifier`, the identity `BatchUpdateFindings` addresses a
 //! finding by, and the account/Region prefix is what makes "disable removes this
 //! account's findings in this Region" expressible.
+//!
+//! A custom insight `CreateInsight` creates is keyed the same way — `(account id,
+//! Region, InsightArn)` — because an insight is a saved query over exactly the
+//! findings of the hub it was created in, so disabling the hub takes it with it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -226,6 +230,8 @@ pub struct StandardsSubscriptionRecord {
 /// Per-service state for com-amazonaws-securityhub-securityhubapiservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSecurityhubSecurityhubapiserviceState {
+    /// Custom insights, keyed by hub + the ARN `CreateInsight` minted.
+    pub insights: HashMap<InsightKey, StoredInsight>,
     /// The subscribed hubs, one per `(account id, Region)`.
     pub hubs: HashMap<HubKey, Hub>,
     /// Imported findings, keyed by hub + `AwsSecurityFindingIdentifier`.
@@ -987,4 +993,42 @@ pub fn finding_changes(
         });
     }
     changes
+}
+
+/// A custom insight's identity: the hub it lives in, plus the ARN `CreateInsight`
+/// minted for it. The ARN alone would be unique, but the account/Region prefix is
+/// what makes "disable removes this account's insights in this Region" expressible,
+/// exactly as it does for [`FindingKey`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InsightKey {
+    pub account_id: String,
+    pub region: String,
+    pub insight_arn: String,
+}
+
+/// A custom insight as `CreateInsight` stored it: the three members the modelled
+/// `Insight` shape carries beyond its ARN. `GetInsightResults` evaluates it against
+/// the hub's findings.
+///
+/// `Filters` names its type by path rather than through this module's `use`, so
+/// adding an insight store costs no line in an import list every new operation of
+/// this service also edits.
+#[derive(Debug, Clone)]
+pub struct StoredInsight {
+    pub name: String,
+    pub filters: crate::ops::types::AwsSecurityFindingFilters,
+    pub group_by_attribute: String,
+}
+
+/// `arn:aws:securityhub:<region>:<account>:insight/<account>/custom/<id>` — the ARN
+/// Security Hub CSPM mints for a CUSTOM insight (the insights a caller creates,
+/// as opposed to the service's own managed ones).
+pub fn custom_insight_arn(key: &HubKey, insight_id: &str) -> String {
+    // `emulator_arn` stamps the canonical emulator account id; the key's account is
+    // that same id, so the two cannot drift.
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        &key.1,
+        &format!("insight/{}/custom/{insight_id}", key.0),
+    )
 }

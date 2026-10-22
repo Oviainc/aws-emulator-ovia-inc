@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInsight
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInsight`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a custom insight — a named, saved `AwsSecurityFindingFilters` query plus the
+//! attribute its matching findings are grouped by — in the caller's hub, and answers the
+//! ARN it minted for it. `GetInsightResults` is what evaluates the stored insight.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInsight::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The insight lives in [`crate::state`] beside the findings it queries, keyed on the
+//! hub's account/Region and its own ARN, so disabling Security Hub CSPM takes it with
+//! the findings. A hub holds at most [`MAX_CUSTOM_INSIGHTS_PER_HUB`] of them; the create
+//! that would exceed the quota is the modelled `LimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +139,64 @@ impl<Eng> CreateInsight<Eng> {
     }
 }
 
+/// Security Hub CSPM's published quota for custom insights: "Insights — 100 custom
+/// insights per account per Region" (the AWS Security Hub quotas reference). Reaching
+/// it is exactly what this operation's `LimitExceededException` is modelled for — "it
+/// attempted to create resources beyond the current Amazon Web Services account or
+/// throttling limits" — and it is what bounds the insights one caller can accumulate
+/// in a hub.
+const MAX_CUSTOM_INSIGHTS_PER_HUB: usize = 100;
+
+/// A fresh identifier for an insight's ARN, rendered in the 8-4-4-4-12 hex grouping
+/// Security Hub CSPM's own insight ARNs carry.
+///
+/// The 128 bits come from SHA-256 over the hub, the submitted name, the store's
+/// monotonic write sequence and the clock, so two creates cannot mint the same
+/// identifier — not even when a deleted insight's name is created again in the same
+/// instant, because the write sequence has moved on.
+fn mint_insight_id(
+    account_id: &str,
+    region: &str,
+    name: &str,
+    write_seq: u64,
+    now_nanos: i128,
+) -> String {
+    use ::sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for field in [account_id.as_bytes(), region.as_bytes(), name.as_bytes()] {
+        hasher.update(field);
+        // A separator, so two different field splits cannot hash alike.
+        hasher.update([0u8]);
+    }
+    hasher.update(write_seq.to_be_bytes());
+    hasher.update(now_nanos.to_be_bytes());
+    let digest = hasher.finalize();
+    let hex = ::hex::encode(&digest[..16]);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Is `attribute` the name of a finding attribute an insight can group by?
+///
+/// Asked of the MODEL, not of a hand-written list: `GroupByAttribute` "identifies the
+/// type of item that the insight applies to", and the items an
+/// `AwsSecurityFinding` can be grouped into are exactly the finding attributes
+/// `AwsSecurityFindingFilters` names a member for — so the shape's member list in this
+/// service's Smithy model is the catalog, and it cannot drift from the model.
+fn is_group_by_attribute(attribute: &str) -> bool {
+    AwsSecurityFindingFilters::SCHEMA
+        .members()
+        .iter()
+        .any(|member| member.member_name() == Some(attribute))
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateInsight<Eng>
 {
@@ -157,18 +214,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInsight` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInsightErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInsight"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateInsightError::Modeled(CreateInsightErrorModeled::InternalException(
+                InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+        let invalid_input = |message: String| {
+            CreateInsightError::Modeled(CreateInsightErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                },
+            ))
+        };
+
+        let key = crate::state::hub_key(ctx);
+        let (account_id, region) = (key.0.clone(), key.1.clone());
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&key) {
+            return Err(CreateInsightErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {account_id} is not subscribed to Security Hub CSPM in Region {region}"
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Whether the insight is a legal one cannot depend on what the hub happens to
+        // hold, so both of these are decided before anything is stored.
+        if !is_group_by_attribute(&input.group_by_attribute) {
+            return Err(invalid_input(format!(
+                "GroupByAttribute {} is not a finding attribute an insight can be grouped by",
+                input.group_by_attribute
+            )));
+        }
+        // `Insight$Filters` carries the same documented limits as `GetFindings$Filters`,
+        // so an insight accepts exactly the filters a `GetFindings` call would.
+        if let Err(message) = crate::ops::get_findings::validate_filters(&input.filters) {
+            return Err(invalid_input(message));
+        }
+
+        // The ARN is minted here, so `Name` is the only identity the caller supplies —
+        // and therefore the only thing a second `CreateInsight` can conflict with.
+        let mut insights_in_hub = 0usize;
+        let mut name_in_use: Option<&str> = None;
+        for (stored_key, stored) in &store.insights {
+            if stored_key.account_id != account_id || stored_key.region != region {
+                continue;
+            }
+            insights_in_hub += 1;
+            if stored.name == input.name {
+                name_in_use = Some(stored.name.as_str());
+            }
+        }
+        if let Some(name) = name_in_use {
+            return Err(CreateInsightErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    message: Some(format!(
+                        "An insight named {name} already exists for account {account_id} in Region {region}"
+                    )),
+                    code: Some("ResourceConflictException".to_string()),
+                },
+            )
+            .into());
+        }
+        // The quota is what keeps the insights one caller can accumulate bounded.
+        if insights_in_hub >= MAX_CUSTOM_INSIGHTS_PER_HUB {
+            return Err(CreateInsightErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Account {account_id} already has the maximum of {MAX_CUSTOM_INSIGHTS_PER_HUB} custom insights in Region {region}"
+                    )),
+                    code: Some("LimitExceededException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let insight_id = mint_insight_id(
+            &account_id,
+            &region,
+            &input.name,
+            store.next_write_seq(),
+            crate::state::now_nanos(),
+        );
+        let insight_arn = crate::state::custom_insight_arn(&key, &insight_id);
+        store.insights.insert(
+            crate::state::InsightKey {
+                account_id,
+                region,
+                insight_arn: insight_arn.clone(),
+            },
+            crate::state::StoredInsight {
+                name: input.name,
+                filters: input.filters,
+                group_by_attribute: input.group_by_attribute,
+            },
+        );
+
+        Ok(CreateInsightOutput { insight_arn })
     }
 }
