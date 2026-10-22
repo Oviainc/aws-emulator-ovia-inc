@@ -10,6 +10,9 @@
 //! * an **agreement** — what `AcceptAgreementRequest` finalises from one of
 //!   those requests, and what `DescribeAgreement`, `GetAgreementTerms`,
 //!   `SearchAgreements` and `CancelAgreement` report on and mutate;
+//! * a **payment request** — what `SendAgreementPaymentRequest` submits under an
+//!   agreement's `VariablePaymentTerm`, and what
+//!   `ListAgreementPaymentRequests` reports;
 //! * a **billing adjustment request** — what
 //!   `BatchCreateBillingAdjustmentRequest` submits against one invoice of an
 //!   agreement, and what `GetBillingAdjustmentRequest` and
@@ -45,12 +48,12 @@ use crate::ops::types::{
     BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary, ByolPricingTerm,
     ChargeSummary, ConfigurableUpfrontPricingTerm, ConflictException, DescribeAgreementOutput,
     EndTimeBehavior, EstimatedCharges, ExpectedCharge, Filter, FixedUpfrontPricingTerm,
-    FreeTrialPricingTerm, GetBillingAdjustmentRequestOutput,
-    InternalServerException, ItemizedCharge, LegalTerm, NetPaymentTerm, PaymentScheduleTerm,
+    FreeTrialPricingTerm, GetBillingAdjustmentRequestOutput, InternalServerException,
+    ItemizedCharge, LegalTerm, NetPaymentTerm, PaymentRequestSummary, PaymentScheduleTerm,
     ProposalSummary, Proposer, PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm,
-    RequestedTermConfiguration, ResourceNotFoundException, SupportTerm, TaxConfiguration,
-    ThrottlingException, UsageBasedPricingTerm, ValidationException, ValidationExceptionField,
-    ValidityTerm, VariablePaymentTerm,
+    RequestedTermConfiguration, ResourceNotFoundException, SendAgreementPaymentRequestInput,
+    SupportTerm, TaxConfiguration, ThrottlingException, UsageBasedPricingTerm, ValidationException,
+    ValidationExceptionField, ValidityTerm, VariablePaymentTerm,
 };
 
 /// The `agreementType` every agreement this slice mints carries.
@@ -94,6 +97,8 @@ pub const RESOURCE_TYPE_AGREEMENT: &str = "Agreement";
 pub const RESOURCE_TYPE_AGREEMENT_REQUEST: &str = "AgreementRequest";
 /// See [`RESOURCE_TYPE_AGREEMENT`].
 pub const RESOURCE_TYPE_BILLING_ADJUSTMENT_REQUEST: &str = "BillingAdjustmentRequest";
+/// See [`RESOURCE_TYPE_AGREEMENT`].
+pub const RESOURCE_TYPE_PAYMENT_REQUEST: &str = "PaymentRequest";
 
 /// The largest page the paginated operations serve, and the page they serve
 /// when the request names no `maxResults`: `MaxResults` is modelled
@@ -113,6 +118,22 @@ pub const AGREEMENT_REQUEST_QUOTA: usize = 1_000;
 /// quota code is an identifier Service Quotas issues, which this emulator does
 /// not model and so must not invent one of.
 pub const AGREEMENT_REQUEST_QUOTA_CODE: &str = "AgreementRequestsPerAccount";
+
+/// How many payment requests the store holds before
+/// `SendAgreementPaymentRequest` refuses to store another.
+///
+/// Like [`AGREEMENT_REQUEST_QUOTA`], this is the emulator's OWN bound on the
+/// store rather than a claim about an account's quota (AWS Marketplace
+/// publishes no number for it): it is what stops a caller growing state without
+/// end, and it is far above any workflow an emulator serves. It also bounds the
+/// idempotency lookup, which scans the stored requests for the `clientToken`
+/// that minted one rather than holding a second, separately growing map.
+///
+/// `SendAgreementPaymentRequest` models no `ServiceQuotaExceededException`, so
+/// reaching the bound is answered with the modelled `ThrottlingException`
+/// ("Request was denied due to request throttling") — a retryable refusal that
+/// stores nothing.
+pub const PAYMENT_REQUEST_QUOTA: usize = 1_000;
 
 /// How many agreement cancellation requests the store holds before
 /// `SendAgreementCancellationRequest` refuses another.
@@ -291,9 +312,24 @@ pub const SEARCH_FILTER_NAMES: &[&str] = &[
 
 /// `PartyType`'s two values, as `SearchAgreementsInput$filters` documents them:
 /// "The party type of the caller. Use `Proposer` or `Acceptor`."
+///
+/// `ListAgreementPaymentRequestsInput$partyType` names the same two with the
+/// roles spelled out: "Use `Proposer` to list payment requests where you are the
+/// seller, or `Acceptor` to list payment requests where you are the buyer."
 pub const PARTY_TYPE_ACCEPTOR: &str = "Acceptor";
 /// See [`PARTY_TYPE_ACCEPTOR`].
 pub const PARTY_TYPE_PROPOSER: &str = "Proposer";
+
+/// The `PaymentRequestStatus` a payment request is created in:
+/// `SendAgreementPaymentRequest` documents "The payment request is created in
+/// `PENDING_APPROVAL` status, at which point the buyer can accept or reject
+/// it."
+pub const PAYMENT_REQUEST_STATUS_PENDING_APPROVAL: &str = "PENDING_APPROVAL";
+
+/// The `PaymentRequestStatus` an approved payment request carries, and the only
+/// one `PaymentRequestSummary$chargeId` is reported for ("This field is only
+/// present for approved payment requests").
+pub const PAYMENT_REQUEST_STATUS_APPROVED: &str = "APPROVED";
 
 /// Every value a `partyType` admits. `PartyType` is modelled a plain string
 /// (`@length(1, 32)`, `^[A-Za-z]+$`), not an enum, so the boundary validator
@@ -763,6 +799,24 @@ impl Agreement {
         }
     }
 
+    /// The accepted `VariablePaymentTerm` of this agreement that `term_id`
+    /// names, or `None` when no accepted term of that kind carries that id.
+    ///
+    /// `SendAgreementPaymentRequest` is defined over exactly this term — "an
+    /// agreement that includes a `VariablePaymentTerm`" — and
+    /// `SendAgreementPaymentRequestInput$termId` names "the unique identifier of
+    /// the `VariablePaymentTerm` for the agreement".
+    pub fn variable_payment_term(&self, term_id: &str) -> Option<&VariablePaymentTerm> {
+        self.accepted_terms.iter().find_map(|term| match term {
+            AcceptedTerm::variablePaymentTerm(variable)
+                if variable.id.as_deref() == Some(term_id) =>
+            {
+                Some(variable)
+            }
+            _ => None,
+        })
+    }
+
     /// The instant `sort_by` orders this agreement by, absent when the
     /// agreement has no value for that attribute.
     pub fn sort_key(&self, sort_by: &str) -> Option<SystemTime> {
@@ -772,6 +826,111 @@ impl Agreement {
             // `DEFAULT_SORT_BY`.
             _ => self.end_time,
         }
+    }
+}
+
+/// One payment request — what a seller submits to a buyer "for a specific
+/// charge amount for an agreement that includes a `VariablePaymentTerm`" — as
+/// this emulator persists it.
+///
+/// `ListAgreementPaymentRequests` reports these, and every member it projects is
+/// read from this record or from the agreement it names; nothing is echoed from
+/// the listing call's own input.
+#[derive(Debug, Clone)]
+pub struct PaymentRequest {
+    /// `^pr-[a-zA-Z0-9]+$`, minted by
+    /// [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::mint_payment_request_id`].
+    pub id: String,
+    /// The agreement the request is for; the agreement itself stays the single
+    /// copy of its own type, catalog and parties.
+    pub agreement_id: String,
+    /// The `VariablePaymentTerm` of that agreement the request was sent under.
+    pub term_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub charge_amount: String,
+    /// "The currency code for the charge amount": the currency of the accepted
+    /// term, which is `VariablePaymentTerm$currencyCode`. The term belongs to an
+    /// agreement proposal this emulator does not hold (see the module docs), so
+    /// an accepted term carries no currency and neither does a payment request
+    /// sent under it.
+    pub currency_code: Option<String>,
+    /// One of `PaymentRequestStatus`'s values.
+    pub status: String,
+    /// "The unique identifier of the charge created after the payment request is
+    /// approved. This field is only present for approved payment requests" —
+    /// approving one is `AcceptAgreementPaymentRequest`, still a scaffold stub,
+    /// so no stored request carries a charge yet.
+    pub charge_id: Option<String>,
+    /// The account that submitted the request, which is its proposer: "Allows
+    /// sellers (proposers) to submit a payment request to buyers (acceptors)".
+    pub proposer_account_id: String,
+    /// The `clientToken` the send carried, if any.
+    pub client_token: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl PaymentRequest {
+    /// Whether this request is the one `input` asks to send — every member the
+    /// request carries beside its `clientToken` is the same.
+    ///
+    /// A send replaying the same token with the same details reports this
+    /// request; one reusing it for different details is a conflict, as the
+    /// sibling `BillingAdjustmentRequest::matches_entry` treats the same case.
+    pub fn matches_send(&self, input: &SendAgreementPaymentRequestInput) -> bool {
+        self.agreement_id == input.agreement_id
+            && self.term_id == input.term_id
+            && self.name == input.name
+            && self.charge_amount == input.charge_amount
+            && self.description == input.description
+    }
+
+    /// The `ListAgreementPaymentRequests` projection of this payment request.
+    pub fn to_summary(&self) -> PaymentRequestSummary {
+        PaymentRequestSummary {
+            payment_request_id: Some(self.id.clone()),
+            agreement_id: Some(self.agreement_id.clone()),
+            status: Some(self.status.clone()),
+            name: Some(self.name.clone()),
+            // Only an approved request has a charge; see `charge_id`.
+            charge_id: self
+                .charge_id
+                .clone()
+                .filter(|_| self.status == PAYMENT_REQUEST_STATUS_APPROVED),
+            charge_amount: Some(self.charge_amount.clone()),
+            currency_code: self.currency_code.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+        }
+    }
+}
+
+/// Whether the caller is the `party_type` party of `request`.
+///
+/// `ListAgreementPaymentRequestsInput$partyType` states the two roles: "Use
+/// `Proposer` to list payment requests where you are the seller, or `Acceptor`
+/// to list payment requests where you are the buyer." The buyer is the acceptor
+/// of the agreement the request was sent for, which [`caller_is_party`] decides
+/// — so `agreement` is the stored agreement `request.agreement_id` names, and a
+/// request whose agreement is gone has no buyer to match. The seller is the
+/// account that submitted the payment request, which this service DOES record
+/// (`SendAgreementPaymentRequest` is the seller's own call), unlike the proposer
+/// of an agreement.
+///
+/// A `party_type` that is neither value matches nothing; the handler refuses it
+/// before any request is scanned.
+pub fn payment_request_party_matches(
+    request: &PaymentRequest,
+    agreement: Option<&Agreement>,
+    party_type: &str,
+) -> bool {
+    match party_type {
+        PARTY_TYPE_PROPOSER => request.proposer_account_id == ::engine::emulator_account_id(),
+        PARTY_TYPE_ACCEPTOR => {
+            agreement.is_some_and(|agreement| caller_is_party(agreement, PARTY_TYPE_ACCEPTOR))
+        }
+        _ => false,
     }
 }
 
@@ -1224,6 +1383,26 @@ pub fn search_scope(
     ])
 }
 
+/// The scope a `ListAgreementPaymentRequests` page token belongs to: every
+/// parameter that selects which payment requests the list reports, so a token
+/// minted for one list cannot resume another.
+pub fn payment_request_scope(
+    party_type: &str,
+    agreement_id: Option<&str>,
+    agreement_type: Option<&str>,
+    catalog: Option<&str>,
+    status: Option<&str>,
+) -> String {
+    format!(
+        "{}{}{}{}{}",
+        counted(party_type),
+        counted(agreement_id.unwrap_or_default()),
+        counted(agreement_type.unwrap_or_default()),
+        counted(catalog.unwrap_or_default()),
+        counted(status.unwrap_or_default())
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Modelled failures
 // ---------------------------------------------------------------------------
@@ -1592,6 +1771,12 @@ pub struct ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// `SearchAgreements` a stable total order to page over: ids are minted from
     /// a zero-padded counter, so they sort in creation order.
     pub agreements: BTreeMap<String, Agreement>,
+    /// Every payment request, keyed by its `^pr-[a-zA-Z0-9]+$` id. A `BTreeMap`
+    /// gives `ListAgreementPaymentRequests` the same stable total order to page
+    /// over that `agreements` gives `SearchAgreements`. Bounded by
+    /// [`PAYMENT_REQUEST_QUOTA`], which `SendAgreementPaymentRequest` checks
+    /// before it stores one.
+    pub payment_requests: BTreeMap<String, PaymentRequest>,
     /// Every agreement cancellation request, keyed by its
     /// `^acr-[a-zA-Z0-9]+$` id. A `BTreeMap` is what gives
     /// `ListAgreementCancellationRequests` a stable total order to page over:
@@ -1654,6 +1839,17 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         }
     }
 
+    /// Mint an unused payment request id matching `PaymentRequestId`'s
+    /// `^pr-[a-zA-Z0-9]+$`.
+    pub fn mint_payment_request_id(&mut self) -> String {
+        loop {
+            let id = format!("pr-{:016x}", self.next_sequence());
+            if !self.payment_requests.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
     /// Mint an unused billing adjustment request id matching
     /// `BillingAdjustmentRequestId`'s `^ba-[a-zA-Z0-9]+$`.
     pub fn mint_billing_adjustment_request_id(&mut self) -> String {
@@ -1663,6 +1859,19 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
                 return id;
             }
         }
+    }
+
+    /// The payment request `token` already sent, if any.
+    ///
+    /// `SendAgreementPaymentRequestInput$clientToken` is modelled
+    /// `@idempotencyToken`, so a replayed token names the request it first
+    /// minted. The token lives on the record itself rather than in a second map,
+    /// so the two can never diverge and the lookup is bounded by the same
+    /// [`PAYMENT_REQUEST_QUOTA`] that bounds the store.
+    pub fn payment_request_for_token(&self, token: &str) -> Option<&PaymentRequest> {
+        self.payment_requests
+            .values()
+            .find(|request| request.client_token.as_deref() == Some(token))
     }
 
     /// The stored billing adjustment request submitted under `token`, if any.

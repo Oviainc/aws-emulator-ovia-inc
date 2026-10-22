@@ -953,6 +953,64 @@ pub fn store_cap_reached(what: &str, cap: usize) -> BadRequestException {
     ))
 }
 
+/// The JSON type of a value, for a refusal that names what the caller sent without
+/// echoing it back. One wording for the whole service, so the refusals of
+/// `UpdateSchema`'s `Content`, `PutResourcePolicy`'s `Policy` and
+/// `GetDiscoveredSchema`'s `Events` cannot drift apart.
+pub fn json_type_name(value: &::serde_json::Value) -> &'static str {
+    match value {
+        ::serde_json::Value::Null => "null",
+        ::serde_json::Value::Bool(_) => "a boolean",
+        ::serde_json::Value::Number(_) => "a number",
+        ::serde_json::Value::String(_) => "a string",
+        ::serde_json::Value::Array(_) => "an array",
+        ::serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Refuse `Content` that is not a schema document at all.
+///
+/// A schema registry holds schema SOURCE, so content an `UpdateSchema` call would
+/// store is parsed before it enters the store rather than retained blind. Both types
+/// this service models are JSON documents whose top level is an object: "A JSON Schema
+/// is a JSON document, and that document MUST be an object" (JSON Schema draft-04,
+/// section 3.2), and an OpenAPI document "is itself a JSON object" (OpenAPI
+/// Specification 3.0, "Document Structure"/"Format"). Content that does not parse as
+/// JSON, or parses as a value that is not an object, is therefore a document of
+/// neither modelled `Type`, and no reader of it could treat it as a schema.
+///
+/// What this does NOT do is check a document against the whole of its specification —
+/// that every member OpenAPI requires is present, or that every draft-04 keyword is
+/// well-formed. Content is stored verbatim and handed back verbatim by
+/// `DescribeSchema` and `ExportSchema`, and partial documents are legitimate input to
+/// those, so the refusal is scoped to content that is not a schema document at all.
+/// `CreateSchema` does not route through here: changing which inputs a create accepts
+/// is its own change, not this one.
+///
+/// `schema_type` is named in the message only — the requirement is the same for both
+/// of [`crate::ops::types::TYPE_VALUES`], and a third type cannot reach a handler
+/// because the modelled enum is refused at the boundary before one runs.
+///
+/// The message names the member, the type it was declared as and what the parser
+/// objected to, the way a validation error does; it echoes no content back.
+pub fn validate_content(content: &str, schema_type: &str) -> Result<(), BadRequestException> {
+    let document: ::serde_json::Value = ::serde_json::from_str(content).map_err(|error| {
+        bad_request(format!(
+            "Content is not a valid {schema_type} document: it is not JSON ({error})."
+        ))
+    })?;
+    if document.is_object() {
+        return Ok(());
+    }
+    // The JSON type the content turned out to be, so the caller can see what it sent
+    // without the content being echoed back.
+    let kind = json_type_name(&document);
+    Err(bad_request(format!(
+        "Content is not a valid {schema_type} document: a schema document is a JSON object, \
+         but this Content is {kind}."
+    )))
+}
+
 /// Refuse a search that names more keywords than one request may carry. Names the
 /// member, the bound and what the request asked for, as a validation error does.
 pub fn too_many_keywords(named: usize) -> BadRequestException {
@@ -1199,6 +1257,73 @@ mod tests {
             10,
             "every stored version's content counts towards the budget"
         );
+    }
+
+    /// Content that enters the store is a JSON schema document. The rows vary along
+    /// the FORM the content takes — well-formed JSON objects of both modelled types,
+    /// and every other shape a JSON body can have — not along one example of it.
+    #[test]
+    fn content_is_accepted_only_as_a_json_schema_document() {
+        // An OpenAPI 3 document as the specification describes one: a JSON object
+        // carrying `openapi` and `info`.
+        const OPENAPI: &str = r#"{"openapi":"3.0.0","info":{"title":"t","version":"1.0.0"},"paths":{}}"#;
+        for (case, content, schema_type, accepted) in [
+            ("openapi-document", OPENAPI, "OpenApi3", true),
+            (
+                "openapi-with-components-and-extensions",
+                r#"{"openapi":"3.0.3","info":{"title":"t","version":"1"},"paths":{},"components":{"schemas":{"E":{"type":"object","properties":{"id":{"type":"string"}}}}},"x-vendor":1}"#,
+                "OpenApi3",
+                true,
+            ),
+            // A partial document is still a document: content is stored and handed
+            // back verbatim, so what is refused is content that is not one at all.
+            ("openapi-version-only", r#"{"openapi":"3.0.0"}"#, "OpenApi3", true),
+            ("openapi-empty-object", "{}", "OpenApi3", true),
+            ("openapi-not-json", "not a schema at all", "OpenApi3", false),
+            ("openapi-truncated-json", r#"{"openapi":"#, "OpenApi3", false),
+            ("openapi-array", "[]", "OpenApi3", false),
+            (
+                "draft4-empty-object",
+                "{}",
+                // Draft 4 makes every keyword optional, so the empty schema is valid.
+                "JSONSchemaDraft4",
+                true,
+            ),
+            (
+                "draft4-typical",
+                r#"{"$schema":"http://json-schema.org/draft-04/schema#","type":"object","required":["id"]}"#,
+                "JSONSchemaDraft4",
+                true,
+            ),
+            ("draft4-array", "[]", "JSONSchemaDraft4", false),
+            ("draft4-number", "42", "JSONSchemaDraft4", false),
+            ("draft4-string", "\"schema\"", "JSONSchemaDraft4", false),
+            ("draft4-boolean", "true", "JSONSchemaDraft4", false),
+            ("draft4-null", "null", "JSONSchemaDraft4", false),
+            ("draft4-empty-body", "", "JSONSchemaDraft4", false),
+            ("draft4-truncated-json", "{\"type\":", "JSONSchemaDraft4", false),
+            ("draft4-trailing-garbage", "{} }", "JSONSchemaDraft4", false),
+        ] {
+            let outcome = validate_content(content, schema_type);
+            assert_eq!(
+                outcome.is_ok(),
+                accepted,
+                "case {case:?}: expected accepted={accepted}, got {outcome:?}"
+            );
+            if let Err(refusal) = outcome {
+                assert_eq!(
+                    refusal.code, "BadRequestException",
+                    "case {case:?}: a refusal carries its own code, got {:?}",
+                    refusal.code
+                );
+                assert!(
+                    refusal.message.contains("Content")
+                        && refusal.message.contains(schema_type),
+                    "case {case:?}: the message must name the member and the declared type, got {:?}",
+                    refusal.message
+                );
+            }
+        }
     }
 
     /// A fresh store already holds the service-owned catalogue, with every entry

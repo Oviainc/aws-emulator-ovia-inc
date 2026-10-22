@@ -9,17 +9,24 @@
 //!
 //! ## Decision order
 //!
-//! 1. the account has serial-console access, else `SerialConsoleAccessDisabledException`
-//!    (403);
-//! 2. the instance is in the registry, else `EC2InstanceNotFoundException` (404);
+//! 1. the account has serial-console access, else `SerialConsoleAccessDisabledException`;
+//! 2. the instance is in the registry, else `EC2InstanceNotFoundException`;
 //! 3. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
-//!    still launching) or `EC2InstanceStateInvalidException` (400, going down, stopped or
+//!    still launching) or `EC2InstanceStateInvalidException` (going down, stopped or
 //!    terminated);
-//! 4. its instance type supports the serial console, else `EC2InstanceTypeInvalidException`
-//!    (400);
+//! 4. its instance type supports the serial console, else `EC2InstanceTypeInvalidException`;
 //! 5. the key is stored against (instance id, serial port), replacing whatever was there and
 //!    restarting the 60-second lifetime, and `Success: true` comes back with a fresh
 //!    `RequestId`.
+//!
+//! Every member this operation carries (`InstanceId`, `SSHPublicKey`, `SerialPort`) has its
+//! modelled constraints enforced by the framework before this handler runs, and
+//! `crate::service` words that refusal as the modelled `InvalidArgsException`; there is no
+//! constraint here the framework cannot evaluate, so the handler adds none.
+//!
+//! Every client error above is served with HTTP 400 whatever `@httpError` the shape
+//! carries — see [`crate::scaffolded::client_error_status`], which owns that mapping for
+//! the whole service.
 //!
 //! `SerialConsoleSessionLimitExceededException`, `SerialConsoleSessionUnavailableException`
 //! and `SerialConsoleSessionUnsupportedException` report facts about an SSH serial-console
@@ -218,27 +225,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account-level toggle EC2's `EnableSerialConsoleAccess` sets, checked before the
         // instance is looked up: an account without serial-console access may not ask about
-        // any instance. HTTP 403.
+        // any instance. The message names the account the call was made under — AWS's own
+        // construction for this error — which is the emulator's account id
+        // (`engine::emulator_account_id`), never a literal.
         if !state.serial_console_access_enabled {
             return Err(
                 SendSerialConsoleSSHPublicKeyErrorModeled::SerialConsoleAccessDisabledException(
                     SerialConsoleAccessDisabledException {
-                        message: Some(
-                            "Your account is not authorized to use the EC2 Serial Console. To \
-                             authorize your account, run the EnableSerialConsoleAccess API."
-                                .to_string(),
-                        ),
+                        message: Some(format!(
+                            "The account ({}) is not authorized to use the EC2 Serial Console. \
+                             To authorize the account, run the EnableSerialConsoleAccess API.",
+                            ::engine::emulator_account_id()
+                        )),
                     },
                 )
                 .into(),
             );
         }
 
-        // The instance must be in the registry: `EC2InstanceNotFoundException`, HTTP 404.
+        // The instance must be in the registry: `EC2InstanceNotFoundException`.
         let instance = state.instance(&input.instance_id).cloned().ok_or_else(|| {
             SendSerialConsoleSSHPublicKeyErrorModeled::EC2InstanceNotFoundException(
                 EC2InstanceNotFoundException {
-                    message: Some(format!("Instance {} not found", input.instance_id)),
+                    message: Some("Instance not found.".to_string()),
                 },
             )
         })?;
@@ -276,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Only an instance type that supports the serial console can take a serial-console
-        // key: `EC2InstanceTypeInvalidException`, HTTP 400.
+        // key: `EC2InstanceTypeInvalidException`.
         if !instance.serial_console_supported {
             return Err(
                 SendSerialConsoleSSHPublicKeyErrorModeled::EC2InstanceTypeInvalidException(

@@ -24,6 +24,8 @@
 //!   templates and is not grown by any request path yet, so its size is a constant;
 //!   the cap on caller-created templates belongs with `CreateJobTemplate`, which is
 //!   still a scaffold stub.
+//! * A record's `tags` are capped at [`MAX_TAGS_PER_RESOURCE`], so `TagResource` cannot
+//!   grow one record without limit either; past the cap it answers the same quota error.
 //! * Every lookup is an O(log n) `BTreeMap` probe; no handler clones the whole store.
 //! * [`ComAmazonawsMediaconvertMediaconvertState::settle`] — the only work a reporting
 //!   operation does — touches ONLY the jobs whose due instant has already passed, by
@@ -228,23 +230,27 @@ pub fn system_resource_delete_message(member: &str) -> String {
 }
 
 /// `arn:aws:mediaconvert:<region>:<account>:queues/<name>`.
+///
+/// The resource-id format itself lives in exactly one place,
+/// [`TaggedResource::resource_id`], so the ARN a reader reports and the ARN the tagging
+/// operations resolve cannot drift apart.
 pub fn queue_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("queues/{name}"))
+    TaggedResource::Queue(name.to_string()).arn(region)
 }
 
-/// `arn:aws:mediaconvert:<region>:<account>:jobs/<id>`.
+/// `arn:aws:mediaconvert:<region>:<account>:jobs/<id>`. See [`queue_arn`].
 pub fn job_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("jobs/{id}"))
+    TaggedResource::Job(id.to_string()).arn(region)
 }
 
-/// `arn:aws:mediaconvert:<region>:<account>:presets/<name>`.
+/// `arn:aws:mediaconvert:<region>:<account>:presets/<name>`. See [`queue_arn`].
 pub fn preset_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("presets/{name}"))
+    TaggedResource::Preset(name.to_string()).arn(region)
 }
 
-/// `arn:aws:mediaconvert:<region>:<account>:jobTemplates/<name>`.
+/// `arn:aws:mediaconvert:<region>:<account>:jobTemplates/<name>`. See [`queue_arn`].
 pub fn job_template_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("jobTemplates/{name}"))
+    TaggedResource::JobTemplate(name.to_string()).arn(region)
 }
 
 /// The account's MediaConvert API endpoint URL in `region`.
@@ -273,6 +279,98 @@ pub fn queue_name_from_reference(reference: &str) -> &str {
     match reference.rsplit_once(":queues/") {
         Some((prefix, name)) if prefix.starts_with("arn:") => name,
         _ => reference,
+    }
+}
+
+/// The resource-type prefixes a MediaConvert resource ARN can carry.
+///
+/// `TagResource`'s own documentation: "Add tags to a MediaConvert queue, preset, job, or
+/// job template." The resource id of each is `<plural type>/<name>`, as
+/// [`queue_arn`] and [`job_arn`] already build for the two kinds this store holds.
+pub const RESOURCE_TYPE_QUEUES: &str = "queues";
+/// See [`RESOURCE_TYPE_QUEUES`].
+pub const RESOURCE_TYPE_JOBS: &str = "jobs";
+/// See [`RESOURCE_TYPE_QUEUES`].
+pub const RESOURCE_TYPE_PRESETS: &str = "presets";
+/// See [`RESOURCE_TYPE_QUEUES`].
+pub const RESOURCE_TYPE_JOB_TEMPLATES: &str = "jobTemplates";
+
+/// How many tags one resource carries before a tagging call is refused.
+///
+/// A CHOSEN capacity bound, as [`MAX_QUEUES`] is, set at the tag count AWS's tagging
+/// restrictions publish for a resource: it exists so `TagResource` cannot grow a record
+/// without limit. Past it the call answers the error the model already declares for
+/// growing past a quota, `ServiceQuotaExceededException` (HTTP 402).
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// A resource a MediaConvert ARN names, as the tagging operations resolve it.
+///
+/// Identity here is the resource KIND plus its name, which is exactly what the resource
+/// id of the ARN carries: the partition, region and account of an ARN are not part of a
+/// record's identity in this store, which serves one account and derives every ARN it
+/// reports from the region of the request that reads it (see [`QueueRecord`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// `queues/<name>`.
+    Queue(String),
+    /// `jobs/<id>`.
+    Job(String),
+    /// `presets/<name>`.
+    Preset(String),
+    /// `jobTemplates/<name>`.
+    JobTemplate(String),
+}
+
+impl TaggedResource {
+    /// The resource id this resource's ARN carries, `<type>/<name>`.
+    pub fn resource_id(&self) -> String {
+        match self {
+            Self::Queue(name) => format!("{RESOURCE_TYPE_QUEUES}/{name}"),
+            Self::Job(id) => format!("{RESOURCE_TYPE_JOBS}/{id}"),
+            Self::Preset(name) => format!("{RESOURCE_TYPE_PRESETS}/{name}"),
+            Self::JobTemplate(name) => format!("{RESOURCE_TYPE_JOB_TEMPLATES}/{name}"),
+        }
+    }
+
+    /// This resource's ARN in `region`, built by the same helper every other ARN this
+    /// service reports goes through.
+    pub fn arn(&self, region: &str) -> String {
+        ::engine::emulator_arn(ARN_NAMESPACE, region, &self.resource_id())
+    }
+}
+
+/// The resource an ARN names, or `None` when the value is not a MediaConvert resource
+/// ARN at all.
+///
+/// Accepts `arn:<partition>:mediaconvert:<region>:<account>:<type>/<name>` for the four
+/// resource kinds MediaConvert documents as taggable, and nothing else: a value that is
+/// not an ARN, an ARN of another service, or one whose resource id names no MediaConvert
+/// resource kind is a problem in the REQUEST, which a caller fixes by sending a different
+/// value — the handlers answer it with the modelled `BadRequestException`. Whether the
+/// named resource EXISTS is a separate question, answered by [`ComAmazonawsMediaconvertMediaconvertState::tags`].
+pub fn parse_resource_arn(arn: &str) -> Option<TaggedResource> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    // The partition and the ARN's own region/account are not part of a record's
+    // identity here, but they must be present for the value to be an ARN at all.
+    let _partition = fields.next()?;
+    if fields.next()? != ARN_NAMESPACE {
+        return None;
+    }
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let (kind, name) = fields.next()?.split_once('/')?;
+    if name.is_empty() {
+        return None;
+    }
+    match kind {
+        RESOURCE_TYPE_QUEUES => Some(TaggedResource::Queue(name.to_string())),
+        RESOURCE_TYPE_JOBS => Some(TaggedResource::Job(name.to_string())),
+        RESOURCE_TYPE_PRESETS => Some(TaggedResource::Preset(name.to_string())),
+        RESOURCE_TYPE_JOB_TEMPLATES => Some(TaggedResource::JobTemplate(name.to_string())),
+        _ => None,
     }
 }
 
@@ -974,6 +1072,41 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// Whether the store is at [`MAX_PRESETS`] and can hold no further preset.
     pub fn presets_at_capacity(&self) -> bool {
         self.presets.len() >= MAX_PRESETS
+    }
+
+    /// The tag set of the resource an ARN named, or `None` when this store holds no such
+    /// resource.
+    ///
+    /// Tags are not a map of their own: they live ON the record they belong to, so a
+    /// resource and its tags cannot drift apart and deleting the resource takes its tags
+    /// with it.
+    pub fn tags(&self, resource: &TaggedResource) -> Option<&BTreeMap<String, String>> {
+        match resource {
+            TaggedResource::Queue(name) => self.queues.get(name).map(|queue| &queue.tags),
+            TaggedResource::Job(id) => self.jobs.get(id).map(|job| &job.tags),
+            TaggedResource::JobTemplate(name) => {
+                self.job_templates.get(name).map(|template| &template.tags)
+            }
+            TaggedResource::Preset(name) => self.presets.get(name).map(|preset| &preset.tags),
+        }
+    }
+
+    /// The tag set of the resource an ARN named, for writing. See [`Self::tags`].
+    pub fn tags_mut(
+        &mut self,
+        resource: &TaggedResource,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        match resource {
+            TaggedResource::Queue(name) => self.queues.get_mut(name).map(|queue| &mut queue.tags),
+            TaggedResource::Job(id) => self.jobs.get_mut(id).map(|job| &mut job.tags),
+            TaggedResource::JobTemplate(name) => self
+                .job_templates
+                .get_mut(name)
+                .map(|template| &mut template.tags),
+            TaggedResource::Preset(name) => {
+                self.presets.get_mut(name).map(|preset| &mut preset.tags)
+            }
+        }
     }
 
     /// How many jobs in `queue_name` are `SUBMITTED` and how many are `PROGRESSING`.

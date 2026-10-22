@@ -192,6 +192,35 @@ impl Emulator {
         .await
     }
 
+    /// `UpdateChannelGroup` — `PUT` on the group's own path. `headers` carries the
+    /// conditional `x-amzn-update-if-match` when a case sets a precondition.
+    pub(crate) async fn update_group(
+        &self,
+        name: &str,
+        body: Value,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value) {
+        self.call_with_headers("PUT", &format!("/channelGroup/{name}"), Some(body), headers)
+            .await
+    }
+
+    /// `UpdateChannel` — `PUT` on the channel's own path.
+    pub(crate) async fn update_channel(
+        &self,
+        group: &str,
+        name: &str,
+        body: Value,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value) {
+        self.call_with_headers(
+            "PUT",
+            &format!("/channelGroup/{group}/channel/{name}/"),
+            Some(body),
+            headers,
+        )
+        .await
+    }
+
     /// `UpdateOriginEndpoint` — `PUT` on the endpoint's own path.
     pub(crate) async fn update_endpoint(
         &self,

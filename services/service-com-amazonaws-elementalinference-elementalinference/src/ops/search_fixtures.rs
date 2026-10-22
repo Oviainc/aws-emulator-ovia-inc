@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchFixtures
-//! IMPLEMENTED: reports the fixtures the data-source catalog holds for one sport in
+//! IMPLEMENTED: reports the fixtures the data-source catalog HOLDS for one sport in
 //! a date window, filtered and paginated. Reporting only (`@readonly`): it writes
 //! nothing at all.
 //!
 //! A fixture is not a resource of this service — nothing creates, updates or deletes
-//! one — so this handler reads [`crate::state`]'s fixture catalog, the emulator's
-//! single stand-in for the external sports data source, which `GetFixture` projects
-//! too. See that module's docs for why the catalog is derived rather than stored.
+//! one — so this handler selects from the fixture store in [`crate::state`], which
+//! `GetFixture` reads too. Every row of the answer is a held fixture the request's
+//! `sport`, window and `filters` select; a window the store holds no event in reports
+//! an empty list, which is what the store answers until something seeds it. See that
+//! module's docs for where its records come from.
 //!
 //! ## Shape of an operation
 //!
@@ -163,10 +165,7 @@ const MAX_PAGE_SIZE: usize = 100;
 /// AWS documents no default for it (`SearchFixturesRequest$maxResults` only says the
 /// service "might return fewer fixtures than the maxResults value"), so it is
 /// [`MAX_PAGE_SIZE`], the model's own ceiling: a request that asks for no page size
-/// still cannot be answered with more than the modelled maximum. A window is at most
-/// [`crate::state::MAX_SEARCH_WINDOW_DAYS`] days of at most
-/// [`crate::state::MAX_FIXTURES_PER_DAY`] fixtures, so this is also more than a whole
-/// window.
+/// still cannot be answered with more than the modelled maximum.
 const DEFAULT_MAX_RESULTS: usize = MAX_PAGE_SIZE;
 
 /// The only `FilterName` the model declares
@@ -219,12 +218,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries request metadata only, and this operation needs none of it.
         let _ = ctx;
-        // The fixtures come from the data-source catalog in `crate::state`, not from
-        // the engine's store: no operation of this service creates a fixture, and
-        // this one is `@readonly`, so there is nothing here to write and nothing
-        // per-account to read. The engine stays on `self` all the same, as every
-        // handler's constructor seam.
-        let _ = &self.engine;
+        // The fixtures come from the fixture store in `crate::state`, reached through
+        // the shared engine held on `self` (the constructor seam). This operation is
+        // `@readonly`, so it only reads that store: nothing here writes, and the
+        // fixture records owe the clock no transition to settle either.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SearchFixturesErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
 
         // The modelled `DataSourceSport` enum has already refused any other value at
         // the boundary; this is what turns it into the catalog's sport.
@@ -305,11 +311,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(DEFAULT_MAX_RESULTS, |max| max.max(1) as usize)
             .clamp(1, MAX_PAGE_SIZE);
 
-        let now = crate::state::now_secs();
-        // The window's days in order, each day's fixtures in scheduled order — which
-        // is also ascending id order, so `nextToken` can name a position in it.
-        let mut matching = (start_day..=end_day)
-            .flat_map(|day| crate::state::fixtures_on_day(sport, day))
+        let state = state.lock();
+        // The held fixtures of this sport scheduled on a day of the window, in
+        // `FixtureId` order — the one order a `nextToken` can name a position in.
+        let mut matching = state
+            .fixtures_in_window(sport, start_day, end_day)
             .filter(|fixture| {
                 resume_after
                     .as_deref()
@@ -326,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let fixtures: Vec<FixtureSummary> = matching
             .by_ref()
             .take(page_size)
-            .map(|fixture| fixture.summary(now))
+            .map(crate::state::Fixture::summary)
             .collect();
         // A token only when a further fixture is actually there to be fetched: it "is
         // absent when there are no more results to return".

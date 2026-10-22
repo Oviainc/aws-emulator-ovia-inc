@@ -177,13 +177,42 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The status EC2 Instance Connect puts on a modeled error, given the status its shape's
+/// `@httpError` trait declares.
+///
+/// This service does NOT serialize `@httpError` for a client-side failure: it answers
+/// every client error with HTTP 400 — the awsJson1_1 default status for a client error —
+/// whatever the trait on the shape says. The recorded wire answers show it on two
+/// different shapes of two different operations: `EC2InstanceNotFoundException`
+/// (`@httpError` 404) and `SerialConsoleAccessDisabledException` (`@httpError` 403) both
+/// come back 400, and the AWS API Reference lists this service's client errors as "HTTP
+/// Status Code: 400" throughout. A client's retry classifier keys on the status, so
+/// answering 404 or 403 where AWS answers 400 changes how a caller handles the failure.
+///
+/// Server-side errors are untouched, because nothing says they move: the model's
+/// `errorKind: server` shapes (`ServiceException` 500,
+/// `SerialConsoleSessionUnavailableException` 500, `EC2InstanceUnavailableException` 503)
+/// keep the status the model gives them, and so does any status outside the 4xx range.
+///
+/// One function for the whole service, reached by every operation's error channel through
+/// [`Scaffolded::http_status`], so the two operations cannot answer the same shape with
+/// two different statuses.
+pub fn client_error_status(modeled_status: u16) -> u16 {
+    if (400..500).contains(&modeled_status) {
+        400
+    } else {
+        modeled_status
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status
+    /// [`client_error_status`] gives it.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -278,14 +307,18 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// The status this service answers an error with.
     ///
-    /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
-    /// retryable, so a client would retry an operation that can never succeed.
+    /// 501 for the scaffold signal. Keep it 501 and not a 5xx server fault: SDK retry
+    /// classifiers treat those as retryable, so a client would retry an operation that can
+    /// never succeed.
+    ///
+    /// A MODELED error goes through [`client_error_status`], which is where EC2 Instance
+    /// Connect's own status mapping lives.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => client_error_status(e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

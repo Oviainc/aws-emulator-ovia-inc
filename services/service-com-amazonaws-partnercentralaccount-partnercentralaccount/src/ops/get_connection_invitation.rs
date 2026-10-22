@@ -199,9 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetConnectionInvitationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "Connection invitation {} was not found in catalog {}.",
-                            input.identifier, input.catalog
+                        message: crate::state::not_found_message(
+                            crate::state::RESOURCE_CONNECTION_INVITATION,
+                            &input.catalog,
+                            &input.identifier,
                         ),
                         reason: crate::state::REASON_CONNECTION_INVITATION_NOT_FOUND.to_string(),
                     },

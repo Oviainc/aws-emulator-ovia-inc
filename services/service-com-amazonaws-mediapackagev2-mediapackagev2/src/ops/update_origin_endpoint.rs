@@ -8,8 +8,9 @@
 //! What it refuses, before anything is written:
 //!
 //! * a member the model documents as immutable after creation, when the request carries
-//!   a different value — `ContainerType` (`CONTAINER_TYPE_IMMUTABLE`) and
-//!   `StreamNameOutputMode` (`STREAM_NAME_OUTPUT_MODE_IMMUTABLE`), each a 400
+//!   a different value — `ContainerType` (`CONTAINER_TYPE_IMMUTABLE`),
+//!   `StreamNameOutputMode` (`STREAM_NAME_OUTPUT_MODE_IMMUTABLE`) and
+//!   `Segment.OutputTimestampMode` (`OUTPUT_TIMESTAMP_MODE_IMMUTABLE`), each a 400
 //!   `ValidationException` naming the member, with the stored endpoint untouched;
 //! * a manifest set the new `ContainerType` cannot serve, no manifest at all, or more
 //!   manifests than [`crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT`] — the same rules
@@ -252,6 +253,17 @@ const STREAM_NAME_OUTPUT_MODE: ImmutableMember = ImmutableMember {
              a new origin endpoint",
 };
 
+/// The segment output-timestamp mode of an endpoint that was created with one is fixed:
+/// `Segment$OutputTimestampMode` is documented "immutable after endpoint creation", and
+/// `ValidationExceptionType` names `OUTPUT_TIMESTAMP_MODE_IMMUTABLE` for it.
+const OUTPUT_TIMESTAMP_MODE: ImmutableMember = ImmutableMember {
+    member: "segment.outputTimestampMode",
+    exception_type: "OUTPUT_TIMESTAMP_MODE_IMMUTABLE",
+    detail: "You can't change the output timestamp mode after you create an origin \
+             endpoint. To use a different output timestamp mode, you'll need to create a \
+             new origin endpoint",
+};
+
 /// The `ValidationException` for an attempt to change an immutable member: the service's
 /// own message form, naming the member and restating the rule, plus the discriminator.
 fn immutable_violation(member: &ImmutableMember) -> ValidationException {
@@ -400,12 +412,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The immutable members: `ContainerType` is required on every update, so it is
-        // compared always; `StreamNameOutputMode` only when the request provides one,
-        // because an absent request value means "keep what is there". Every endpoint HAS
-        // a stored mode — the service applies one at create whether or not the request
-        // named it — so a request that names a different one is asking to change an
-        // immutable member. Both are refused BEFORE a single field is written, so a
-        // rejected update leaves the endpoint — and its ETag — exactly as it was.
+        // compared always; `StreamNameOutputMode` and `Segment.OutputTimestampMode` only
+        // when the request provides one, because an absent request value means "keep what
+        // is there". Every endpoint HAS a stored stream-name output mode — the service
+        // applies one at create whether or not the request named it — so a request that
+        // names a different one is asking to change an immutable member; the segment's
+        // output-timestamp mode is reported only when it was configured, so a request
+        // naming one is compared against it only where the endpoint has one. All are
+        // refused BEFORE a single field is written, so a rejected update leaves the
+        // endpoint — and its ETag — exactly as it was.
         if input.container_type != endpoint.container_type {
             return Err(UpdateOriginEndpointErrorModeled::ValidationException(
                 immutable_violation(&CONTAINER_TYPE),
@@ -421,6 +436,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 immutable_violation(&STREAM_NAME_OUTPUT_MODE),
             )
             .into());
+        }
+        if let (Some(requested), Some(stored)) = (
+            input
+                .segment
+                .as_ref()
+                .and_then(|segment| segment.output_timestamp_mode.as_ref()),
+            endpoint.segment.output_timestamp_mode.as_ref(),
+        ) {
+            if requested != stored {
+                return Err(UpdateOriginEndpointErrorModeled::ValidationException(
+                    immutable_violation(&OUTPUT_TIMESTAMP_MODE),
+                )
+                .into());
+            }
         }
         // `ETag` is the precondition the caller read from an earlier response: "If the
         // specified ETag does not match the resource's current entity tag, the update
@@ -478,13 +507,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|manifest| crate::state::stored_mss_manifest(manifest, at))
             .collect();
         // An update carries the whole packaging configuration, so a member the request
-        // omits is cleared rather than kept — except the two the model says are preserved
+        // omits is cleared rather than kept — except the ones the model says are preserved
         // when absent (`UriSeparator`: "If you don't specify a value in the update
         // request, the current value is preserved") or cannot be changed at all. The
         // members the SERVICE applies are re-materialised here exactly as the create
         // materialises them, so an update that names none of them leaves the endpoint
-        // reporting the service's own settings rather than nothing.
-        endpoint.segment = crate::state::materialized_segment(input.segment);
+        // reporting the service's own settings rather than nothing. The segment's
+        // output-timestamp mode is immutable, so the stored one is carried over when the
+        // replacement segment does not name it.
+        let mut segment = crate::state::materialized_segment(input.segment);
+        segment.output_timestamp_mode = segment
+            .output_timestamp_mode
+            .or(endpoint.segment.output_timestamp_mode.clone());
+        endpoint.segment = segment;
         endpoint.description = input.description;
         endpoint.startover_window_seconds =
             crate::state::materialized_startover_window_seconds(input.startover_window_seconds);

@@ -6,6 +6,12 @@
 //! every member reports what was created; an ARN no record is held for is a
 //! `ResourceNotFoundException` (404).
 //!
+//! `quantumTaskArn` targets `QuantumTaskArn`, an `@arnReference` shape with no
+//! `@pattern` for the boundary validator to enforce, so its syntax is checked HERE,
+//! before the store is consulted: a value that is not a Braket quantum-task ARN is
+//! invalid input (`ValidationException`, 400), and only a well-formed ARN that names
+//! no stored task is a missing resource (404).
+//!
 //! Before reading, the status transitions the clock has already made due are
 //! materialised — the same transitions any other call would have materialised at this
 //! instant, so this read changes no answer a later caller could otherwise have seen.
@@ -222,6 +228,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Input validation comes before any state access: a label that is not an ARN
+        // names no resource at all, so it is never looked up.
+        if !crate::state::is_braket_arn(
+            &input.quantum_task_arn,
+            crate::state::ARN_RESOURCE_QUANTUM_TASK,
+        ) {
+            return Err(GetQuantumTaskErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::invalid_arn_message(
+                    "quantumTaskArn",
+                    crate::state::ARN_RESOURCE_QUANTUM_TASK,
+                    &input.quantum_task_arn,
+                )),
+                reason: None,
+                program_set_validation_failures: None,
+            })
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetQuantumTaskError::from(GetQuantumTaskErrorModeled::InternalServiceException(
                 InternalServiceException {

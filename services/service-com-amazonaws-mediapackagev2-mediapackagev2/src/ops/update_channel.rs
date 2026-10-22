@@ -4,6 +4,12 @@
 //! IMPLEMENTED. Updates one channel's editable members and reports the channel as it is
 //! now stored, so a later `GetChannel` returns the same bytes.
 //!
+//! The switching and CMSD-header blocks the SERVICE applies are re-materialised exactly
+//! as the create materialises them; every member the model restricts to particular input
+//! types is refused on the channel's STORED (immutable) input type through the same rule
+//! table `CreateChannel` uses; and the multiview configuration — which the model says
+//! can be changed but neither added nor removed — is preserved when the request omits it.
+//!
 //! ## The conditional-update contract
 //!
 //! `ETag` arrives in the `x-amzn-update-if-match` header. When it is present it is a
@@ -18,9 +24,6 @@
 //!
 //! An absent `ETag` is an unconditional update, which is what the model's optional
 //! member means.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -231,11 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The conditional entity tag is bound to a header by the model, so it arrives on
         // the deserialized input: nothing else is needed from the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateChannelErrorModeled::InternalServerException(
                 InternalServerException {
@@ -262,7 +264,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The precondition: a presented entity tag that is not the committed one means
-        // somebody else committed first.
+        // somebody else committed first, which is what the model's `ConflictException` /
+        // `CONFLICTING_OPERATION` describes.
         if input
             .e_tag
             .as_deref()
@@ -274,12 +277,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Every member the model restricts to particular input types is checked against
+        // the channel's STORED input type — which is immutable, so an update may not
+        // slip a member past the restriction the create would have refused it under.
+        // The rule table is the one `CreateChannel` checks its own request against
+        // (`crate::state::channel_input_type_violation`), so the two cannot drift: an
+        // update naming MQCS switching, a preferred input or CMSD publication on a
+        // non-CMAF channel, or a multiview configuration on a channel that is not
+        // MULTIVIEW, is refused with that member's own `ValidationExceptionType` and
+        // nothing is written. The same rule is what the model means by "you can change a
+        // multiview channel's sources and layouts. You can't add or remove the multiview
+        // configuration itself": only a MULTIVIEW channel may carry one, and an update
+        // that omits the member keeps the one the channel has (below) rather than
+        // removing it.
+        let submitted = crate::state::SubmittedChannelMembers {
+            // `OutputLockingMode` is not an `UpdateChannel` input at all, so this
+            // request can never be the one that introduces it.
+            output_locking_mode: false,
+            mqcs_input_switching: input
+                .input_switch_configuration
+                .as_ref()
+                .is_some_and(|switch| switch.mqcs_input_switching.is_some()),
+            preferred_input: input
+                .input_switch_configuration
+                .as_ref()
+                .is_some_and(|switch| switch.preferred_input.is_some()),
+            publish_mqcs: input
+                .output_header_configuration
+                .as_ref()
+                .is_some_and(|header| header.publish_mqcs.is_some()),
+            multiview_configuration: input.multiview_configuration.is_some(),
+        };
+        let input_type = channel
+            .input_type
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_INPUT_TYPE);
+        if let Some(violation) = crate::state::channel_input_type_violation(submitted, input_type) {
+            return Err(UpdateChannelErrorModeled::ValidationException(violation).into());
+        }
+
         // Only the members `UpdateChannelRequest` binds are editable; everything else
-        // (the name, the ARN, the ingest endpoints, `CreatedAt`) is immutable, so the
-        // update leaves it exactly as the create derived it. The switching and
-        // CMSD-header blocks are MATERIALISED, not echoed, by the same functions the
-        // create uses, so an update that omits them leaves the channel with the state the
-        // service reports rather than with nothing.
+        // (the name, the ARN, the ingest endpoints, `CreatedAt`, the output-locking mode,
+        // the attached policy and the tags) is immutable or not this operation's input,
+        // so the update leaves it exactly as the store holds it. A bound member the
+        // request omits is cleared, except the ones the model documents otherwise, each
+        // handled on its own here. The switching and CMSD-header blocks are
+        // MATERIALISED, not echoed, by the same functions the create uses, so an update
+        // that omits them leaves the channel with the state the service reports rather
+        // than with nothing.
         channel.description = input.description;
         channel.input_switch_configuration =
             crate::state::materialized_input_switch_configuration(input.input_switch_configuration);
@@ -287,7 +332,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::materialized_output_header_configuration(
                 input.output_header_configuration,
             );
-        channel.multiview_configuration = input.multiview_configuration;
+        // Documented as neither addable nor removable: a submitted configuration
+        // changes the channel's sources and layouts (the restriction above has already
+        // established that only a MULTIVIEW channel may carry one), an omitted one
+        // leaves the stored configuration in place rather than removing it.
+        if let Some(requested) = input.multiview_configuration {
+            channel.multiview_configuration = Some(requested);
+        }
         channel.commit(crate::state::now());
 
         // Answer from what was stored, so the response can only carry what a later

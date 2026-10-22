@@ -39,11 +39,44 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # How this service refuses a request on its input constraints
+//!
+//! PartnerCentral Account answers a member outside a modelled constraint with its
+//! own `ValidationException` — `@httpError 400`, with the prose in the `Message`
+//! member the model declares. The framework's pre-dispatch renderer gets the status
+//! and the error code right, but writes the prose into a framework-chosen lowercase
+//! `message` key that is the same for every awsJson service, so the body carries no
+//! `Message` at all and an SDK surfaces a constraint refusal with no reason.
+//!
+//! [`InModelledEnvelope`] closes that gap: every modelled operation is served
+//! wrapped in it, and a request the wrapper finds refusable is answered through the
+//! `ValidationException` envelope below instead. The violations come from the
+//! framework's OWN deserializer and constraint walk, so the wrapper cannot refuse a
+//! different set of requests than the walk that follows it.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::{Schema, ShapeId, ShapeType};
+use aws_smithy_schema_server::constraints;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
+    OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with: its own
+/// modelled `ValidationException`, which every operation declares
+/// (`smithy_query(query="shape", shape="ValidationException")`). It is also the code
+/// the framework would have chosen, restated here because the envelope below and
+/// `override_refusal` each name the code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The status that shape's `@httpError` declares.
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// This service's Smithy namespace, for the error shape the envelope below names.
+const NAMESPACE: &str = "com.amazonaws.partnercentralaccount";
 
 /// The `com-amazonaws-partnercentralaccount-partnercentralaccount` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +85,28 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`InModelledEnvelope`] so a request refused before its handler runs is
+    /// refused in this service's own `ValidationException`. Keyed by the routing key
+    /// the protocol resolves — the key the generated table uses — and built from the
+    /// SAME shared engine, so a wrapped operation reads and writes the one store.
+    in_modelled_envelope: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`InModelledEnvelope`] and keyed by its operation shape name — the routing key
+/// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(InModelledEnvelope::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -59,9 +114,228 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut in_modelled_envelope = OperationRoutingTable::new();
+        wrap_operations!(
+            in_modelled_envelope,
+            engine,
+            accept_connection_invitation::AcceptConnectionInvitation,
+            associate_aws_training_certification_email_domain::AssociateAwsTrainingCertificationEmailDomain,
+            cancel_connection::CancelConnection,
+            cancel_connection_invitation::CancelConnectionInvitation,
+            cancel_profile_update_task::CancelProfileUpdateTask,
+            create_connection_invitation::CreateConnectionInvitation,
+            create_partner::CreatePartner,
+            disassociate_aws_training_certification_email_domain::DisassociateAwsTrainingCertificationEmailDomain,
+            get_alliance_lead_contact::GetAllianceLeadContact,
+            get_connection::GetConnection,
+            get_connection_invitation::GetConnectionInvitation,
+            get_connection_preferences::GetConnectionPreferences,
+            get_partner::GetPartner,
+            get_profile_update_task::GetProfileUpdateTask,
+            get_profile_visibility::GetProfileVisibility,
+            get_qualifications_association_details::GetQualificationsAssociationDetails,
+            get_qualifications_association_task::GetQualificationsAssociationTask,
+            get_qualifications_disassociation_task::GetQualificationsDisassociationTask,
+            get_verification::GetVerification,
+            list_connection_invitations::ListConnectionInvitations,
+            list_connections::ListConnections,
+            list_partners::ListPartners,
+            list_tags_for_resource::ListTagsForResource,
+            put_alliance_lead_contact::PutAllianceLeadContact,
+            put_profile_visibility::PutProfileVisibility,
+            reject_connection_invitation::RejectConnectionInvitation,
+            send_email_verification_code::SendEmailVerificationCode,
+            start_profile_update_task::StartProfileUpdateTask,
+            start_qualifications_association_task::StartQualificationsAssociationTask,
+            start_qualifications_disassociation_task::StartQualificationsDisassociationTask,
+            start_verification::StartVerification,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_connection_preferences::UpdateConnectionPreferences,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            in_modelled_envelope,
         }
+    }
+}
+
+/// The `Message` member of this service's `ValidationException`, as the model spells
+/// it (`ValidationException$Message`, `@required`). The awsJson codecs key a member
+/// by its MEMBER NAME, so this is what puts `Message` — not the framework's lowercase
+/// `message` — in the refusal body.
+static VALIDATION_EXCEPTION_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.partnercentralaccount#ValidationException$Message",
+        NAMESPACE,
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    0,
+)
+.with_xml_name("Message");
+
+/// The shape a constraint refusal is serialized through: this service's
+/// `ValidationException`, carrying the `Message` member alone.
+///
+/// `Reason` is deliberately absent rather than filled with a value this layer does
+/// not know. It names a rule BEYOND the modelled constraints
+/// (`REQUEST_VALIDATION_FAILED` / `BUSINESS_VALIDATION_FAILED`), and the recorded
+/// frontend answers a member outside its declared constraint with the message alone;
+/// a handler that does know the reason sets it itself through the modelled shape in
+/// `ops::types`.
+static VALIDATION_EXCEPTION_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.partnercentralaccount#ValidationException",
+        NAMESPACE,
+        "ValidationException",
+    ),
+    ShapeType::Structure,
+    &[&VALIDATION_EXCEPTION_MESSAGE],
+);
+
+/// The body of a constraint refusal: why the request was refused, and nothing else.
+struct ConstraintRefusal {
+    message: String,
+}
+
+impl SerializableStruct for ConstraintRefusal {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&VALIDATION_EXCEPTION_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
+/// One modelled operation, served with the refusals it owes stated in this service's
+/// own `ValidationException` (see the module docs).
+///
+/// Nothing else is re-implemented: a request this wrapper does not refuse is handed
+/// to the generated `ErasedOperation::run`, which owns deserialize -> validate ->
+/// handle -> serialize, telemetry and every modelled error.
+struct InModelledEnvelope<O> {
+    operation: O,
+}
+
+impl<O> InModelledEnvelope<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O> ErasedOperation for InModelledEnvelope<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // Read the protocol out before the await: `&dyn ErasedServiceDefinition`
+            // is not `Sync`, and this future is. The protocol itself is.
+            let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
+            let violations = refused_by::<O>(protocol, req);
+            if let Some(refusal) = validation_exception(protocol, &violations) {
+                return refusal;
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// Every violation that refuses `req` before `O`'s handler runs: a `@required` member
+/// absent, or a value outside a declared constraint. Empty when the request is valid,
+/// and empty for a failure that is NOT a refusal — a body the codec cannot read is a
+/// serialization failure, which the framework's own walk renders.
+///
+/// Both classes come from the framework's own machinery (the protocol's deserializer
+/// and `constraints::validate` over the built input), so this cannot find a different
+/// set of violations from the walk that follows it.
+fn refused_by<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Vec<Violation> {
+    let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
+        return Vec::new();
+    };
+    match <O::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
+        Ok(input) => constraints::validate(&input, O::INPUT_SCHEMA),
+        // Absence is found while READING the request and a bad value while walking
+        // what was read; to a caller they are one refusal, so they are one here.
+        Err(SerdeError::MissingMember { member_name }) => vec![Violation {
+            path: member_name,
+            kind: ViolationKind::MissingRequiredMember,
+            value: None,
+        }],
+        Err(_) => Vec::new(),
+    }
+}
+
+/// This service's answer to `violations`: HTTP 400 `ValidationException` with the
+/// prose in the `Message` member the model declares. `None` when there is nothing to
+/// refuse — and also when the error cannot be serialized, which leaves the
+/// framework's walk to refuse the request in its own envelope rather than answering a
+/// 400 with no reason at all.
+fn validation_exception(
+    protocol: &dyn ServerHttpProtocol,
+    violations: &[Violation],
+) -> Option<RtResponse> {
+    let refused = ConstraintRefusal {
+        message: constraint_envelope(violations)?,
+    };
+    protocol
+        .serialize_error(
+            &refused,
+            &VALIDATION_EXCEPTION_SCHEMA,
+            VALIDATION_EXCEPTION,
+            VALIDATION_EXCEPTION_STATUS,
+        )
+        .ok()
+}
+
+/// The `Message` of a constraint refusal: the AWS validation envelope
+/// (`N validation error(s) detected: `) over one clause per violation, each naming
+/// the rejected value, the member path in lowerCamelCase and the constraint it
+/// failed. `None` when there is nothing to state.
+///
+/// The clauses come from the framework's own renderer, so a constraint class added
+/// upstream cannot arrive with a sentence of its own; [`as_stated`] only names a
+/// `@pattern` the way this service names it.
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
+    constraints::envelope(&stated)
+}
+
+/// A violation as this service states it: the framework's clause, with a `@pattern`
+/// named without the anchors the model brackets it with.
+///
+/// The clause already says the whole member must satisfy the expression, so the
+/// anchors would be restating the sentence. Every other clause is the framework's
+/// unchanged.
+fn as_stated(violation: &Violation) -> Violation {
+    match &violation.kind {
+        ViolationKind::Pattern(regex) => Violation {
+            kind: ViolationKind::Pattern(unanchored(regex).to_string()),
+            ..violation.clone()
+        },
+        _ => violation.clone(),
+    }
+}
+
+/// `regex` without a leading `^` or a trailing `$`. A trailing `$` escaped by a
+/// backslash is a literal dollar in the expression, not an anchor, so it stays.
+fn unanchored(regex: &str) -> &str {
+    let inner = regex.strip_prefix('^').unwrap_or(regex);
+    match inner.strip_suffix('$') {
+        Some(stripped) if !stripped.ends_with('\\') => stripped,
+        _ => inner,
     }
 }
 
@@ -87,26 +361,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol
+        // resolves, and the operation it names is the one served — wrapped in
+        // `InModelledEnvelope` so a request refused before the handler runs is
+        // refused in this service's `ValidationException` rather than in the
+        // framework's pre-dispatch envelope, which names no `Message`. A key the
+        // model does not name resolves to `None` here exactly as it does in the
+        // generated table, so the router's routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.in_modelled_envelope.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // `InModelledEnvelope` refuses a constraint violation itself, in the modelled
+        // envelope, so this seam words any refusal the FRAMEWORK still renders — the
+        // fallback in `validation_exception`, and a refusal raised before an operation
+        // is named at all. Wording it here from the same violations keeps the two
+        // paths from disagreeing: a value outside a declared bound is this service's
+        // `ValidationException` either way.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: constraint_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
