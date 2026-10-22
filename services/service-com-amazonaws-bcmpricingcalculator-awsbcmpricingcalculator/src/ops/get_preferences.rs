@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPreferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPreferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPreferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the rate-type preferences `UpdatePreferences` last stored
+//! (`crate::state::Preferences`), member for member: a selection that was stored is
+//! reported exactly as stored, and a selection nobody ever stated is not reported at
+//! all — the members are optional and the service documents no selection it applies
+//! in the account's place, so there is nothing to report for one.
+//!
+//! A pure read: `@readonly`, and it writes nothing, so two consecutive reads of an
+//! untouched store answer identically.
 //!
 //! ## Shape of an operation
 //!
@@ -132,21 +132,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _input: Self::Input,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPreferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPreferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPreferences"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPreferencesErrorModeled::DataUnavailableException(
+                DataUnavailableException {
+                    message: "the preferences store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        // A read: the guard is taken, the stored record is copied out, and nothing is
+        // written — what a later caller sees is exactly what this call saw.
+        let preferences = store.lock().preferences.clone();
+
+        Ok(GetPreferencesOutput {
+            management_account_rate_type_selections: preferences
+                .management_account_rate_type_selections,
+            member_account_rate_type_selections: preferences.member_account_rate_type_selections,
+            standalone_account_rate_type_selections: preferences
+                .standalone_account_rate_type_selections,
+        })
     }
 }

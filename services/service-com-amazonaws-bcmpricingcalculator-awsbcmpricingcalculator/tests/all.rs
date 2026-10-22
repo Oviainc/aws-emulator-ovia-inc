@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bill_scenario_lifecycle.rs"]
 mod bill_scenario_lifecycle;
+#[path = "all/preferences.rs"]
+mod preferences;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/workload_estimate_lifecycle.rs"]

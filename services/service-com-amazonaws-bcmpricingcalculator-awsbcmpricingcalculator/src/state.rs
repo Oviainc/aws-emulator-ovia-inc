@@ -261,6 +261,52 @@ impl BillScenario {
     }
 }
 
+/// The account's Pricing Calculator preferences: the preferred rate types for each
+/// kind of account, written by `UpdatePreferences` and reported by `GetPreferences`.
+///
+/// One record, not one per account: the preference belongs to the account the request
+/// is made for, and this emulator serves a single account (`engine::mock_account_id`),
+/// so a second key would only ever hold that one record.
+///
+/// Every selection is optional because an account that has never stated a preference
+/// for that kind of account has none — `RateTypes` is an optional member of both the
+/// `GetPreferences` and the `UpdatePreferences` response precisely so it can be
+/// absent. Neither the Smithy model nor the API reference states a selection the
+/// service applies in the account's place, so this emulator invents none: a
+/// preference nobody set reads back unset rather than as a fabricated default.
+#[derive(Debug, Clone, Default)]
+pub struct Preferences {
+    /// `RateTypes` (len 1..3, of `RateType`: `BEFORE_DISCOUNTS` | `AFTER_DISCOUNTS` |
+    /// `AFTER_DISCOUNTS_AND_COMMITMENTS`) — smithy_query: `shape="RateType"`.
+    pub management_account_rate_type_selections: Option<Vec<String>>,
+    pub member_account_rate_type_selections: Option<Vec<String>>,
+    pub standalone_account_rate_type_selections: Option<Vec<String>>,
+}
+
+impl Preferences {
+    /// Apply one `UpdatePreferences` request: each selection the request supplies
+    /// REPLACES the stored one (the member is a whole list, so there is nothing to
+    /// merge inside it), and each selection the request omits keeps its stored value.
+    /// Every member is individually optional, so an omitted one states nothing about
+    /// that preference rather than clearing it.
+    pub fn merge(
+        &mut self,
+        management_account_rate_type_selections: Option<Vec<String>>,
+        member_account_rate_type_selections: Option<Vec<String>>,
+        standalone_account_rate_type_selections: Option<Vec<String>>,
+    ) {
+        if let Some(selections) = management_account_rate_type_selections {
+            self.management_account_rate_type_selections = Some(selections);
+        }
+        if let Some(selections) = member_account_rate_type_selections {
+            self.member_account_rate_type_selections = Some(selections);
+        }
+        if let Some(selections) = standalone_account_rate_type_selections {
+            self.standalone_account_rate_type_selections = Some(selections);
+        }
+    }
+}
+
 /// What a previous request carrying an `@idempotencyToken` did.
 #[derive(Debug, Clone)]
 pub struct IdempotentRecord {
@@ -297,6 +343,10 @@ pub struct ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
     /// resource. The key carries the operation name because the same token may
     /// legitimately be reused for a different operation.
     pub idempotency: HashMap<String, IdempotentRecord>,
+    /// The rate-type preferences `UpdatePreferences` last stored, which
+    /// `GetPreferences` reports. Default-constructed: an account that never called
+    /// `UpdatePreferences` has stated no preference at all.
+    pub preferences: Preferences,
 }
 
 impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
@@ -456,6 +506,7 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
             bill_scenarios,
             workload_estimates,
             idempotency,
+            preferences: _,
         } = self;
         let live: std::collections::HashSet<&str> = bill_scenarios
             .iter()
