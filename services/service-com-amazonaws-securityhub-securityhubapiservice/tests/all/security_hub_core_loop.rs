@@ -136,6 +136,23 @@ pub(crate) fn base_finding(id: &str) -> Value {
     })
 }
 
+/// The ISO-8601 instant `seconds_ago` before now, in the `date-time` encoding a
+/// `AwsSecurityFinding` timestamp carries (whole seconds, UTC).
+///
+/// A test whose expectation depends on a window measured back from NOW — a `DateRange`
+/// filter, say — has to place its fixture relative to now too: a hard-coded instant
+/// stops being inside the window once the wall clock passes it.
+pub(crate) fn iso8601_before_now(seconds_ago: u64) -> String {
+    let now = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .expect("the clock must be after the Unix epoch")
+        .as_secs();
+    let seconds = i64::try_from(now.saturating_sub(seconds_ago)).expect("instant fits in an i64");
+    aws_smithy_types::DateTime::from_secs(seconds)
+        .fmt(aws_smithy_types::date_time::Format::DateTime)
+        .expect("a date-time rendering of an epoch-second instant")
+}
+
 /// The ids in `Findings`, in the order the response listed them.
 pub(crate) fn returned_ids(body: &Value) -> Vec<String> {
     body["Findings"]
@@ -827,9 +844,13 @@ async fn date_filters_select_findings_inside_the_window_they_name() {
     old["CreatedAt"] = json!("2020-01-01T00:00:00Z");
     old["UpdatedAt"] = json!("2020-01-02T00:00:00Z");
 
+    // The recent finding's instants are relative to NOW, because the `DateRange` row
+    // below is: "OLDER_THAN one day" is measured back from the moment the request runs,
+    // so a hard-coded "recent" timestamp stops being recent once the wall clock passes
+    // it and the row starts selecting both findings.
     let mut recent = base_finding("date-recent");
-    recent["CreatedAt"] = json!("2026-10-21T20:00:00Z");
-    recent["UpdatedAt"] = json!("2026-10-21T21:00:00Z");
+    recent["CreatedAt"] = json!(iso8601_before_now(2 * 60 * 60));
+    recent["UpdatedAt"] = json!(iso8601_before_now(60 * 60));
 
     let harness = Harness::with_findings(vec![old, recent]).await;
 
