@@ -19,6 +19,8 @@ mod db_instance_deletion;
 mod db_instance_envelope;
 #[path = "all/db_instances.rs"]
 mod db_instances;
+#[path = "all/docdb_query_surface.rs"]
+mod docdb_query_surface;
 #[path = "all/option_group_options.rs"]
 mod option_group_options;
 #[path = "all/option_groups.rs"]

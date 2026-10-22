@@ -85,7 +85,10 @@ impl ErasedOperation for UnsupportedApiVersionOperation {
 /// a client branches on, and they are AWS's for this refusal. The envelope itself is the
 /// framework's own `awsQuery` error document
 /// (`aws_smithy_schema_server::query_error_body`), so a routing refusal raised here and
-/// one raised by the generated definition cannot answer in different shapes.
+/// one raised by the generated definition cannot answer in different shapes — including
+/// the `<RequestId>` element that envelope carries, which
+/// [`crate::service::query_error_envelope::with_request_id`] adds to every error response
+/// this service emits, wherever it was raised.
 fn unsupported_version_response(req: &RtRequest) -> RtResponse {
     let action = req
         .body()
@@ -103,5 +106,5 @@ fn unsupported_version_response(req: &RtRequest) -> RtResponse {
         SdkBody::from(body),
     );
     resp.headers_mut().insert("content-type", "text/xml");
-    resp
+    super::query_error_envelope::with_request_id(resp)
 }

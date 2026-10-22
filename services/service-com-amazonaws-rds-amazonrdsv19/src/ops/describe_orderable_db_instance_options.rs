@@ -98,6 +98,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The engine-catalogue predicates both reports read, so they cannot disagree about an
+// engine: whether its instances are CLUSTER members, and whether it belongs to another
+// control plane this one front door serves.
+use crate::ops::describe_db_engine_versions::{is_cluster_engine, serves_another_control_plane};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -314,13 +318,6 @@ const fn family(
         burstable,
         graviton,
     }
-}
-
-/// Whether `engine` is a CLUSTER engine, whose storage the cluster manages instead of an
-/// instance ordering it: the Aurora engines, and the Amazon DocumentDB and Amazon Neptune
-/// engines this same front door serves (`src/service.rs`).
-fn is_cluster_engine(engine: &str) -> bool {
-    crate::state::is_aurora(engine) || matches!(engine, "docdb" | "neptune")
 }
 
 /// The sizes a burstable family is published in.
@@ -819,9 +816,16 @@ fn to_wire(
                 .collect(),
         ),
         supports_global_databases: Some(version.profile.supports_global_databases),
-        // "Whether DB instances can be configured as a Multi-AZ DB cluster": offered on
-        // the MySQL and PostgreSQL engines, and never on a burstable class.
-        supports_clusters: Some(!class.burstable && matches!(engine, "mysql" | "postgres")),
+        // "Whether DB instances can be configured as a Multi-AZ DB cluster": the Multi-AZ
+        // DB cluster deployment is offered on the MySQL and PostgreSQL engines and never on
+        // a burstable class. An engine of ANOTHER control plane served by this door reports
+        // it too — an Amazon DocumentDB or Amazon Neptune instance is only ever a member of
+        // its cluster, and recorded behaviour for the DocumentDB engine reports this member
+        // true for every option.
+        supports_clusters: Some(
+            serves_another_control_plane(engine)
+                || (!class.burstable && matches!(engine, "mysql" | "postgres")),
+        ),
         // A dedicated log volume is offered on the RDS engines, whose log volume is
         // ordered with the instance; a cluster engine's storage is cluster-managed.
         supports_dedicated_log_volume: Some(!is_cluster_engine(engine)),

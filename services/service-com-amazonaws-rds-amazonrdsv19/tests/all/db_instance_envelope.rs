@@ -13,8 +13,10 @@
 //! license model differ; the four ways an `EngineVersion` resolves against the
 //! engine-version catalogue (absent, exact, a major version, a version inside a major
 //! version the catalogue publishes) plus the values it refuses; both branches of the
-//! `StorageThroughput` and `DbInstancePort` rules; and, for every member that has a
-//! documented default, the supplied value as well as the default.
+//! `StorageThroughput` rule and the reachable branch of the `DbInstancePort` one (no
+//! instance here is a cluster member: `CreateDBInstance` resolves `DBClusterIdentifier`
+//! against DB cluster records this service cannot yet hold); and, for every member that
+//! has a documented default, the supplied value as well as the default.
 //!
 //! Every call goes over the wire through the same `MultiServiceRouter` the production
 //! router uses, and every assertion reads the XML the emulator answered with.
@@ -552,26 +554,34 @@ async fn a_supplied_member_is_reported_from_the_store_rather_than_defaulted() {
 }
 
 #[tokio::test]
-async fn an_instance_in_a_db_cluster_reports_its_own_port() {
+async fn an_instance_that_belongs_to_no_cluster_reports_no_cluster_member_port() {
     let router = emulator();
-    let case = "a cluster member";
+    let case = "an explicit port, no cluster";
     let identifier = "emu-env-cluster-member";
+    // `DBClusterIdentifier` is NOT supplied: `CreateDBInstance` resolves it against this
+    // service's DB cluster records before admitting the instance, and this service holds
+    // none — every operation that could create a cluster (`CreateDBCluster`,
+    // `RestoreDBClusterFromSnapshot`, `RestoreDBClusterToPointInTime`) is still a
+    // scaffolded 501 — so no instance here is a cluster member and the refusal for one
+    // that names a cluster is pinned in `docdb_query_surface`. That is what this test
+    // reads back: the port the create named is the port the instance listens on, while
+    // `DbInstancePort` — the CLUSTER MEMBER's port, "if the DB instance is part of a DB
+    // cluster, this can be a different port than the DB cluster port" — stays zero,
+    // whatever port was asked for. Its non-zero branch becomes reachable when one of
+    // those operations can store a cluster.
     let created = create_instance(
         &router,
         case,
         identifier,
         "aurora-mysql",
-        &[("DBClusterIdentifier", "emu-cluster"), ("Port", "13306")],
+        &[("Port", "13306")],
     )
     .await;
     wait_for_settle();
     let described = describe_instance(&router, case, identifier).await;
     for (envelope, instance) in [("create", &created), ("describe", &described)] {
-        // "The port that the DB instance listens on. If the DB instance is part of a DB
-        // cluster, this can be a different port than the DB cluster port."
-        assert_member(case, envelope, instance, "DbInstancePort", "13306");
         assert_member(case, envelope, instance, "Port", "13306");
-        assert_member(case, envelope, instance, "DBClusterIdentifier", "emu-cluster");
+        assert_member(case, envelope, instance, "DbInstancePort", "0");
     }
 }
 
