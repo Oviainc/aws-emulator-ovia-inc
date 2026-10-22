@@ -39,7 +39,7 @@ use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    CA_CERTIFICATES, DEFAULT_CA_CERTIFICATE_FOR_NEW_LAUNCHES, STATUS_TRANSITION_DELAY,
+    CA_CERTIFICATES, DEFAULT_CA_CERTIFICATE_IDENTIFIER, STATUS_TRANSITION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -556,7 +556,7 @@ async fn an_engine_version_reports_the_certificates_it_can_be_launched_with() {
          reported {reported:?}, still valid {expected:?}"
     );
     assert!(
-        expected.contains(&DEFAULT_CA_CERTIFICATE_FOR_NEW_LAUNCHES.to_string()),
+        expected.contains(&DEFAULT_CA_CERTIFICATE_IDENTIFIER.to_string()),
         "the certificate new instances get must be one an engine version can be launched \
          with, got {expected:?}"
     );
