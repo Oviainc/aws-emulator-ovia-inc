@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccountActivity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccountActivity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccountActivity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one row of the account's stored activity catalog
+//! ([`crate::state::Activity`]) — the same catalog `ListAccountActivities`
+//! pages over.
+//!
+//! The scaffold's guidance follows.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccountActivity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccountActivityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccountActivity"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAccountActivityErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Free Tier emulator is mounted on an engine that holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // An id that cannot be an `ActivityId` is a malformed request, not a
+        // missing activity: the framework refuses it before `handle` runs, and
+        // checking here keeps that a 400 rather than a 404 whatever the
+        // boundary does.
+        let activity_id = input.activity_id.as_str();
+        if !crate::state::is_activity_id(activity_id) {
+            return Err(validation(format!(
+                "activityId: {activity_id} must be exactly 32 characters matching \
+                 ^[a-zA-Z0-9]+$"
+            )));
+        }
+
+        if let Some(language_code) = input.language_code.as_deref() {
+            // As on `ListAccountActivities`: the code selects the language of
+            // the title and description AWS returns, and this emulator stores
+            // one language, so an accepted code reports the stored text.
+            if !LANGUAGE_CODE_VALUES.contains(&language_code) {
+                return Err(validation(format!(
+                    "languageCode: {language_code} is not a language code; expected one of {}",
+                    LANGUAGE_CODE_VALUES.join(", ")
+                )));
+            }
+        }
+
+        let store = state.lock();
+        let Some(activity) = store
+            .activities_for(crate::state::caller_account_id())
+            .iter()
+            .find(|activity| activity.activity_id == activity_id)
+        else {
+            return Err(GetAccountActivityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no activity with id {activity_id} exists for this account"),
+                },
+            )
+            .into());
+        };
+
+        // `startedAt` appears only for an activity in the IN_PROGRESS or
+        // COMPLETED state, and `completedAt` only for a COMPLETED one, so the
+        // timestamps reported never contradict the status reported beside them.
+        let started = matches!(
+            activity.status.as_str(),
+            crate::state::ACTIVITY_STATUS_IN_PROGRESS | crate::state::ACTIVITY_STATUS_COMPLETED
+        );
+        let completed = activity.status == crate::state::ACTIVITY_STATUS_COMPLETED;
+
+        Ok(GetAccountActivityOutput {
+            activity_id: activity.activity_id.clone(),
+            title: activity.title.clone(),
+            description: activity.description.clone(),
+            status: activity.status.clone(),
+            instructions_url: activity.instructions_url.clone(),
+            reward: activity.reward_union(),
+            estimated_time_to_complete_in_minutes: activity.estimated_time_to_complete_in_minutes,
+            expires_at: activity.expires_at,
+            started_at: activity.started_at.filter(|_| started),
+            completed_at: activity.completed_at.filter(|_| completed),
+        })
     }
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400).
+fn validation(message: impl Into<String>) -> GetAccountActivityError {
+    GetAccountActivityErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+    })
+    .into()
 }

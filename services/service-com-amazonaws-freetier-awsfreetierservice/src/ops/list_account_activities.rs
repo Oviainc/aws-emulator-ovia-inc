@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountActivities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountActivities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountActivities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the account's stored activity catalog
+//! ([`crate::state::Activity`]), optionally narrowed to the statuses the
+//! request lists. The catalog is the same one `GetAccountActivity` looks ids up
+//! in, so a summary and its detail view always agree.
+//!
+//! The scaffold's guidance follows.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +152,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountActivities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountActivitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountActivities"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAccountActivitiesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Free Tier emulator is mounted on an engine that holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Every status named in the filter must be one the model declares; a
+        // value outside the enum selects nothing, so it is refused rather than
+        // served as an empty page.
+        let wanted: &[String] = input
+            .filter_activity_statuses
+            .as_deref()
+            .unwrap_or_default();
+        for status in wanted {
+            if !ACTIVITY_STATUS_VALUES.contains(&status.as_str()) {
+                return Err(validation(format!(
+                    "filterActivityStatuses: {status} is not an activity status; expected one \
+                     of {}",
+                    ACTIVITY_STATUS_VALUES.join(", ")
+                )));
+            }
+        }
+
+        // `languageCode` only selects the language of the titles and
+        // descriptions AWS returns; this emulator stores one language, so the
+        // member is accepted and the stored text is reported.
+        if let Some(language_code) = input.language_code.as_deref() {
+            if !LANGUAGE_CODE_VALUES.contains(&language_code) {
+                return Err(validation(format!(
+                    "languageCode: {language_code} is not a language code; expected one of {}",
+                    LANGUAGE_CODE_VALUES.join(", ")
+                )));
+            }
+        }
+
+        // The token names the catalog position the next page begins at
+        // (inclusive), so a page resumes exactly where its predecessor stopped.
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(PAGE_KIND, token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(validation(
+                        "nextToken: the pagination token is not one ListAccountActivities issued",
+                    ))
+                }
+            },
+        };
+
+        let page_size = crate::state::page_size(input.max_results);
+        let store = state.lock();
+        // Catalog position kept beside each row: the token is an offset into the
+        // catalog, not into the filtered view, so changing the filter between
+        // pages cannot make a page resume in the middle of a row it already
+        // reported.
+        let selected: Vec<(usize, ActivitySummary)> = store
+            .activities_for(crate::state::caller_account_id())
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .filter(|(_, activity)| {
+                wanted.is_empty() || wanted.contains(&activity.status)
+            })
+            .map(|(position, activity)| {
+                (
+                    position,
+                    ActivitySummary {
+                        activity_id: activity.activity_id.clone(),
+                        title: activity.title.clone(),
+                        reward: activity.reward_union(),
+                        status: activity.status.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        let page = &selected[..page_size.min(selected.len())];
+        // Issued only when a row the filter selects is still unreported: the
+        // `@paginated` contract is that an absent token ends the iteration.
+        let next_token = match page.last() {
+            Some((position, _)) if selected.len() > page.len() => {
+                Some(crate::state::encode_page_token(PAGE_KIND, position + 1))
+            }
+            _ => None,
+        };
+
+        Ok(ListAccountActivitiesOutput {
+            activities: page.iter().map(|(_, summary)| summary.clone()).collect(),
+            next_token,
+        })
     }
+}
+
+/// The list a `nextToken` from this operation belongs to, so a token issued by
+/// `GetFreeTierUsage` is not accepted here.
+const PAGE_KIND: &str = "activities";
+
+/// Refuse the request with this operation's own modelled `ValidationException`
+/// (HTTP 400).
+fn validation(message: impl Into<String>) -> ListAccountActivitiesError {
+    ListAccountActivitiesErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+    })
+    .into()
 }
