@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let described = state.input_description(&input.input_id).ok_or_else(|| {
             DescribeInputErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Input not found: {}", input.input_id)),
+                message: Some(crate::state::not_found_message("Input", &input.input_id)),
             })
         })?;
 

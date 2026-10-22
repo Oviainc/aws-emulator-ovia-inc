@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let channel = state.channel_description(&input.channel_id).ok_or_else(|| {
             DescribeChannelErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Channel not found: {}", input.channel_id)),
+                message: Some(crate::state::not_found_message("Channel", &input.channel_id)),
             })
         })?;
 

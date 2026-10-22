@@ -17,7 +17,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::wire::{call, error_code, medialive, ACCOUNT};
 
 /// Long enough for a transient channel state to have come due, with margin.
-fn wait_for_the_clock() {
+pub(crate) fn wait_for_the_clock() {
     std::thread::sleep(TRANSIENT_STATE_SPAN + Duration::from_millis(200));
 }
 

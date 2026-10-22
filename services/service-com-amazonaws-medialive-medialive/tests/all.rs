@@ -26,6 +26,9 @@ mod input_security_group;
 #[path = "all/sdi_source_lifecycle.rs"]
 mod sdi_source_lifecycle;
 
+#[path = "all/signal_maps.rs"]
+mod signal_maps;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

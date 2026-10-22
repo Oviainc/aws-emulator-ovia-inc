@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSignalMap
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSignalMap`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSignalMap::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -189,18 +179,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSignalMap` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSignalMapErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSignalMap"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // A retried create (same `@idempotencyToken` `RequestId`) must return the
+        // signal map the first one created, not a second one.
+        if let Some(existing) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| state.signal_map_for_token(token))
+            .map(str::to_string)
+        {
+            let described = state
+                .signal_map_description(&existing)
+                .ok_or_else(unavailable)?;
+            return Ok(crate::state::signal_map_description_output!(
+                CreateSignalMapOutput,
+                described
+            ));
+        }
+
+        // Request SYNTAX first: `DiscoveryEntryPointArn` is "A top-level
+        // supported AWS resource ARN to discovery a signal map from", so a value
+        // that is not an ARN at all cannot name a resource — a bad request rather
+        // than a missing one.
+        if !crate::state::is_resource_arn(&input.discovery_entry_point_arn) {
+            return Err(CreateSignalMapErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "DiscoveryEntryPointArn is not an AWS resource ARN: {}",
+                    input.discovery_entry_point_arn
+                )),
+            })
+            .into());
+        }
+
+        // Then resolution: discovery resolves the entry point against the
+        // resources that exist and walks the graph out from it. An ARN naming no
+        // existing resource is refused and nothing is stored: there is no
+        // workflow to map.
+        let media_resource_map = state
+            .discover_media_resource_map(&input.discovery_entry_point_arn)
+            .ok_or_else(|| {
+                CreateSignalMapErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "Resource",
+                        &input.discovery_entry_point_arn,
+                    )),
+                })
+            })?;
+
+        // A group identifier names a template group that must already exist, and
+        // the signal map records the id of the group it resolved \u2014 never the
+        // identifier it was given. An eventbridge rule template group resolves
+        // against the ones this store holds, by id or by current name, exactly as
+        // `GetEventBridgeRuleTemplateGroup`'s `Identifier` is documented.
+        let mut event_bridge_rule_template_group_ids: Vec<String> = Vec::new();
+        for identifier in input
+            .event_bridge_rule_template_group_identifiers
+            .iter()
+            .flatten()
+        {
+            let group = state
+                .event_bridge_rule_template_group(&region, identifier)
+                .ok_or_else(|| {
+                    CreateSignalMapErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(crate::state::not_found_message(
+                            "EventBridge rule template group",
+                            identifier,
+                        )),
+                    })
+                })?;
+            event_bridge_rule_template_group_ids.push(group.id.clone());
+        }
+
+        // An alarm template group, on the other hand, cannot exist here:
+        // `CreateCloudWatchAlarmTemplateGroup` is still a scaffold (HTTP 501), so
+        // nothing has ever created one and every identifier is unresolvable. The
+        // honest answer is this operation's modelled `NotFoundException`, not a
+        // response carrying group ids nothing created.
+        if let Some(identifier) = input
+            .cloud_watch_alarm_template_group_identifiers
+            .iter()
+            .flatten()
+            .next()
+        {
+            return Err(CreateSignalMapErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "CloudWatch alarm template group",
+                    identifier,
+                )),
+            })
+            .into());
+        }
+
+        // `Name` is documented as unique "within the scope of a resource type in
+        // a specific region", so a second signal map cannot take a name one
+        // already holds.
+        if let Some(existing) = state.signal_map_named(&input.name) {
+            return Err(CreateSignalMapErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A signal map named {} already exists with id {}",
+                    input.name, existing
+                )),
+            })
+            .into());
+        }
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit: once it is full the operation's own modelled throttle is
+        // the answer, not another signal map.
+        if state.signal_maps_full() {
+            return Err(CreateSignalMapErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This emulator stores at most {} signal maps; delete one before creating another",
+                        crate::state::MAX_SIGNAL_MAPS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_signal_map_id();
+        let arn = ::engine::emulator_arn("medialive", &region, &format!("signal-map:{id}"));
+        let mut signal_map = crate::state::new_signal_map(
+            id.clone(),
+            arn,
+            input.name,
+            input.discovery_entry_point_arn,
+            media_resource_map,
+            now,
+        );
+        // Everything else the request supplied is stored verbatim, and the
+        // resolved group ids beside it; the response is then read back out of the
+        // stored record, never from `input`.
+        signal_map.description = input.description;
+        signal_map.tags = input.tags.unwrap_or_default();
+        signal_map.event_bridge_rule_template_group_ids = event_bridge_rule_template_group_ids;
+
+        state.signal_maps.insert(id.clone(), signal_map);
+        if let Some(token) = input.request_id {
+            // Bounded, evicting write: a caller-chosen token can neither
+            // accumulate past the cap nor outlive the signal map it created.
+            state.record_signal_map_token(token, &id);
+        }
+
+        let described = state.signal_map_description(&id).ok_or_else(unavailable)?;
+        Ok(crate::state::signal_map_description_output!(
+            CreateSignalMapOutput,
+            described
+        ))
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the signal map in. A modelled server error,
+/// never a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateSignalMapError {
+    CreateSignalMapErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

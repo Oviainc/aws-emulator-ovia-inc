@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSignalMap
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSignalMap`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSignalMap::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,20 +164,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSignalMap` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSignalMapErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSignalMap"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises the discovery the clock had
+        // already made due, which was owed whether or not this read ran.
+        state.settle(::std::time::SystemTime::now());
+
+        // `Identifier` is "A signal map's identifier. Can be either be its id or
+        // current name", so both resolve to the same stored signal map.
+        let id = state
+            .signal_map_id_for_identifier(&input.identifier)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                GetSignalMapErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "Signal map",
+                        &input.identifier,
+                    )),
+                })
+            })?;
+        let described = state.signal_map_description(&id).ok_or_else(unavailable)?;
+
+        Ok(crate::state::signal_map_description_output!(
+            GetSignalMapOutput,
+            described
+        ))
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no signal-map store to read. A modelled server error, never a
+/// fresh engine (which would answer from an empty store nobody ever wrote to).
+fn unavailable() -> GetSignalMapError {
+    GetSignalMapErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

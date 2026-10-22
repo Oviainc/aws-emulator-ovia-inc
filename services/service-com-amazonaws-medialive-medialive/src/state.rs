@@ -8,7 +8,9 @@
 //! The input lifecycle lives beside it: one [`InputRecord`] per created input,
 //! its own id counter and its own token map. The SDI-source resource lives here
 //! too: one [`SdiSourceRecord`] per created source, its own id counter and its
-//! own token map.
+//! own token map. So do signal maps: one [`SignalMapRecord`] per created signal
+//! map, carrying the media-resource graph discovery found by walking the
+//! channels this store already holds.
 //!
 //! The input security group lifecycle lives here too: one
 //! [`InputSecurityGroupRecord`] per created group and the counter that mints its
@@ -21,12 +23,14 @@
 //! the scope of a resource type in a specific region" (the `Name` member's own
 //! documentation).
 //!
-//! Every value a channel-, input-, input-security-group-, SdiSource- or
-//! eventbridge-rule-template-group-shaped response carries is either stored
-//! verbatim from the request that created the resource or derived from the stored
-//! state ([`ComAmazonawsMedialiveMedialiveState::channel_description`],
+//! Every value a channel-, input-, input-security-group-, SdiSource-,
+//! eventbridge-rule-template-group- or signal-map-shaped response carries is
+//! either stored verbatim from the request that created the resource or derived
+//! from the stored state
+//! ([`ComAmazonawsMedialiveMedialiveState::channel_description`],
 //! [`ComAmazonawsMedialiveMedialiveState::input_description`],
 //! [`ComAmazonawsMedialiveMedialiveState::sdi_source_description`],
+//! [`ComAmazonawsMedialiveMedialiveState::signal_map_description`],
 //! [`event_bridge_rule_template_group_output`]) - no operation builds a response
 //! out of its own request.
 
@@ -41,11 +45,12 @@ use crate::ops::types::{
     InputDestinationRoute, InputDeviceSettings, InputSecurityGroup, InputSource,
     InputSourceRequest, InputSpecification, InputVpcRequest, InputWhitelistRule,
     LinkedChannelSettings, MaintenanceStatus, MediaConnectFlow, MediaConnectFlowRequest,
-    MulticastSettings, MulticastSettingsCreateRequest, MulticastSource, OutputDestination,
-    PipelineDetail, RouterDestination, RouterInputSettings, RouterSettings, SdiSource,
-    SdiSourceSummary,
+    MediaResource, MediaResourceNeighbor, MonitorDeployment, MulticastSettings,
+    MulticastSettingsCreateRequest, MulticastSource, OutputDestination, PipelineDetail,
+    RouterDestination, RouterInputSettings, RouterSettings, SdiSource, SdiSourceSummary,
     Smpte2110ReceiverGroupSettings, SrtCallerDecryption, SrtCallerSource,
     SrtListenerDecryption, SrtListenerSettings, SrtSettings, SrtSettingsRequest,
+    SuccessfulMonitorDeployment,
     VpcOutputSettings, VpcOutputSettingsDescription,
 };
 
@@ -78,6 +83,15 @@ pub mod sdi_source_state {
 pub mod channel_class {
     pub const STANDARD: &str = "STANDARD";
     pub const SINGLE_PIPELINE: &str = "SINGLE_PIPELINE";
+}
+
+/// The `SignalMapStatus` values this slice uses, spelled exactly as the model
+/// declares them (`smithy_query(query="shape", shape="SignalMapStatus")`:
+/// CREATE_IN_PROGRESS | CREATE_COMPLETE | CREATE_FAILED | UPDATE_IN_PROGRESS |
+/// UPDATE_COMPLETE | UPDATE_REVERTED | UPDATE_FAILED | READY | NOT_READY).
+pub mod signal_map_status {
+    pub const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+    pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 }
 
 /// The `InputSecurityGroupState` enum values, spelled exactly as the model
@@ -135,14 +149,15 @@ const DYNAMIC_CAPABLE_INPUT_TYPES: [&str; 2] = ["MP4_FILE", "TS_FILE"];
 /// string `$urlPath$` in place of the part of the path that will change").
 const DYNAMIC_URL_VARIABLE: &str = "$urlPath$";
 
-/// How long a channel stays in a transient state (`CREATING`, `STARTING`,
-/// `STOPPING`, `DELETING`) before the clock makes the next state due.
+/// How long a resource stays in a transient state before the clock makes the next
+/// one due: a channel's `CREATING`, `STARTING`, `STOPPING` and `DELETING`, and a
+/// signal map's `CREATE_IN_PROGRESS` discovery.
 ///
 /// CHOSEN, not documented by AWS: the real service takes minutes, and no doc
 /// sentence pins a number, so this is the emulator's own span. It is deliberately
 /// non-zero so a caller that acts immediately after `CreateChannel` /
-/// `StartChannel` still observes the transient state and the `ConflictException`
-/// it produces, exactly as it would against the real service.
+/// `StartChannel` / `CreateSignalMap` still observes the transient state and the
+/// `ConflictException` it produces, exactly as it would against the real service.
 pub const TRANSIENT_STATE_SPAN: Duration = Duration::from_millis(500);
 
 /// The id the first channel of a process gets. AWS channel ids are numeric
@@ -165,6 +180,22 @@ pub const MAX_CHANNELS: usize = 100;
 /// enforced anyway, by evicting the oldest token, so the map cannot accumulate
 /// caller-chosen strings independently of the channels they name.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_CHANNELS;
+
+/// The id the first signal map of a process gets. AWS signal map ids are short
+/// strings (`__stringMin7Max11PatternAws097`, i.e. 7 to 11 characters); minting
+/// them from a counter at a fixed seven-digit width satisfies that length and
+/// keeps the `BTreeMap` key order equal to the mint order. A range of its own,
+/// for the same reason as [`FIRST_INPUT_SECURITY_GROUP_ID`]: a caller that
+/// passes a channel's or an input's id where a signal map's belongs gets a
+/// `NotFoundException` rather than a coincidental hit.
+const FIRST_SIGNAL_MAP_ID: u64 = 4_000_000;
+
+/// The most signal maps this emulator stores for one account.
+///
+/// A ceiling, not a guess at AWS's published quota: it exists so a create loop
+/// cannot grow the emulator's heap without bound. `CreateSignalMap` models
+/// `TooManyRequestsException`, which is the refusal once the store is full.
+pub const MAX_SIGNAL_MAPS: usize = 100;
 
 /// The id the first SdiSource of a process gets, and the most SDI sources this
 /// emulator stores for one account.
@@ -448,10 +479,11 @@ pub fn is_ipv4_cidr(cidr: &str) -> bool {
 /// first attempt made instead of a second one.
 ///
 /// One implementation for every resource kind that models an idempotency token
-/// (channels, inputs, SDI sources), so the cap and the eviction order cannot
-/// drift between them, and a token used on two different creates cannot make one
-/// of them answer with the other's resource. The fields are PRIVATE: the only way
-/// in is [`Self::record`], which enforces the cap by evicting the oldest token.
+/// (channels, inputs, SDI sources, signal maps), so the cap and the eviction
+/// order cannot drift between them, and a token used on two different creates
+/// cannot make one of them answer with the other's resource. The fields are
+/// PRIVATE: the only way in is [`Self::record`], which enforces the cap by
+/// evicting the oldest token.
 #[derive(Debug, Default)]
 pub struct IdempotencyTokens {
     /// token -> the id of the resource it created.
@@ -589,16 +621,23 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// -> the group it created, so a retry returns that group instead of a
     /// second one. PRIVATE for the same reason as [`Self::channel_tokens`].
     event_bridge_rule_template_group_tokens: IdempotencyTokens,
+    /// Every signal map that exists, keyed by its minted `Id`, in mint order for
+    /// the same reason as [`Self::channels`].
+    pub signal_maps: BTreeMap<String, SignalMapRecord>,
+    /// Mint counter behind [`Self::mint_signal_map_id`].
+    pub next_signal_map_id: u64,
+    /// `CreateSignalMap`'s `RequestId` (`@idempotencyToken`) -> the signal map it
+    /// created.
+    signal_map_tokens: IdempotencyTokens,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
     /// Materialise every transition the clock had already made due as of `now`,
     /// then answer from the result.
     ///
-    /// Call this at the top of every channel operation, reporting ones included:
-    /// it only applies transitions that were owed at that instant whether or not
-    /// anybody called, so it never changes what a later caller would otherwise
-    /// have seen.
+    /// Call this at the top of every operation, reporting ones included: it only
+    /// applies transitions that were owed at that instant whether or not anybody
+    /// called, so it never changes what a later caller would otherwise have seen.
     pub fn settle(&mut self, now: SystemTime) {
         let mut removed: Vec<String> = Vec::new();
         self.channels.retain(|id, channel| {
@@ -611,6 +650,9 @@ impl ComAmazonawsMedialiveMedialiveState {
         // A token never outlives the channel it minted.
         for id in removed {
             self.channel_tokens.forget(&id);
+        }
+        for signal_map in self.signal_maps.values_mut() {
+            signal_map.settle(now);
         }
     }
 
@@ -1112,6 +1154,354 @@ impl ComAmazonawsMedialiveMedialiveState {
             }),
         }
     }
+
+    /// The channel whose ARN is exactly `arn`, if this store holds one. An ARN
+    /// identifies a resource globally, so a partition, region or account that
+    /// differs names a resource this emulator does not hold.
+    fn channel_by_arn(&self, arn: &str) -> Option<&ChannelRecord> {
+        self.channels.values().find(|channel| channel.arn == arn)
+    }
+
+    /// Whether the signal-map store is full, so `CreateSignalMap` must refuse
+    /// rather than mint another signal map.
+    pub fn signal_maps_full(&self) -> bool {
+        self.signal_maps.len() >= MAX_SIGNAL_MAPS
+    }
+
+    /// The next signal map id: a numeric string of the length the model's
+    /// `__stringMin7Max11PatternAws097` allows.
+    pub fn mint_signal_map_id(&mut self) -> String {
+        let id = FIRST_SIGNAL_MAP_ID + self.next_signal_map_id;
+        self.next_signal_map_id += 1;
+        id.to_string()
+    }
+
+    /// Record `token` as having created `signal_map_id`.
+    pub fn record_signal_map_token(&mut self, token: String, signal_map_id: &str) {
+        self.signal_map_tokens
+            .record(token, signal_map_id, MAX_SIGNAL_MAPS);
+    }
+
+    /// The signal map a stored `RequestId` created, if it still exists.
+    pub fn signal_map_for_token(&self, request_id: &str) -> Option<&str> {
+        let id = self.signal_map_tokens.created(request_id)?;
+        self.signal_maps.get(id).map(|map| map.id.as_str())
+    }
+
+    /// The id of the signal map `identifier` names: `GetSignalMap`'s
+    /// `Identifier` is documented as "A signal map's identifier. Can be either
+    /// be its id or current name", so an id is tried first and then a name.
+    pub fn signal_map_id_for_identifier(&self, identifier: &str) -> Option<&str> {
+        if let Some(map) = self.signal_maps.get(identifier) {
+            return Some(map.id.as_str());
+        }
+        self.signal_map_named(identifier)
+    }
+
+    /// The id of the signal map called `name`, if one exists. A signal map's
+    /// `Name` is documented as unique "within the scope of a resource type in a
+    /// specific region", which is what makes this lookup single-valued.
+    pub fn signal_map_named(&self, name: &str) -> Option<&str> {
+        self.signal_maps
+            .values()
+            .find(|map| map.name == name)
+            .map(|map| map.id.as_str())
+    }
+
+    /// Discover the media workflow graph reachable from the resource
+    /// `entry_point` names, keyed by each discovered resource's ARN.
+    ///
+    /// The graph's resources are CHANNELS: a channel is the only resource kind
+    /// this store holds that carries links to other media resources, so an ARN
+    /// naming anything else (another resource type of this service, another
+    /// service, another account or region) resolves to no graph resource and
+    /// answers `None` — which the caller renders as the operation's modelled
+    /// `NotFoundException`. An input or an input security group this store does
+    /// hold is a member of no workflow graph here: nothing records which inputs
+    /// a signal map's workflow reaches, so claiming one would be fabrication.
+    ///
+    /// The walk is breadth-first over the links the discovered resources
+    /// themselves declare (a follower channel's primary, and the followers that
+    /// name it), so the graph is read out of persisted state. It is the SNAPSHOT
+    /// of that state at the instant discovery runs: the real service rediscovers
+    /// a signal map's graph only when a discovery is asked for
+    /// (`StartUpdateSignalMap`, still a scaffold here), so a channel created or
+    /// deleted afterwards does not change a stored signal map's
+    /// `MediaResourceMap`.
+    pub fn discover_media_resource_map(
+        &self,
+        entry_point: &str,
+    ) -> Option<BTreeMap<String, MediaResource>> {
+        self.channel_by_arn(entry_point)?;
+
+        let mut discovered: BTreeMap<String, MediaResource> = BTreeMap::new();
+        let mut pending: VecDeque<String> = VecDeque::new();
+        pending.push_back(entry_point.to_string());
+
+        while let Some(arn) = pending.pop_front() {
+            if discovered.contains_key(&arn) {
+                continue;
+            }
+            let Some(channel) = self.channel_by_arn(&arn) else {
+                continue;
+            };
+            // Upstream: the primary this channel follows, reported only when
+            // that channel exists here — discovery never claims a resource the
+            // store does not hold.
+            let sources: Vec<MediaResourceNeighbor> = channel
+                .linked_channel_settings
+                .as_ref()
+                .and_then(|linked| linked.follower_channel_settings.as_ref())
+                .and_then(|follower| follower.primary_channel_arn.as_deref())
+                .and_then(|primary| self.channel_by_arn(primary))
+                .map(|primary| vec![neighbor(primary)])
+                .unwrap_or_default();
+            // Downstream: the channels that follow this one.
+            let destinations: Vec<MediaResourceNeighbor> = self
+                .following_channel_arns(&arn)
+                .iter()
+                .filter_map(|follower| self.channel_by_arn(follower))
+                .map(neighbor)
+                .collect();
+
+            for next in sources.iter().chain(destinations.iter()) {
+                pending.push_back(next.arn.clone());
+            }
+            discovered.insert(
+                arn,
+                MediaResource {
+                    name: channel.name.clone(),
+                    sources: Some(sources),
+                    destinations: Some(destinations),
+                },
+            );
+        }
+        Some(discovered)
+    }
+
+    /// The full description of one stored signal map, or `None` when no signal
+    /// map has that id.
+    pub fn signal_map_description(&self, id: &str) -> Option<SignalMapDescription> {
+        let map = self.signal_maps.get(id)?;
+        let discovered = map.status == signal_map_status::CREATE_COMPLETE;
+        Some(SignalMapDescription {
+            arn: Some(map.arn.clone()),
+            // ABSENT, not empty: `CloudWatchAlarmTemplateGroupIds` reports the
+            // alarm template groups the signal map is associated with, and
+            // `CreateSignalMap` refuses a request naming any (no alarm template
+            // group can exist here — `CreateCloudWatchAlarmTemplateGroup` is
+            // still a scaffold), so there is no association to report.
+            cloud_watch_alarm_template_group_ids: None,
+            // The ids of the eventbridge rule template groups the create
+            // resolved, or ABSENT when the request named none.
+            event_bridge_rule_template_group_ids: (!map
+                .event_bridge_rule_template_group_ids
+                .is_empty())
+                .then(|| map.event_bridge_rule_template_group_ids.clone()),
+            created_at: Some(timestamp(map.created_at)),
+            description: map.description.clone(),
+            discovery_entry_point_arn: Some(map.discovery_entry_point_arn.clone()),
+            // ABSENT while nothing failed: `ErrorMessage` is "Error message
+            // associated with a failed creation or failed update attempt", and a
+            // stored signal map's discovery resolved its entry point.
+            error_message: None,
+            failed_media_resource_map: None,
+            id: Some(map.id.clone()),
+            // The discovered graph and the instant it was discovered are
+            // reported only once the clock has made discovery due; while the
+            // signal map is CREATE_IN_PROGRESS there is nothing discovered yet.
+            last_discovered_at: map.last_discovered_at.map(timestamp),
+            media_resource_map: discovered.then(|| map.media_resource_map.clone()),
+            modified_at: Some(timestamp(map.modified_at)),
+            // No monitor has ever been deployed for a signal map in this
+            // emulator (`StartMonitorDeployment` is scaffolded), so there is
+            // neither a deployment to report nor a pending change to one.
+            monitor_changes_pending_deployment: Some(false),
+            monitor_deployment: None,
+            last_successful_monitor_deployment: None,
+            name: Some(map.name.clone()),
+            status: Some(map.status.clone()),
+            tags: Some(map.tags.clone()),
+        })
+    }
+}
+
+/// One created signal map, as `CreateSignalMap` stored it plus the graph its
+/// discovery found and the lifecycle state of that discovery.
+#[derive(Debug, Clone)]
+pub struct SignalMapRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub discovery_entry_point_arn: String,
+    /// The ids of the eventbridge rule template groups the create resolved from
+    /// the identifiers the request named — ids this store holds, never the
+    /// identifiers themselves.
+    pub event_bridge_rule_template_group_ids: Vec<String>,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    /// Updated when the signal map changes — which, for a signal map nothing
+    /// has updated yet, is when its discovery completed.
+    modified_at: SystemTime,
+    /// The graph discovery found, keyed by resource ARN. Reported only once
+    /// discovery has come due.
+    media_resource_map: BTreeMap<String, MediaResource>,
+    /// The `SignalMapStatus` this signal map is in.
+    status: String,
+    /// The instant discovery becomes due, so `CREATE_IN_PROGRESS` settles into
+    /// `CREATE_COMPLETE`. Stored, never slept on.
+    discovery_due: SystemTime,
+    last_discovered_at: Option<SystemTime>,
+}
+
+impl SignalMapRecord {
+    /// Materialise the discovery the clock has already made due. Owed at
+    /// `discovery_due` whether or not anybody called, so applying it in a
+    /// reporting operation changes nothing a later caller would have seen.
+    fn settle(&mut self, now: SystemTime) {
+        if self.status == signal_map_status::CREATE_IN_PROGRESS && now >= self.discovery_due {
+            self.status = signal_map_status::CREATE_COMPLETE.to_string();
+            self.last_discovered_at = Some(self.discovery_due);
+            self.modified_at = self.discovery_due;
+        }
+    }
+}
+
+/// The description of one signal map, as `CreateSignalMap` and `GetSignalMap`
+/// both report it: the model gives those operations structurally identical flat
+/// outputs, so one projection feeds both through
+/// [`signal_map_description_output`].
+#[derive(Debug, Clone)]
+pub struct SignalMapDescription {
+    pub arn: Option<String>,
+    pub cloud_watch_alarm_template_group_ids: Option<Vec<String>>,
+    pub created_at: Option<::aws_smithy_types::DateTime>,
+    pub description: Option<String>,
+    pub discovery_entry_point_arn: Option<String>,
+    pub error_message: Option<String>,
+    pub event_bridge_rule_template_group_ids: Option<Vec<String>>,
+    pub failed_media_resource_map: Option<BTreeMap<String, MediaResource>>,
+    pub id: Option<String>,
+    pub last_discovered_at: Option<::aws_smithy_types::DateTime>,
+    pub last_successful_monitor_deployment: Option<SuccessfulMonitorDeployment>,
+    pub media_resource_map: Option<BTreeMap<String, MediaResource>>,
+    pub modified_at: Option<::aws_smithy_types::DateTime>,
+    pub monitor_changes_pending_deployment: Option<bool>,
+    pub monitor_deployment: Option<MonitorDeployment>,
+    pub name: Option<String>,
+    pub status: Option<String>,
+    pub tags: Option<HashMap<String, String>>,
+}
+
+/// Project a [`SignalMapDescription`] onto one of the structurally identical
+/// per-operation signal-map output shapes (`CreateSignalMapOutput`,
+/// `GetSignalMapOutput`).
+///
+/// One macro rather than a hand-written copy per operation, so the operations
+/// cannot drift from each other. The modelled maps are `HashMap`s, so the
+/// `BTreeMap`s the state keeps (ordered, for deterministic iteration) are
+/// converted here.
+macro_rules! signal_map_description_output {
+    ($out:ident, $map:expr) => {{
+        let map: $crate::state::SignalMapDescription = $map;
+        $out {
+            arn: map.arn,
+            cloud_watch_alarm_template_group_ids: map.cloud_watch_alarm_template_group_ids,
+            created_at: map.created_at,
+            description: map.description,
+            discovery_entry_point_arn: map.discovery_entry_point_arn,
+            error_message: map.error_message,
+            event_bridge_rule_template_group_ids: map.event_bridge_rule_template_group_ids,
+            failed_media_resource_map: map
+                .failed_media_resource_map
+                .map(|resources| resources.into_iter().collect()),
+            id: map.id,
+            last_discovered_at: map.last_discovered_at,
+            last_successful_monitor_deployment: map.last_successful_monitor_deployment,
+            media_resource_map: map
+                .media_resource_map
+                .map(|resources| resources.into_iter().collect()),
+            modified_at: map.modified_at,
+            monitor_changes_pending_deployment: map.monitor_changes_pending_deployment,
+            monitor_deployment: map.monitor_deployment,
+            name: map.name,
+            status: map.status,
+            tags: map.tags,
+        }
+    }};
+}
+
+pub(crate) use signal_map_description_output;
+
+/// Build a new signal map record from a `CreateSignalMap` request's values and
+/// the graph discovery found for its entry point.
+///
+/// The signal map starts in `CREATE_IN_PROGRESS` and owes `CREATE_COMPLETE`
+/// once [`TRANSIENT_STATE_SPAN`] has passed, which is what the real service
+/// does: creation is asynchronous and a caller waits on `Status`.
+pub fn new_signal_map(
+    id: String,
+    arn: String,
+    name: String,
+    discovery_entry_point_arn: String,
+    media_resource_map: BTreeMap<String, MediaResource>,
+    now: SystemTime,
+) -> SignalMapRecord {
+    SignalMapRecord {
+        id,
+        arn,
+        name,
+        description: None,
+        discovery_entry_point_arn,
+        event_bridge_rule_template_group_ids: Vec::new(),
+        tags: HashMap::new(),
+        created_at: now,
+        modified_at: now,
+        media_resource_map,
+        status: signal_map_status::CREATE_IN_PROGRESS.to_string(),
+        discovery_due: now + TRANSIENT_STATE_SPAN,
+        last_discovered_at: None,
+    }
+}
+
+/// One channel as a neighbour in a discovered media workflow graph.
+fn neighbor(channel: &ChannelRecord) -> MediaResourceNeighbor {
+    MediaResourceNeighbor {
+        arn: channel.arn.clone(),
+        name: channel.name.clone(),
+    }
+}
+
+/// A stored instant as the model's `__timestampIso8601` type.
+fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from(at)
+}
+
+/// Whether `arn` is syntactically an AWS ARN:
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`, six
+/// colon-separated segments whose partition, service and resource are non-empty
+/// (region and account are empty for a global service's ARNs).
+pub fn is_resource_arn(arn: &str) -> bool {
+    let mut segments = arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some(service), Some(_region), Some(_account), Some(resource)) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    !partition.is_empty() && !service.is_empty() && !resource.is_empty()
+}
+
+/// The message a not-found refusal carries: the resource type, the identifier
+/// the request named, then `not found` — the phrasing the real service composes
+/// from the request. One helper, so no two operations word it two ways.
+pub fn not_found_message(resource_type: &str, identifier: &str) -> String {
+    format!("{resource_type} {identifier} not found")
 }
 
 /// One created input, as `CreateInput` stored it plus its lifecycle state.
