@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBroker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBroker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBroker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a broker, persists it in [`crate::state::ComAmazonawsMqMqState`]
+//! and returns the minted `BrokerId` / `BrokerArn`. `DescribeBroker` and `ListBrokers`
+//! read the same record back.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +138,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -216,18 +212,422 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBroker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBrokerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBroker"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateBrokerErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        // Every rule below comes from the member's own modelled documentation.
+        // The enum checks are defence in depth: for a member the model types as
+        // an enum the boundary validator already refused a bad value before this
+        // handler ran, so they only fire for one the model types as a plain
+        // string — they never produce a second wording for the same refusal.
+        state::validate_broker_name(&input.broker_name).map_err(bad_request)?;
+        state::validate_enum("engineType", &input.engine_type, ENGINE_TYPE_VALUES)
+            .map_err(bad_request)?;
+        state::validate_enum(
+            "deploymentMode",
+            &input.deployment_mode,
+            DEPLOYMENT_MODE_VALUES,
+        )
+        .map_err(bad_request)?;
+        state::validate_present("hostInstanceType", &input.host_instance_type)
+            .map_err(bad_request)?;
+        if let Some(strategy) = &input.authentication_strategy {
+            state::validate_enum(
+                "authenticationStrategy",
+                strategy,
+                AUTHENTICATION_STRATEGY_VALUES,
+            )
+            .map_err(bad_request)?;
+        }
+        if let Some(storage_type) = &input.storage_type {
+            state::validate_enum("storageType", storage_type, BROKER_STORAGE_TYPE_VALUES)
+                .map_err(bad_request)?;
+        }
+        if let Some(mode) = &input.data_replication_mode {
+            state::validate_enum("dataReplicationMode", mode, DATA_REPLICATION_MODE_VALUES)
+                .map_err(bad_request)?;
+            // `DataReplicationPrimaryBrokerArn` "Must be set when
+            // dataReplicationMode is set to CRDR".
+            if mode == "CRDR"
+                && input
+                    .data_replication_primary_broker_arn
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            {
+                return Err(bad_request(state::Invalid::new(
+                    "dataReplicationPrimaryBrokerArn",
+                    "dataReplicationPrimaryBrokerArn must be set when dataReplicationMode \
+                     is set to CRDR",
+                )));
+            }
+        }
+
+        // `Logs$audit` "does not apply to RabbitMQ brokers", so asking for audit
+        // logging on one is refused rather than accepted and dropped.
+        if input.engine_type == state::ENGINE_TYPE_RABBITMQ
+            && input.logs.as_ref().and_then(|logs| logs.audit) == Some(true)
+        {
+            return Err(bad_request(state::Invalid::new(
+                "logs",
+                format!(
+                    "logs.audit does not apply to {} brokers; audit logging is available \
+                     on ACTIVEMQ brokers only",
+                    state::ENGINE_TYPE_RABBITMQ
+                ),
+            )));
+        }
+
+        // `Configuration` names a configuration resource this service does not
+        // hold yet (`CreateConfiguration` is still unimplemented), so a broker
+        // cannot be created against one. Refusing names the member rather than
+        // accepting the reference and reporting no configuration later.
+        if let Some(configuration) = &input.configuration {
+            return Err(bad_request(state::Invalid::new(
+                "configuration",
+                format!(
+                    "configuration must name a configuration that exists; no configuration \
+                     with id {:?} exists",
+                    configuration.id
+                ),
+            )));
+        }
+
+        // Bound every caller-sized collection before anything is stored, so one
+        // request cannot grow one record by as much as it asks for.
+        if let Some(security_groups) = &input.security_groups {
+            state::validate_list_size(
+                "securityGroups",
+                security_groups.len(),
+                1,
+                state::MAX_SECURITY_GROUPS,
+            )
+            .map_err(bad_request)?;
+        }
+        state::validate_subnet_ids(
+            &input.deployment_mode,
+            input.subnet_ids.as_deref().unwrap_or_default(),
+        )
+        .map_err(bad_request)?;
+        if let Some(tags) = &input.tags {
+            state::validate_list_size("tags", tags.len(), 0, state::MAX_TAGS)
+                .map_err(bad_request)?;
+        }
+        if let Some(requested) = &input.users {
+            state::validate_list_size("users", requested.len(), 0, state::MAX_USERS_PER_BROKER)
+                .map_err(bad_request)?;
+        }
+
+        // The broker's initial users, as `CreateBroker` accepts them inline.
+        // Every refusal names the member a client can match on — `users` — and
+        // puts the offending element's position and rule in the message.
+        let mut users: std::collections::BTreeMap<String, state::BrokerUser> =
+            std::collections::BTreeMap::new();
+        for (position, user) in input.users.iter().flatten().enumerate() {
+            let in_users = |invalid: state::Invalid| {
+                bad_request(state::Invalid {
+                    attribute: Some("users".to_string()),
+                    message: format!("users[{position}]: {}", invalid.message),
+                })
+            };
+            state::validate_username("username", &user.username).map_err(in_users)?;
+            state::validate_password("password", &user.password).map_err(in_users)?;
+            state::validate_groups("groups", user.groups.as_deref().unwrap_or_default())
+                .map_err(in_users)?;
+            if users.contains_key(&user.username) {
+                return Err(bad_request(state::Invalid::new(
+                    "users",
+                    format!(
+                        "users must not name the same username twice, {:?} appears more than once",
+                        user.username
+                    ),
+                )));
+            }
+            users.insert(
+                user.username.clone(),
+                state::BrokerUser {
+                    username: user.username.clone(),
+                    password: user.password.clone(),
+                    console_access: user.console_access.unwrap_or(false),
+                    groups: user.groups.clone().unwrap_or_default(),
+                    replication_user: user.replication_user.unwrap_or(false),
+                },
+            );
+        }
+
+        let region = state::request_region(ctx.parts());
+
+        // The members the request may also set on the broker, in the records the
+        // state module keeps them in. Each is stored as sent, except the
+        // maintenance window's time zone, which the model documents as "UTC by
+        // default".
+        let logs = state::BrokerLogs {
+            audit: input.logs.as_ref().and_then(|logs| logs.audit),
+            general: input
+                .logs
+                .as_ref()
+                .and_then(|logs| logs.general)
+                .unwrap_or(false),
+        };
+        let encryption_options =
+            input
+                .encryption_options
+                .as_ref()
+                .map(|options| state::BrokerEncryptionOptions {
+                    kms_key_id: options.kms_key_id.clone(),
+                    use_aws_owned_key: options.use_aws_owned_key,
+                });
+        let maintenance_window_start_time =
+            input
+                .maintenance_window_start_time
+                .as_ref()
+                .map(|window| state::BrokerMaintenanceWindow {
+                    day_of_week: window.day_of_week.clone(),
+                    time_of_day: window.time_of_day.clone(),
+                    time_zone: window
+                        .time_zone
+                        .clone()
+                        .filter(|zone| !zone.is_empty())
+                        .unwrap_or_else(|| {
+                            state::DEFAULT_MAINTENANCE_TIME_ZONE.to_string()
+                        }),
+                });
+        let ldap_server_metadata =
+            input
+                .ldap_server_metadata
+                .as_ref()
+                .map(|ldap| state::BrokerLdapServerMetadata {
+                    hosts: ldap.hosts.clone(),
+                    role_base: ldap.role_base.clone(),
+                    role_name: ldap.role_name.clone(),
+                    role_search_matching: ldap.role_search_matching.clone(),
+                    role_search_subtree: ldap.role_search_subtree,
+                    service_account_username: ldap.service_account_username.clone(),
+                    service_account_password: ldap.service_account_password.clone(),
+                    user_base: ldap.user_base.clone(),
+                    user_role_name: ldap.user_role_name.clone(),
+                    user_search_matching: ldap.user_search_matching.clone(),
+                    user_search_subtree: ldap.user_search_subtree,
+                });
+
+        // What a token's replay is compared against: EVERY member that defines
+        // the broker being asked for, so a replay that changes any of them is a
+        // mismatch rather than a retry. The elements are joined, never parsed.
+        let fingerprint = state::fingerprint_of(&[
+            input.broker_name.clone(),
+            input.engine_type.clone(),
+            input.deployment_mode.clone(),
+            input.host_instance_type.clone(),
+            input.engine_version.clone().unwrap_or_default(),
+            input.authentication_strategy.clone().unwrap_or_default(),
+            input.storage_type.clone().unwrap_or_default(),
+            input.storage_size.map_or(String::new(), |s| s.to_string()),
+            input.publicly_accessible.to_string(),
+            input
+                .auto_minor_version_upgrade
+                .map_or(String::new(), |b| b.to_string()),
+            input
+                .security_groups
+                .clone()
+                .unwrap_or_default()
+                .join("\u{1e}"),
+            input.subnet_ids.clone().unwrap_or_default().join("\u{1e}"),
+            input.data_replication_mode.clone().unwrap_or_default(),
+            input
+                .data_replication_primary_broker_arn
+                .clone()
+                .unwrap_or_default(),
+            // Every member of every initial user, not just the usernames, so a
+            // replay that changes one user's password or access is a mismatch.
+            users
+                .values()
+                .map(|user| {
+                    format!(
+                        "{}|{}|{}|{}|{}",
+                        user.username,
+                        user.password,
+                        user.console_access,
+                        user.replication_user,
+                        user.groups.join(",")
+                    )
+                })
+                .collect::<Vec<String>>()
+                .join("\u{1e}"),
+            input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<String, String>>()
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<String>>()
+                .join("\u{1e}"),
+            format!("{:?}|{}", logs.audit, logs.general),
+            encryption_options.as_ref().map_or(String::new(), |options| {
+                format!(
+                    "{}|{}",
+                    options.kms_key_id.clone().unwrap_or_default(),
+                    options.use_aws_owned_key
+                )
+            }),
+            maintenance_window_start_time
+                .as_ref()
+                .map_or(String::new(), |window| format!(
+                    "{}|{}|{}",
+                    window.day_of_week, window.time_of_day, window.time_zone
+                )),
+            ldap_server_metadata.as_ref().map_or(String::new(), |ldap| {
+                format!(
+                    "{}|{}|{}|{}|{:?}|{}|{}|{}|{:?}|{}|{:?}",
+                    ldap.hosts.join(","),
+                    ldap.role_base,
+                    ldap.role_name.clone().unwrap_or_default(),
+                    ldap.role_search_matching,
+                    ldap.role_search_subtree,
+                    ldap.service_account_username,
+                    ldap.service_account_password,
+                    ldap.user_base,
+                    ldap.user_role_name,
+                    ldap.user_search_matching,
+                    ldap.user_search_subtree
+                )
+            }),
+        ]);
+        let mut store = state.lock();
+
+        // `CreatorRequestId` is the operation's `@idempotencyToken`: repeating the
+        // SAME request with the same token answers with the broker that token
+        // created rather than minting a second one; repeating a DIFFERENT request
+        // with it is refused, so a reused-token bug is not reported as success.
+        if let Some(token) = input
+            .creator_request_id
+            .as_deref()
+            .filter(|token| !token.is_empty())
+        {
+            if let Some(existing) = store.broker_by_creator_request_id(token) {
+                if existing.creation_fingerprint != fingerprint {
+                    return Err(CreateBrokerErrorModeled::ConflictException(
+                        ConflictException {
+                            error_attribute: Some("creatorRequestId".to_string()),
+                            message: Some(format!(
+                                "creatorRequestId {token:?} was already used to create broker \
+                                 {:?}; a different request must carry a different \
+                                 creatorRequestId",
+                                existing.broker_id
+                            )),
+                            resource_share_errors: None,
+                        },
+                    )
+                    .into());
+                }
+                return Ok(CreateBrokerOutput {
+                    broker_arn: Some(existing.broker_arn.clone()),
+                    broker_id: Some(existing.broker_id.clone()),
+                });
+            }
+        }
+
+        // A broker name is unique within an account.
+        if store.broker_by_name(&input.broker_name).is_some() {
+            return Err(CreateBrokerErrorModeled::ConflictException(ConflictException {
+                error_attribute: Some("brokerName".to_string()),
+                message: Some(format!(
+                    "a broker named {:?} already exists in this account",
+                    input.broker_name
+                )),
+                resource_share_errors: None,
+            })
+            .into());
+        }
+
+        // The account's broker quota. Checked after the idempotent repeat above,
+        // which mints nothing, and before anything is stored. No `errorAttribute`:
+        // no member of the request is at fault, the account's broker count is.
+        if store.brokers.len() >= state::MAX_BROKERS {
+            return Err(bad_request(state::Invalid {
+                attribute: None,
+                message: format!(
+                    "this account already holds its quota of {} brokers in this Region; \
+                     delete a broker before creating another",
+                    state::MAX_BROKERS
+                ),
+            }));
+        }
+
+        let created = ::std::time::SystemTime::now();
+        // The id is MINTED by the store, which owns the mint sequence that
+        // makes it unique; the ARN is then built around it.
+        let broker_id = store.mint_broker_id(created, &input.broker_name);
+        let broker_arn = ::engine::emulator_arn(
+            ctx.identity().signing_name(),
+            &region,
+            &format!("broker:{}:{}", input.broker_name, broker_id),
+        );
+        let broker = state::Broker {
+            broker_id: broker_id.clone(),
+            broker_arn: broker_arn.clone(),
+            broker_name: input.broker_name.clone(),
+            engine_type: input.engine_type.clone(),
+            engine_version: input.engine_version.clone(),
+            deployment_mode: input.deployment_mode.clone(),
+            host_instance_type: input.host_instance_type.clone(),
+            publicly_accessible: input.publicly_accessible,
+            auto_minor_version_upgrade: input
+                .auto_minor_version_upgrade
+                .unwrap_or(state::DEFAULT_AUTO_MINOR_VERSION_UPGRADE),
+            authentication_strategy: input
+                .authentication_strategy
+                .clone()
+                .unwrap_or_else(|| state::DEFAULT_AUTHENTICATION_STRATEGY.to_string()),
+            storage_type: input.storage_type.clone(),
+            storage_size: input.storage_size,
+            security_groups: input.security_groups.clone().unwrap_or_default(),
+            subnet_ids: input.subnet_ids.clone().unwrap_or_default(),
+            data_replication_mode: input.data_replication_mode.clone(),
+            data_replication_primary_broker_arn: input
+                .data_replication_primary_broker_arn
+                .clone(),
+            created,
+            available_at: created + state::BROKER_PROVISIONING,
+            creator_request_id: input
+                .creator_request_id
+                .clone()
+                .filter(|token| !token.is_empty()),
+            creation_fingerprint: fingerprint,
+            users,
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            logs,
+            encryption_options,
+            maintenance_window_start_time,
+            ldap_server_metadata,
+        };
+        store.brokers.insert(broker_id.clone(), broker);
+
+        Ok(CreateBrokerOutput {
+            broker_arn: Some(broker_arn),
+            broker_id: Some(broker_id),
+        })
     }
+}
+
+/// Lift a refused value into this operation's modelled `BadRequestException` (HTTP 400).
+fn bad_request(invalid: state::Invalid) -> CreateBrokerError {
+    CreateBrokerErrorModeled::BadRequestException(BadRequestException {
+        error_attribute: invalid.attribute,
+        message: Some(invalid.message),
+        resource_share_errors: None,
+    })
+    .into()
 }

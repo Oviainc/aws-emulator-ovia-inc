@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: adds a user to the broker named by `BrokerId` and persists it on that
+//! broker's record, where `DescribeUser` reads it back. The response has no members.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +76,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +150,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUser"))
+        let _ = ctx;
+        let Some(state) = state::service_state(&*self.engine) else {
+            return Err(CreateUserErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        // Both constraints are the member's own documented ones. They are
+        // evaluated here but ANSWERED after the broker is resolved, so a request
+        // naming a broker that does not exist is reported as a missing resource
+        // (404) even when one of its members is also invalid.
+        let members = state::validate_username("username", &input.username)
+            .and_then(|()| state::validate_password("password", &input.password))
+            .and_then(|()| {
+                state::validate_groups("groups", input.groups.as_deref().unwrap_or_default())
+            });
+
+        let mut store = state.lock();
+        let Some(broker) = store.brokers.get_mut(&input.broker_id) else {
+            return Err(CreateUserErrorModeled::NotFoundException(NotFoundException {
+                error_attribute: Some("broker-id".to_string()),
+                message: Some(format!("no broker with id {:?} exists", input.broker_id)),
+                resource_share_errors: None,
+            })
+            .into());
+        };
+        members.map_err(bad_request)?;
+
+        // A username is unique within one broker.
+        if broker.users.contains_key(&input.username) {
+            return Err(CreateUserErrorModeled::ConflictException(ConflictException {
+                error_attribute: Some("username".to_string()),
+                message: Some(format!(
+                    "broker {:?} already has a user named {:?}",
+                    input.broker_id, input.username
+                )),
+                resource_share_errors: None,
+            })
+            .into());
+        }
+
+        // The broker's user quota, so the number of users one broker holds is not
+        // driven purely by how many requests a caller makes. No `errorAttribute`:
+        // no member of the request is at fault, the broker's user count is.
+        if broker.users.len() >= state::MAX_USERS_PER_BROKER {
+            return Err(bad_request(state::Invalid {
+                attribute: None,
+                message: format!(
+                    "broker {:?} already holds its quota of {} users",
+                    input.broker_id,
+                    state::MAX_USERS_PER_BROKER
+                ),
+            }));
+        }
+
+        broker.users.insert(
+            input.username.clone(),
+            state::BrokerUser {
+                username: input.username.clone(),
+                password: input.password.clone(),
+                console_access: input.console_access.unwrap_or(false),
+                groups: input.groups.clone().unwrap_or_default(),
+                replication_user: input.replication_user.unwrap_or(false),
+            },
+        );
+
+        Ok(CreateUserOutput {})
     }
+}
+
+/// Lift a refused value into this operation's modelled `BadRequestException` (HTTP 400).
+fn bad_request(invalid: state::Invalid) -> CreateUserError {
+    CreateUserErrorModeled::BadRequestException(BadRequestException {
+        error_attribute: invalid.attribute,
+        message: Some(invalid.message),
+        resource_share_errors: None,
+    })
+    .into()
 }

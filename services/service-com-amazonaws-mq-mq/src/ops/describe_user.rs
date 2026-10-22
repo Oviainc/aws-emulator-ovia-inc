@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a REPORTING operation. Returns the user `CreateUser` (or
+//! `CreateBroker`'s inline `Users`) persisted on that broker. The user's password is
+//! never returned — no modelled output member carries it.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +79,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +152,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUser"))
+        let _ = ctx;
+        let Some(state) = state::service_state(&*self.engine) else {
+            return Err(DescribeUserErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(broker) = store.brokers.get(&input.broker_id) else {
+            return Err(DescribeUserErrorModeled::NotFoundException(NotFoundException {
+                error_attribute: Some("broker-id".to_string()),
+                message: Some(format!("no broker with id {:?} exists", input.broker_id)),
+                resource_share_errors: None,
+            })
+            .into());
+        };
+        let Some(user) = broker.users.get(&input.username) else {
+            return Err(DescribeUserErrorModeled::NotFoundException(NotFoundException {
+                error_attribute: Some("username".to_string()),
+                message: Some(format!(
+                    "broker {:?} has no user named {:?}",
+                    input.broker_id, input.username
+                )),
+                resource_share_errors: None,
+            })
+            .into());
+        };
+
+        Ok(DescribeUserOutput {
+            broker_id: Some(broker.broker_id.clone()),
+            username: Some(user.username.clone()),
+            console_access: Some(user.console_access),
+            groups: state::optional_list(&user.groups),
+            replication_user: Some(user.replication_user),
+            pending: None,
+        })
     }
 }
