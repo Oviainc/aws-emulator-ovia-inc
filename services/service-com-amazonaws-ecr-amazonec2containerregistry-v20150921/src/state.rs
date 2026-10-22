@@ -289,6 +289,12 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// Repositories by name. A `BTreeMap` so every listing — and therefore every
     /// pagination token — has one deterministic order.
     pub repositories: BTreeMap<String, Repo>,
+    /// The registry permissions policy, as `PutRegistryPolicy` stored it: the document
+    /// text exactly as it arrived, so a read returns it byte for byte. `None` is "this
+    /// registry has no associated registry policy", which the registry-policy read and
+    /// delete answer with `RegistryPolicyNotFoundException`. One registry is served
+    /// here, so there is at most one such policy.
+    pub registry_policy: Option<String>,
     /// The registry's signing configuration, which `PutSigningConfiguration` creates or
     /// replaces and `GetSigningConfiguration` reports. There is at most one per registry
     /// and this emulator serves one registry, so it is a single optional record rather
@@ -372,6 +378,167 @@ pub fn check_registry(registry_id_input: Option<&String>) -> Result<(), Fault> {
         ))),
         _ => Ok(()),
     }
+}
+
+/// The policy-language versions an IAM JSON policy document may declare. The IAM JSON
+/// policy reference documents exactly two `Version` values: `2012-10-17`, the current
+/// one, and `2008-10-17`, the legacy one that no new policy should use.
+pub const POLICY_VERSIONS: [&str; 2] = ["2012-10-17", "2008-10-17"];
+
+/// The values an IAM statement's `Effect` may take — "the Effect element is required
+/// and specifies whether the statement results in an allow or an explicit deny".
+pub const POLICY_EFFECTS: [&str; 2] = ["Allow", "Deny"];
+
+/// The wording ECR uses when the registry carries no registry policy.
+pub fn registry_policy_not_found_message() -> String {
+    format!(
+        "Registry policy does not exist in the registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// `member` of the request does not hold a usable policy document, because `detail`.
+fn bad_policy(member: &str, detail: impl std::fmt::Display) -> Fault {
+    Fault::InvalidParameter(format!(
+        "Invalid parameter at '{member}' failed to satisfy constraint: {detail}"
+    ))
+}
+
+/// Validate `text` as a resource-based IAM policy document, or report
+/// [`Fault::InvalidParameter`] naming what the document gets wrong.
+///
+/// The grammar enforced here is the IAM JSON policy language's own: the document is a
+/// JSON object; a `Version` it declares is one of [`POLICY_VERSIONS`]; `Statement` is
+/// required and holds either one statement object or a non-empty array of them; and
+/// every statement carries an `Effect` of [`POLICY_EFFECTS`], at least one action
+/// (`Action` or `NotAction`) and — because this is a RESOURCE-based policy, which
+/// states who the permission is granted to — a `Principal`.
+///
+/// `check_principal` is called with each statement's `Principal` element, so a service
+/// that adds its own rule about who a policy may name (see
+/// [`validate_registry_policy`]) does not have to parse the document a second time;
+/// a service with no such rule passes `|_| Ok(())`.
+///
+/// Parsing is `serde_json`'s; only the policy grammar on top of it is ours.
+pub fn validate_resource_policy(
+    member: &str,
+    text: &str,
+    mut check_principal: impl FnMut(&serde_json::Value) -> Result<(), Fault>,
+) -> Result<(), Fault> {
+    let document: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| bad_policy(member, format!("the policy is not valid JSON: {error}")))?;
+    let document = document
+        .as_object()
+        .ok_or_else(|| bad_policy(member, "the policy must be a JSON object"))?;
+
+    if let Some(version) = document.get("Version") {
+        let declared = version.as_str().ok_or_else(|| {
+            bad_policy(member, "the policy's Version element must be a string")
+        })?;
+        if !POLICY_VERSIONS.contains(&declared) {
+            return Err(bad_policy(
+                member,
+                format!(
+                    "the policy declares Version '{declared}', which is not one of {}",
+                    POLICY_VERSIONS.join(", ")
+                ),
+            ));
+        }
+    }
+
+    let statement = document
+        .get("Statement")
+        .ok_or_else(|| bad_policy(member, "the policy must carry a Statement element"))?;
+    let statements: Vec<&serde_json::Value> = match statement {
+        serde_json::Value::Array(entries) => entries.iter().collect(),
+        single => vec![single],
+    };
+    if statements.is_empty() {
+        return Err(bad_policy(
+            member,
+            "the policy's Statement element must carry at least one statement",
+        ));
+    }
+
+    for entry in statements {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| bad_policy(member, "every policy statement must be a JSON object"))?;
+        let effect = entry
+            .get("Effect")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                bad_policy(member, "every policy statement must carry a string Effect")
+            })?;
+        if !POLICY_EFFECTS.contains(&effect) {
+            return Err(bad_policy(
+                member,
+                format!(
+                    "a policy statement's Effect is '{effect}', which is not one of {}",
+                    POLICY_EFFECTS.join(", ")
+                ),
+            ));
+        }
+        if !["Action", "NotAction"]
+            .iter()
+            .any(|key| entry.get(*key).is_some_and(names_values))
+        {
+            return Err(bad_policy(
+                member,
+                "every policy statement must carry at least one Action or NotAction",
+            ));
+        }
+        let principal = entry.get("Principal").filter(|p| names_values(p)).ok_or_else(|| {
+            bad_policy(
+                member,
+                "every statement of a resource-based policy must carry a Principal",
+            )
+        })?;
+        check_principal(principal)?;
+    }
+    Ok(())
+}
+
+/// Whether a policy element names at least one value: a non-empty string, a non-empty
+/// array of strings, or — as `Principal` is written — an object mapping a principal
+/// type to either of those.
+fn names_values(element: &serde_json::Value) -> bool {
+    match element {
+        serde_json::Value::String(value) => !value.is_empty(),
+        serde_json::Value::Array(entries) => !entries.is_empty() && entries.iter().all(names_values),
+        serde_json::Value::Object(members) => {
+            !members.is_empty() && members.values().all(names_values)
+        }
+        _ => false,
+    }
+}
+
+/// Every principal a statement's `Principal` element names, flattened out of the string,
+/// the array or the `{"AWS": …}`-style object it may be written as.
+fn principals(element: &serde_json::Value) -> Vec<&str> {
+    match element {
+        serde_json::Value::String(value) => vec![value.as_str()],
+        serde_json::Value::Array(entries) => entries.iter().flat_map(principals).collect(),
+        serde_json::Value::Object(members) => members.values().flat_map(principals).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Validate a registry permissions policy document: the resource-policy grammar of
+/// [`validate_resource_policy`], plus the one rule a REGISTRY policy adds — it grants to
+/// other accounts, so every statement must name the identities it grants to and may not
+/// open the registry to every principal with the `*` wildcard.
+pub fn validate_registry_policy(member: &str, text: &str) -> Result<(), Fault> {
+    validate_resource_policy(member, text, |principal| {
+        if principals(principal).contains(&"*") {
+            return Err(bad_policy(
+                member,
+                "a registry policy statement cannot grant to every principal ('*'); \
+                 name the accounts or roles the registry is shared with",
+            ));
+        }
+        Ok(())
+    })
 }
 
 /// The resource-type prefix of an ECR repository ARN's resource field.
