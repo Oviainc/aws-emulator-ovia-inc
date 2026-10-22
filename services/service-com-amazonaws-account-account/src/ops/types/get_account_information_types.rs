@@ -17,7 +17,41 @@ pub struct GetAccountInformationInput {
     pub account_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.account#GetAccountInformationResponse")]
+/// `GetAccountInformationResponse`, with its schema written out instead of derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it:
+/// `AccountCreatedDate` targets `com.amazonaws.account#AccountCreatedDate`, which the
+/// model marks `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="com.amazonaws.account#AccountCreatedDate",
+/// model_path="services/service-com-amazonaws-account-account/smithy-model/com-amazonaws-account-account.json")`),
+/// and the derive does not carry that trait onto the member schemas it emits. The JSON
+/// codec reads the format off the member schema
+/// (`vendor/smithy-schema-server/src/json.rs`, `write_timestamp`) and otherwise falls
+/// back to the restJson1 default, epoch seconds — so the creation instant would go out
+/// as `1792638609.645` where the model (and every SDK's generated deserializer for a
+/// `date-time` member) requires an RFC 3339 string. The four member schemas below are
+/// the model's, member for member: same shape ids, same wire names, same order, same
+/// shape types, plus the `date-time` format the model declares.
+///
+/// The constraint traits the derive also captures (`AccountId`'s `^\d{12}$`,
+/// `AccountName`'s `@length(1..50)` and pattern) are deliberately NOT reproduced: the
+/// framework's validating walk runs against `Operation::INPUT_SCHEMA` only
+/// (`vendor/smithy-server-runtime/src/operation.rs`), so nothing reads them on an
+/// output shape.
+///
+/// This is a PER-SHAPE workaround and has to be kept in step with the model by hand.
+/// The generator gap it works around is filed as
+/// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`
+/// — the real fix is in `vendor/smithy-macros` (chain `.with_timestamp_format(..)` when
+/// building a member schema), which is read-only from a service crate. REMOVE this block
+/// and put the derive back once the generator learns `smithy.api#timestampFormat`;
+/// `tests/all/account_information_wire_fidelity.rs` pins the wire form, so it fails if
+/// the derive still drops it.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape is
+/// an operation OUTPUT, which the server only ever serializes (`Operation::Output`
+/// requires `SerializableStruct`; only `Input` is deserialized), so a hand-written read
+/// path would be untested code with no caller.
 #[derive(Debug, Clone, Default)]
 pub struct GetAccountInformationOutput {
     pub account_id: Option<String>,
@@ -26,3 +60,91 @@ pub struct GetAccountInformationOutput {
     pub account_state: Option<String>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetAccountInformationOutput {
+    const M_ACCOUNT_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.account#GetAccountInformationResponse$AccountId",
+            "com.amazonaws.account",
+            "AccountId",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "AccountId",
+        0,
+    );
+
+    const M_ACCOUNT_NAME: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.account#GetAccountInformationResponse$AccountName",
+            "com.amazonaws.account",
+            "AccountName",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "AccountName",
+        1,
+    );
+
+    const M_ACCOUNT_CREATED_DATE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.account#GetAccountInformationResponse$AccountCreatedDate",
+                "com.amazonaws.account",
+                "AccountCreatedDate",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "AccountCreatedDate",
+            2,
+        )
+        // The one chain call the vendored codegen omits; see the note above.
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    const M_ACCOUNT_STATE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.account#GetAccountInformationResponse$AccountState",
+            "com.amazonaws.account",
+            "AccountState",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "AccountState",
+        3,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.account#GetAccountInformationResponse",
+            "com.amazonaws.account",
+            "GetAccountInformationResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ACCOUNT_ID,
+            &Self::M_ACCOUNT_NAME,
+            &Self::M_ACCOUNT_CREATED_DATE,
+            &Self::M_ACCOUNT_STATE,
+        ],
+    );
+}
+
+pub static GET_ACCOUNT_INFORMATION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetAccountInformationOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetAccountInformationOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.account_id.as_ref() {
+            serializer.write_string(&Self::M_ACCOUNT_ID, value.as_str())?;
+        }
+        if let Some(value) = self.account_name.as_ref() {
+            serializer.write_string(&Self::M_ACCOUNT_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.account_created_date.as_ref() {
+            serializer.write_timestamp(&Self::M_ACCOUNT_CREATED_DATE, value)?;
+        }
+        if let Some(value) = self.account_state.as_ref() {
+            serializer.write_string(&Self::M_ACCOUNT_STATE, value.as_str())?;
+        }
+        Ok(())
+    }
+}

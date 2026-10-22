@@ -38,6 +38,25 @@ pub const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 /// this service — a server fault, never a bad request.
 pub const STORE_UNAVAILABLE: &str = "the account store is unavailable";
 
+/// The name an account record carries from the moment it exists, before any
+/// `PutAccountName` renames it.
+///
+/// Every Amazon Web Services account HAS a name: the name is set when the
+/// account is created, and `GetAccountInformation` is documented to retrieve
+/// "information about the specified account including its account name, account
+/// ID, account creation date and time, and account state" — so no account ever
+/// reports that member absent. An account record this emulator holds therefore
+/// gets a name when it is created, not when a caller first writes one.
+///
+/// The value names the account by its id, which keeps it distinct per record and
+/// inside `AccountName`'s modelled `@length(min: 1, max: 50)` and
+/// `^[ -;=?-~]+$`: 8 characters of prefix plus a 12-digit id is 20, and every
+/// byte of it (the ASCII letters, the space and the digits) is in the admitted
+/// range.
+pub fn initial_account_name(account_id: &str) -> String {
+    format!("Account {account_id}")
+}
+
 /// How many account records the store holds before a call that would create a
 /// NEW one is refused.
 ///
@@ -114,8 +133,10 @@ impl AlternateContactRecord {
 pub struct Account {
     /// The 12-digit account id this record is keyed by (`^\d{12}$`).
     pub account_id: String,
-    /// What `PutAccountName` last stored; unset until a call stores one.
-    pub account_name: Option<String>,
+    /// The account's name: [`initial_account_name`] at creation, and whatever
+    /// `PutAccountName` last stored after that. Never absent — an account
+    /// always has a name (see [`initial_account_name`]).
+    pub account_name: String,
     /// Set ONCE, when the record is first created, and never recomputed — so
     /// every later `GetAccountInformation` reports the same instant.
     pub created_date: SystemTime,
@@ -130,8 +151,8 @@ impl Account {
     /// A new account record, created at `now`.
     pub fn new(account_id: String, now: SystemTime) -> Self {
         Self {
+            account_name: initial_account_name(&account_id),
             account_id,
-            account_name: None,
             created_date: now,
             state: ACTIVE_ACCOUNT_STATE.to_string(),
             alternate_contacts: BTreeMap::new(),

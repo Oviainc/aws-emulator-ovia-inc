@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccountInformation
-//! Reports the stored account record: the name `PutAccountName` last stored, the
-//! instant the record was created, and the account's state. A REPORT only — it
-//! creates and changes nothing.
+//! Reports the stored account record: its name — the one every account carries
+//! from creation (`crate::state::initial_account_name`), or whatever
+//! `PutAccountName` last stored over it — the instant the record was created,
+//! and the account's state. A REPORT only — it creates and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -193,7 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetAccountInformationOutput {
             account_id: Some(account.account_id.clone()),
-            account_name: account.account_name.clone(),
+            // An account always has a name (`state::initial_account_name`), so
+            // this member is reported on every read, not only after a rename.
+            account_name: Some(account.account_name.clone()),
             account_created_date: Some(::aws_smithy_types::DateTime::from(account.created_date)),
             account_state: Some(account.state.clone()),
         })

@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        account.account_name = Some(input.account_name);
+        account.account_name = input.account_name;
 
         Ok(PutAccountNameOutput)
     }
