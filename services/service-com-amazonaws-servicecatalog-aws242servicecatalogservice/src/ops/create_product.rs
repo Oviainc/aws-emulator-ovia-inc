@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +166,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        // `IdempotencyToken` is `@idempotencyToken`: "If multiple requests differ only
+        // by the idempotency token, the same response is returned for each repeated
+        // request" — so a token already seen REPLAYS the product it created, together
+        // with the artifact that create minted, rather than minting a second product. A
+        // token whose product has since been deleted is no longer a replay and falls
+        // through to a fresh create.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProduct"))
+        // The replay keys on the TOKEN ALONE, deliberately: this operation's model
+        // declares no mismatch error (InvalidParameters, LimitExceeded and
+        // TagOptionNotMigrated), so there is no faithful way to refuse a token reused
+        // with different members.
+        if let Some(product) = state.replayed_product(&input.idempotency_token) {
+            return Ok(CreateProductOutput {
+                product_view_detail: Some(product.detail()),
+                provisioning_artifact_detail: product
+                    .provisioning_artifacts
+                    .values()
+                    .next()
+                    .map(crate::state::ProvisioningArtifact::detail),
+                tags: Some(product.tag_list()),
+            });
+        }
+
+        // A product's first version comes either from `ProvisioningArtifactParameters`
+        // (its `Info` is the template source) or from a `SourceConnection`, which has
+        // Service Catalog sync the artifact from the connected repository. A request that
+        // carries neither describes no version at all, and AWS refuses it with this
+        // operation's own parameter error, naming both members it could have used.
+        let has_artifact_info = input
+            .provisioning_artifact_parameters
+            .as_ref()
+            .and_then(|properties| properties.info.as_ref())
+            .is_some_and(|info| !info.is_empty());
+        if !has_artifact_info && input.source_connection.is_none() {
+            return Err(CreateProductErrorModeled::InvalidParametersException(
+                InvalidParametersException {
+                    message: Some(
+                        "SourceConnection (for Repo products) or \
+                         ProvisioningArtifactParameters.Info cannot both be null"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        // Only the artifact the request DESCRIBES is created here. A Repo product's first
+        // artifact is whatever a sync fetches from the connected repository, and this
+        // emulator makes no outbound connections, so no sync has run and the product is
+        // stored with no version rather than with a fabricated one. Its control plane
+        // record — the product, its ARN, its tags — is real either way.
+        let artifact_properties = input
+            .provisioning_artifact_parameters
+            .filter(|_| has_artifact_info);
+
+        // A product holds each tag key once, so a repeated key in `Tags` collapses to
+        // its last value. The modelled 0..20 bound on the input list is already enforced
+        // by the time this handler runs.
+        let tags: std::collections::BTreeMap<String, String> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        // The account's product quota. Refused before anything is stored, so a caller
+        // cannot grow the store past it by repeating the call.
+        if state.products.len() >= crate::state::MAX_PRODUCTS {
+            return Err(CreateProductErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "An account cannot hold more than {} products.",
+                        crate::state::MAX_PRODUCTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.next_product_id();
+        let view_id = state.next_product_view_id();
+        // AWS addresses Service Catalog resources under the `catalog` ARN namespace: the
+        // IAM service-authorization reference gives a product as
+        // `arn:${Partition}:catalog:${Region}:${Account}:product/${ProductId}`.
+        let arn = ::emulator_server::emulator_arn(
+            "catalog",
+            &crate::state::request_region(ctx),
+            &format!("product/{id}"),
+        );
+        let created_time = std::time::SystemTime::now();
+
+        let mut provisioning_artifacts = std::collections::BTreeMap::new();
+        if let Some(artifact_properties) = artifact_properties {
+            let artifact_id = state.next_provisioning_artifact_id();
+            provisioning_artifacts.insert(
+                artifact_id.clone(),
+                crate::state::ProvisioningArtifact {
+                    id: artifact_id,
+                    name: artifact_properties.name,
+                    description: artifact_properties.description,
+                    // The artifact's own `Type` when the request names one; otherwise the
+                    // product's `ProductType`, but only where that name is also a
+                    // `ProvisioningArtifactType` value, and `None` for a product type
+                    // that names no artifact type rather than a value the model does not
+                    // admit.
+                    r#type: artifact_properties
+                        .r#type
+                        .or_else(|| artifact_type_for_product_type(&input.product_type)),
+                    // A created version can be provisioned, and nothing has deprecated it.
+                    active: true,
+                    guidance: crate::state::ARTIFACT_GUIDANCE_DEFAULT.to_string(),
+                    created_time,
+                    info: artifact_properties
+                        .info
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect(),
+                },
+            );
+        }
+
+        let product = crate::state::Product {
+            id: id.clone(),
+            view_id,
+            arn,
+            name: input.name,
+            owner: input.owner,
+            short_description: input.description,
+            distributor: input.distributor,
+            support_email: input.support_email,
+            support_description: input.support_description,
+            support_url: input.support_url,
+            product_type: input.product_type,
+            status: crate::state::PRODUCT_STATUS_CREATED.to_string(),
+            created_time,
+            tags,
+            // The connection the product is to sync from, reported back as the detail
+            // shape: the `Type` and `ConnectionParameters` the request carried, with no
+            // `LastSync` because no sync has run.
+            source_connection: input.source_connection.map(|connection| {
+                SourceConnectionDetail {
+                    r#type: connection.r#type,
+                    connection_parameters: Some(connection.connection_parameters),
+                    last_sync: None,
+                }
+            }),
+            provisioning_artifacts,
+        };
+
+        let product_view_detail = product.detail();
+        let provisioning_artifact_detail = product
+            .provisioning_artifacts
+            .values()
+            .next()
+            .map(crate::state::ProvisioningArtifact::detail);
+        let tag_list = product.tag_list();
+        state.products.insert(id.clone(), product);
+        state.remember_product_token(input.idempotency_token, id);
+
+        Ok(CreateProductOutput {
+            product_view_detail: Some(product_view_detail),
+            provisioning_artifact_detail,
+            tags: Some(tag_list),
+        })
     }
+}
+
+/// The `ProvisioningArtifactType` that bears the same name as `product_type`, or `None`
+/// when the two enums do not share that name.
+///
+/// `ProductType` is CLOUD_FORMATION_TEMPLATE | MARKETPLACE | TERRAFORM_OPEN_SOURCE |
+/// TERRAFORM_CLOUD | EXTERNAL and `ProvisioningArtifactType` is CLOUD_FORMATION_TEMPLATE
+/// | MARKETPLACE_AMI | MARKETPLACE_CAR | TERRAFORM_OPEN_SOURCE | TERRAFORM_CLOUD |
+/// EXTERNAL (`smithy_query query="shape" shape="ProductType,ProvisioningArtifactType"`),
+/// so every product type but MARKETPLACE names an artifact type too.
+fn artifact_type_for_product_type(product_type: &str) -> Option<String> {
+    const SHARED: &[&str] = &[
+        "CLOUD_FORMATION_TEMPLATE",
+        "TERRAFORM_OPEN_SOURCE",
+        "TERRAFORM_CLOUD",
+        "EXTERNAL",
+    ];
+    SHARED
+        .contains(&product_type)
+        .then(|| product_type.to_string())
 }
