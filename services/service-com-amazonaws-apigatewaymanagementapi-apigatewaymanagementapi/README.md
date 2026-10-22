@@ -105,3 +105,43 @@ State lives in the SINGLE shared engine, keyed by type. Reach it through
 Do not add a second engine crate — the router and every service must share
 one `InMemoryEngine` type or the engine the router injects cannot be handed to this
 service's operations.
+
+## The connection registry, and how a connection comes to exist
+
+This service's whole state is a registry of WebSocket connections, keyed by
+`ConnectionId`:
+`ComAmazonawsApigatewaymanagementapiApigatewaymanagementapiState::connections`. All
+three modelled operations address one entry of it, and **a missing entry is the single
+source of truth for `GoneException` (HTTP 410)**.
+
+None of the three CREATES a connection: in real AWS a connection exists because a
+client completed a WebSocket handshake against the API's own invoke endpoint, which
+this management API never serves. The emulator therefore registers one through exactly
+one seam, and that is the rule this crate follows:
+
+```rust
+// Emulator-internal: a test, or a future WebSocket data plane for the owning API.
+service_com_amazonaws_apigatewaymanagementapi_apigatewaymanagementapi::state::register_connection(
+    &*engine,
+    "abc123",
+    // the modelled Identity shape: SourceIp / UserAgent
+    state::Identity { source_ip: "192.0.2.10".into(), user_agent: "wscat/5".into() },
+    std::time::SystemTime::now(), // becomes ConnectedAt, and the initial LastActiveAt
+);
+```
+
+* A connection exists **only** between `register_connection` and the
+  `DeleteConnection` that removes it. There is deliberately **no auto-registration on
+  first reference**: that would make `GetConnection` answer `200` for an id that never
+  existed, which the real service never does.
+* `ConnectedAt` is fixed at registration and never moves; re-registering a present id
+  changes nothing.
+* `LastActiveAt` moves only when data actually flows to the connection — a successful
+  `PostToConnection`. `GetConnection` reports and never writes.
+* `state::connection(&*engine, id)` is the read side of the seam: it returns the stored
+  record, including a BOUNDED window of the `Data` payloads `PostToConnection`
+  delivered, which no modelled operation exposes. Retention is capped by
+  `state::MAX_RETAINED_MESSAGES` and `state::MAX_RETAINED_BYTES` (emulator bounds, not
+  AWS limits — AWS retains nothing a caller can read back), so a caller cannot grow
+  shared state without limit; `delivered_count` / `delivered_bytes` stay exact across
+  eviction.

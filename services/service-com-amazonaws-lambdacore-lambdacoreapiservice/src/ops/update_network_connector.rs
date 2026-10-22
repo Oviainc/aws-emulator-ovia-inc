@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNetworkConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNetworkConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNetworkConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +191,206 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNetworkConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNetworkConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNetworkConnector"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateNetworkConnectorErrorModeled::ServiceException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // "You can specify the connector ID, name, or full ARN": an update
+        // names the connector, never one of its versions, which are immutable.
+        let parsed = crate::state::parse_identifier(&input.identifier);
+        if parsed.version.is_some() {
+            return Err(
+                UpdateNetworkConnectorErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(format!(
+                            "Identifier {} names a connector version, and a version is \
+                             immutable: update the connector itself",
+                            input.identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An `@idempotencyToken` replay reports the version that token already
+        // produced rather than appending a second one.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotency.get(token).cloned());
+        if let Some(outcome) = replayed {
+            if let Some((connector, _)) = store.settled_mut(&outcome.name, now) {
+                if let Some(version) = connector.version(Some(outcome.version)) {
+                    return Ok(UpdateNetworkConnectorOutput {
+                        arn: connector.arn.clone(),
+                        name: connector.name.clone(),
+                        id: connector.id.clone(),
+                        version_arn: Some(version.version_arn.clone()),
+                        version: Some(version.version),
+                        operator_role: version.operator_role.clone(),
+                        configuration: Some(version.configuration.clone()),
+                        state: Some(connector.state.clone()),
+                        last_update_status: connector.last_update_status.clone(),
+                        last_update_status_reason: connector.last_update_status_reason.clone(),
+                        last_modified: Some(::aws_smithy_types::DateTime::from(
+                            connector.last_modified,
+                        )),
+                    });
+                }
+            }
+        }
+
+        let Some((connector, _)) = store.settled_mut(&input.identifier, now) else {
+            return Err(UpdateNetworkConnectorErrorModeled::ResourceNotFoundException(
+                crate::state::connector_not_found(&input.identifier),
+            )
+            .into());
+        };
+
+        // "The connector must be in ACTIVE state to accept updates" — which is
+        // what `ResourceConflictException` is modelled for ("for example,
+        // attempting to update a connector that is not in ACTIVE state").
+        if connector.state != crate::state::STATE_ACTIVE {
+            return Err(UpdateNetworkConnectorErrorModeled::ResourceConflictException(
+                crate::state::connector_conflict(format!(
+                    "The network connector {} is in {} state; it must be {} to accept updates",
+                    connector.name,
+                    connector.state,
+                    crate::state::STATE_ACTIVE
+                )),
+            )
+            .into());
+        }
+
+        let Some(current) = connector.version(None).cloned() else {
+            return Err(UpdateNetworkConnectorErrorModeled::ResourceNotFoundException(
+                crate::state::connector_not_found(&input.identifier),
+            )
+            .into());
+        };
+
+        // A member the request leaves out changes nothing; `Configuration`
+        // "replaces the existing configuration" when it is supplied.
+        let configuration = input
+            .configuration
+            .unwrap_or_else(|| current.configuration.clone());
+        let operator_role = input
+            .operator_role
+            .clone()
+            .or_else(|| current.operator_role.clone());
+        let changed =
+            configuration != current.configuration || operator_role != current.operator_role;
+
+        // "Each SUCCESSFUL CONFIGURATION CHANGE creates a new immutable
+        // version ... a no-op update returns the current version number": a
+        // request that asks for what the connector already holds appends
+        // nothing and reports the record as it stands.
+        if !changed {
+            let output = UpdateNetworkConnectorOutput {
+                arn: connector.arn.clone(),
+                name: connector.name.clone(),
+                id: connector.id.clone(),
+                version_arn: Some(current.version_arn.clone()),
+                version: Some(current.version),
+                operator_role: current.operator_role.clone(),
+                configuration: Some(current.configuration.clone()),
+                state: Some(connector.state.clone()),
+                last_update_status: connector.last_update_status.clone(),
+                last_update_status_reason: connector.last_update_status_reason.clone(),
+                last_modified: Some(::aws_smithy_types::DateTime::from(connector.last_modified)),
+            };
+            if let Some(token) = input.client_token {
+                let name = connector.name.clone();
+                store.remember_token(token, name, current.version);
+            }
+            return Ok(output);
+        }
+
+        // "A connector can have a limited number of versions; once that limit
+        // is reached, further updates fail with
+        // NetworkConnectorLimitExceededException until you delete older
+        // versions."
+        if connector.versions.len() >= crate::state::MAX_VERSIONS_PER_CONNECTOR {
+            return Err(
+                UpdateNetworkConnectorErrorModeled::NetworkConnectorLimitExceededException(
+                    NetworkConnectorLimitExceededException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The network connector {} already holds the maximum of {} versions; \
+                             delete older versions before updating it again",
+                            connector.name,
+                            crate::state::MAX_VERSIONS_PER_CONNECTOR
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let version = connector.latest_version + 1;
+        let version_arn = connector.version_arn(version);
+        let settles_at = now + crate::state::LIFECYCLE_TRANSITION;
+        connector.versions.insert(
+            version,
+            crate::state::ConnectorVersion {
+                version,
+                version_arn: version_arn.clone(),
+                configuration: configuration.clone(),
+                operator_role: operator_role.clone(),
+                // The new version's own resources are still being provisioned;
+                // it carries the connector's state once the update finishes.
+                state: crate::state::STATE_PENDING.to_string(),
+                pending: Some(crate::state::PendingTransition {
+                    due: settles_at,
+                    change: crate::state::PendingChange::State(
+                        crate::state::STATE_ACTIVE.to_string(),
+                    ),
+                }),
+                last_modified: now,
+            },
+        );
+        connector.latest_version = version;
+        connector.last_modified = now;
+        // "The connector remains in ACTIVE state during the update" and its
+        // `LastUpdateStatus` "transitions through InProgress to Successful" —
+        // a transition the clock owes, not one a later call performs.
+        connector.last_update_status = Some(crate::state::LAST_UPDATE_IN_PROGRESS.to_string());
+        connector.last_update_status_reason = None;
+        connector.last_update_status_reason_code = None;
+        connector.pending_update = Some(crate::state::PendingTransition {
+            due: settles_at,
+            change: crate::state::PendingChange::State(
+                crate::state::LAST_UPDATE_SUCCESSFUL.to_string(),
+            ),
+        });
+
+        let output = UpdateNetworkConnectorOutput {
+            arn: connector.arn.clone(),
+            name: connector.name.clone(),
+            id: connector.id.clone(),
+            version_arn: Some(version_arn),
+            version: Some(version),
+            operator_role,
+            configuration: Some(configuration),
+            state: Some(connector.state.clone()),
+            last_update_status: connector.last_update_status.clone(),
+            last_update_status_reason: connector.last_update_status_reason.clone(),
+            last_modified: Some(::aws_smithy_types::DateTime::from(now)),
+        };
+        let name = connector.name.clone();
+        if let Some(token) = input.client_token {
+            store.remember_token(token, name, version);
+        }
+
+        Ok(output)
     }
 }

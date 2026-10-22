@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationError, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -52,6 +52,56 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Answers an over-limit `PostToConnection`; see [`OversizedPayload`].
+    oversized_payload: OversizedPayload,
+}
+
+/// Answers a `PostToConnection` whose `Data` payload is larger than the model allows
+/// with that operation's own modeled `PayloadTooLargeException` (HTTP 413).
+///
+/// WHY this is a seam and not a line in the handler: `Data` carries
+/// `@length(min: 0, max: 131072)` AND `PostToConnection` declares
+/// `PayloadTooLargeException` with `@httpError(413)`. The framework validates every
+/// modeled constraint BEFORE a handler runs and renders a violation as the
+/// protocol's generic refusal (HTTP 400), so the modeled 413 is unreachable from
+/// inside `handle` — the request is refused before it gets there. The model's routing
+/// key cannot distinguish an over-limit payload either, which is exactly what
+/// [`Service::override_operation`] exists for: it routes that one request here, and
+/// this answers the error the model declares for it.
+///
+/// Every wire fact comes from the model, through the operation's own error enum: the
+/// status, the error code and the error schema are read off
+/// [`OperationError`], never spelled out here.
+struct OversizedPayload;
+
+impl ErasedOperation for OversizedPayload {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        _ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // `Data` is the `@httpPayload` member, so the request body IS the payload
+            // whose size broke the bound. `override_operation` only routes here for a
+            // buffered body it already measured, so this read agrees with that measure;
+            // 0 is the inert fallback for a body that is somehow no longer buffered.
+            let actual = req.body().bytes().map_or(0, <[u8]>::len);
+            let modeled =
+                crate::ops::post_to_connection::PostToConnectionErrorModeled::PayloadTooLargeException(
+                    crate::ops::post_to_connection::payload_too_large(actual),
+                );
+            svc.definition()
+                .protocol()
+                .serialize_error(
+                    modeled.as_serializable(),
+                    modeled.variant_schema(),
+                    modeled.shape_name(),
+                    modeled.http_status(),
+                )
+                .unwrap_or_else(|e| svc.definition().framework_error_response(e))
+        })
+    }
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +111,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            oversized_payload: OversizedPayload,
         }
     }
 }
@@ -91,8 +142,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // One case needs it: a `PostToConnection` whose `Data` payload is past the
+        // modeled `@length` maximum. See [`OversizedPayload`] for why the modeled
+        // `PayloadTooLargeException` (413) cannot be answered from the handler. Both
+        // the operation name and the bound are read from the model, not spelled out.
+        let routing_key = self.definition().protocol().routing_key(req).ok()?;
+        if routing_key
+            != <crate::ops::post_to_connection::PostToConnection<Eng> as smithy_server_runtime::Operation>::NAME
+        {
+            return None;
+        }
+        // `Data` is the `@httpPayload` member, so the body length IS the payload
+        // length. `aws-chunked` framing is already stripped by this point, and this
+        // dispatch path always hands over a fully buffered body (the router builds the
+        // runtime-API request from the buffered bytes before any lookup), so `bytes()`
+        // is `Some`. A body that is NOT buffered cannot be sized without consuming it,
+        // so decline the override and let the framework's own constraint boundary judge
+        // it rather than guessing a length of zero.
+        let payload_len = req.body().bytes()?.len();
+        (payload_len > crate::ops::post_to_connection::MAX_DATA_BYTES)
+            .then_some(&self.oversized_payload as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

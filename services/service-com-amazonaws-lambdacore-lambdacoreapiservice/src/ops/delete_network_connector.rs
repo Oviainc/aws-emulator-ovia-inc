@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNetworkConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNetworkConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNetworkConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +175,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNetworkConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNetworkConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNetworkConnector"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteNetworkConnectorErrorModeled::ServiceException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A connector whose deletion already completed is forgotten here, so
+        // this call reports it as absent rather than deleting it twice.
+        let Some((connector, qualified)) = store.settled_mut(&input.identifier, now) else {
+            // The operation is `@idempotent` and "calling delete on a connector
+            // that is already deleting or has been deleted succeeds without
+            // error" — but `Arn`, `Name` and `Id` are @required answers that a
+            // forgotten record cannot supply, and this emulator does not invent
+            // them. The modelled refusal for an identifier that names nothing
+            // is what it answers.
+            return Err(DeleteNetworkConnectorErrorModeled::ResourceNotFoundException(
+                crate::state::connector_not_found(&input.identifier),
+            )
+            .into());
+        };
+
+        // "To remove a single historical version, supply its version-qualified
+        // ARN; the connector and its remaining versions are unaffected."
+        if let Some(version_number) = qualified {
+            if version_number == connector.latest_version {
+                return Err(DeleteNetworkConnectorErrorModeled::ResourceConflictException(
+                    crate::state::connector_conflict(format!(
+                        "Version {} of network connector {} is its latest version and cannot be \
+                         deleted on its own; delete the connector instead",
+                        version_number, connector.name
+                    )),
+                )
+                .into());
+            }
+            let Some(version) = connector.versions.remove(&version_number) else {
+                return Err(DeleteNetworkConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::connector_not_found(&input.identifier),
+                )
+                .into());
+            };
+            let output = DeleteNetworkConnectorOutput {
+                arn: connector.arn.clone(),
+                name: connector.name.clone(),
+                id: connector.id.clone(),
+                version_arn: Some(version.version_arn.clone()),
+                version: Some(version.version),
+                configuration: Some(version.configuration.clone()),
+                operator_role: version.operator_role.clone(),
+                // The connector itself is unaffected, so its state is the one
+                // this answer reports.
+                state: Some(connector.state.clone()),
+            };
+            let name = connector.name.clone();
+            // A client token that produced the version just removed no longer
+            // names anything that can be replayed.
+            store
+                .idempotency
+                .retain(|_, outcome| outcome.name != name || outcome.version != version_number);
+            return Ok(output);
+        }
+
+        // "You can delete connectors in ACTIVE or FAILED states" — and the
+        // operation is idempotent for one that is "already deleting", which
+        // reports the record as it stands without restarting the clock.
+        let deletable = [
+            crate::state::STATE_ACTIVE,
+            crate::state::STATE_FAILED,
+            crate::state::STATE_DELETING,
+        ];
+        if !deletable.contains(&connector.state.as_str()) {
+            return Err(DeleteNetworkConnectorErrorModeled::ResourceConflictException(
+                crate::state::connector_conflict(format!(
+                    "The network connector {} is in {} state; it can be deleted once it is {}",
+                    connector.name,
+                    connector.state,
+                    crate::state::STATE_ACTIVE
+                )),
+            )
+            .into());
+        }
+
+        if connector.state != crate::state::STATE_DELETING {
+            // "The connector transitions to DELETING state while elastic
+            // network interfaces are cleaned up asynchronously. After deletion
+            // completes, subsequent calls to GetNetworkConnector return
+            // ResourceNotFoundException" — so the record is forgotten by the
+            // clock, which is what removes it and all of its versions.
+            connector.state = crate::state::STATE_DELETING.to_string();
+            connector.last_modified = now;
+            connector.pending = Some(crate::state::PendingTransition {
+                due: now + crate::state::LIFECYCLE_TRANSITION,
+                change: crate::state::PendingChange::Removal,
+            });
+        }
+
+        let latest = connector.version(None);
+        Ok(DeleteNetworkConnectorOutput {
+            arn: connector.arn.clone(),
+            name: connector.name.clone(),
+            id: connector.id.clone(),
+            version_arn: latest.map(|version| version.version_arn.clone()),
+            version: latest.map(|version| version.version),
+            configuration: latest.map(|version| version.configuration.clone()),
+            operator_role: latest.and_then(|version| version.operator_role.clone()),
+            state: Some(connector.state.clone()),
+        })
     }
 }
