@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeListeners
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeListeners`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeListeners::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports exactly the listeners in state, filtered by `ListenerArns` or the
+//! `LoadBalancerArn` they belong to (an identifier nothing in state carries is the
+//! matching not-found refusal) and paged by `PageSize`/`Marker`. This is the
+//! read-back for `CreateListener`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeListeners` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeListenersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeListeners"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("DescribeListeners")
+        })?;
+
+        let guard = state.lock();
+
+        let selected: Vec<&crate::state::ListenerRecord> =
+            if let Some(arns) = input.listener_arns.as_deref() {
+                let mut selected = Vec::new();
+                for arn in arns {
+                    let Some(listener) = guard.listeners.get(arn) else {
+                        return Err(DescribeListenersErrorModeled::ListenerNotFoundException(
+                            ListenerNotFoundException {
+                                message: Some(format!("Listener '{arn}' not found")),
+                            },
+                        )
+                        .into());
+                    };
+                    selected.push(listener);
+                }
+                selected
+            } else if let Some(load_balancer_arn) = input.load_balancer_arn.as_ref() {
+                let Some(load_balancer) = guard.load_balancers.get(load_balancer_arn) else {
+                    return Err(DescribeListenersErrorModeled::LoadBalancerNotFoundException(
+                        LoadBalancerNotFoundException {
+                            message: Some(format!("Load balancer '{load_balancer_arn}' not found")),
+                        },
+                    )
+                    .into());
+                };
+                let mut selected: Vec<&crate::state::ListenerRecord> = load_balancer
+                    .listener_arns
+                    .iter()
+                    .filter_map(|arn| guard.listeners.get(arn))
+                    .collect();
+                selected.sort_by(|a, b| a.arn.cmp(&b.arn));
+                selected
+            } else {
+                guard.listeners_in_order()
+            };
+
+        let (page, next_marker) =
+            crate::state::paginate(selected, input.marker.as_deref(), input.page_size).map_err(
+                |_| {
+                    crate::scaffolded::Scaffolded::validation(
+                        "The marker is not valid: it must be a NextMarker from a previous page of this collection",
+                    )
+                },
+            )?;
+
+        Ok(DescribeListenersOutput {
+            listeners: Some(page.iter().map(|record| record.to_shape()).collect()),
+            next_marker,
+        })
     }
 }
