@@ -119,7 +119,9 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 /// so an EMPTY list reaches the handler: a configuration manager is the deployment of
 /// its definitions, so one with none to deploy is refused. The remaining checks are
 /// the store's own bounds on collections the model gives no length (see
-/// `crate::state`'s `MAX_*` constants).
+/// `crate::state`'s `MAX_*` constants), and the `IAMRoleArn` form of
+/// `LocalDeploymentAdministrationRoleArn`, which the model states as an
+/// `@arnReference` rather than as a `@pattern` the boundary could enforce.
 fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<String> {
     if input.configuration_definitions.is_empty() {
         return Some(
@@ -155,6 +157,24 @@ fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<Stri
             input.tags.as_ref().map_or(0, std::collections::HashMap::len),
             crate::state::MAX_TAGS,
         )
+    })
+    .or_else(|| {
+        // `LocalDeploymentAdministrationRoleArn` is an `IAMRoleArn`, whose
+        // `@arnReference` to `AWS::IAM::Role` the model states with no `@pattern` to
+        // enforce it; `crate::state::iam_role_arn_rejection` is the one place that
+        // rule lives, shared with every other `IAMRoleArn` member of this service.
+        input
+            .configuration_definitions
+            .iter()
+            .filter_map(|definition| {
+                definition.local_deployment_administration_role_arn.as_deref()
+            })
+            .find_map(|arn| {
+                crate::state::iam_role_arn_rejection(
+                    "ConfigurationDefinitions.LocalDeploymentAdministrationRoleArn",
+                    arn,
+                )
+            })
     })
 }
 
