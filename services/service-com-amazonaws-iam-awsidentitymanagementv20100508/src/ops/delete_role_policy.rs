@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRolePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRolePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRolePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the inline policy the request names from the role it names, so the document
+//! `PutRolePolicy` embedded is gone: `GetRolePolicy` stops resolving it and it no longer
+//! holds the role back from `DeleteRole`. A role the account does not hold, or a policy
+//! name the role does not carry, is a `NoSuchEntityException`; a service-linked role is
+//! an `UnmodifiableEntityException`.
 //!
 //! ## Shape of an operation
 //!
@@ -173,20 +170,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // `ctx` carries request metadata only; this deletion is driven entirely by its
+        // input and the store.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRolePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRolePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRolePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRolePolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // IAM entity names are unique within the account and not distinguished by
+        // case, so the role is looked up by its case-folded name. A name the account
+        // holds no role under "referenced a resource entity that does not exist".
+        let role_key = crate::state::name_key(&input.role_name);
+        let Some(role) = store.roles.get(&role_key) else {
+            return Err(DeleteRolePolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let role_name = role.role_name.clone();
+        // Which service a role is linked to is carried by its path, read through the
+        // one definition of that rule in `crate::state`.
+        let linked_service =
+            crate::state::service_linked_role_principal(&role.path).map(str::to_string);
+
+        // A service-linked role is a protected resource: only the service that depends
+        // on it may change it, so deleting one of its inline policies from any other
+        // caller is refused with the modelled `UnmodifiableEntityException`, whose
+        // documentation says the message "includes the name of the service that depends
+        // on this service-linked role". This mirrors `PutRolePolicy`, the operation
+        // that embeds one.
+        if let Some(linked_service) = linked_service {
+            return Err(DeleteRolePolicyErrorModeled::UnmodifiableEntityException(
+                UnmodifiableEntityException {
+                    message: Some(format!(
+                        "Service role policies may not be modified: the role {role_name} is a \
+                         service-linked role for {linked_service}, so the change must be \
+                         requested through that service"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Deletes the specified inline policy that is embedded in the specified IAM
+        // role": the embedded document goes, so the role no longer depends on it —
+        // `GetRolePolicy` stops resolving it, and `DeleteRole`'s conflict guard, which
+        // reads this very map, no longer counts it against the role. A policy name the
+        // role does not carry "referenced a resource entity that does not exist". The
+        // policy name is case-folded for the same reason the role name is: "user,
+        // group, role, and policy names must be unique within the account. Names are
+        // not distinguished by case."
+        let policy_key = crate::state::name_key(&input.policy_name);
+        let deleted = store
+            .role_inline_policies
+            .get_mut(&role_key)
+            .is_some_and(|policies| policies.remove(&policy_key).is_some());
+        if !deleted {
+            return Err(DeleteRolePolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role policy with name {} cannot be found.",
+                        input.policy_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A role embedding no inline policy carries no policy map either: an empty one
+        // left behind is bookkeeping for a dependency that no longer exists.
+        if store
+            .role_inline_policies
+            .get(&role_key)
+            .is_some_and(::std::collections::BTreeMap::is_empty)
+        {
+            store.role_inline_policies.remove(&role_key);
+        }
+
+        Ok(DeleteRolePolicyOutput)
     }
 }
