@@ -7,8 +7,17 @@
 //! and the `CreatedAt` / `ModifiedAt` it was stored with, and a rule that was
 //! never stored is in no listing.
 //!
+//! The account's service-managed `Default` rule is listed after them, on a fresh
+//! account as well as beside created rules: it exists without being created, so
+//! it is derived rather than stored
+//! (`crate::state::default_sampling_rule`), and an SDK reading this listing
+//! always finds a rule that matches every request.
+//!
 //! Paginated: a `NextToken` is emitted only when the listing exceeded one page,
-//! and resuming from it returns the remainder exactly once.
+//! and resuming from it returns the remainder exactly once. The token NAMES the
+//! rule the next page starts at, so one naming no currently listed rule — a
+//! token for a rule deleted since it was issued, or one this service never
+//! issued — is refused rather than answered with an arbitrary page.
 //!
 //! ## Shape of an operation
 //!
@@ -138,7 +147,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetSamplingRulesErrorModeled::ThrottledException(
                 ThrottledException {
@@ -151,46 +159,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
-        // A token this service issued names the rule the next page starts at; one
-        // past the end of the keyspace never came from here.
-        if let Some(token) = input.next_token.as_deref() {
-            let within_keyspace = store
-                .sampling_rules
-                .keys()
-                .next_back()
-                .is_some_and(|last| token <= last.as_str());
-            if !within_keyspace {
-                return Err(GetSamplingRulesErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!(
-                            "NextToken `{token}` was not issued by this service"
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
+        // Every rule the account has: the ones it created, in rule-name order,
+        // and then the service-managed `Default` rule every X-Ray account holds
+        // without creating it.
+        let visible = store.visible_sampling_rules(&region);
 
-        // `sampling_rules` is a `BTreeMap`, so the listing is in rule-name order
-        // and a token naming the next rule resumes where the last page stopped.
-        let remaining: Vec<&crate::state::StoredSamplingRule> = match input.next_token.as_deref() {
-            Some(token) => store
-                .sampling_rules
-                .range(token.to_string()..)
-                .map(|(_, stored)| stored)
-                .collect(),
-            None => store.sampling_rules.values().collect(),
+        // A token this service issued names the rule the next page starts at, so
+        // one naming no listed rule never came from here.
+        let from = match input.next_token.as_deref() {
+            Some(token) => visible
+                .iter()
+                .position(|stored| stored.rule.rule_name.as_deref() == Some(token))
+                .ok_or_else(|| {
+                    GetSamplingRulesErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!(
+                                "NextToken `{token}` was not issued by this service"
+                            )),
+                        },
+                    )
+                })?,
+            None => 0,
         };
 
+        let remaining = &visible[from..];
         let next_token = remaining
             .get(SAMPLING_RULES_PAGE_SIZE)
             .and_then(|stored| stored.rule.rule_name.clone());
         let sampling_rule_records = remaining
             .iter()
             .take(SAMPLING_RULES_PAGE_SIZE)
-            .map(|stored| stored.to_record())
+            .map(crate::state::StoredSamplingRule::to_record)
             .collect();
 
         Ok(GetSamplingRulesOutput {

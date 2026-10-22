@@ -195,7 +195,7 @@ async fn delete_removes_exactly_the_selected_rule_and_answers_its_record() {
     let listed = all_rules(&xray, "after-delete").await;
     assert_eq!(
         listed.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["kept"],
+        vec!["Default", "kept"],
         "only the selected rules were removed, listing holds {:?}",
         listed.keys().collect::<Vec<_>>()
     );
@@ -293,11 +293,22 @@ async fn a_rules_arn_names_the_region_it_was_created_in_and_does_not_move() {
         let listed = all_rules_in(&xray, reader, reader).await;
         assert_eq!(
             listed.len(),
-            regions.len(),
-            "case {reader:?}: one store serves every endpoint, listing holds {:?}",
+            regions.len() + 1,
+            "case {reader:?}: one store serves every endpoint, beside the service-managed Default rule, listing holds {:?}",
             listed.keys().collect::<Vec<_>>()
         );
         for (name, record) in &listed {
+            // The service-managed rule is DERIVED, so the ARN a reader sees is
+            // its own region's rather than a stored one.
+            if name == "Default" {
+                assert_eq!(
+                    rule_member(record, "RuleARN"),
+                    &json!(expected_rule_arn(reader, "Default")),
+                    "case {reader:?}: the Default rule is read with this region's ARN, got {:?}",
+                    rule_member(record, "RuleARN")
+                );
+                continue;
+            }
             let created_in = name
                 .strip_prefix("rule-")
                 .expect("the fixture names carry their region");
