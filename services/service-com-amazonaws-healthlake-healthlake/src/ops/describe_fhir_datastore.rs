@@ -3,7 +3,9 @@
 //! @op DescribeFHIRDatastore
 //!
 //! Reports the data store `CreateFHIRDatastore` persisted, straight from
-//! [`crate::state`]; an id no data store carries is a 404.
+//! [`crate::state`]; an id no data store carries is the modelled
+//! `ResourceNotFoundException`, served with the status
+//! [`crate::scaffolded::wire_http_status`] gives a client fault on this protocol.
 //!
 //! ## Shape of an operation
 //!

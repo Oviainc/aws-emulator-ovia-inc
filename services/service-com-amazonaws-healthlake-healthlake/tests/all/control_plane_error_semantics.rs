@@ -12,8 +12,10 @@
 //!    member and the permitted set and does NOT echo the rejected value, while
 //!    every other constraint class keeps the AWS framing that quotes the value;
 //! 3. `UpdateFHIRDatastore` applies its members to the stored record only while
-//!    that record is `ACTIVE`; any other status is refused with 403
-//!    `AccessDeniedException` and nothing is written.
+//!    that record is `ACTIVE`; any other status is refused with
+//!    `AccessDeniedException` and nothing is written. Its wire STATUS is 400, not the
+//!    `@httpError(403)` the shape declares: see `tests/all/error_envelopes.rs` for
+//!    that rule, which holds for every modelled client error of this service.
 //!
 //! Every call goes through [`MultiServiceRouter::dispatch`] by way of the shared
 //! harness in `fhir_datastore_lifecycle`, so routing, deserialization, the
@@ -58,8 +60,8 @@ fn enum_envelope(path: &str, allowed: &[&str]) -> String {
 /// the fixed text, and no echo of what was asked for.
 fn assert_not_found(case: &str, status: u16, payload: &Value, request_value: &str) {
     assert_eq!(
-        status, 404,
-        "case {case:?}: a data store no record holds must answer 404, got {status}: {payload}"
+        status, 400,
+        "case {case:?}: a data store no record holds must answer 400, got {status}: {payload}"
     );
     assert_eq!(
         error_code(payload),
@@ -462,8 +464,8 @@ async fn update_refuses_a_data_store_that_is_not_active_with_403_and_writes_noth
             )
             .await;
         assert_eq!(
-            status, 403,
-            "case {case:?}: a mutation on a non-ACTIVE data store must answer 403, got {status}: {payload}"
+            status, 400,
+            "case {case:?}: a mutation on a non-ACTIVE data store must answer 400, got {status}: {payload}"
         );
         assert_eq!(
             error_code(&payload),
