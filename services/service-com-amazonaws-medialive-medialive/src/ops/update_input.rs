@@ -254,6 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.special_router_settings = Some(router_settings);
         }
 
+        // A destination slot this update added needs its ingest address, and one
+        // that already had an address keeps it: the endpoint is fixed for the
+        // lifetime of the input.
+        state.allocate_input_ingest_addresses(&input.input_id);
+
         // Read back out of the store, so the response reports the input that was
         // written rather than one this handler assembled from the request.
         let updated = state

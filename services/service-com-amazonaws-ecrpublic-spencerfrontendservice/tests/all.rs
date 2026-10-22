@@ -19,6 +19,8 @@ mod layer_upload_sessions;
 mod registry_catalog_data;
 #[path = "all/registry_describe.rs"]
 mod registry_describe;
+#[path = "all/repository_catalog_data.rs"]
+mod repository_catalog_data;
 #[path = "all/repository_image_lifecycle.rs"]
 mod repository_image_lifecycle;
 #[path = "all/repository_policy.rs"]

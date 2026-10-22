@@ -244,11 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some()
         {
             return Err(CreateComponentErrorModeled::ResourceConflictException(
-                crate::state::duplicate_component_name(
-                    &input.app_id,
-                    &input.environment_name,
-                    &data.name,
-                ),
+                crate::state::duplicate_item_name(),
             )
             .into());
         }
