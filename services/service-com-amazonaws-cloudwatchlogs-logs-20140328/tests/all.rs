@@ -17,6 +17,8 @@ mod harness;
 mod log_core_loop;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
+#[path = "all/retention_policy.rs"]
+mod retention_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subscription_filters.rs"]

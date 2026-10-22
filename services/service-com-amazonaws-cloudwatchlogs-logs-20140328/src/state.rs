@@ -59,6 +59,17 @@ pub const POLICY_SCOPE_ACCOUNT: &str = "ACCOUNT";
 /// `PolicyScope` enum (`ACCOUNT` | `RESOURCE`).
 pub const POLICY_SCOPE_RESOURCE: &str = "RESOURCE";
 
+/// The retentions a log group can be set to, from the model's `Days` shape: "The number
+/// of days to retain the log events in the specified log group. Possible values are: 1,
+/// 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557,
+/// 2922, 3288, and 3653." `Days` is a plain integer in the model, so nothing refuses a
+/// value outside this list before a handler runs. Ascending, so the list renders in the
+/// documented order in a refusal message.
+pub const RETENTION_IN_DAYS_VALUES: [i32; 22] = [
+    1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922,
+    3288, 3653,
+];
+
 /// AWS's documented subscription-filter quota, from `PutSubscriptionFilter`: "Each log
 /// group can have up to two subscription filters associated with it." A put naming a
 /// filter the group already holds is an update of that filter, so it does not count

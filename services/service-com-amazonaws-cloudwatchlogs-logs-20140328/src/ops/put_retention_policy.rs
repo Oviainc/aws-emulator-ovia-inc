@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRetentionPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRetentionPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRetentionPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the retention of one existing log group: `retentionInDays` is stored on the
+//! group named by `logGroupName`, replacing whatever retention it was at, and every
+//! later read of that group reports it. The output is `Unit`, so success is a 200 with
+//! an empty body.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +172,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRetentionPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRetentionPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRetentionPolicy"))
+        // `ctx` carries only request metadata: the retention this call sets belongs to
+        // the log group `input` names.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutRetentionPolicyError::from(
+                PutRetentionPolicyErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // "Possible values are: 1, 3, 5, 7, 14, …, 3653" — `Days` is a plain integer in
+        // the model, so the boundary validator does not hold `retentionInDays` to that
+        // catalogue and this handler is what refuses a value outside it.
+        if !crate::state::RETENTION_IN_DAYS_VALUES.contains(&input.retention_in_days) {
+            return Err(PutRetentionPolicyErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "retentionInDays value {} is not one of {}",
+                        input.retention_in_days,
+                        crate::state::RETENTION_IN_DAYS_VALUES
+                            .iter()
+                            .map(i32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Sets the retention of the specified log group": there is no retention to set
+        // until that group exists.
+        let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
+            return Err(PutRetentionPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The specified log group does not exist".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The retention is a property of the group, so a put replaces whatever retention
+        // it was at and changes nothing else about it.
+        group.retention_in_days = Some(input.retention_in_days);
+
+        Ok(PutRetentionPolicyOutput)
     }
 }
