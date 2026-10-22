@@ -17,6 +17,8 @@ mod api_key_collection_members;
 mod api_key_lifecycle;
 #[path = "all/delete_lifecycle.rs"]
 mod delete_lifecycle;
+#[path = "all/method_integration.rs"]
+mod method_integration;
 #[path = "all/patch_updates.rs"]
 mod patch_updates;
 #[path = "all/rest_api_defaults.rs"]

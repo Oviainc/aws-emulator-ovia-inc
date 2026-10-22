@@ -544,6 +544,69 @@ impl Repository {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Resource policies
+//
+// A domain and a repository each hold at most one resource policy ([`Domain::policy`] /
+// [`Repository::policy`]), and the whole `Put*PermissionsPolicy` /
+// `Get*PermissionsPolicy` / `Delete*PermissionsPolicy` family reads and writes exactly
+// that field. The revision rules below therefore live here rather than once per handler,
+// so a revision minted by one operation is the revision the next one accepts.
+// ---------------------------------------------------------------------------
+
+/// Whether a caller-supplied `policyRevision` authorises writing over the policy a
+/// resource currently holds (`current`).
+///
+/// `policyRevision` is modelled as optional and documented as optimistic locking ("This
+/// revision is used for optimistic locking, which prevents others from overwriting your
+/// changes"), so: a caller that supplies one is asserting which revision it read, and the
+/// write proceeds only while that is still the revision in the store; a caller that
+/// supplies none is locking nothing and the write proceeds unconditionally. A resource
+/// holding no policy carries no revision, so a supplied revision can never match it.
+pub fn policy_revision_matches(current: Option<&ResourcePolicy>, supplied: Option<&str>) -> bool {
+    match supplied {
+        None => true,
+        Some(supplied) => current.and_then(|policy| policy.revision.as_deref()) == Some(supplied),
+    }
+}
+
+/// The policy to store on the resource `resource_arn` names: `document` as the caller
+/// sent it, under a freshly minted revision that replaces `current`'s.
+///
+/// The document is stored VERBATIM — a resource policy is reported back as the string
+/// that was submitted, never as a re-serialised or normalised rendering of it.
+pub fn attached_policy(
+    resource_arn: &str,
+    document: String,
+    current: Option<&ResourcePolicy>,
+) -> ResourcePolicy {
+    let replaced = current.and_then(|policy| policy.revision.as_deref());
+    ResourcePolicy {
+        revision: Some(policy_revision(resource_arn, &document, replaced)),
+        resource_arn: Some(resource_arn.to_string()),
+        document: Some(document),
+    }
+}
+
+/// The revision a resource policy carries once it is written.
+///
+/// Derived from the resource the policy hangs off, the document being written and the
+/// revision being replaced, so it is stable across every read of the same policy (nothing
+/// per-call goes into it), differs from the revision it replaces — that revision is one of
+/// its inputs, so even re-writing a byte-identical document mints a new one, which is what
+/// makes the revision a usable optimistic lock — and is distinct between resources.
+fn policy_revision(resource_arn: &str, document: &str, replaced: Option<&str>) -> String {
+    let digest = identity_digest(&[
+        "policy-revision",
+        resource_arn,
+        document,
+        replaced.unwrap_or_default(),
+    ]);
+    // 16 bytes rendered as 32 hex characters: inside `PolicyRevision`'s modelled 1..100
+    // length and matching its `^\S+$` pattern.
+    hex::encode(&digest[..16])
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/codedeploy_lifecycle.rs"]
 mod codedeploy_lifecycle;
+#[path = "all/git_hub_account_token_names.rs"]
+mod git_hub_account_token_names;
 #[path = "all/on_premises_instances.rs"]
 mod on_premises_instances;
 #[path = "all/state_roundtrip.rs"]

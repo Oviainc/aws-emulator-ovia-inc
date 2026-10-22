@@ -136,17 +136,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let region = crate::state::request_region(ctx.parts());
+        let _ = ctx;
         let now = crate::state::now_millis();
         let mut guard = state.lock();
 
         let Some(stored) = guard.builds.get_mut(&input.id) else {
             return Err(StopBuildErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Build cannot be found: {}",
-                        crate::state::build_arn(&region, &input.id)
-                    )),
+                    // CodeBuild names an absent build by the id the request gave,
+                    // exactly as given — the same text `BatchDeleteBuilds` reports in
+                    // `BuildNotDeleted$statusCode` for an id it holds no record of.
+                    message: Some(format!("Build {} does not exist", input.id)),
                 },
             )
             .into());

@@ -72,6 +72,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Shared with the seeded AWS-managed catalogue in `crate::state`: it WRITES the
+// documents these constants describe (the event envelope and the component refs that
+// point at it) and this operation converts them, so one definition keeps the writer
+// and the reader from drifting apart.
+use crate::state::{EVENT_ENVELOPE_COMPONENT, JSON_SCHEMA_DRAFT4_URI, OPENAPI_COMPONENT_REF};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -250,20 +256,8 @@ const JSON_SCHEMA_DRAFT4_TYPE: &str = "JSONSchemaDraft4";
 /// See [`JSON_SCHEMA_DRAFT4_TYPE`].
 const OPEN_API_3_TYPE: &str = "OpenApi3";
 
-/// The `$schema` of a JSON Schema draft-4 document — what makes the export draft 4
-/// rather than some other draft. Shared with `GetDiscoveredSchema`, which stamps the
-/// same marker on the document it infers.
-use crate::state::JSON_SCHEMA_DRAFT4_URI;
-
-/// Where an OpenAPI 3 document keeps its reusable schemas, as a `$ref` names one.
-const OPENAPI_COMPONENT_REF: &str = "#/components/schemas/";
-
 /// Where a JSON Schema draft-4 document keeps the same, as a `$ref` names one.
 const DRAFT4_DEFINITION_REF: &str = "#/definitions/";
-
-/// The component an AWS event schema's OpenAPI document roots at: the event envelope,
-/// whose `detail` references the event-specific component.
-const EVENT_ENVELOPE_COMPONENT: &str = "AWSEvent";
 
 /// Render the OpenAPI 3 document `openapi` as one JSON Schema draft-4 document.
 ///

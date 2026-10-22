@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBlockPublicAccessConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBlockPublicAccessConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBlockPublicAccessConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPLACES the ONE block public access configuration of this account and Region in
+//! [`crate::state::ComAmazonawsEmrElasticmapreduceState::block_public_access`] — the
+//! configuration is stored whole, never merged into the one already there — and records
+//! the calling principal and the instant beside it, which is what
+//! `GetBlockPublicAccessConfiguration` then reports as its metadata.
+//!
+//! The work a request can ask for is bounded before it is done: an exception list
+//! longer than the port space it draws from is refused by its length alone, a
+//! configuration carrying more than [`crate::state::MAX_CONFIGURATION_ENTRIES`] entries
+//! is refused without walking the rest of it, and the range rules are then linear and
+//! log-linear in a list that cap holds down — so neither this call nor the
+//! `GetBlockPublicAccessConfiguration` calls that later clone the stored configuration
+//! can be made expensive.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +80,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{MAX_CONFIGURATION_ENTRIES, MAX_PERMITTED_PUBLIC_RANGES, PORT_MAX, PORT_MIN};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +152,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBlockPublicAccessConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBlockPublicAccessConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBlockPublicAccessConfiguration"))
+        let now = ::std::time::SystemTime::now();
+        let created_by_arn = crate::state::caller_arn(ctx.parts());
+        let configuration = input.block_public_access_configuration;
+
+        // Every refusal below is decided BEFORE the lock is taken, and the work each
+        // one costs is bounded before it is done: the length cap is O(1), the entry cap
+        // stops counting at the cap, and the two range rules are then O(n) and
+        // O(n log n) over an `n` the length cap holds at
+        // `MAX_PERMITTED_PUBLIC_RANGES`.
+        if let Some(error) = configuration_violation(&configuration) {
+            return Err(
+                PutBlockPublicAccessConfigurationErrorModeled::InvalidRequestException(error)
+                    .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutBlockPublicAccessConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the Amazon EMR block public access configuration is unavailable"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // REPLACE, never merge: the stored record is overwritten whole, so a member the
+        // new configuration leaves out is gone rather than inherited from the old one.
+        // "Each time a configuration for block public access is updated, Amazon EMR
+        // updates this metadata." (`BlockPublicAccessConfigurationMetadata` doc.)
+        state.lock().block_public_access =
+            crate::state::BlockPublicAccessRecord::put(configuration, created_by_arn, now);
+
+        Ok(PutBlockPublicAccessConfigurationOutput {})
     }
+}
+
+/// The last port of a range: "To specify a single port, use the same value for
+/// `MinRange` and `MaxRange`" (`PortRange` doc), so a range that gives only `MinRange`
+/// is that single port.
+fn last_port(range: &PortRange) -> i32 {
+    range.max_range.unwrap_or(range.min_range)
+}
+
+/// A refusal naming the member and the values at fault, so the caller can correct the
+/// request from the message alone.
+fn refuse(message: String) -> InvalidRequestException {
+    InvalidRequestException {
+        // No `ErrorCode` value is documented for this refusal, so none is invented; the
+        // wire error code is the shape's own, `InvalidRequestException`.
+        error_code: None,
+        message: Some(message),
+    }
+}
+
+/// Why this configuration cannot be accepted, if it cannot.
+///
+/// The checks are ordered so that the cost of reaching a refusal is bounded by the
+/// cheapest check that could have caught it.
+fn configuration_violation(
+    configuration: &BlockPublicAccessConfiguration,
+) -> Option<InvalidRequestException> {
+    let ranges = configuration
+        .permitted_public_security_group_rule_ranges
+        .as_deref()
+        .unwrap_or_default();
+
+    // O(1). A permitted range covers at least one port of the port space `Port` admits
+    // and the ranges may not overlap, so a longer list repeats a port whatever it
+    // carries. See `state::MAX_PERMITTED_PUBLIC_RANGES`.
+    if ranges.len() > MAX_PERMITTED_PUBLIC_RANGES {
+        return Some(refuse(format!(
+            "PermittedPublicSecurityGroupRuleRanges carries {} ranges, more than the \
+             {MAX_PERMITTED_PUBLIC_RANGES} ports {PORT_MIN}..={PORT_MAX} there are to \
+             permit, so its ranges cannot be disjoint",
+            ranges.len(),
+        )));
+    }
+
+    // Bounded: the count stops at the cap, so a configuration that busts it is refused
+    // without walking the rest of it. See `state::MAX_CONFIGURATION_ENTRIES`.
+    if configuration_entries(configuration, MAX_CONFIGURATION_ENTRIES) > MAX_CONFIGURATION_ENTRIES
+    {
+        return Some(refuse(format!(
+            "BlockPublicAccessConfiguration carries more than the \
+             {MAX_CONFIGURATION_ENTRIES} entries a block public access configuration \
+             may hold"
+        )));
+    }
+
+    // O(n). "To specify a single port, use the same value for MinRange and MaxRange."
+    // (`PortRange` doc.) A range therefore runs upwards, and a range given without a
+    // `MaxRange` is that single port. The bounds themselves are NOT checked here: both
+    // target `Port`, whose `range { min: -1, max: 65535 }` the framework's validate
+    // phase refuses before this handler runs, so every port reaching this function is
+    // already inside PORT_MIN..=PORT_MAX — which is what makes the length cap above a
+    // statement about the ports there are to permit.
+    for range in ranges {
+        if last_port(range) < range.min_range {
+            return Some(refuse(format!(
+                "PermittedPublicSecurityGroupRuleRanges carries the port range {}-{}: \
+                 MaxRange must be at least MinRange",
+                range.min_range,
+                last_port(range),
+            )));
+        }
+    }
+
+    // O(n log n). The exception list is a SET of permitted ports, so two ranges that
+    // permit the same port are refused rather than silently coalesced — the behaviour
+    // the recorded unit `emr.block-public-access-configuration-overlapping-ranges-
+    // rejected` was filed on. Sorting by `MinRange` and comparing each range against
+    // the furthest port already claimed finds an overlap anywhere in the list without
+    // comparing every pair.
+    let mut by_min: Vec<&PortRange> = ranges.iter().collect();
+    by_min.sort_by_key(|range| (range.min_range, last_port(range)));
+    let mut claimed: Option<&PortRange> = None;
+    for range in by_min {
+        if let Some(previous) = claimed {
+            if range.min_range <= last_port(previous) {
+                return Some(refuse(format!(
+                    "PermittedPublicSecurityGroupRuleRanges carries the overlapping port \
+                     ranges {}-{} and {}-{}: the ranges must not overlap",
+                    previous.min_range,
+                    last_port(previous),
+                    range.min_range,
+                    last_port(range),
+                )));
+            }
+        }
+        // The furthest port claimed so far, which is what the next range must clear.
+        if claimed.is_none_or(|previous| last_port(range) > last_port(previous)) {
+            claimed = Some(range);
+        }
+    }
+    None
+}
+
+/// How many entries this configuration holds — permitted ranges, plus the properties
+/// and nested configurations of its classification members — counted no further than
+/// `cap + 1`, which is all a caller of this function needs to know.
+///
+/// Iterative rather than recursive, so a deeply nested `Configurations` costs stack
+/// space no deeper than this frame.
+fn configuration_entries(configuration: &BlockPublicAccessConfiguration, cap: usize) -> usize {
+    let mut entries = configuration
+        .permitted_public_security_group_rule_ranges
+        .as_ref()
+        .map_or(0, Vec::len)
+        + configuration.properties.as_ref().map_or(0, |p| p.len());
+    let mut pending: Vec<&Configuration> = configuration
+        .configurations
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .collect();
+    while let Some(nested) = pending.pop() {
+        if entries > cap {
+            break;
+        }
+        entries += 1 + nested.properties.as_ref().map_or(0, |p| p.len());
+        pending.extend(nested.configurations.as_deref().unwrap_or_default().iter());
+    }
+    entries
 }

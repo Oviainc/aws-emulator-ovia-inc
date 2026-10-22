@@ -128,11 +128,13 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidParentCommitIdException",
             "The parent commit ID is not valid.",
         ),
-        ("commitId", _) if missing => (
+        ("commitId" | "afterCommitId" | "beforeCommitId", _) if missing => (
             "CommitIdRequiredException",
             "A commit ID was not specified.",
         ),
-        ("commitId", _) => ("InvalidCommitIdException", "The specified commit ID is not valid."),
+        ("commitId" | "afterCommitId" | "beforeCommitId", _) => {
+            ("InvalidCommitIdException", "The specified commit ID is not valid.")
+        }
         ("blobId", _) if missing => (
             "BlobIdRequiredException",
             "A blob ID is required, but was not specified.",
@@ -149,6 +151,26 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ("email", _) => (
             "InvalidEmailException",
             "The specified email address either contains one or more characters that are not allowed, or it exceeds the maximum number of characters allowed for an email address.",
+        ),
+        ("content", _) if missing => (
+            "CommentContentRequiredException",
+            "The comment is empty. You must provide some content for a comment.",
+        ),
+        ("content", ViolationKind::MaxLength(_)) => (
+            "CommentContentSizeLimitExceededException",
+            "The comment is too large. Comments are limited to 10,240 characters.",
+        ),
+        ("relativeFileVersion", ViolationKind::EnumValue(_)) => (
+            "InvalidRelativeFileVersionEnumException",
+            "Either the enum is not in a valid format, or the specified file version enum is not valid in respect to the current file version.",
+        ),
+        ("clientRequestToken", _) if missing => (
+            "ClientRequestTokenRequiredException",
+            "A client request token is required.",
+        ),
+        ("clientRequestToken", _) => (
+            "InvalidClientRequestTokenException",
+            "The client request token is not valid.",
         ),
         ("sortBy", ViolationKind::EnumValue(_)) => (
             "InvalidSortByException",

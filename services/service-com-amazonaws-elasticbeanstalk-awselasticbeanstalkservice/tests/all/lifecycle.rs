@@ -50,7 +50,8 @@ pub(crate) const TEST_REGION: &str = "us-west-2";
 
 /// Long enough that a status change the clock owed is due. Derived from the
 /// service's own span so the two cannot drift apart.
-pub(crate) const PAST_DUE: Duration = eb::state::STATUS_TRANSITION_SPAN.saturating_add(Duration::from_millis(250));
+pub(crate) const PAST_DUE: Duration =
+    eb::state::STATUS_TRANSITION_SPAN.saturating_add(Duration::from_millis(250));
 
 /// The emulator under test: this one service, mounted in the router the
 /// production binary mounts it in, driven over HTTP.

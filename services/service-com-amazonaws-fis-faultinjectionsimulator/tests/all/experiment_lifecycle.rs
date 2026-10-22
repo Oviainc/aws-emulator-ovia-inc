@@ -17,8 +17,10 @@
 //!   at ANY admissible page size enumerates the collection once;
 //! * an experiment is minted from the PERSISTED template: it carries that template's
 //!   `roleArn`, targets, actions and stop conditions, starts `initiating`, becomes
-//!   `running` once the clock says so, and goes `stopping` -> `stopped` with an `endTime`
-//!   when it is stopped;
+//!   `running` once the clock says so, runs for as long as its wait actions last and then
+//!   reaches the terminal status its actions earn — `completed` for a run of waits,
+//!   `failed` for one carrying an action this emulator cannot inject — and goes
+//!   `stopping` -> `stopped` with an `endTime` when it is stopped instead;
 //! * a resource id that names no record answers `ResourceNotFoundException` (HTTP 404),
 //!   and a request outside a constraint the model or the FIS documentation states answers
 //!   `ValidationException` (HTTP 400).
@@ -49,11 +51,20 @@ const DESCRIPTION_CEILING: usize = 512;
 const ACCOUNT_ID: &str = "000000000000";
 
 /// The region an ARN names when the request's credential scope offers none usable.
-const FALLBACK_REGION: &str = "us-east-1";
+pub(crate) const FALLBACK_REGION: &str = "us-east-1";
 
 /// How long to wait before a transition this service owes the clock must have been
 /// materialised. The emulator's span is deliberately non-zero and well under this.
 const PAST_TRANSITION: Duration = Duration::from_millis(900);
+
+/// A wait every template in this suite can carry: inside the 1..720 minutes FIS documents
+/// for the `aws:fis:wait` action's `duration`, and long enough that an experiment running
+/// it is still running while a case polls it.
+pub(crate) const WAIT_DURATION: &str = "PT5M";
+
+/// How long a case waits for an experiment whose run this emulator cannot perform to reach
+/// its terminal status. That run is one transition span long, so this is generous.
+const FINAL_BUDGET: Duration = Duration::from_secs(5);
 
 /// A SigV4 credential scope naming this service, for `region`. The service field is what
 /// routes the request to fis; the region field is what a minted ARN names.
@@ -65,7 +76,7 @@ fn signed_for(region: &str) -> String {
 }
 
 /// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -74,14 +85,14 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The wire error code (`__type`), or the empty string on a success.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body["__type"].as_str().unwrap_or_default()
     }
 
@@ -91,12 +102,12 @@ impl Answer {
     }
 
     /// The member `name` of this answer's body.
-    fn member(&self, name: &str) -> &Value {
+    pub(crate) fn member(&self, name: &str) -> &Value {
         &self.body[name]
     }
 }
 
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -131,7 +142,7 @@ async fn send(
     Answer { status, body }
 }
 
-async fn create_template(router: &MultiServiceRouter, body: Value) -> Answer {
+pub(crate) async fn create_template(router: &MultiServiceRouter, body: Value) -> Answer {
     send(
         router,
         "POST",
@@ -175,11 +186,11 @@ async fn list_templates(router: &MultiServiceRouter, query: &str) -> Answer {
     .await
 }
 
-async fn start_experiment(router: &MultiServiceRouter, body: Value) -> Answer {
+pub(crate) async fn start_experiment(router: &MultiServiceRouter, body: Value) -> Answer {
     send(router, "POST", "/experiments", Some(body), FALLBACK_REGION).await
 }
 
-async fn get_experiment(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_experiment(router: &MultiServiceRouter, id: &str) -> Answer {
     send(
         router,
         "GET",
@@ -190,7 +201,7 @@ async fn get_experiment(router: &MultiServiceRouter, id: &str) -> Answer {
     .await
 }
 
-async fn stop_experiment(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn stop_experiment(router: &MultiServiceRouter, id: &str) -> Answer {
     send(
         router,
         "DELETE",
@@ -199,6 +210,38 @@ async fn stop_experiment(router: &MultiServiceRouter, id: &str) -> Answer {
         FALLBACK_REGION,
     )
     .await
+}
+
+/// True when every action of a create body is the `aws:fis:wait` built-in — the one action
+/// whose whole effect is elapsed time, so the emulator can carry the experiment out and
+/// the run ends `completed`. Any other action injects a fault into another service, which
+/// the emulator does not do, so that run ends `failed`.
+fn only_waits(body: &Value) -> bool {
+    body["actions"]
+        .as_object()
+        .expect("a create body names its actions")
+        .values()
+        .all(|action| action["actionId"].as_str() == Some("aws:fis:wait"))
+}
+
+/// Poll `GetExperiment` until the experiment reaches a terminal status, or `budget` runs
+/// out, and report the experiment as it was last read.
+pub(crate) async fn poll_until_final(router: &MultiServiceRouter, id: &str, budget: Duration) -> Value {
+    const INTERVAL: Duration = Duration::from_millis(50);
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let experiment = get_experiment(router, id).await.member("experiment").clone();
+        let status = experiment["state"]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if ["completed", "failed", "stopped", "cancelled"].contains(&status.as_str())
+            || std::time::Instant::now() >= deadline
+        {
+            return experiment;
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
 }
 
 /// Assert that every member `expected` carries appears in `actual` with an equal value.
@@ -276,7 +319,7 @@ fn template_id(case: &str, answer: &Answer) -> String {
 }
 
 /// A `clientToken` no other case in this suite uses.
-fn token(label: &str) -> String {
+pub(crate) fn token(label: &str) -> String {
     format!("token-{label}")
 }
 
@@ -381,7 +424,7 @@ fn template_cases() -> Vec<(&'static str, Value)> {
                 "roleArn": "arn:aws:iam::000000000000:role/fis-report",
                 "stopConditions": [{ "source": "none" }],
                 "actions": {
-                    "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT30S" } }
+                    "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT30M" } }
                 },
                 "logConfiguration": {
                     "cloudWatchLogsConfiguration": {
@@ -411,7 +454,7 @@ fn template_cases() -> Vec<(&'static str, Value)> {
                 "roleArn": "arn:aws:iam::000000000000:role/fis-ceiling",
                 "stopConditions": [{ "source": "none" }],
                 "actions": {
-                    "wait": { "actionId": "aws:fis:wait" }
+                    "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } }
                 }
             }),
         ),
@@ -578,7 +621,7 @@ async fn experiment_options_a_request_omits_report_the_documented_defaults() {
             "description": format!("experiment options: {case}"),
             "roleArn": "arn:aws:iam::000000000000:role/fis-options",
             "stopConditions": [{ "source": "none" }],
-            "actions": { "wait": { "actionId": "aws:fis:wait" } }
+            "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
         });
         if !options.is_null() {
             body["experimentOptions"] = options;
@@ -630,7 +673,7 @@ async fn a_minted_arn_names_the_region_the_request_was_signed_for() {
                 "description": format!("signed for {signing_region}"),
                 "roleArn": "arn:aws:iam::000000000000:role/fis-region",
                 "stopConditions": [{ "source": "none" }],
-                "actions": { "wait": { "actionId": "aws:fis:wait" } }
+                "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             })),
             signing_region,
         )
@@ -866,10 +909,11 @@ async fn walking_the_pages_at_any_page_size_enumerates_every_template_once() {
 }
 
 #[tokio::test]
-async fn an_experiment_carries_the_persisted_template_and_moves_from_initiating_to_running() {
+async fn an_experiment_carries_the_persisted_template_and_runs_to_the_status_its_actions_earn() {
     let router = emulator();
 
     for (case, body) in template_cases() {
+        let body_for_outcome = body.clone();
         let created = create_template(&router, body).await;
         let id = template_id(case, &created);
         let template = created.member("experimentTemplate").clone();
@@ -971,23 +1015,65 @@ async fn an_experiment_carries_the_persisted_template_and_moves_from_initiating_
 
         tokio::time::sleep(PAST_TRANSITION).await;
 
-        let running = get_experiment(&router, &experiment_id).await;
-        assert_eq!(
-            running.member("experiment")["state"]["status"]
-                .as_str()
-                .unwrap_or_default(),
-            "running",
-            "case {case:?}: expected the experiment to be running once the transition fell \
-             due, got {:?}",
-            running.body
-        );
-        // Everything else is the record it was: only the status moved.
-        for member in ["id", "arn", "experimentTemplateId", "roleArn", "creationTime"] {
+        if only_waits(&body_for_outcome) {
+            // Every action is a wait of several minutes, so the experiment is running —
+            // and stays running — once the transition to `running` has fallen due.
+            let running = get_experiment(&router, &experiment_id).await;
             assert_eq!(
-                running.member("experiment")[member], experiment[member],
-                "case {case:?}: expected experiment.{member} to be unchanged, got {:?}",
-                running.member("experiment")[member]
+                running.member("experiment")["state"]["status"]
+                    .as_str()
+                    .unwrap_or_default(),
+                "running",
+                "case {case:?}: expected the experiment to be running once the transition fell \
+                 due, got {:?}",
+                running.body
             );
+            // Everything else is the record it was: only the status moved.
+            for member in ["id", "arn", "experimentTemplateId", "roleArn", "creationTime"] {
+                assert_eq!(
+                    running.member("experiment")[member], experiment[member],
+                    "case {case:?}: expected experiment.{member} to be unchanged, got {:?}",
+                    running.member("experiment")[member]
+                );
+            }
+            // This row is done with its experiment: stop it, so the suite does not hold
+            // one active-experiment slot per row and no later row can be refused for
+            // having reached the account's quota.
+            let stopped = stop_experiment(&router, &experiment_id).await;
+            assert_eq!(
+                stopped.status, 200,
+                "case {case:?}: expected the stop to be accepted, got {} with {:?}",
+                stopped.status, stopped.body
+            );
+        } else {
+            // The template carries an action that injects a fault into another service,
+            // which this emulator does not do: the run ends in the modelled `failed`
+            // state with a reason saying so, rather than reporting a success.
+            let final_state = poll_until_final(&router, &experiment_id, FINAL_BUDGET).await;
+            assert_eq!(
+                final_state["state"]["status"].as_str().unwrap_or_default(),
+                "failed",
+                "case {case:?}: expected a run this emulator cannot perform to fail, \
+                 got {final_state:?}"
+            );
+            assert!(
+                final_state["state"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty()),
+                "case {case:?}: a failed experiment says why, got {final_state:?}"
+            );
+            assert!(
+                !final_state["endTime"].is_null(),
+                "case {case:?}: an experiment that has ended carries an endTime, \
+                 got {final_state:?}"
+            );
+            for member in ["id", "arn", "experimentTemplateId", "roleArn", "creationTime"] {
+                assert_eq!(
+                    final_state[member], experiment[member],
+                    "case {case:?}: expected experiment.{member} to be unchanged, got {:?}",
+                    final_state[member]
+                );
+            }
         }
     }
 }
@@ -1007,7 +1093,7 @@ async fn stopping_an_experiment_moves_it_to_stopped_with_a_reason_and_an_end_tim
                 "description": format!("stop: {case}"),
                 "roleArn": "arn:aws:iam::000000000000:role/fis-stop",
                 "stopConditions": [{ "source": "none" }],
-                "actions": { "wait": { "actionId": "aws:fis:wait" } }
+                "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
         )
         .await;
@@ -1062,25 +1148,33 @@ async fn stopping_an_experiment_moves_it_to_stopped_with_a_reason_and_an_end_tim
             "case {case:?}: a stopped experiment carries an endTime, got {experiment:?}"
         );
 
-        // A second stop is a no-op: the status stays stopped and `endTime` does not move.
+        // A second stop is REFUSED: the experiment is in a final state, so the call
+        // answers 400 `ValidationException` and leaves the record exactly as it was.
         let again = stop_experiment(&router, &experiment_id).await;
         assert_eq!(
-            again.status, 200,
-            "case {case:?}: expected HTTP 200 from a repeated StopExperiment, got {} with {:?}",
+            again.status, 400,
+            "case {case:?}: expected HTTP 400 from a stop of a final experiment, got {} with {:?}",
             again.status, again.body
         );
         assert_eq!(
-            again.member("experiment")["state"]["status"]
+            again.error_code(),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            again.body
+        );
+        let untouched = get_experiment(&router, &experiment_id).await;
+        assert_eq!(
+            untouched.member("experiment")["state"]["status"]
                 .as_str()
                 .unwrap_or_default(),
             "stopped",
-            "case {case:?}: a repeated stop must leave the experiment stopped, got {:?}",
-            again.body
+            "case {case:?}: a refused stop must leave the experiment stopped, got {:?}",
+            untouched.body
         );
         assert_eq!(
-            again.member("experiment")["endTime"], experiment["endTime"],
-            "case {case:?}: a repeated stop must not move endTime, got {:?}",
-            again.member("experiment")["endTime"]
+            untouched.member("experiment")["endTime"], experiment["endTime"],
+            "case {case:?}: a refused stop must not move endTime, got {:?}",
+            untouched.member("experiment")["endTime"]
         );
     }
 }
@@ -1101,7 +1195,7 @@ async fn list_experiments_reports_the_persisted_experiments_and_filters_by_templ
                 "description": format!("list: {case}"),
                 "roleArn": "arn:aws:iam::000000000000:role/fis-list",
                 "stopConditions": [{ "source": "none" }],
-                "actions": { "wait": { "actionId": "aws:fis:wait" } }
+                "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
         )
         .await;
@@ -1332,7 +1426,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
             "description": "a template to list",
             "roleArn": "arn:aws:iam::000000000000:role/fis-validation",
             "stopConditions": [{ "source": "none" }],
-            "actions": { "wait": { "actionId": "aws:fis:wait" } }
+            "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
         }),
     )
     .await;
@@ -1349,7 +1443,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
                 "description": "an undocumented stop condition source",
                 "roleArn": "arn:aws:iam::000000000000:role/fis-bad",
                 "stopConditions": [{ "source": "aws:cloudwatch:composite-alarm" }],
-                "actions": { "wait": { "actionId": "aws:fis:wait" } }
+                "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
         ),
         (
@@ -1359,7 +1453,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
                 "description": "an alarm stop condition with no alarm",
                 "roleArn": "arn:aws:iam::000000000000:role/fis-bad",
                 "stopConditions": [{ "source": "aws:cloudwatch:alarm" }],
-                "actions": { "wait": { "actionId": "aws:fis:wait" } }
+                "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
         ),
         (
@@ -1369,7 +1463,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
                 "description": "an account targeting value the enum does not admit",
                 "roleArn": "arn:aws:iam::000000000000:role/fis-bad",
                 "stopConditions": [{ "source": "none" }],
-                "actions": { "wait": { "actionId": "aws:fis:wait" } },
+                "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } },
                 "experimentOptions": { "accountTargeting": "every-account" }
             }),
         ),
@@ -1380,7 +1474,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
                 "description": "a resolution mode the enum does not admit",
                 "roleArn": "arn:aws:iam::000000000000:role/fis-bad",
                 "stopConditions": [{ "source": "none" }],
-                "actions": { "wait": { "actionId": "aws:fis:wait" } },
+                "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } },
                 "experimentOptions": { "emptyTargetResolutionMode": "ignore" }
             }),
         ),
@@ -1391,7 +1485,7 @@ async fn a_request_outside_a_stated_constraint_answers_validation_exception() {
                 "description": "d".repeat(DESCRIPTION_CEILING + 1),
                 "roleArn": "arn:aws:iam::000000000000:role/fis-bad",
                 "stopConditions": [{ "source": "none" }],
-                "actions": { "wait": { "actionId": "aws:fis:wait" } }
+                "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": WAIT_DURATION } } }
             }),
         ),
     ];
