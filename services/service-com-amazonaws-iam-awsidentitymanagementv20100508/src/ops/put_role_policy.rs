@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRolePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRolePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRolePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -193,20 +184,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // `ctx` carries request metadata only; this operation is driven entirely by
+        // its input and the store.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRolePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRolePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRolePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRolePolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // IAM entity names are unique within the account and not distinguished by
+        // case, so the role is looked up by its case-folded name.
+        let key = crate::state::name_key(&input.role_name);
+        let Some(role) = store.roles.get(&key) else {
+            return Err(PutRolePolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The role with name {} cannot be found.",
+                        input.role_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let role_name = role.role_name.clone();
+        // Which service a role is linked to is carried by its path, read through the
+        // one definition of that rule in `crate::state`.
+        let linked_service =
+            crate::state::service_linked_role_principal(&role.path).map(str::to_string);
+
+        // A service-linked role is a protected resource: only the service that
+        // depends on it may change it, so an embed from any other caller is refused
+        // with the modelled `UnmodifiableEntityException`, whose documentation says
+        // the message "includes the name of the service that depends on this
+        // service-linked role".
+        if let Some(linked_service) = linked_service {
+            return Err(PutRolePolicyErrorModeled::UnmodifiableEntityException(
+                UnmodifiableEntityException {
+                    message: Some(format!(
+                        "Service role policies may not be modified: the role {role_name} is a \
+                         service-linked role for {linked_service}, so the change must be \
+                         requested through that service"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An IAM policy document is a JSON object whose top-level elements are
+        // `Version` and `Id` (both optional) and `Statement` (required) — the IAM
+        // JSON policy grammar. The rule itself, and the note on how far it checks,
+        // live on `crate::state::is_policy_document`, which every operation taking
+        // a policy document shares.
+        if !crate::state::is_policy_document(&input.policy_document) {
+            return Err(PutRolePolicyErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(
+                        "Syntax errors in policy: the policy document must be a JSON object \
+                         carrying a Statement element"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The inline policies embedded in one role have a bounded aggregate size,
+        // so a caller cannot grow a role's policy set without limit. A put of an
+        // existing name replaces that document, so the one being replaced does not
+        // count toward the quota the new document has to fit inside.
+        let policy_key = crate::state::name_key(&input.policy_name);
+        let already_embedded = store.role_inline_policy_characters(&key, &policy_key);
+        let would_embed = already_embedded + input.policy_document.chars().count();
+        if would_embed > crate::state::MAX_ROLE_INLINE_POLICY_CHARACTERS {
+            return Err(PutRolePolicyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Maximum policy size of {} characters exceeded for role {role_name}",
+                        crate::state::MAX_ROLE_INLINE_POLICY_CHARACTERS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Stored verbatim and keyed by the case-folded policy name, so a repeat put
+        // of that name replaces the policy rather than adding a second one, and a
+        // later read reports the document exactly as it was embedded.
+        store.role_inline_policies.entry(key).or_default().insert(
+            policy_key,
+            crate::state::InlinePolicy {
+                policy_name: input.policy_name,
+                policy_document: input.policy_document,
+            },
+        );
+        Ok(PutRolePolicyOutput)
     }
 }
