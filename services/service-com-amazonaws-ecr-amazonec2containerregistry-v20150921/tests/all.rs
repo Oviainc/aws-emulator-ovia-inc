@@ -29,6 +29,8 @@ mod registry_replication_configuration;
 mod repository_creation_templates;
 #[path = "all/repository_image_lifecycle.rs"]
 mod repository_image_lifecycle;
+#[path = "all/repository_policy.rs"]
+mod repository_policy;
 #[path = "all/resource_tag_mutations.rs"]
 mod resource_tag_mutations;
 #[path = "all/resource_tags.rs"]
