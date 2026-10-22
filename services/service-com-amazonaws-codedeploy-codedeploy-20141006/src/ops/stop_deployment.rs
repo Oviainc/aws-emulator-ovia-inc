@@ -262,11 +262,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let (Some(rollback_id), Some(revision)) =
                 (rollback_deployment_id.clone(), rollback_revision)
             {
+                // A rollback is a deployment to the SAME deployment group, so it
+                // owes the original environment whatever that group configured,
+                // exactly as a client's own deployment to it does.
+                let (terminates_original_instances, termination_wait_millis) =
+                    deployment_group_name
+                        .as_deref()
+                        .and_then(|group_name| {
+                            state
+                                .applications
+                                .get(&application_name)
+                                .and_then(|application| {
+                                    application.deployment_groups.get(group_name)
+                                })
+                        })
+                        .map_or((false, 0), crate::state::termination_wait);
                 state.record_deployment(crate::state::Deployment {
                     deployment_id: rollback_id,
                     application_name,
                     deployment_group_name,
                     deployment_config_name,
+                    // The revision's identity, computed once here so no later
+                    // request re-derives it from the revision's content.
+                    revision_key: crate::state::revision_key(&revision),
                     revision: Some(revision),
                     // The revision this group was on when the rollback started:
                     // the one the stopped deployment was deploying.
@@ -293,7 +311,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     start_time_ms: None,
                     complete_time_ms: None,
                     starts_at_ms: crate::state::deployment_start_due(stopped_at_ms),
-                    completes_at_ms: crate::state::deployment_completion_due(stopped_at_ms),
+                    completes_at_ms: crate::state::deployment_completion_due(stopped_at_ms)
+                        + termination_wait_millis,
+                    terminates_original_instances,
+                    termination_wait_millis,
+                    instance_termination_wait_time_started: false,
                 });
             }
 

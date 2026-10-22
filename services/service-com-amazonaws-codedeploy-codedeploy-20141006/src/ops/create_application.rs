@@ -199,6 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     tags,
                     deployment_groups: ::std::collections::HashMap::new(),
                     deployment_group_order: Vec::new(),
+                    revisions: ::std::collections::HashMap::new(),
+                    revision_order: Vec::new(),
                 },
             );
             state.application_order.push(name.clone());
