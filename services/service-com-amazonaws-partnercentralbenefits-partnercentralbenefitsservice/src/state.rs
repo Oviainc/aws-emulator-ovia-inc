@@ -127,6 +127,73 @@ pub const MAX_PAGE_SIZE: i32 = 100;
 /// application created, so it is bounded by the same count.
 pub const MAX_APPLICATIONS_PER_CATALOG: usize = 500;
 
+/// The most amendments one `AmendBenefitApplication` request may carry.
+///
+/// The modelled `AmendmentList` has no `@length`, so this is the bound on the work one
+/// request drives — the loop that applies them runs under the store lock — and on how
+/// much the amendment record below keeps. CHOSEN, not an AWS quota: far more fields than
+/// one correction touches, while keeping one request's work and footprint finite.
+pub const MAX_AMENDMENTS_PER_REQUEST: usize = 20;
+
+/// The longest `Amendment$FieldPath` this service reads.
+///
+/// The member is an unconstrained `String`, so this is what keeps a path (and the record
+/// of it below) from being arbitrarily long. CHOSEN: wider than any path into a document
+/// this service stores, since [`MAX_DETAILS_DEPTH`] also caps the segments a path may
+/// have.
+pub const MAX_FIELD_PATH_LEN: usize = 256;
+
+/// The longest value an amendment may write into `BenefitApplicationDetails`.
+///
+/// `Amendment$NewValue` is an unconstrained `String`, while the members a path can name
+/// on the record itself carry the model's own `@length` (`BenefitApplicationName` 1..255,
+/// `BenefitApplicationDescription` 1..1000). This is the matching bound for a leaf of
+/// the document, which the model constrains not at all: the longest string member the
+/// model lets a caller store on this resource.
+pub const MAX_DETAILS_VALUE_LEN: usize = 1000;
+
+/// The longest `AmendmentReason` this service stores, which is the modelled
+/// `AmendBenefitApplicationInput$AmendmentReason` `@length(max: 1000)`
+/// (`smithy_query(query="operation",operation="AmendBenefitApplication")`). The
+/// amendment record below keeps the reason, so this is also the bound on the bytes one
+/// record holds for it.
+pub const MAX_AMENDMENT_REASON_LEN: usize = 1000;
+
+/// The longest `ClientToken` this service stores, which is the modelled
+/// `AmendBenefitApplicationInput$ClientToken` `@length(min: 1, max: 64)` (its
+/// `@pattern` `^[a-zA-Z0-9-]{1,64}$` says the same). The amendment record keeps the
+/// token, so this bounds the bytes one record holds for it.
+pub const MAX_CLIENT_TOKEN_LEN: usize = 64;
+
+/// The most amendments one benefit application keeps a record of.
+///
+/// `AmendBenefitApplication` is idempotent on its `ClientToken`, which it recognises by
+/// looking the token up in this record, so the record is what bounds how far back a
+/// retry is recognised. AWS publishes no retention for the token, so the number is
+/// CHOSEN: more amendments than a retry window needs, while keeping the record of one
+/// application finite however many times it is amended. Beyond it the oldest amendment
+/// is dropped, and a retry of a token that old applies its amendments again.
+///
+/// With [`MAX_AMENDMENTS_PER_REQUEST`], [`MAX_FIELD_PATH_LEN`],
+/// [`MAX_AMENDMENT_REASON_LEN`] and [`MAX_CLIENT_TOKEN_LEN`] — each enforced by
+/// `AmendBenefitApplication` before the record is written — one application's amendment
+/// record holds at most 20 x (64-byte token + 1000-byte reason + 20 x 256-byte path) of
+/// caller text: bounded, like every other part of this store.
+pub const MAX_AMENDMENT_HISTORY: usize = 20;
+
+/// The most members a stored `BenefitApplicationDetails` document may hold, counted over
+/// the whole tree.
+///
+/// The member is an unconstrained `Document` and `AmendBenefitApplication` can ADD a
+/// member the document did not hold, so a count bound is what keeps repeated amendments
+/// from growing one record without limit. Emulator resource guard, NOT an AWS quota.
+pub const MAX_DETAILS_MEMBERS: usize = 256;
+
+/// The most bytes of text (member names and string values) a stored
+/// `BenefitApplicationDetails` document may carry. Emulator resource guard, NOT an AWS
+/// quota; see [`MAX_DETAILS_MEMBERS`].
+pub const MAX_DETAILS_BYTES: usize = 64 * 1024;
+
 /// The most tags one resource of this service holds.
 ///
 /// It is the model's own published bound on an application's tag set —
@@ -280,6 +347,29 @@ pub struct Benefit {
     pub status: String,
 }
 
+/// One amendment request `AmendBenefitApplication` applied to a benefit application.
+///
+/// Kept so a replayed `ClientToken` applies nothing a second time, and as the record of
+/// WHICH fields each amendment changed and why. No modelled output reports it: the model
+/// binds no amendment member on any output shape, so it is state this service holds
+/// rather than something it reports. The new values are not copied here — the fields
+/// themselves hold them — which is also what keeps the record small.
+#[derive(Debug, Clone)]
+pub struct AppliedAmendment {
+    /// The request's `ClientToken`.
+    pub client_token: String,
+    /// The request's `AmendmentReason`.
+    pub reason: String,
+    /// The `FieldPath` of each amendment applied, in the order they were applied; at
+    /// most [`MAX_AMENDMENTS_PER_REQUEST`] of them, each at most
+    /// [`MAX_FIELD_PATH_LEN`] bytes.
+    pub field_paths: Vec<String>,
+    /// When the amendment was applied, as epoch milliseconds.
+    pub applied_at_millis: i64,
+    /// The revision the amendment produced.
+    pub revision: u64,
+}
+
 /// One stored benefit application: the single source of truth for every application
 /// operation.
 #[derive(Debug, Clone)]
@@ -327,6 +417,9 @@ pub struct BenefitApplication {
     pub partner_contacts: Vec<Contact>,
     pub file_details: Vec<FileDetail>,
     pub tags: BTreeMap<String, String>,
+    /// The amendments applied to this application, oldest first, at most
+    /// [`MAX_AMENDMENT_HISTORY`] of them.
+    pub amendments: Vec<AppliedAmendment>,
 }
 
 impl BenefitApplication {
@@ -376,6 +469,22 @@ impl BenefitApplication {
         self.recall_client_token = None;
         self.revision = self.revision.saturating_add(1);
         self.touch(now_millis);
+    }
+
+    /// The amendment `client_token` already applied to this application, if this
+    /// application still holds a record of it.
+    pub fn applied_amendment(&self, client_token: &str) -> Option<&AppliedAmendment> {
+        self.amendments
+            .iter()
+            .find(|applied| applied.client_token == client_token)
+    }
+
+    /// Record one applied amendment, dropping the oldest once the record is full.
+    pub fn record_amendment(&mut self, applied: AppliedAmendment) {
+        self.amendments.push(applied);
+        if self.amendments.len() > MAX_AMENDMENT_HISTORY {
+            self.amendments.remove(0);
+        }
     }
 
     /// A list member, omitted from the wire when nothing was ever stored for it.
@@ -479,9 +588,10 @@ pub const APPLICATION_RESOURCE: &str = "benefit-application";
 /// Per-service state for com-amazonaws-partnercentralbenefits-partnercentralbenefitsservice. A handler reaches it through [`service_state`].
 ///
 /// BOUNDED: `CreateBenefitApplication` refuses a create that would take a catalog past
-/// [`MAX_APPLICATIONS_PER_CATALOG`], the catalog set is fixed by [`SEEDED_CATALOGS`], and
-/// `arns` and `client_tokens` carry at most one entry per stored application — so no
-/// caller can grow this store without limit.
+/// [`MAX_APPLICATIONS_PER_CATALOG`], the catalog set is fixed by [`SEEDED_CATALOGS`],
+/// `arns` and `client_tokens` carry at most one entry per stored application, and one
+/// application records at most [`MAX_AMENDMENT_HISTORY`] amendments — so no caller can
+/// grow this store without limit.
 #[derive(Debug)]
 pub struct ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// Every catalog, keyed by the `Catalog` input string.
@@ -743,18 +853,63 @@ fn document_json(value: &Document, budget: usize) -> String {
     }
 }
 
-/// Why a supplied `BenefitApplicationDetails` cannot be stored, or `None` when it can.
+/// Why a supplied or amended `BenefitApplicationDetails` cannot be stored, or `None`
+/// when it can.
 ///
-/// The one rule: the document must nest no deeper than [`MAX_DETAILS_DEPTH`]. Both
-/// operations that accept the member apply it, each rendering the refusal as its own
-/// modelled `ValidationException`.
+/// Three rules, each an emulator resource guard on a member the model leaves entirely
+/// caller-controlled: the document must nest no deeper than [`MAX_DETAILS_DEPTH`], hold
+/// no more than [`MAX_DETAILS_MEMBERS`] members over the whole tree, and carry no more
+/// than [`MAX_DETAILS_BYTES`] of text. Every operation that writes the member applies
+/// this — the create and the update to the document they were handed,
+/// `AmendBenefitApplication` to the document its amendments produced — each rendering
+/// the refusal as its own modelled `ValidationException`.
 pub fn details_rejection(details: Option<&Document>) -> Option<String> {
-    let fits = details.is_none_or(|document| document_fits(document, MAX_DETAILS_DEPTH));
-    (!fits).then(|| {
-        format!(
+    let document = details?;
+    if !document_fits(document, MAX_DETAILS_DEPTH) {
+        return Some(format!(
             "BenefitApplicationDetails nests deeper than the {MAX_DETAILS_DEPTH} levels this service accepts"
+        ));
+    }
+    // Counted only after the depth check, so this walk's recursion is already bounded.
+    let (members, bytes) = document_weight(document);
+    if members > MAX_DETAILS_MEMBERS {
+        return Some(format!(
+            "BenefitApplicationDetails holds more than the {MAX_DETAILS_MEMBERS} members this service stores"
+        ));
+    }
+    (bytes > MAX_DETAILS_BYTES).then(|| {
+        format!(
+            "BenefitApplicationDetails carries more than the {MAX_DETAILS_BYTES} bytes of text this service stores"
         )
     })
+}
+
+/// How many members and how many bytes of text `value` holds, over the whole tree: the
+/// two sizes [`details_rejection`] bounds.
+///
+/// A member is an object member or an array element; the bytes counted are the member
+/// names and the string values, which is all of the document a caller chooses the SIZE
+/// of (a number or a boolean has none).
+fn document_weight(value: &Document) -> (usize, usize) {
+    match value {
+        Document::Null | Document::Bool(_) | Document::Number(_) => (0, 0),
+        Document::String(text) => (0, text.len()),
+        Document::Array(items) => items.iter().fold((0, 0), |(members, bytes), item| {
+            let (item_members, item_bytes) = document_weight(item);
+            (members + 1 + item_members, bytes + item_bytes)
+        }),
+        Document::Object(entries) => {
+            entries
+                .iter()
+                .fold((0, 0), |(members, bytes), (name, member)| {
+                    let (member_members, member_bytes) = document_weight(member);
+                    (
+                        members + 1 + member_members,
+                        bytes + name.len() + member_bytes,
+                    )
+                })
+        }
+    }
 }
 
 /// Whether `value` nests no deeper than `budget` levels.

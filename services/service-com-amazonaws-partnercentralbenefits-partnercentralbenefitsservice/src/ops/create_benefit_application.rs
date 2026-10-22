@@ -329,6 +329,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|file| crate::state::file_detail(file, &principal, now))
                 .collect(),
             tags: crate::state::tag_map(input.tags.as_ref()),
+            // A freshly created application has been amended by nobody.
+            amendments: Vec::new(),
         };
         let revision = application.created_revision_text();
         store.insert_application(input.client_token, application);

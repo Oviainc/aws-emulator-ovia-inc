@@ -52,15 +52,15 @@ use std::sync::Arc;
 /// code and the message together.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
-/// Render one constraint violation the way PartnerCentral states it: the member path
-/// and the constraint it failed, and NOTHING of the value that was rejected.
+/// The requirement one violation class states, in this service's wording.
 ///
-/// Returns `None` for a violation class this service has no wording for, which lets
-/// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
-/// rather than invent a sentence ([`ViolationKind`] is `#[non_exhaustive]`, so a class
-/// can be added upstream).
-pub fn constraint_clause(violation: &Violation) -> Option<String> {
-    let requirement = match &violation.kind {
+/// Separate from [`constraint_clause`] so a handler refusing an unmodelled constraint of
+/// the same CLASS (a length an operation enforces itself, say) states it with the same
+/// words the centralized walk uses, rather than a copy that can drift.
+///
+/// `None` for a class this service has no wording for — see [`constraint_clause`].
+pub fn constraint_requirement(kind: &ViolationKind) -> Option<String> {
+    let requirement = match kind {
         ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
         ViolationKind::MinLength(min) => {
             format!("Member must have length greater than or equal to {min}")
@@ -87,17 +87,35 @@ pub fn constraint_clause(violation: &Violation) -> Option<String> {
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
     };
+    Some(requirement)
+}
+
+/// One clause of a refusal: the member path, then the requirement it failed. The one
+/// construction both the walk's refusals and a handler's own use, so the two cannot
+/// drift.
+///
+/// `subject_null` renders the subject for an absent member, which has no submitted value
+/// at all: that is a fact of the request's shape, not a rendering of a value the caller
+/// sent.
+pub fn member_clause(path: &str, requirement: &str, subject_null: bool) -> String {
+    let subject = if subject_null { "Value null" } else { "Value" };
+    format!("{subject} at '{path}' failed to satisfy constraint: {requirement}")
+}
+
+/// Render one constraint violation the way PartnerCentral states it: the member path
+/// and the constraint it failed, and NOTHING of the value that was rejected.
+///
+/// Returns `None` for a violation class this service has no wording for, which lets
+/// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
+/// rather than invent a sentence ([`ViolationKind`] is `#[non_exhaustive]`, so a class
+/// can be added upstream).
+pub fn constraint_clause(violation: &Violation) -> Option<String> {
+    let requirement = constraint_requirement(&violation.kind)?;
     // An absent member has no submitted value at all, so it is reported as the null it
     // was: that is a fact of the request's shape, not a rendering of a value the caller
     // sent. Every other violation names the member only.
-    let subject = match &violation.kind {
-        ViolationKind::MissingRequiredMember => "Value null",
-        _ => "Value",
-    };
-    Some(format!(
-        "{subject} at '{}' failed to satisfy constraint: {requirement}",
-        violation.path
-    ))
+    let absent = matches!(violation.kind, ViolationKind::MissingRequiredMember);
+    Some(member_clause(&violation.path, &requirement, absent))
 }
 
 /// A `@pattern` expression without the anchors the model may spell it with. A `$`
@@ -127,6 +145,15 @@ pub fn constraint_envelope(violations: &[Violation]) -> Option<String> {
         .iter()
         .map(constraint_clause)
         .collect::<Option<Vec<_>>>()?;
+    validation_envelope(&clauses)
+}
+
+/// The AWS validation envelope (`N validation error(s) detected: `) over clauses already
+/// rendered by [`member_clause`]. `None` for no clause at all.
+///
+/// A handler refusing an input member of its own states it through here, so an
+/// in-handler refusal reads exactly like one the centralized walk produced.
+pub fn validation_envelope(clauses: &[String]) -> Option<String> {
     match clauses.len() {
         0 => None,
         1 => Some(format!("1 validation error detected: {}", clauses[0])),
