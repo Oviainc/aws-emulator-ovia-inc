@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPlatformVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPlatformVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPlatformVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the platform versions available to the account — the AWS-managed
+//! catalogue, addressed in the region the request was signed for, plus the custom platform
+//! versions the store holds — narrowed by every supplied `PlatformFilter` term and paginated
+//! by `MaxRecords`/`NextToken`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +86,8 @@
 //! * `InsufficientPrivilegesException` (HTTP 403) — The specified account does not have
 //!   sufficient privileges for one or more Amazon Web Services services.
 
+use std::cmp::Ordering;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -163,18 +160,344 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPlatformVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPlatformVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPlatformVersions"))
+        // "The filter is interpreted as a logical conjunction (AND) of the
+        // separate PlatformFilter terms": every term is parsed up front, so a
+        // filter the service cannot evaluate is refused rather than ignored.
+        let terms = input
+            .filters
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(position, filter)| FilterTerm::parse(position, filter))
+            .collect::<Result<Vec<FilterTerm>, Self::Error>>()?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPlatformVersionsError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+
+        // What this account can list in the region this request was signed
+        // for: the platform versions AWS publishes there (the service's own
+        // solution-stack catalog, with each entry's branch attributes taken from
+        // the branch catalog the store holds) and the custom platform versions
+        // the store holds there. A platform version is a REGIONAL resource — its
+        // ARN names the region it lives in — so a custom one created in another
+        // region is not listed here.
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        // The only write a report performs: a status change the clock already
+        // made due (a custom platform version's `Creating` -> `Ready`) was owed
+        // whether or not anybody called, so it is settled before the store is
+        // read — otherwise this operation and DescribePlatformVersion would
+        // disagree about the version's status.
+        store.materialize_due_transitions();
+        let mut available =
+            crate::state::managed_platform_summaries(&region, &store.platform_branches);
+        available.extend(
+            store
+                .platform_versions
+                .values()
+                .filter(|version| arn_region(&version.arn) == Some(region.as_str()))
+                .map(crate::state::PlatformVersion::to_summary),
+        );
+        drop(store);
+
+        // A stable total order, so a `NextToken` taken from one response names
+        // the same page boundary in the next: by platform name, the newest
+        // version of a platform first, with the ARN breaking any remaining tie.
+        available.sort_by(|left, right| {
+            platform_name(left)
+                .cmp(platform_name(right))
+                .then_with(|| {
+                    crate::state::version_cmp(version_of(right), version_of(left))
+                })
+                .then_with(|| arn_of(left).cmp(arn_of(right)))
+        });
+
+        let matching: Vec<PlatformSummary> = available
+            .into_iter()
+            .filter(|version| terms.iter().all(|term| term.matches(version)))
+            .collect();
+
+        // The page boundary is the ARN of the first platform version of the
+        // next page — stable under the order above, and the only value in a
+        // summary that identifies one version.
+        let offset = match input.next_token.as_deref() {
+            Some(token) => matching
+                .iter()
+                .position(|version| arn_of(version) == token)
+                .ok_or_else(|| {
+                    ListPlatformVersionsError::invalid_parameter_value(format!(
+                        "Invalid NextToken: {token}"
+                    ))
+                })?,
+            None => 0,
+        };
+        let page = &matching[offset..];
+        // `MaxRecords` is modelled `range 1..`, so the boundary validator has
+        // already refused anything below one before this handler runs; the
+        // guard keeps a future widening of that range from inventing an empty
+        // page with a continuation token.
+        let max_records = input
+            .max_records
+            .and_then(|max_records| usize::try_from(max_records).ok())
+            .filter(|max_records| *max_records > 0);
+        let (page, next_token) = match max_records {
+            Some(max_records) if page.len() > max_records => (
+                &page[..max_records],
+                Some(arn_of(&page[max_records]).to_string()),
+            ),
+            _ => (page, None),
+        };
+
+        Ok(ListPlatformVersionsOutput {
+            platform_summary_list: Some(page.to_vec()),
+            next_token,
+        })
     }
+}
+
+/// The `PlatformArn` of one summary — what a page boundary is named by.
+fn arn_of(summary: &PlatformSummary) -> &str {
+    summary.platform_arn.as_deref().unwrap_or_default()
+}
+
+/// The `PlatformVersion` of one summary, or the empty string when it carries
+/// none.
+fn version_of(summary: &PlatformSummary) -> &str {
+    summary.platform_version.as_deref().unwrap_or_default()
+}
+
+/// The platform name a summary's ARN carries (`…:platform/<name>/<version>`) —
+/// the attribute the `PlatformName` filter type is applied to, which
+/// `PlatformSummary` reports only inside `PlatformArn`.
+fn platform_name(summary: &PlatformSummary) -> &str {
+    let resource = arn_of(summary).split(':').next_back().unwrap_or_default();
+    let after_kind = resource.strip_prefix("platform/").unwrap_or(resource);
+    match after_kind.rfind('/') {
+        Some(at) => &after_kind[..at],
+        None => after_kind,
+    }
+}
+
+/// The platform-version attribute a filter term is applied to.
+///
+/// The set is `PlatformFilter$Type`'s: "Valid values: `PlatformName` |
+/// `PlatformVersion` | `PlatformStatus` | `PlatformBranchName` |
+/// `PlatformLifecycleState` | `PlatformOwner` | `SupportedTier` |
+/// `SupportedAddon` | `ProgrammingLanguageName` | `OperatingSystemName`".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attribute {
+    PlatformName,
+    PlatformVersion,
+    PlatformStatus,
+    PlatformBranchName,
+    PlatformLifecycleState,
+    PlatformOwner,
+    SupportedTier,
+    SupportedAddon,
+    ProgrammingLanguageName,
+    OperatingSystemName,
+}
+
+impl Attribute {
+    /// The valid values, in the order the model documents them, for the refusal
+    /// message of a type this service does not know.
+    const VALID_VALUES: &'static str = "PlatformName | PlatformVersion | PlatformStatus | \
+         PlatformBranchName | PlatformLifecycleState | PlatformOwner | SupportedTier | \
+         SupportedAddon | ProgrammingLanguageName | OperatingSystemName";
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "PlatformName" => Some(Self::PlatformName),
+            "PlatformVersion" => Some(Self::PlatformVersion),
+            "PlatformStatus" => Some(Self::PlatformStatus),
+            "PlatformBranchName" => Some(Self::PlatformBranchName),
+            "PlatformLifecycleState" => Some(Self::PlatformLifecycleState),
+            "PlatformOwner" => Some(Self::PlatformOwner),
+            "SupportedTier" => Some(Self::SupportedTier),
+            "SupportedAddon" => Some(Self::SupportedAddon),
+            "ProgrammingLanguageName" => Some(Self::ProgrammingLanguageName),
+            "OperatingSystemName" => Some(Self::OperatingSystemName),
+            _ => None,
+        }
+    }
+
+    /// This attribute's value(s) on `summary`. Three of the attributes are
+    /// multi-valued (the tiers and the addons a version supports, the languages
+    /// it runs); the rest carry exactly one value. A member the summary does not
+    /// carry reads as NO value, so an `=` term on it selects nothing and a `!=`
+    /// term selects everything — the honest answer for an attribute only a built
+    /// platform's definition archive states, which this service does not read.
+    fn values_of(self, summary: &PlatformSummary) -> Vec<&str> {
+        /// The member's one value, or no value at all when it is absent.
+        fn one(member: Option<&String>) -> Vec<&str> {
+            member.map(String::as_str).into_iter().collect()
+        }
+        /// Every value of a list member, or none when the list is absent.
+        fn many(member: Option<&Vec<String>>) -> Vec<&str> {
+            member
+                .map(|values| values.iter().map(String::as_str).collect())
+                .unwrap_or_default()
+        }
+        match self {
+            Self::PlatformName => vec![platform_name(summary)],
+            Self::PlatformVersion => one(summary.platform_version.as_ref()),
+            Self::PlatformStatus => one(summary.platform_status.as_ref()),
+            Self::PlatformBranchName => one(summary.platform_branch_name.as_ref()),
+            Self::PlatformLifecycleState => one(summary.platform_lifecycle_state.as_ref()),
+            Self::PlatformOwner => one(summary.platform_owner.as_ref()),
+            Self::OperatingSystemName => one(summary.operating_system_name.as_ref()),
+            Self::SupportedTier => many(summary.supported_tier_list.as_ref()),
+            Self::SupportedAddon => many(summary.supported_addon_list.as_ref()),
+            // A summary carries no programming language at all: the languages a
+            // platform runs are read off its definition archive, which this
+            // service does not read.
+            Self::ProgrammingLanguageName => Vec::new(),
+        }
+    }
+}
+
+/// The test a filter term applies to its attribute.
+///
+/// The set is `PlatformFilter$Operator`'s: "Valid values: `=` | `!=` | `<` |
+/// `<=` | `>` | `>=` | `contains` | `begins_with` | `ends_with`".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Operator {
+    Equal,
+    NotEqual,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+    Contains,
+    BeginsWith,
+    EndsWith,
+}
+
+impl Operator {
+    /// The valid values, in the order the model documents them, for the refusal
+    /// message of an operator this service does not know.
+    const VALID_VALUES: &'static str =
+        "= | != | < | <= | > | >= | contains | begins_with | ends_with";
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "=" => Some(Self::Equal),
+            "!=" => Some(Self::NotEqual),
+            "<" => Some(Self::Less),
+            "<=" => Some(Self::LessOrEqual),
+            ">" => Some(Self::Greater),
+            ">=" => Some(Self::GreaterOrEqual),
+            "contains" => Some(Self::Contains),
+            "begins_with" => Some(Self::BeginsWith),
+            "ends_with" => Some(Self::EndsWith),
+            _ => None,
+        }
+    }
+
+    /// Whether `candidate <operator> value` holds for one value of the
+    /// attribute.
+    ///
+    /// The ordering operators compare through [`crate::state::version_cmp`]: a
+    /// dotted-numeric value is ordered component by component numerically — so
+    /// `4.0.11` is above `4.0.9`, which a byte comparison gets wrong — and
+    /// anything else by bytes.
+    fn holds(self, candidate: &str, value: &str) -> bool {
+        match self {
+            Self::Equal => candidate == value,
+            // The one statement of the `!=` rule: the negation of the equality
+            // test above. `FilterTerm::matches` applies it over the whole
+            // candidate set, which for a single-valued attribute is this.
+            Self::NotEqual => !Self::Equal.holds(candidate, value),
+            Self::Less => crate::state::version_cmp(candidate, value) == Ordering::Less,
+            Self::LessOrEqual => {
+                crate::state::version_cmp(candidate, value) != Ordering::Greater
+            }
+            Self::Greater => crate::state::version_cmp(candidate, value) == Ordering::Greater,
+            Self::GreaterOrEqual => crate::state::version_cmp(candidate, value) != Ordering::Less,
+            Self::Contains => candidate.contains(value),
+            Self::BeginsWith => candidate.starts_with(value),
+            Self::EndsWith => candidate.ends_with(value),
+        }
+    }
+}
+
+/// One parsed `PlatformFilter`: "The filter is evaluated as follows: `Type
+/// Operator Values[1]`".
+#[derive(Debug)]
+struct FilterTerm {
+    attribute: Attribute,
+    operator: Operator,
+    value: String,
+}
+
+impl FilterTerm {
+    /// Parse the term at `position` of the request's `Filters` list, refusing a
+    /// term this service cannot evaluate. `PlatformFilter`'s members are
+    /// modelled as plain strings with no enum constraint, so none of this is
+    /// refused by the boundary validator before the handler runs.
+    fn parse(position: usize, filter: &PlatformFilter) -> Result<Self, ListPlatformVersionsError> {
+        let Some(type_name) = filter.r#type.as_deref().filter(|name| !name.is_empty()) else {
+            return Err(ListPlatformVersionsError::missing_required_parameter(
+                format!("Filters[{position}].Type must be specified"),
+            ));
+        };
+        let attribute = Attribute::parse(type_name).ok_or_else(|| {
+            ListPlatformVersionsError::invalid_parameter_value(format!(
+                "Filters[{position}].Type: {type_name} is not a platform version attribute. \
+                 Valid values: {}",
+                Attribute::VALID_VALUES
+            ))
+        })?;
+        // "The operator to apply to the Type with each of the Values" — a term
+        // that names none is the equality test.
+        let operator = match filter.operator.as_deref().filter(|name| !name.is_empty()) {
+            Some(name) => Operator::parse(name).ok_or_else(|| {
+                ListPlatformVersionsError::invalid_parameter_value(format!(
+                    "Filters[{position}].Operator: {name} is not a platform filter operator. \
+                     Valid values: {}",
+                    Operator::VALID_VALUES
+                ))
+            })?,
+            None => Operator::Equal,
+        };
+        // "Only one value is supported for all current operators", and the term
+        // is evaluated as `Type Operator Values[1]`, so a term carrying no
+        // value cannot be evaluated at all.
+        let Some(value) = filter.values.as_ref().and_then(|values| values.first()) else {
+            return Err(ListPlatformVersionsError::missing_required_parameter(
+                format!("Filters[{position}].Values must specify a value"),
+            ));
+        };
+        Ok(Self {
+            attribute,
+            operator,
+            value: value.clone(),
+        })
+    }
+
+    /// Whether `version` satisfies this term.
+    fn matches(&self, version: &PlatformSummary) -> bool {
+        let candidates = self.attribute.values_of(version);
+        match self.operator {
+            // Over a multi-valued attribute "not equal" holds when NO value of
+            // the attribute equals the term's — over a single-valued one that is
+            // the same test.
+            Operator::NotEqual => !candidates
+                .iter()
+                .any(|candidate| Operator::Equal.holds(candidate, &self.value)),
+            _ => candidates
+                .iter()
+                .any(|candidate| self.operator.holds(candidate, &self.value)),
+        }
+    }
+}
+
+/// The region segment of an ARN (`arn:aws:<service>:<region>:<account>:<resource>`),
+/// which is the region the resource it names lives in.
+fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3)
 }

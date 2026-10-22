@@ -1235,6 +1235,98 @@ macro_rules! environment_description {
 
 pub(crate) use environment_description;
 
+/// `PlatformLifecycleState` for the newest version of a branch, as
+/// `PlatformSummary$PlatformLifecycleState` documents it: "Possible values:
+/// `recommended` | empty. If an empty value is returned, the platform version is
+/// supported but isn't the recommended one for its branch."
+pub const PLATFORM_LIFECYCLE_RECOMMENDED: &str = "recommended";
+
+/// Order two version strings, and more generally two platform attribute values.
+///
+/// A dotted-numeric value — a `PlatformVersion` such as `4.0.11`, an
+/// `OperatingSystemVersion` — is ordered component by component NUMERICALLY, so
+/// `4.0.11` is above `4.0.9` as a version ordering requires, and a shorter
+/// prefix (`4.0`) below a longer value that extends it (`4.0.1`). A value that
+/// is not dotted-numeric orders by bytes among its own kind and AFTER every
+/// dotted-numeric one.
+///
+/// That last rule is what makes this a TOTAL order, which `sort_by` requires:
+/// comparing numerically within one kind and by bytes across kinds would not be
+/// transitive (`10` > `9` numerically, `9` > `1a` by bytes, yet `10` < `1a` by
+/// bytes), and a caller can put such a mix in the store, since
+/// `CreatePlatformVersion` takes `PlatformVersion` as a string. The ordering is
+/// equivalent to sorting on the key `(is not dotted-numeric, components, bytes)`.
+///
+/// The newest version of a platform branch is decided by this ordering, and so
+/// are `ListPlatformVersions`' `<`/`<=`/`>`/`>=` filter operators, so the two
+/// cannot disagree.
+pub fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    match (numeric_components(left), numeric_components(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
+}
+
+/// `value`'s `.`-separated components when every one of them is a decimal
+/// number, `None` otherwise.
+fn numeric_components(value: &str) -> Option<Vec<u64>> {
+    if value.is_empty() {
+        return None;
+    }
+    value
+        .split('.')
+        .map(|component| component.parse::<u64>().ok())
+        .collect()
+}
+
+/// The AWS-managed platform versions a request in `region` can list, as the
+/// modelled `PlatformSummary`.
+///
+/// The catalog is the service's own: [`SOLUTION_STACKS`] holds the published
+/// version of every platform branch, and `branches` — the branch catalog the
+/// store holds and `ListPlatformBranches` reports — supplies that branch's
+/// life-cycle state and supported tiers, so the two operations cannot disagree
+/// about them. Only the ARNs are regional, so the list is rendered per request
+/// rather than copied into the store, where it would go stale against the
+/// region the caller signed for.
+///
+/// `PlatformLifecycleState` is [`PLATFORM_LIFECYCLE_RECOMMENDED`] for every
+/// entry because the catalog publishes exactly one version per branch, so each
+/// published version IS its branch's recommended one. A stack whose branch the
+/// store does not hold is not published: a version of a branch nobody can see is
+/// not available to the account either. What only a built platform's definition
+/// archive carries (its category, operating system and addons) is left ABSENT
+/// rather than guessed, exactly as [`SolutionStack::to_description`] leaves it.
+pub fn managed_platform_summaries(
+    region: &str,
+    branches: &BTreeMap<String, PlatformBranch>,
+) -> Vec<PlatformSummary> {
+    SOLUTION_STACKS
+        .iter()
+        .filter_map(|stack| {
+            let branch = branches
+                .values()
+                .find(|branch| branch.branch_name == stack.branch_name)?;
+            Some(PlatformSummary {
+                platform_arn: Some(stack.platform_arn(region)),
+                platform_owner: Some(MANAGED_PLATFORM_OWNER.to_string()),
+                platform_status: Some(PLATFORM_STATUS_READY.to_string()),
+                platform_version: Some(stack.platform_version.to_string()),
+                platform_branch_name: Some(branch.branch_name.clone()),
+                platform_branch_lifecycle_state: Some(branch.lifecycle_state.clone()),
+                supported_tier_list: Some(branch.supported_tiers.clone()),
+                platform_lifecycle_state: Some(PLATFORM_LIFECYCLE_RECOMMENDED.to_string()),
+                platform_category: None,
+                operating_system_name: None,
+                operating_system_version: None,
+                supported_addon_list: None,
+            })
+        })
+        .collect()
+}
+
 /// Per-service state for com-amazonaws-elasticbeanstalk-awselasticbeanstalkservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
