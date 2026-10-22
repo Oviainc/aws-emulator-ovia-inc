@@ -499,7 +499,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DisplayName` is a uniqueness claim within the identity store, which an
         // update makes exactly as a create does: a name another group of this store
         // already holds conflicts, while the group's own current name is already its
-        // claim and so does not. The name is `@sensitive` and stays out of the message.
+        // claim and so does not. The conflict names the CLAIM that was violated and
+        // nothing else: neither the `@sensitive` name nor the group that holds it.
         if let Some(display_name) = &updated.display_name {
             if store
                 .group_display_name_index
@@ -507,10 +508,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .is_some_and(|owner| *owner != updated.group_id)
             {
                 return Err(UpdateGroupErrorModeled::ConflictException(
-                    crate::state::uniqueness_conflict(format!(
-                        "another group in identity store {} already has this DisplayName",
-                        store.identity_store_id
-                    )),
+                    crate::state::uniqueness_conflict(
+                        crate::state::UniquenessClaim::GroupDisplayName,
+                    ),
                 )
                 .into());
             }

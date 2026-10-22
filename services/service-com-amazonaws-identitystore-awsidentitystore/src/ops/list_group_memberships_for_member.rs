@@ -183,11 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // member is always a user of this identity store, and that user must exist for
         // the listing to be about anything — an absent one is the modelled
         // `ResourceNotFoundException`, as it is on the operations that take the other
-        // end of a membership.
+        // end of a membership. The request names that user through `MemberId` rather
+        // than through a user id of its own, so it is the member end's constant, exactly
+        // as `CreateGroupMembership` and `IsMemberInGroups` answer. A store that was
+        // never created holds no such member either and is reported the same way, as
+        // this operation's own suite pins: the member is the resource the call is about.
         let MemberId::UserId(member) = &input.member_id;
         let not_found = || {
             ListGroupMembershipsForMemberErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::ResourceKind::User, member),
+                crate::state::member_not_found(member),
             )
         };
         let store = state.store(&input.identity_store_id).ok_or_else(not_found)?;
