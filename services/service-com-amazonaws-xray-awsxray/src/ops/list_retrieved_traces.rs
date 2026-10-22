@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRetrievedTraces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRetrievedTraces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRetrievedTraces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the traces of the retrieval a `RetrievalToken` names: its
+//! `RetrievalStatus`, recomputed from the instants the retrieval was stored
+//! with, and — once that status is `COMPLETE` — the stored segment documents of
+//! the requested trace ids that fall inside the requested window.
+//!
+//! "This API does not initiate a retrieval process", so nothing here starts
+//! work or moves a status: the only state this writes is the expiry the clock
+//! already owed ([`crate::state::ComAmazonawsXrayAwsxrayState::trace_retrieval`]).
+//!
+//! Three refusals:
+//!
+//! * a token this service never issued, or whose retrieval has timed out, names
+//!   no retrieval and is refused with `ResourceNotFoundException` (404);
+//! * a `NextToken` this operation never issued for this retrieval is refused
+//!   with `InvalidRequestException` (400), the same refusal `BatchGetTraces`
+//!   makes for a page token it did not mint; and
+//! * `TraceFormat` `OTEL` is refused with `InvalidRequestException` (400): this
+//!   emulator ingests X-Ray segment documents (`PutTraceSegments`) and holds no
+//!   OpenTelemetry form of them, so there is no OTEL representation of these
+//!   spans to answer with.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +170,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRetrievedTraces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRetrievedTracesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRetrievedTraces"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRetrievedTracesErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray trace store is unavailable on this emulator engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = crate::state::now_epoch_seconds();
+        let mut store = state.lock();
+        // Cloned out of the store: the lookup materialises the clock's expiry, so
+        // it borrows the store mutably, and deriving the traces below reads it
+        // again.
+        let retrieval = store
+            .trace_retrieval(&input.retrieval_token, now)
+            .cloned();
+        let Some(retrieval) = retrieval else {
+            return Err(ListRetrievedTracesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(retrieval_not_found(&input.retrieval_token)),
+                    resource_name: Some(input.retrieval_token.clone()),
+                },
+            )
+            .into());
+        };
+
+        // The only format these spans exist in is the one they were ingested in.
+        // Asked AFTER the token is resolved, so a token no retrieval stands
+        // behind is answered by the one refusal that names it, whatever format
+        // the request asked for.
+        let requested_format = input
+            .trace_format
+            .as_deref()
+            .unwrap_or(crate::state::TRACE_FORMAT_XRAY);
+        if requested_format != crate::state::TRACE_FORMAT_XRAY {
+            return Err(refuse(format!(
+                "TraceFormat `{requested_format}` is not available: these spans were ingested as X-Ray segment documents, so only `{}` can be retrieved",
+                crate::state::TRACE_FORMAT_XRAY
+            )));
+        }
+
+        // "When the RetrievalStatus is not COMPLETE, the API will return an empty
+        // response" — so the status is the whole answer until the clock has made
+        // the results readable.
+        let status = retrieval.status(now);
+        if status != crate::state::RETRIEVAL_STATUS_COMPLETE {
+            return Ok(ListRetrievedTracesOutput {
+                retrieval_status: Some(status.to_string()),
+                trace_format: Some(crate::state::TRACE_FORMAT_XRAY.to_string()),
+                traces: Some(Vec::new()),
+                next_token: None,
+            });
+        }
+
+        let retrieved = store.retrieved_traces(&retrieval);
+
+        // The token names how far into this retrieval's traces the last page
+        // got, so the only values this operation ever issues are whole pages in.
+        // Anything else — unparseable, not on a page boundary, or past the end —
+        // it never issued, and is refused rather than answered with a page.
+        let offset = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(offset)
+                    if offset < retrieved.len() && offset % RETRIEVED_TRACES_PAGE_SIZE == 0 =>
+                {
+                    offset
+                }
+                _ => {
+                    return Err(refuse(format!(
+                        "NextToken `{token}` was not issued by this service for this RetrievalToken"
+                    )))
+                }
+            },
+        };
+
+        let traces: Vec<RetrievedTrace> = retrieved
+            .iter()
+            .skip(offset)
+            .take(RETRIEVED_TRACES_PAGE_SIZE)
+            .map(retrieved_trace)
+            .collect();
+        let consumed = offset + traces.len();
+        let next_token = (consumed < retrieved.len()).then(|| consumed.to_string());
+
+        Ok(ListRetrievedTracesOutput {
+            retrieval_status: Some(status.to_string()),
+            trace_format: Some(crate::state::TRACE_FORMAT_XRAY.to_string()),
+            traces: Some(traces),
+            next_token,
+        })
     }
+}
+
+/// How many `RetrievedTrace` values one page carries.
+///
+/// MODELLED, not chosen: `ListRetrievedTracesResult$Traces` is `@length(max: 5)`
+/// (`smithy_query(query="operation",operation="ListRetrievedTraces")`), so a
+/// retrieval of more traces than that is paginated rather than truncated.
+pub const RETRIEVED_TRACES_PAGE_SIZE: usize = 5;
+
+/// The most `Span` values one `RetrievedTrace` carries.
+///
+/// MODELLED too: `RetrievedTrace$Spans` is `@length(max: 100)`
+/// (`smithy_query(query="shape",shape="RetrievedTrace")`), while a stored trace
+/// may hold up to [`crate::state::MAX_SEGMENTS_PER_TRACE`] segments. The model
+/// gives a retrieved trace neither a span page token nor a `LimitExceeded`-style
+/// flag, so a trace with more in-window segments than this is reported with its
+/// first `MAX_SPANS_PER_RETRIEVED_TRACE` of them, in stored order: the modelled
+/// bound is the cap, and `BatchGetTraces` remains the reader that answers a
+/// whole trace.
+pub const MAX_SPANS_PER_RETRIEVED_TRACE: usize = 100;
+
+/// What a `RetrievalToken` that names no stored retrieval is refused with.
+fn retrieval_not_found(retrieval_token: &str) -> String {
+    format!("RetrievalToken `{retrieval_token}` was not issued by this service, or its retrieval has timed out")
+}
+
+/// One trimmed stored trace as the modelled `RetrievedTrace`: its spans are the
+/// stored segment documents, byte for byte, the way `BatchGetTraces` answers
+/// them ("For information on what each trace returns, see BatchGetTraces").
+fn retrieved_trace(trace: &crate::state::TraceRecord) -> RetrievedTrace {
+    RetrievedTrace {
+        id: Some(trace.id.clone()),
+        duration: trace.duration(),
+        spans: Some(
+            trace
+                .segments
+                .iter()
+                .take(MAX_SPANS_PER_RETRIEVED_TRACE)
+                .map(|segment| Span {
+                    id: Some(segment.id.clone()),
+                    document: Some(segment.document.clone()),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Refuse the request with the error this operation models for an invalid one.
+fn refuse(message: String) -> ListRetrievedTracesError {
+    ListRetrievedTracesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
 }

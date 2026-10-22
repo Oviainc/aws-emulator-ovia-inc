@@ -7,6 +7,13 @@
 //! later reader has a retrieval to resume from and a token this service never
 //! issued resolves to nothing.
 //!
+//! The retrieval the token names is not readable at once: it is stored with the
+//! instants the clock owes its status transitions at, so it reports `SCHEDULED`,
+//! then `RUNNING`, then `COMPLETE`
+//! ([`crate::state::TraceRetrievalRecord::status`]) — which is what
+//! `ListRetrievedTraces` and `GetRetrievedTracesGraph` answer for it, and what
+//! `CancelTraceRetrieval` can still stop while it is one of the first two.
+//!
 //! Two refusals come before that token exists:
 //!
 //! * a `[StartTime, EndTime]` window that names no interval of recorded traffic

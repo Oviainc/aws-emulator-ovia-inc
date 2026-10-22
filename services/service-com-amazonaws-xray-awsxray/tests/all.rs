@@ -53,6 +53,9 @@ mod trace_graph;
 #[path = "all/trace_ingest_and_groups.rs"]
 mod trace_ingest_and_groups;
 
+#[path = "all/trace_retrieval_lifecycle.rs"]
+mod trace_retrieval_lifecycle;
+
 #[path = "all/trace_segment_destination.rs"]
 mod trace_segment_destination;
 
