@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteAutomationRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteAutomationRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteAutomationRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the automation rules the request names from [`crate::state`], so a later
+//! import applies none of them. A rule ARN that names no rule in the caller's
+//! account and Region is reported in `UnprocessedAutomationRules`.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteAutomationRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteAutomationRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteAutomationRules"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchDeleteAutomationRulesError::Modeled(
+                BatchDeleteAutomationRulesErrorModeled::InternalException(InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                }),
+            )
+        })?;
+
+        let hub = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&hub) {
+            return Err(
+                BatchDeleteAutomationRulesErrorModeled::InvalidAccessException(
+                    InvalidAccessException {
+                        message: Some(format!(
+                            "Account {} is not subscribed to Security Hub CSPM in Region {}",
+                            hub.0, hub.1
+                        )),
+                        code: Some("InvalidAccessException".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut processed: Vec<String> = Vec::new();
+        let mut unprocessed: Vec<UnprocessedAutomationRule> = Vec::new();
+        for rule_arn in input.automation_rules_arns {
+            let key = crate::state::AutomationRuleKey {
+                account_id: hub.0.clone(),
+                region: hub.1.clone(),
+                rule_arn: rule_arn.clone(),
+            };
+            if store.automation_rules.remove(&key).is_some() {
+                processed.push(rule_arn);
+            } else {
+                unprocessed.push(UnprocessedAutomationRule {
+                    rule_arn: Some(rule_arn.clone()),
+                    error_code: Some(crate::state::RULE_ERROR_CODE_NOT_FOUND),
+                    error_message: Some(format!(
+                        "No automation rule with ARN {rule_arn} exists in this account and Region"
+                    )),
+                });
+            }
+        }
+
+        Ok(BatchDeleteAutomationRulesOutput {
+            // `AutomationRulesArnsList` is modelled `@length(min: 1)`, so a call that
+            // deleted nothing reports no list rather than an empty one.
+            processed_automation_rules: (!processed.is_empty()).then_some(processed),
+            unprocessed_automation_rules: Some(unprocessed),
+        })
     }
 }

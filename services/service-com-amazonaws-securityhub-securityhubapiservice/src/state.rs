@@ -18,7 +18,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ops::types::{
-    AwsSecurityFinding, FindingHistoryUpdate, Severity, Standard, StandardsManagedBy,
+    AutomationRulesAction, AutomationRulesFindingFieldsUpdate, AutomationRulesFindingFilters,
+    AwsSecurityFinding, BooleanFilter, DateFilter, DateRange, FindingHistoryUpdate, Note,
+    NumberFilter, Severity, Standard, StandardsManagedBy, StringFilter, Workflow,
 };
 
 /// The hub resource is one per account and Region, named `hub/default`.
@@ -196,6 +198,37 @@ impl StoredFinding {
     }
 }
 
+/// A stored automation rule's identity: the hub it belongs to, plus the ARN
+/// `CreateAutomationRule` minted for it. Automation rules are per account and
+/// Region, exactly like the hub and the findings they act on.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AutomationRuleKey {
+    pub account_id: String,
+    pub region: String,
+    pub rule_arn: String,
+}
+
+/// An automation rule as `CreateAutomationRule` stored it, mutated in place by
+/// `BatchUpdateAutomationRules` and removed by `BatchDeleteAutomationRules`.
+#[derive(Debug, Clone)]
+pub struct AutomationRule {
+    pub rule_arn: String,
+    pub rule_status: String,
+    pub rule_order: i32,
+    pub rule_name: String,
+    pub description: String,
+    pub is_terminal: bool,
+    pub criteria: AutomationRulesFindingFilters,
+    pub actions: Vec<AutomationRulesAction>,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub updated_at: ::aws_smithy_types::DateTime,
+    pub created_by: String,
+    pub tags: HashMap<String, String>,
+    /// Monotonic sequence of the create that stored this rule: the deterministic
+    /// tie-breaker between two rules that carry the same `RuleOrder`.
+    pub created_seq: u64,
+}
+
 /// A standards subscription's identity: the hub it belongs to plus the ARN of the
 /// standard it subscribes to. One subscription per standard per account/Region, which
 /// is what makes `BatchEnableStandards` of an already-enabled standard the same
@@ -244,9 +277,12 @@ pub struct ComAmazonawsSecurityhubSecurityhubapiserviceState {
     pub members: HashMap<MemberKey, MemberAssociation>,
     /// Custom action targets, keyed by hub + the creator-chosen `Id`.
     pub action_targets: HashMap<ActionTargetKey, ActionTargetRecord>,
+    /// The automation rules of each hub, keyed by hub + minted rule ARN.
+    pub automation_rules: HashMap<AutomationRuleKey, AutomationRule>,
     /// The enabled standards, keyed by hub + standard ARN.
     pub standards: HashMap<StandardsSubscriptionKey, StandardsSubscriptionRecord>,
-    /// Source of [`StoredFinding::imported_seq`] / [`StoredFinding::updated_seq`].
+    /// Source of [`StoredFinding::imported_seq`] / [`StoredFinding::updated_seq`]
+    /// and of [`AutomationRule::created_seq`].
     pub write_seq: u64,
 }
 
@@ -799,19 +835,31 @@ pub fn is_well_formed_arn(arn: &str) -> bool {
 /// account and Region behind per-Region endpoints, so the search is scoped to the
 /// requesting account/Region: an ARN naming another Region's resource resolves to
 /// nothing here, which is the 404 the call owes it. Every resource kind this crate
-/// persists and the model gives a tag set is looked up here — today that is the
-/// `hub/default` resource `EnableSecurityHub` creates; a resource kind whose create
-/// operation is still a stub has nothing in state to find.
+/// persists and the model gives a tag set is looked up here — today the
+/// `hub/default` resource `EnableSecurityHub` creates and the `automation-rule/...`
+/// resources `CreateAutomationRule` creates; a resource kind whose create operation
+/// is still a stub has nothing in state to find.
 pub fn resource_tags<'a>(
     store: &'a ComAmazonawsSecurityhubSecurityhubapiserviceState,
     key: &HubKey,
     resource_arn: &str,
 ) -> Option<&'a HashMap<String, String>> {
-    store
+    if let Some(tags) = store
         .hubs
         .get(key)
         .filter(|hub| hub.hub_arn == resource_arn)
         .map(|hub| &hub.tags)
+    {
+        return Some(tags);
+    }
+    store
+        .automation_rules
+        .get(&AutomationRuleKey {
+            account_id: key.0.clone(),
+            region: key.1.clone(),
+            rule_arn: resource_arn.to_string(),
+        })
+        .map(|rule| &rule.tags)
 }
 
 /// The tag set of the resource `resource_arn` names, for writing — the mutable twin
@@ -822,11 +870,23 @@ pub fn resource_tags_mut<'a>(
     key: &HubKey,
     resource_arn: &str,
 ) -> Option<&'a mut HashMap<String, String>> {
-    store
+    // The hub is checked first and the borrow released before the rule map is
+    // reached, so one lookup never holds the store mutably for the other.
+    if store
         .hubs
-        .get_mut(key)
-        .filter(|hub| hub.hub_arn == resource_arn)
-        .map(|hub| &mut hub.tags)
+        .get(key)
+        .is_some_and(|hub| hub.hub_arn == resource_arn)
+    {
+        return store.hubs.get_mut(key).map(|hub| &mut hub.tags);
+    }
+    store
+        .automation_rules
+        .get_mut(&AutomationRuleKey {
+            account_id: key.0.clone(),
+            region: key.1.clone(),
+            rule_arn: resource_arn.to_string(),
+        })
+        .map(|rule| &mut rule.tags)
 }
 
 /// The company every standard in [`STANDARDS_CATALOG`] is managed by. The model's
@@ -905,6 +965,627 @@ pub fn complete_severity(severity: &mut Severity) {
             severity.label = label_for_normalized(normalized).map(str::to_string);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Finding filter primitives
+//
+// `StringFilter` / `NumberFilter` / `DateFilter` / `BooleanFilter` and the finding
+// attributes they read are SHAPE-level, not operation-level: `GetFindings$Filters`
+// (`AwsSecurityFindingFilters`) and an automation rule's `Criteria`
+// (`AutomationRulesFindingFilters`) are two member sets over the same filter shapes
+// and the same `AwsSecurityFinding`. The predicates therefore live here, where every
+// operation that filters findings reaches them, instead of being re-implemented per
+// operation and drifting apart.
+// ---------------------------------------------------------------------------
+
+/// The `StringFilterComparison` values that select findings which HAVE the filter
+/// value; `StringFilter$Comparison` documents them as joined by `OR` on one field.
+pub const POSITIVE_STRING_COMPARISONS: [&str; 3] = ["EQUALS", "PREFIX", "CONTAINS"];
+
+/// The published breadth limit on a finding filter: `GetFindings$Filters`, "You can
+/// filter by up to 10 finding attributes." Every surface that filters findings — the
+/// query and an automation rule's stored `Criteria` — is held to it, so no request
+/// can store or evaluate an unbounded predicate set.
+pub const MAX_FILTER_ATTRIBUTES: usize = 10;
+
+/// The published depth limit on one filtered attribute: `GetFindings$Filters`, "For
+/// each attribute, you can provide up to 20 filter values."
+pub const MAX_FILTER_VALUES_PER_ATTRIBUTE: usize = 20;
+
+/// The `StringFilterComparison` values that select findings which do NOT have the
+/// filter value; `StringFilter$Comparison` documents them as joined by `AND` on one
+/// field.
+pub const NEGATIVE_STRING_COMPARISONS: [&str; 3] =
+    ["NOT_EQUALS", "PREFIX_NOT_EQUALS", "NOT_CONTAINS"];
+
+/// Does `value` satisfy `comparison` against `filter_value`, read as the positive
+/// form of the comparison? `NOT_*` comparisons are evaluated by negating their
+/// positive twin, which is why they share one function.
+pub fn positive_form_matches(value: &str, filter_value: &str, comparison: &str) -> bool {
+    match comparison {
+        "EQUALS" | "NOT_EQUALS" => value == filter_value,
+        "PREFIX" | "PREFIX_NOT_EQUALS" => value.starts_with(filter_value),
+        // Filter values are case sensitive (`StringFilter$Value`).
+        "CONTAINS" | "NOT_CONTAINS" => value.contains(filter_value),
+        _ => false,
+    }
+}
+
+/// The comparison a `StringFilter` asks for; `EQUALS` when the member is absent, the
+/// only comparison that reads a bare value as itself.
+pub fn comparison_of(filter: &StringFilter) -> &str {
+    filter.comparison.as_deref().unwrap_or("EQUALS")
+}
+
+/// Refuse the filter combinations `StringFilter$Comparison` documents as errors:
+/// "You can't have both a `CONTAINS` filter and a `NOT_CONTAINS` filter on the same
+/// field. Similarly, you can't provide both an `EQUALS` filter and a `NOT_EQUALS` or
+/// `PREFIX_NOT_EQUALS` filter on the same field. ... `CONTAINS` filters can only be
+/// used with other `CONTAINS` filters. `NOT_CONTAINS` filters can only be used with
+/// other `NOT_CONTAINS` filters."
+///
+/// `CONTAINS_WORD` is refused here too: that comparison "works only in the
+/// `GetFindingsV2`, `GetFindingStatisticsV2`, `GetResourcesV2`, and
+/// `GetResourcesStatisticsV2` APIs", none of which is a v1 finding filter.
+pub fn check_string_filter_combination(
+    attribute: &str,
+    filters: &[StringFilter],
+) -> Result<(), String> {
+    let comparisons: Vec<&str> = filters.iter().map(comparison_of).collect();
+    if comparisons.contains(&"CONTAINS_WORD") {
+        return Err(format!(
+            "Filter {attribute}: the CONTAINS_WORD comparison works only in the V2 finding APIs"
+        ));
+    }
+    // A comparison that is neither a positive nor a negative form names no predicate
+    // this emulator can evaluate. Refusing it is what keeps a filtered request from
+    // quietly answering as if the filter were not there.
+    if let Some(unknown) = comparisons.iter().find(|c| {
+        !POSITIVE_STRING_COMPARISONS.contains(c) && !NEGATIVE_STRING_COMPARISONS.contains(c)
+    }) {
+        return Err(format!(
+            "Filter {attribute}: {unknown} is not a StringFilterComparison this emulator evaluates"
+        ));
+    }
+    let has = |wanted: &str| comparisons.contains(&wanted);
+    if has("CONTAINS") && comparisons.iter().any(|c| *c != "CONTAINS") {
+        return Err(format!(
+            "Filter {attribute}: CONTAINS filters can only be used with other CONTAINS filters"
+        ));
+    }
+    if has("NOT_CONTAINS") && comparisons.iter().any(|c| *c != "NOT_CONTAINS") {
+        return Err(format!(
+            "Filter {attribute}: NOT_CONTAINS filters can only be used with other NOT_CONTAINS filters"
+        ));
+    }
+    if has("EQUALS") && (has("NOT_EQUALS") || has("PREFIX_NOT_EQUALS")) {
+        return Err(format!(
+            "Filter {attribute}: an EQUALS filter cannot be combined with a NOT_EQUALS or PREFIX_NOT_EQUALS filter on the same field"
+        ));
+    }
+    Ok(())
+}
+
+/// Evaluate one field's string filters against every value the finding carries for
+/// that field (a list-valued attribute such as `Type` carries several).
+pub fn string_filters_match(values: &[&str], filters: &[StringFilter]) -> bool {
+    let mut saw_positive = false;
+    let mut positive_hit = false;
+    for filter in filters {
+        let Some(filter_value) = filter.value.as_deref() else {
+            continue;
+        };
+        let comparison = comparison_of(filter);
+        let any_value_matches = values
+            .iter()
+            .any(|value| positive_form_matches(value, filter_value, comparison));
+        if POSITIVE_STRING_COMPARISONS.contains(&comparison) {
+            saw_positive = true;
+            positive_hit |= any_value_matches;
+        } else if NEGATIVE_STRING_COMPARISONS.contains(&comparison) && any_value_matches {
+            // Negative filters are joined by AND: one hit excludes the finding.
+            return false;
+        }
+    }
+    !saw_positive || positive_hit
+}
+
+/// Evaluate one field's number filters. Several filters on one field are joined by
+/// `OR`, matching the string-filter rule; the bounds within one filter are joined by
+/// `AND`.
+pub fn number_filters_match(value: Option<f64>, filters: &[NumberFilter]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let Some(value) = value else {
+        return false;
+    };
+    filters.iter().any(|filter| {
+        // `NumberFilter$Eq` is an equality predicate on the value the finding
+        // carries, so this is EXACT equality on purpose: the filtered attributes
+        // (`Confidence`, `Criticality`, `SeverityNormalized`, `SeverityProduct`) are
+        // compared to the value the caller sent, not approximated.
+        filter.eq.is_none_or(|eq| value == eq)
+            && filter.gte.is_none_or(|gte| value >= gte)
+            && filter.lte.is_none_or(|lte| value <= lte)
+            && filter.gt.is_none_or(|gt| value > gt)
+            && filter.lt.is_none_or(|lt| value < lt)
+    })
+}
+
+/// Evaluate one field's date filters, joined by `OR` like the other filter kinds.
+/// `Start`/`End` are absolute inclusive bounds; a `DateRange` is relative to `now`,
+/// `WITHIN` the window or `OLDER_THAN` it ("If you don't specify a value, the default
+/// is `WITHIN`" — `DateRange$Comparison`).
+pub fn date_filters_match(
+    attribute: &str,
+    value: Option<&str>,
+    filters: &[DateFilter],
+    now_nanos: i128,
+) -> Result<bool, String> {
+    if filters.is_empty() {
+        return Ok(true);
+    }
+    let Some(instant) = value.and_then(parse_iso8601_nanos) else {
+        return Ok(false);
+    };
+    let mut any = false;
+    for filter in filters {
+        let mut matches = true;
+        if let Some(start) = filter.start.as_deref() {
+            let start = parse_iso8601_nanos(start)
+                .ok_or_else(|| format!("Filter {attribute}: Start must be an ISO-8601 timestamp"))?;
+            matches &= instant >= start;
+        }
+        if let Some(end) = filter.end.as_deref() {
+            let end = parse_iso8601_nanos(end)
+                .ok_or_else(|| format!("Filter {attribute}: End must be an ISO-8601 timestamp"))?;
+            matches &= instant <= end;
+        }
+        if let Some(range) = filter.date_range.as_ref() {
+            let window = date_range_nanos(attribute, range)?;
+            let boundary = now_nanos - window;
+            matches &= match range.comparison.as_deref().unwrap_or("WITHIN") {
+                "WITHIN" => instant >= boundary,
+                "OLDER_THAN" => instant < boundary,
+                other => {
+                    return Err(format!(
+                        "Filter {attribute}: DateRange.Comparison {other} is not a supported comparison"
+                    ))
+                }
+            };
+        }
+        any |= matches;
+    }
+    Ok(any)
+}
+
+/// The width of a `DateRange` in nanoseconds. `DateRangeUnit` models `DAYS` only, and
+/// a range names a window, so its `Value` is required and cannot be negative.
+pub fn date_range_nanos(attribute: &str, range: &DateRange) -> Result<i128, String> {
+    let Some(value) = range.value else {
+        return Err(format!(
+            "Filter {attribute}: DateRange.Value is required when DateRange is set"
+        ));
+    };
+    if value < 0 {
+        return Err(format!(
+            "Filter {attribute}: DateRange.Value must not be negative, got {value}"
+        ));
+    }
+    let value = i128::from(value);
+    match range.unit.as_deref().unwrap_or("DAYS") {
+        "DAYS" => Ok(value * 24 * 60 * 60 * 1_000_000_000),
+        other => Err(format!(
+            "Filter {attribute}: DateRange.Unit {other} is not a supported unit"
+        )),
+    }
+}
+
+/// Evaluate one field's boolean filters, joined by `OR`.
+pub fn boolean_filters_match(value: Option<bool>, filters: &[BooleanFilter]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    filters
+        .iter()
+        .any(|filter| filter.value.is_none_or(|wanted| value == Some(wanted)))
+}
+
+/// The value(s) a finding carries for a string-valued finding attribute, or `None`
+/// when the attribute is not one this emulator knows. The attribute names are the
+/// filter member names, which are also the names `SortCriterion$Field` uses.
+pub fn string_attribute<'a>(
+    finding: &'a AwsSecurityFinding,
+    attribute: &str,
+) -> Option<Vec<&'a str>> {
+    let one = |value: Option<&'a str>| Some(value.into_iter().collect::<Vec<&'a str>>());
+    match attribute {
+        "Id" => one(Some(finding.id.as_str())),
+        "ProductArn" => one(Some(finding.product_arn.as_str())),
+        "AwsAccountId" => one(Some(finding.aws_account_id.as_str())),
+        "AwsAccountName" => one(finding.aws_account_name.as_deref()),
+        "GeneratorId" => one(Some(finding.generator_id.as_str())),
+        "Region" => one(finding.region.as_deref()),
+        "ProductName" => one(finding.product_name.as_deref()),
+        "CompanyName" => one(finding.company_name.as_deref()),
+        "Title" => one(Some(finding.title.as_str())),
+        "Description" => one(Some(finding.description.as_str())),
+        "SourceUrl" => one(finding.source_url.as_deref()),
+        "SeverityLabel" => one(finding.severity.as_ref().and_then(|s| s.label.as_deref())),
+        "RecordState" => one(finding.record_state.as_deref()),
+        "WorkflowState" => one(finding.workflow_state.as_deref()),
+        "WorkflowStatus" => one(finding.workflow.as_ref().and_then(|w| w.status.as_deref())),
+        "VerificationState" => one(finding.verification_state.as_deref()),
+        "ComplianceStatus" => one(finding.compliance.as_ref().and_then(|c| c.status.as_deref())),
+        "ComplianceSecurityControlId" => one(finding
+            .compliance
+            .as_ref()
+            .and_then(|c| c.security_control_id.as_deref())),
+        "RecommendationText" => one(finding
+            .remediation
+            .as_ref()
+            .and_then(|r| r.recommendation.as_ref())
+            .and_then(|r| r.text.as_deref())),
+        "NoteText" => one(finding.note.as_ref().map(|n| n.text.as_str())),
+        "NoteUpdatedBy" => one(finding.note.as_ref().map(|n| n.updated_by.as_str())),
+        "Type" => Some(
+            finding
+                .types
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// The value a finding carries for a number-valued finding attribute; the outer
+/// `None` means the attribute is not one this emulator knows.
+pub fn number_attribute(finding: &AwsSecurityFinding, attribute: &str) -> Option<Option<f64>> {
+    match attribute {
+        "Confidence" => Some(finding.confidence.map(f64::from)),
+        "Criticality" => Some(finding.criticality.map(f64::from)),
+        "SeverityNormalized" => Some(
+            finding
+                .severity
+                .as_ref()
+                .and_then(|s| s.normalized)
+                .map(f64::from),
+        ),
+        "SeverityProduct" => Some(finding.severity.as_ref().and_then(|s| s.product)),
+        _ => None,
+    }
+}
+
+/// The value a finding carries for a timestamp-valued finding attribute; the outer
+/// `None` means the attribute is not one this emulator knows.
+pub fn date_attribute<'a>(
+    finding: &'a AwsSecurityFinding,
+    attribute: &str,
+) -> Option<Option<&'a str>> {
+    match attribute {
+        "CreatedAt" => Some(Some(finding.created_at.as_str())),
+        "UpdatedAt" => Some(Some(finding.updated_at.as_str())),
+        "FirstObservedAt" => Some(finding.first_observed_at.as_deref()),
+        "LastObservedAt" => Some(finding.last_observed_at.as_deref()),
+        "ProcessedAt" => Some(finding.processed_at.as_deref()),
+        "NoteUpdatedAt" => Some(finding.note.as_ref().map(|n| n.updated_at.as_str())),
+        _ => None,
+    }
+}
+
+/// The value a finding carries for a boolean-valued finding attribute; the outer
+/// `None` means the attribute is not one this emulator knows.
+pub fn boolean_attribute(finding: &AwsSecurityFinding, attribute: &str) -> Option<Option<bool>> {
+    match attribute {
+        "Sample" => Some(finding.sample),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Automation rules
+// ---------------------------------------------------------------------------
+
+/// `RuleStatus`' two values (`smithy_query(query="shape", shape="RuleStatus")`).
+pub const RULE_STATUS_ENABLED: &str = "ENABLED";
+/// See [`RULE_STATUS_ENABLED`].
+pub const RULE_STATUS_DISABLED: &str = "DISABLED";
+
+/// The only `AutomationRulesActionType` the model defines
+/// (`smithy_query(query="shape", shape="AutomationRulesActionType")`), and the only
+/// action kind a rule can therefore carry.
+pub const ACTION_TYPE_FINDING_FIELDS_UPDATE: &str = "FINDING_FIELDS_UPDATE";
+
+/// `IsTerminal`'s documented default: "By default, a rule isn't terminal."
+pub const DEFAULT_IS_TERMINAL: bool = false;
+
+/// `RuleStatus` is optional and says the rule "is active after it is created", with
+/// `BatchUpdateAutomationRules` named as the way to change that value afterwards: a
+/// create that does not name a status produces the active rule.
+pub const DEFAULT_RULE_STATUS: &str = RULE_STATUS_ENABLED;
+
+/// The quota on automation rules per account and Region, from the AWS Security Hub
+/// CSPM quotas page ("Automation rules — 100 per account per Region"). The create
+/// that would exceed it is what `LimitExceededException` answers.
+pub const MAX_AUTOMATION_RULES_PER_HUB: usize = 100;
+
+/// The `UnprocessedAutomationRule$ErrorCode` for a rule ARN that names no rule in
+/// the caller's account and Region: the status of the `ResourceNotFoundException`
+/// that same condition carries when it refuses a whole request.
+pub const RULE_ERROR_CODE_NOT_FOUND: i32 = 404;
+
+/// The longest `RuleName` this store keeps for an automation rule. The model
+/// documents no bound for that member, so the cap mirrors the one this crate already
+/// applies to a finding's `Title` (`MAX_TITLE_LEN` in `ops/batch_import_findings.rs`):
+/// one record's size must not grow with whatever a caller sends.
+pub const MAX_RULE_NAME_LEN: usize = 256;
+
+/// The longest `Description` this store keeps for an automation rule, mirroring the
+/// cap this crate applies to a finding's `Description` (`MAX_DESCRIPTION_LEN` in
+/// `ops/batch_import_findings.rs`) for the same reason as [`MAX_RULE_NAME_LEN`].
+pub const MAX_RULE_DESCRIPTION_LEN: usize = 1024;
+
+/// Why a rule's `RuleName` / `Description` cannot be stored, or `None` when both are
+/// within the caps above. Each argument is `None` for a member the request left out,
+/// which an update may do.
+pub fn rule_text_violation(rule_name: Option<&str>, description: Option<&str>) -> Option<String> {
+    for (member, value, max) in [
+        ("RuleName", rule_name, MAX_RULE_NAME_LEN),
+        ("Description", description, MAX_RULE_DESCRIPTION_LEN),
+    ] {
+        if let Some(value) = value {
+            if value.len() > max {
+                return Some(format!(
+                    "{member} must be at most {max} characters, got {}",
+                    value.len()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// `arn:aws:securityhub:<region>:<account>:automation-rule/<id>` for a freshly
+/// minted rule, where the id is the 8-4-4-4-12 hex grouping a real rule ARN carries.
+///
+/// The id comes from [`mint_resource_id`], the construction every resource this
+/// service mints already uses (`CreateInsight`, `CreateFindingAggregator`): SHA-256
+/// over the hub, the store's monotonic write sequence and the clock, so two creates
+/// cannot mint the same ARN even in one instant, and the id is derived from no
+/// caller input.
+pub fn new_automation_rule_arn(
+    account_id: &str,
+    region: &str,
+    write_seq: u64,
+    now_nanos: i128,
+) -> String {
+    let rule_id = mint_resource_id(
+        &[account_id.as_bytes(), region.as_bytes()],
+        write_seq,
+        now_nanos,
+    );
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("automation-rule/{rule_id}"),
+    )
+}
+
+/// The `AutomationRulesFindingFilters` string members this emulator evaluates,
+/// paired with the finding attribute each one filters. Every criteria member name is
+/// also the finding attribute name, which is what lets a rule's `Criteria` reuse
+/// [`string_attribute`].
+pub fn criteria_string_bindings(
+    criteria: &AutomationRulesFindingFilters,
+) -> Vec<(&'static str, &[StringFilter])> {
+    let bindings: [(&'static str, Option<&Vec<StringFilter>>); 19] = [
+        ("ProductArn", criteria.product_arn.as_ref()),
+        ("AwsAccountId", criteria.aws_account_id.as_ref()),
+        ("AwsAccountName", criteria.aws_account_name.as_ref()),
+        ("Id", criteria.id.as_ref()),
+        ("GeneratorId", criteria.generator_id.as_ref()),
+        ("Type", criteria.r#type.as_ref()),
+        ("Title", criteria.title.as_ref()),
+        ("Description", criteria.description.as_ref()),
+        ("SourceUrl", criteria.source_url.as_ref()),
+        ("ProductName", criteria.product_name.as_ref()),
+        ("CompanyName", criteria.company_name.as_ref()),
+        ("SeverityLabel", criteria.severity_label.as_ref()),
+        ("ComplianceStatus", criteria.compliance_status.as_ref()),
+        (
+            "ComplianceSecurityControlId",
+            criteria.compliance_security_control_id.as_ref(),
+        ),
+        ("VerificationState", criteria.verification_state.as_ref()),
+        ("WorkflowStatus", criteria.workflow_status.as_ref()),
+        ("RecordState", criteria.record_state.as_ref()),
+        ("NoteText", criteria.note_text.as_ref()),
+        ("NoteUpdatedBy", criteria.note_updated_by.as_ref()),
+    ];
+    bindings
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| (name, v.as_slice())))
+        .collect()
+}
+
+/// The number-filter criteria members this emulator evaluates.
+pub fn criteria_number_bindings(
+    criteria: &AutomationRulesFindingFilters,
+) -> Vec<(&'static str, &[NumberFilter])> {
+    let bindings: [(&'static str, Option<&Vec<NumberFilter>>); 2] = [
+        ("Confidence", criteria.confidence.as_ref()),
+        ("Criticality", criteria.criticality.as_ref()),
+    ];
+    bindings
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| (name, v.as_slice())))
+        .collect()
+}
+
+/// The date-filter criteria members this emulator evaluates.
+pub fn criteria_date_bindings(
+    criteria: &AutomationRulesFindingFilters,
+) -> Vec<(&'static str, &[DateFilter])> {
+    let bindings: [(&'static str, Option<&Vec<DateFilter>>); 5] = [
+        ("CreatedAt", criteria.created_at.as_ref()),
+        ("UpdatedAt", criteria.updated_at.as_ref()),
+        ("FirstObservedAt", criteria.first_observed_at.as_ref()),
+        ("LastObservedAt", criteria.last_observed_at.as_ref()),
+        ("NoteUpdatedAt", criteria.note_updated_at.as_ref()),
+    ];
+    bindings
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| (name, v.as_slice())))
+        .collect()
+}
+
+/// The first `Criteria` member the caller set that this emulator does not evaluate.
+/// Reported as a 501 by the operation that was handed it, never ignored: a rule
+/// stored with a criterion nothing evaluates would act on findings it must not act
+/// on.
+pub fn unsupported_criteria_member(
+    criteria: &AutomationRulesFindingFilters,
+) -> Option<&'static str> {
+    let set: [(&'static str, bool); 15] = [
+        ("ResourceType", criteria.resource_type.is_some()),
+        ("ResourceId", criteria.resource_id.is_some()),
+        ("ResourcePartition", criteria.resource_partition.is_some()),
+        ("ResourceRegion", criteria.resource_region.is_some()),
+        ("ResourceTags", criteria.resource_tags.is_some()),
+        (
+            "ResourceDetailsOther",
+            criteria.resource_details_other.is_some(),
+        ),
+        (
+            "ComplianceAssociatedStandardsId",
+            criteria.compliance_associated_standards_id.is_some(),
+        ),
+        (
+            "RelatedFindingsProductArn",
+            criteria.related_findings_product_arn.is_some(),
+        ),
+        ("RelatedFindingsId", criteria.related_findings_id.is_some()),
+        ("UserDefinedFields", criteria.user_defined_fields.is_some()),
+        (
+            "ResourceApplicationArn",
+            criteria.resource_application_arn.is_some(),
+        ),
+        (
+            "ResourceApplicationName",
+            criteria.resource_application_name.is_some(),
+        ),
+        ("ResourceProvider", criteria.resource_provider.is_some()),
+        (
+            "ResourceOwnerAccountId",
+            criteria.resource_owner_account_id.is_some(),
+        ),
+        (
+            "ResourceOwnerOrgId",
+            criteria.resource_owner_org_id.is_some(),
+        ),
+    ];
+    set.into_iter()
+        .find_map(|(name, present)| present.then_some(name))
+}
+
+/// Refuse a `Criteria` the filter shapes' own rules reject, BEFORE the rule is
+/// stored: a rule whose criteria cannot be evaluated could never be applied, so the
+/// create or update that carries it is a 400 rather than a rule that silently never
+/// (or always) matches.
+///
+/// The published breadth and depth limits on a finding filter
+/// ([`MAX_FILTER_ATTRIBUTES`] / [`MAX_FILTER_VALUES_PER_ATTRIBUTE`]) are enforced
+/// here too, exactly as `GetFindings` enforces them on the same shapes: a stored
+/// rule is evaluated against every finding of every later write, so an unbounded
+/// criteria would be an unbounded amount of work per import, and an unbounded record
+/// to clone, for one create.
+pub fn validate_criteria(criteria: &AutomationRulesFindingFilters) -> Result<(), String> {
+    let mut attributes = 0usize;
+    for (attribute, count) in criteria_string_bindings(criteria)
+        .iter()
+        .map(|(name, filters)| (*name, filters.len()))
+        .chain(
+            criteria_number_bindings(criteria)
+                .iter()
+                .map(|(name, filters)| (*name, filters.len())),
+        )
+        .chain(
+            criteria_date_bindings(criteria)
+                .iter()
+                .map(|(name, filters)| (*name, filters.len())),
+        )
+    {
+        // An attribute with an empty filter list expresses no condition, so it does
+        // not count toward the breadth limit.
+        if count == 0 {
+            continue;
+        }
+        attributes += 1;
+        if count > MAX_FILTER_VALUES_PER_ATTRIBUTE {
+            return Err(format!(
+                "Filter {attribute}: at most {MAX_FILTER_VALUES_PER_ATTRIBUTE} filter values are allowed per attribute, got {count}"
+            ));
+        }
+    }
+    if attributes > MAX_FILTER_ATTRIBUTES {
+        return Err(format!(
+            "Criteria: at most {MAX_FILTER_ATTRIBUTES} finding attributes may be filtered on, got {attributes}"
+        ));
+    }
+
+    for (attribute, filters) in criteria_string_bindings(criteria) {
+        check_string_filter_combination(attribute, filters)?;
+        // A filter with no `Value` names no predicate; a rule may not act on
+        // findings a criterion did not actually select.
+        if filters.iter().any(|f| f.value.is_none()) {
+            return Err(format!("Filter {attribute}: every filter must carry a Value"));
+        }
+    }
+    for (attribute, filters) in criteria_number_bindings(criteria) {
+        if filters.iter().any(|f| {
+            f.eq.is_none() && f.gte.is_none() && f.lte.is_none() && f.gt.is_none() && f.lt.is_none()
+        }) {
+            return Err(format!(
+                "Filter {attribute}: every filter must carry at least one of Eq, Gt, Gte, Lt or Lte"
+            ));
+        }
+    }
+    for (attribute, filters) in criteria_date_bindings(criteria) {
+        for filter in filters {
+            if filter.start.is_none() && filter.end.is_none() && filter.date_range.is_none() {
+                return Err(format!(
+                    "Filter {attribute}: every filter must carry Start, End or DateRange"
+                ));
+            }
+            for (member, bound) in [("Start", filter.start.as_deref()), ("End", filter.end.as_deref())]
+            {
+                if let Some(bound) = bound {
+                    if parse_iso8601_nanos(bound).is_none() {
+                        return Err(format!(
+                            "Filter {attribute}: {member} must be an ISO-8601 timestamp, got {bound}"
+                        ));
+                    }
+                }
+            }
+            if let Some(range) = filter.date_range.as_ref() {
+                date_range_nanos(attribute, range)?;
+                match range.comparison.as_deref().unwrap_or("WITHIN") {
+                    "WITHIN" | "OLDER_THAN" => {}
+                    other => {
+                        return Err(format!(
+                            "Filter {attribute}: DateRange.Comparison {other} is not a supported comparison"
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `FindingHistoryUpdateSource.Type` for a change `BatchImportFindings` made; one of
@@ -1041,6 +1722,191 @@ pub fn finding_changes(
         });
     }
     changes
+}
+
+/// Does this finding satisfy every criteria member the rule set? Every member is
+/// joined by `AND`, as in `GetFindings$Filters`: "a finding matches the conditions
+/// specified in this parameter" is one condition set, not a choice between them.
+///
+/// `Err` carries the text of the `InvalidInputException` the create or update that
+/// stored this criteria should have been refused with; [`validate_criteria`] refuses
+/// it there, so a stored rule cannot reach it.
+pub fn finding_matches_criteria(
+    finding: &AwsSecurityFinding,
+    criteria: &AutomationRulesFindingFilters,
+    now_nanos: i128,
+) -> Result<bool, String> {
+    for (attribute, filters) in criteria_string_bindings(criteria) {
+        let values = string_attribute(finding, attribute).unwrap_or_default();
+        if !string_filters_match(&values, filters) {
+            return Ok(false);
+        }
+    }
+    for (attribute, filters) in criteria_number_bindings(criteria) {
+        let value = number_attribute(finding, attribute).unwrap_or_default();
+        if !number_filters_match(value, filters) {
+            return Ok(false);
+        }
+    }
+    for (attribute, filters) in criteria_date_bindings(criteria) {
+        let value = date_attribute(finding, attribute).unwrap_or_default();
+        if !date_filters_match(attribute, value, filters, now_nanos)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Apply one `FINDING_FIELDS_UPDATE` action to a finding.
+///
+/// `AutomationRulesFindingFieldsUpdate` names the same finding fields
+/// `BatchUpdateFindingsRequest` does, so a member the action carries overwrites that
+/// field and a member it omits leaves the field as it was — the same semantics
+/// `BatchUpdateFindings` applies, because it is the same update.
+pub fn apply_finding_fields_update(
+    finding: &mut AwsSecurityFinding,
+    update: &AutomationRulesFindingFieldsUpdate,
+    applied_at: &str,
+) {
+    if let Some(note) = update.note.as_ref() {
+        finding.note = Some(Note {
+            text: note.text.clone(),
+            updated_by: note.updated_by.clone(),
+            updated_at: applied_at.to_string(),
+        });
+    }
+    if let Some(severity) = update.severity.as_ref() {
+        // `Product` and `Original` are provider-owned and are not part of
+        // `SeverityUpdate`'s Label/Normalized pair, so they survive an update that
+        // does not carry them.
+        let previous = finding.severity.clone().unwrap_or_default();
+        let mut updated = Severity {
+            product: severity.product.or(previous.product),
+            label: severity.label.clone(),
+            normalized: severity.normalized,
+            original: previous.original,
+        };
+        complete_severity(&mut updated);
+        finding.severity = Some(updated);
+    }
+    if let Some(verification_state) = update.verification_state.as_ref() {
+        finding.verification_state = Some(verification_state.clone());
+    }
+    if let Some(confidence) = update.confidence {
+        finding.confidence = Some(confidence);
+    }
+    if let Some(criticality) = update.criticality {
+        finding.criticality = Some(criticality);
+    }
+    if let Some(types) = update.types.as_ref() {
+        finding.types = Some(types.clone());
+    }
+    if let Some(user_defined_fields) = update.user_defined_fields.as_ref() {
+        finding.user_defined_fields = Some(user_defined_fields.clone());
+    }
+    if let Some(status) = update.workflow.as_ref().and_then(|w| w.status.as_ref()) {
+        finding.workflow = Some(Workflow {
+            status: Some(status.clone()),
+        });
+    }
+    if let Some(related_findings) = update.related_findings.as_ref() {
+        finding.related_findings = Some(related_findings.clone());
+    }
+}
+
+impl ComAmazonawsSecurityhubSecurityhubapiserviceState {
+    /// The hub's rules in the order Security Hub CSPM applies them, `ENABLED` and
+    /// `DISABLED` alike — what `ListAutomationRules` reports: "The response includes
+    /// rules with a RuleStatus of ENABLED and DISABLED."
+    ///
+    /// The order is the applied one: "Security Hub CSPM applies rules with lower
+    /// values for this parameter first" (`RuleOrderValue`), with the creation
+    /// sequence breaking a tie so the order is total and two findings can never be
+    /// acted on in different orders. This is the single place that order is defined.
+    ///
+    /// Cloned rather than borrowed so a caller can keep mutating the findings map
+    /// while it applies them; a hub holds at most
+    /// [`MAX_AUTOMATION_RULES_PER_HUB`] rules.
+    pub fn rules_in_order(&self, hub: &HubKey) -> Vec<AutomationRule> {
+        let mut rules: Vec<AutomationRule> = self
+            .automation_rules
+            .iter()
+            .filter(|(key, _)| key.account_id == hub.0 && key.region == hub.1)
+            .map(|(_, rule)| rule.clone())
+            .collect();
+        rules.sort_by(|left, right| {
+            left.rule_order
+                .cmp(&right.rule_order)
+                .then_with(|| left.created_seq.cmp(&right.created_seq))
+        });
+        rules
+    }
+
+    /// [`Self::rules_in_order`] narrowed to the rules that are `ENABLED`: the ones a
+    /// write actually applies, since a `DISABLED` rule changes nothing.
+    pub fn enabled_rules_in_order(&self, hub: &HubKey) -> Vec<AutomationRule> {
+        let mut rules = self.rules_in_order(hub);
+        rules.retain(|rule| rule.rule_status == RULE_STATUS_ENABLED);
+        rules
+    }
+}
+
+/// Apply `rules` to a finding that is being written, in the order they were given.
+///
+/// A rule acts only on a finding that matches its `Criteria`, and a matching rule
+/// that `IsTerminal` ends the walk: "If a rule is terminal, Security Hub CSPM
+/// applies the rule action to a finding that matches the rule criteria and doesn't
+/// evaluate other rules for the finding." Rules the caller filtered to `ENABLED`
+/// are the only ones passed in, which is what makes a `DISABLED` rule a rule that
+/// changes nothing.
+///
+/// Answers the ARNs of the rules that acted, so a caller can tell "no rule matched"
+/// from "a rule matched and changed nothing".
+pub fn apply_automation_rules(
+    rules: &[AutomationRule],
+    finding: &mut AwsSecurityFinding,
+    applied_at: &str,
+    now_nanos: i128,
+) -> Vec<String> {
+    let mut applied: Vec<String> = Vec::new();
+    for rule in rules {
+        let matches = match finding_matches_criteria(finding, &rule.criteria, now_nanos) {
+            Ok(matches) => matches,
+            Err(message) => {
+                // Unreachable: `validate_criteria` refused this criteria when the
+                // rule was created or updated. Reported rather than silently
+                // dropped, so a regression there is visible instead of a rule that
+                // quietly stops acting.
+                debug_assert!(
+                    false,
+                    "stored rule {} carries criteria validate_criteria would refuse: {message}",
+                    rule.rule_arn
+                );
+                ::tracing::warn!(
+                    rule_arn = %rule.rule_arn,
+                    reason = %message,
+                    "skipping an automation rule whose criteria cannot be evaluated"
+                );
+                false
+            }
+        };
+        if !matches {
+            continue;
+        }
+        for action in &rule.actions {
+            if action.r#type.as_deref() != Some(ACTION_TYPE_FINDING_FIELDS_UPDATE) {
+                continue;
+            }
+            if let Some(update) = action.finding_fields_update.as_ref() {
+                apply_finding_fields_update(finding, update, applied_at);
+            }
+        }
+        applied.push(rule.rule_arn.clone());
+        if rule.is_terminal {
+            break;
+        }
+    }
+    applied
 }
 
 /// A custom insight's identity: the hub it lives in, plus the ARN `CreateInsight`

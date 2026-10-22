@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetAutomationRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetAutomationRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetAutomationRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the automation rules [`crate::state`] holds for the ARNs the caller
+//! named, as `CreateAutomationRule` stored them and `BatchUpdateAutomationRules`
+//! last changed them. An ARN that names no rule in the caller's account and Region
+//! is reported in `UnprocessedAutomationRules`, so one unknown ARN does not refuse
+//! the whole batch.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +134,24 @@ impl<Eng> BatchGetAutomationRules<Eng> {
     }
 }
 
+/// The `AutomationRulesConfig` a stored rule reports: every member the shape
+/// declares, read back from what `CreateAutomationRule` persisted.
+pub fn rule_config(rule: &crate::state::AutomationRule) -> AutomationRulesConfig {
+    AutomationRulesConfig {
+        rule_arn: Some(rule.rule_arn.clone()),
+        rule_status: Some(rule.rule_status.clone()),
+        rule_order: Some(rule.rule_order),
+        rule_name: Some(rule.rule_name.clone()),
+        description: Some(rule.description.clone()),
+        is_terminal: Some(rule.is_terminal),
+        criteria: Some(rule.criteria.clone()),
+        actions: Some(rule.actions.clone()),
+        created_at: Some(rule.created_at),
+        updated_at: Some(rule.updated_at),
+        created_by: Some(rule.created_by.clone()),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for BatchGetAutomationRules<Eng>
 {
@@ -155,18 +169,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetAutomationRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetAutomationRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetAutomationRules"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetAutomationRulesError::Modeled(
+                BatchGetAutomationRulesErrorModeled::InternalException(InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                }),
+            )
+        })?;
+
+        let hub = crate::state::hub_key(ctx);
+        let store = state.lock();
+        if !store.hubs.contains_key(&hub) {
+            return Err(BatchGetAutomationRulesErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {} is not subscribed to Security Hub CSPM in Region {}",
+                        hub.0, hub.1
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut rules: Vec<AutomationRulesConfig> = Vec::new();
+        let mut unprocessed: Vec<UnprocessedAutomationRule> = Vec::new();
+        for rule_arn in input.automation_rules_arns {
+            let key = crate::state::AutomationRuleKey {
+                account_id: hub.0.clone(),
+                region: hub.1.clone(),
+                rule_arn: rule_arn.clone(),
+            };
+            match store.automation_rules.get(&key) {
+                Some(rule) => rules.push(rule_config(rule)),
+                None => unprocessed.push(UnprocessedAutomationRule {
+                    rule_arn: Some(rule_arn.clone()),
+                    error_code: Some(crate::state::RULE_ERROR_CODE_NOT_FOUND),
+                    error_message: Some(format!(
+                        "No automation rule with ARN {rule_arn} exists in this account and Region"
+                    )),
+                }),
+            }
+        }
+
+        Ok(BatchGetAutomationRulesOutput {
+            rules: Some(rules),
+            unprocessed_automation_rules: Some(unprocessed),
+        })
     }
 }

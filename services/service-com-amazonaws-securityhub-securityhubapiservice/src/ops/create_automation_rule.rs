@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAutomationRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAutomationRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAutomationRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a new automation rule in [`crate::state`], keyed by the hub it belongs to
+//! plus the `automation-rule/<uuid>` ARN this operation mints and returns. The stored
+//! rule is what `BatchGetAutomationRules` / `ListAutomationRules` report, what
+//! `BatchUpdateAutomationRules` mutates, and — while its `RuleStatus` is `ENABLED` —
+//! what `BatchImportFindings` and `BatchUpdateFindings` apply to a finding that
+//! matches its `Criteria`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +165,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAutomationRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAutomationRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAutomationRule"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAutomationRuleError::Modeled(
+                CreateAutomationRuleErrorModeled::InternalException(InternalException {
+                    message: Some("the Security Hub CSPM state store is unavailable".to_string()),
+                    code: Some("InternalException".to_string()),
+                }),
+            )
+        })?;
+        let invalid_input = |message: String| {
+            CreateAutomationRuleError::Modeled(
+                CreateAutomationRuleErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                }),
+            )
+        };
+
+        let hub = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&hub) {
+            return Err(CreateAutomationRuleErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(format!(
+                        "Account {} is not subscribed to Security Hub CSPM in Region {}",
+                        hub.0, hub.1
+                    )),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Whether the rule can be stored is decided before anything is written: a
+        // rule whose criteria nothing evaluates, or whose action nothing can perform,
+        // would act on findings it must not act on.
+        if let Some(member) = crate::state::unsupported_criteria_member(&input.criteria) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "CreateAutomationRule Criteria {member}"
+            )));
+        }
+        if let Err(message) = crate::state::validate_criteria(&input.criteria) {
+            return Err(invalid_input(message));
+        }
+        // The model bounds neither member, so the stored record is capped here: a
+        // rule is read back by every reader and cloned on every write that evaluates
+        // it, so its size must not grow with whatever a caller sends.
+        if let Some(message) =
+            crate::state::rule_text_violation(Some(&input.rule_name), Some(&input.description))
+        {
+            return Err(invalid_input(message));
+        }
+        for action in &input.actions {
+            let Some(action_type) = action.r#type.as_deref() else {
+                return Err(invalid_input(
+                    "Actions: every action must carry a Type".to_string(),
+                ));
+            };
+            if action_type != crate::state::ACTION_TYPE_FINDING_FIELDS_UPDATE {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "CreateAutomationRule action type {action_type}"
+                )));
+            }
+            if action.finding_fields_update.is_none() {
+                return Err(invalid_input(format!(
+                    "Actions: a {} action must carry FindingFieldsUpdate",
+                    crate::state::ACTION_TYPE_FINDING_FIELDS_UPDATE
+                )));
+            }
+        }
+
+        let rule_status = match input.rule_status.as_deref() {
+            // `RuleStatus` is optional; the rule "is active after it is created".
+            None => crate::state::DEFAULT_RULE_STATUS.to_string(),
+            Some(status)
+                if status == crate::state::RULE_STATUS_ENABLED
+                    || status == crate::state::RULE_STATUS_DISABLED =>
+            {
+                status.to_string()
+            }
+            Some(other) => {
+                return Err(invalid_input(format!(
+                    "RuleStatus {other} is not a RuleStatus value"
+                )))
+            }
+        };
+
+        let stored_rules = store
+            .automation_rules
+            .keys()
+            .filter(|key| key.account_id == hub.0 && key.region == hub.1)
+            .count();
+        if stored_rules >= crate::state::MAX_AUTOMATION_RULES_PER_HUB {
+            return Err(CreateAutomationRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Account {} has reached the quota of {} automation rules in Region {}",
+                        hub.0,
+                        crate::state::MAX_AUTOMATION_RULES_PER_HUB,
+                        hub.1
+                    )),
+                    code: Some("LimitExceededException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A freshly created rule has never been updated, so `UpdatedAt` is the
+        // instant it was created; `BatchUpdateAutomationRules` is what moves it.
+        let created_at = crate::state::now_date_time();
+        let created_seq = store.next_write_seq();
+        // The write sequence and the clock are what make the minted id unique, so the
+        // ARN is minted after the sequence has moved: two creates in one instant
+        // cannot mint the same rule.
+        let rule_arn = crate::state::new_automation_rule_arn(
+            &hub.0,
+            &hub.1,
+            created_seq,
+            crate::state::datetime_nanos(&created_at),
+        );
+        store.automation_rules.insert(
+            crate::state::AutomationRuleKey {
+                account_id: hub.0.clone(),
+                region: hub.1.clone(),
+                rule_arn: rule_arn.clone(),
+            },
+            crate::state::AutomationRule {
+                rule_arn: rule_arn.clone(),
+                rule_status,
+                rule_order: input.rule_order,
+                rule_name: input.rule_name,
+                description: input.description,
+                is_terminal: input.is_terminal.unwrap_or(crate::state::DEFAULT_IS_TERMINAL),
+                criteria: input.criteria,
+                actions: input.actions,
+                created_at,
+                updated_at: created_at,
+                // `AutomationRulesConfig$CreatedBy` is "the principal that created
+                // a rule", which is the one principal this emulator attributes every
+                // signed request to — the same identity a finding-history event names.
+                created_by: crate::state::caller_arn(),
+                tags: input.tags.unwrap_or_default(),
+                created_seq,
+            },
+        );
+
+        Ok(CreateAutomationRuleOutput {
+            rule_arn: Some(rule_arn),
+        })
     }
 }
