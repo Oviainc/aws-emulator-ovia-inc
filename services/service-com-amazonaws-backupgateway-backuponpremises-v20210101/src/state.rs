@@ -23,16 +23,21 @@
 //!
 //! The second resource this store owns is the **hypervisor** ([`StoredHypervisor`]),
 //! keyed by its own ARN: `GetHypervisor` resolves it out of that map and reports the
-//! record, and the state it reports is derived from the record and the clock
+//! record, `ListHypervisors` pages over that map in ARN order, and the state either one
+//! reports is derived from the record and the clock
 //! ([`StoredHypervisor::state_as_of`]) so a read never moves it.
+//!
+//! Both listings page through one helper ([`page_of`], handing back a [`Page`]), so a
+//! page boundary and the token that encodes it mean the same thing whichever resource
+//! is being listed.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    BandwidthRateLimitInterval, Gateway, GatewayDetails, HypervisorDetails, MaintenanceStartTime,
-    Tag,
+    BandwidthRateLimitInterval, Gateway, GatewayDetails, Hypervisor, HypervisorDetails,
+    MaintenanceStartTime, Tag,
 };
 
 /// This service's ARN namespace (`smithy_query(query="service_info")`:
@@ -137,8 +142,8 @@ pub const MAX_STORED_GATEWAYS: usize = 1_000;
 /// rather than served.
 pub const MAX_STORED_HYPERVISORS: usize = 1_000;
 
-/// The page size `ListGateways` uses when a request names no `MaxResults`, and the
-/// largest page it will return whatever `MaxResults` asks for.
+/// The page size a list operation of this service uses when a request names no
+/// `MaxResults`, and the largest page it will return whatever `MaxResults` asks for.
 ///
 /// The model declares neither (`MaxResults` has a minimum of 1 and no maximum), so these
 /// are the emulator's own server-side bounds: without them one tiny request would clone
@@ -251,8 +256,9 @@ fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
 /// One persisted hypervisor.
 ///
 /// Keyed in the store by [`StoredHypervisor::arn`], the identity every hypervisor
-/// operation takes (`GetHypervisor`, `UpdateHypervisor`, `DeleteHypervisor` all name a
-/// `ServerArn`). The members are exactly the ones `HypervisorDetails` reports
+/// operation takes (`GetHypervisor`, `ListHypervisors`, `UpdateHypervisor`,
+/// `DeleteHypervisor` all name or return a `ServerArn`). The members are exactly the
+/// ones `HypervisorDetails` reports
 /// (`smithy_query(query="shape",shape="HypervisorDetails")`), so a read serialises the
 /// record rather than recomputing anything from the request — the hypervisor's
 /// credentials are NOT among them and are not kept here.
@@ -324,6 +330,23 @@ impl StoredHypervisor {
         }
     }
 
+    /// This record as the `Hypervisor` summary shape `ListHypervisors` returns, as of
+    /// `now`.
+    ///
+    /// The summary is the subset of [`Self::details_as_of`] the `Hypervisor` shape
+    /// declares (`smithy_query(query="shape",shape="Hypervisor")`: `Host`,
+    /// `HypervisorArn`, `KmsKeyArn`, `Name`, `State`) — read off the same record and the
+    /// same clock, so a listing and a get cannot disagree about one hypervisor.
+    pub fn summary_as_of(&self, now: SystemTime) -> Hypervisor {
+        Hypervisor {
+            host: Some(self.host.clone()),
+            hypervisor_arn: Some(self.arn.clone()),
+            kms_key_arn: self.kms_key_arn.clone(),
+            name: Some(self.name.clone()),
+            state: Some(self.state_as_of(now).to_string()),
+        }
+    }
+
     /// The persisted tags as the modelled `Tags` list, in key order.
     pub fn tag_list(&self) -> Vec<Tag> {
         tag_list(&self.tags)
@@ -348,11 +371,14 @@ pub struct HypervisorConfiguration {
     pub tags: BTreeMap<String, String>,
 }
 
-/// One page of `ListGateways`: the records it returns and the token that resumes after
-/// them, present only while more records remain.
+/// One page of a list operation: the records it returns and the token that resumes
+/// after them, present only while more records remain.
+///
+/// One shape for every paginated listing of this service, so a page boundary means the
+/// same thing whichever resource is being listed.
 #[derive(Debug, Default)]
-pub struct GatewayPage {
-    pub gateways: Vec<StoredGateway>,
+pub struct Page<T> {
+    pub items: Vec<T>,
     pub next_token: Option<String>,
 }
 
@@ -377,8 +403,11 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// refused — see [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::activation_key_issued`].
     activation_keys: BTreeMap<String, SystemTime>,
     /// Hypervisors by ARN. A `BTreeMap` for the same reason as `gateways`: the key order
-    /// is total and stable, so `ListHypervisors` can paginate over it once it is
-    /// implemented.
+    /// is total and stable, and it is the order `ListHypervisors` reports them in —
+    /// "ordered by their Amazon Resource Names (ARNs)"
+    /// (`smithy_query(query="operation",operation="ListHypervisors")`) — so a page
+    /// boundary means the same thing on every call and a token can name the key it
+    /// resumes after.
     hypervisors: BTreeMap<String, StoredHypervisor>,
     /// Monotonic counter behind the `hypervisor/<id>` ARN suffix.
     next_hypervisor_id: u64,
@@ -475,27 +504,8 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// skipping a record that stayed put. `limit` is the caller's `MaxResults` already
     /// clamped to [`MAX_PAGE_SIZE`] by the handler, so no request can make one response
     /// carry the whole store.
-    pub fn page_of_gateways(&self, after: Option<&str>, limit: usize) -> GatewayPage {
-        let lower = match after {
-            Some(arn) => Bound::Excluded(arn.to_string()),
-            None => Bound::Unbounded,
-        };
-        let mut remaining = self.gateways.range((lower, Bound::Unbounded));
-        let gateways: Vec<StoredGateway> = remaining
-            .by_ref()
-            .take(limit)
-            .map(|(_, gateway)| gateway.clone())
-            .collect();
-        // A token only when a record really remains past this page: the final page must
-        // not carry one, or a paginating client never stops.
-        let next_token = match remaining.next() {
-            Some(_) => gateways.last().map(|gateway| encode_page_token(&gateway.arn)),
-            None => None,
-        };
-        GatewayPage {
-            gateways,
-            next_token,
-        }
+    pub fn page_of_gateways(&self, after: Option<&str>, limit: usize) -> Page<StoredGateway> {
+        page_of(&self.gateways, after, limit)
     }
 
     /// Persist a hypervisor for `configuration` and hand back the record as it is now
@@ -567,6 +577,12 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         self.hypervisors.len()
     }
 
+    /// One page of hypervisors in ARN order — the order `ListHypervisors` reports them
+    /// in. Same contract as [`Self::page_of_gateways`], whose implementation it shares.
+    pub fn page_of_hypervisors(&self, after: Option<&str>, limit: usize) -> Page<StoredHypervisor> {
+        page_of(&self.hypervisors, after, limit)
+    }
+
     /// The hypervisor stored for `host`, if any.
     ///
     /// A hypervisor record stands for the machine reachable at its host, so the host is
@@ -617,6 +633,33 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     }
 }
 
+/// One page of an ARN-keyed resource map in key order — the paging every list
+/// operation of this service does, written once.
+///
+/// `after` is the key the previous page ended on (resolved from a `NextToken`), and the
+/// page starts at the next key AFTER it — so a record created, or deleted, between two
+/// pages changes what the second page holds without ever repeating or skipping a record
+/// that stayed put. `limit` is the caller's `MaxResults` already clamped to
+/// [`MAX_PAGE_SIZE`] by the handler, so no request can make one response carry a whole
+/// store.
+fn page_of<T: Clone>(records: &BTreeMap<String, T>, after: Option<&str>, limit: usize) -> Page<T> {
+    let lower = match after {
+        Some(key) => Bound::Excluded(key.to_string()),
+        None => Bound::Unbounded,
+    };
+    let mut remaining = records.range((lower, Bound::Unbounded));
+    let page: Vec<(&String, &T)> = remaining.by_ref().take(limit).collect();
+    // A token only when a record really remains past this page: the final page must
+    // not carry one, or a paginating client never stops.
+    let next_token = remaining
+        .next()
+        .and_then(|_| page.last().map(|(key, _)| encode_page_token(key)));
+    Page {
+        items: page.into_iter().map(|(_, record)| record.clone()).collect(),
+        next_token,
+    }
+}
+
 /// Merge a request's `Tags` into the tags a resource already carries, refusing what the
 /// model's own traits cannot express.
 ///
@@ -660,7 +703,7 @@ pub fn tag_map(requested: &[Tag]) -> Result<BTreeMap<String, String>, String> {
     merged_tags(&BTreeMap::new(), requested)
 }
 
-/// The opaque `ListGateways` pagination token for a page that ended on `arn`.
+/// The opaque pagination token for a page that ended on `arn`.
 ///
 /// The token is the page boundary itself (the last ARN returned), hex-encoded so a
 /// client has nothing to read in it and treats it as opaque, as the modelled `NextToken`
@@ -670,21 +713,25 @@ pub fn encode_page_token(arn: &str) -> String {
     hex::encode(arn)
 }
 
-/// Resolve a client-supplied `NextToken` back to the ARN its page ended on.
+/// Resolve a client-supplied `NextToken` back to the ARN its page ended on, for a
+/// listing of `resource_type`.
 ///
-/// `None` for anything this service cannot have issued: not hex, not UTF-8, or not a
-/// gateway ARN. The caller answers that with the modelled `ValidationException`, never
-/// by silently restarting the listing from the top — a client that mangled a token must
-/// learn that, not receive page one again.
-pub fn decode_page_token(token: &str) -> Option<String> {
+/// `None` for anything this service cannot have issued for THIS listing: not hex, not
+/// UTF-8, not an ARN of this service, or an ARN naming another resource type — a token
+/// one listing handed out does not resume another, because the page boundary it encodes
+/// is a key of a different map. The caller answers `None` with the modelled
+/// `ValidationException`, never by silently restarting the listing from the top: a
+/// client that mangled a token must learn that, not receive page one again.
+pub fn decode_page_token(token: &str, resource_type: &str) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    is_gateway_arn(&decoded).then_some(decoded)
+    is_resource_arn(&decoded, resource_type).then_some(decoded)
 }
 
-/// Whether `candidate` has the form the modelled `GatewayArn` pattern accepts:
+/// Whether `candidate` is an ARN of this service naming `resource_type`, in the form
+/// the modelled `GatewayArn` and `ServerArn` patterns accept:
 /// `arn:(aws|aws-cn|aws-us-gov):backup-gateway:<region>:<account>:<type>/<id>`, every
 /// segment non-empty and drawn from `[a-zA-Z-0-9]`.
-pub fn is_gateway_arn(candidate: &str) -> bool {
+pub fn is_resource_arn(candidate: &str, resource_type: &str) -> bool {
     let fields: Vec<&str> = candidate.split(':').collect();
     let [arn, partition, service, region, account, resource] = fields.as_slice() else {
         return false;
@@ -695,12 +742,13 @@ pub fn is_gateway_arn(candidate: &str) -> bool {
     if *service != ARN_SERVICE {
         return false;
     }
-    let Some((resource_type, id)) = resource.split_once('/') else {
+    let Some((kind, id)) = resource.split_once('/') else {
         return false;
     };
-    [*region, *account, resource_type, id]
-        .into_iter()
-        .all(is_arn_segment)
+    kind == resource_type
+        && [*region, *account, kind, id]
+            .into_iter()
+            .all(is_arn_segment)
 }
 
 /// The resource-type segment of a backup-gateway ARN — the `gateway` of
