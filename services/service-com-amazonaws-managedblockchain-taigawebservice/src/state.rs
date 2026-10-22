@@ -19,7 +19,7 @@ use crate::ops::types::{
     MemberLogPublishingConfiguration, MemberSummary, Network, NetworkFabricAttributes,
     NetworkFrameworkAttributes, NetworkSummary, Node, NodeFabricAttributes,
     NodeFrameworkAttributes, NodeLogPublishingConfiguration, NodeSummary, Proposal,
-    ProposalActions, VotingPolicy,
+    ProposalActions, ResourceNotFoundException, VotingPolicy,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service (the model's
@@ -956,6 +956,48 @@ pub fn invitation_arn(region: &str, invitation_id: &str) -> String {
         region,
         &format!("invitations/{invitation_id}"),
     )
+}
+
+/// How this service names the resource type of a network in the prose of a failure.
+pub const RESOURCE_NETWORK: &str = "Network";
+
+/// How this service names the resource type of a member in the prose of a failure.
+pub const RESOURCE_MEMBER: &str = "Member";
+
+/// How this service names the resource type of a node in the prose of a failure.
+pub const RESOURCE_NODE: &str = "Node";
+
+/// How this service names the resource type of an invitation in the prose of a failure.
+pub const RESOURCE_INVITATION: &str = "Invitation";
+
+/// How this service names the resource type of a proposal in the prose of a failure.
+pub const RESOURCE_PROPOSAL: &str = "Proposal";
+
+/// How this service names the resource type of an accessor in the prose of a failure.
+pub const RESOURCE_ACCESSOR: &str = "Accessor";
+
+/// The `ResourceNotFoundException` for a resource the request named and this service does
+/// not hold: `Network n-… not found.`, `Node nd-… not found.`
+///
+/// `ResourceNotFoundException$ResourceName` targets `ArnString` — `@length(1, 1011)` and
+/// `@pattern ^arn:.+:.+:.+:.+:.+$` — so the member can only ever carry an ARN. A lookup
+/// that found nothing has no stored ARN to name, and a bare resource id cannot satisfy
+/// that pattern (a client that parses the member for its region, account and resource id
+/// would fail on one, and a model-driven validator rejects it outright), so the member is
+/// OMITTED here. The identification travels in `Message` instead, which names the type
+/// and the id the request asked for — both read off the request, so the sentence always
+/// names the resource the caller actually asked about.
+///
+/// This is the helper for a resource the request identifies BY ID, which every operation
+/// here but the three tagging ones does. One that identifies it by ARN
+/// (`TagResource`/`UntagResource`/`ListTagsForResource` take a `ResourceArn`) does have
+/// an ARN to name, so a handler of one of those sets `ResourceName` to that ARN instead
+/// of calling this.
+pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("{resource_type} {id} not found.")),
+        resource_name: None,
+    }
 }
 
 /// The VPC endpoint service name members use to reach a network's resources

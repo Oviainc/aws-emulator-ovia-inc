@@ -17,6 +17,9 @@ mod lookup_error_envelopes;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/validation_envelopes.rs"]
+mod validation_envelopes;
+
 #[path = "all/workload_computed_members.rs"]
 mod workload_computed_members;
 

@@ -171,7 +171,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The token names the report it was cut for and the version to resume at, so a
         // token issued for another report, and a number a client made up, are both
-        // refused rather than honoured as an offset.
+        // refused rather than honoured as an offset — with the service's one fixed
+        // invalid-token text, which does not say which of the two it was.
         let resume_at = match input.next_token.as_deref() {
             None => None,
             Some(token) => {
@@ -179,10 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(version) => Some(version),
                     None => {
                         return Err(ListReportVersionsErrorModeled::ValidationException(
-                            crate::state::invalid_token(
-                                "nextToken is not a token returned by ListReportVersions for \
-                                 this reportId",
-                            ),
+                            crate::state::invalid_token(),
                         )
                         .into())
                     }

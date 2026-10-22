@@ -23,6 +23,8 @@ mod cloudfront_key_value_store_handshake;
 mod connect_signing_name_routing;
 #[path = "all/dynamodb_streams_routing.rs"]
 mod dynamodb_streams_routing;
+#[path = "all/events_signing_name_routing.rs"]
+mod events_signing_name_routing;
 #[path = "all/iam_and_signer_signing_name_routing.rs"]
 mod iam_and_signer_signing_name_routing;
 #[path = "all/iam_signing_name_routing.rs"]

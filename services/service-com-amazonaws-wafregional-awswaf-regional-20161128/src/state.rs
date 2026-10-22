@@ -2,22 +2,23 @@
 
 //! Engine state for the com-amazonaws-wafregional-awswaf-regional-20161128 service.
 //!
-//! AWS WAF Classic's `IPSet`, `Rule`, `SqlInjectionMatchSet` and `XssMatchSet` records
-//! and the change tokens every mutating call consumes live here, so `GetChangeToken`,
-//! `GetChangeTokenStatus` and the `Create*`, `Update*`, `Get*`, `List*` and `Delete*`
-//! handlers of every resource kind all read and write ONE copy of each resource. The
-//! helpers below (id minting, the change-token protocol, CIDR parsing, metric-name
-//! validation, filter identity, the `IPSet`/`IPSetSummary`, `Rule`,
-//! `SqlInjectionMatchSet` and `XssMatchSet`/`XssMatchSetSummary` projections) are shared
-//! by those handlers rather than duplicated per operation.
+//! AWS WAF Classic's `IPSet`, `Rule`, `SqlInjectionMatchSet`, `WebACL` and
+//! `XssMatchSet` records and the change tokens every mutating call consumes live here,
+//! so `GetChangeToken`, `GetChangeTokenStatus` and the `Create*`, `Update*`, `Get*`,
+//! `List*` and `Delete*` handlers of every resource kind all read and write ONE copy
+//! of each resource. The helpers below (id minting, the change-token protocol, CIDR
+//! parsing, metric-name validation, filter identity, the `IPSet`/`IPSetSummary`,
+//! `Rule`, `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet`/`XssMatchSetSummary`
+//! projections) are shared by those handlers rather than duplicated per operation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    IPSet, IPSetDescriptor, IPSetSummary, Predicate, Rule, SqlInjectionMatchSet,
-    SqlInjectionMatchTuple, XssMatchSet, XssMatchSetSummary, XssMatchTuple,
+    ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, Rule,
+    SqlInjectionMatchSet, SqlInjectionMatchTuple, WafAction, WebACL, XssMatchSet,
+    XssMatchSetSummary, XssMatchTuple,
 };
 
 /// `ChangeTokenStatus` wire values, from the model's `CHANGE_TOKEN_STATUS_VALUES`
@@ -97,6 +98,56 @@ pub const MAX_SQL_INJECTION_MATCH_SETS: usize = 100;
 /// minted would grow without end. Chosen far above the number of tokens any one
 /// client has in flight.
 pub const MAX_CHANGE_TOKENS: usize = 1_000;
+
+/// The most `WebACL`s this emulator stores for the account before `CreateWebACL`
+/// answers its modelled `WAFLimitsExceededException`.
+///
+/// The model states no quota — only that `WAFLimitsExceededException` covers "the
+/// maximum number of `WebACL` objects that you can create for an AWS account" — so
+/// this bound is the one AWS WAF Classic publishes for an account (50 web ACLs). It
+/// keeps the web ACL state a caller can grow bounded.
+pub const MAX_WEB_ACLS: usize = 50;
+
+/// The ARN service segment of every ARN this service mints: its SigV4 signing name,
+/// as `WebACLArn` carries it.
+pub const ARN_SERVICE: &str = "waf-regional";
+
+/// The region an ARN names when the request carries no SigV4 credential scope to read
+/// one from — `emulator_arn`'s own documented default.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region ARNs minted for this request name: the one in the caller's SigV4
+/// credential scope, else [`DEFAULT_REGION`]. A scope region that is empty, or that is
+/// not shaped like an AWS region name, falls back too: on the real service the region
+/// in an ARN is a property of the endpoint the request reached, so a caller cannot put
+/// arbitrary text there.
+pub fn region_of(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| region_is_well_formed(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `region` is shaped like an AWS region name: two or more non-empty groups of
+/// lowercase letters and digits joined by single hyphens (`us-east-1`,
+/// `ap-southeast-4`), bounded in length.
+fn region_is_well_formed(region: &str) -> bool {
+    (1..=32).contains(&region.len())
+        && region.split('-').count() >= 2
+        && region.split('-').all(|group| {
+            !group.is_empty()
+                && group
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
+}
+
+/// The `WebACLArn` of the web ACL `web_acl_id` in `region`, built through
+/// `engine::emulator_arn` so the account segment is the one canonical account id this
+/// emulator presents.
+pub fn web_acl_arn(region: &str, web_acl_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("webacl/{web_acl_id}"))
+}
 
 /// The largest page `ListIPSets` returns, and the page size a `Limit` of 0 (the
 /// model's declared default) asks for.
@@ -346,6 +397,68 @@ impl IPSetEntry {
     }
 }
 
+/// One stored `WebACL`.
+#[derive(Debug, Clone)]
+pub struct WebACLEntry {
+    pub web_acl_id: String,
+    /// `Name`, which "you can't change ... after you create it".
+    pub name: String,
+    /// `MetricName`, which "you can't change ... after you create the `WebACL`".
+    pub metric_name: String,
+    /// The `WafActionType` wire value of `DefaultAction`: the action AWS WAF takes for
+    /// a request none of the web ACL's rules match.
+    pub default_action: String,
+    /// The rules activated in this web ACL, in priority order. A newly created web ACL
+    /// holds none: they arrive through `UpdateWebACL`.
+    pub rules: Vec<ActivatedRule>,
+    /// The resource's tags, as a key→value map — a repeated key is one tag, the last
+    /// value winning, as an AWS tag set is. At most [`MAX_TAGS_PER_RESOURCE`] entries,
+    /// so one record's tag state is bounded; the tagging operations
+    /// (`ListTagsForResource`, `TagResource`, `UntagResource`) will project and update
+    /// it when their own stub issues are implemented.
+    pub tags: BTreeMap<String, String>,
+    /// `WebACLArn`, minted once at create time so every later read reports the same
+    /// ARN rather than one rebuilt from the reading request's region.
+    pub web_acl_arn: String,
+}
+
+impl WebACLEntry {
+    /// A new web ACL record, holding no rules.
+    pub fn new(
+        web_acl_id: String,
+        name: String,
+        metric_name: String,
+        default_action: String,
+        web_acl_arn: String,
+        tags: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            web_acl_id,
+            name,
+            metric_name,
+            default_action,
+            rules: Vec::new(),
+            tags,
+            web_acl_arn,
+        }
+    }
+
+    /// This record projected onto the modelled `WebACL` shape the Create and Get
+    /// responses carry: the stored record's own fields, never request input.
+    pub fn to_modelled(&self) -> WebACL {
+        WebACL {
+            web_acl_id: self.web_acl_id.clone(),
+            name: Some(self.name.clone()),
+            metric_name: Some(self.metric_name.clone()),
+            default_action: WafAction {
+                r#type: self.default_action.clone(),
+            },
+            rules: self.rules.clone(),
+            web_acl_arn: Some(self.web_acl_arn.clone()),
+        }
+    }
+}
+
 /// One `XssMatchTuple`'s identity: the part of the request it inspects and the text
 /// transformation applied before inspecting it.
 ///
@@ -562,6 +675,10 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// walks them in one stable order and a `NextMarker` taken on one page resumes at
     /// the right place on the next.
     pub ip_sets: BTreeMap<String, IPSetEntry>,
+    /// Every stored `WebACL`, keyed by its `WebACLId`. A `BTreeMap` so `ListWebACLs`
+    /// walks them in one stable order and a `NextMarker` taken on one page resumes at
+    /// the right place on the next.
+    pub web_acls: BTreeMap<String, WebACLEntry>,
     /// Every stored `Rule`, keyed by its `RuleId`. A `BTreeMap` for the same reason as
     /// [`Self::ip_sets`]: one stable order for the paginated `ListRules`.
     pub rules: BTreeMap<String, RuleEntry>,

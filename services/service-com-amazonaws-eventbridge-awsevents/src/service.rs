@@ -45,6 +45,53 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The first URI path segment EVERY request to this service carries: the ROOT path.
+///
+/// This model is `awsJson1_1` and binds no `smithy.api#http` trait to any operation
+/// (`smithy_query(query="digest",
+/// model_path="services/service-com-amazonaws-eventbridge-awsevents/smithy-model/\
+/// com-amazonaws-eventbridge-awsevents.json")` reports protocol `awsJson1_1` and no
+/// `http` binding), so every EventBridge request is `POST /` with
+/// `X-Amz-Target: AWSEvents.<Operation>` — the crate's `OPERATIONS.md`, "Wire
+/// protocol". `emulator_server::ROOT_PATH_SEGMENT` is the framework's sentinel for
+/// exactly that path.
+///
+/// It is claimed EXPLICITLY, rather than through the generated `ROUTE_PATH_SEGMENTS`
+/// (EMPTY for a service with no http bindings, which claims EVERY path under the
+/// signing name): the `events` signing name is shared with the EventBridge V2
+/// endpoint, whose `rpcv2Cbor` requests arrive at
+/// `POST /service/AWSEventsV2/operation/<Operation>`. Claiming every path would make
+/// both services claim that request and the router would answer `500
+/// AmbiguousService` — a code that exists in no AWS model — instead of serving it.
+const OWN_PATH_SEGMENTS: &[&str] = &[emulator_server::ROOT_PATH_SEGMENT];
+
+/// Whether the request these `parts` came from matches this service's SigV4 signing
+/// name AND the one URI path its wire protocol publishes ([`OWN_PATH_SEGMENTS`]).
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
+/// owner of that rule, and it is CALLED here rather than re-implemented: the request's
+/// route key must match this service's signing name AND its first URI path segment must
+/// be one of the segments passed, by exact segment equality.
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed only
+/// the request's parts, so the two things it reads — the URI and the headers — are
+/// re-presented to it as a bodiless request. It reads neither the body nor the method, so
+/// nothing it decides on is missing.
+fn claims_route_key_and_root_path(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        OWN_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-eventbridge-awsevents` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +121,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `events` — a signing name it SHARES with the
+        // EventBridge V2 endpoint (`services/service-com-amazonaws-eventbridgev2-\
+        // awseventsv2`, `aws.auth#sigv4` name `events`, endpointPrefix `eventsv2`) and
+        // with the LEGACY CloudWatch Events model of this very service. Claiming on the
+        // signing name alone makes several services claim one request, which the router
+        // answers `500 AmbiguousService` instead of serving any of them.
+        //
+        // So the claim is narrowed to this service's own request space: the route key
+        // AND the single URI path its `awsJson1_1` wire protocol publishes (`POST /`),
+        // leaving the V2 endpoint's `rpcv2Cbor` path space to that service. The legacy
+        // CloudWatch Events crate — same shape, version, protocol, endpoint prefix and
+        // signing name, a strict SUBSET of this model's operations — claims nothing, so
+        // this service owns the `events` key deterministically.
+        claims_route_key_and_root_path(parts)
     }
 
     fn override_operation(

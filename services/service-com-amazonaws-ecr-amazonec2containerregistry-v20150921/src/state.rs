@@ -74,9 +74,7 @@ pub const MAX_PULL_TIME_UPDATE_EXCLUSIONS: usize = 1_000;
 pub const ACTIVE_IMAGE_STATUS: &str = "ACTIVE";
 
 /// The `ScanFrequency` of a repository whose scan on push is switched on: a push is what
-/// triggers its scan. (`ScanFrequency`'s modelled values are `SCAN_ON_PUSH`,
-/// `CONTINUOUS_SCAN` and `MANUAL`; `CONTINUOUS_SCAN` belongs to `ENHANCED` registry
-/// scanning, which no operation configures here yet.)
+/// triggers its scan.
 pub const SCAN_ON_PUSH_FREQUENCY: &str = "SCAN_ON_PUSH";
 
 /// The `ScanFrequency` of a repository that is scanned only when asked: "If scan on push
@@ -345,9 +343,9 @@ impl Repo {
     /// configured, so `false`, the member's modelled default), and the frequency follows
     /// from it — a repository scanned on push has the `SCAN_ON_PUSH` frequency, and one
     /// that is not has the `MANUAL` one. `appliedScanFilters` lists the registry
-    /// scanning rules' filters that match this repository; a registry nobody has
-    /// configured carries no rules (`PutRegistryScanningConfiguration` is still a 501
-    /// stub), so no filter applies and the list is empty.
+    /// scanning rules' filters that match this repository; deriving that match from the
+    /// registry configuration `PutRegistryScanningConfiguration` now stores belongs to
+    /// this projection's own operation, so the list stays empty here.
     pub fn to_scanning_configuration(&self) -> RepositoryScanningConfiguration {
         let scan_on_push = self
             .image_scanning_config
@@ -560,6 +558,11 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// what makes a second register of the same principal a duplicate — and a
     /// `BTreeMap` so listing and its pagination tokens have one deterministic order.
     pub pull_time_update_exclusions: BTreeMap<String, SystemTime>,
+    /// The registry's scanning configuration, exactly as the last
+    /// `PutRegistryScanningConfiguration` stored it. `None` until one is stored, which is
+    /// the state the documented default describes — see
+    /// [`registry_scanning_configuration`](ComAmazonawsEcrAmazonec2containerregistryV20150921State::registry_scanning_configuration).
+    pub registry_scanning: Option<crate::ops::types::RegistryScanningConfiguration>,
 }
 
 impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
@@ -1195,3 +1198,10 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsEcrAmazonec2containerregistryV20150921State>)
 }
+
+/// The registry's scanning configuration — the record `PutRegistryScanningConfiguration`
+/// stores and `GetRegistryScanningConfiguration` reports — and everything derived from
+/// it, in `state/scanning.rs`. Declared and re-exported here, so a handler reaches it as
+/// `crate::state::…` like every other part of this store.
+pub mod scanning;
+pub use scanning::*;

@@ -193,15 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // The node this call creates does not exist yet, so the resources it was asked
+        // to act on are the network it is created in and the member that will own it:
+        // those are the ones a not-found failure here names.
         let Some(network) = guard.networks.get(&input.network_id) else {
             return Err(CreateNodeErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "network {} does not exist on this account",
-                        input.network_id
-                    )),
-                    resource_name: Some(input.network_id.clone()),
-                },
+                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
             .into());
         };
@@ -253,13 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let Some(member) = network.members.get(&member_id) else {
                 return Err(CreateNodeErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "member {member_id} does not exist on network {}",
-                            input.network_id
-                        )),
-                        resource_name: Some(member_id.clone()),
-                    },
+                    crate::state::not_found(crate::state::RESOURCE_MEMBER, &member_id),
                 )
                 .into());
             };

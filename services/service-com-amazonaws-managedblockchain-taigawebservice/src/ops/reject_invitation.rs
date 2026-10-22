@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A MUTATION: the spec says this call rejects the invitation, so it moves the
         // stored record's status. The settle() below it materialises only what the clock
         // already owed.
-        let region = crate::state::request_region(ctx);
+        let _ = ctx;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(RejectInvitationErrorModeled::InternalServiceErrorException(
@@ -168,19 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|invitation| invitation.principal == account)
         else {
             return Err(RejectInvitationErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "invitation {} does not exist on this account",
-                        input.invitation_id
-                    )),
-                    // `ResourceNotFoundException$ResourceName` is an `ArnString`
-                    // (`^arn:.+:.+:.+:.+:.+$`), so it names the requested resource in ARN
-                    // form rather than by bare id.
-                    resource_name: Some(crate::state::invitation_arn(
-                        &region,
-                        &input.invitation_id,
-                    )),
-                },
+                crate::state::not_found(
+                    crate::state::RESOURCE_INVITATION,
+                    &input.invitation_id,
+                ),
             )
             .into());
         };

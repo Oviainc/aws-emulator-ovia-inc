@@ -182,35 +182,6 @@ pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     }
 }
 
-/// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
-/// first segment (`"/"`, `""`).
-fn first_path_segment(path: &str) -> Option<&str> {
-    let segment = path.trim_start_matches('/').split('/').next()?;
-    (!segment.is_empty()).then_some(segment)
-}
-
-/// Whether `parts` addresses a path inside `path_segments` — the model-derived first
-/// URI path segments this service declares (`crate::ROUTE_PATH_SEGMENTS`).
-///
-/// This mirrors the framework's own discriminator,
-/// `emulator_server::can_handle_based_on_route_key_and_path`, which the generated
-/// `can_handle` entry point uses. The framework helper takes a whole buffered
-/// `http::Request`, which the `Service::can_handle` seam below does not receive, so the
-/// rule is applied here over `Parts` instead of called. It is kept identical, including
-/// both edge cases: an EMPTY list means the model published no usable discriminator and
-/// is "no constraint", and the framework's own `ROOT_PATH_SEGMENT` sentinel is how a
-/// service that must answer `POST /` claims the root path without claiming every path.
-/// Matching is EXACT segment equality, deliberately never a prefix test.
-fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> bool {
-    if path_segments.is_empty() {
-        return true;
-    }
-    match first_path_segment(parts.uri.path()) {
-        Some(segment) => path_segments.contains(&segment),
-        None => path_segments.contains(&emulator_server::ROOT_PATH_SEGMENT),
-    }
-}
-
 /// The `com-amazonaws-marketplacediscovery-awsmarketplacediscovery` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -240,26 +211,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // This service signs as `aws-marketplace` — a signing name every AWS
-        // Marketplace-family service SHARES while each serves its own endpoint
-        // (`discovery-marketplace` here, `catalog.marketplace` for Marketplace
-        // Catalog, `entitlement.marketplace` for the Entitlement Service, …). The
-        // router's routing key comes from the SigV4 credential scope first, so all of
-        // them resolve to `aws-marketplace` and matching on the signing name ALONE
-        // makes every one of them claim every request — which the router answers
-        // `500 AmbiguousService`, leaving all of them unreachable.
+        // This service signs as `aws-marketplace` — a signing name it SHARES with
+        // every other AWS Marketplace-family service (Catalog, Reporting, Deployment,
+        // Agreement, Entitlement, Metering), each serving its own endpoint
+        // (`discovery-marketplace` here). The router's routing key comes from the
+        // SigV4 credential scope first, so all of them resolve to `aws-marketplace`
+        // and matching on the signing name ALONE makes every one of them claim every
+        // request — which the router answers `500 AmbiguousService`.
         //
-        // So the claim is narrowed the way the framework narrows it for the other
-        // signing-name collisions: the signing name must match AND the request must
-        // address this service's own modeled URI path space (see `claims_modeled_path`)
-        // — every operation here is bound to `POST /2026-02-05/<operation>`
-        // (`OPERATIONS.md`).
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) if key == self.entry.identity().signing_name() => {
-                claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
-            }
-            _ => false,
-        }
+        // So the claim is narrowed to this service's own modelled wire surface, by the
+        // one rule `service-common` states for every service under a shared signing
+        // name. This model is `restJson1`: its surface is the URI path space its
+        // operations bind — every operation here is `POST /2026-02-05/<operation>`
+        // (`OPERATIONS.md`) — which is what `claims_request` matches against the
+        // generated `ROUTE_PATH_SEGMENTS` when a service declares no RPC protocol.
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            None,
+        )
     }
 
     fn override_operation(

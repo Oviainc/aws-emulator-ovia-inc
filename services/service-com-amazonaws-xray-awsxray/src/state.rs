@@ -38,8 +38,10 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    EncryptionConfig, Group, GroupSummary, IndexingRule, IndexingRuleValue, InsightsConfiguration,
-    ProbabilisticRuleValue, TelemetryRecord,
+    Edge, EdgeStatistics, EncryptionConfig, ErrorStatistics, FaultStatistics, Group, GroupSummary,
+    HistogramEntry, IndexingRule, IndexingRuleValue, Insight, InsightsConfiguration,
+    ProbabilisticRuleValue, SamplingRule, SamplingRuleRecord, Service, ServiceStatistics,
+    TelemetryRecord,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -376,6 +378,56 @@ pub const MAX_TRACE_IDS_PER_CALL: usize = 500;
 /// always readable ([`MAX_SEGMENTS_PER_TRACE`] segments fit the budget exactly).
 pub const MAX_SEGMENTS_PER_BATCH_RESPONSE: usize = MAX_SEGMENTS_PER_TRACE;
 
+/// The most sampling rules the store keeps; `CreateSamplingRule` past this is
+/// refused with the modelled `RuleLimitExceededException`.
+///
+/// The model documents no quota, so this is the emulator's bound on growth, in
+/// the same spirit as [`MAX_GROUPS`].
+pub const MAX_SAMPLING_RULES: usize = 500;
+
+/// The most trace retrievals the store keeps. A new retrieval past this evicts
+/// the one that started longest ago (expired ones are dropped first).
+pub const MAX_TRACE_RETRIEVALS: usize = 250;
+
+/// How long a started trace retrieval stays readable.
+///
+/// "Retrievals will time out after 60 minutes" — the `StartTraceRetrieval`
+/// documentation (`smithy_query(query="doc",shape="StartTraceRetrieval")`), so
+/// the value is the service's, not this emulator's choice.
+pub const TRACE_RETRIEVAL_TIMEOUT_SECONDS: f64 = 60.0 * 60.0;
+
+/// How many `StartTraceRetrieval` calls may arrive back-to-back before the
+/// account's request budget is empty and the next one is throttled.
+///
+/// `ThrottledException` is "the request exceeds the maximum number of requests
+/// per second" and the model publishes no number, so the budget below is this
+/// emulator's: it bounds how much retrieval work one caller can start at once,
+/// and refills at [`TRACE_RETRIEVAL_RATE_PER_SECOND`] so a steady caller is
+/// never throttled.
+pub const TRACE_RETRIEVAL_BURST: u32 = 3;
+
+/// How fast the `StartTraceRetrieval` budget refills, in requests per second.
+///
+/// Slower than the burst, so a caller that fires several retrievals at once runs
+/// the budget down and is told so, while a caller that starts one retrieval at a
+/// time is never throttled.
+pub const TRACE_RETRIEVAL_RATE_PER_SECOND: f64 = 3.0;
+
+/// How far past the present a `[StartTime, EndTime]` bound may land before the
+/// window is refused as not naming a time the data could have.
+///
+/// A whole day is far more than any clock skew, which is deliberate: the bound
+/// exists to refuse a value that cannot be a timestamp of recorded traffic at
+/// all — a millisecond-scale epoch value read as seconds lands thousands of
+/// years out — not to second-guess a caller asking for a window that reaches a
+/// little past now.
+pub const MAX_WINDOW_FUTURE_SKEW_SECONDS: f64 = 24.0 * 60.0 * 60.0;
+
+/// The most entries one `Histogram` in a service graph carries. The model
+/// publishes no bound, so this caps the response a caller can amplify out of
+/// widely-spread segment durations.
+pub const MAX_HISTOGRAM_ENTRIES: usize = 50;
+
 /// Per-service state for com-amazonaws-xray-awsxray. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsXrayAwsxrayState {
@@ -390,6 +442,28 @@ pub struct ComAmazonawsXrayAwsxrayState {
     pub group_seq: u64,
     /// Ingest counter, stamped on a trace so the oldest can be evicted.
     pub ingest_seq: u64,
+    /// Sampling rules, keyed by their case-sensitive `RuleName`, at most
+    /// [`MAX_SAMPLING_RULES`] of them. A rule's ARN is derived from its name, so
+    /// no second index is needed to resolve one by ARN.
+    pub sampling_rules: BTreeMap<String, StoredSamplingRule>,
+    /// Started trace retrievals, keyed by the `RetrievalToken` that was minted
+    /// for them, at most [`MAX_TRACE_RETRIEVALS`] of them.
+    pub retrievals: BTreeMap<String, TraceRetrievalRecord>,
+    /// Feeds the unique prefix of a minted `RetrievalToken`; never reset, so two
+    /// retrievals of the same traces still get distinct tokens.
+    pub retrieval_seq: u64,
+    /// The account's `StartTraceRetrieval` request budget.
+    pub retrieval_rate: RateLimiter,
+    /// Insights, keyed by their `InsightId`.
+    ///
+    /// X-Ray MINTS insights itself, from anomaly detection over ingested traces
+    /// ("When fault rates go outside of the expected range, X-Ray creates an
+    /// insight" — `smithy_query(query="shape",shape="Insight")`); no operation in
+    /// the API creates one. This emulator does not run that analysis, so this is
+    /// the map an insight generator would write and `GetInsight` /
+    /// `GetInsightSummaries` read: an `InsightId` it does not hold names no
+    /// insight, which is exactly what `GetInsight` refuses.
+    pub insights: BTreeMap<String, Insight>,
     /// Daemon telemetry, keyed by the reporting source the request identified,
     /// at most [`MAX_TELEMETRY_SOURCES`] of them.
     pub telemetry: BTreeMap<TelemetrySource, TelemetryReporter>,
@@ -676,12 +750,13 @@ impl IndexingRuleRecord {
 }
 
 /// The current instant in whole seconds of epoch time.
+///
+/// The crate keeps ONE clock: this is [`now_epoch_seconds`] truncated, for the
+/// members X-Ray documents "in Unix time seconds".
 pub fn now_epoch_secs() -> i64 {
-    ::std::time::SystemTime::now()
-        .duration_since(::std::time::UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-        })
+    #[allow(clippy::cast_possible_truncation)]
+    let seconds = now_epoch_seconds().trunc() as i64;
+    seconds
 }
 
 /// One trace: every segment document submitted under a single `trace_id`.
@@ -1120,6 +1195,17 @@ impl SegmentRecord {
         self.http.as_ref().and_then(|http| http.response_status)
     }
 
+    /// How long this segment took, in seconds; `None` while it is in progress.
+    pub fn duration(&self) -> Option<f64> {
+        self.end_time.map(|end| end - self.start_time)
+    }
+
+    /// The latest instant this segment is known to have reached: its `end_time`
+    /// when it has one, else its `start_time`.
+    pub fn latest(&self) -> f64 {
+        self.end_time.unwrap_or(self.start_time)
+    }
+
     /// Whether this segment recorded a 400-series error — its `error` flag, or
     /// an `http.response.status` in the 400 series (`TraceSummary$HasError`).
     pub fn is_error(&self) -> bool {
@@ -1187,6 +1273,14 @@ impl TraceRecord {
         self.segments
             .iter()
             .find(|segment| segment.parent_id.is_none())
+    }
+
+    /// The segment stored under `id`, in O(log n) through the id index rather
+    /// than a scan \u2014 which is how a graph resolves a segment's `parent_id`.
+    pub fn segment(&self, id: &str) -> Option<&SegmentRecord> {
+        self.segment_index
+            .get(id)
+            .and_then(|at| self.segments.get(*at))
     }
 
     /// "The length of time in seconds between the start and end times of the
@@ -1619,6 +1713,748 @@ pub struct GroupUpdate {
     pub filter_expression: Option<String>,
     /// The updated insights configuration, when the request carried one.
     pub insights_configuration: Option<InsightsConfigurationRecord>,
+}
+
+// ---------------------------------------------------------------------------
+// The clock
+// ---------------------------------------------------------------------------
+
+/// Now, in floating point seconds of epoch time — the unit every stored instant
+/// in this service uses, so a handler never converts between two clocks.
+pub fn now_epoch_seconds() -> f64 {
+    ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64())
+}
+
+/// A modelled timestamp as floating point seconds of epoch time.
+pub fn epoch_seconds(timestamp: &::aws_smithy_types::DateTime) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let seconds = timestamp.secs() as f64;
+    seconds + f64::from(timestamp.subsec_nanos()) / 1_000_000_000.0
+}
+
+// ---------------------------------------------------------------------------
+// [StartTime, EndTime] windows
+// ---------------------------------------------------------------------------
+
+/// Why a `[StartTime, EndTime]` window names no interval of recorded traffic.
+///
+/// Lives here, beside [`validate_window`], so every operation that takes a
+/// required window refuses the same windows with the same wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowError {
+    /// `EndTime` is before `StartTime`, so the window contains no instant.
+    Inverted,
+    /// A bound lands further than [`MAX_WINDOW_FUTURE_SKEW_SECONDS`] past now,
+    /// so it names no time any recorded segment could carry — which is what a
+    /// millisecond-scale epoch value read as seconds looks like.
+    Future,
+}
+
+impl WindowError {
+    /// What to tell the caller, naming the members at fault and the values that
+    /// broke the rule.
+    pub fn message(self, start: f64, end: f64) -> String {
+        match self {
+            Self::Inverted => format!(
+                "EndTime ({end}) must be at or after StartTime ({start}), in seconds of epoch time"
+            ),
+            Self::Future => format!(
+                "StartTime ({start}) and EndTime ({end}) must be within {MAX_WINDOW_FUTURE_SKEW_SECONDS} seconds of the present, in seconds of epoch time"
+            ),
+        }
+    }
+}
+
+/// Refuse a `[StartTime, EndTime]` window that names no interval of recorded
+/// traffic: one running backwards, or one whose bounds are not times the data
+/// could have.
+///
+/// Nothing is refused for being OLD: this emulator's trace store keeps whatever
+/// was ingested until [`MAX_TRACES`] forces an eviction, so there is no
+/// retention horizon a window could fall off the far side of.
+pub fn validate_window(start: f64, end: f64, now: f64) -> Result<(), WindowError> {
+    if !start.is_finite() || !end.is_finite() {
+        return Err(WindowError::Future);
+    }
+    if end < start {
+        return Err(WindowError::Inverted);
+    }
+    if start > now + MAX_WINDOW_FUTURE_SKEW_SECONDS || end > now + MAX_WINDOW_FUTURE_SKEW_SECONDS {
+        return Err(WindowError::Future);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The per-account request budget
+// ---------------------------------------------------------------------------
+
+/// A request budget: [`burst`](Self::burst) requests may arrive back-to-back,
+/// and the budget refills at [`per_second`](Self::per_second) requests a second.
+///
+/// A token bucket rather than a counter per fixed window, so a caller that has
+/// just exhausted the budget is not locked out for the rest of a window: the
+/// next request is served as soon as the refill has earned one request back.
+#[derive(Debug)]
+pub struct RateLimiter {
+    /// How many requests may arrive back-to-back.
+    burst: f64,
+    /// How fast the budget refills, in requests per second.
+    per_second: f64,
+    /// What is left of the budget.
+    tokens: f64,
+    /// When the budget was last refilled.
+    last_refill: ::std::time::Instant,
+}
+
+impl RateLimiter {
+    /// A full budget of `burst` requests, refilling at `per_second`.
+    pub fn new(burst: u32, per_second: f64) -> Self {
+        Self {
+            burst: f64::from(burst),
+            per_second,
+            tokens: f64::from(burst),
+            last_refill: ::std::time::Instant::now(),
+        }
+    }
+
+    /// Spend one request of the budget, answering whether there was one to
+    /// spend. `false` is what a `ThrottledException` reports.
+    pub fn try_acquire(&mut self) -> bool {
+        let now = ::std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * self.per_second).min(self.burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// `StartTraceRetrieval` is the one operation in this service with a request
+/// budget, so the default is its: see [`TRACE_RETRIEVAL_BURST`].
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new(TRACE_RETRIEVAL_BURST, TRACE_RETRIEVAL_RATE_PER_SECOND)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trace retrievals
+// ---------------------------------------------------------------------------
+
+/// One started trace retrieval: what `StartTraceRetrieval` was asked for, under
+/// the `RetrievalToken` it minted for it.
+#[derive(Debug, Clone, Default)]
+pub struct TraceRetrievalRecord {
+    /// The minted, opaque `RetrievalToken`.
+    pub retrieval_token: String,
+    /// The trace ids the retrieval was started for.
+    pub trace_ids: Vec<String>,
+    /// The requested window's start, in seconds of epoch time.
+    pub start_time: f64,
+    /// The requested window's end, in seconds of epoch time.
+    pub end_time: f64,
+    /// When the retrieval was started, in seconds of epoch time.
+    pub started_at: f64,
+    /// When the retrieval times out, [`TRACE_RETRIEVAL_TIMEOUT_SECONDS`] after
+    /// it started.
+    pub expires_at: f64,
+}
+
+impl ComAmazonawsXrayAwsxrayState {
+    /// Start a trace retrieval and return the stored record, whose
+    /// `retrieval_token` is what the caller gets back.
+    ///
+    /// Bounded: retrievals the clock has already timed out are dropped first,
+    /// and if the store is still at [`MAX_TRACE_RETRIEVALS`] the one that started
+    /// longest ago makes room.
+    pub fn start_trace_retrieval(
+        &mut self,
+        trace_ids: Vec<String>,
+        start_time: f64,
+        end_time: f64,
+        now: f64,
+    ) -> &TraceRetrievalRecord {
+        self.expire_trace_retrievals(now);
+        if self.retrievals.len() >= MAX_TRACE_RETRIEVALS {
+            let oldest = self
+                .retrievals
+                .iter()
+                .min_by(|(_, left), (_, right)| left.started_at.total_cmp(&right.started_at))
+                .map(|(token, _)| token.clone());
+            if let Some(token) = oldest {
+                self.retrievals.remove(&token);
+            }
+        }
+        self.retrieval_seq += 1;
+        let retrieval_token = self.mint_retrieval_token(&trace_ids, start_time, end_time);
+        self.retrievals.insert(
+            retrieval_token.clone(),
+            TraceRetrievalRecord {
+                retrieval_token: retrieval_token.clone(),
+                trace_ids,
+                start_time,
+                end_time,
+                started_at: now,
+                expires_at: now + TRACE_RETRIEVAL_TIMEOUT_SECONDS,
+            },
+        );
+        &self.retrievals[&retrieval_token]
+    }
+
+    /// Drop every retrieval the clock has already timed out.
+    ///
+    /// This is work the clock owed at `now` whether or not anybody called, which
+    /// is why a reader may materialise it too.
+    pub fn expire_trace_retrievals(&mut self, now: f64) {
+        self.retrievals
+            .retain(|_, retrieval| retrieval.expires_at > now);
+    }
+
+    /// Mint an opaque `RetrievalToken`: 32 hexadecimal digits, the first half the
+    /// never-reset [`retrieval_seq`](Self::retrieval_seq) and the second a mix of
+    /// what was asked for, so no two retrievals share a token even when they ask
+    /// for the same traces and no clock enters the value.
+    fn mint_retrieval_token(&self, trace_ids: &[String], start_time: f64, end_time: f64) -> String {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.retrieval_seq.hash(&mut hasher);
+        trace_ids.hash(&mut hasher);
+        start_time.to_bits().hash(&mut hasher);
+        end_time.to_bits().hash(&mut hasher);
+        format!("{:016x}{:016x}", self.retrieval_seq, hasher.finish())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sampling rules
+// ---------------------------------------------------------------------------
+
+/// A stored sampling rule: the rule as it was accepted — its `RuleName` and the
+/// `RuleARN` minted for it filled in — plus when it was created and last
+/// modified. `CreateSamplingRule` and `GetSamplingRules` both answer from this.
+#[derive(Debug, Clone)]
+pub struct StoredSamplingRule {
+    /// The accepted rule, with `RuleName` and `RuleARN` as stored.
+    pub rule: SamplingRule,
+    /// When the rule was created, in seconds of epoch time.
+    pub created_at: f64,
+    /// When the rule was last modified, in seconds of epoch time.
+    pub modified_at: f64,
+    /// The tags the rule was created with, in submission order.
+    pub tags: Vec<(String, String)>,
+}
+
+impl StoredSamplingRule {
+    /// This record as the modelled `SamplingRuleRecord`.
+    pub fn to_record(&self) -> SamplingRuleRecord {
+        SamplingRuleRecord {
+            sampling_rule: Some(self.rule.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from_secs_f64(self.created_at)),
+            modified_at: Some(::aws_smithy_types::DateTime::from_secs_f64(self.modified_at)),
+        }
+    }
+}
+
+/// Why a submitted `SamplingRule` cannot be created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SamplingRuleRejection {
+    /// The rule is refused for what it says: a bad selector, or a member value
+    /// the service does not accept. A client-input refusal.
+    Invalid(String),
+    /// The store already holds [`MAX_SAMPLING_RULES`] rules. This is the one
+    /// rejection `RuleLimitExceededException` reports.
+    LimitExceeded(String),
+}
+
+impl SamplingRuleRejection {
+    /// What to tell the caller.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Invalid(message) | Self::LimitExceeded(message) => message,
+        }
+    }
+}
+
+/// The `RuleName` a submitted rule is to be stored under, refusing a rule whose
+/// members cannot describe one.
+///
+/// The rules come from the member documentation
+/// (`smithy_query(query="shape",shape="SamplingRule")`): a rule is specified
+/// "by either name or ARN, but not both", `Version` is "the version of the
+/// sampling rule format (`1`)", and `ResourceARN` "matches the ARN of the Amazon
+/// Web Services resource on which the service runs" — an ARN, or `*` for any.
+/// Every modelled `@length` / `@range` bound is refused at the boundary before a
+/// handler sees the request, so none of them is re-checked here.
+pub fn sampling_rule_name(rule: &SamplingRule) -> Result<&str, SamplingRuleRejection> {
+    let invalid =
+        |message: String| -> SamplingRuleRejection { SamplingRuleRejection::Invalid(message) };
+    let name = match (rule.rule_name.as_deref(), rule.rule_arn.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "SamplingRule must specify a rule by either RuleName or RuleARN, but not both"
+                    .to_string(),
+            ))
+        }
+        (None, _) => {
+            return Err(invalid(
+                "SamplingRule.RuleName is required to create a sampling rule; its RuleARN is minted by X-Ray".to_string(),
+            ))
+        }
+        (Some(name), None) => name,
+    };
+    if rule.version != SAMPLING_RULE_FORMAT_VERSION {
+        return Err(invalid(format!(
+            "SamplingRule.Version must be {SAMPLING_RULE_FORMAT_VERSION}, the version of the sampling rule format, not {}",
+            rule.version
+        )));
+    }
+    if rule.resource_arn != ANY_RESOURCE_ARN && !rule.resource_arn.starts_with("arn:") {
+        return Err(invalid(format!(
+            "SamplingRule.ResourceARN must be an ARN or `{ANY_RESOURCE_ARN}`, not `{}`",
+            rule.resource_arn
+        )));
+    }
+    Ok(name)
+}
+
+/// The only `SamplingRule$Version` X-Ray accepts: "the version of the sampling
+/// rule format (`1`)".
+pub const SAMPLING_RULE_FORMAT_VERSION: i32 = 1;
+
+/// The `SamplingRule$ResourceARN` that matches any resource.
+pub const ANY_RESOURCE_ARN: &str = "*";
+
+impl ComAmazonawsXrayAwsxrayState {
+    /// Create one sampling rule, keyed by its `RuleName`.
+    ///
+    /// The collision check and the insert are ONE step on the locked store, so N
+    /// concurrent calls for one name have exactly one winner: every loser sees
+    /// the winner's record already present.
+    pub fn insert_sampling_rule(
+        &mut self,
+        region: &str,
+        mut rule: SamplingRule,
+        tags: Vec<(String, String)>,
+        now: f64,
+    ) -> Result<&StoredSamplingRule, SamplingRuleRejection> {
+        let name = sampling_rule_name(&rule)?.to_string();
+        if self.sampling_rules.contains_key(&name) {
+            return Err(SamplingRuleRejection::Invalid(format!(
+                "{name} already exists"
+            )));
+        }
+        if self.sampling_rules.len() >= MAX_SAMPLING_RULES {
+            return Err(SamplingRuleRejection::LimitExceeded(format!(
+                "this emulator holds the maximum of {MAX_SAMPLING_RULES} sampling rules"
+            )));
+        }
+        rule.rule_arn = Some(sampling_rule_arn(region, &name));
+        rule.rule_name = Some(name.clone());
+        self.sampling_rules.insert(
+            name.clone(),
+            StoredSamplingRule {
+                rule,
+                created_at: now,
+                modified_at: now,
+                tags,
+            },
+        );
+        Ok(&self.sampling_rules[&name])
+    }
+}
+
+/// A sampling rule's ARN, `arn:aws:xray:<region>:<account>:sampling-rule/<RuleName>`.
+///
+/// Derived from the name rather than minted with a unique suffix, because a
+/// rule's name is unique in the account for as long as the rule exists — so an
+/// ARN resolves back to a name without a second index.
+pub fn sampling_rule_arn(region: &str, rule_name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("sampling-rule/{rule_name}"),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Service graphs
+// ---------------------------------------------------------------------------
+
+/// `Service$State` for a node that has at least one completed segment in the
+/// graph's window: the service answered.
+pub const SERVICE_STATE_ACTIVE: &str = "active";
+
+/// `Service$State` for a node whose every segment in the window is still in
+/// progress: nothing is known about how it answered.
+pub const SERVICE_STATE_UNKNOWN: &str = "unknown";
+
+/// The time span a node or an edge covers, widened segment by segment.
+#[derive(Debug, Default)]
+struct Span {
+    start: Option<f64>,
+    end: Option<f64>,
+}
+
+impl Span {
+    /// Widen this span to include one segment.
+    fn widen(&mut self, segment: &SegmentRecord) {
+        self.start = Some(
+            self.start
+                .map_or(segment.start_time, |start| start.min(segment.start_time)),
+        );
+        self.end = Some(
+            self.end
+                .map_or(segment.latest(), |end| end.max(segment.latest())),
+        );
+    }
+
+    /// The span's start as a modelled timestamp.
+    fn start_time(&self) -> Option<::aws_smithy_types::DateTime> {
+        self.start.map(::aws_smithy_types::DateTime::from_secs_f64)
+    }
+
+    /// The span's end as a modelled timestamp.
+    fn end_time(&self) -> Option<::aws_smithy_types::DateTime> {
+        self.end.map(::aws_smithy_types::DateTime::from_secs_f64)
+    }
+}
+
+/// The counts `ServiceStatistics` and `EdgeStatistics` both carry, accumulated
+/// over the segments a node or an edge covers.
+#[derive(Debug, Default)]
+struct CallStatistics {
+    ok_count: i64,
+    throttle_count: i64,
+    error_other_count: i64,
+    fault_count: i64,
+    total_count: i64,
+    total_response_time: f64,
+}
+
+impl CallStatistics {
+    /// Count one segment. A fault outranks an error (a 500-series answer is not
+    /// also a 400-series one), a throttled error is counted as a throttle rather
+    /// than as "other", and a segment that recorded neither is OK — the same
+    /// classification `TraceSummary$HasFault` / `HasError` / `HasThrottle` use.
+    fn record(&mut self, segment: &SegmentRecord) {
+        self.total_count += 1;
+        if segment.is_fault() {
+            self.fault_count += 1;
+        } else if segment.is_throttle() {
+            self.throttle_count += 1;
+        } else if segment.is_error() {
+            self.error_other_count += 1;
+        } else {
+            self.ok_count += 1;
+        }
+        self.total_response_time += segment.duration().unwrap_or(0.0);
+    }
+
+    /// The 400-series counts.
+    fn error_statistics(&self) -> ErrorStatistics {
+        ErrorStatistics {
+            throttle_count: Some(self.throttle_count),
+            other_count: Some(self.error_other_count),
+            total_count: Some(self.throttle_count + self.error_other_count),
+        }
+    }
+
+    /// The 500-series counts.
+    fn fault_statistics(&self) -> FaultStatistics {
+        FaultStatistics {
+            other_count: Some(self.fault_count),
+            total_count: Some(self.fault_count),
+        }
+    }
+
+    /// These counts as a node's `SummaryStatistics`.
+    fn service_statistics(&self) -> ServiceStatistics {
+        ServiceStatistics {
+            ok_count: Some(self.ok_count),
+            error_statistics: Some(self.error_statistics()),
+            fault_statistics: Some(self.fault_statistics()),
+            total_count: Some(self.total_count),
+            total_response_time: Some(self.total_response_time),
+        }
+    }
+
+    /// These counts as an edge's `SummaryStatistics`.
+    fn edge_statistics(&self) -> EdgeStatistics {
+        EdgeStatistics {
+            ok_count: Some(self.ok_count),
+            error_statistics: Some(self.error_statistics()),
+            fault_statistics: Some(self.fault_statistics()),
+            total_count: Some(self.total_count),
+            total_response_time: Some(self.total_response_time),
+        }
+    }
+}
+
+/// One connection from a node to a downstream node, under construction.
+#[derive(Debug, Default)]
+struct EdgeAccumulator {
+    span: Span,
+    statistics: CallStatistics,
+    response_times: Vec<f64>,
+}
+
+impl EdgeAccumulator {
+    /// Count one downstream segment on this edge.
+    fn record(&mut self, segment: &SegmentRecord) {
+        self.span.widen(segment);
+        self.statistics.record(segment);
+        if let Some(duration) = segment.duration() {
+            self.response_times.push(duration);
+        }
+    }
+
+    /// This edge as the modelled `Edge`, naming the downstream node by its
+    /// `ReferenceId`.
+    fn to_edge(&self, downstream: i32) -> Edge {
+        Edge {
+            reference_id: Some(downstream),
+            start_time: self.span.start_time(),
+            end_time: self.span.end_time(),
+            summary_statistics: Some(self.statistics.edge_statistics()),
+            response_time_histogram: histogram(&self.response_times),
+            aliases: None,
+            // `link` describes an asynchronous connection, which a stored
+            // segment document does not say it is; an edge derived from a
+            // parent/child pair is the synchronous default.
+            edge_type: None,
+            received_event_age_histogram: None,
+        }
+    }
+}
+
+/// One node of a service graph, under construction.
+#[derive(Debug, Default)]
+struct NodeAccumulator {
+    account_id: Option<String>,
+    service_type: Option<String>,
+    root: bool,
+    complete: bool,
+    span: Span,
+    statistics: CallStatistics,
+    durations: Vec<f64>,
+    response_times: Vec<f64>,
+    /// Downstream service name -> the edge that reaches it.
+    edges: BTreeMap<String, EdgeAccumulator>,
+}
+
+impl NodeAccumulator {
+    /// Fold one of this service's segments into the node.
+    fn record(&mut self, segment: &SegmentRecord) {
+        self.span.widen(segment);
+        self.statistics.record(segment);
+        if segment.parent_id.is_none() {
+            // "Indicates that the service was the first service to process a
+            // request" — a segment with no parent is the entry point of its
+            // trace.
+            self.root = true;
+        }
+        if let Some(duration) = segment.duration() {
+            self.complete = true;
+            self.durations.push(duration);
+            if segment.parent_id.is_none() {
+                self.response_times.push(duration);
+            }
+        }
+        if self.service_type.is_none() {
+            self.service_type = segment.origin.clone();
+        }
+        if self.account_id.is_none() {
+            self.account_id = segment.account_id.clone();
+        }
+    }
+
+    /// This node as the modelled `Service`.
+    fn to_service(&self, name: &str, reference_ids: &BTreeMap<String, i32>) -> Service {
+        Service {
+            reference_id: reference_ids.get(name).copied(),
+            name: Some(name.to_string()),
+            names: Some(vec![name.to_string()]),
+            root: Some(self.root),
+            account_id: self.account_id.clone(),
+            r#type: self.service_type.clone(),
+            state: Some(
+                if self.complete {
+                    SERVICE_STATE_ACTIVE
+                } else {
+                    SERVICE_STATE_UNKNOWN
+                }
+                .to_string(),
+            ),
+            start_time: self.span.start_time(),
+            end_time: self.span.end_time(),
+            edges: Some(
+                self.edges
+                    .iter()
+                    .filter_map(|(downstream, edge)| {
+                        Some(edge.to_edge(reference_ids.get(downstream).copied()?))
+                    })
+                    .collect(),
+            ),
+            summary_statistics: Some(self.statistics.service_statistics()),
+            duration_histogram: histogram(&self.durations),
+            response_time_histogram: histogram(&self.response_times),
+        }
+    }
+}
+
+/// The spread of `values` as the modelled `Histogram`: one entry per distinct
+/// millisecond-rounded value with how many samples landed on it, ascending, at
+/// most [`MAX_HISTOGRAM_ENTRIES`] of them. `None` when nothing was sampled.
+fn histogram(values: &[f64]) -> Option<Vec<HistogramEntry>> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut buckets: BTreeMap<i64, i32> = BTreeMap::new();
+    for value in values {
+        #[allow(clippy::cast_possible_truncation)]
+        let millis = (value * 1_000.0).round() as i64;
+        *buckets.entry(millis).or_default() += 1;
+    }
+    Some(
+        buckets
+            .into_iter()
+            .take(MAX_HISTOGRAM_ENTRIES)
+            .map(|(millis, count)| {
+                #[allow(clippy::cast_precision_loss)]
+                let value = millis as f64 / 1_000.0;
+                HistogramEntry { value, count }
+            })
+            .collect(),
+    )
+}
+
+/// Derive the `Service` list a service graph reports from stored traces.
+///
+/// This is the one derivation behind both graph readers — `GetServiceGraph` over
+/// a time window and `GetTraceGraph` over named traces — so the two can never
+/// describe the same stored segments differently.
+///
+/// A node is one distinct segment `name` (the canonical name of the service that
+/// handled the request); an edge is a stored `parent_id` link between two
+/// segments of DIFFERENT services, counted on the upstream node and naming the
+/// downstream one by `ReferenceId`. Every count, time and histogram comes from
+/// the stored segment documents; nothing is echoed from the request.
+///
+/// `window` selects which segments take part: `Some((start, end))` keeps the
+/// segments whose `start_time` falls in the half-open interval [start, end) —
+/// the same selection `GetTraceSummaries` makes — and `None` keeps every segment
+/// of every trace handed in, which is what a per-trace graph is.
+pub fn service_graph<'a>(
+    traces: impl IntoIterator<Item = &'a TraceRecord>,
+    window: Option<(f64, f64)>,
+) -> Vec<Service> {
+    let selects = |segment: &SegmentRecord| match window {
+        Some((start, end)) => segment.start_time >= start && segment.start_time < end,
+        None => true,
+    };
+
+    let mut nodes: BTreeMap<String, NodeAccumulator> = BTreeMap::new();
+    for trace in traces {
+        for segment in &trace.segments {
+            if selects(segment) {
+                nodes.entry(segment.name.clone()).or_default().record(segment);
+            }
+        }
+        // Edges need both ends, so they are walked once this trace's nodes are
+        // known: a segment whose `parent_id` names nothing stored, or whose
+        // parent is outside the window, is on no edge.
+        for segment in &trace.segments {
+            if !selects(segment) {
+                continue;
+            }
+            let Some(parent) = segment
+                .parent_id
+                .as_deref()
+                .and_then(|parent_id| trace.segment(parent_id))
+            else {
+                continue;
+            };
+            if parent.name == segment.name || !selects(parent) {
+                continue;
+            }
+            let Some(upstream) = nodes.get_mut(&parent.name) else {
+                continue;
+            };
+            upstream
+                .edges
+                .entry(segment.name.clone())
+                .or_default()
+                .record(segment);
+        }
+    }
+
+    // "Identifier for the service. Unique within the service map": assigned over
+    // the nodes in name order, so one stored graph always answers with the same
+    // ids — across pages of one walk, and across calls.
+    let reference_ids: BTreeMap<String, i32> = nodes
+        .keys()
+        .enumerate()
+        .map(|(at, name)| {
+            (
+                name.clone(),
+                i32::try_from(at).unwrap_or(i32::MAX),
+            )
+        })
+        .collect();
+
+    nodes
+        .iter()
+        .map(|(name, node)| node.to_service(name, &reference_ids))
+        .collect()
+}
+
+/// One page of a service graph: the `Service` values to answer with, and the
+/// `NextToken` that resumes after them when the graph was truncated.
+///
+/// Lives beside [`service_graph`] so the two graph readers cannot drift in their
+/// pagination contract.
+#[derive(Debug, Clone)]
+pub struct ServiceGraphPage {
+    /// The page's services, at most `page_size` of them.
+    pub services: Vec<Service>,
+    /// The token that resumes after this page, or `None` when it is the last.
+    pub next_token: Option<String>,
+}
+
+/// Cut one page out of a WHOLE derived graph, resuming at `resume`.
+///
+/// The page is cut after the graph is derived, so every page of one walk reports
+/// the same `ReferenceId` for the same service and an edge's `ReferenceId` names
+/// a node whichever page that node lands on. `Err` is the one refusal this makes
+/// possible: a `NextToken` that names no service at or after it, which is a
+/// token this service never issued.
+pub fn page_service_graph(
+    services: &[Service],
+    resume: Option<&str>,
+    page_size: usize,
+) -> Result<ServiceGraphPage, String> {
+    let from = match resume {
+        Some(token) => services
+            .iter()
+            .position(|service| service.name.as_deref().is_some_and(|name| name >= token))
+            .ok_or_else(|| format!("NextToken `{token}` was not issued by this service"))?,
+        None => 0,
+    };
+    let remaining = &services[from..];
+    Ok(ServiceGraphPage {
+        services: remaining.iter().take(page_size).cloned().collect(),
+        next_token: remaining
+            .get(page_size)
+            .and_then(|service| service.name.clone()),
+    })
 }
 
 /// The region this request's SigV4 credential scope names, else [`DEFAULT_REGION`].

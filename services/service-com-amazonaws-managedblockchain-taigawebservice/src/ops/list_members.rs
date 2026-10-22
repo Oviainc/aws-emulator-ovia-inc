@@ -198,16 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `NetworkId` that names no network is the resource-not-found case, not an
         // empty page: an empty page would claim the network exists and holds no members.
-        // The message names the resource that was not found, which is what a caller needs
-        // to tell the two apart; `ResourceName` is `ArnString`
-        // (`@pattern ^arn:.+:.+:.+:.+:.+$`) and nothing stored holds an ARN for a network
-        // that does not exist, so it is left unset rather than filled with a bare id.
+        // The network is the resource this listing was asked for, and the shared
+        // constructor states it the way every other failure of this service does.
         let Some(network) = guard.networks.get(&input.network_id) else {
             return Err(ListMembersErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Network {} not found.", input.network_id)),
-                    resource_name: None,
-                },
+                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
             .into());
         };

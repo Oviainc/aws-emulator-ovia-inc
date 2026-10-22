@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Partial update of a stored project: every member the request carries replaces the
+//! stored one, every member it omits is left exactly as it was, and the answer is the
+//! whole updated project read back out of the store (the same projection `GetProject`
+//! serves).
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +190,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProject"))
+        let _ = ctx;
+        use crate::state::{date_time, now_ms};
+
+        // Environment configuration and project profiles are separate resources this
+        // slice of the emulator does not serve yet (`CreateProject` refuses
+        // `userParameters` for the same reason). A request that asks to re-deploy
+        // environments, or to move the project to another project profile version, is
+        // answered with the scaffold's honest "not written yet" rather than accepted
+        // and silently dropped.
+        if input.user_parameters.is_some()
+            || input.environment_deployment_details.is_some()
+            || input.project_profile_version.is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateProject with userParameters, environmentDeploymentDetails or \
+                 projectProfileVersion",
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateProjectErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // A domain that is gone, or already being deleted, holds no project to update.
+        if store.live_domain(&input.domain_identifier).is_none() {
+            return Err(UpdateProjectErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Domain {} was not found", input.domain_identifier),
+                },
+            )
+            .into());
+        }
+        let project = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .and_then(|domain| domain.projects.get_mut(&input.identifier))
+            .ok_or_else(|| {
+                UpdateProjectErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Project {} was not found", input.identifier),
+                })
+            })?;
+
+        // PATCH semantics: a member the request carries replaces the stored value, a
+        // member it omits leaves the stored value untouched.
+        if let Some(name) = input.name {
+            project.name = name;
+        }
+        if let Some(description) = input.description {
+            project.description = Some(description);
+        }
+        if let Some(glossary_terms) = input.glossary_terms {
+            project.glossary_terms = glossary_terms;
+        }
+        if let Some(domain_unit_id) = input.domain_unit_id {
+            project.domain_unit_id = Some(domain_unit_id);
+        }
+        if let Some(resource_tags) = input.resource_tags {
+            project.resource_tags = resource_tags.into_iter().collect();
+        }
+        project.last_updated_at_ms = now;
+
+        Ok(UpdateProjectOutput {
+            domain_id: project.domain_id.clone(),
+            id: project.id.clone(),
+            name: project.name.clone(),
+            description: project.description.clone(),
+            project_status: Some(project.project_status.clone()),
+            // Nothing failed, so the project carries no deletion error.
+            failure_reasons: None,
+            // `createdBy`/`createdAt` belong to the create, so an update never
+            // rewrites them: they are reported as stored.
+            created_by: project.created_by.clone(),
+            created_at: Some(date_time(project.created_at_ms)),
+            last_updated_at: Some(date_time(project.last_updated_at_ms)),
+            resource_tags: Some(
+                project
+                    .resource_tags
+                    .iter()
+                    .map(|(key, value)| ResourceTag {
+                        key: key.clone(),
+                        value: value.clone(),
+                        // `ResourceTagSource` is PROJECT | PROJECT_PROFILE
+                        // (smithy_query shape="ResourceTagSource"): a tag carried by a
+                        // create/update request is the project's own, not one inherited
+                        // from a project profile.
+                        source: "PROJECT".to_string(),
+                    })
+                    .collect(),
+            ),
+            glossary_terms: (!project.glossary_terms.is_empty())
+                .then(|| project.glossary_terms.clone()),
+            domain_unit_id: project.domain_unit_id.clone(),
+            project_profile_id: project.project_profile_id.clone(),
+            // No environments were configured, so there is no user parameter set and
+            // no deployment to report.
+            user_parameters: None,
+            environment_deployment_details: None,
+            project_category: project.project_category.clone(),
+        })
     }
 }

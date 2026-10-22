@@ -371,16 +371,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
                 // "Within a single ChangeSet, you can't start the same change
-                // type against the same entity multiple times."
+                // type against the same entity multiple times." A change set
+                // that does is REFUSED as invalid — the pair is not in use by
+                // another caller, it is the request that contradicts itself —
+                // so the answer is the modelled `ValidationException`, naming
+                // the change type and the entity it was repeated on.
                 if changes.iter().any(|held| {
                     held.entity_id.as_deref() == Some(entity_id)
                         && held.change_type == change.change_type
                 }) {
-                    return Err(StartChangeSetErrorModeled::ResourceInUseException(
-                        crate::state::in_use(format!(
-                            "this change set runs {} against entity {entity_id} more than once",
-                            change.change_type
-                        )),
+                    return Err(StartChangeSetErrorModeled::ValidationException(
+                        crate::state::validation(
+                            "ChangeSet.ChangeType",
+                            format!(
+                                "Requested changes contain multiple changes for the same \
+                                 change type '{}' on entity '{entity_id}'. Entity - change \
+                                 type pairs should be unique.",
+                                change.change_type
+                            ),
+                        ),
                     )
                     .into());
                 }

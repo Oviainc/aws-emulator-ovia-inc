@@ -160,21 +160,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("MaxResults is clamped into 1..=50, which always fits in a usize");
 
         // An opaque token this service did not issue is a bad request, not an empty page.
+        // A token is this service's own cursor, not a value a caller composes: it cannot
+        // be corrected, only obtained again, so the refusal is classified `CANNOT_PARSE`
+        // ("restart the pagination") rather than as a field rule to fix — and it still
+        // names the member whose value could not be decoded.
         let cursor = match input.next_token.as_deref() {
             None => None,
             Some(token) => match crate::state::decode_next_token(token) {
                 Some(cursor) => Some(cursor),
                 None => {
-                    let (message, fields) = crate::state::validation_detail(
-                        "NextToken",
-                        "Member must be a token returned by a previous ListWorkloads call",
-                    );
                     return Err(ListWorkloadsErrorModeled::ValidationException(
-                        ValidationException {
-                            message,
-                            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                            fields: Some(fields),
-                        },
+                        crate::state::cannot_parse_exception(
+                            NEXT_TOKEN_MEMBER,
+                            INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
                     )
                     .into());
                 }
@@ -225,3 +224,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `MaxResults` gets: the modelled `MaxResults` `@range(min: 1, max: 50)` maximum
 /// (`smithy_query(query="operation", operation="ListWorkloads")`).
 const MAX_RESULTS_CEILING: i32 = 50;
+
+/// What a `NextToken` this service did not issue is answered with. The token is this
+/// service's own opaque cursor, so the only thing a caller can do is start the
+/// pagination again — which is what `CANNOT_PARSE` tells it.
+const INVALID_NEXT_TOKEN_MESSAGE: &str = "The next token that was passed in is invalid.";
+
+/// The member an undecodable-token finding names (`ListWorkloadsInput$NextToken`).
+const NEXT_TOKEN_MEMBER: &str = "NextToken";

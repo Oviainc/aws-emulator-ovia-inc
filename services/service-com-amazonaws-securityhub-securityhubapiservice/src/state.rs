@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::ops::types::{AwsSecurityFinding, Severity};
+use crate::ops::types::{AwsSecurityFinding, Severity, Standard, StandardsManagedBy};
 
 /// The hub resource is one per account and Region, named `hub/default`.
 pub type HubKey = (String, String);
@@ -406,6 +406,38 @@ pub fn parse_iso8601_nanos(text: &str) -> Option<i128> {
     )
     .ok()?;
     Some(i128::from(dt.secs()) * 1_000_000_000 + i128::from(dt.subsec_nanos()))
+}
+
+/// The company every standard in [`STANDARDS_CATALOG`] is managed by: "For existing
+/// standards, the value is equal to `Amazon Web Services`"
+/// (`smithy_query(query="shape", shape="StandardsManagedBy")`, member `Company`).
+pub const STANDARDS_MANAGED_BY_COMPANY: &str = "Amazon Web Services";
+
+/// The product every standard in [`STANDARDS_CATALOG`] is managed by: "the value is
+/// equal to the Amazon Web Services service that manages the standard"
+/// (`smithy_query(query="shape", shape="StandardsManagedBy")`, member `Product`).
+pub const STANDARDS_MANAGED_BY_PRODUCT: &str = "Security Hub";
+
+/// [`STANDARDS_CATALOG`] as the modelled `Standard` list `DescribeStandards`
+/// reports, with every ARN built for `region`.
+///
+/// Every published standard is managed by Amazon Web Services, so each entry
+/// carries the same `StandardsManagedBy` pair.
+pub fn standards_catalog(region: &str) -> Vec<Standard> {
+    STANDARDS_CATALOG
+        .iter()
+        .map(|definition| Standard {
+            standards_arn: Some(standard_arn(region, definition)),
+            name: Some(definition.name.to_string()),
+            description: Some(definition.description.to_string()),
+            enabled_by_default: Some(definition.enabled_by_default),
+            provider: Some(definition.provider.to_string()),
+            standards_managed_by: Some(StandardsManagedBy {
+                company: Some(STANDARDS_MANAGED_BY_COMPANY.to_string()),
+                product: Some(STANDARDS_MANAGED_BY_PRODUCT.to_string()),
+            }),
+        })
+        .collect()
 }
 
 /// The documented `Normalized` value for a `SeverityLabel`: "If you provide `Label`

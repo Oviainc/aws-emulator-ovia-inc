@@ -18,10 +18,12 @@ use ::aws_smithy_types::Document;
 use serde_json::{Map, Value};
 
 use crate::ops::types::{
-    AccessDeniedException, AmiProductSummary, ChangeSetSummaryListItem, ChangeSummary,
-    ContainerProductSummary, DataProductSummary, Entity, EntitySummary,
-    MachineLearningProductSummary, ResourceInUseException, ResourceNotFoundException,
-    SaaSProductSummary, Tag, ValidationException,
+    AccessDeniedException, AMISecuritySummary, AmiProductSummary, AssessmentSummary,
+    AssessmentTargetFilter, AssessmentTargetSummary, ChangeSetSummaryListItem, ChangeSummary,
+    ContainerProductSummary, ContainerSecuritySummary, ControlAssessment, DataProductSummary,
+    Entity, EntitySummary, FrameworkFilters, FrameworkSummary, MachineLearningProductSummary,
+    ResourceInUseException, ResourceNotFoundException, SaaSProductSummary, Tag,
+    ValidationException,
 };
 
 /// The only catalog this service serves.
@@ -188,6 +190,42 @@ pub const CHANGE_SET_PAGE_PREFIX: &str = "CS";
 
 /// The `NextToken` prefix `ListEntities` pages with.
 pub const ENTITY_PAGE_PREFIX: &str = "ENT";
+
+/// The largest page `ListAssessments` serves:
+/// `ListAssessmentsMaxResultInteger` is `@range(min: 1, max: 100)`. Its
+/// `MaxResults` is `@default(20)` ("If a value isn't provided, the default value
+/// is 20"), which the boundary applies before a handler runs.
+pub const LIST_ASSESSMENTS_PAGE_LIMIT: i32 = 100;
+
+/// The largest page `DescribeAssessment` serves of one assessment's
+/// `ControlAssessments`: `DescribeAssessmentMaxResultInteger` is
+/// `@range(min: 1, max: 100)`, `@default(50)`.
+pub const DESCRIBE_ASSESSMENT_PAGE_LIMIT: i32 = 100;
+
+/// The `NextToken` prefix `ListAssessments` pages with.
+pub const ASSESSMENT_PAGE_PREFIX: &str = "ASMT";
+
+/// The `NextToken` prefix `DescribeAssessment` pages its `ControlAssessments`
+/// with.
+pub const CONTROL_PAGE_PREFIX: &str = "CTRL";
+
+/// The prefix of every assessment id, from `AssessmentIdentifier`'s own pattern
+/// (`^(assessment-[a-zA-Z0-9]+|arn:…/Assessment/assessment-[a-zA-Z0-9]+)$`) and
+/// from `DescribeAssessmentRequest$AssessmentIdentifier`'s doc ("for example,
+/// assessment-12345").
+pub const ASSESSMENT_ID_PREFIX: &str = "assessment-";
+
+/// The resource type an assessment ARN names, from the same two sources
+/// ("arn:aws:aws-marketplace:us-east-1::AWSMarketplace/Assessment/assessment-12345").
+pub const ASSESSMENT_ARN_RESOURCE_TYPE: &str = "Assessment";
+
+/// The frameworks this catalog assesses against, named by the `FrameworkSummary`
+/// and `FrameworkFilters` union members the model declares (`AMISecuritySummary`
+/// / `AMISecurityFilters` -> `AMISecurity`, `ContainerSecuritySummary` /
+/// `ContainerSecurityFilters` -> `ContainerSecurity`); `FrameworkId`'s doc gives
+/// `AMISecurity` as the unversioned form and `DescribeAssessmentResponse$FrameworkId`'s
+/// the versioned one ("frameworkId@version (for example, AMISecurity@1.0)").
+pub const ASSESSMENT_FRAMEWORKS: &[&str] = &["AMISecurity", "ContainerSecurity"];
 
 /// A `ChangeStatus` value.
 pub const STATUS_PREPARING: &str = "PREPARING";
@@ -485,6 +523,133 @@ impl EntityRecord {
     }
 }
 
+/// One assessment, as this emulator persists it: the record
+/// `DescribeAssessment` reports and `ListAssessments` summarises.
+///
+/// An assessment is the RESULT of evaluating an entity or a change set against a
+/// framework (`ListAssessments`: "An assessment is the result of evaluating a
+/// product or change set against a framework, such as AMI Security or Container
+/// Security"). This service models no operation that performs such an
+/// evaluation, and this emulator runs none — so no call creates a record here,
+/// and both operations answer from a store that is consequently empty
+/// (`ListAssessments` an empty list, `DescribeAssessment` the modelled
+/// `ResourceNotFoundException`). Reporting a `PASS`/`FAIL` for a framework
+/// evaluation nothing ran would be a fabricated result, which is worse than
+/// reporting that the account holds no assessments.
+#[derive(Debug, Clone)]
+pub struct AssessmentRecord {
+    /// `ResourceId`'s `^[\w\-]+$`, in the `assessment-…` form
+    /// `AssessmentIdentifier` accepts back.
+    pub id: String,
+    pub arn: String,
+    /// `VersionedFrameworkId`: `<framework>@<version>`, whose framework is one of
+    /// [`ASSESSMENT_FRAMEWORKS`].
+    pub framework_id: String,
+    /// The framework evaluated, one of [`ASSESSMENT_FRAMEWORKS`] — which
+    /// `FrameworkSummary` member the report carries.
+    pub framework: String,
+    /// The delivery option the framework evaluated, carried by both
+    /// `FrameworkSummary` members.
+    pub delivery_option_id: Option<String>,
+    /// `AssessmentTargetSummary$EntityId`: the entity assessed, if it was one.
+    pub entity_id: Option<String>,
+    /// `AssessmentTargetSummary$ChangeSetId`: the change set assessed, if it was
+    /// one.
+    pub change_set_id: Option<String>,
+    /// `AssessmentResult`: `PASS` or `FAIL`.
+    pub result: String,
+    /// `DateTimeISO8601`: `....-..-..T..:..:..Z`.
+    pub created_at: String,
+    /// `DateTimeISO8601`, the instant the assessment expires.
+    pub expires_at: String,
+    /// One entry per control the framework evaluated.
+    pub controls: Vec<ControlAssessment>,
+}
+
+impl AssessmentRecord {
+    /// `AssessmentTargetSummary`: which entity or change set was assessed.
+    pub fn target_summary(&self) -> AssessmentTargetSummary {
+        AssessmentTargetSummary {
+            entity_id: self.entity_id.clone(),
+            change_set_id: self.change_set_id.clone(),
+        }
+    }
+
+    /// `FrameworkSummary`: "The set member corresponds to the framework
+    /// identified by `FrameworkId`".
+    pub fn framework_summary(&self) -> Option<FrameworkSummary> {
+        match self.framework.as_str() {
+            "AMISecurity" => Some(FrameworkSummary::AMISecuritySummary(AMISecuritySummary {
+                delivery_option_id: self.delivery_option_id.clone(),
+            })),
+            "ContainerSecurity" => Some(FrameworkSummary::ContainerSecuritySummary(
+                ContainerSecuritySummary {
+                    delivery_option_id: self.delivery_option_id.clone(),
+                },
+            )),
+            _ => None,
+        }
+    }
+
+    /// The `AssessmentSummary` projection `ListAssessments` reports.
+    pub fn to_summary(&self) -> AssessmentSummary {
+        AssessmentSummary {
+            assessment_arn: Some(self.arn.clone()),
+            assessment_id: Some(self.id.clone()),
+            framework_id: Some(self.framework_id.clone()),
+            assessment_target_summary: Some(self.target_summary()),
+            framework_summary: self.framework_summary(),
+            assessment_result: Some(self.result.clone()),
+            created_at: Some(self.created_at.clone()),
+            expires_at: Some(self.expires_at.clone()),
+        }
+    }
+
+    /// Whether this assessment was performed against the framework
+    /// `framework_id` names — `ListAssessmentsRequest$FrameworkId` is the
+    /// UNVERSIONED id ("For example, AMISecurity"), so a request naming one
+    /// selects every version of it, and one naming a version selects that
+    /// version alone.
+    pub fn matches_framework_id(&self, framework_id: &str) -> bool {
+        if self.framework_id == framework_id {
+            return true;
+        }
+        self.framework == framework_id
+    }
+
+    /// Whether this assessment satisfies an `AssessmentTargetFilter`: "Filters
+    /// the list of assessments to those performed against a specific entity or
+    /// change set". A member the filter leaves absent constrains nothing.
+    pub fn matches_target(&self, filter: &AssessmentTargetFilter) -> bool {
+        let entity = filter
+            .entity_id
+            .as_deref()
+            .is_none_or(|wanted| self.entity_id.as_deref() == Some(wanted));
+        let change_set = filter
+            .change_set_id
+            .as_deref()
+            .is_none_or(|wanted| self.change_set_id.as_deref() == Some(wanted));
+        entity && change_set
+    }
+
+    /// Whether this assessment satisfies `FrameworkFilters`: "Set exactly one
+    /// member to filter results to assessments performed against that
+    /// framework" — so the member chosen selects the framework, and the
+    /// `DeliveryOptionId` it carries narrows further.
+    pub fn matches_framework_filters(&self, filters: &FrameworkFilters) -> bool {
+        let (framework, delivery_option) = match filters {
+            FrameworkFilters::AMISecurityFilters(filter) => {
+                ("AMISecurity", filter.delivery_option_id.as_deref())
+            }
+            FrameworkFilters::ContainerSecurityFilters(filter) => {
+                ("ContainerSecurity", filter.delivery_option_id.as_deref())
+            }
+        };
+        self.framework == framework
+            && delivery_option.is_none_or(|wanted| self.delivery_option_id.as_deref() == Some(wanted))
+    }
+}
+
 /// One page of a list operation's answer, and the token the next page resumes
 /// at.
 #[derive(Debug)]
@@ -519,6 +684,10 @@ pub struct ComAmazonawsMarketplacecatalogAwsmpseymourState {
     pub change_sets: BTreeMap<String, ChangeSetRecord>,
     /// Every entity a succeeded `APPLY` change set has created, keyed by id.
     pub entities: BTreeMap<String, EntityRecord>,
+    /// Every assessment, keyed by its id. Nothing creates one: an assessment is
+    /// the result of a framework evaluation, which this service models no
+    /// operation for and this emulator runs none of — see [`AssessmentRecord`].
+    pub assessments: BTreeMap<String, AssessmentRecord>,
     /// A `StartChangeSet` `ClientRequestToken` to the change set that token
     /// started, so a retried start reports the first change set instead of
     /// minting a second.
@@ -826,6 +995,91 @@ pub fn entity_arn(region: &str, entity_type: &str, entity_id: &str) -> String {
         region,
         &format!("{AWS_MARKETPLACE_CATALOG}/{entity_type}/{entity_id}"),
     )
+}
+
+/// The ARN of an assessment, in the form
+/// `DescribeAssessmentRequest$AssessmentIdentifier` documents
+/// ("arn:aws:aws-marketplace:us-east-1::AWSMarketplace/Assessment/assessment-12345")
+/// and `ARN`'s `^[a-zA-Z0-9:*/-]+$` allows.
+pub fn assessment_arn(region: &str, assessment_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{AWS_MARKETPLACE_CATALOG}/{ASSESSMENT_ARN_RESOURCE_TYPE}/{assessment_id}"),
+    )
+}
+
+/// True when `value` is an assessment id: [`ASSESSMENT_ID_PREFIX`] followed by at
+/// least one alphanumeric character, which is `AssessmentIdentifier`'s
+/// `assessment-[a-zA-Z0-9]+` alternative.
+pub fn is_assessment_id(value: &str) -> bool {
+    match value.strip_prefix(ASSESSMENT_ID_PREFIX) {
+        Some(tail) => !tail.is_empty() && tail.chars().all(|c| c.is_ascii_alphanumeric()),
+        None => false,
+    }
+}
+
+/// The assessment `identifier` names, for an identifier of either form
+/// `AssessmentIdentifier` documents: the id itself, or the id at the end of an
+/// assessment ARN of `catalog` in this service's own ARN namespace. `None` for
+/// anything else, which is what the caller refuses the request for.
+///
+/// The ARN alternative of the modelled pattern constrains only the SHAPE of an
+/// ARN (`arn:<partition>:<service>:<region>:<account>:<type>/Assessment/assessment-…`),
+/// so an ARN naming another service's namespace or another catalog satisfies it
+/// while naming no assessment of this catalog. The partition, region and account
+/// are the caller's: this service serves one catalog, whatever region a caller
+/// signs for, so they do not select the record.
+pub fn assessment_id_of<'a>(identifier: &'a str, catalog: &str) -> Option<&'a str> {
+    if is_assessment_id(identifier) {
+        return Some(identifier);
+    }
+    let mut fields = identifier.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(_partition),
+        Some(ARN_NAMESPACE),
+        Some(_region),
+        Some(_account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    let id = resource.strip_prefix(&format!("{catalog}/{ASSESSMENT_ARN_RESOURCE_TYPE}/"))?;
+    is_assessment_id(id).then_some(id)
+}
+
+/// The modelled `ValidationException` payload for an `AssessmentIdentifier` that
+/// is neither of the forms [`assessment_id_of`] resolves — built from the
+/// request, naming the identifier it rejected and the forms it accepts.
+pub fn invalid_assessment_identifier(identifier: &str) -> ValidationException {
+    validation(
+        "AssessmentIdentifier",
+        format!(
+            "Requested assessment identifier '{identifier}' is invalid. It should match with \
+             (^{ASSESSMENT_ID_PREFIX}[a-zA-Z0-9]+$)|(^arn:[a-zA-Z0-9-]+:{ARN_NAMESPACE}:\
+             [a-zA-Z0-9-]*:[0-9]*:{AWS_MARKETPLACE_CATALOG}/{ASSESSMENT_ARN_RESOURCE_TYPE}/\
+             {ASSESSMENT_ID_PREFIX}[a-zA-Z0-9]+$)."
+        ),
+    )
+}
+
+/// The modelled `ResourceNotFoundException` payload for an assessment id that
+/// names no assessment.
+pub fn assessment_not_found(assessment_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Requested assessment '{assessment_id}' does not exist."
+        )),
+    }
 }
 
 /// A resource of this catalog, as one of its resource ARNs names it.
@@ -1164,9 +1418,18 @@ pub fn invalid_sort_by(sort_by: &str, supported: &[&str]) -> ValidationException
 
 /// The modelled `ResourceNotFoundException` payload for a change set id that
 /// names no change set.
+///
+/// Worded as this service words every "does not exist" refusal — naming the
+/// resource the request asked for, which is the one rule a message built from the
+/// request follows ("Requested change set '…' does not exist.", "Requested entity
+/// '…' does not exist.", "Requested assessment '…' does not exist."). The error
+/// code and the 404 are the contract; the prose follows that one form so a client
+/// reading any of them reads the same sentence.
 pub fn change_set_not_found(change_set_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Change set {change_set_id} was not found")),
+        message: Some(format!(
+            "Requested change set '{change_set_id}' does not exist."
+        )),
     }
 }
 

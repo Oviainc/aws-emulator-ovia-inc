@@ -190,6 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .collect(),
             policies: ::std::collections::BTreeMap::new(),
+            identity_sources: ::std::collections::BTreeMap::new(),
             next_id_seq: 0,
             // A new store holds no schema: `PutSchema` is what puts one there.
             schema: None,

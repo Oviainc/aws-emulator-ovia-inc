@@ -220,6 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The same rule `CreateWorkload` applies: a Region the workload claims to run in
+        // has to be a Region. Refused before the record is touched, so an update cannot
+        // leave the store holding a value the real service would have refused.
+        if let Some(regions) = input.aws_regions.as_deref() {
+            if let Some(exception) = crate::state::unknown_aws_region_exception(regions) {
+                return Err(UpdateWorkloadErrorModeled::ValidationException(exception).into());
+            }
+        }
+
         let mut store = state.lock();
 
         if !store.workloads.contains_key(&input.workload_id) {
@@ -332,11 +341,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The service's own modelled `ValidationException` (HTTP 400) naming the member that
 /// failed and the constraint it violated.
 fn field_validation(member: &str, constraint: &str) -> UpdateWorkloadError {
-    let (message, fields) = crate::state::validation_detail(member, constraint);
-    UpdateWorkloadErrorModeled::ValidationException(ValidationException {
-        message,
-        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-        fields: Some(fields),
-    })
+    UpdateWorkloadErrorModeled::ValidationException(crate::state::member_constraint_exception(
+        member, constraint,
+    ))
     .into()
 }

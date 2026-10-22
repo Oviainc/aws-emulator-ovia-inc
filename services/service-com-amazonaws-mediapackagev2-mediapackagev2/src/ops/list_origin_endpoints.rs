@@ -181,8 +181,8 @@ fn list_configuration(
                 .collect(),
         ),
         force_endpoint_error_configuration: endpoint.force_endpoint_error_configuration.clone(),
-        uri_separator: endpoint.uri_separator.clone(),
-        stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
+        uri_separator: Some(endpoint.uri_separator.clone()),
+        stream_name_output_mode: Some(endpoint.stream_name_output_mode.clone()),
     }
 }
 

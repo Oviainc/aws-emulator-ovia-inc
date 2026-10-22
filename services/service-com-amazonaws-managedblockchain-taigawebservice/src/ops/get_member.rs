@@ -159,28 +159,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // The MEMBER is the resource this operation was asked for; the network id scopes
+        // the lookup. So a member nothing holds is reported as the missing resource
+        // whether the network that would hold it exists or not — a caller cannot act on
+        // "the network is gone" when what it asked for is a member.
+        let found = guard
+            .networks
+            .get(&input.network_id)
+            .and_then(|network| network.members.get(&input.member_id));
+        let Some(member) = found else {
             return Err(GetMemberErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "network {} does not exist on this account",
-                        input.network_id
-                    )),
-                    resource_name: Some(input.network_id.clone()),
-                },
-            )
-            .into());
-        };
-
-        let Some(member) = network.members.get(&input.member_id) else {
-            return Err(GetMemberErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "member {} does not exist on network {}",
-                        input.member_id, input.network_id
-                    )),
-                    resource_name: Some(input.member_id.clone()),
-                },
+                crate::state::not_found(crate::state::RESOURCE_MEMBER, &input.member_id),
             )
             .into());
         };

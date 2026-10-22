@@ -227,15 +227,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // The proposal this call creates does not exist yet, so the resources it was
+        // asked to act on are the network it is put to and the member making it: those
+        // are the ones a not-found failure here names.
         let Some(network) = guard.networks.get(&input.network_id) else {
             return Err(CreateProposalErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "network {} does not exist on this account",
-                        input.network_id
-                    )),
-                    resource_name: Some(input.network_id.clone()),
-                },
+                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
             .into());
         };
@@ -263,13 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this network's own.
         let Some(member) = network.members.get(&input.member_id) else {
             return Err(CreateProposalErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "member {} does not exist on network {}",
-                        input.member_id, input.network_id
-                    )),
-                    resource_name: Some(input.member_id.clone()),
-                },
+                crate::state::not_found(crate::state::RESOURCE_MEMBER, &input.member_id),
             )
             .into());
         };

@@ -57,7 +57,8 @@
 //! said `ValidationException`. Values the request carries in its URI are NOT the
 //! gateway's concern: a `@httpQuery` value outside its modelled constraint is refused
 //! by the service, as its 400 `ValidationException`, which is what the framework's own
-//! boundary already answers (hence `override_refusal` below still returns `None`).
+//! boundary already answers — `override_refusal` below only restates the MESSAGE of
+//! that refusal in this service's own wording.
 //!
 //! [`EmulatedService::front_door`] is check 1 and 2 for every request whose target or
 //! body the gateway judges, reached through [`Service::override_operation`] because
@@ -424,18 +425,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording.
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
         //
-        // KEPT at `None` deliberately. What reaches here is a refusal of a value the
-        // request carried in its URI — the gateway in front of this service validates
-        // the BODY (answered as `BadRequestException` before dispatch, see
-        // `front_door`) and leaves URI-bound values to the service. The service refuses
-        // those as its modelled 400 `ValidationException` naming the member and the
-        // constraint, which is exactly what the framework's own wording is.
-        let _ = refusal;
-        None
+        // What reaches here is a refusal of a value the request carried in its URI —
+        // the gateway in front of this service validates the BODY (answered as
+        // `BadRequestException` before dispatch, see `front_door`) and leaves
+        // URI-bound values to the service, which refuses them as its modelled 400
+        // `ValidationException` naming the member and the constraint. The STATUS and
+        // the CODE of that refusal are already the framework's, and are what the model
+        // declares (`ValidationException`, `@httpError(400)`); only the MESSAGE
+        // differs, because this service states a constraint violation as the
+        // validation envelope naming the member path and the requirement it failed
+        // WITHOUT quoting the rejected value back at the caller. So the code is
+        // restated unchanged alongside the reworded message: `Refused` carries both,
+        // and a message without its matching code is worse than leaving both alone.
+        //
+        // An authentication refusal is left to the framework: it is not a
+        // modelled-input failure and this service does not restate it.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        Some(Refused {
+            code: "ValidationException".to_string(),
+            message: crate::state::constraint_violation_message(violations)?,
+        })
     }
 
     fn override_routing_error(

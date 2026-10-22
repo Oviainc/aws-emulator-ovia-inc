@@ -160,15 +160,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
+        // The network is the resource this operation was asked for, so it is the one the
+        // failure names. `ResourceName` is left unset by `crate::state::not_found`: it is
+        // modelled `ArnString` and a network nothing holds has no ARN.
         let Some(network) = guard.networks.get(&input.network_id) else {
             return Err(GetNetworkErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "network {} does not exist on this account",
-                        input.network_id
-                    )),
-                    resource_name: Some(input.network_id.clone()),
-                },
+                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
             .into());
         };

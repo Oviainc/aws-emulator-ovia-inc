@@ -165,8 +165,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `GroupName`'s length bound is modelled, so the boundary refuses a
         // missing or over-length name before this handler runs; what is left to
-        // refuse is a name already taken, and a store already full (the cap is
-        // owned by `insert_group`, which answers `None` once it is reached).
+        // refuse is a configuration the documentation forbids, a name already
+        // taken, and a store already full (the cap is owned by `insert_group`,
+        // which answers `None` once it is reached).
+        //
+        // "Notifications may only be enabled on a group with InsightsEnabled set
+        // to true" (`InsightsConfiguration` on this operation's input), decided
+        // against the record this call would store — the same rule `UpdateGroup`
+        // applies, so a group cannot be created in a state an update refuses.
+        if let Some(configuration) = input.insights_configuration.as_ref() {
+            if configuration.notifications_enabled == Some(true)
+                && configuration.insights_enabled != Some(true)
+            {
+                return Err(CreateGroupErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "InsightsConfiguration.NotificationsEnabled can only be true on a group whose InsightsEnabled is true".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
         let mut store = state.lock();
         if store.groups.contains_key(&input.group_name) {
             return Err(CreateGroupErrorModeled::InvalidRequestException(

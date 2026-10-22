@@ -1618,7 +1618,8 @@ async fn a_running_change_set_locks_its_entities() {
         accepted.status, accepted.body
     );
 
-    // And one change set may not run one change type against one entity twice.
+    // And one change set may not run one change type against one entity twice: that
+    // request contradicts itself, so it is refused as invalid rather than as in use.
     wait_for_success();
     let twice = start_change_set(
         &router,
@@ -1640,9 +1641,19 @@ async fn a_running_change_set_locks_its_entities() {
     )
     .await;
     assert_eq!(
-        twice.status, 423,
-        "the same change type twice against one entity must answer 423, got {} with {:?}",
-        twice.status, twice.body
+        (twice.status, twice.error_code()),
+        (422, "ValidationException"),
+        "the same change type twice against one entity must answer 422 ValidationException, \
+         got {} {:?} with {:?}",
+        twice.status,
+        twice.error_code(),
+        twice.body
+    );
+    assert!(
+        twice.text("/Message").contains("AddRevisions")
+            && twice.text("/Message").contains(&entity_id),
+        "the refusal must name the repeated change type and the entity, got {:?}",
+        twice.body
     );
 
     // Two different change types against the same entity are fine.
