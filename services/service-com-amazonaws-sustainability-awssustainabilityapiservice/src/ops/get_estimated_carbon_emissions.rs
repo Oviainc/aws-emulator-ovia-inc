@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEstimatedCarbonEmissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEstimatedCarbonEmissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Buckets the seeded CARBON dataset's rows by `Granularity`, applies `FilterBy`, sums the
+//! requested `EmissionsTypes` per `GroupBy` combination and pages the result. Every value
+//! in a response is a sum over the rows the request selects — nothing is canned and nothing
+//! is echoed from the request.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEstimatedCarbonEmissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Carbon is MONTH-grained ("The smallest supported granularity for carbon emissions is
+//! MONTHLY", the modelled contract below), so the seeded carbon dataset holds one row per
+//! calendar month and every modelled granularity is a whole number of those months. A month
+//! is selected when the range includes its start, and a row's reported `TimePeriod` covers
+//! exactly the months summed into it — which is why 2025-04-01 .. 2026-04-01 at
+//! `YEARLY_CALENDAR` answers with the last 9 months of 2025 and the first 3 of 2026.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +175,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEstimatedCarbonEmissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEstimatedCarbonEmissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEstimatedCarbonEmissions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetEstimatedCarbonEmissionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Sustainability dataset is unavailable".to_string(),
+                },
+            )
+        })?;
+        let state = state.lock();
+
+        let invalid = |message: String| -> Self::Error {
+            GetEstimatedCarbonEmissionsErrorModeled::ValidationException(ValidationException {
+                message,
+            })
+            .into()
+        };
+
+        let (start_secs, end_secs) =
+            crate::state::validate_time_period(&input.time_period).map_err(invalid)?;
+        let granularity = crate::state::validate_granularity(
+            &input.granularity,
+            crate::state::CARBON_SUPPORTED_GRANULARITIES,
+        )
+        .map_err(invalid)?;
+        let fiscal_year_start_month = crate::state::validate_fiscal_year_start_month(
+            input
+                .granularity_configuration
+                .as_ref()
+                .map_or_else(
+                    || i32::from(crate::state::DEFAULT_FISCAL_YEAR_START_MONTH),
+                    |configuration| configuration.fiscal_year_start_month,
+                ),
+        )
+        .map_err(invalid)?;
+        let group_by = crate::state::validate_enum_list(
+            "GroupBy",
+            input.group_by.as_deref().unwrap_or_default(),
+            DIMENSION_VALUES,
+        )
+        .map_err(invalid)?;
+        // "If absent, returns TOTAL_LBM_CARBON_EMISSIONS and TOTAL_MBM_CARBON_EMISSIONS
+        // emissions types" — the modelled documentation of `EmissionsTypes`.
+        let requested_types = crate::state::validate_enum_list(
+            "EmissionsTypes",
+            input.emissions_types.as_deref().unwrap_or_default(),
+            EMISSIONS_TYPE_VALUES,
+        )
+        .map_err(invalid)?;
+        let emissions_types = if requested_types.is_empty() {
+            crate::state::DEFAULT_EMISSIONS_TYPES
+                .iter()
+                .map(|emissions_type| (*emissions_type).to_string())
+                .collect::<Vec<String>>()
+        } else {
+            requested_types
+        };
+        let filter = crate::state::validate_filter(input.filter_by.as_ref()).map_err(invalid)?;
+        let page_size = crate::state::validate_max_results(input.max_results).map_err(invalid)?;
+
+        // A token names a position in THIS operation's answer to THIS request, so one
+        // minted elsewhere — or for other parameters — names no row and is refused rather
+        // than read as "from the beginning".
+        let fingerprint = crate::state::request_fingerprint(&[
+            start_secs.to_string(),
+            end_secs.to_string(),
+            granularity.clone(),
+            fiscal_year_start_month.to_string(),
+            group_by.join(","),
+            crate::state::canonical_filter(&filter),
+            emissions_types.join(","),
+        ]);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(token, Self::NAME, &fingerprint)
+                .ok_or_else(|| {
+                    invalid(
+                        "NextToken is not a pagination token this operation issued for this \
+                         request"
+                            .to_string(),
+                    )
+                })?,
+        };
+
+        let rows = crate::state::aggregate(
+            &state.carbon,
+            &crate::state::Query {
+                start_secs,
+                end_secs,
+                granularity: &granularity,
+                fiscal_year_start_month,
+                group_by: &group_by,
+                filter: &filter,
+                metrics: &emissions_types,
+            },
+        );
+        let (page, next_offset) = crate::state::page(&rows, offset, page_size);
+        let results = page
+            .into_iter()
+            .map(|row| EstimatedCarbonEmissions {
+                time_period: row.time_period(),
+                dimensions_values: row.dimensions.into_iter().collect(),
+                model_version: state.model_version.clone(),
+                emissions_values: row
+                    .values
+                    .into_iter()
+                    .map(|(emissions_type, value)| {
+                        (
+                            emissions_type,
+                            Emissions {
+                                value,
+                                unit: crate::state::EMISSIONS_UNIT.to_string(),
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(GetEstimatedCarbonEmissionsOutput {
+            results,
+            // Present only when a further page exists, so a caller that follows the tokens
+            // stops exactly once every row has been reported once.
+            next_token: next_offset
+                .map(|offset| crate::state::encode_page_token(Self::NAME, &fingerprint, offset)),
+        })
     }
 }

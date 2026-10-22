@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEstimatedWaterAllocationDimensionValues
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEstimatedWaterAllocationDimensionValues`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the distinct values each requested dimension takes over the WATER dataset's
+//! rows that the requested range selects — the same strings that appear in
+//! `GetEstimatedWaterAllocation`'s `DimensionsValues` and that its `FilterBy` accepts,
+//! because both read this service's seeded water dataset.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEstimatedWaterAllocationDimensionValues::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! That dataset is annual (water allocation supports only `YEARLY_CALENDAR`), so a row is
+//! selected when the range includes the start of its year — "The range must include the
+//! start date of a year for that year's data to be included in the response", this file's
+//! modelled contract for `TimePeriod` below.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +157,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEstimatedWaterAllocationDimensionValues` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEstimatedWaterAllocationDimensionValuesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEstimatedWaterAllocationDimensionValues"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetEstimatedWaterAllocationDimensionValuesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Sustainability dataset is unavailable".to_string(),
+                },
+            )
+        })?;
+        let state = state.lock();
+
+        let invalid = |message: String| -> Self::Error {
+            GetEstimatedWaterAllocationDimensionValuesErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into()
+        };
+
+        let (start_secs, end_secs) =
+            crate::state::validate_time_period(&input.time_period).map_err(invalid)?;
+        let dimensions =
+            crate::state::validate_enum_list("Dimensions", &input.dimensions, DIMENSION_VALUES)
+                .map_err(invalid)?;
+        let page_size = crate::state::validate_max_results(input.max_results).map_err(invalid)?;
+
+        // A token names a position in THIS operation's answer to THIS request, so one
+        // minted elsewhere — or for other parameters — names no row and is refused rather
+        // than read as "from the beginning".
+        let fingerprint = crate::state::request_fingerprint(&[
+            start_secs.to_string(),
+            end_secs.to_string(),
+            dimensions.join(","),
+        ]);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(token, Self::NAME, &fingerprint)
+                .ok_or_else(|| {
+                    invalid(
+                        "NextToken is not a pagination token this operation issued for this \
+                         request"
+                            .to_string(),
+                    )
+                })?,
+        };
+
+        let entries =
+            crate::state::dimension_values(&state.water, start_secs, end_secs, &dimensions);
+        let (results, next_offset) = crate::state::page(&entries, offset, page_size);
+        Ok(GetEstimatedWaterAllocationDimensionValuesOutput {
+            results,
+            // Present only when a further page exists, so a caller that follows the tokens
+            // stops exactly once every entry has been reported once.
+            next_token: next_offset
+                .map(|offset| crate::state::encode_page_token(Self::NAME, &fingerprint, offset)),
+        })
     }
 }

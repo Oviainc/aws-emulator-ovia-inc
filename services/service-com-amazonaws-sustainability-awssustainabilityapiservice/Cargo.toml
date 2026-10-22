@@ -21,13 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The seeded dataset's values and the request fingerprint carried in a page token are
+# SHA-256 digests, so they are stable across processes without any per-call randomness.
+sha2 = { workspace = true }
+# Opaque pagination cursors: hex keeps the cursor opaque and makes a token this service
+# did not mint detectable, which is what lets a paginating operation refuse it.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

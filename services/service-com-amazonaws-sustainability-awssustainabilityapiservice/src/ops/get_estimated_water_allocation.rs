@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEstimatedWaterAllocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEstimatedWaterAllocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Buckets the seeded WATER dataset's rows, applies `FilterBy`, sums the requested
+//! `AllocationTypes` per `GroupBy` combination and pages the result. Every value in a
+//! response is a sum over the rows the request selects.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEstimatedWaterAllocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The water surface is YEAR-grained, as this file's modelled contract below states:
+//! `YEARLY_CALENDAR` is its default AND the only granularity it supports ("Only
+//! YEARLY_CALENDAR time granularity is currently supported for water allocation"), so a
+//! request naming another modelled granularity is refused with `ValidationException`; the
+//! seeded water dataset therefore holds one row per calendar year, which is what makes
+//! "the range must include the start date of a year for that year's data to be included"
+//! the selection rule here and "all the data for 2026 only" the answer to a range of
+//! 2025-04-01 .. 2026-04-01.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +173,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEstimatedWaterAllocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEstimatedWaterAllocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEstimatedWaterAllocation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetEstimatedWaterAllocationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Sustainability dataset is unavailable".to_string(),
+                },
+            )
+        })?;
+        let state = state.lock();
+
+        let invalid = |message: String| -> Self::Error {
+            GetEstimatedWaterAllocationErrorModeled::ValidationException(ValidationException {
+                message,
+            })
+            .into()
+        };
+
+        let (start_secs, end_secs) =
+            crate::state::validate_time_period(&input.time_period).map_err(invalid)?;
+        // "Only YEARLY_CALENDAR time granularity is currently supported for water
+        // allocation" — this operation's own documentation of `Granularity`. Any other
+        // modelled value is refused rather than answered.
+        let granularity = crate::state::validate_granularity(
+            &input.granularity,
+            crate::state::WATER_SUPPORTED_GRANULARITIES,
+        )
+        .map_err(invalid)?;
+        let group_by = crate::state::validate_enum_list(
+            "GroupBy",
+            input.group_by.as_deref().unwrap_or_default(),
+            DIMENSION_VALUES,
+        )
+        .map_err(invalid)?;
+        let requested_types = crate::state::validate_enum_list(
+            "AllocationTypes",
+            input.allocation_types.as_deref().unwrap_or_default(),
+            WATER_ALLOCATION_TYPE_VALUES,
+        )
+        .map_err(invalid)?;
+        let allocation_types = if requested_types.is_empty() {
+            crate::state::DEFAULT_WATER_ALLOCATION_TYPES
+                .iter()
+                .map(|allocation_type| (*allocation_type).to_string())
+                .collect::<Vec<String>>()
+        } else {
+            requested_types
+        };
+        let filter = crate::state::validate_filter(input.filter_by.as_ref()).map_err(invalid)?;
+        let page_size = crate::state::validate_max_results(input.max_results).map_err(invalid)?;
+
+        // This operation models no `GranularityConfiguration`, so its fiscal buckets start
+        // in the default fiscal month.
+        let fiscal_year_start_month = crate::state::DEFAULT_FISCAL_YEAR_START_MONTH;
+
+        // A token names a position in THIS operation's answer to THIS request, so one
+        // minted elsewhere — or for other parameters — names no row and is refused rather
+        // than read as "from the beginning".
+        let fingerprint = crate::state::request_fingerprint(&[
+            start_secs.to_string(),
+            end_secs.to_string(),
+            granularity.clone(),
+            group_by.join(","),
+            crate::state::canonical_filter(&filter),
+            allocation_types.join(","),
+        ]);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(token, Self::NAME, &fingerprint)
+                .ok_or_else(|| {
+                    invalid(
+                        "NextToken is not a pagination token this operation issued for this \
+                         request"
+                            .to_string(),
+                    )
+                })?,
+        };
+
+        let rows = crate::state::aggregate(
+            &state.water,
+            &crate::state::Query {
+                start_secs,
+                end_secs,
+                granularity: &granularity,
+                fiscal_year_start_month,
+                group_by: &group_by,
+                filter: &filter,
+                metrics: &allocation_types,
+            },
+        );
+        let (page, next_offset) = crate::state::page(&rows, offset, page_size);
+        let results = page
+            .into_iter()
+            .map(|row| EstimatedWaterAllocation {
+                time_period: row.time_period(),
+                dimensions_values: row.dimensions.into_iter().collect(),
+                model_version: state.model_version.clone(),
+                allocation_values: row
+                    .values
+                    .into_iter()
+                    .map(|(allocation_type, value)| {
+                        (
+                            allocation_type,
+                            WaterAllocation {
+                                value,
+                                unit: crate::state::WATER_ALLOCATION_UNIT.to_string(),
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(GetEstimatedWaterAllocationOutput {
+            results,
+            // Present only when a further page exists, so a caller that follows the tokens
+            // stops exactly once every row has been reported once.
+            next_token: next_offset
+                .map(|offset| crate::state::encode_page_token(Self::NAME, &fingerprint, offset)),
+        })
     }
 }
