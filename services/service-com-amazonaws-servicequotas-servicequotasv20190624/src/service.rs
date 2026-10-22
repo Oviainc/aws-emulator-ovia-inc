@@ -96,17 +96,39 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Service Quotas has its OWN names for these two refusals, and they are the
+        // ones its model declares — it declares no `ValidationException`, which is
+        // what the framework would otherwise answer:
+        //
+        // * `IllegalArgumentException` (HTTP 400, "Invalid input was provided") is
+        //   listed on every operation in the model and is the code a Service Quotas
+        //   client branches on for a malformed or absent input member — a
+        //   `ServiceCode` outside `^[a-zA-Z][a-zA-Z0-9-]{1,63}$`, a `MaxResults`
+        //   outside 1..100, an absent required member;
+        // * `AccessDeniedException` (HTTP 403, "You do not have sufficient
+        //   permission to perform this action") is the model's refusal of a caller.
+        //
+        // The framework keeps the status and the envelope; only the code and the
+        // message are chosen here, and the message is the framework's own clause,
+        // which names the member and the constraint it failed.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "IllegalArgumentException".to_string(),
+                message: violations
+                    .iter()
+                    .map(smithy_server_runtime::Violation::message)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            }),
+            Refusal::Unauthenticated => Some(Refused {
+                code: "AccessDeniedException".to_string(),
+                message: "You do not have sufficient permission to perform this action"
+                    .to_string(),
+            }),
+            // `Refusal` is `#[non_exhaustive]`: a refusal this service has no name of
+            // its own for keeps the framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
