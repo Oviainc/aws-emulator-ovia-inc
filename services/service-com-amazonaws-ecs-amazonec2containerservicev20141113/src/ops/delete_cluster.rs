@@ -3,7 +3,10 @@
 //! @op DeleteCluster
 //! Removes a stored cluster and reports it with `status: INACTIVE` — the
 //! `Cluster$status` doc: "INACTIVE: The cluster has been deleted." A cluster that still
-//! holds a task that has not stopped is refused with `ClusterContainsTasksException`.
+//! holds a task that has not stopped is refused with `ClusterContainsTasksException`,
+//! and one that still holds a service that has not been deleted with
+//! `ClusterContainsServicesException` ("You can't delete a cluster that contains
+//! services").
 //!
 //! ## Shape of an operation
 //!
@@ -194,6 +197,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A service OWNS the tasks its scheduler placed, so it is the service that has
+        // to go first: "You can't delete a cluster that contains services."
+        if guard.cluster_has_active_services(&cluster_name) {
+            return Err(DeleteClusterErrorModeled::ClusterContainsServicesException(
+                ClusterContainsServicesException {
+                    message: Some(format!(
+                        "cluster {cluster_name:?} still contains services that have not \
+                         been deleted"
+                    )),
+                },
+            )
+            .into());
+        }
+
         if guard.cluster_has_active_tasks(&cluster_name) {
             return Err(DeleteClusterErrorModeled::ClusterContainsTasksException(
                 ClusterContainsTasksException {
@@ -212,8 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("the cluster was just found in the store");
         record.status = crate::state::CLUSTER_INACTIVE.to_string();
         // The tasks the cluster held have all stopped; they go with it, so a later
-        // ListTasks cannot report tasks of a cluster that no longer exists.
+        // ListTasks cannot report tasks of a cluster that no longer exists, and the same
+        // holds for the services it held, all of which are INACTIVE by now.
         guard.tasks.retain(|_, task| task.cluster_name != cluster_name);
+        guard
+            .services
+            .retain(|_, service| service.cluster_name != cluster_name);
         let view = guard.cluster_view(&record, crate::state::ClusterFields::all());
 
         Ok(DeleteClusterOutput {

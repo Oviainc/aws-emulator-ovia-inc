@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an ECS service in a cluster and reports it. The stored record holds the
+//! requested configuration, and the ECS service scheduler places `desiredCount` tasks of
+//! the resolved task-definition revision — the operation's own doc: "Runs and maintains
+//! your desired number of tasks from a specified task definition". Everything a response
+//! counts (`runningCount`, `pendingCount`, the deployment's `rolloutState`) is derived
+//! from the tasks that exist, so `DescribeServices` and `UpdateService` read the same
+//! numbers back.
 //!
 //! ## Shape of an operation
 //!
@@ -338,18 +336,307 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateService"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateServiceErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let name = input.service_name.clone();
+        if !crate::state::is_valid_name(&name) {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "serviceName must be 1 to {} letters, numbers, underscores or \
+                         hyphens; got {name:?}",
+                        crate::state::MAX_NAME_LENGTH
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "It must be unique and is case sensitive. Up to 36 ASCII characters in the
+        // range of 33-126 (inclusive) are allowed."
+        if let Some(token) = input.client_token.as_deref() {
+            let legal = token.len() <= crate::state::MAX_CLIENT_TOKEN_LENGTH
+                && !token.is_empty()
+                && token.bytes().all(|byte| (33..=126).contains(&byte));
+            if !legal {
+                return Err(CreateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "clientToken must be up to {} ASCII characters in the range \
+                             33-126; got {token:?}",
+                            crate::state::MAX_CLIENT_TOKEN_LENGTH
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The scheduling strategy to use for the service" — `REPLICA` when unspecified.
+        let scheduling_strategy = input
+            .scheduling_strategy
+            .clone()
+            .unwrap_or_else(|| crate::state::SCHEDULING_REPLICA.to_string());
+        // "If no deployment controller is specified, the default value of ECS is used."
+        let controller = input.deployment_controller.clone().unwrap_or({
+            DeploymentController {
+                r#type: crate::state::DEPLOYMENT_CONTROLLER_ECS.to_string(),
+            }
+        });
+        let scheduler_owned = controller.r#type == crate::state::DEPLOYMENT_CONTROLLER_ECS;
+
+        // "If a capacityProviderStrategy is specified, the launchType parameter must be
+        // omitted."
+        let requested_strategy = input.capacity_provider_strategy.clone().unwrap_or_default();
+        if !requested_strategy.is_empty() && input.launch_type.is_some() {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "launchType must be omitted when capacityProviderStrategy is \
+                         specified"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "This is required if schedulingStrategy is REPLICA or isn't specified. If
+        // schedulingStrategy is DAEMON then this isn't required."
+        let daemon = scheduling_strategy == crate::state::SCHEDULING_DAEMON;
+        if !daemon && input.desired_count.is_none() {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "desiredCount is required when schedulingStrategy is {}",
+                        crate::state::SCHEDULING_REPLICA
+                    )),
+                },
+            )
+            .into());
+        }
+        if input.desired_count.is_some_and(|count| count < 0) {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "desiredCount must not be negative; got {:?}",
+                        input.desired_count
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A task definition must be specified if the service uses either the ECS or
+        // CODE_DEPLOY deployment controllers."
+        let needs_definition = scheduler_owned || controller.r#type == "CODE_DEPLOY";
+        if needs_definition && input.task_definition.is_none() {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "taskDefinition is required for a service using the {} \
+                         deployment controller",
+                        controller.r#type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        let Some(cluster) = guard.clusters.get(&cluster_name) else {
+            return Err(CreateServiceErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                },
+            )
+            .into());
+        };
+        let cluster_arn = cluster.arn.clone();
+        let cluster_default_strategy = cluster.default_capacity_provider_strategy.clone();
+
+        // "The family and revision (family:revision) or full ARN of the task definition
+        // to run in your service. If a revision isn't specified, the latest ACTIVE
+        // revision is used."
+        let definition = match input.task_definition.as_deref() {
+            None => None,
+            Some(reference) => {
+                let Some((family, revision)) =
+                    crate::state::parse_task_definition_reference(reference)
+                else {
+                    return Err(CreateServiceErrorModeled::ClientException(ClientException {
+                        message: Some(format!(
+                            "taskDefinition must be a family, family:revision or \
+                             task-definition ARN; got {reference:?}"
+                        )),
+                    })
+                    .into());
+                };
+                let found = match revision {
+                    Some(revision) => guard.task_definitions.get(&(family.clone(), revision)),
+                    None => guard.latest_active_revision(&family),
+                };
+                let Some(found) = found.cloned() else {
+                    return Err(CreateServiceErrorModeled::ClientException(ClientException {
+                        message: Some(format!(
+                            "unable to describe task definition {reference:?}"
+                        )),
+                    })
+                    .into());
+                };
+                Some(found)
+            }
+        };
+
+        let key = (cluster_name.clone(), name.clone());
+        if let Some(existing) = guard.services.get(&key) {
+            if existing.status != crate::state::SERVICE_INACTIVE {
+                // "An identifier that you provide to ensure the idempotency of the
+                // request": the same token on the same service name is the SAME create,
+                // so the stored record is reported back unchanged.
+                if input.client_token.is_some() && existing.client_token == input.client_token {
+                    let view = guard.service_view(existing, crate::state::ServiceFields::all());
+                    return Ok(CreateServiceOutput {
+                        service: Some(view),
+                    });
+                }
+                return Err(CreateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "service {name:?} already exists in cluster {cluster_name:?}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        } else if guard.services.len() >= crate::state::MAX_SERVICES {
+            return Err(CreateServiceErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "this emulator holds at most {} services; delete one before creating \
+                     another",
+                    crate::state::MAX_SERVICES
+                )),
+            })
+            .into());
+        }
+
+        // "The daemon scheduling strategy deploys exactly one task on each active
+        // container instance", so a daemon's desired count is the capacity registered to
+        // the cluster rather than a number the request carries.
+        let desired_count = if daemon {
+            i32::try_from(guard.registered_container_instances(&cluster_name)).unwrap_or(i32::MAX)
+        } else {
+            input.desired_count.unwrap_or_default()
+        };
+
+        // "If no capacityProviderStrategy or launchType is specified, the
+        // defaultCapacityProviderStrategy for the cluster is used" — and when the
+        // cluster has none either, the service runs on the EC2 capacity registered to it.
+        let effective_strategy = if requested_strategy.is_empty() {
+            cluster_default_strategy
+        } else {
+            requested_strategy
+        };
+        let (launch_type, capacity_provider_strategy) = match input.launch_type.clone() {
+            Some(launch_type) => (Some(launch_type), Vec::new()),
+            None if effective_strategy.is_empty() => (
+                Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string()),
+                Vec::new(),
+            ),
+            None => (None, effective_strategy),
+        };
+
+        let created_at = crate::state::now();
+        let deployment_id = guard.next_deployment_id();
+        let record = crate::state::ServiceRecord {
+            arn: crate::state::service_arn(&region, &cluster_name, &name),
+            name: name.clone(),
+            cluster_name: cluster_name.clone(),
+            cluster_arn,
+            status: crate::state::SERVICE_ACTIVE.to_string(),
+            desired_count,
+            task_definition_arn: definition.as_ref().map(|found| found.arn.clone()),
+            task_definition: definition
+                .as_ref()
+                .map(|found| (found.family.clone(), found.revision)),
+            launch_type,
+            capacity_provider_strategy,
+            platform_version: input.platform_version.clone(),
+            role_arn: input.role.clone(),
+            load_balancers: input.load_balancers.clone().unwrap_or_default(),
+            service_registries: input.service_registries.clone().unwrap_or_default(),
+            deployment_configuration: crate::state::deployment_configuration(
+                input.deployment_configuration.clone(),
+                daemon,
+            ),
+            deployment_controller: controller,
+            placement_constraints: input.placement_constraints.clone().unwrap_or_default(),
+            placement_strategy: input.placement_strategy.clone().unwrap_or_default(),
+            network_configuration: input.network_configuration.clone(),
+            service_connect_configuration: input.service_connect_configuration.clone(),
+            volume_configurations: input.volume_configurations.clone().unwrap_or_default(),
+            vpc_lattice_configurations: input.vpc_lattice_configurations.clone().unwrap_or_default(),
+            health_check_grace_period_seconds: input.health_check_grace_period_seconds,
+            scheduling_strategy,
+            // "If no value is specified, the tags aren't propagated. ... The default is
+            // NONE."
+            propagate_tags: input
+                .propagate_tags
+                .clone()
+                .unwrap_or_else(|| crate::state::PROPAGATE_TAGS_NONE.to_string()),
+            enable_ecs_managed_tags: input.enable_ecs_managed_tags,
+            enable_execute_command: input.enable_execute_command,
+            // "For create service requests, when no value is specified for
+            // AvailabilityZoneRebalancing, Amazon ECS defaults the value to ENABLED."
+            availability_zone_rebalancing: input
+                .availability_zone_rebalancing
+                .clone()
+                .unwrap_or_else(|| crate::state::AZ_REBALANCING_ENABLED.to_string()),
+            tags: input.tags.clone().unwrap_or_default(),
+            client_token: input.client_token.clone(),
+            created_at,
+            deployment_id,
+            deployment_created_at: created_at,
+            deployment_updated_at: created_at,
+        };
+        guard.services.insert(key.clone(), record);
+
+        // The scheduler places the service's task set now. `scale_service` is what gates
+        // this on the deployment controller (`ServiceRecord::places_tasks`): only the
+        // ECS controller owns a task set, the others' tasks come from a task set.
+        if let Some(definition) = definition.as_ref() {
+            if guard.scale_service(&key, definition, &region, now).is_err() {
+                guard.services.remove(&key);
+                return Err(CreateServiceErrorModeled::ClientException(ClientException {
+                    message: Some(format!(
+                        "this emulator holds at most {} tasks; stop some before placing \
+                         a service of {desired_count} tasks",
+                        crate::state::MAX_TASKS
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let stored = guard
+            .services
+            .get(&key)
+            .expect("the service was just inserted");
+        // `CreateService` has no `include` member to narrow the response with, so the
+        // service it just created is reported with the tags it was created with.
+        let view = guard.service_view(stored, crate::state::ServiceFields::all());
+        Ok(CreateServiceOutput {
+            service: Some(view),
+        })
     }
 }

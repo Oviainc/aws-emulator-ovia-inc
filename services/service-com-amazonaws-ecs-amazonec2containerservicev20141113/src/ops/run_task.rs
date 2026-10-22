@@ -437,33 +437,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for _ in 0..count {
             let task_id = guard.next_task_id();
             let task_arn = crate::state::task_arn(&region, &cluster_name, &task_id);
-            let containers = definition
-                .container_definitions
-                .iter()
-                .map(|container| {
-                    let container_id = guard.next_container_id();
-                    crate::state::ContainerRecord {
-                        container_arn: crate::state::container_arn(
-                            &region,
-                            &cluster_name,
-                            &task_id,
-                            &container_id,
-                        ),
-                        task_arn: task_arn.clone(),
-                        name: container.name.clone(),
-                        image: container.image.clone(),
-                        last_status: crate::state::STATUS_PENDING.to_string(),
-                        // `Container$cpu`: "The value is 0 if no value was specified in
-                        // the container definition" — which is what the modelled
-                        // non-optional `cpu` already holds.
-                        cpu: Some(container.cpu.to_string()),
-                        memory: container.memory.map(|memory| memory.to_string()),
-                        memory_reservation: container
-                            .memory_reservation
-                            .map(|memory| memory.to_string()),
-                    }
-                })
-                .collect::<Vec<_>>();
+            let containers = guard.mint_containers(
+                &region,
+                &cluster_name,
+                &task_id,
+                &task_arn,
+                &definition,
+                crate::state::STATUS_PENDING,
+            );
 
             let record = crate::state::TaskRecord {
                 task_arn: task_arn.clone(),
@@ -483,6 +464,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 platform_version: input.platform_version.clone(),
                 started_by: input.started_by.clone(),
                 group: group.clone(),
+                // Nothing but the service scheduler places a task for a service, so a
+                // task a client ran stands alone.
+                service_name: None,
                 tags: tags.clone(),
                 enable_execute_command: input.enable_execute_command,
                 created_at,

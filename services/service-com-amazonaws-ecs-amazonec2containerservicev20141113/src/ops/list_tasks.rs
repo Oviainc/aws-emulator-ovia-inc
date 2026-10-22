@@ -213,16 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A service cannot exist in this slice — nothing creates one — so a filter that
-        // names one names something absent, which is what the modelled error reports.
-        if let Some(service_name) = input.service_name.as_deref() {
-            return Err(ListTasksErrorModeled::ServiceNotFoundException(
-                ServiceNotFoundException {
-                    message: Some(format!("service {service_name:?} was not found")),
-                },
-            )
-            .into());
-        }
+        // "Specifying a serviceName limits the results to tasks that belong to that
+        // service." A name that matches no service in the cluster names nothing, which
+        // is what the modelled error reports.
+        let service_name = input
+            .service_name
+            .as_deref()
+            .map(crate::state::service_name_from_reference);
 
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
         // "The default status filter is RUNNING, which shows tasks that Amazon ECS has
@@ -242,6 +239,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        if let Some(name) = service_name.as_deref() {
+            if !guard
+                .services
+                .contains_key(&(cluster_name.clone(), name.to_string()))
+            {
+                return Err(ListTasksErrorModeled::ServiceNotFoundException(
+                    ServiceNotFoundException {
+                        message: Some(format!(
+                            "service {name:?} was not found in cluster {cluster_name:?}"
+                        )),
+                    },
+                )
+                .into());
+            }
         }
 
         // "Specifying a containerInstance limits the results to tasks that belong to
@@ -292,6 +305,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .launch_type
                     .as_deref()
                     .is_none_or(|launch_type| task.launch_type.as_deref() == Some(launch_type))
+            })
+            .filter(|task| {
+                service_name
+                    .as_deref()
+                    .is_none_or(|name| task.service_name.as_deref() == Some(name))
             })
             // A daemon cannot exist in this slice, so no task belongs to one and a
             // `daemonName` filter selects nothing.
