@@ -17,3 +17,5 @@ mod control_plane_error_semantics;
 mod fhir_datastore_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_fhir_datastore.rs"]
+mod update_fhir_datastore;

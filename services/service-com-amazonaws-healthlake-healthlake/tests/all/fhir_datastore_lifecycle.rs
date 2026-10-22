@@ -77,7 +77,7 @@ impl HealthLake {
     }
 
     /// Every data store the service reports, in `ListFHIRDatastores` order.
-    async fn list_all(&self, filter: &Value) -> Vec<Value> {
+    pub(crate) async fn list_all(&self, filter: &Value) -> Vec<Value> {
         let mut request = json!({});
         if !filter.is_null() {
             request["Filter"] = filter.clone();

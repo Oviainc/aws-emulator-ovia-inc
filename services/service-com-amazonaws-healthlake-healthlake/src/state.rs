@@ -4,8 +4,9 @@
 //!
 //! The FHIR data store is this service's primary resource: `CreateFHIRDatastore`
 //! mints one here and `DescribeFHIRDatastore` / `ListFHIRDatastores` /
-//! `TagResource` / `ListTagsForResource` / `DeleteFHIRDatastore` all read and
-//! write the SAME record, so a create is observable through every one of them.
+//! `TagResource` / `ListTagsForResource` / `UpdateFHIRDatastore` /
+//! `DeleteFHIRDatastore` all read and write the SAME record, so a create is
+//! observable through every one of them.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -90,10 +91,15 @@ pub const MAX_TAGS_PER_DATASTORE: usize = 50;
 /// (`...:(datastore\/fhir\/.{32}|dataTransformationProfile\/[a-f0-9]{32})$`).
 const DATASTORE_ARN_RESOURCE_PREFIX: &str = "datastore/fhir/";
 
+/// The enabled value of the modelled `BackupStatus` enum
+/// (`BACKUP_STATUS_VALUES` = `["DISABLED", "ENABLED"]`).
+const BACKUP_ENABLED: &str = "ENABLED";
+
 /// The states a data store moves through in this slice, as the modelled
-/// `DatastoreStatus` enum names them on the wire. The failure states the enum
-/// also declares (`CREATE_FAILED`, `UPDATING`, `UPDATE_FAILED`) belong to
-/// operations that are still scaffolded, so nothing here produces them.
+/// `DatastoreStatus` enum names them on the wire. The states the enum also
+/// declares (`CREATE_FAILED`, `UPDATING`, `UPDATE_FAILED`) describe a failure,
+/// or work that outlives its own call, and nothing in this slice produces
+/// either, so nothing here produces them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatastoreStatus {
     Creating,
@@ -138,6 +144,11 @@ pub struct Datastore {
     pub nlp_configuration: Option<NlpConfiguration>,
     pub profile_configuration: Option<ProfileConfiguration>,
     pub backup_configuration: Option<BackupConfiguration>,
+    /// When this data store's backup configuration became `ENABLED`, which is
+    /// what the modelled `DatastoreBackupStatus.BackupEnabledAt` reports ("the
+    /// time backup was enabled on the data store"). `None` whenever backup is
+    /// not enabled. Written only through [`Datastore::set_backup_configuration`].
+    pub backup_enabled_at: Option<::aws_smithy_types::DateTime>,
     pub error_cause: Option<ErrorCause>,
     /// Tags by key, so `TagResource` merges by key and the reported order is
     /// stable across reads. Seeded from `CreateFHIRDatastore`'s `Tags`.
@@ -163,22 +174,42 @@ impl Datastore {
             nlp_configuration: self.nlp_configuration.clone(),
             analytics_configuration: self.analytics_configuration.clone(),
             profile_configuration: self.profile_configuration.clone(),
-            // Only the configuration half of the backup status is known here:
-            // it took effect when the data store was created. The restore-point
-            // and scheduled-deletion instants describe backups that have run,
-            // and nothing in this slice runs one, so they stay unset rather
-            // than being invented.
+            // Only the configuration half of the backup status is known here,
+            // plus the instant that configuration became enabled. The
+            // restore-point and scheduled-deletion instants describe backups
+            // that have run, and nothing in this slice runs one, so they stay
+            // unset rather than being invented.
             backup_status_info: self
                 .backup_configuration
                 .clone()
                 .map(|configuration| DatastoreBackupStatus {
                     configuration: Some(configuration),
-                    backup_enabled_at: Some(self.created_at),
+                    backup_enabled_at: self.backup_enabled_at,
                     earliest_restore_point: None,
                     latest_restore_point: None,
                     scheduled_permanent_deletion_time: None,
                 }),
         }
+    }
+
+    /// Record `configuration` as this data store's backup configuration, taken
+    /// at `at`.
+    ///
+    /// `DatastoreBackupStatus.BackupEnabledAt` is "the time backup was enabled
+    /// on the data store", so it is stamped when the configuration becomes
+    /// enabled, left alone while it stays enabled (a later configuration change
+    /// does not re-enable anything), and cleared when it is not enabled.
+    pub fn set_backup_configuration(
+        &mut self,
+        configuration: BackupConfiguration,
+        at: ::aws_smithy_types::DateTime,
+    ) {
+        let enabled = configuration.status.as_deref() == Some(BACKUP_ENABLED);
+        self.backup_configuration = Some(configuration);
+        self.backup_enabled_at = match (enabled, self.backup_enabled_at) {
+            (true, already_enabled_at) => already_enabled_at.or(Some(at)),
+            (false, _) => None,
+        };
     }
 
     /// The stored tags as the modelled `TagList`, ordered by key.

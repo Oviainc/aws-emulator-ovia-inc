@@ -284,8 +284,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        let created_at = ::aws_smithy_types::DateTime::from(now);
         let id = store.next_datastore_id(now);
-        let datastore = crate::state::Datastore {
+        let mut datastore = crate::state::Datastore {
             arn: crate::state::datastore_arn(&region, &id),
             endpoint: crate::state::datastore_endpoint(&region, &id),
             id: id.clone(),
@@ -300,17 +301,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )),
             reap_at: None,
             type_version: input.datastore_type_version,
-            created_at: ::aws_smithy_types::DateTime::from(now),
+            created_at,
             sse_configuration: input.sse_configuration,
             preload_data_config: input.preload_data_config,
             identity_provider_configuration: input.identity_provider_configuration,
             analytics_configuration: input.analytics_configuration,
             nlp_configuration: input.nlp_configuration,
             profile_configuration: input.profile_configuration,
-            backup_configuration: input.backup_configuration,
+            backup_configuration: None,
+            backup_enabled_at: None,
             error_cause: None,
             tags,
         };
+        // Written through the record's own setter, so the reported
+        // `BackupEnabledAt` is the instant backup became enabled rather than a
+        // second copy of the creation time.
+        if let Some(configuration) = input.backup_configuration {
+            datastore.set_backup_configuration(configuration, created_at);
+        }
 
         let output = CreateFHIRDatastoreOutput {
             datastore_id: datastore.id.clone(),

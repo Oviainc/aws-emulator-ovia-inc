@@ -216,7 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             datastore.identity_provider_configuration = Some(configuration);
         }
         if let Some(configuration) = input.backup_configuration {
-            datastore.backup_configuration = Some(configuration);
+            // Through the record's own setter, so the reported `BackupEnabledAt`
+            // is the instant backup became enabled rather than the instant this
+            // call ran or the data store was created.
+            datastore.set_backup_configuration(
+                configuration,
+                ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+            );
         }
 
         // The data store stays `ACTIVE`: the update is in the record by the time
