@@ -25,6 +25,8 @@ mod identity_sources;
 mod policy_store_alias;
 #[path = "all/policy_store_authorization.rs"]
 mod policy_store_authorization;
+#[path = "all/policy_store_settings.rs"]
+mod policy_store_settings;
 #[path = "all/schema.rs"]
 mod schema;
 #[path = "all/state_roundtrip.rs"]

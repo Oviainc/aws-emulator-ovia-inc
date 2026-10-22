@@ -91,6 +91,38 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// request's map; this bounds what a resource ends up holding.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The Cedar language version a policy store is created with, one of
+/// `CedarVersion`'s two values (`smithy_query(query="shape",
+/// shape="CedarVersion")`: `CEDAR_2 | CEDAR_4`).
+///
+/// It is a SERVICE default, not a request value: no member of any modelled
+/// operation carries a Cedar version — `CreatePolicyStore`, `UpdatePolicyStore`
+/// and `PutSchema` have none — and `CedarVersion` is only ever reported, by
+/// `GetPolicyStore`. The corpus's recorded `GetPolicyStore` responses for a
+/// plainly created store report `CEDAR_4`, the newer of the two, which is what
+/// the service creates stores with.
+pub const DEFAULT_CEDAR_VERSION: &str = "CEDAR_4";
+
+/// The message `GetPolicyStore`'s `ResourceNotFoundException` carries for a
+/// reference that names no live store.
+///
+/// A CONSTANT, embedding no request or generated value: the model gives the
+/// exception its own `resourceId` ("the unique ID of the resource referenced in
+/// the failed request") and `resourceType` members, so the identity of what was
+/// not found is reported there rather than spliced into prose, and this is the
+/// text the corpus records for the `GetPolicyStore` 404 of fixture
+/// `verifiedpermissions-policy-store-lifecycle-and-tags` (steps task#2 and
+/// teardown#11).
+///
+/// Used ONLY where a recording establishes it, never by generalisation: the
+/// corpus records an id-BEARING message for `IsAuthorized`'s 404, so no one
+/// message rule covers every operation of this service, and the remaining
+/// interpolated not-found messages (`GetPolicy`, `ListTagsForResource`,
+/// `UpdatePolicyStore`) are causes of the open issue
+/// `20261022T044921Z-verifiedpermissions-verified-permissions-error-messages-interpolate-request-and-generated.md`,
+/// which owns them.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
 /// How long a `clientToken` is remembered, from `CreatePolicyStore`'s own model
 /// documentation: "Verified Permissions recognizes a ClientToken for eight hours."
 pub const CLIENT_TOKEN_TTL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -159,6 +191,26 @@ pub struct PolicyStoreAlias {
     pub state: String,
 }
 
+/// How a policy store and its child resources are encrypted: the state behind
+/// `GetPolicyStoreOutput$encryptionState`, whose modelled union has exactly
+/// these two arms.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StoreEncryption {
+    /// `EncryptionState$default`: "This is the default encryption state. The
+    /// policy store is encrypted using an Amazon Web Services owned key."
+    #[default]
+    AwsOwnedKey,
+    /// `EncryptionState$kmsEncryptionState`: the store is encrypted with a
+    /// customer-managed KMS key, under a user-defined encryption context.
+    CustomerManagedKey {
+        /// `KmsEncryptionState$key` — the key being used for encryption.
+        key: String,
+        /// `KmsEncryptionState$encryptionContext` — the user-defined context
+        /// added during encryption processes.
+        encryption_context: BTreeMap<String, String>,
+    },
+}
+
 /// One policy store and everything it owns.
 #[derive(Debug, Clone)]
 pub struct PolicyStore {
@@ -171,6 +223,14 @@ pub struct PolicyStore {
     pub deletion_protection: String,
     pub created_date: DateTime,
     pub last_updated_date: DateTime,
+    /// `CedarVersion`: the Cedar language version this store's policies are
+    /// written against, [`DEFAULT_CEDAR_VERSION`] at creation.
+    pub cedar_version: String,
+    /// How this store is encrypted. A store is created
+    /// [`StoreEncryption::AwsOwnedKey`] unless a customer-managed key was
+    /// configured for it, and `GetPolicyStore` reports whichever arm is
+    /// persisted here.
+    pub encryption: StoreEncryption,
     pub tags: BTreeMap<String, String>,
     /// The store's policies, keyed by `policyId`.
     pub policies: BTreeMap<String, Policy>,

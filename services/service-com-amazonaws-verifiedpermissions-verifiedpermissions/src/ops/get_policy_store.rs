@@ -4,9 +4,9 @@
 //!
 //! Hand-authored. The scaffold op-stub generator declined this operation because
 //! `GetPolicyStoreOutput$encryptionState` targets a union with a `smithy.api#Unit`
-//! arm (see `src/ops/SKIPPED_STUBS.md`); the output type in
-//! `types/get_policy_store_types.rs` declares that one member `unsupported` and
-//! serves every other one.
+//! arm (see `src/ops/SKIPPED_STUBS.md`); the output type and its schema are
+//! written out in `types/get_policy_store_types.rs`, which serves every modelled
+//! member of this output, that union included.
 //!
 //! `@readonly`: looks the store up in [`crate::state`] and reports exactly what
 //! was persisted. It writes nothing.
@@ -21,8 +21,8 @@
 //!
 //! * `policyStoreId`, `arn`, `validationSettings`, `createdDate`,
 //!   `lastUpdatedDate` — all **required**.
-//! * `description`, `deletionProtection`, `cedarVersion`, `tags` — present when set.
-//! * `encryptionState` (EncryptionState) — not served by this slice.
+//! * `description`, `deletionProtection`, `cedarVersion`, `encryptionState`,
+//!   `tags` — present when set.
 //!
 //! ## Errors
 //!
@@ -86,12 +86,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The reference this request named goes in `resourceId`, which the model
+        // makes required for exactly that, so the message is the constant the
+        // recorded responses for this operation's 404 carry — see
+        // [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] for the recording it
+        // comes from.
         let not_found = || {
             GetPolicyStoreErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "No policy store exists with the input ID: {}",
-                    input.policy_store_id
-                ),
+                message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                 resource_id: input.policy_store_id.clone(),
                 resource_type: "POLICY_STORE".to_string(),
             })
@@ -118,10 +120,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_date: store.last_updated_date,
             description: store.description.clone(),
             deletion_protection: Some(store.deletion_protection.clone()),
-            // `cedarVersion` is a property of the policy store that no modelled
-            // request member sets — neither `CreatePolicyStore` nor `PutSchema`
-            // carries one — so there is nothing persisted to report.
-            cedar_version: None,
+            // Both of these are properties of the store that no request member
+            // sets, so `CreatePolicyStore` persists the service's own default
+            // for each and this reports whatever the record holds.
+            encryption_state: Some(match &store.encryption {
+                crate::state::StoreEncryption::AwsOwnedKey => EncryptionState::Default,
+                crate::state::StoreEncryption::CustomerManagedKey {
+                    key,
+                    encryption_context,
+                } => EncryptionState::KmsEncryptionState(KmsEncryptionState {
+                    key: key.clone(),
+                    encryption_context: encryption_context.clone().into_iter().collect(),
+                }),
+            }),
+            cedar_version: Some(store.cedar_version.clone()),
             // The tags are reported only when the request asked for them.
             tags: input
                 .tags

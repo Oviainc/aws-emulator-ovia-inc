@@ -60,6 +60,20 @@
 //!   resource occurred at the same time.
 //! * `ResourceNotFoundException` (HTTP 404) — The request failed because it references a
 //!   resource that doesn't exist.
+//!
+//! ## Which members this call replaces
+//!
+//! `validationSettings` is `@required`, so every call replaces the store's
+//! validation mode. `deletionProtection` is the one member the model documents
+//! as sticky — "this parameter is unchanged unless explicitly included in the
+//! call" — so an absent one leaves the stored flag alone. `description` carries
+//! no such sentence, in deliberate contrast, so it is replaced by what the
+//! request carries, which is also the only way a caller can clear it.
+//!
+//! `ConflictException` is modelled for "another request to modify a resource
+//! occurred at the same time". This emulator serves a request under the state
+//! lock, so two updates are never in flight at once and that error has no
+//! occasion to be raised here.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -87,14 +101,11 @@ pub enum UpdatePolicyStoreErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::update_policy_store::UpdatePolicyStoreError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// (`crate::ops::update_policy_store::UpdatePolicyStoreError`).
 pub type UpdatePolicyStoreError = crate::scaffolded::Scaffolded<UpdatePolicyStoreErrorModeled>;
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the
+/// handler writes `Err(SomeModeledError.into())` rather than naming the wrapper.
 impl From<UpdatePolicyStoreErrorModeled> for UpdatePolicyStoreError {
     fn from(modeled: UpdatePolicyStoreErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
