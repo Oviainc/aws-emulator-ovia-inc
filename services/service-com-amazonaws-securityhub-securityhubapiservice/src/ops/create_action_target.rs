@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateActionTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateActionTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateActionTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one custom action target in the caller's hub: the `(account, Region, Id)`
+//! record `DescribeActionTargets` reports and `DeleteActionTarget` removes, named by
+//! `arn:aws:securityhub:<region>:<account>:action/custom/<Id>`. An `Id` the hub
+//! already holds is the modelled `ResourceConflictException` (409); an `Id` or `Name`
+//! outside the bounds the model documents is the modelled `InvalidInputException`
+//! (400) — as is a `Description` longer than the length this store keeps; a hub that
+//! already holds [`crate::state::MAX_ACTION_TARGETS_PER_HUB`] targets is the modelled
+//! `LimitExceededException` (429); a caller whose account is not subscribed in the
+//! Region is the modelled
+//! `InvalidAccessException` (401), as every other hub-scoped operation in this crate
+//! answers it.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +122,68 @@ impl From<CreateActionTargetErrorModeled> for CreateActionTargetError {
     }
 }
 
+/// `Id`'s documented bound: "The ID for the custom action target. Can contain up to
+/// 20 alphanumeric characters" (`smithy_query(query="doc",
+/// shape="CreateActionTargetRequest", member="Id")`).
+const MAX_ID_LENGTH: usize = 20;
+
+/// `Name`'s documented bound: "The name of the custom action target. Can contain up
+/// to 20 characters" (`smithy_query(query="doc",
+/// shape="CreateActionTargetRequest", member="Name")`).
+const MAX_NAME_LENGTH: usize = 20;
+
+/// Why `id` is not a custom action target id, naming the member and the constraint it
+/// breaks, or `None` when it satisfies both halves of the documented bound.
+fn id_rejection(id: &str) -> Option<String> {
+    if id.chars().count() > MAX_ID_LENGTH {
+        return Some(format!(
+            "Id can contain up to {MAX_ID_LENGTH} alphanumeric characters, got {} characters",
+            id.chars().count()
+        ));
+    }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Some(format!(
+            "Id can contain up to {MAX_ID_LENGTH} alphanumeric characters, got {id}"
+        ));
+    }
+    None
+}
+
+/// Why `name` is not a custom action target name, or `None` when it is within the
+/// documented length. `Name` is documented by length only, so any character the
+/// modelled `NonEmptyString` admits is accepted.
+fn name_rejection(name: &str) -> Option<String> {
+    (name.chars().count() > MAX_NAME_LENGTH).then(|| {
+        format!(
+            "Name can contain up to {MAX_NAME_LENGTH} characters, got {} characters",
+            name.chars().count()
+        )
+    })
+}
+
+/// Why `description` is not a custom action target description, or `None` when it is
+/// within the length this store keeps
+/// ([`crate::state::MAX_ACTION_TARGET_DESCRIPTION_LEN`]).
+fn description_rejection(description: &str) -> Option<String> {
+    let limit = crate::state::MAX_ACTION_TARGET_DESCRIPTION_LEN;
+    (description.chars().count() > limit).then(|| {
+        format!(
+            "Description must be at most {limit} characters, got {} characters",
+            description.chars().count()
+        )
+    })
+}
+
+/// The modelled 400 for an input value outside a documented bound.
+fn invalid_input(message: String) -> CreateActionTargetError {
+    CreateActionTargetError::Modeled(CreateActionTargetErrorModeled::InvalidInputException(
+        InvalidInputException {
+            message: Some(message),
+            code: Some("InvalidInputException".to_string()),
+        },
+    ))
+}
+
 /// The `CreateActionTarget` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,18 +220,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateActionTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateActionTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateActionTarget"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateActionTargetError::Modeled(CreateActionTargetErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&(account_id.clone(), region.clone())) {
+            return Err(CreateActionTargetErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(&account_id, &region)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Whether the request is well-formed is decided before anything is stored, so
+        // a rejected call leaves the hub exactly as it was.
+        if let Some(message) = id_rejection(&input.id) {
+            return Err(invalid_input(message));
+        }
+        if let Some(message) = name_rejection(&input.name) {
+            return Err(invalid_input(message));
+        }
+        if let Some(message) = description_rejection(&input.description) {
+            return Err(invalid_input(message));
+        }
+
+        // A hub holds at most [`crate::state::MAX_ACTION_TARGETS_PER_HUB`] custom
+        // action targets, so the number of records a caller can make this store hold
+        // is bounded; past it the create is the modelled `LimitExceededException`.
+        let held = store
+            .action_targets
+            .keys()
+            .filter(|key| key.account_id == account_id && key.region == region)
+            .count();
+        if held >= crate::state::MAX_ACTION_TARGETS_PER_HUB {
+            return Err(CreateActionTargetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Account {account_id} already holds the maximum of {} custom action targets in Region {region}",
+                        crate::state::MAX_ACTION_TARGETS_PER_HUB
+                    )),
+                    code: Some("LimitExceededException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let key = crate::state::ActionTargetKey {
+            account_id,
+            region: region.clone(),
+            target_id: input.id.clone(),
+        };
+        if let Some(existing) = store.action_targets.get(&key) {
+            return Err(CreateActionTargetErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    message: Some(format!(
+                        "Custom action target {} already exists",
+                        existing.action_target_arn
+                    )),
+                    code: Some("ResourceConflictException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let action_target_arn = crate::state::action_target_arn(&region, &input.id);
+        store.action_targets.insert(
+            key,
+            crate::state::ActionTargetRecord {
+                action_target_arn: action_target_arn.clone(),
+                name: input.name,
+                description: input.description,
+            },
+        );
+
+        Ok(CreateActionTargetOutput { action_target_arn })
     }
 }

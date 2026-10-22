@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteActionTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteActionTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteActionTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one custom action target from the caller's hub, addressed by the ARN
+//! `CreateActionTarget` answered with, and echoes that ARN back. An ARN the hub does
+//! not hold is the modelled `ResourceNotFoundException` (404); a caller whose account
+//! is not subscribed in the Region is the modelled `InvalidAccessException` (401).
+//! Findings already sent to EventBridge through the action are untouched — this
+//! operation touches only the action target record.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +145,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteActionTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteActionTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteActionTarget"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteActionTargetError::Modeled(DeleteActionTargetErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let (account_id, region) = crate::state::hub_key(ctx);
+        let mut store = state.lock();
+        if !store.hubs.contains_key(&(account_id.clone(), region.clone())) {
+            return Err(DeleteActionTargetErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(&account_id, &region)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The ARN the create answered with is the resource's address, so the lookup
+        // compares against the stored ARN rather than re-deriving one from the input:
+        // an ARN of another account or Region matches no record of this hub.
+        let found = store
+            .action_targets
+            .iter()
+            .find(|(key, record)| {
+                key.account_id == account_id
+                    && key.region == region
+                    && record.action_target_arn == input.action_target_arn
+            })
+            .map(|(key, _)| key.clone());
+
+        let Some(key) = found else {
+            return Err(DeleteActionTargetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Custom action target {} does not exist",
+                        input.action_target_arn
+                    )),
+                    code: Some("ResourceNotFoundException".to_string()),
+                },
+            )
+            .into());
+        };
+        store.action_targets.remove(&key);
+
+        Ok(DeleteActionTargetOutput {
+            action_target_arn: input.action_target_arn,
+        })
     }
 }

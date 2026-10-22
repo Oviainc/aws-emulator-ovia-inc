@@ -126,17 +126,15 @@ pub const MAX_RESULTS_LIMIT: usize = 100;
 /// value a caller invented — is rejected rather than read as an offset.
 const NEXT_TOKEN_PREFIX: &str = "securityhub:enabled-standards:";
 
-/// A `NextToken` resuming at `offset` in the sorted result. Opaque to the caller:
-/// the cursor is hex-encoded, so nothing in the response invites arithmetic on it.
+/// A `NextToken` resuming at `offset` in the sorted result.
 fn encode_next_token(offset: usize) -> String {
-    ::hex::encode(format!("{NEXT_TOKEN_PREFIX}{offset}"))
+    crate::state::encode_list_token(NEXT_TOKEN_PREFIX, offset)
 }
 
 /// The offset a `NextToken` resumes at, or `None` when it is not one this operation
 /// minted.
 fn decode_next_token(token: &str) -> Option<usize> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    decoded.strip_prefix(NEXT_TOKEN_PREFIX)?.parse().ok()
+    crate::state::decode_list_token(NEXT_TOKEN_PREFIX, token)
 }
 
 /// Every `StandardsProvider` value the model declares (`smithy_query(query="shape",
