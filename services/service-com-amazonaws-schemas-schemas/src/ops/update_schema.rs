@@ -216,6 +216,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The type OF the content this request carries: the request's when it sends
+        // one, else the type the schema already carries.
+        let r#type = input.r#type.clone().unwrap_or_else(|| schema.r#type.clone());
+        // Whether the content is a schema document is a property of the REQUEST, so it
+        // is decided here — before the idempotency-token lookup below, so the same body
+        // is refused whatever the schema's token history, and before anything is
+        // written, so a refused update leaves the schema exactly as it was.
+        if let Some(content) = input.content.as_deref() {
+            crate::state::validate_content(content, &r#type).map_err(|refusal| {
+                UpdateSchemaError::from(UpdateSchemaErrorModeled::BadRequestException(refusal))
+            })?;
+        }
+
         let now = ::std::time::SystemTime::now();
         let reported_version = match input.content.clone() {
             // `Content` IS the schema definition, so sending it writes a new,
@@ -254,8 +267,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             )
                             .into());
                         }
-                        let r#type =
-                            input.r#type.clone().unwrap_or_else(|| schema.r#type.clone());
                         // An absent `Description` leaves the schema's description as
                         // it is, rather than clearing it: a member a request does not
                         // send asks for no change.

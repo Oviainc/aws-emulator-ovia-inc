@@ -27,3 +27,5 @@ mod resource_policy;
 mod search_schemas;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_schema_versions.rs"]
+mod update_schema_versions;
