@@ -23,7 +23,7 @@ use crate::wire::{call, change_token, expect_error, is_resource_id, ok_call, rou
 
 /// Create a SqlInjectionMatchSet named `name` and return `(SqlInjectionMatchSetId, the
 /// create response)`.
-async fn create_set(router: &MultiServiceRouter, name: &str) -> (String, Value) {
+pub(crate) async fn create_set(router: &MultiServiceRouter, name: &str) -> (String, Value) {
     let token = change_token(router).await;
     let body = ok_call(
         router,
@@ -39,7 +39,7 @@ async fn create_set(router: &MultiServiceRouter, name: &str) -> (String, Value) 
 }
 
 /// The `SqlInjectionMatchSet` member of `GetSqlInjectionMatchSet`'s answer for `id`.
-async fn get_set(router: &MultiServiceRouter, id: &str) -> Value {
+pub(crate) async fn get_set(router: &MultiServiceRouter, id: &str) -> Value {
     let body = ok_call(
         router,
         "GetSqlInjectionMatchSet",
