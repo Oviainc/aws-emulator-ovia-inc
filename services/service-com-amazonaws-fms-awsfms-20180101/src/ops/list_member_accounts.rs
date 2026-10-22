@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMemberAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMemberAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMemberAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the accounts of the Firewall Manager administrator's organization that
+//! this service's store records
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::member_accounts`]), one
+//! bounded page at a time. A REPORTING operation: it writes nothing.
+//!
+//! Organization-scoped, so it is answered only for a Firewall Manager administrator
+//! or the organization's management account — the gate in
+//! [`crate::state::require_administrator`], which refuses every other caller with
+//! `AccessDeniedException` before any pagination token is looked at.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +118,12 @@ impl From<ListMemberAccountsErrorModeled> for ListMemberAccountsError {
     }
 }
 
+/// The largest page `ListMemberAccounts` serves, which is the maximum the model's
+/// `com.amazonaws.fms#PaginationMaxResults` declares for `MaxResults` (range
+/// 1..100). It bounds the response for EVERY caller, including one that sends no
+/// `MaxResults` at all.
+const MAX_PAGE_SIZE: usize = 100;
+
 /// The `ListMemberAccounts` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +160,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMemberAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMemberAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMemberAccounts"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListMemberAccountsErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // Authorization first: a caller that is not entitled to an
+        // organisation-scoped call is refused identically whatever it sent, so a
+        // token this service never minted cannot turn the refusal into a
+        // request-shape complaint. The refusal names the Region the request was
+        // signed for, which is the Region whose association was looked for.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        // A token this service did not mint names no page boundary. The model
+        // declares no client-input error for ListMemberAccounts, so refuse it as a
+        // bad request rather than inventing a page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_account_page_token(token) {
+                Some(start) => Some(start),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "NextToken is not a pagination token issued by ListMemberAccounts",
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        // The member accounts are ordered by account id, so a page boundary is a
+        // key: resume at the first id at or after the token's. With no token the
+        // lower bound is the empty id, which sorts before every account id.
+        let accounts = store.member_accounts();
+        let lower = start.unwrap_or_default();
+        let mut remaining = accounts.range(lower..);
+
+        // The page is bounded whether or not the caller asked for a bound: the
+        // model's `PaginationMaxResults` range is 1..100, so 100 is the largest page
+        // this operation serves. Clamped rather than only capped, so a page can
+        // never come back empty with a token (which a client would follow forever)
+        // if that modelled validation ever changes.
+        let page_size = input
+            .max_results
+            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
+            .clamp(1, MAX_PAGE_SIZE);
+        let member_accounts: Vec<String> = remaining.by_ref().take(page_size).cloned().collect();
+        // A token only when an account is left AFTER this page, so the last page
+        // carries none.
+        let next_token = remaining
+            .next()
+            .map(|account_id| crate::state::encode_page_token(account_id));
+
+        Ok(ListMemberAccountsOutput {
+            member_accounts: Some(member_accounts),
+            next_token,
+        })
     }
 }

@@ -27,7 +27,10 @@ const REGION: &str = "us-west-2";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// A fresh emulator: one shared engine, this service mounted on a router.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` so a sibling suite in this test target drives the service through
+/// the same wire harness rather than building a second copy of it.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(engine));
@@ -44,12 +47,12 @@ fn authorization(region: &str) -> String {
 }
 
 /// Call one operation and return `(http status, parsed body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     call_in(router, operation, body, REGION).await
 }
 
 /// [`call`], signed for an explicit Region.
-async fn call_in(
+pub(crate) async fn call_in(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,
@@ -81,7 +84,7 @@ async fn call_in(
 }
 
 /// The modelled error code an awsJson1_1 error envelope carries in `__type`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")

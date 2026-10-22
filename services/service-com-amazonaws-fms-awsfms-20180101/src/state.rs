@@ -9,7 +9,7 @@
 //! (the request's Region, the policy ARN, the `PolicySummary` projection and the
 //! pagination token codec), kept in one place so two handlers cannot disagree.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{Policy, PolicySummary, Tag};
@@ -42,6 +42,12 @@ pub struct AdminAccountRecord {
 /// `AccountRoleStatus` of an administrator account whose role exists and is
 /// usable. One of [`crate::ops::types::ACCOUNT_ROLE_STATUS_VALUES`].
 pub const ROLE_STATUS_READY: &str = "READY";
+
+/// The `CustomerPolicyScopeIdType` key under which a policy's `IncludeMap` /
+/// `ExcludeMap` holds ACCOUNT IDS (the only other key, `ORG_UNIT`, holds
+/// organizational-unit ids). One of
+/// [`crate::ops::types::CUSTOMER_POLICY_SCOPE_ID_TYPE_VALUES`].
+pub const SCOPE_ID_TYPE_ACCOUNT: &str = "ACCOUNT";
 
 /// The default `CustomerPolicyStatus` of a policy an administrator created: the
 /// administrator can manage and delete it. One of
@@ -122,6 +128,94 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     pub tags_by_arn: HashMap<String, Vec<Tag>>,
 }
 
+impl ComAmazonawsFmsAwsfms20180101State {
+    /// The accounts of the administrator's organization this store records, in
+    /// ascending account-id order.
+    ///
+    /// Firewall Manager learns its organization's accounts from Organizations,
+    /// which this emulator does not stand in for; what it DOES hold is every
+    /// account id its own control plane was told about:
+    ///
+    /// * the associated administrator account — `AssociateAdminAccount`
+    ///   documents that it "must be a member account of the organization in
+    ///   Organizations whose resources you want to protect";
+    /// * every account id a stored policy names under the
+    ///   [`SCOPE_ID_TYPE_ACCOUNT`] key of its `IncludeMap` or `ExcludeMap` —
+    ///   `CustomerPolicyScopeMap`'s accounts are the organization's accounts the
+    ///   policy applies to or leaves out.
+    ///
+    /// Values that are not `AWSAccountId`s (the model's
+    /// `com.amazonaws.fms#AWSAccountId`: length 1..1024, `^[0-9]+$`) are left
+    /// out: a scope map's `CustomerPolicyScopeId` is a free-form string, and an
+    /// account list may only carry account ids.
+    ///
+    /// A `BTreeSet` so the order is total and an account named by two policies
+    /// is reported once: a page boundary is then a key, not a cursor.
+    pub fn member_accounts(&self) -> BTreeSet<String> {
+        let mut accounts = BTreeSet::new();
+        if let Some(admin) = self.admin_account.as_ref() {
+            accounts.insert(admin.account_id.clone());
+        }
+        for record in self.policies.values() {
+            for scope_map in [&record.policy.include_map, &record.policy.exclude_map]
+                .into_iter()
+                .flatten()
+            {
+                let Some(scoped) = scope_map.get(SCOPE_ID_TYPE_ACCOUNT) else {
+                    continue;
+                };
+                accounts.extend(
+                    scoped
+                        .iter()
+                        .filter(|id| is_account_id(id))
+                        .map(String::clone),
+                );
+            }
+        }
+        accounts
+    }
+}
+
+/// Whether `value` is an `AWSAccountId` as this service's model declares it
+/// (`com.amazonaws.fms#AWSAccountId`: length 1..1024, pattern `^[0-9]+$`).
+pub fn is_account_id(value: &str) -> bool {
+    (1..=1024).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The Firewall Manager administrator the organization has associated, or the
+/// service's authorization refusal for a caller that is not entitled to an
+/// organization-scoped call.
+///
+/// Firewall Manager answers an organization-scoped request only for a Firewall
+/// Manager administrator or the organization's management account
+/// (`ListMemberAccounts`: "Either an Firewall Manager administrator or the
+/// organization's management account can make this request"). This emulator
+/// presents ONE account, [`::engine::emulator_account_id`], and it is the
+/// account that associates the administrator — so what decides the gate is
+/// whether an administrator association exists at all. With none, the caller is
+/// neither of the two, and the live service refuses the call with the error code
+/// `AccessDeniedException`, which this service's model declares for no
+/// operation (hence [`crate::scaffolded::Scaffolded::access_denied`], HTTP 400).
+///
+/// The refusal's message is BUILT FROM THE REQUEST — it names the calling
+/// account and the Region the request was signed for, the two things that decide
+/// which administrator association was looked for — so `region` is the caller's
+/// Region ([`request_region`]), never a constant.
+///
+/// Generic over the operation's modeled error enum, so every administrator-gated
+/// handler shares this one gate.
+pub fn require_administrator<'store, E>(
+    store: &'store ComAmazonawsFmsAwsfms20180101State,
+    region: &str,
+) -> Result<&'store AdminAccountRecord, crate::scaffolded::Scaffolded<E>> {
+    store.admin_account.as_ref().ok_or_else(|| {
+        crate::scaffolded::Scaffolded::access_denied(format!(
+            "No default admin could be found for account {} in Region {region}",
+            ::engine::emulator_account_id()
+        ))
+    })
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -148,7 +242,8 @@ pub fn policy_arn(region: &str, policy_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("policy/{policy_id}"))
 }
 
-/// Encode a page boundary (the `PolicyId` the next page starts at) as an opaque
+/// Encode a page boundary (the key the next page starts at — a `PolicyId` for
+/// `ListPolicies`, an account id for `ListMemberAccounts`) as an opaque
 /// `PaginationToken`.
 ///
 /// Hex keeps the token inside the modelled `PaginationToken` pattern
@@ -172,6 +267,18 @@ pub fn decode_page_token(token: &str) -> Option<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-');
     is_policy_id.then_some(decoded)
+}
+
+/// Decode an account-keyed `PaginationToken` produced by
+/// [`encode_page_token`]. `None` when the token was not produced by this
+/// service.
+///
+/// The decoded value must still be an `AWSAccountId` ([`is_account_id`]), so a
+/// foreign token that happens to be valid hex is refused rather than resumed
+/// from as an arbitrary key.
+pub fn decode_account_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    is_account_id(&decoded).then_some(decoded)
 }
 
 /// Mint a fresh service-owned identifier: 36 lowercase hex characters, which

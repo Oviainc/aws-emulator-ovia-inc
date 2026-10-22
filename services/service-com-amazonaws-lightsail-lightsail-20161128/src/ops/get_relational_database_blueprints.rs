@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRelationalDatabaseBlueprints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRelationalDatabaseBlueprints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRelationalDatabaseBlueprints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the database blueprint catalog in `crate::state`
+//! ([`crate::state::RELATIONAL_DATABASE_BLUEPRINTS`]) — the engines and major
+//! engine versions a managed database can be created from. The catalog is
+//! service-published data, the same for every account, so this operation reads it
+//! rather than the per-account store and writes NOTHING: a read of it leaves
+//! every later caller exactly the answer it would have had.
+//!
+//! One page is the catalog from the entry `pageToken` names onward, at most
+//! [`crate::state::RELATIONAL_DATABASE_BLUEPRINT_PAGE_SIZE`] entries, and
+//! `nextPageToken` names the first entry of the next page — present only while
+//! entries remain. A token that names no blueprint is refused with the modelled
+//! `InvalidInputException`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +172,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRelationalDatabaseBlueprints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRelationalDatabaseBlueprintsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRelationalDatabaseBlueprints"))
+        let _ = (ctx, &self.engine);
+
+        let catalog = crate::state::RELATIONAL_DATABASE_BLUEPRINTS;
+
+        // `pageToken` is the blueprint id the previous page stopped before, so a
+        // page is the catalog from that entry onward. Naming the entry rather than
+        // an index means a catalog that gained or lost a blueprint between two
+        // pages cannot make the walk skip or repeat another one. An absent — or
+        // empty — token asks for the first page.
+        let start = match input.page_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => catalog
+                .iter()
+                .position(|spec| spec.blueprint_id() == token)
+                .ok_or_else(|| invalid_page_token(token))?,
+        };
+
+        let mut blueprints = Vec::new();
+        let mut next_page_token = None;
+        for spec in &catalog[start..] {
+            if blueprints.len() == crate::state::RELATIONAL_DATABASE_BLUEPRINT_PAGE_SIZE {
+                next_page_token = Some(spec.blueprint_id());
+                break;
+            }
+            blueprints.push(spec.view());
+        }
+
+        Ok(GetRelationalDatabaseBlueprintsOutput {
+            // A page always reports a list, empty or not: the caller asked what
+            // the catalog holds, and an absent member would say nothing.
+            blueprints: Some(blueprints),
+            next_page_token,
+        })
     }
+}
+
+/// `pageToken` names no blueprint in the catalog, so there is no page to answer:
+/// the modelled `InvalidInputException`, documented as "user input does not
+/// conform to the validation rules of an input field".
+fn invalid_page_token(token: &str) -> GetRelationalDatabaseBlueprintsError {
+    GetRelationalDatabaseBlueprintsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(format!(
+            "pageToken {token:?} does not name a database blueprint; a page token is the blueprint id a previous page reported as nextPageToken, one of: {}",
+            crate::state::relational_database_blueprint_ids()
+        )),
+        ..Default::default()
+    })
+    .into()
 }
