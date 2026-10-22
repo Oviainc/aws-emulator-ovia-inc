@@ -1,11 +1,295 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-comprehend-comprehend-20171127 service.
+//!
+//! Comprehend's asynchronous analysis jobs all share ONE record shape: every
+//! `Start*DetectionJob` family persists the same identity, lifecycle, data-location
+//! and security members, and its `Describe*`/`List*` pair projects that record into
+//! the family's own `*JobProperties` shape. [`AnalysisJob`] is that record, keyed by
+//! [`JobFamily`] so each family has its own id space, and
+//! [`AnalysisJob::settle`] is the ONE place a job's clock-owed status change is
+//! materialised.
+//!
+//! ## Bounds
+//!
+//! Every collection here is bounded, so no sequence of requests can grow this store
+//! without limit:
+//!
+//! * `analysis_jobs` — [`MAX_ANALYSIS_JOB_RECORDS`], enforced by the ONE insertion
+//!   path, [`ComAmazonawsComprehendComprehend20171127State::insert_analysis_job`],
+//!   with oldest-first eviction. AWS caps no account's analysis-job count, so a
+//!   `Start*DetectionJob` is never refused for a bound on the emulator's own record
+//!   set; only the record set is trimmed. The bound also caps the lock-held
+//!   `settle` sweep `List*` performs.
+//! * `idempotency_tokens` — an entry is dropped together with the job it points at,
+//!   so this index cannot outgrow `analysis_jobs`.
+//!
+//! `ops::list_sentiment_detection_jobs` bounds the RESPONSE the same way, with its
+//! `DEFAULT_MAX_RESULTS` and the modelled `MaxResults` ceiling.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
+
+use crate::ops::types::{InputDataConfig, OutputDataConfig, SentimentDetectionJobProperties, Tag, VpcConfig};
+
+/// How long a freshly submitted job stays `SUBMITTED` before the clock owes it
+/// `IN_PROGRESS`.
+///
+/// The emulator's own span, not a documented AWS duration: a real Comprehend job
+/// takes minutes, which no test can wait for. It is deliberately non-zero, so a
+/// caller that reads a job straight back still observes `SUBMITTED`.
+pub const QUEUE_SPAN: Duration = Duration::from_millis(300);
+
+/// How long a job stays `IN_PROGRESS` before the clock owes it its terminal
+/// status. The emulator's own span, chosen for the same reason as [`QUEUE_SPAN`].
+pub const PROCESSING_SPAN: Duration = Duration::from_millis(300);
+
+/// How long a job stays `STOP_REQUESTED` before the clock owes it `STOPPED`.
+/// The emulator's own span, chosen for the same reason as [`QUEUE_SPAN`].
+pub const STOPPING_SPAN: Duration = Duration::from_millis(300);
+
+/// The most analysis-job records this emulator retains, across every family.
+///
+/// AWS publishes neither a retention nor an account limit for analysis jobs, so
+/// this is the EMULATOR's bound, and it exists so a caller cannot grow the store
+/// without limit: the oldest record is evicted (with its idempotency-index entry)
+/// once the store passes it. It is far above any test or client working set, so
+/// eviction never hides a job a caller is still polling.
+pub const MAX_ANALYSIS_JOB_RECORDS: usize = 1000;
+
+/// Which `Start*DetectionJob` family a persisted [`AnalysisJob`] belongs to.
+///
+/// The variant also carries the ARN resource type the family's `JobArn` uses, so
+/// the ARN form is stated once. Sibling families (dominant-language, entities,
+/// key-phrases, topics, …) are added as their own issues implement them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum JobFamily {
+    /// `StartSentimentDetectionJob` and its Describe/List/Stop operations.
+    SentimentDetection,
+}
+
+impl JobFamily {
+    /// The resource type segment this family's `JobArn` carries, e.g.
+    /// `arn:aws:comprehend:<region>:<account>:sentiment-detection-job/<JobId>`.
+    pub fn arn_resource_type(self) -> &'static str {
+        match self {
+            Self::SentimentDetection => "sentiment-detection-job",
+        }
+    }
+}
+
+/// One persisted asynchronous analysis job.
+///
+/// Every member is the value `Start*DetectionJob` was called with, or a value this
+/// service minted for the job — never anything a later `Describe`/`List` request
+/// supplied.
+#[derive(Debug, Clone)]
+pub struct AnalysisJob {
+    /// Submission order within the service, the stable key `List*` pages on.
+    pub seq: u64,
+    pub job_id: String,
+    pub job_arn: String,
+    pub job_name: Option<String>,
+    /// One of `super::ops::types::JOB_STATUS_VALUES`.
+    pub job_status: String,
+    pub message: Option<String>,
+    pub submit_time: SystemTime,
+    pub end_time: Option<SystemTime>,
+    /// When the clock owes `SUBMITTED` -> `IN_PROGRESS`.
+    pub in_progress_due_at: SystemTime,
+    /// When the clock owes `IN_PROGRESS` -> its terminal status.
+    pub terminal_due_at: SystemTime,
+    /// When the clock owes `STOP_REQUESTED` -> `STOPPED`; `None` until a stop is
+    /// requested.
+    pub stopped_due_at: Option<SystemTime>,
+    pub input_data_config: InputDataConfig,
+    pub output_data_config: OutputDataConfig,
+    /// One of `super::ops::types::LANGUAGE_CODE_VALUES`.
+    pub language_code: String,
+    pub data_access_role_arn: String,
+    pub volume_kms_key_id: Option<String>,
+    pub vpc_config: Option<VpcConfig>,
+    pub tags: Vec<Tag>,
+    /// The `ClientRequestToken` this job was submitted under, if any. Held so the
+    /// idempotency-index entry can be dropped with the record it points at.
+    pub client_request_token: Option<String>,
+}
+
+impl AnalysisJob {
+    /// Materialise every status change the clock already owed at `now`.
+    ///
+    /// Called by the reporting operations as well as the mutating ones: the
+    /// transition was due at `now` whether or not anybody called, so applying it on
+    /// read reports the status the job already had rather than advancing it.
+    ///
+    /// The terminal status of a started job is `FAILED`: running it means reading
+    /// the documents from the Amazon S3 location `InputDataConfig` names and writing
+    /// analysed output back to `OutputDataConfig`, and this emulator serves no object
+    /// storage for batch jobs, so no document is ever read and no output is ever
+    /// written. The job therefore ends in the modelled failure state with a `Message`
+    /// that says exactly that, rather than reporting a `COMPLETED` run that nothing
+    /// performed.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.job_status == "SUBMITTED" && now >= self.in_progress_due_at {
+            self.job_status = "IN_PROGRESS".to_string();
+        }
+        if self.job_status == "IN_PROGRESS" && now >= self.terminal_due_at {
+            self.job_status = "FAILED".to_string();
+            self.end_time = Some(self.terminal_due_at);
+            self.message = Some(self.unreadable_input_message());
+        }
+        if self.job_status == "STOP_REQUESTED"
+            && self.stopped_due_at.is_some_and(|due| now >= due)
+        {
+            self.job_status = "STOPPED".to_string();
+            self.end_time = self.stopped_due_at;
+        }
+    }
+
+    /// Record that a caller asked for this job to stop, naming the reason in
+    /// `Message`. A job that has not started processing stops outright, because
+    /// nothing was running to wind down.
+    pub fn request_stop(&mut self, now: SystemTime) {
+        match self.job_status.as_str() {
+            "SUBMITTED" => {
+                self.job_status = "STOPPED".to_string();
+                self.end_time = Some(now);
+            }
+            "IN_PROGRESS" => {
+                self.job_status = "STOP_REQUESTED".to_string();
+                self.stopped_due_at = Some(now + STOPPING_SPAN);
+            }
+            // Already stopping, stopped, or terminal: nothing to wind down.
+            _ => return,
+        }
+        self.message = Some("The job was stopped at the request of the caller.".to_string());
+    }
+
+    /// Whether this job has reached a status it can never leave.
+    ///
+    /// `STOPPED` is deliberately NOT terminal here: the stop operation documents a
+    /// 400 only for `COMPLETED` and `FAILED`, so re-stopping a stopped job answers
+    /// 200 with its unchanged status rather than a refusal.
+    ///
+    /// `COMPLETED` is listed because the modelled vocabulary has it and this record
+    /// serves every job family, not because a sentiment-detection job can reach it:
+    /// [`Self::settle`] ends a started job in `FAILED`, so `COMPLETED` is reserved
+    /// for a family whose work this emulator can genuinely perform.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.job_status.as_str(), "COMPLETED" | "FAILED")
+    }
+
+    /// Why a started job fails: the input it was pointed at was never read, so no
+    /// output was ever written.
+    fn unreadable_input_message(&self) -> String {
+        format!(
+            "Could not read the input documents from {}: this emulator serves no object \
+             storage for asynchronous analysis jobs, so no document was analyzed and no \
+             output was written to {}.",
+            self.input_data_config.s3_uri, self.output_data_config.s3_uri,
+        )
+    }
+
+    /// Project this record into the sentiment family's modelled properties shape.
+    pub fn sentiment_detection_job_properties(&self) -> SentimentDetectionJobProperties {
+        SentimentDetectionJobProperties {
+            job_id: Some(self.job_id.clone()),
+            job_arn: Some(self.job_arn.clone()),
+            job_name: self.job_name.clone(),
+            job_status: Some(self.job_status.clone()),
+            message: self.message.clone(),
+            submit_time: Some(::aws_smithy_types::DateTime::from(self.submit_time)),
+            end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
+            input_data_config: Some(self.input_data_config.clone()),
+            output_data_config: Some(self.output_data_config.clone()),
+            language_code: Some(self.language_code.clone()),
+            data_access_role_arn: Some(self.data_access_role_arn.clone()),
+            volume_kms_key_id: self.volume_kms_key_id.clone(),
+            vpc_config: self.vpc_config.clone(),
+        }
+    }
+}
 
 /// Per-service state for com-amazonaws-comprehend-comprehend-20171127. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsComprehendComprehend20171127State {
-    // TODO: add service-specific state fields
+    /// Every persisted asynchronous analysis job, keyed by its family and `JobId`.
+    /// Bounded by [`MAX_ANALYSIS_JOB_RECORDS`]: insert through
+    /// [`Self::insert_analysis_job`], never directly.
+    pub analysis_jobs: BTreeMap<(JobFamily, String), AnalysisJob>,
+    /// The first `JobId` minted for a `(family, ClientRequestToken)` pair, so a
+    /// retried `Start*DetectionJob` resolves to the job it already created. An
+    /// entry is dropped with the job it points at.
+    pub idempotency_tokens: HashMap<(JobFamily, String), String>,
+    /// Monotonic submission counter: the source of both a job's `seq` and the
+    /// uniqueness of a minted `JobId`.
+    pub job_id_seq: u64,
+}
+
+impl ComAmazonawsComprehendComprehend20171127State {
+    /// Mint the next submission sequence number and a `JobId` for it.
+    ///
+    /// The id is the first 16 bytes of a digest over the sequence number and the
+    /// submission instant, rendered as 32 lowercase hex characters — the form and
+    /// the modelled 1..32 length an AWS `JobId` has, and unique per submission
+    /// because the sequence number is.
+    pub fn mint_job_id(&mut self, submitted_at: SystemTime) -> (u64, String) {
+        self.job_id_seq += 1;
+        let nanos = submitted_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hasher = Sha256::new();
+        hasher.update(self.job_id_seq.to_be_bytes());
+        hasher.update(nanos.to_be_bytes());
+        let digest = hasher.finalize();
+        (self.job_id_seq, hex::encode(&digest[..16]))
+    }
+
+    /// Persist a submitted job, index it under its `ClientRequestToken`, and evict
+    /// the oldest records once the store passes [`MAX_ANALYSIS_JOB_RECORDS`].
+    ///
+    /// The ONE insertion path for [`Self::analysis_jobs`], so the bound cannot be
+    /// bypassed by a handler. Submission never fails for the bound: AWS refuses no
+    /// `Start*DetectionJob` for a record count, so only this emulator's record set
+    /// is trimmed.
+    pub fn insert_analysis_job(&mut self, family: JobFamily, job: AnalysisJob) {
+        let job_id = job.job_id.clone();
+        if let Some(token) = job.client_request_token.clone() {
+            self.idempotency_tokens
+                .insert((family, token), job_id.clone());
+        }
+        self.analysis_jobs.insert((family, job_id), job);
+        while self.analysis_jobs.len() > MAX_ANALYSIS_JOB_RECORDS {
+            let oldest = self
+                .analysis_jobs
+                .iter()
+                .min_by(|((left_family, left_id), left), ((right_family, right_id), right)| {
+                    (left.seq, left_family, left_id.as_str()).cmp(&(
+                        right.seq,
+                        right_family,
+                        right_id.as_str(),
+                    ))
+                })
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            let evicted = self.analysis_jobs.remove(&oldest);
+            // Drop the index entry only while it still points at the evicted
+            // record: a later submission may have taken the same token over.
+            if let Some(token) = evicted.and_then(|job| job.client_request_token) {
+                let index_key = (oldest.0, token);
+                if self
+                    .idempotency_tokens
+                    .get(&index_key)
+                    .is_some_and(|id| *id == oldest.1)
+                {
+                    self.idempotency_tokens.remove(&index_key);
+                }
+            }
+        }
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -17,4 +301,29 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsComprehendComprehend20171127State>)
+}
+
+/// The AWS region this request was signed for, the region every ARN this service
+/// mints carries. Falls back to the emulator's default region for an unsigned
+/// request, which carries no credential scope.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The region an unsigned request is answered in; emulators default to `us-east-1`
+/// (see `emulator_server::emulator_arn`).
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// A `SystemTime` as the epoch-relative `(seconds, subsecond nanos)` pair a modelled
+/// timestamp compares against. Goes through the modelled timestamp type, so a time
+/// and a filter bound are always compared on the same scale.
+pub fn epoch_parts(time: SystemTime) -> (i64, u32) {
+    datetime_parts(&::aws_smithy_types::DateTime::from(time))
+}
+
+/// A modelled timestamp as the same epoch-relative pair as [`epoch_parts`].
+pub fn datetime_parts(timestamp: &::aws_smithy_types::DateTime) -> (i64, u32) {
+    (timestamp.secs(), timestamp.subsec_nanos())
 }

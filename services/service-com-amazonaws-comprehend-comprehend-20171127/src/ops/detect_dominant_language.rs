@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetectDominantLanguage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetectDominantLanguage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetectDominantLanguage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The inference runs in-process through the `whatlang` natural-language
+//! identification engine, restricted to the languages Comprehend's `LanguageCode`
+//! enum names, so the answer is that engine's own identification of the
+//! submitted text — never a value matched out of the request.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +72,95 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::sync::OnceLock;
+
+use whatlang::{Detector, Lang};
+
+/// Comprehend's `LanguageCode` values (`super::types::LANGUAGE_CODE_VALUES`) paired
+/// with the language the identification engine recognises for each.
+///
+/// `zh-TW` has no entry: the engine identifies Chinese without distinguishing the
+/// traditional-script variant, so it is never the answer — a language the engine
+/// cannot tell apart is not reported rather than guessed at.
+const DETECTABLE_LANGUAGES: &[(Lang, &str)] = &[
+    (Lang::Ara, "ar"),
+    (Lang::Deu, "de"),
+    (Lang::Eng, "en"),
+    (Lang::Spa, "es"),
+    (Lang::Fra, "fr"),
+    (Lang::Hin, "hi"),
+    (Lang::Jpn, "ja"),
+    (Lang::Kor, "ko"),
+    (Lang::Ita, "it"),
+    (Lang::Por, "pt"),
+    (Lang::Cmn, "zh"),
+];
+
+/// The largest `Text` this operation accepts, in UTF-8 bytes.
+///
+/// From the modelled member documentation of `DetectDominantLanguageRequest$Text`:
+/// "The maximum string size is 100 KB." Anything larger is refused with the
+/// `TextSizeLimitExceededException` the operation declares.
+const MAX_TEXT_BYTES: usize = 100 * 1024;
+
+/// How much of the document the identification engine is given, in characters.
+///
+/// The bound in-process execution must carry: the engine's n-gram pass costs more
+/// than linearly in the length of a single token, so an unbounded document lets one
+/// request hold the whole emulator for minutes. A language's n-gram profile
+/// saturates after a few thousand characters — two orders of magnitude above the 20
+/// characters this operation's documentation asks for — so the engine reads the
+/// document's leading characters up to this budget. The answer is still the
+/// engine's own, over text the caller submitted.
+///
+/// Contract consequence a caller should know: a document whose leading characters
+/// are one language and whose tail is another is identified from that leading
+/// sample alone.
+const IDENTIFICATION_SAMPLE_CHARS: usize = 4096;
+
+/// The shared language-identification engine, restricted to the languages
+/// Comprehend's `LanguageCode` enum names.
+///
+/// Built once: the engine is immutable, so every request observes the same
+/// deterministic model set and the allow-list is assembled a single time.
+fn detector() -> &'static Detector {
+    static DETECTOR: OnceLock<Detector> = OnceLock::new();
+    DETECTOR.get_or_init(|| {
+        Detector::with_allowlist(DETECTABLE_LANGUAGES.iter().map(|(lang, _)| *lang).collect())
+    })
+}
+
+/// The engine's answer for `text`, as the modelled `DominantLanguage` list: the
+/// language it identifies and the confidence it reports, which is the list's single
+/// entry, so the array is trivially "sorted in descending order of the score (the
+/// dominant language is always the first element)" as the modelled `Languages`
+/// member documents. The engine ranks one candidate, so no further entry exists to
+/// report — a second language with an invented score is not one.
+///
+/// A document the engine can place nowhere — one carrying no letters at all —
+/// gets an EMPTY list. That is the engine's own answer: a confidence it did not
+/// produce would be an invented one, and the modelled `Languages` member is
+/// optional precisely because a response need not name a language.
+fn detect_languages(text: &str) -> Vec<DominantLanguage> {
+    let sample: String = text.chars().take(IDENTIFICATION_SAMPLE_CHARS).collect();
+    detector()
+        .detect(&sample)
+        .and_then(|info| {
+            let score = info.confidence() as f32;
+            DETECTABLE_LANGUAGES
+                .iter()
+                .find(|(candidate, _)| *candidate == info.lang())
+                // A confidence that renders as zero is no candidate at all.
+                .filter(|_| score > 0.0)
+                .map(|(_, code)| DominantLanguage {
+                    language_code: Some((*code).to_string()),
+                    score: Some(score),
+                })
+        })
+        .into_iter()
+        .collect()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,18 +232,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetectDominantLanguage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetectDominantLanguageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetectDominantLanguage"))
+        // Synchronous inference holds no state: the answer is a function of `Text`
+        // alone, so repeating a call returns the same scores.
+        let _ = (ctx, &self.engine);
+
+        // The model's `@length` floor of 1 is enforced at the boundary; the byte
+        // ceiling it documents in prose is not, so it is enforced here.
+        if input.text.len() > MAX_TEXT_BYTES {
+            return Err(DetectDominantLanguageErrorModeled::TextSizeLimitExceededException(
+                TextSizeLimitExceededException {
+                    message: Some(format!(
+                        "Text is {} bytes, which exceeds the {MAX_TEXT_BYTES} byte limit for \
+                         DetectDominantLanguage. Use a smaller document.",
+                        input.text.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        Ok(DetectDominantLanguageOutput {
+            languages: Some(detect_languages(&input.text)),
+        })
     }
 }

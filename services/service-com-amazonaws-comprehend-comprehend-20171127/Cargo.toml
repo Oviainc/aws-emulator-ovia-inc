@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+# Natural-language identification engine behind DetectDominantLanguage: trigram
+# script- and language-profile detection over the language set it is given.
+whatlang = "0.16"
+# VADER sentiment engine behind DetectSentiment: a rule-based English sentiment
+# analyser returning positive/negative/neutral proportions and a compound score.
+vader_sentiment = "0.1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

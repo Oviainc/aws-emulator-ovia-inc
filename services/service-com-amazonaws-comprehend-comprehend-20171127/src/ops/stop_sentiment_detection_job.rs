@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopSentimentDetectionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopSentimentDetectionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopSentimentDetectionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Mutates the persisted job record, so a later Describe observes the
+//! new status.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +75,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::JobFamily;
+
+/// The family this operation's `JobId` is looked up in.
+const FAMILY: JobFamily = JobFamily::SentimentDetection;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -151,18 +152,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopSentimentDetectionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopSentimentDetectionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopSentimentDetectionJob"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopSentimentDetectionJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The service store is unavailable. Retry your request.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        let job = store
+            .analysis_jobs
+            .get_mut(&(FAMILY, input.job_id.clone()))
+            .ok_or_else(|| {
+                StopSentimentDetectionJobErrorModeled::JobNotFoundException(JobNotFoundException {
+                    message: Some(format!(
+                        "The sentiment detection job with id '{}' was not found.",
+                        input.job_id
+                    )),
+                })
+            })?;
+
+        // Settle first: the job may already have reached a terminal status before
+        // this call, which is exactly the case the operation refuses.
+        job.settle(now);
+
+        // The operation's documented lifecycle: a job already in `COMPLETED` or
+        // `FAILED` is refused with a 400; otherwise `AnalysisJob::request_stop`
+        // applies the transition (a processing job is marked for termination and
+        // reaches `STOPPED` when the clock owes it; one that has not started
+        // processing stops outright; one already stopping changes nothing).
+        if job.is_terminal() {
+            return Err(StopSentimentDetectionJobErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "The sentiment detection job with id '{}' is in the {} state and \
+                         cannot be stopped.",
+                        job.job_id, job.job_status
+                    )),
+                    reason: None,
+                    detail: None,
+                },
+            )
+            .into());
+        }
+        job.request_stop(now);
+
+        Ok(StopSentimentDetectionJobOutput {
+            job_id: Some(job.job_id.clone()),
+            job_status: Some(job.job_status.clone()),
+        })
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetectSentiment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetectSentiment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetectSentiment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. The inference runs in-process through the VADER sentiment engine
+//! (`vader_sentiment`), so the verdict and its four confidences are computed from the
+//! submitted text rather than matched out of the request. A `LanguageCode` the engine
+//! has no lexicon for is answered with the modelled `UnsupportedLanguageException`.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +78,108 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::sync::OnceLock;
+
+use vader_sentiment::SentimentIntensityAnalyzer;
+
+/// The largest `Text` this operation accepts, in UTF-8 bytes.
+///
+/// From the modelled member documentation of `DetectSentimentRequest$Text`: "The
+/// maximum string size is 5 KB." Anything larger is refused with the
+/// `TextSizeLimitExceededException` the operation declares.
+const MAX_TEXT_BYTES: usize = 5 * 1024;
+
+/// The `LanguageCode` values the in-process sentiment engine has a lexicon for.
+///
+/// VADER's lexicon and its boosters, negations and idioms are English. Every other
+/// value Comprehend's `LanguageCode` enum names is answered with the modelled
+/// `UnsupportedLanguageException` rather than with a neutral verdict that no
+/// analysis produced.
+const ANALYSABLE_LANGUAGES: &[&str] = &["en"];
+
+/// The shared sentiment engine. Built once: `new()` parses the lexicon files, which
+/// is far more expensive than scoring one document, and it is immutable afterwards.
+fn analyzer() -> &'static SentimentIntensityAnalyzer<'static> {
+    static ANALYZER: OnceLock<SentimentIntensityAnalyzer<'static>> = OnceLock::new();
+    ANALYZER.get_or_init(SentimentIntensityAnalyzer::new)
+}
+
+/// The modelled enum values of `SentimentType` paired with their confidences, in
+/// the order a tie between two equal confidences resolves: a signed verdict wins
+/// over `NEUTRAL`, which wins over `MIXED`.
+fn ranked_labels(
+    positive: f64,
+    negative: f64,
+    neutral: f64,
+    mixed: f64,
+) -> [(&'static str, f64); 4] {
+    [
+        ("POSITIVE", positive),
+        ("NEGATIVE", negative),
+        ("NEUTRAL", neutral),
+        ("MIXED", mixed),
+    ]
+}
+
+/// Score `text` into Comprehend's four confidences plus the winning label.
+///
+/// The engine reports `pos`/`neg`/`neu` — the proportions of the document carrying
+/// each polarity, which sum to 1 — and `compound`, the normalised net polarity in
+/// -1..1. Those map onto Comprehend's four classes as:
+///
+/// * `Mixed` = `2 * min(pos, neg)`: the share of the document that carries BOTH
+///   polarities, which is what MIXED means.
+/// * `Positive` / `Negative` = the positive / negative part of `compound`: the net
+///   signed polarity, so only the winning direction is scored.
+/// * `Neutral` = whatever is left of the document once the signed and the
+///   both-signed shares are taken out.
+///
+/// The four are then normalised, so they sum to 1, and the verdict is their
+/// arg-max. Text the engine finds no sentiment in leaves `Neutral` holding all of
+/// it.
+fn score_sentiment(text: &str) -> (String, SentimentScore) {
+    let scores = analyzer().polarity_scores(text);
+    let positive_share = scores.get("pos").copied().unwrap_or_default();
+    let negative_share = scores.get("neg").copied().unwrap_or_default();
+    let compound = scores.get("compound").copied().unwrap_or_default();
+
+    let mixed = 2.0 * positive_share.min(negative_share);
+    let positive = compound.max(0.0);
+    let negative = (-compound).max(0.0);
+    let neutral = (1.0 - compound.abs() - mixed).max(0.0);
+
+    let total = positive + negative + neutral + mixed;
+    let (positive, negative, neutral, mixed) = if total > 0.0 {
+        (
+            positive / total,
+            negative / total,
+            neutral / total,
+            mixed / total,
+        )
+    } else {
+        // No polarity and no room left for one: the document is wholly neutral.
+        (0.0, 0.0, 1.0, 0.0)
+    };
+
+    // Arg-max over the four. `ranked_labels` is already in tie-break order and the
+    // fold keeps the incumbent on a tie, so two equal confidences always resolve to
+    // the same label.
+    let sentiment = ranked_labels(positive, negative, neutral, mixed)
+        .into_iter()
+        .reduce(|best, candidate| if candidate.1 > best.1 { candidate } else { best })
+        .map_or("NEUTRAL", |(label, _)| label);
+
+    (
+        sentiment.to_string(),
+        SentimentScore {
+            positive: Some(positive as f32),
+            negative: Some(negative as f32),
+            neutral: Some(neutral as f32),
+            mixed: Some(mixed as f32),
+        },
+    )
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +251,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetectSentiment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetectSentimentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetectSentiment"))
+        // Synchronous inference holds no state: the answer is a function of `Text`
+        // and `LanguageCode` alone, so repeating a call returns the same scores.
+        let _ = (ctx, &self.engine);
+
+        // The model's `@length` floor of 1 is enforced at the boundary; the byte
+        // ceiling it documents in prose is not, so it is enforced here.
+        if input.text.len() > MAX_TEXT_BYTES {
+            return Err(DetectSentimentErrorModeled::TextSizeLimitExceededException(
+                TextSizeLimitExceededException {
+                    message: Some(format!(
+                        "Text is {} bytes, which exceeds the {MAX_TEXT_BYTES} byte limit for \
+                         DetectSentiment. Use a smaller document.",
+                        input.text.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Membership of the `LanguageCode` enum is enforced at the boundary; whether
+        // this emulator's sentiment engine can read that language is not.
+        if !ANALYSABLE_LANGUAGES.contains(&input.language_code.as_str()) {
+            return Err(DetectSentimentErrorModeled::UnsupportedLanguageException(
+                UnsupportedLanguageException {
+                    message: Some(format!(
+                        "This emulator's sentiment engine cannot process the language \
+                         '{}'. Supported languages: {}.",
+                        input.language_code,
+                        ANALYSABLE_LANGUAGES.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (sentiment, sentiment_score) = score_sentiment(&input.text);
+        Ok(DetectSentimentOutput {
+            sentiment: Some(sentiment),
+            sentiment_score: Some(sentiment_score),
+        })
     }
 }
