@@ -63,6 +63,30 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
         }
     }
+
+    /// Whether `path` is in the URI path space this service's model declares.
+    ///
+    /// This mirrors the framework's own
+    /// [`::emulator_server::can_handle_based_on_route_key_and_path`] rule — the
+    /// empty-list fallback, EXACT first-segment equality (never a prefix test,
+    /// so a peer's segment that merely starts with one of ours is not claimed)
+    /// and the [`::emulator_server::ROOT_PATH_SEGMENT`] sentinel. It is mirrored
+    /// rather than called because that helper takes a whole buffered
+    /// `http::Request` while [`Service::can_handle`] is handed only the request
+    /// parts, and the framework crate is vendored (not editable from here).
+    fn claims_path(&self, path: &str) -> bool {
+        if crate::ROUTE_PATH_SEGMENTS.is_empty() {
+            return true;
+        }
+        match path.trim_start_matches('/').split('/').next() {
+            Some(segment) if !segment.is_empty() => {
+                crate::ROUTE_PATH_SEGMENTS.contains(&segment)
+            }
+            // The root path (`POST /`), which an RPC service claims through the
+            // framework's sentinel segment.
+            _ => crate::ROUTE_PATH_SEGMENTS.contains(&::emulator_server::ROOT_PATH_SEGMENT),
+        }
+    }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -74,11 +98,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // S3 Control SHARES its SigV4 signing name (`s3`) with Amazon S3, so the
+        // signing name alone does not name this service and the router would see
+        // two claimants. The model's own path space is the discriminator: every
+        // S3 Control operation is under `/v20180820`, which is
+        // `crate::ROUTE_PATH_SEGMENTS` (derived from the model at build time),
+        // while S3's operations are under `/{Bucket}/{Key}`.
+        //
+        // An EMPTY segment list means the model published no usable path
+        // discriminator, and this degrades to matching on the signing name alone
+        // — the same rule the framework's own
+        // `can_handle_based_on_route_key_and_path` applies.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
+            // Case-insensitively, as the framework's own
+            // `can_handle_based_on_route_key` compares it.
+            Some(key) => {
+                key.eq_ignore_ascii_case(self.entry.identity().signing_name())
+                    && self.claims_path(parts.uri.path())
+            }
             None => false,
         }
     }

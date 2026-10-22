@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccessPoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccessPoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccessPoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the access point `CreateAccessPoint` stored under (account id, name),
+//! or `NoSuchAccessPoint` when the account owns none of that name. A pure read:
+//! it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +171,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccessPoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccessPointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccessPoint"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let key = (input.account_id.clone(), input.name.clone());
+        let store = state.lock();
+        let Some(record) = store.access_points.get(&key) else {
+            return Err(crate::state::no_such_access_point(&input.name));
+        };
+
+        Ok(GetAccessPointOutput {
+            name: Some(record.name.clone()),
+            bucket: Some(record.bucket.clone()),
+            network_origin: Some(record.network_origin.clone()),
+            vpc_configuration: record.vpc_configuration.clone(),
+            public_access_block_configuration: record.public_access_block_configuration.clone(),
+            creation_date: Some(record.creation_date),
+            alias: Some(record.alias.clone()),
+            access_point_arn: Some(record.arn.clone()),
+            // `Endpoints` is reported for S3 on Outposts access points only, and
+            // Outposts is not emulated.
+            endpoints: None,
+            bucket_account_id: record.bucket_account_id.clone(),
+            // Set only for an access point attached to a data source (FSx), which
+            // `CreateAccessPoint` here never does.
+            data_source_id: None,
+            data_source_type: None,
+        })
     }
 }
