@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServiceNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServiceNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServiceNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: applies the requested `authType` to the stored service network, by id or
+//! by ARN, refreshes its `lastUpdatedAt`, and answers from the record it just wrote — so
+//! a later `GetServiceNetwork` reports the new value.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +122,16 @@ impl From<UpdateServiceNetworkErrorModeled> for UpdateServiceNetworkError {
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted service network.
+fn not_found(identifier: &str) -> UpdateServiceNetworkError {
+    UpdateServiceNetworkErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("service network {identifier} not found"),
+        resource_id: identifier.to_string(),
+        resource_type: crate::state::KIND_SERVICE_NETWORK.to_string(),
+    })
+    .into()
+}
+
 /// The `UpdateServiceNetwork` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,18 +168,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServiceNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServiceNetwork"))
+        let _ = ctx;
+        // `authType` is `@required` and targets the `AuthType` enum, so the boundary has
+        // already refused an absent or out-of-enum value before this handler runs.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateServiceNetworkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // `serviceNetworkIdentifier` is modelled as either the bare id or the ARN.
+        let Some(id) = crate::state::id_from_identifier(
+            &input.service_network_identifier,
+            crate::state::PREFIX_SERVICE_NETWORK,
+        ) else {
+            return Err(not_found(&input.service_network_identifier));
+        };
+        let mut store = state.lock();
+        let Some(network) = store.service_networks.get_mut(&id) else {
+            return Err(not_found(&input.service_network_identifier));
+        };
+        // The accepted change is PERSISTED, not merely echoed: the stored auth type
+        // becomes what the caller asked for, and an update is an update, so the
+        // resource's `lastUpdatedAt` moves to this call's instant.
+        network.auth_type = input.auth_type.clone();
+        network.last_updated_at = std::time::SystemTime::now();
+        // Answered from the record just written, so the response cannot disagree with
+        // what a later read reports.
+        Ok(UpdateServiceNetworkOutput {
+            id: Some(network.id.clone()),
+            name: Some(network.name.clone()),
+            arn: Some(network.arn.clone()),
+            auth_type: Some(network.auth_type.clone()),
+        })
     }
 }

@@ -45,6 +45,32 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The routing key that names THIS service, as opposed to the SigV4 signing name it
+/// SHARES with two peers.
+///
+/// Amazon DocumentDB, Amazon Neptune and Amazon RDS are three emulated services behind
+/// ONE signing name. All three are generated from the same `AmazonRDSv19` model, whose
+/// `aws.api#service`/`aws.auth#sigv4` traits give each of them `sigv4Name: rds` and
+/// `endpointPrefix: rds` (`smithy_query(query="service_info")` on any of the three
+/// models), so the default signing-name `can_handle` makes all three claim every
+/// `rds`-signed request and the router answers `500 AmbiguousService` for all of it —
+/// leaving none of them reachable.
+///
+/// The shared name resolves to the ONE service whose own identity is that name: Amazon
+/// RDS (`sdkId: RDS`, `cloudTrailEventSource: rds.amazonaws.com`), which is also what
+/// AWS does — the DocumentDB and Neptune APIs are served on the RDS endpoint. This
+/// service therefore claims only a request whose resolved routing key names IT: its own
+/// service prefix `docdb` (`sdkId: DocDB`, `cloudTrailEventSource: docdb.amazonaws.com`),
+/// which is what a client addressed at this service reaches it by — a credential scope or
+/// a host label naming `docdb`.
+///
+/// One consequence is worth knowing: an AWS SDK DocumentDB client signs `rds` (the model
+/// gives it no other name), so its traffic reaches Amazon RDS — which is also what
+/// happens against AWS, where the DocumentDB API is served on the RDS endpoint. Where
+/// Amazon RDS still answers 501 for an operation this service implements, that is the
+/// RDS operation's own stub issue, not this routing rule.
+const ROUTE_KEY: &str = "docdb";
+
 /// The `com-amazonaws-docdb-amazonrdsv19` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,11 +100,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // The model does not express this service's identity: its signing name is
+        // `rds`, shared with Amazon RDS and Amazon Neptune, so matching on the signing
+        // name alone claims their traffic too and the router refuses all three with
+        // `500 AmbiguousService`. Claim only a request whose routing key names THIS
+        // service (see [`ROUTE_KEY`]); the shared `rds` name belongs to Amazon RDS,
+        // the service that owns it.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
+            Some(key) => key == ROUTE_KEY,
             None => false,
         }
     }

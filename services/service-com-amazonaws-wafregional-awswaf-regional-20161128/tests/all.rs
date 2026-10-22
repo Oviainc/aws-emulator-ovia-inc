@@ -17,6 +17,8 @@ mod ip_set_lifecycle;
 mod rule_group_lifecycle;
 #[path = "all/rule_lifecycle.rs"]
 mod rule_lifecycle;
+#[path = "all/size_constraint_set.rs"]
+mod size_constraint_set;
 #[path = "all/sql_injection_match_set.rs"]
 mod sql_injection_match_set;
 #[path = "all/state_roundtrip.rs"]

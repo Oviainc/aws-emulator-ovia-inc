@@ -7,9 +7,8 @@
 //! query filters applied. It is a reporting operation: the only write it makes is
 //! materialising a domain lifecycle step the clock already owed.
 //!
-//! The `userIdentifier` / `groupIdentifier` filters select by project MEMBERSHIP, a
-//! resource this slice of the emulator does not serve yet, so a request using one is
-//! answered with the scaffold's 501 rather than a list that ignored the filter.
+//! The `userIdentifier` / `groupIdentifier` filters select by project MEMBERSHIP:
+//! a project is reported only when the named principal holds a membership in it.
 //!
 //! ## Shape of an operation
 //!
@@ -170,13 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        use crate::state::{date_time, decode_page_token, encode_page_token, now_ms};
-
-        if input.user_identifier.is_some() || input.group_identifier.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "ListProjects filtered by userIdentifier or groupIdentifier",
-            ));
-        }
+        use crate::state::{
+            date_time, decode_page_token, encode_page_token, membership_key, now_ms, MemberKind,
+        };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListProjectsErrorModeled::InternalServerException(InternalServerException {
@@ -219,6 +214,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|p| {
                 input.project_category.as_deref().is_none_or(|category| {
                     p.project_category.as_deref() == Some(category)
+                })
+            })
+            // A principal filter keeps the projects that principal is a member of.
+            .filter(|p| {
+                input.user_identifier.as_deref().is_none_or(|user| {
+                    p.memberships
+                        .contains_key(&membership_key(MemberKind::User, user))
+                })
+            })
+            .filter(|p| {
+                input.group_identifier.as_deref().is_none_or(|group| {
+                    p.memberships
+                        .contains_key(&membership_key(MemberKind::Group, group))
                 })
             });
 

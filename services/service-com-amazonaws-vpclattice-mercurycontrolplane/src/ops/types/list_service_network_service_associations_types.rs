@@ -27,7 +27,14 @@ pub struct ListServiceNetworkServiceAssociationsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#ServiceNetworkServiceAssociationSummary")]
+/// `ServiceNetworkServiceAssociationSummary`, with its schema written out instead of
+/// derived because `createdAt` is `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape: same ids, same order, same indices.
+///
+/// The deserializer is reproduced too: `ListServiceNetworkServiceAssociationsOutput`
+/// above is derived, and its generated read path for `items` calls
+/// `<ServiceNetworkServiceAssociationSummary as DeserializableStruct>::deserialize`.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceNetworkServiceAssociationSummary {
     pub id: Option<String>,
@@ -43,5 +50,205 @@ pub struct ServiceNetworkServiceAssociationSummary {
     pub service_network_arn: Option<String>,
     pub dns_entry: Option<DnsEntry>,
     pub custom_domain_name: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl ServiceNetworkServiceAssociationSummary {
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ServiceNetworkServiceAssociationSummary", "id", String, 0);
+    // `ServiceNetworkServiceAssociationStatus` is an enum shape, which the generator
+    // writes as `ShapeType::String`.
+    const M_STATUS: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "status",
+        String,
+        1
+    );
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ServiceNetworkServiceAssociationSummary", "arn", String, 2);
+    const M_CREATED_BY: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "createdBy",
+        String,
+        3
+    );
+    const M_CREATED_AT: ::aws_smithy_schema::Schema = shared_types::date_time_member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "createdAt",
+        4
+    );
+    const M_SERVICE_ID: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "serviceId",
+        String,
+        5
+    );
+    const M_SERVICE_NAME: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "serviceName",
+        String,
+        6
+    );
+    const M_SERVICE_ARN: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "serviceArn",
+        String,
+        7
+    );
+    const M_SERVICE_NETWORK_ID: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "serviceNetworkId",
+        String,
+        8
+    );
+    const M_SERVICE_NETWORK_NAME: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "serviceNetworkName",
+        String,
+        9
+    );
+    const M_SERVICE_NETWORK_ARN: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "serviceNetworkArn",
+        String,
+        10
+    );
+    const M_DNS_ENTRY: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "dnsEntry",
+        Structure,
+        11
+    );
+    const M_CUSTOM_DOMAIN_NAME: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "ServiceNetworkServiceAssociationSummary",
+        "customDomainName",
+        String,
+        12
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#ServiceNetworkServiceAssociationSummary",
+            shared_types::NAMESPACE,
+            "ServiceNetworkServiceAssociationSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_STATUS,
+            &Self::M_ARN,
+            &Self::M_CREATED_BY,
+            &Self::M_CREATED_AT,
+            &Self::M_SERVICE_ID,
+            &Self::M_SERVICE_NAME,
+            &Self::M_SERVICE_ARN,
+            &Self::M_SERVICE_NETWORK_ID,
+            &Self::M_SERVICE_NETWORK_NAME,
+            &Self::M_SERVICE_NETWORK_ARN,
+            &Self::M_DNS_ENTRY,
+            &Self::M_CUSTOM_DOMAIN_NAME,
+        ],
+    );
+}
+
+pub static SERVICE_NETWORK_SERVICE_ASSOCIATION_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema =
+    &ServiceNetworkServiceAssociationSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ServiceNetworkServiceAssociationSummary {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.status.as_ref() {
+            serializer.write_string(&Self::M_STATUS, value.as_str())?;
+        }
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.created_by.as_ref() {
+            serializer.write_string(&Self::M_CREATED_BY, value.as_str())?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.service_id.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_ID, value.as_str())?;
+        }
+        if let Some(value) = self.service_name.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.service_arn.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.service_network_id.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_NETWORK_ID, value.as_str())?;
+        }
+        if let Some(value) = self.service_network_name.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_NETWORK_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.service_network_arn.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_NETWORK_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.dns_entry.as_ref() {
+            serializer.write_struct(&Self::M_DNS_ENTRY, value)?;
+        }
+        if let Some(value) = self.custom_domain_name.as_ref() {
+            serializer.write_string(&Self::M_CUSTOM_DOMAIN_NAME, value.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ServiceNetworkServiceAssociationSummary {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut summary = Self::default();
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, value| {
+            match member.member_index() {
+                Some(0) => summary.id = Some(value.read_string(&Self::M_ID)?),
+                Some(1) => summary.status = Some(value.read_string(&Self::M_STATUS)?),
+                Some(2) => summary.arn = Some(value.read_string(&Self::M_ARN)?),
+                Some(3) => summary.created_by = Some(value.read_string(&Self::M_CREATED_BY)?),
+                Some(4) => {
+                    summary.created_at = Some(value.read_timestamp(&Self::M_CREATED_AT)?);
+                }
+                Some(5) => summary.service_id = Some(value.read_string(&Self::M_SERVICE_ID)?),
+                Some(6) => {
+                    summary.service_name = Some(value.read_string(&Self::M_SERVICE_NAME)?);
+                }
+                Some(7) => summary.service_arn = Some(value.read_string(&Self::M_SERVICE_ARN)?),
+                Some(8) => {
+                    summary.service_network_id =
+                        Some(value.read_string(&Self::M_SERVICE_NETWORK_ID)?);
+                }
+                Some(9) => {
+                    summary.service_network_name =
+                        Some(value.read_string(&Self::M_SERVICE_NETWORK_NAME)?);
+                }
+                Some(10) => {
+                    summary.service_network_arn =
+                        Some(value.read_string(&Self::M_SERVICE_NETWORK_ARN)?);
+                }
+                Some(11) => {
+                    summary.dns_entry = Some(
+                        <DnsEntry as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(
+                            value,
+                        )?,
+                    );
+                }
+                Some(12) => {
+                    summary.custom_domain_name =
+                        Some(value.read_string(&Self::M_CUSTOM_DOMAIN_NAME)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(summary)
+    }
 }
 

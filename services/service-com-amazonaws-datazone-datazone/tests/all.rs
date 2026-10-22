@@ -17,6 +17,8 @@ mod asset_types;
 mod domain_project_lifecycle;
 #[path = "all/glossary_lifecycle.rs"]
 mod glossary_lifecycle;
+#[path = "all/project_memberships.rs"]
+mod project_memberships;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_project.rs"]

@@ -157,7 +157,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
+        let _ = &input;
+        // The account-level device gate. It is a SERVICE-level precondition, ahead of
+        // anything this operation does: in a Region this account has activated no
+        // Snow device in there is no device to list resources for, and the service
+        // refuses the call. It is answered here even though the operation itself is
+        // still scaffolded, because a gated caller never reaches the operation at
+        // all — the 501 below is what is still owed for an account that HAS a device.
+        if let Some(state) = crate::state::service_state(&*self.engine) {
+            let region = crate::state::request_region(ctx.parts());
+            if !state.lock().has_activated_device(&region) {
+                return Err(ListDeviceResourcesErrorModeled::AccessDeniedException(
+                    crate::state::no_devices_in_region(),
+                )
+                .into());
+            }
+        }
         // Implement `ListDeviceResources` here, then delete the SCAFFOLDED marker at the top of
         // this file. Return modeled failures as
         // `Err(ListDeviceResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.

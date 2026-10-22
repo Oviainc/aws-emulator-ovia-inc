@@ -2,14 +2,14 @@
 
 //! Engine state for the com-amazonaws-wafregional-awswaf-regional-20161128 service.
 //!
-//! AWS WAF Classic's `IPSet`, `Rule`, `SqlInjectionMatchSet`, `WebACL`, `XssMatchSet`
-//! and `RuleGroup` records and the change tokens every mutating call consumes live
-//! here, so `GetChangeToken`, `GetChangeTokenStatus` and the `Create*`, `Update*`,
-//! `Get*`, `List*` and `Delete*` handlers of every resource kind all read and write ONE
-//! copy of each resource. The helpers below (id minting, the change-token protocol,
-//! CIDR parsing, metric-name validation, filter identity, the `IPSet`/`IPSetSummary`,
-//! `Rule`, `SqlInjectionMatchSet`, `WebACL`, `XssMatchSet`/`XssMatchSetSummary` and
-//! `RuleGroup`
+//! AWS WAF Classic's `IPSet`, `Rule`, `RuleGroup`, `SizeConstraintSet`,
+//! `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet` records and the change tokens
+//! every mutating call consumes live here, so `GetChangeToken`, `GetChangeTokenStatus`
+//! and the `Create*`, `Update*`, `Get*`, `List*` and `Delete*` handlers of every
+//! resource kind all read and write ONE copy of each resource. The helpers below (id
+//! minting, the change-token protocol, CIDR parsing, metric-name validation, filter
+//! identity, the `IPSet`/`IPSetSummary`, `Rule`, `RuleGroup`, `SizeConstraintSet`,
+//! `SqlInjectionMatchSet`, `WebACL` and `XssMatchSet`/`XssMatchSetSummary`
 //! projections) are shared by those handlers rather than duplicated per operation.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, Rule, RuleGroup, RuleSummary,
-    SqlInjectionMatchSet, SqlInjectionMatchTuple, WafAction, WebACL, XssMatchSet,
+    SizeConstraint, SizeConstraintSet, SqlInjectionMatchSet, SqlInjectionMatchTuple, WafAction,
+    WebACL, XssMatchSet,
     XssMatchSetSummary, XssMatchTuple,
 };
 
@@ -107,6 +108,15 @@ pub const MAX_RULE_GROUPS: usize = 3;
 /// minted would grow without end. Chosen far above the number of tokens any one
 /// client has in flight.
 pub const MAX_CHANGE_TOKENS: usize = 1_000;
+
+/// The most `SizeConstraintSet`s this emulator stores for the account before
+/// `CreateSizeConstraintSet` answers its modelled `WAFLimitsExceededException`.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes for an
+/// account (100 conditions of each type, a `SizeConstraintSet` being one condition —
+/// the same source as [`MAX_SQL_INJECTION_MATCH_SETS`]), which keeps the
+/// SizeConstraintSet state a caller can grow bounded.
+pub const MAX_SIZE_CONSTRAINT_SETS: usize = 100;
 
 /// The most `WebACL`s this emulator stores for the account before `CreateWebACL`
 /// answers its modelled `WAFLimitsExceededException`.
@@ -403,6 +413,40 @@ impl IPSetEntry {
         }
         self.descriptors.retain(|stored| &stored.cidr != cidr);
         true
+    }
+}
+
+/// One stored `SizeConstraintSet`.
+///
+/// A set is created empty — `CreateSizeConstraintSet` documents that it answers "a
+/// `SizeConstraintSet` that contains no `SizeConstraint` objects" — and its
+/// constraints arrive through `UpdateSizeConstraintSet`.
+#[derive(Debug, Clone)]
+pub struct SizeConstraintSetEntry {
+    pub size_constraint_set_id: String,
+    pub name: String,
+    /// The constraints in insertion order.
+    pub size_constraints: Vec<SizeConstraint>,
+}
+
+impl SizeConstraintSetEntry {
+    /// A new, empty `SizeConstraintSet` record.
+    pub fn new(size_constraint_set_id: String, name: String) -> Self {
+        Self {
+            size_constraint_set_id,
+            name,
+            size_constraints: Vec::new(),
+        }
+    }
+
+    /// This record projected onto the modelled `SizeConstraintSet` shape the Get and
+    /// Create responses carry: the stored record's own fields, never request input.
+    pub fn to_modelled(&self) -> SizeConstraintSet {
+        SizeConstraintSet {
+            size_constraint_set_id: self.size_constraint_set_id.clone(),
+            name: Some(self.name.clone()),
+            size_constraints: self.size_constraints.clone(),
+        }
     }
 }
 
@@ -743,6 +787,10 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// Every stored `Rule`, keyed by its `RuleId`. A `BTreeMap` for the same reason as
     /// [`Self::ip_sets`]: one stable order for the paginated `ListRules`.
     pub rules: BTreeMap<String, RuleEntry>,
+    /// Every stored `SizeConstraintSet`, keyed by its `SizeConstraintSetId`. A
+    /// `BTreeMap` so `ListSizeConstraintSets` walks them in one stable order and a
+    /// `NextMarker` taken on one page resumes at the right place on the next.
+    pub size_constraint_sets: BTreeMap<String, SizeConstraintSetEntry>,
     /// Every stored `SqlInjectionMatchSet`, keyed by its `SqlInjectionMatchSetId`. A
     /// `BTreeMap` for the same reason as `ip_sets`: one stable walk order for the
     /// paginated list.

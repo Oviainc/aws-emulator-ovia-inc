@@ -16,12 +16,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_snowdevicemanagement_snowdevicemanagement::state::{
-    EXECUTION_FINISH_SPAN, EXECUTION_START_SPAN,
+    service_state, EXECUTION_FINISH_SPAN, EXECUTION_START_SPAN,
 };
 use service_com_amazonaws_snowdevicemanagement_snowdevicemanagement::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -69,12 +69,28 @@ const IP_ADDRESS_ASSIGNMENTS: &[&str] = &["DHCP", "STATIC"];
 const MAX_RESULTS_FLOOR: i64 = 1;
 const MAX_RESULTS_CEILING: i64 = 100;
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// How many devices this suite activates Snow Device Management on. Two jobs' worth,
+/// so a `jobId` filter has both a multi-device and a single-device answer to compute.
+const ACTIVATED_DEVICES: u64 = 3;
+
+/// One emulator: a router carrying only this service, over one shared engine, with
+/// Snow Device Management activated on [`ACTIVATED_DEVICES`] ordered devices in
+/// [`SIGNED_REGION`].
+///
+/// The API models NO device-creation operation — a device becomes manageable by being
+/// ORDERED, which is another service's API — so the activation goes through the one
+/// state seam that puts a device in the inventory. Without it this account's inventory
+/// is empty and every gated operation answers the account-level device gate, which is
+/// what `account_device_gate.rs` pins.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    service_state(&*engine)
+        .expect("the in-memory engine carries this service's state")
+        .lock()
+        .activate_devices(SIGNED_REGION, ACTIVATED_DEVICES, SystemTime::now());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router
 }
 
@@ -151,6 +167,20 @@ async fn list_executions(router: &MultiServiceRouter, query: &str) -> Answer {
     call(router, "GET", &format!("/executions{query}"), None).await
 }
 
+async fn describe_execution(
+    router: &MultiServiceRouter,
+    task_id: &str,
+    managed_device_id: &str,
+) -> Answer {
+    call(
+        router,
+        "POST",
+        &format!("/task/{task_id}/execution/{managed_device_id}"),
+        None,
+    )
+    .await
+}
+
 /// Assert a call succeeded and hand back its body.
 fn ok(answer: &Answer, case: &str) -> Value {
     assert_eq!(
@@ -213,14 +243,14 @@ fn executions_of(body: &Value, case: &str) -> Vec<Value> {
         .clone()
 }
 
-/// Every seeded device, in the order `ListDevices` serves them.
+/// Every activated device, in the order `ListDevices` serves them.
 async fn whole_inventory(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
     let answer = list_devices(router, "").await;
     let body = ok(&answer, case);
     let devices = devices_of(&body, case);
     assert!(
         devices.len() >= 2,
-        "case {case:?}: the emulator must seed a device inventory, got {body}"
+        "case {case:?}: this suite activates a device inventory, got {body}"
     );
     assert!(
         body["nextToken"].is_null(),
@@ -251,7 +281,7 @@ fn assert_modelled_token(token: &str, case: &str) {
 }
 
 #[tokio::test]
-async fn list_devices_reports_the_seeded_inventory_with_stable_region_scoped_arns() {
+async fn list_devices_reports_the_activated_inventory_with_stable_region_scoped_arns() {
     let router = emulator();
     let first = whole_inventory(&router, "first ListDevices").await;
 
@@ -318,7 +348,7 @@ async fn list_devices_narrows_the_inventory_to_one_job_id() {
     }
     assert!(
         by_job.len() >= 2,
-        "case \"fixture\": the seeded inventory must span at least two jobs for a \
+        "case \"fixture\": the activated inventory must span at least two jobs for a \
          jobId filter to be observable, got {by_job:?}"
     );
     by_job.insert("JID00000000-0000-4000-8000-ffffffffffff".to_string(), vec![]);
@@ -435,7 +465,7 @@ async fn the_list_operations_refuse_a_next_token_they_never_issued() {
 }
 
 #[tokio::test]
-async fn describe_device_reports_the_stored_record_for_every_seeded_device() {
+async fn describe_device_reports_the_stored_record_for_every_activated_device() {
     let router = emulator();
     let inventory = whole_inventory(&router, "inventory").await;
 
@@ -627,7 +657,7 @@ async fn create_task_persists_what_describe_task_and_list_executions_report() {
         assert_eq!(
             targets.len(),
             row.target_count,
-            "case {case:?}: the seeded inventory must hold enough devices for this row"
+            "case {case:?}: the activated inventory must hold enough devices for this row"
         );
 
         let mut request = json!({ "targets": targets, "command": { row.command: {} } });
@@ -953,6 +983,93 @@ async fn the_task_operations_404_a_task_id_that_names_no_task() {
 }
 
 #[tokio::test]
+async fn describe_execution_reports_the_stored_execution_for_every_target() {
+    // Rows differ in how many devices the task targets and in the command, so the
+    // execution the pair addresses is not one shape of record.
+    let rows: &[(&str, usize)] = &[("unlock", 1), ("reboot", 3)];
+    for (command, target_count) in rows {
+        let router = emulator();
+        let case = format!("{command} over {target_count} targets");
+        let (task_id, _, targets) = queue_task(&router, &[command], *target_count, None).await;
+
+        let listed = ok(
+            &list_executions(&router, &format!("?taskId={task_id}")).await,
+            &case,
+        );
+        let summaries = executions_of(&listed, &case);
+        assert_eq!(
+            summaries.len(),
+            targets.len(),
+            "case {case:?}: every target has an execution, got {listed}"
+        );
+
+        // DescribeExecution and ListExecutions are two projections of ONE record.
+        for summary in &summaries {
+            let device = string(summary, "managedDeviceId", &case);
+            let case = format!("{case}, device {device}");
+            let described = ok(&describe_execution(&router, &task_id, &device).await, &case);
+            for member in ["taskId", "executionId", "managedDeviceId", "state"] {
+                assert_eq!(
+                    described[member], summary[member],
+                    "case {case:?}: DescribeExecution and ListExecutions must project the \
+                     same stored {member}, got {} and {}",
+                    described[member], summary[member]
+                );
+            }
+            let state = string(&described, "state", &case);
+            assert!(
+                EXECUTION_STATES.contains(&state.as_str()),
+                "case {case:?}: state {state:?} is not one of ExecutionState's values \
+                 {EXECUTION_STATES:?}"
+            );
+            assert!(
+                described["startedAt"].is_null(),
+                "case {case:?}: a queued execution has not started, so it reports no \
+                 startedAt, got {described}"
+            );
+            assert!(
+                described["lastUpdatedAt"].as_f64().unwrap_or(-1.0) > 0.0,
+                "case {case:?}: lastUpdatedAt must be the stored instant, got {described}"
+            );
+        }
+
+        // The pair is what addresses an execution: a device the task did not target,
+        // and a task that does not exist, both answer the modelled 404.
+        let untargeted: Vec<String> = ids_of(&whole_inventory(&router, &case).await, &case)
+            .into_iter()
+            .filter(|id| !targets.contains(id))
+            .collect();
+        for device in untargeted {
+            assert_not_found(
+                &describe_execution(&router, &task_id, &device).await,
+                &format!("{case}, untargeted device {device}"),
+            );
+        }
+        assert_not_found(
+            &describe_execution(&router, "st-ffffffffffffffff", &targets[0]).await,
+            &format!("{case}, unknown task"),
+        );
+
+        // And the clock carries the record this operation reports: past the dispatch
+        // span the execution is running and reports the instant it started.
+        tokio::time::sleep(EXECUTION_START_SPAN + Duration::from_millis(150)).await;
+        let running = ok(
+            &describe_execution(&router, &task_id, &targets[0]).await,
+            &case,
+        );
+        assert_eq!(
+            running["state"].as_str(),
+            Some("IN_PROGRESS"),
+            "case {case:?}: past the dispatch span the execution is running, got {running}"
+        );
+        assert!(
+            running["startedAt"].as_f64().unwrap_or(-1.0) > 0.0,
+            "case {case:?}: a running execution reports the instant it started, got {running}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn list_executions_narrows_a_task_to_one_execution_state() {
     let router = emulator();
     let (task_id, _, targets) = queue_task(&router, &["unlock"], 3, None).await;
@@ -1055,7 +1172,7 @@ async fn the_clock_carries_an_execution_to_succeeded_and_applies_the_command() {
         assert_eq!(
             before["deviceState"].as_str(),
             Some("LOCKED"),
-            "case {case:?}: a seeded device is locked until a task unlocks it, got {before}"
+            "case {case:?}: an activated device is locked until a task unlocks it, got {before}"
         );
 
         // The span is never zero, so the caller right after the create still sees the
@@ -1072,9 +1189,10 @@ async fn the_clock_carries_an_execution_to_succeeded_and_applies_the_command() {
             Some("IN_PROGRESS"),
             "case {case:?}: past the dispatch span the execution is running, got {listed}"
         );
-        // `ExecutionSummary` carries no `startedAt` (only `DescribeExecution`, still a
-        // stub, reports it), so the running execution's own instant is not observable
-        // here; what this page states is its state.
+        // `ExecutionSummary` carries no `startedAt` (only `DescribeExecution` reports
+        // it, which `describe_execution_reports_the_stored_execution_for_every_target`
+        // pins), so the running execution's own instant is not observable here; what
+        // this page states is its state.
         let running = ok(&describe_task(&router, &task_id).await, &case);
         assert_eq!(
             running["state"].as_str(),

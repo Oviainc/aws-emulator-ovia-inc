@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored execution the `(taskId, managedDeviceId)` pair addresses — the
+//! work one target device does for one task — after the clock has carried every
+//! execution the span has elapsed on to its next state. A Region this account has
+//! activated no device in is refused by the account-level device gate
+//! (`AccessDeniedException`) before either id is resolved.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeExecution"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeExecutionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the snow-device-management task store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The account-level device gate, consulted BEFORE either id is resolved.
+        if !store.has_activated_device(&region) {
+            return Err(DescribeExecutionErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+        store.settle(now);
+
+        // "The ID of the task that the action is describing": a task of another
+        // Region is not this Region's to report.
+        if store.task_in(&region, &input.task_id).is_none() {
+            return Err(DescribeExecutionErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::TASK_RESOURCE_TYPE, &input.task_id),
+            )
+            .into());
+        }
+
+        let key = (input.task_id.clone(), input.managed_device_id.clone());
+        let Some(execution) = store.executions.get(&key) else {
+            // The pair addresses one execution; when the task did not target this
+            // device there is none to report.
+            return Err(DescribeExecutionErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::EXECUTION_RESOURCE_TYPE,
+                    &format!("{}/{}", input.task_id, input.managed_device_id),
+                ),
+            )
+            .into());
+        };
+
+        Ok(DescribeExecutionOutput {
+            task_id: Some(execution.task_id.clone()),
+            execution_id: Some(execution.execution_id.clone()),
+            managed_device_id: Some(execution.managed_device_id.clone()),
+            state: Some(execution.state.clone()),
+            // "When the status of the execution was last updated" / the instant the
+            // command reached the device: absent while the execution is still
+            // queued, because it has not started.
+            started_at: execution.started_at.map(::aws_smithy_types::DateTime::from),
+            last_updated_at: Some(::aws_smithy_types::DateTime::from(
+                execution.last_updated_at,
+            )),
+        })
     }
 }
