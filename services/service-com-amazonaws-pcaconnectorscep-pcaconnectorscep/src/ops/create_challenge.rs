@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChallenge
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChallenge`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChallenge::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a challenge password under an existing, active, general-purpose connector and
+//! stores it there, so `GetChallengePassword` reads back exactly what was returned.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +173,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChallenge` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChallengeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChallenge"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The resource-defining input of this call, so a retry carrying the same
+        // `ClientToken` can be checked to be the same request.
+        let request = crate::state::challenge_request(&input.connector_arn);
+
+        // `ClientToken` is how the caller says "this is a retry": within its documented
+        // five-minute window the same token answers with the challenge it already created,
+        // password included, rather than minting a second password.
+        if let Some(existing) = store.challenge_for_token(input.client_token.as_deref()) {
+            if let Some(challenge) = store.challenge(&existing.arn) {
+                // Same token, different request: the caller is not retrying the call this
+                // token stands for.
+                if existing.request != request {
+                    return Err(CreateChallengeErrorModeled::ConflictException(ConflictException {
+                        message: format!(
+                            "The ClientToken was already used to create challenge {} with \
+                             different parameters",
+                            existing.arn
+                        ),
+                        resource_id: existing.arn.clone(),
+                        resource_type: crate::state::RESOURCE_TYPE_CHALLENGE.to_string(),
+                    })
+                    .into());
+                }
+                return Ok(CreateChallengeOutput {
+                    challenge: Some(challenge.to_challenge()),
+                });
+            }
+        }
+
+        let connector_arn = input.connector_arn.clone();
+        let connector = store
+            .connectors
+            .get(&connector_arn)
+            .ok_or_else(|| not_found(&connector_arn))?;
+
+        // "For general-purpose connectors" (this operation's own doc): with an Intune
+        // connector the challenge passwords are managed in Microsoft Intune, so there is
+        // nothing for this call to mint. The model carries the reason for exactly this.
+        if connector.connector_type != crate::state::TYPE_GENERAL_PURPOSE {
+            return Err(CreateChallengeErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Connector {connector_arn} has type {}; challenge passwords can only be created for {} connectors",
+                    connector.connector_type,
+                    crate::state::TYPE_GENERAL_PURPOSE
+                ),
+                reason: Some(crate::state::REASON_INVALID_CONNECTOR_TYPE.to_string()),
+            })
+            .into());
+        }
+
+        // A connector that is not yet serving cannot authenticate a certificate request
+        // with a challenge password, so it cannot hand one out either.
+        if !connector.is_active() {
+            return Err(CreateChallengeErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Connector {connector_arn} has status {}; it must be {} to create a challenge",
+                    connector.status,
+                    crate::state::STATUS_ACTIVE
+                ),
+                reason: Some(crate::state::REASON_INVALID_STATE.to_string()),
+            })
+            .into());
+        }
+
+        // The emulator's own ceiling, which the real service expresses as a service quota
+        // and this operation models `ServiceQuotaExceededException` for.
+        if connector.challenges.len() >= crate::state::MAX_CHALLENGES_PER_CONNECTOR {
+            return Err(CreateChallengeErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of challenge passwords ({}) for connector {connector_arn} has been reached",
+                        crate::state::MAX_CHALLENGES_PER_CONNECTOR
+                    ),
+                    resource_type: crate::state::RESOURCE_TYPE_CHALLENGE.to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                    quota_code: crate::state::QUOTA_CODE_CHALLENGES.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `Tags` carries no modelled `@length`, so the per-resource tag limit is enforced
+        // here, on the request's own entry count and BEFORE anything is collected, so an
+        // oversized map costs nothing and duplicate keys cannot collapse under the limit.
+        let tag_count = input.tags.as_ref().map(|tags| tags.len()).unwrap_or_default();
+        if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateChallengeErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Tags carries {tag_count} entries; a resource may have at most {}",
+                    crate::state::MAX_TAGS_PER_RESOURCE
+                ),
+                reason: None,
+            })
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+
+        let arn = crate::state::challenge_arn(&connector_arn, &crate::state::new_uuid());
+        let record = crate::state::StoredChallenge {
+            arn: arn.clone(),
+            connector_arn: connector_arn.clone(),
+            // "The SCEP challenge password, in UUID format" (the `Password` member's doc).
+            password: crate::state::new_uuid(),
+            created_at: now,
+            updated_at: now,
+            tags,
+        };
+        // The response is built from the record BEFORE it is handed to the store, so this
+        // answer is exactly what a later GetChallengePassword reads.
+        let challenge = record.to_challenge();
+        let Some(connector) = store.connectors.get_mut(&connector_arn) else {
+            // Unreachable: the connector was read under this same lock a few lines above,
+            // and nothing can take the lock in between.
+            return Err(store_unavailable());
+        };
+        connector.challenges.insert(arn.clone(), record);
+
+        if let Some(token) = input.client_token {
+            store.challenge_tokens.insert(
+                token,
+                crate::state::IdempotencyRecord {
+                    arn,
+                    created_at: now,
+                    request,
+                },
+            );
+        }
+
+        Ok(CreateChallengeOutput {
+            challenge: Some(challenge),
+        })
     }
+}
+
+/// No connector is stored under this ARN — HTTP 404 `ResourceNotFoundException`, which is
+/// also what a well-formed ARN that was never created answers.
+fn not_found(connector_arn: &str) -> CreateChallengeError {
+    CreateChallengeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("Connector {connector_arn} could not be found"),
+        resource_id: connector_arn.to_string(),
+        resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, which this operation models as
+/// `InternalServerException` (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> CreateChallengeError {
+    CreateChallengeErrorModeled::InternalServerException(InternalServerException {
+        message: "the Connector for SCEP connector store is unavailable".to_string(),
+    })
+    .into()
 }
