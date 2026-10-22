@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAssetProperty
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAssetProperty`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports one property of a stored asset from the shared
+//! engine store (`crate::state`); this is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAssetProperty::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The property's own members (id, external id, name, alias, notification, data type,
+//! unit) come from the asset's materialised property, while its `type` is read from the
+//! asset model's CURRENT definition — which is what makes an attribute report the
+//! default value the model carries now, as this operation's documentation states.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +173,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAssetProperty` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAssetPropertyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAssetProperty"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAssetPropertyError::Modeled(
+                DescribeAssetPropertyErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        // A REPORTING operation: it reads the stored asset, its property and the
+        // referenced model's current definition, and writes nothing.
+        let store = state.lock();
+
+        // Both ids are `CustomID`s: a raw UUID, or `externalId:<externalId>`. The
+        // asset resolves through the shared resolver every other handler uses.
+        let asset_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET,
+                &input.asset_id,
+            ))
+        })?;
+        let asset = store.assets.get(&asset_id).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET,
+                &input.asset_id,
+            ))
+        })?;
+        // The model is what declares every property this asset carries. An asset
+        // cannot be created without one and `DeleteAssetModel` refuses while any
+        // asset instantiates the model, so a stored asset always has its model: the
+        // `Option` is carried rather than refused only so an unreachable state
+        // cannot unwind. A property is then reported with its own stored members and
+        // without a `type` — never withheld, and never refused as a server failure
+        // for a resource that is really there.
+        let model = store.asset_models.get(&asset.asset_model_id);
+
+        // A property of the asset itself — the normal case this operation documents
+        // as reported in `assetProperty`.
+        if let Some(stored) = asset.property(&input.property_id) {
+            // The property TYPE is read from the model's definition as it stands
+            // NOW, not snapshotted at create time: "If you update the default value
+            // in the model, this operation's response includes the new default
+            // value."
+            let definition = model.and_then(|model| {
+                model
+                    .properties
+                    .iter()
+                    .find(|property| property.id.as_deref() == Some(stored.id.as_str()))
+            });
+            return Ok(DescribeAssetPropertyOutput {
+                asset_id: asset.id.clone(),
+                asset_external_id: asset.external_id.clone(),
+                asset_name: asset.name.clone(),
+                asset_model_id: asset.asset_model_id.clone(),
+                asset_property: Some(property_of(stored, definition)),
+                composite_model: None,
+            });
+        }
+
+        // A property declared by one of the model's composite models, which this
+        // operation reports in `compositeModel` instead: "If you describe an asset
+        // property in a composite model, this response includes the asset property
+        // information in compositeModel."
+        if let Some(model) = model {
+            for composite in &model.composite_models {
+                let Some(definition) = composite.properties.iter().flatten().find(|property| {
+                    // A definition with no id names no addressable property, so it
+                    // is passed over rather than reported with a blank one — and
+                    // the scan of this composite model carries on past it. Every
+                    // create path mints one
+                    // (`crate::state::property_definitions_to_properties`), so this
+                    // only guards a state no stored model reaches; both label forms
+                    // stay resolvable for every definition that was stored.
+                    property.id.as_deref().is_some_and(|id| !id.is_empty())
+                        && crate::state::matches_id_label(
+                            property.id.as_deref(),
+                            property.external_id.as_deref(),
+                            &input.property_id,
+                        )
+                }) else {
+                    continue;
+                };
+                return Ok(DescribeAssetPropertyOutput {
+                    asset_id: asset.id.clone(),
+                    asset_external_id: asset.external_id.clone(),
+                    asset_name: asset.name.clone(),
+                    asset_model_id: asset.asset_model_id.clone(),
+                    asset_property: None,
+                    composite_model: Some(CompositeModelProperty {
+                        name: composite.name.clone(),
+                        r#type: composite.r#type.clone(),
+                        id: composite.id.clone(),
+                        external_id: composite.external_id.clone(),
+                        asset_property: property_of_definition(definition),
+                    }),
+                });
+            }
+        }
+
+        Err(not_found(format!(
+            "The asset {} has no property {}.",
+            input.asset_id, input.property_id
+        )))
     }
+}
+
+/// The `Property` a stored asset property reports: its own members, plus the
+/// property type from the asset model definition it was materialised from
+/// (absent when the model no longer declares it).
+fn property_of(stored: &AssetProperty, definition: Option<&AssetModelProperty>) -> Property {
+    Property {
+        id: stored.id.clone(),
+        external_id: stored.external_id.clone(),
+        name: stored.name.clone(),
+        alias: stored.alias.clone(),
+        notification: stored.notification.clone(),
+        data_type: stored.data_type.clone(),
+        unit: stored.unit.clone(),
+        r#type: definition.map(|definition| definition.r#type.clone()),
+        path: stored.path.clone(),
+    }
+}
+
+/// The `Property` a composite model's property definition reports.
+///
+/// A composite model's properties are declared on the asset model and this
+/// emulator materialises no per-asset instance of them, so the two members only
+/// a materialised property can carry — the alias and the notification topic,
+/// both written by `UpdateAssetProperty`, which addresses the asset's own
+/// property list — are absent rather than invented.
+fn property_of_definition(definition: &AssetModelProperty) -> Property {
+    Property {
+        id: definition.id.clone().unwrap_or_default(),
+        external_id: definition.external_id.clone(),
+        name: definition.name.clone(),
+        alias: None,
+        notification: None,
+        data_type: definition.data_type.clone(),
+        unit: definition.unit.clone(),
+        r#type: Some(definition.r#type.clone()),
+        path: None,
+    }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DescribeAssetPropertyError {
+    DescribeAssetPropertyError::Modeled(
+        DescribeAssetPropertyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message,
+        }),
+    )
 }

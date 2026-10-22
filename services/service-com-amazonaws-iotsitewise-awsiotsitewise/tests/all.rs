@@ -42,6 +42,8 @@ mod associated_assets;
 mod batch_get_latest_values;
 #[path = "all/batch_put_timestamp_and_quality.rs"]
 mod batch_put_timestamp_and_quality;
+#[path = "all/describe_asset_property.rs"]
+mod describe_asset_property;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
 #[path = "all/hierarchies_etags_and_refusals.rs"]

@@ -4,10 +4,16 @@
 //!
 //! MERGES `tags` onto the tag map of the one stored deployment parameter whose
 //! `resourceArn` the `@httpLabel` names, so a key already present takes the new
-//! value and every other stored key is left alone. An ARN that names no stored
-//! record is a 404 carrying this service's own `NotFoundException` code
-//! (`crate::state::parameter_not_found`), which is the code its recorded responses
-//! use rather than the modelled `ResourceNotFoundException` shape name.
+//! value and every other stored key is left alone.
+//!
+//! The label is judged as an INPUT first (`crate::state::validate_resource_arn`): a
+//! value that is not a resource ARN of this service's vendor names nothing this API
+//! can address, so it is the modelled `ValidationException` (400) naming the member,
+//! raised before the store is consulted at all. An ARN that IS one of this service's
+//! and names no stored record is a 404 carrying this service's own
+//! `NotFoundException` code (`crate::state::parameter_not_found`), which is the code
+//! its recorded responses use rather than the modelled `ResourceNotFoundException`
+//! shape name.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +150,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Input before lookup: an ARN of another vendor is a bad request, not a
+        // missing resource.
+        if let Err(invalid) = crate::state::validate_resource_arn(&input.resource_arn) {
+            return Err(TagResourceErrorModeled::ValidationException(invalid).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {

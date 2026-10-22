@@ -15,5 +15,7 @@
 mod asset_contracts;
 #[path = "all/chain_query_slice.rs"]
 mod chain_query_slice;
+#[path = "all/error_contract.rs"]
+mod error_contract;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

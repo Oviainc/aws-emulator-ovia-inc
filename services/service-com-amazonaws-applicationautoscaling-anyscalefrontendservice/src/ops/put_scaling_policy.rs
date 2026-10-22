@@ -364,6 +364,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(config) = step_config.as_ref() {
             check_step_config(config)?;
         }
+        // And it has to hold together for THIS scalable dimension: the metric it names has
+        // to be one this dimension is scaled on, with a target value inside the window
+        // that metric's own service publishes, and no other policy of this target may
+        // already be steering the same metric.
+        if let Some(config) = target_tracking_config.as_ref() {
+            check_tracked_metric(&input.scalable_dimension, config)?;
+            // "You can have one or more target tracking scaling policies" — but not two
+            // tracking ONE metric: they would compute contradictory capacity from the same
+            // signal, and the alarms of the second would duplicate the first's.
+            let signature = crate::state::metric_signature(config);
+            if let Some((other, _)) = state.policies.iter().find(|(other_key, policy)| {
+                other_key.target == key.target
+                    && other_key.policy_name != key.policy_name
+                    && policy.policy_type == "TargetTrackingScaling"
+                    && policy
+                        .target_tracking_config
+                        .as_ref()
+                        .is_some_and(|stored| crate::state::metric_signature(stored) == signature)
+            }) {
+                return Err(validation(format!(
+                    "Only one TargetTrackingScaling policy for a given metric specification is \
+                     allowed: the policy {} already tracks this metric for this scalable target",
+                    other.policy_name
+                )));
+            }
+        }
 
         // The ARN and the creation time are minted once per policy identity and survive
         // every later Put for the same (namespace, resource, dimension, policy name).
@@ -534,6 +560,65 @@ fn check_target_tracking_config(
                     "PutScalingPolicy with a CustomizedMetricSpecification metric math query",
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a target-tracking configuration whose metric is not one `scalable_dimension` is
+/// scaled on, or whose target value is outside that metric's published window.
+///
+/// A predefined metric is a metric of one service's resources, so it only describes the
+/// dimensions that service publishes it for ([`crate::state::predefined_metric_dimensions`])
+/// — a read-capacity metric does not describe a write-capacity dimension, and an ECS
+/// service metric does not describe a DynamoDB table at all. A customized metric is only
+/// accepted where the dimension's owning service scales from a signal of the caller's
+/// choosing ([`crate::state::customized_metric_supported`]). And where the owning service
+/// publishes the window its target utilisation must lie in
+/// ([`crate::state::predefined_metric_target_range`]), a target outside it is not a
+/// utilisation that service can hold.
+fn check_tracked_metric(
+    scalable_dimension: &str,
+    config: &TargetTrackingScalingPolicyConfiguration,
+) -> Result<(), PutScalingPolicyError> {
+    if config.customized_metric_specification.is_some()
+        && !crate::state::customized_metric_supported(scalable_dimension)
+    {
+        return Err(validation(format!(
+            "Value at 'targetTrackingScalingPolicyConfiguration.customizedMetricSpecification' \
+             failed to satisfy constraint: a customized metric is not supported for scalable \
+             dimension {scalable_dimension}"
+        )));
+    }
+    let Some(predefined) = config.predefined_metric_specification.as_ref() else {
+        return Ok(());
+    };
+    let metric_type = predefined.predefined_metric_type.as_str();
+    // A type outside the enum is already refused by `check_target_tracking_config`; one
+    // inside it with no catalog row would mint no alarm, so it is refused here rather than
+    // accepted as a policy that drives nothing.
+    let Some(dimensions) = crate::state::predefined_metric_dimensions(metric_type) else {
+        return Err(validation(format!(
+            "Value '{metric_type}' at 'targetTrackingScalingPolicyConfiguration.\
+             predefinedMetricSpecification.predefinedMetricType' failed to satisfy constraint: \
+             Member must be a metric this service scales on"
+        )));
+    };
+    if !dimensions.contains(&scalable_dimension) {
+        return Err(validation(format!(
+            "Value '{metric_type}' at 'targetTrackingScalingPolicyConfiguration.\
+             predefinedMetricSpecification.predefinedMetricType' failed to satisfy constraint: \
+             Member must be a metric published for scalable dimension {scalable_dimension}"
+        )));
+    }
+    if let Some((low, high)) = crate::state::predefined_metric_target_range(metric_type) {
+        if config.target_value < low || config.target_value > high {
+            return Err(validation(format!(
+                "Value '{}' at 'targetTrackingScalingPolicyConfiguration.targetValue' failed to \
+                 satisfy constraint: Member must be between {low} and {high} for metric \
+                 {metric_type}",
+                config.target_value
+            )));
         }
     }
     Ok(())

@@ -196,13 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(holding), Some(record)) => (holding, record),
             _ => {
                 return Err(GetTokenBalanceErrorModeled::ResourceNotFoundException(
-                    crate::state::not_found(
-                        key.resource_id(),
-                        format!(
-                            "No balance is recorded for owner {} of that token on network {}",
-                            key.owner_address, requested.network
-                        ),
-                    ),
+                    crate::state::not_found(key.resource_id()),
                 )
                 .into());
             }
