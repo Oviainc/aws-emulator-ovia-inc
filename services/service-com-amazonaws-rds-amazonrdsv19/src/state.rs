@@ -2,14 +2,15 @@
 
 //! Engine state for the com-amazonaws-rds-amazonrdsv19 service.
 //!
-//! The DB instance and DB snapshot records the implemented handlers read and write,
-//! plus the projection of a stored record onto the modelled `DBInstance` /
-//! `DBSnapshot` wire shapes. These live here rather than in one operation file
-//! because every implemented operation shares them: `CreateDBInstance`,
-//! `DescribeDBInstances`, `ModifyDBInstance`, `CreateDBSnapshot`,
-//! `DescribeDBSnapshots` and `DeleteDBInstance` all project the same record.
+//! The DB instance, DB snapshot and option group records the implemented handlers
+//! read and write, plus the projection of a stored record onto the modelled
+//! `DBInstance` / `DBSnapshot` / `OptionGroup` wire shapes. These live here rather
+//! than in one operation file because every implemented operation shares them:
+//! `CreateDBInstance`, `DescribeDBInstances`, `ModifyDBInstance`,
+//! `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBInstance`,
+//! `CreateOptionGroup` and `DescribeOptionGroups` all project the same records.
 //!
-//! RDS is a REGIONAL service, so both maps are keyed by `(region, identifier)`: the
+//! RDS is a REGIONAL service, so every map is keyed by `(region, identifier)`: the
 //! region a request is signed for scopes what it can see and create, one identifier
 //! can name a different instance in each region, and a describe signed for one region
 //! never reports another's.
@@ -20,8 +21,9 @@
 //! only a value of the published AWS region-id form (so a region key is at most 32
 //! bytes), [`MAX_REGIONS`] caps how many distinct regions hold records at all, and the
 //! per-region quotas cap the records in each. The store therefore holds at most
-//! `MAX_REGIONS * DB_INSTANCE_QUOTA_PER_REGION` instances and
-//! `MAX_REGIONS * DB_SNAPSHOT_QUOTA_PER_REGION` snapshots, whatever sequence of
+//! `MAX_REGIONS * DB_INSTANCE_QUOTA_PER_REGION` instances,
+//! `MAX_REGIONS * DB_SNAPSHOT_QUOTA_PER_REGION` snapshots and
+//! `MAX_REGIONS * OPTION_GROUP_QUOTA_PER_REGION` option groups, whatever sequence of
 //! requests arrives, and every per-request scan reads one region's ordered range
 //! rather than the whole map.
 
@@ -29,8 +31,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    DBInstance, DBParameterGroupStatus, DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint, Tag,
-    VpcSecurityGroupMembership,
+    DBInstance, DBParameterGroupStatus, DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint,
+    OptionGroup, Tag, VpcSecurityGroupMembership,
 };
 
 /// How long after the call that starts it a status transition this service owes
@@ -58,6 +60,51 @@ pub const DB_INSTANCE_QUOTA_PER_REGION: usize = 40;
 /// `SnapshotQuotaExceededFault`, which both `CreateDBSnapshot` and `DeleteDBInstance`
 /// declare.
 pub const DB_SNAPSHOT_QUOTA_PER_REGION: usize = 100;
+
+/// How many option groups one region may hold: the allowance `CreateOptionGroup`
+/// documents ("You can create up to 20 option groups"), which its modelled
+/// `OptionGroupQuotaExceededFault` names in turn ("The quota of 20 option groups was
+/// exceeded for this Amazon Web Services account"). AWS counts that allowance per
+/// account and Region; this store is keyed by region, so it is enforced per region.
+pub const OPTION_GROUP_QUOTA_PER_REGION: usize = 20;
+
+/// The engines an option group may be associated with, as
+/// `CreateOptionGroupMessage$EngineName` lists them — the identical list
+/// `DescribeOptionGroupsMessage$EngineName` publishes for its filter
+/// (`smithy_query(query="doc",shape="CreateOptionGroupMessage",member="EngineName")`:
+/// "Valid Values: db2-ae db2-ce db2-se mariadb mysql oracle-ee oracle-ee-cdb
+/// oracle-se2 oracle-se2-cdb postgres sqlserver-ee sqlserver-se sqlserver-ex
+/// sqlserver-web"). A value AWS allocated, so the only honest source is the model's
+/// own list; extend it when the model does.
+pub const OPTION_GROUP_ENGINE_NAMES: [&str; 14] = [
+    "db2-ae",
+    "db2-ce",
+    "db2-se",
+    "mariadb",
+    "mysql",
+    "oracle-ee",
+    "oracle-ee-cdb",
+    "oracle-se2",
+    "oracle-se2-cdb",
+    "postgres",
+    "sqlserver-ee",
+    "sqlserver-se",
+    "sqlserver-ex",
+    "sqlserver-web",
+];
+
+/// Refuse an `EngineName` outside the value list its member publishes
+/// ([`OPTION_GROUP_ENGINE_NAMES`]). Returns the message to refuse the request with,
+/// naming the member and the constraint it broke.
+pub fn check_option_group_engine_name(engine_name: &str) -> Result<(), String> {
+    if OPTION_GROUP_ENGINE_NAMES.contains(&engine_name) {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid value '{engine_name}' for EngineName: valid values are {}",
+        OPTION_GROUP_ENGINE_NAMES.join(", ")
+    ))
+}
 
 /// How many distinct regions this store keeps records for.
 ///
@@ -95,6 +142,9 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     pub db_instances: BTreeMap<RegionalKey, DbInstanceRecord>,
     /// DB snapshots by `(region, DBSnapshotIdentifier)`. Ordered, for the same reason.
     pub db_snapshots: BTreeMap<RegionalKey, DbSnapshotRecord>,
+    /// Option groups by `(region, OptionGroupName)`. Ordered, so
+    /// `DescribeOptionGroups` pages deterministically within a region.
+    pub option_groups: BTreeMap<RegionalKey, OptionGroupRecord>,
     /// Monotonic counter behind every server-assigned id this service mints, so
     /// resource ids and endpoint hosts are unique and reproducible.
     pub mint_counter: u64,
@@ -149,10 +199,15 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         range_in(&self.db_snapshots, region)
     }
 
+    /// The option groups stored in `region`, in name order.
+    pub fn option_groups_in(&self, region: &str) -> Vec<&OptionGroupRecord> {
+        range_in(&self.option_groups, region)
+    }
+
     /// Whether a record may be stored for `region`: either it already holds records, or
     /// the store has room for one more region ([`MAX_REGIONS`]).
     ///
-    /// The count walks the keys of both maps, which the three bounds above already cap
+    /// The count walks the keys of all three maps, which the bounds above already cap
     /// in total, so the work is bounded by that total rather than by anything a caller
     /// chooses.
     pub fn has_room_for_region(&self, region: &str) -> bool {
@@ -160,6 +215,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .db_instances
             .keys()
             .chain(self.db_snapshots.keys())
+            .chain(self.option_groups.keys())
             .map(|(stored, _)| stored.as_str())
             .collect();
         known.contains(region) || known.len() < MAX_REGIONS
@@ -437,6 +493,50 @@ impl DbSnapshotRecord {
             dbi_resource_id: Some(self.dbi_resource_id.clone()),
             tag_list: Some(self.tags.clone()),
             ..DBSnapshot::default()
+        }
+    }
+}
+
+/// A stored option group: everything `CreateOptionGroup` persists about one.
+///
+/// The ARN is NOT stored as text: it is a function of the stored region and name,
+/// which [`OptionGroupRecord::to_wire`] computes, so it cannot drift from the record
+/// the way a stored copy could.
+#[derive(Debug, Clone)]
+pub struct OptionGroupRecord {
+    pub name: String,
+    /// The region the group was created in; the scope of its ARN.
+    pub region: String,
+    pub description: String,
+    pub engine_name: String,
+    pub major_engine_version: String,
+    pub tags: Vec<Tag>,
+}
+
+impl OptionGroupRecord {
+    /// `arn:aws:rds:<region>:<account>:og:<name>` — `og` is the resource type RDS
+    /// gives an option group in its ARN format.
+    pub fn arn(&self) -> String {
+        emulator_server::emulator_arn(ARN_NAMESPACE, &self.region, &format!("og:{}", self.name))
+    }
+
+    /// Project the stored record onto the modelled `OptionGroup` output shape.
+    pub fn to_wire(&self) -> OptionGroup {
+        OptionGroup {
+            option_group_name: Some(self.name.clone()),
+            option_group_description: Some(self.description.clone()),
+            engine_name: Some(self.engine_name.clone()),
+            major_engine_version: Some(self.major_engine_version.clone()),
+            // A group `CreateOptionGroup` minted holds no options — options are added
+            // by `ModifyOptionGroup`, which is still a stub — so the list is reported
+            // EMPTY rather than absent: the group exists and has nothing in it.
+            options: Some(Vec::new()),
+            option_group_arn: Some(self.arn()),
+            // `VpcId` belongs to a group bound to one VPC, and
+            // `SourceOptionGroup`/`SourceAccountId`/`CopyTimestamp` to a group
+            // `CopyOptionGroup` produced. Neither describes a group created here, so
+            // neither is reported rather than carrying a made-up value.
+            ..OptionGroup::default()
         }
     }
 }

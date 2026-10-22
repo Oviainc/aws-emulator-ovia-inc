@@ -74,9 +74,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // Claim a request whose resolved route key is this service's signing name,
+        // `rds`.
+        //
+        // That key is SHARED: Amazon DocumentDB
+        // (`services/service-com-amazonaws-docdb-amazonrdsv19`) and Amazon Neptune
+        // (`services/service-com-amazonaws-neptune-amazonrdsv19`) are served by this
+        // same RDS front door and publish the identical wire identity — service shape
+        // `AmazonRDSv19`, version `2014-10-31`, `awsQuery`, `endpointPrefix` /
+        // `arnNamespace` / `aws.auth#sigv4` name `rds` — so no signal in a request can
+        // tell the three apart and the key must resolve to exactly ONE of them. THIS
+        // service owns it: its 168 operations are a superset of DocumentDB's 55 and
+        // Neptune's 70 (every one of their operation names is in this model), so a
+        // client signing for `rds` loses no operation. Those two crates claim their own
+        // sdkId-derived keys (`docdb`, `neptune`) instead of `rds`, which is what keeps
+        // this claim unambiguous; before that, all three claimed `rds` and the router
+        // answered `500 AmbiguousService` — a code that exists in no AWS model, in a
+        // JSON body an awsQuery client cannot parse — for every RDS request.
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
             None => false,

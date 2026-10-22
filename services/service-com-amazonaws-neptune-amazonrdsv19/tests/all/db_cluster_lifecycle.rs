@@ -236,6 +236,11 @@ impl Neptune {
             .uri("/")
             .header("content-type", "application/x-www-form-urlencoded")
             .header(
+                // The routing key every front door reads: the SigV4 credential scope.
+                // Neptune SHARES the `rds` signing name with Amazon RDS and Amazon
+                // DocumentDB, and that shared name resolves to Amazon RDS, so a request
+                // for THIS service names it: `neptune` (see `ROUTE_KEY` in
+                // `src/service.rs`).
                 "authorization",
                 format!(
                     "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/{REGION}/neptune/aws4_request, \

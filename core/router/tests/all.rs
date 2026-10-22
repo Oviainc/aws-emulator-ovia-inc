@@ -47,6 +47,8 @@ mod partnercentral_channel_target_routing;
 mod personalize_signing_name_routing;
 #[path = "all/rds_docdb_neptune_signing_name_routing.rs"]
 mod rds_docdb_neptune_signing_name_routing;
+#[path = "all/rds_shared_signing_name_routing.rs"]
+mod rds_shared_signing_name_routing;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;
 #[path = "all/transfer_user_with_iam_role.rs"]
