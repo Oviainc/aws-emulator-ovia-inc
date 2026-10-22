@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendHeartbeat
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendHeartbeat`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendHeartbeat::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The agent reporting in. This is the only operation of this service that the agent
+//! mutates state with, and its output has no members, so state is the ONLY observable
+//! effect: the device record of `(DeviceFleetName, DeviceName)` takes the reported agent
+//! version, the instant of this heartbeat, the reported models and agent metrics, and —
+//! when `DeploymentResult` is present — that result against the named deployment, which
+//! is the device's acknowledgement of it, so `GetDeployments` stops handing it back.
+//!
+//! A device the service does not hold yet is recorded here, with this service's own
+//! registration document, because a heartbeat is the agent reporting the device's
+//! existence and current state. Because the record is keyed by names the request chooses,
+//! the write goes through `state::record_heartbeat`, which refuses a heartbeat that would
+//! grow the store past its bounds instead of growing without limit.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +169,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendHeartbeat` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendHeartbeatErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendHeartbeat"))
+        // The region the device ARN in a first-contact registration document carries.
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        // A deployment result that names no deployment cannot be an acknowledgement of
+        // one, so the request is refused before anything is written rather than recorded
+        // under an empty name. `DeploymentName` is optional in the model, so the boundary
+        // validator passes this through.
+        let mut input = input;
+        let reported_result = match input.deployment_result.take() {
+            None => None,
+            Some(mut result) => match result.deployment_name.take() {
+                Some(deployment_name) if !deployment_name.is_empty() => Some((
+                    deployment_name,
+                    crate::state::DeploymentResultRecord::from_reported(result),
+                )),
+                _ => {
+                    // The access record of a refused mutation, as a real service keeps one.
+                    ::tracing::info!(
+                        operation = Self::NAME,
+                        device_fleet_name = %input.device_fleet_name,
+                        device_name = %input.device_name,
+                        outcome = "refused",
+                        reason = "DeploymentResult names no deployment",
+                        "heartbeat refused"
+                    );
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "DeploymentResult.DeploymentName must name the deployment whose \
+                         result is reported",
+                    ));
+                }
+            },
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SendHeartbeatErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "the sagemakeredge emulator could not reach its service state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let acknowledged = reported_result
+            .as_ref()
+            .map(|(deployment_name, _)| deployment_name.clone());
+        let heartbeat = crate::state::Heartbeat {
+            agent_version: input.agent_version,
+            at: ::std::time::SystemTime::now(),
+            models: input.models.unwrap_or_default(),
+            agent_metrics: input.agent_metrics.unwrap_or_default(),
+            deployment_result: reported_result,
+        };
+
+        // One write path, which checks the store's bounds before it changes anything: a
+        // caller cannot grow the store without limit by inventing fleet or device names.
+        let recorded = state.lock().record_heartbeat(
+            &input.device_fleet_name,
+            &input.device_name,
+            &region,
+            heartbeat,
+        );
+
+        // The access record of this service's only mutation: which device reported, what
+        // it acknowledged, and how the call ended. Request fields only — no credential.
+        match recorded {
+            Ok(()) => ::tracing::info!(
+                operation = Self::NAME,
+                device_fleet_name = %input.device_fleet_name,
+                device_name = %input.device_name,
+                acknowledged_deployment = acknowledged.as_deref().unwrap_or(""),
+                outcome = "recorded",
+                "heartbeat recorded"
+            ),
+            Err(exceeded) => {
+                ::tracing::info!(
+                    operation = Self::NAME,
+                    device_fleet_name = %input.device_fleet_name,
+                    device_name = %input.device_name,
+                    outcome = "refused",
+                    reason = %exceeded,
+                    "heartbeat refused"
+                );
+                // The store's own bound, not a fault in the request, so it is answered
+                // with the operation's MODELLED error rather than a validation refusal.
+                return Err(SendHeartbeatErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(exceeded.message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        Ok(SendHeartbeatOutput)
     }
 }
