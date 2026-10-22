@@ -41,9 +41,63 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code Account answers an input-constraint violation with: the modeled
+/// `ValidationException`, which this service declares as a common error with
+/// `@error("client")` and `@httpError(400)` (the framework's own default code for a
+/// refusal, restated here because `override_refusal` replaces code and message
+/// together).
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// One `@pattern` violation as Account states it: the violated ECMA-262 expression
+/// and the input string that did not match it, and nothing else — no member name,
+/// no path, no count. Account validates a request against the JSON-Schema form of
+/// its model, so a refusal reports the regex and the subject, not the Coral-style
+/// `Value '<v>' at '<member>' failed to satisfy constraint: ...` clause the
+/// framework words by default.
+///
+/// The expression is the `@pattern` verbatim, anchors included, because that is the
+/// expression the value was tested against. `None` for anything that is not a
+/// pattern violation, which lets [`pattern_refusal_message`] decline the whole
+/// refusal and keep the framework's wording rather than invent a sentence for a
+/// violation class this service has no recorded phrasing for.
+fn pattern_clause(violation: &Violation) -> Option<String> {
+    let ViolationKind::Pattern(regex) = &violation.kind else {
+        return None;
+    };
+    // A pattern violation always carries the value it tested; a violation without
+    // one (an absent member) is not a pattern violation at all.
+    let value = violation.value.as_deref()?;
+    Some(format!(
+        "ECMA 262 regex \"{regex}\" does not match input string \"{value}\""
+    ))
+}
+
+/// The `ValidationException` message for a refusal whose violations are all
+/// `@pattern` violations: the bracketed list of the reasons, one per violated
+/// member, in the order the validating walk found them.
+///
+/// The brackets are the list itself — a single violation reads
+/// `[ECMA 262 regex "..." does not match input string "..."]` — so a request that
+/// violates two patterns states both reasons inside the one pair of brackets.
+///
+/// `None` declines the refusal: either it holds no violation at all, or at least
+/// one of them is of a class this service has no wording for (see
+/// [`pattern_clause`]), and a message half in one service's voice and half in
+/// another's is worse than the framework's consistent default.
+fn pattern_refusal_message(violations: &[Violation]) -> Option<String> {
+    if violations.is_empty() {
+        return None;
+    }
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(pattern_clause)
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("[{}]", clauses.join(", ")))
+}
 
 /// The `com-amazonaws-account-account` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +152,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Account states a `@pattern` violation as the violated ECMA-262
+        // expression and the input string that failed it, for every
+        // pattern-constrained member of every operation and at any depth in the
+        // input — the message names no member and no path. The code stays the
+        // modeled `ValidationException` (HTTP 400), which is what the framework
+        // would have answered; only the wording changes.
+        //
+        // Every other refusal — an absent required member, a `@length` or
+        // `@range` bound, an enum value, an authentication failure — keeps the
+        // framework's wording: nothing records how this service phrases those.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: pattern_refusal_message(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

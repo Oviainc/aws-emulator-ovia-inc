@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/pattern_validation_messages.rs"]
+mod pattern_validation_messages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
