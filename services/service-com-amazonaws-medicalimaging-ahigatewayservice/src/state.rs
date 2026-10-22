@@ -80,6 +80,30 @@ pub const ARN_SERVICE: &str = "medical-imaging";
 /// The region an ARN names when the request carries no SigV4 credential scope.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The `@pattern` of `com.amazonaws.medicalimaging#Arn`
+/// (`smithy_query(query="shape",shape="Arn")`), the shape every `resourceArn` path
+/// label targets, copied verbatim.
+///
+/// It is the single source for two things: [`parse_resource_arn`] below, and the way
+/// [`crate::service`] recognises a malformed RESOURCE ARN — a refused value is one
+/// when the `@pattern` it failed is this one. No other member targets this shape:
+/// `kmsKeyArn`, `lambdaAuthorizerArn` and `dataAccessRoleArn` each target their own
+/// ARN shape with its own pattern, so they keep the generic constraint refusal.
+pub const ARN_PATTERN: &str = "^arn:aws((-us-gov)|(-iso)|(-iso-b)|(-cn))?:medical-imaging:[a-z0-9-]+:[0-9]{12}:datastore/[0-9a-z]{32}(/imageset/[0-9a-z]{32})?$";
+
+/// The ARN partitions [`ARN_PATTERN`] admits: `aws` plus the four suffixed ones
+/// (`(-us-gov)|(-iso)|(-iso-b)|(-cn))?`).
+pub const ARN_PARTITIONS: [&str; 5] = ["aws", "aws-us-gov", "aws-iso", "aws-iso-b", "aws-cn"];
+
+/// How many tags one resource will hold at once.
+///
+/// A memory bound, not an AWS quota: the tagging operations persist caller-supplied
+/// keys and values in process memory, so without a cap one caller could grow a
+/// resource's tag map without limit. Past the cap `TagResource` is refused with its
+/// own modelled `ValidationException` (HTTP 400). The value matches AWS's
+/// general per-resource tag limit of 50.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// `DatastoreStatus`, exactly the values the model declares
 /// (`smithy_query(query="shape",shape="DatastoreStatus")`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +225,10 @@ impl ImportJob {
 /// the bootstrap slice only needs the data store to own it.
 #[derive(Debug, Clone)]
 pub struct ImageSet {
+    /// The tags `TagResource` / `ListTagsForResource` keep for this image set, which
+    /// an ARN reaches through its optional `/imageset/<id>` suffix (see
+    /// [`ARN_PATTERN`]). Empty until the image-set slice mints image sets.
+    pub tags: HashMap<String, String>,
     pub image_set_id: String,
     pub image_set_arn: String,
     pub versions: Vec<String>,
@@ -324,6 +352,36 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
         }
     }
 
+    /// The tag map of the resource `arn` names — a data store, or one image set it
+    /// owns — or `None` when this emulator holds no such resource.
+    ///
+    /// One lookup for both resource kinds, so the three tagging operations agree on
+    /// what exists: tags live ON the resource record rather than in a map beside it.
+    /// The ARN must be the resource's OWN: a data store is reached by its id, and
+    /// then only when the ARN it was named by is the one the data store reports.
+    pub fn resource_tags(&self, arn: &ResourceArn) -> Option<&HashMap<String, String>> {
+        let datastore = self.datastores.get(&arn.datastore_id)?;
+        if datastore.datastore_arn != arn.datastore_arn {
+            return None;
+        }
+        match &arn.image_set_id {
+            None => Some(&datastore.tags),
+            Some(image_set_id) => Some(&datastore.image_sets.get(image_set_id)?.tags),
+        }
+    }
+
+    /// [`Self::resource_tags`], for a writer.
+    pub fn resource_tags_mut(&mut self, arn: &ResourceArn) -> Option<&mut HashMap<String, String>> {
+        let datastore = self.datastores.get_mut(&arn.datastore_id)?;
+        if datastore.datastore_arn != arn.datastore_arn {
+            return None;
+        }
+        match &arn.image_set_id {
+            None => Some(&mut datastore.tags),
+            Some(image_set_id) => Some(&mut datastore.image_sets.get_mut(image_set_id)?.tags),
+        }
+    }
+
     /// Materialise every status change the clock owed by `now`, dropping the data
     /// stores whose deletion has fallen due — and, with them, the ledger entries that
     /// named the data store or any of its import jobs, so a create/delete loop cannot
@@ -382,6 +440,86 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// `arn:aws:medical-imaging:<region>:<account>:datastore/<datastoreId>`.
 pub fn datastore_arn(region: &str, datastore_id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("datastore/{datastore_id}"))
+}
+
+/// What a `resourceArn` label names: a data store, or ONE image set inside it —
+/// the two resources [`ARN_PATTERN`] can spell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceArn {
+    /// The ARN of the data store, i.e. the label minus any `/imageset/<id>` suffix.
+    ///
+    /// Carried, not just the id, because an ARN names a resource only when it is
+    /// THAT resource's ARN: one differing in partition, region or account names a
+    /// resource of another account or region, which this emulator does not hold.
+    pub datastore_arn: String,
+    pub datastore_id: String,
+    /// `Some` only when the ARN carries the optional `/imageset/<id>` suffix.
+    pub image_set_id: Option<String>,
+}
+
+/// Parse a medical-imaging resource ARN, or `None` when the string is not one.
+///
+/// Accepts exactly what [`ARN_PATTERN`] does — partition, this service's
+/// `arnNamespace`, a region, a 12-digit account id, and a `datastore/<id>` resource
+/// with an optional `/imageset/<id>` suffix — so a value the boundary validator let
+/// through always parses, and a caller that reaches the handler by another route is
+/// still refused rather than mis-read.
+pub fn parse_resource_arn(arn: &str) -> Option<ResourceArn> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let partition = fields.next()?;
+    if !ARN_PARTITIONS.contains(&partition) {
+        return None;
+    }
+    if fields.next()? != ARN_SERVICE {
+        return None;
+    }
+    // `[a-z0-9-]+`: the pattern constrains the region's alphabet, not its shape.
+    let region = fields.next()?;
+    if region.is_empty()
+        || !region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return None;
+    }
+    // `[0-9]{12}`: an account id.
+    let account_id = fields.next()?;
+    if account_id.len() != 12 || !account_id.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut segments = fields.next()?.split('/');
+    if segments.next()? != "datastore" {
+        return None;
+    }
+    let datastore_id = segments.next().filter(|id| is_resource_id(id))?.to_string();
+    let image_set_id = match segments.next() {
+        None => None,
+        Some("imageset") => Some(segments.next().filter(|id| is_resource_id(id))?.to_string()),
+        Some(_) => return None,
+    };
+    if segments.next().is_some() {
+        return None;
+    }
+    Some(ResourceArn {
+        datastore_arn: format!(
+            "arn:{partition}:{ARN_SERVICE}:{region}:{account_id}:datastore/{datastore_id}"
+        ),
+        datastore_id,
+        image_set_id,
+    })
+}
+
+/// `[0-9a-z]{32}`: the id form [`ARN_PATTERN`] gives both `datastore/` and
+/// `/imageset/`, and the form [`ComAmazonawsMedicalimagingAhigatewayserviceState::mint_id`]
+/// produces.
+fn is_resource_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
 /// A modelled timestamp for `instant`, kept to full nanosecond precision rather than
