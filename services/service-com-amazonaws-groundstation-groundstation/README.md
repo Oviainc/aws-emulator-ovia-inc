@@ -105,3 +105,25 @@ State lives in the SINGLE shared engine, keyed by type. Reach it through
 Do not add a second engine crate — the router and every service must share
 one `InMemoryEngine` type or the engine the router injects cannot be handed to this
 service's operations.
+
+## Operator settings
+
+| Variable | What it does |
+|---|---|
+| `GROUNDSTATION_APPROVED_UPLINK_BANDS_MHZ` | The uplink frequency bands this emulated account is approved to transmit on, as comma-separated `<low>-<high>` pairs in MHz (`2025-2120` approves the whole band the service operates). Read ONCE, when this service's store is first created, so setting it after the first request has no effect. |
+| `GROUNDSTATION_RECORDING_BUCKETS` | The S3 buckets this emulated Ground Station can read the location of, as comma-separated bucket NAMES (`aws-groundstation-downlink`). Read once, with the same timing. |
+
+Both settings stand for something that happens OUTSIDE the Ground Station API, which is
+why they are settings rather than operations:
+
+- Uplink approval is granted by AWS after spectrum coordination — the model has no
+  operation that grants one and none that reports one — so an account starts with none
+  and `CreateConfig`/`UpdateConfig` refuse every `antennaUplinkConfig` with
+  `InvalidParameterException` ("The specified Uplink Frequency has not been approved."),
+  which is what AWS answers for an unapproved account.
+- A recording bucket is made in S3 and granted to Ground Station in IAM, so this API
+  never learns about one either; until a name is listed here an `s3RecordingConfig` is
+  refused with the sentence AWS answers when it cannot read the bucket's location.
+
+`src/state.rs`'s `APPROVED_UPLINK_BANDS_ENV` and `RECORDING_BUCKETS_ENV` are the two
+readers, and both land in this service's own state, where a test seeds them directly.
