@@ -24,7 +24,7 @@ use service_com_amazonaws_mq_mq::state::BROKER_PROVISIONING;
 /// A SigV4 `Authorization` header signing for `mq` in `region`: it is what the
 /// router resolves this service from, and what the ARN's region segment is read
 /// from.
-fn authorization(region: &str) -> String {
+pub(crate) fn authorization(region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/mq/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=deadbeef"
@@ -32,13 +32,13 @@ fn authorization(region: &str) -> String {
 }
 
 /// One emulator with one shared engine, serving `mq` over the production dispatch path.
-struct Mq {
+pub(crate) struct Mq {
     router: MultiServiceRouter,
     region: String,
 }
 
 impl Mq {
-    fn new(region: &str) -> Self {
+    pub(crate) fn new(region: &str) -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -49,7 +49,7 @@ impl Mq {
         }
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let (status, _code, json) = self.call_with_code(method, path, body).await;
         (status, json)
     }
@@ -57,7 +57,7 @@ impl Mq {
     /// The same dispatch, also reporting the error code a restJson1 client
     /// branches on: the `x-amzn-errortype` header, falling back to the body's
     /// `__type`/`code` member.
-    async fn call_with_code(
+    pub(crate) async fn call_with_code(
         &self,
         method: &str,
         path: &str,
@@ -108,11 +108,11 @@ impl Mq {
         (status, code, json)
     }
 
-    async fn create_broker(&self, body: Value) -> (u16, Value) {
+    pub(crate) async fn create_broker(&self, body: Value) -> (u16, Value) {
         self.call("POST", "/v1/brokers", Some(body)).await
     }
 
-    async fn describe_broker(&self, broker_id: &str) -> (u16, Value) {
+    pub(crate) async fn describe_broker(&self, broker_id: &str) -> (u16, Value) {
         self.call("GET", &format!("/v1/brokers/{broker_id}"), None)
             .await
     }
@@ -122,7 +122,7 @@ impl Mq {
             .await
     }
 
-    async fn list_brokers(&self, query: &str) -> (u16, Value) {
+    pub(crate) async fn list_brokers(&self, query: &str) -> (u16, Value) {
         let path = if query.is_empty() {
             "/v1/brokers".to_string()
         } else {
@@ -150,18 +150,21 @@ impl Mq {
     }
 }
 
-/// A minimal valid `CreateBroker` body.
-fn create_body(name: &str) -> Value {
+/// A minimal valid `CreateBroker` body: the members the model requires, plus the
+/// one initial user Amazon MQ creates a broker with (`Users` — "an
+/// administrative user is required", see `state::MIN_USERS_PER_BROKER`).
+pub(crate) fn create_body(name: &str) -> Value {
     json!({
         "brokerName": name,
         "engineType": "ACTIVEMQ",
         "deploymentMode": "SINGLE_INSTANCE",
         "hostInstanceType": "mq.t3.micro",
         "publiclyAccessible": false,
+        "users": [{"username": "admin", "password": "SuperSecret123"}],
     })
 }
 
-fn string_at(value: &Value, pointer: &str) -> String {
+pub(crate) fn string_at(value: &Value, pointer: &str) -> String {
     value
         .pointer(pointer)
         .and_then(Value::as_str)
@@ -385,6 +388,7 @@ async fn every_modelled_engine_deployment_and_storage_combination_round_trips() 
                             "storageType": storage_type,
                             "autoMinorVersionUpgrade": false,
                             "authenticationStrategy": "LDAP",
+                            "users": [{"username": "admin", "password": "SuperSecret123"}],
                         }))
                         .await;
                     assert_eq!(
@@ -458,6 +462,7 @@ async fn a_reused_broker_name_is_a_conflict() {
                 "deploymentMode": "CLUSTER_MULTI_AZ",
                 "hostInstanceType": "mq.m5.large",
                 "publiclyAccessible": true,
+                "users": [{"username": "other-admin", "password": "AnotherSecret12"}],
             }))
             .await;
         assert_eq!(
@@ -830,10 +835,11 @@ async fn create_broker_refuses_values_outside_the_documented_constraints() {
             "case {case:?}: expected 400, got {status} {answer:?}"
         );
         // Each handler names the member whose documented rule fired, so the row
-        // cannot pass on some other refusal. `None` is the framework's own
-        // pre-handler refusal — an absent required member, or a value outside a
-        // constraint the MODEL declares, such as an enum's value set — whose
-        // envelope carries code and message only.
+        // cannot pass on some other refusal. `None` is left only for the
+        // framework's own pre-handler refusal of an ABSENT required member,
+        // whose envelope carries code and message only: a value outside a
+        // constraint the MODEL declares (an enum's value set) is refused by the
+        // handler now, so it names its member like every other refusal.
         let expected_attribute = match case {
             "brokerName too long"
             | "brokerName with a space"
@@ -853,13 +859,14 @@ async fn create_broker_refuses_values_outside_the_documented_constraints() {
             "SINGLE_INSTANCE with two subnets" | "ACTIVE_STANDBY_MULTI_AZ with one subnet" => {
                 Some("subnetIds")
             }
-            // Refused at the boundary against the model's own enum value set or
-            // @required trait, before the handler runs.
-            "brokerName absent"
-            | "engineType unknown"
-            | "deploymentMode unknown"
-            | "storageType unknown"
-            | "authenticationStrategy unknown" => None,
+            "engineType unknown" => Some("engineType"),
+            "deploymentMode unknown" => Some("deploymentMode"),
+            "storageType unknown" => Some("storageType"),
+            "authenticationStrategy unknown" => Some("authenticationStrategy"),
+            // Absence is found while READING the request, before any handler
+            // runs, and the framework's refusal envelope carries no modelled
+            // member to name it in.
+            "brokerName absent" => None,
             other => panic!("case {other:?} has no expected errorAttribute in this table"),
         };
         assert_eq!(
@@ -912,13 +919,15 @@ async fn the_documented_quotas_bound_what_one_caller_can_store() {
         "the refused create must store nothing, got {listed:?}"
     );
 
-    // And the per-broker user quota, on a broker created inside the quota.
+    // And the per-broker user quota, on a broker created inside the quota. The
+    // create already stored this broker's initial user, so the quota is reached
+    // one `CreateUser` earlier.
     let broker_id = listed
         .pointer("/brokerSummaries/0/brokerId")
         .and_then(Value::as_str)
         .expect("a broker to add users to")
         .to_string();
-    for index in 0..MAX_USERS_PER_BROKER {
+    for index in 1..MAX_USERS_PER_BROKER {
         let (status, body) = mq
             .create_user(
                 &broker_id,

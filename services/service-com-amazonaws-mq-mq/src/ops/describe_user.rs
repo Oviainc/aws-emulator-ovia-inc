@@ -167,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(broker) = store.brokers.get(&input.broker_id) else {
             return Err(DescribeUserErrorModeled::NotFoundException(NotFoundException {
                 error_attribute: Some("broker-id".to_string()),
-                message: Some(format!("no broker with id {:?} exists", input.broker_id)),
+                message: Some(state::broker_not_found_message(&input.broker_id)),
                 resource_share_errors: None,
             })
             .into());

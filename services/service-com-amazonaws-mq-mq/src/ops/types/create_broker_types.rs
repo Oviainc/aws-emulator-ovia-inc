@@ -11,7 +11,30 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mq-mq.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mq#CreateBrokerRequest")]
+// Every enum-typed member of this request is refused by the HANDLER
+// (`ops::create_broker` -> `state::validate_enum`), not by the framework's
+// boundary validator.
+//
+// Amazon MQ answers a refused input with `BadRequestException`, whose modelled
+// `ErrorAttribute` member ("The attribute which caused the error", jsonName
+// `errorAttribute`) names the member at fault. A refusal raised BEFORE the
+// handler is worded through `Refused { code, message }`
+// (`vendor/smithy-server-runtime/src/pre_dispatch.rs`), which cannot carry a
+// modelled member — so a value outside one of these enums was answered with a
+// `BadRequestException` carrying no `errorAttribute` at all. `skip_validation`
+// drops the constraint traits of exactly these members, so the handler's own
+// check is what refuses them; every other member of this shape (and every
+// nested shape) is still validated at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.mq#CreateBrokerRequest",
+    skip_validation = [
+        "AuthenticationStrategy",
+        "DataReplicationMode",
+        "DeploymentMode",
+        "EngineType",
+        "StorageType"
+    ]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateBrokerInput {
     pub authentication_strategy: Option<String>,
