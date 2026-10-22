@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateParticipantConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateParticipantConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Mints (or re-resolves) the chat session a participant token names,
+//! mints a fresh connection token for this call, and returns the connection
+//! information the request asked for in `Type`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateParticipantConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The connection token this returns is STORED and is the key every later operation
+//! authenticates with; `CONNECTION_CREDENTIALS` and `WEBSOCKET` are served, and
+//! `WEBRTC_CONNECTION` — whose response is Chime SDK media-session data this emulator
+//! cannot produce — is answered with the scaffold's 501.
+//!
+//! Two choices this slice makes, stated:
+//!
+//! * The `WEBSOCKET` URL is reported, derived from the connection token and the host the
+//!   request reached, because the model's `Websocket` member and this operation's
+//!   documentation make it the chat transport's control-plane answer. No websocket
+//!   listener is mounted for it in this slice, so a client cannot subscribe to
+//!   `aws/chat` yet; the websocket data plane (and the `StartContactStreaming`
+//!   alternative the docs mention) is its own gap, not something this slice invents a
+//!   listener for. `ConnectionExpiry` is the documented 100 s connect window.
+//! * A request with `Type` absent asks for no connection information: this operation's
+//!   documentation says "If you need CONNECTION_CREDENTIALS along with marking
+//!   participant as connected, pass CONNECTION_CREDENTIALS in Type", so marking the
+//!   participant as connected is reachable WITHOUT asking for any connection type. Such
+//!   a call records `ConnectParticipant` on the session and answers 200 with no output
+//!   member — and mints no connection token, since none is reported. (An EMPTY `Type`
+//!   list is refused by the model's own `length: min 1`.)
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +205,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateParticipantConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateParticipantConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateParticipantConnection"))
+        let now = std::time::SystemTime::now();
+
+        // `Type` is a list of `ConnectionType`. The model carries the value set but the
+        // boundary validator does not check enum membership, so refuse an unknown value
+        // here rather than silently serving no connection information for it.
+        let requested: Vec<String> = input.r#type.clone().unwrap_or_default();
+        if let Some(unknown) = requested
+            .iter()
+            .find(|value| !CONNECTION_TYPE_VALUES.contains(&value.as_str()))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Type contains '{unknown}', which is not a ConnectionType; expected one of [{}]",
+                CONNECTION_TYPE_VALUES.join(", ")
+            )));
+        }
+        // A `WEBRTC_CONNECTION` response carries Chime SDK `Meeting` and `Attendee` data
+        // for a real media session. Nothing in this emulator can produce one, so the
+        // request is answered with the scaffold's 501 instead of invented media URLs.
+        if requested
+            .iter()
+            .any(|value| value == crate::state::CONNECTION_TYPE_WEBRTC)
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateParticipantConnection with Type WEBRTC_CONNECTION",
+            ));
+        }
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateParticipantConnectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the connectparticipant store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Reclaim what the clock has already retired before anything new is minted.
+        state.prune_expired(now);
+
+        let wants_websocket = requested
+            .iter()
+            .any(|value| value == crate::state::CONNECTION_TYPE_WEBSOCKET);
+        let wants_credentials = requested
+            .iter()
+            .any(|value| value == crate::state::CONNECTION_TYPE_CONNECTION_CREDENTIALS);
+
+        // The websocket URL names the host the caller actually reached; nothing invents
+        // an endpoint the caller cannot address, so a `WEBSOCKET` request on a hostless
+        // request is refused rather than answered with `wss:///...`.
+        let websocket_host = match (wants_websocket, request_host(ctx)) {
+            (false, _) => None,
+            (true, Some(host)) => Some(host),
+            (true, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "the request carries no Host header, so no websocket URL can be reported \
+                     for Type WEBSOCKET",
+                ))
+            }
+        };
+
+        // A participant token identifies one participant of one contact for the lifetime
+        // of that participant, so calling again with the same token connects to the
+        // session it already created rather than starting a second one.
+        let contact_id = match state
+            .participant_tokens
+            .get(&input.participant_token)
+            .cloned()
+        {
+            Some(contact_id) => {
+                let still_live = state
+                    .sessions
+                    .get(&contact_id)
+                    .is_some_and(|session| session.connected);
+                if !still_live {
+                    // The participant left the contact, which is when the participant
+                    // token stops being valid.
+                    return Err(CreateParticipantConnectionErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: "the participant token is no longer part of a contact"
+                                .to_string(),
+                        },
+                    )
+                    .into());
+                }
+                contact_id
+            }
+            None => {
+                if state.sessions.len() >= crate::state::MAX_SESSIONS {
+                    return Err(CreateParticipantConnectionErrorModeled::ThrottlingException(
+                        ThrottlingException {
+                            message: format!(
+                                "this emulator holds its {} chat-session limit; \
+                                 disconnect a participant or wait for a session to expire",
+                                crate::state::MAX_SESSIONS
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                let contact_id = crate::state::new_id();
+                state.sessions.insert(
+                    contact_id.clone(),
+                    crate::state::ChatSession {
+                        contact_id: contact_id.clone(),
+                        initial_contact_id: contact_id.clone(),
+                        participant_id: crate::state::new_id(),
+                        participant_role: crate::state::PARTICIPANT_ROLE_CUSTOMER.to_string(),
+                        display_name: None,
+                        connected: true,
+                        connect_participant: false,
+                        transcript: Vec::new(),
+                        idempotency: std::collections::HashMap::new(),
+                        retain_until: now + crate::state::SESSION_RETENTION,
+                    },
+                );
+                state
+                    .participant_tokens
+                    .insert(input.participant_token.clone(), contact_id.clone());
+                contact_id
+            }
+        };
+
+        // A connection token is minted only when this call actually reports one, so a
+        // request that asks for no connection information cannot consume the session's
+        // connection budget with a token the caller never receives.
+        let reports_token = wants_credentials || websocket_host.is_some();
+        if reports_token
+            && state.connection_count(&contact_id) >= crate::state::MAX_CONNECTIONS_PER_SESSION
+        {
+            return Err(CreateParticipantConnectionErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: format!(
+                        "this participant already holds its {} open-connection limit",
+                        crate::state::MAX_CONNECTIONS_PER_SESSION
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The token is bound to the session with the expiry it is reported with, so the
+        // value the caller receives is the one later calls authenticate with and it is
+        // judged by its own window.
+        let connection_expiry = now + crate::state::CONNECTION_TOKEN_TTL;
+        let connection_token = reports_token.then(crate::state::new_id);
+        if let Some(connection_token) = connection_token.as_ref() {
+            state.connections.insert(
+                connection_token.clone(),
+                crate::state::ConnectionBinding {
+                    contact_id: contact_id.clone(),
+                    expiry: connection_expiry,
+                },
+            );
+        }
+
+        let websocket_expiry = now + crate::state::WEBSOCKET_CONNECT_TTL;
+
+        let Some(session) = state.sessions.get_mut(&contact_id) else {
+            return Err(CreateParticipantConnectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the chat session vanished while serving this request".to_string(),
+                },
+            )
+            .into());
+        };
+        // The session lives exactly as long as the newest token minted for it, so a call
+        // that mints none does not extend its retention.
+        if connection_token.is_some() {
+            session.retain_until = connection_expiry;
+        }
+        if let Some(connect_participant) = input.connect_participant {
+            session.connect_participant = connect_participant;
+        }
+
+        // Only the requested kinds of connection information are returned; the member
+        // whose type was not asked for stays absent, and a call that asked for neither
+        // reports no connection information at all.
+        let Some(connection_token) = connection_token else {
+            return Ok(CreateParticipantConnectionOutput::default());
+        };
+        Ok(CreateParticipantConnectionOutput {
+            websocket: websocket_host.map(|host| Websocket {
+                url: Some(format!(
+                    "wss://{host}/participant/websocket?connectionToken={connection_token}"
+                )),
+                connection_expiry: Some(crate::state::format_instant(websocket_expiry)),
+            }),
+            connection_credentials: wants_credentials.then(|| ConnectionCredentials {
+                connection_token: Some(connection_token),
+                expiry: Some(crate::state::format_instant(connection_expiry)),
+            }),
+            web_rtc_connection: None,
+        })
     }
+}
+
+/// The host the websocket URL is reported on: this emulator's own endpoint, read off the
+/// request, so the URL names the host the caller reached. `None` when the request names
+/// no host at all — nothing is invented in its place.
+fn request_host(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+    ctx.parts()
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| ctx.parts().uri.host())
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
 }

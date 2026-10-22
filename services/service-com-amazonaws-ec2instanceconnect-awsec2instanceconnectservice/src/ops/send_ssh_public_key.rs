@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendSSHPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendSSHPublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendSSHPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pushes an SSH public key at a registered EC2 instance and stores it against
+//! (instance id, OS user) for [`crate::state::PUSHED_KEY_TTL`]. Every answer is computed
+//! from [`crate::state::ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState`]:
+//! the instance registry decides found / not found, the instance's lifecycle state decides
+//! whether a connection is possible at all, and the instance's Availability Zone decides
+//! whether the zone the caller named is the right one.
+//!
+//! ## Decision order
+//!
+//! 1. the instance is in the registry, else `EC2InstanceNotFoundException` (404);
+//! 2. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
+//!    still launching) or `EC2InstanceStateInvalidException` (400, going down, stopped or
+//!    terminated);
+//! 3. the `AvailabilityZone` the caller named, when it names one, is the instance's, else
+//!    `InvalidArgsException` (400);
+//! 4. the key is stored against (instance id, OS user), replacing whatever was there and
+//!    restarting the 60-second lifetime, and `Success: true` comes back with a fresh
+//!    `RequestId`.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +177,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendSSHPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendSSHPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendSSHPublicKey"))
+        // `ctx` carries request metadata only; this operation needs none of it — the request
+        // is fully described by its input members.
+        let _ = ctx;
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendSSHPublicKeyErrorModeled::ServiceException(ServiceException {
+                message: Some(
+                    "the EC2 Instance Connect instance registry is unavailable".to_string(),
+                ),
+            })
+        })?;
+        let mut state = store.lock();
+
+        // One instant for the whole call, so the record's `pushed_at`, its expiry and the
+        // pruning cutoff cannot disagree with each other.
+        let now = ::std::time::Instant::now();
+
+        // The instance must be in the registry: `EC2InstanceNotFoundException`, HTTP 404.
+        let instance = state.instance(&input.instance_id).cloned().ok_or_else(|| {
+            SendSSHPublicKeyErrorModeled::EC2InstanceNotFoundException(
+                EC2InstanceNotFoundException {
+                    message: Some(format!("Instance {} not found", input.instance_id)),
+                },
+            )
+        })?;
+
+        // ... and it must be in a state a connection can be made to. The mapping from
+        // lifecycle state to outcome lives on the state enum, shared with the serial-console
+        // push: a launching instance is "currently unavailable" (HTTP 503); one on its way
+        // down, stopped or terminated is an invalid state (HTTP 400).
+        if let Some(blocked) = instance.state.blocks_connect() {
+            return Err(match blocked {
+                crate::state::ConnectBlocked::NotYetAvailable => {
+                    SendSSHPublicKeyErrorModeled::EC2InstanceUnavailableException(
+                        EC2InstanceUnavailableException {
+                            message: Some(format!(
+                                "Instance {} is {} and is currently unavailable. Wait a few \
+                                 minutes and try again.",
+                                instance.instance_id,
+                                instance.state.as_str()
+                            )),
+                        },
+                    )
+                }
+                crate::state::ConnectBlocked::InvalidState => {
+                    SendSSHPublicKeyErrorModeled::EC2InstanceStateInvalidException(
+                        EC2InstanceStateInvalidException {
+                            message: Some(format!(
+                                "Instance {} is in state {}; connecting to a stopped or \
+                                 terminated instance is not supported",
+                                instance.instance_id,
+                                instance.state.as_str()
+                            )),
+                        },
+                    )
+                }
+            }
+            .into());
+        }
+
+        // `AvailabilityZone` is optional (the service resolves the zone itself when it is
+        // absent), but a zone that is not the instance's is a parameter that is not valid:
+        // `InvalidArgsException`, HTTP 400.
+        if let Some(zone) = input.availability_zone.as_deref() {
+            if zone != instance.availability_zone {
+                return Err(SendSSHPublicKeyErrorModeled::InvalidArgsException(
+                    InvalidArgsException {
+                        message: Some(format!(
+                            "AvailabilityZone {zone} is not the Availability Zone of instance \
+                             {}, which was launched in {}",
+                            instance.instance_id, instance.availability_zone
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A fresh id per call, stored with the key it pushed and in the request log.
+        let request_id = state.next_request_id();
+        state.push_ssh_key(
+            &input.instance_id,
+            &input.instance_os_user,
+            &input.ssh_public_key,
+            &request_id,
+            now,
+        );
+        state.record_request(&request_id, Self::NAME, &input.instance_id, now);
+
+        Ok(SendSSHPublicKeyOutput {
+            request_id: Some(request_id),
+            success: true,
+        })
     }
 }

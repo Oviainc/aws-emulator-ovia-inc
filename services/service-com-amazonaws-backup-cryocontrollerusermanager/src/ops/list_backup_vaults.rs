@@ -4,6 +4,9 @@
 //!
 //! Pages the stored vaults by name, so a vault `CreateBackupVault` inserted is
 //! listed exactly once and one `DeleteBackupVault` removed is not listed at all.
+//! Each entry comes from the ONE vault projection
+//! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::vault_view`])
+//! `DescribeBackupVault` answers from.
 //!
 //! ## Shape of an operation
 //!
@@ -218,22 +221,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let backup_vault_list: Vec<BackupVaultListMember> = matching[start..end]
             .iter()
-            .map(|vault| BackupVaultListMember {
-                backup_vault_name: Some(vault.name.clone()),
-                backup_vault_arn: Some(vault.arn.clone()),
-                vault_type: Some(vault.vault_type.clone()),
-                vault_state: Some(vault.vault_state.clone()),
-                creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
-                encryption_key_arn: vault.encryption_key_arn.clone(),
-                encryption_key_type: Some(vault.encryption_key_type().to_string()),
-                creator_request_id: vault.creator_request_id.clone(),
-                number_of_recovery_points: store.recovery_point_count(&vault.name),
-                locked: Some(vault.locked),
-                min_retention_days: vault.min_retention_days,
-                max_retention_days: vault.max_retention_days,
-                // Vault Lock is reached only by operations still at 501, so no
-                // stored vault carries a lock date.
-                lock_date: None,
+            // ONE projection, shared with `DescribeBackupVault`, so a listed
+            // vault and a described one never disagree.
+            .map(|vault| store.vault_view(vault))
+            .map(|view| BackupVaultListMember {
+                backup_vault_name: Some(view.name),
+                backup_vault_arn: Some(view.arn),
+                vault_type: Some(view.vault_type),
+                vault_state: view.vault_state,
+                creation_date: Some(::aws_smithy_types::DateTime::from(view.creation_date)),
+                encryption_key_arn: Some(view.encryption_key_arn),
+                encryption_key_type: view.encryption_key_type,
+                creator_request_id: view.creator_request_id,
+                number_of_recovery_points: view.number_of_recovery_points,
+                locked: Some(view.locked),
+                min_retention_days: view.min_retention_days,
+                max_retention_days: view.max_retention_days,
+                lock_date: view.lock_date.map(::aws_smithy_types::DateTime::from),
             })
             .collect();
 

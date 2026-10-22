@@ -378,7 +378,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|minutes| u64::try_from(minutes).ok())
             .and_then(|minutes| minutes.checked_mul(60))
             .and_then(|seconds| now.checked_add(::std::time::Duration::from_secs(seconds)));
-        let is_encrypted = vault.encryption_key_arn.is_some();
+        // A recovery point reports the key it is stored under only when the
+        // vault was given one: the key this service creates for a vault whose
+        // create request named none encrypts the vault, and a backup under it
+        // is reported with no key of its own, as the recorded responses for a
+        // default-key vault are.
+        let point_encryption_key_arn = vault
+            .named_encryption_key_arn()
+            .map(ToString::to_string);
+        let is_encrypted = point_encryption_key_arn.is_some();
 
         let point = crate::state::RecoveryPoint {
             arn: point_arn.clone(),
@@ -393,7 +401,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             completion_date: None,
             backup_size_in_bytes: 0,
             lifecycle: input.lifecycle.clone(),
-            encryption_key_arn: vault.encryption_key_arn.clone(),
+            encryption_key_arn: point_encryption_key_arn.clone(),
             is_encrypted,
             is_parent: false,
             tags,
@@ -424,7 +432,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             start_by,
             lifecycle: input.lifecycle,
             backup_options,
-            encryption_key_arn: vault.encryption_key_arn.clone(),
+            encryption_key_arn: point_encryption_key_arn,
             is_encrypted,
             is_parent: false,
             idempotency_token: input.idempotency_token.clone(),

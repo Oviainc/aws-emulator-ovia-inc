@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutChannelPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutChannelPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Attaches one resource policy to the addressed channel, replacing any
+//! policy already on it, so `GetChannelPolicy` then reports exactly these bytes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutChannelPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The policy document is validated before anything is stored (a document that is not an
+//! IAM policy is a 400 `ValidationException` with `ValidationExceptionType`
+//! `INVALID_POLICY`), and the parent chain is resolved first (404
+//! `ResourceNotFoundException`), so a refused request leaves the store untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +83,23 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The sentence MediaPackage answers with when a channel group cannot be resolved —
+/// fixed per resource type, echoing none of the caller's identifiers.
+const CHANNEL_GROUP_NOT_FOUND: &str = "MediaPackage can't process your request because \
+    we can't find your channel group. Verify your channel group name or add a channel \
+    group and then try again";
+
+/// The same fixed sentence at channel scope.
+const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because we \
+    can't find your channel. Verify your channel name or add a channel and then try \
+    again";
+
+/// Why a policy document was refused. Request-derived (it names the rejected member
+/// path and restates the rule), which is the form this service's validation text takes.
+const INVALID_POLICY_MESSAGE: &str = "Validation error encountered at request.policy: \
+    The policy you provided isn't a valid policy document. Provide a JSON policy \
+    document with a Statement and then try again";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +173,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutChannelPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutChannelPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutChannelPolicy"))
+        // A write needs nothing from the request beyond its deserialized input: the
+        // channel this policy attaches to is addressed by name, not by region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutChannelPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The document is checked before the store is touched, so a refused policy
+        // leaves whatever policy the channel already had in place.
+        if !crate::state::is_policy_document(&input.policy) {
+            return Err(PutChannelPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(INVALID_POLICY_MESSAGE.to_string()),
+                    validation_exception_type: Some("INVALID_POLICY".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(PutChannelPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(CHANNEL_GROUP_NOT_FOUND.to_string()),
+                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(PutChannelPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(CHANNEL_NOT_FOUND.to_string()),
+                    resource_type_not_found: Some("CHANNEL".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // One policy per channel: the operation attaches exactly one, so a second call
+        // REPLACES the first rather than accumulating. The channel's own members are
+        // untouched, so its ETag, `ModifiedAt` and every value `GetChannel` reports stay
+        // as they were — the policy is a separate sub-resource, not a channel member.
+        channel.policy = Some(input.policy);
+
+        Ok(PutChannelPolicyOutput {})
     }
 }

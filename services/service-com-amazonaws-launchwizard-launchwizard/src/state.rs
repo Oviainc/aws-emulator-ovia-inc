@@ -140,6 +140,10 @@ impl Workload {
 
     /// This workload as the `WorkloadData` `GetWorkload` returns.
     ///
+    /// The members `WorkloadData` shares with `WorkloadDataSummary` are read off the
+    /// same catalogue entry [`Workload::to_summary`] reads, so the two reporting
+    /// operations cannot disagree about one workload.
+    ///
     /// `accountConstraints` is absent for the reason [`Workload::to_summary`] gives.
     /// `documentationUrl` and `iconUrl` are absent because this emulator hosts no
     /// workload document and no icon, so there is no URL to report; `statusMessage` is
@@ -416,6 +420,9 @@ impl ComAmazonawsLaunchwizardLaunchwizardState {
 /// deployment patterns each of those applications offers. The model constrains the
 /// shapes of these values: `WorkloadName` is `^[A-Za-z][a-zA-Z0-9-_]*$` (len 1..100)
 /// and `DeploymentPatternName` is `^[A-Za-z0-9][a-zA-Z0-9-]*$` (len 1..256).
+///
+/// `description` is the per-workload metadata `WorkloadData` (and therefore
+/// `GetWorkload`) reports: what the entry's application deploys.
 fn seeded_workloads() -> BTreeMap<String, Workload> {
     let catalogue = [
         (
