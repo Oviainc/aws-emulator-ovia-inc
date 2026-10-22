@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutReplicationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutReplicationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutReplicationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or replaces this registry's replication configuration: the rules the request
+//! carries become the registry's configuration, which `DescribeRegistry` then reports. A
+//! destination naming this registry itself (its own account id in the Region the request
+//! was made against) is refused — there is no replication from a registry to itself.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +109,28 @@ impl From<PutReplicationConfigurationErrorModeled> for PutReplicationConfigurati
     }
 }
 
+/// The first destination of `configuration` that names the source registry itself —
+/// this account's registry in `region` — with the index of the rule carrying it.
+///
+/// A destination is ANOTHER registry: this account's registry in a different Region
+/// (cross-Region replication), or another account's registry in any Region
+/// (cross-account replication). One naming this account's registry in the Region the
+/// call was made against names the source, so there is nothing to replicate to. The
+/// model cannot express the pairing, so it is checked here.
+fn source_destination<'a>(
+    configuration: &'a ReplicationConfiguration,
+    region: &str,
+) -> Option<(usize, &'a ReplicationDestination)> {
+    configuration
+        .rules
+        .iter()
+        .enumerate()
+        .flat_map(|(index, rule)| rule.destinations.iter().map(move |dest| (index, dest)))
+        .find(|(_, destination)| {
+            destination.registry_id == crate::state::registry_id() && destination.region == region
+        })
+}
+
 /// The `PutReplicationConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,18 +167,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutReplicationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutReplicationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutReplicationConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutReplicationConfigurationErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // ECR is regional: the registry this call configures is the one in the Region the
+        // request was signed for, and that Region is what makes a destination "the source".
+        let region = crate::state::request_region(ctx.parts());
+        let configuration = input.replication_configuration;
+
+        // Replication from a registry to itself is not a destination: see
+        // [`source_destination`].
+        if let Some((index, destination)) = source_destination(&configuration, &region) {
+            return Err(
+                PutReplicationConfigurationErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "replicationConfiguration.rules[{index}] names destination \
+                             registry '{}' in region '{}', which is the source registry of \
+                             this request; a registry cannot replicate to itself",
+                            destination.registry_id, destination.region
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Creates or updates": the configuration is replaced wholesale, so a put
+        // carrying no rules is how replication is turned off.
+        let mut store = state.lock();
+        store.replication_rules = configuration.rules;
+
+        Ok(PutReplicationConfigurationOutput {
+            // Echoed from the store, so the response is what a later `DescribeRegistry`
+            // will report rather than a copy of the request.
+            replication_configuration: Some(store.replication_configuration()),
+        })
     }
 }

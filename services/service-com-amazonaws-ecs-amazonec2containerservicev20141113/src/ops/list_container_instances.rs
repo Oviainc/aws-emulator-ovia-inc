@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListContainerInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListContainerInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListContainerInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the ARNs of the container instances STORED for a cluster, filtered by status
+//! as the request asks and paged in a stable order. A reporting operation: it writes
+//! nothing beyond materialising the lifecycle transitions the clock has already made
+//! due.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +175,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListContainerInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListContainerInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListContainerInstances"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListContainerInstancesErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        // "This value can be between 1 and 100."
+        if let Some(max_results) = input.max_results {
+            if !(1..=crate::state::MAX_LIST_PAGE_SIZE).contains(&max_results) {
+                return Err(
+                    ListContainerInstancesErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "maxResults must be between 1 and {}; got {max_results}",
+                                crate::state::MAX_LIST_PAGE_SIZE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `filter` takes a cluster query language statement. That language is
+        // Amazon-ECS-proprietary and nothing in this emulator evaluates it, so a request
+        // carrying one is REFUSED rather than answered with an unfiltered list that
+        // would silently claim the filter had been applied.
+        if let Some(filter) = input.filter.as_deref() {
+            return Err(
+                ListContainerInstancesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "filter is a cluster query language statement, which this \
+                             emulator does not evaluate; got {filter:?}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.clusters.contains_key(&cluster_name) {
+            return Err(
+                ListContainerInstancesErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(format!("cluster {cluster_name:?} was not found")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut matching: Vec<String> = guard
+            .container_instances
+            .values()
+            .filter(|instance| instance.cluster_name == cluster_name)
+            // "Filters the container instances by status. ... If you don't specify this
+            // parameter, the default is to include container instances set to all states
+            // other than INACTIVE."
+            .filter(|instance| match input.status.as_deref() {
+                Some(status) => instance.status == status,
+                None => instance.status != crate::state::CONTAINER_INSTANCE_INACTIVE,
+            })
+            .map(|instance| instance.arn.clone())
+            .collect();
+        // Container-instance ARNs end in a zero-padded, monotonically minted id, so
+        // sorting them puts the instances in registration order and gives paging a
+        // stable sequence to walk.
+        matching.sort();
+
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
+        // The token is the ARN the next page starts at, so a page is unaffected by
+        // instances registered or deregistered before it.
+        let start = match input.next_token.as_deref() {
+            Some(token) => matching.partition_point(|arn| arn.as_str() < token),
+            None => 0,
+        };
+        // `start` is a `partition_point` result, so it never exceeds the length, and
+        // `end` is clamped to it: the slice below is always in range.
+        let end = start.saturating_add(page_size).min(matching.len());
+        let container_instance_arns = matching[start..end].to_vec();
+        // "This value is null when there are no more results to return."
+        let next_token = matching.get(end).cloned();
+
+        Ok(ListContainerInstancesOutput {
+            container_instance_arns: Some(container_instance_arns),
+            next_token,
+        })
     }
 }
