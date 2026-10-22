@@ -8,11 +8,17 @@
 //!
 //! The minted request carries a derived `Id`, `Status = PENDING`, and `Created` /
 //! `LastUpdated` timestamps. A request this emulator accepts is decided
-//! ([`crate::state::REQUEST_DECISION_DELAY`] after the call) by approving it and
-//! putting its `DesiredValue` in force as the quota's applied value; the AWS DEFAULT
-//! value is untouched, which is why `GetAWSDefaultServiceQuota` keeps answering the
-//! same number. No support case is opened, so `SupportCaseAllowed` does not change
-//! the outcome and `CaseId` stays absent.
+//! ([`crate::state::REQUEST_DECISION_DELAY`] after the call) by what its submitter
+//! asked for in `SupportCaseAllowed`:
+//!
+//! * allowed (the model's default) — the request is `APPROVED` and its `DesiredValue`
+//!   is put in force as the quota's applied value; the AWS DEFAULT value is untouched,
+//!   which is why `GetAWSDefaultServiceQuota` keeps answering the same number;
+//! * `SupportCaseAllowed = false` — the submitter opted out of the support case that
+//!   reviews an increase, so AWS opens none and the request ends `NOT_APPROVED`: no
+//!   `CaseId`, and the quota keeps the value it had.
+//!
+//! `CaseId` stays absent either way: this emulator opens no support case.
 //!
 //! Refusals:
 //!
@@ -221,6 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.service_code,
             &input.quota_code,
             input.desired_value,
+            // Absent means allowed: the model documents "By default, this flag is set
+            // to True".
+            input
+                .support_case_allowed
+                .unwrap_or(crate::state::SUPPORT_CASE_ALLOWED_BY_DEFAULT),
             crate::state::requester_identity(),
             now,
         );

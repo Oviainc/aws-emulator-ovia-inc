@@ -97,6 +97,29 @@ pub const STATUS_PENDING: &str = "PENDING";
 /// `RequestStatus` member `APPROVED`: the status a decided request carries once the
 /// increase has been applied to the quota.
 pub const STATUS_APPROVED: &str = "APPROVED";
+/// `RequestStatus` member `NOT_APPROVED`: the terminal status of a request whose
+/// submitter opted out of the support case that reviews it.
+///
+/// Source: `RequestServiceQuotaIncreaseRequest$SupportCaseAllowed`'s own documentation
+/// (`smithy_query(query="doc", shape="RequestServiceQuotaIncreaseRequest",
+/// member="SupportCaseAllowed")`) — "If you set the flag to False, Amazon Web Services
+/// does not open a support case and updates the request status to Not approved."
+pub const STATUS_NOT_APPROVED: &str = "NOT_APPROVED";
+
+/// What `SupportCaseAllowed` means when a request does not carry it: the model's own
+/// default, "By default, this flag is set to True".
+pub const SUPPORT_CASE_ALLOWED_BY_DEFAULT: bool = true;
+
+/// The one Region the quota request TEMPLATE plane is served from.
+///
+/// Source: AWS's Service Quotas user guide, "Using quota request templates" — the
+/// template operations are called in the US East (N. Virginia) Region, and a call made
+/// anywhere else is refused with the modelled `TemplatesNotAvailableInRegionException`
+/// ("The Service Quotas template is not available in this Amazon Web Services
+/// Region."). It is the same string as [`DEFAULT_REGION`] but a different fact, so it
+/// is named separately: this one is the template plane's home, that one is the region a
+/// request with no usable credential scope is served as.
+pub const TEMPLATE_HOME_REGION: &str = "us-east-1";
 
 /// How long a quota increase request stays `PENDING` before it is decided.
 ///
@@ -183,6 +206,11 @@ pub struct QuotaRequest {
     pub requester: String,
     /// `CaseId`: `None` unless a support case was opened for the request.
     pub case_id: Option<String>,
+    /// `SupportCaseAllowed`, as the request carried it (or
+    /// [`SUPPORT_CASE_ALLOWED_BY_DEFAULT`] when it carried nothing). `false` is the
+    /// submitter opting out of the support case that reviews an increase, which is what
+    /// decides the request's terminal status.
+    pub support_case_allowed: bool,
     /// `QuotaRequestedAtLevel` — an `AppliedLevelEnum` member.
     pub quota_requested_at_level: String,
 }
@@ -323,12 +351,17 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// The caller has already checked that the quota exists, that it is adjustable,
     /// and that `desired_value` is above the value in force. The ceiling is enforced
     /// HERE, at the one insertion point, so no caller can grow the store past it.
+    ///
+    /// `support_case_allowed` is recorded, not acted on: it is what
+    /// [`Self::settle_due_requests`] reads when the decision comes due.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_request(
         &mut self,
         region: &str,
         service_code: &str,
         quota_code: &str,
         desired_value: f64,
+        support_case_allowed: bool,
         requester: String,
         now: SystemTime,
     ) -> Option<QuotaRequest> {
@@ -352,6 +385,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             decided_at: now + REQUEST_DECISION_DELAY,
             requester,
             case_id: None,
+            support_case_allowed,
             quota_requested_at_level: LEVEL_ACCOUNT.to_string(),
         };
         let state = self.regions.entry(region.to_string()).or_default();
@@ -370,11 +404,19 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
 
     /// Materialise every decision the clock has already made due in `region`.
     ///
-    /// A `PENDING` request whose `decided_at` has passed is `APPROVED` and its
-    /// desired value becomes the quota's applied value. This is the ONLY writer of
-    /// the applied overlay, and it is owed at `decided_at` whether or not anybody
-    /// calls — so a reporting operation may settle it before answering, and reading
-    /// twice yields the same answer.
+    /// A `PENDING` request whose `decided_at` has passed is decided by what its
+    /// submitter asked for:
+    ///
+    /// * `SupportCaseAllowed` (the default) — the increase is `APPROVED` and its
+    ///   desired value becomes the quota's applied value;
+    /// * `SupportCaseAllowed = false` — the submitter opted out of the support case
+    ///   that reviews an increase, so AWS opens none and the request ends
+    ///   `NOT_APPROVED`: no `CaseId`, and NOTHING is put in force, so the quota keeps
+    ///   the value it had.
+    ///
+    /// This is the ONLY writer of the applied overlay, and the decision is owed at
+    /// `decided_at` whether or not anybody calls — so a reporting operation may settle
+    /// it before answering, and reading twice yields the same answer.
     ///
     /// The overlay goes where the quota's own scope says: account-wide for a
     /// `GlobalQuota`, this region for a regional one.
@@ -397,17 +439,22 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             return;
         }
 
-        // The decision: flip the stored requests, and note the overlay each one puts
-        // in force.
+        // The decision: flip the stored requests, and note the overlay each APPROVED
+        // one puts in force. A request that opted out of its support case settles to
+        // NOT_APPROVED and contributes no overlay.
         let mut decided: Vec<(String, String, AppliedQuota)> = Vec::new();
         if let Some(state) = self.regions.get_mut(region) {
             for id in due {
                 let Some(request) = state.quota_requests.get_mut(&id) else {
                     continue;
                 };
-                request.status = STATUS_APPROVED.to_string();
                 // The decision happened when it came due, not when somebody looked.
                 request.last_updated = request.decided_at;
+                if !request.support_case_allowed {
+                    request.status = STATUS_NOT_APPROVED.to_string();
+                    continue;
+                }
+                request.status = STATUS_APPROVED.to_string();
                 decided.push((
                     request.service_code.clone(),
                     request.quota_code.clone(),
@@ -587,6 +634,51 @@ pub fn default_quota_arn(
 /// account's root identity, built through the canonical ARN helper.
 pub fn requester_identity() -> String {
     ::engine::emulator_arn("iam", "", "root")
+}
+
+/// Why a quota request TEMPLATE call is refused.
+///
+/// Both arms are errors every template operation of this service models
+/// (`smithy_query(query="operation",
+/// operation="PutServiceQuotaIncreaseRequestIntoTemplate,…")`), so each handler maps
+/// this to its own error enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateRefusal {
+    /// The call was made at a Region the template plane is not served from:
+    /// `TemplatesNotAvailableInRegionException`.
+    NotAvailableInRegion,
+    /// The calling account belongs to no AWS Organization:
+    /// `NoAvailableOrganizationException`.
+    NoAvailableOrganization,
+}
+
+/// The gate every quota request template operation passes through, evaluated for a call
+/// made at `region`.
+///
+/// Two conditions stand in front of the whole template plane, and this is the only
+/// place either is decided:
+///
+/// 1. the plane is served from one Region only ([`TEMPLATE_HOME_REGION`]), so a call
+///    anywhere else is refused with [`TemplateRefusal::NotAvailableInRegion`];
+/// 2. a quota request template belongs to an AWS ORGANIZATION — AWS applies it to the
+///    organization's member accounts — so an account that is in none has no template to
+///    read, write or associate and is refused with
+///    [`TemplateRefusal::NoAvailableOrganization`].
+///
+/// There is no third answer for the account this emulator serves: it is a single
+/// STANDALONE account. Service Quotas models no organization membership and has no
+/// operation that could create or join one (AWS Organizations is a different service,
+/// with its own state in its own crate), so condition 2 can never be satisfied from
+/// here and no template entry can become observable. That is why this returns a
+/// refusal rather than a `Result`: a template STORE would be state nothing could ever
+/// write or read, and a handler that pretended otherwise would report a template the
+/// account does not have.
+pub fn template_refusal(region: &str) -> TemplateRefusal {
+    if region == TEMPLATE_HOME_REGION {
+        TemplateRefusal::NoAvailableOrganization
+    } else {
+        TemplateRefusal::NotAvailableInRegion
+    }
 }
 
 /// The region a request is addressed to: the SigV4 credential scope's region, which
