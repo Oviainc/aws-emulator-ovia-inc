@@ -13,8 +13,9 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ConflictException, InternalServerException, PosixUser, ResourceNotFoundException,
-    RootDirectory, ServiceQuotaExceededException, Tag, ValidationException,
+    ConflictException, ExpirationDataRule, ImportDataRule, InternalServerException, PosixUser,
+    ResourceNotFoundException, RootDirectory, ServiceQuotaExceededException, Tag,
+    ValidationException,
 };
 
 /// The `LifeCycleState` value a resource carries while the service is still creating
@@ -123,8 +124,112 @@ pub struct FileSystem {
     /// as it was put — the service is given an opaque JSON document, so re-rendering it
     /// would change what the caller gets back.
     pub policy: Option<String>,
+    /// The synchronization configuration of this file system, if one has been put.
+    ///
+    /// Another sub-resource of the file system
+    /// (`/file-systems/{fileSystemId}/synchronization-configuration`), so it lives on
+    /// the record and is released with it. `None` until the first
+    /// `PutSynchronizationConfiguration` creates it.
+    pub synchronization: Option<SynchronizationConfiguration>,
     /// Creation order, so a listing paginates deterministically.
     pub sequence: u64,
+}
+
+/// The version number a file system's FIRST synchronization configuration carries.
+///
+/// `PutSynchronizationConfigurationRequest$latestVersionNumber` documents "Omit this
+/// value when creating a synchronization configuration for the first time", so the
+/// first stored configuration is the one no caller could have named a version for; every
+/// accepted write after it carries the next number up.
+pub const FIRST_SYNCHRONIZATION_VERSION: i32 = 1;
+
+/// The `message` the modelled `ResourceNotFoundException` reports for a file system that
+/// holds no synchronization configuration.
+///
+/// ONE constant sentence naming the kind of resource that is missing, carrying nothing
+/// from the request — the same shape as [`POLICY_NOT_FOUND_MESSAGE`]: the configuration
+/// sub-resource has no id of its own, and the file system is already named by the
+/// request's own path label.
+pub const SYNCHRONIZATION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
+    "Synchronization configuration does not exist.";
+
+/// A stored synchronization configuration: the rules that were put, plus the version
+/// number this store recorded them under.
+///
+/// `GetSynchronizationConfigurationResponse` reports all three members, so the rules are
+/// held exactly as they were put rather than re-derived: the service is given rule
+/// records it stores, not evaluates.
+#[derive(Debug, Clone)]
+pub struct SynchronizationConfiguration {
+    pub import_data_rules: Vec<ImportDataRule>,
+    pub expiration_data_rules: Vec<ExpirationDataRule>,
+    /// The `latestVersionNumber` a read reports and the next write must name.
+    pub version_number: i32,
+}
+
+impl SynchronizationConfiguration {
+    /// The version number that follows this one.
+    ///
+    /// `latestVersionNumber` is a Smithy `Integer`, so the counter is bounded by `i32`;
+    /// saturating keeps a write at the ceiling from wrapping back onto a version a
+    /// caller already holds. Reaching it takes `i32::MAX` accepted writes to one file
+    /// system in one process.
+    fn next_version(&self) -> i32 {
+        self.version_number.saturating_add(1)
+    }
+}
+
+/// Why `latest_version_number` is not the version the next write over `current` must
+/// name, or `None` when it is.
+///
+/// The optimistic-concurrency rule from
+/// `PutSynchronizationConfigurationRequest$latestVersionNumber`: a first-time create
+/// names no version, an update names the version the stored configuration currently
+/// carries, and anything else "does not match the current configuration" and is the
+/// modelled `ConflictException`. The answer is a sentence, so a caller learns which of
+/// the two mismatches it hit.
+pub fn synchronization_version_rejection(
+    current: Option<&SynchronizationConfiguration>,
+    latest_version_number: Option<i32>,
+) -> Option<String> {
+    match (current, latest_version_number) {
+        (None, None) => None,
+        (None, Some(named)) => Some(format!(
+            "no synchronization configuration exists yet, so latestVersionNumber must be \
+             omitted; got {named}"
+        )),
+        (Some(stored), Some(named)) if named == stored.version_number => None,
+        (Some(stored), Some(named)) => Some(format!(
+            "latestVersionNumber {named} does not match the current synchronization \
+             configuration version {}",
+            stored.version_number
+        )),
+        (Some(stored), None) => Some(format!(
+            "a synchronization configuration at version {} already exists, so \
+             latestVersionNumber must name it",
+            stored.version_number
+        )),
+    }
+}
+
+/// The configuration an accepted write stores: the rules it carried, at the version that
+/// follows the stored one (or [`FIRST_SYNCHRONIZATION_VERSION`] for a first-time
+/// create).
+///
+/// Called only once [`synchronization_version_rejection`] has accepted the write.
+pub fn next_synchronization_configuration(
+    current: Option<&SynchronizationConfiguration>,
+    import_data_rules: Vec<ImportDataRule>,
+    expiration_data_rules: Vec<ExpirationDataRule>,
+) -> SynchronizationConfiguration {
+    SynchronizationConfiguration {
+        import_data_rules,
+        expiration_data_rules,
+        version_number: current.map_or(
+            FIRST_SYNCHRONIZATION_VERSION,
+            SynchronizationConfiguration::next_version,
+        ),
+    }
 }
 
 /// A stored access point, a child of exactly one file system.

@@ -19,3 +19,5 @@ mod file_system_lifecycle;
 mod file_system_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/synchronization_configuration.rs"]
+mod synchronization_configuration;

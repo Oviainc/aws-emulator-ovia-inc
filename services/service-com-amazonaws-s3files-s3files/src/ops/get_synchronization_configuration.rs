@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSynchronizationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSynchronizationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSynchronizationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the synchronization configuration stored on one file system — the rules the
+//! last accepted `PutSynchronizationConfiguration` persisted and the version number it
+//! recorded them under, which the next write must name. A file system holding no
+//! configuration answers the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSynchronizationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSynchronizationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSynchronizationConfiguration"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSynchronizationConfigurationErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+        // The only write a reporting operation makes: the transition the clock already
+        // owed at this instant, whether or not anybody called.
+        store.settle(now);
+
+        let file_system_id = crate::state::file_system_id_of(&input.file_system_id)
+            .ok_or_else(|| {
+                GetSynchronizationConfigurationErrorModeled::ValidationException(
+                    crate::state::invalid(format!(
+                        "fileSystemId must be a file system id (fs-<hex>) or its ARN, got {:?}",
+                        input.file_system_id
+                    )),
+                )
+            })?
+            .to_string();
+
+        let stored = store.file_systems.get(&file_system_id).ok_or_else(|| {
+            GetSynchronizationConfigurationErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(format!("no file system {file_system_id}")),
+            )
+        })?;
+
+        // Both rule lists are `@required`, so a file system carrying no configuration
+        // has nothing to report: the configuration sub-resource does not exist until a
+        // put creates it, which is the modelled 404 rather than an empty success.
+        let configuration = stored.synchronization.as_ref().ok_or_else(|| {
+            GetSynchronizationConfigurationErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::SYNCHRONIZATION_CONFIGURATION_NOT_FOUND_MESSAGE,
+                ),
+            )
+        })?;
+
+        Ok(GetSynchronizationConfigurationOutput {
+            import_data_rules: configuration.import_data_rules.clone(),
+            expiration_data_rules: configuration.expiration_data_rules.clone(),
+            // The version the stored configuration carries, which is what the next
+            // `PutSynchronizationConfiguration` has to name.
+            latest_version_number: Some(configuration.version_number),
+        })
     }
 }

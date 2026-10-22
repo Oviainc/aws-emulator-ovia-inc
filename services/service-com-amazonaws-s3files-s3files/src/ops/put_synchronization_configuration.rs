@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSynchronizationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSynchronizationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSynchronizationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or replaces the synchronization configuration of one file system, under the
+//! optimistic-concurrency rule its `latestVersionNumber` documents: a first-time create
+//! names no version, every later write names the version the stored configuration
+//! carries, and a write that names anything else is the modelled `ConflictException`.
+//! The rules are stored on the file system's record and read back by
+//! `GetSynchronizationConfiguration`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +152,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSynchronizationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSynchronizationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSynchronizationConfiguration"))
+        // This operation's answer carries no members, so the only thing it can assert
+        // is the write: the rules are persisted on the named file system's record at
+        // their new version and read back by `GetSynchronizationConfiguration`.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutSynchronizationConfigurationErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+        // The transition the clock already owed at this instant, whether or not anybody
+        // called — the same write every handler in this service makes first.
+        store.settle(now);
+
+        // `fileSystemId` accepts the bare id or the file system's ARN; both name the
+        // same record.
+        let file_system_id = crate::state::file_system_id_of(&input.file_system_id)
+            .ok_or_else(|| {
+                PutSynchronizationConfigurationErrorModeled::ValidationException(
+                    crate::state::invalid(format!(
+                        "fileSystemId must be a file system id (fs-<hex>) or its ARN, got {:?}",
+                        input.file_system_id
+                    )),
+                )
+            })?
+            .to_string();
+
+        let stored = store.file_systems.get_mut(&file_system_id).ok_or_else(|| {
+            PutSynchronizationConfigurationErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(format!("no file system {file_system_id}")),
+            )
+        })?;
+
+        // The optimistic-concurrency rule, stated once in
+        // `state::synchronization_version_rejection`. Checked against what is STORED, so
+        // of two writes naming the same version only the first is accepted.
+        if let Some(reason) = crate::state::synchronization_version_rejection(
+            stored.synchronization.as_ref(),
+            input.latest_version_number,
+        ) {
+            return Err(
+                PutSynchronizationConfigurationErrorModeled::ConflictException(
+                    crate::state::conflict(&file_system_id, "synchronization-configuration", reason),
+                )
+                .into(),
+            );
+        }
+
+        // "Creates or updates": the rules that were put REPLACE the stored ones rather
+        // than merging into them, and the write advances the version the next one must
+        // name.
+        stored.synchronization = Some(crate::state::next_synchronization_configuration(
+            stored.synchronization.as_ref(),
+            input.import_data_rules,
+            input.expiration_data_rules,
+        ));
+
+        Ok(PutSynchronizationConfigurationOutput {})
     }
 }
