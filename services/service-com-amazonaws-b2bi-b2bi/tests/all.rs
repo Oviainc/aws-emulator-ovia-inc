@@ -21,7 +21,11 @@ mod references_logging_and_quota;
 mod starter_mapping_template;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource.rs"]
+mod tag_resource;
 #[path = "all/tagging.rs"]
 mod tagging;
 #[path = "all/transformer_lifecycle.rs"]
 mod transformer_lifecycle;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;

@@ -92,6 +92,17 @@ pub const MAX_RECORDS_PER_STORE: usize = 1_000;
 /// path as well as a ceiling.
 pub const MAX_IDEMPOTENCY_ENTRIES: usize = 10_000;
 
+/// The most tags one resource holds at once.
+///
+/// 200, the maximum of the modelled `TagList` (`len 0..200`) — the very shape
+/// `ListTagsForResourceResponse$Tags` reports a resource's tags through, so a resource
+/// holding more than this could not be read back inside its own modelled bound. It is
+/// also what bounds tag residency: `TagResource` is reachable without a verified caller,
+/// so without a ceiling repeated calls with fresh keys would grow one resource's record
+/// for good. A call that would carry a resource past it is refused with the modelled
+/// `ValidationException`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// A customer profile: the private network a partnership is created under.
 #[derive(Debug, Clone)]
 pub struct Profile {
@@ -272,6 +283,45 @@ impl ComAmazonawsB2biB2biState {
                     .find(|transformer| transformer.transformer_arn == arn)
                     .map(|transformer| &transformer.tags)
             })
+    }
+
+    /// The tags stored on the resource `arn` names, for a handler that CHANGES them
+    /// (`TagResource`), or `None` when this service holds no resource with that ARN.
+    ///
+    /// The same resolution as [`tags_by_arn`](Self::tags_by_arn) — the tag list lives on
+    /// the resource's own record, found by the very ARN its create stored — so a tag
+    /// written here is the one the next `ListTagsForResource` reports, and an ARN that
+    /// differs from a stored one in any field names no resource here.
+    pub fn tags_by_arn_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
+        if let Some(profile) = self
+            .profiles
+            .values_mut()
+            .find(|profile| profile.profile_arn == arn)
+        {
+            return Some(&mut profile.tags);
+        }
+        if let Some(capability) = self
+            .capabilities
+            .values_mut()
+            .find(|capability| capability.capability_arn == arn)
+        {
+            return Some(&mut capability.tags);
+        }
+        if let Some(partnership) = self
+            .partnerships
+            .values_mut()
+            .find(|partnership| partnership.partnership_arn == arn)
+        {
+            return Some(&mut partnership.tags);
+        }
+        if let Some(transformer) = self
+            .transformers
+            .values_mut()
+            .find(|transformer| transformer.transformer_arn == arn)
+        {
+            return Some(&mut transformer.tags);
+        }
+        None
     }
 
     /// Drop every remembered token that minted `id`, called when `id`'s resource is

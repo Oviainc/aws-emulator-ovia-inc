@@ -25,7 +25,7 @@ use crate::onboarding_loop::{
 
 /// A `tags` list for a create request, from `(key, value)` pairs. Member names are
 /// `com.amazonaws.b2bi#Tag`'s own: `Key` and `Value`.
-fn tag_list(pairs: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_list(pairs: &[(&str, &str)]) -> Value {
     json!(pairs
         .iter()
         .map(|(key, value)| json!({ "Key": key, "Value": value }))
@@ -34,7 +34,7 @@ fn tag_list(pairs: &[(&str, &str)]) -> Value {
 
 /// The `(Key, Value)` pairs of a `Tags` list, sorted, so a comparison is about the
 /// CONTENT of the list and not about the order the service happens to report it in.
-fn tag_pairs(tags: &Value) -> Vec<(String, String)> {
+pub(crate) fn tag_pairs(tags: &Value) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = tags
         .as_array()
         .unwrap_or(&Vec::new())
@@ -48,7 +48,7 @@ fn tag_pairs(tags: &Value) -> Vec<(String, String)> {
 /// The `message` of an error body. This service's model spells that member `Message`
 /// on `ValidationException` and `message` on `ResourceNotFoundException`, so both
 /// spellings are read here.
-fn message(body: &Value) -> String {
+pub(crate) fn message(body: &Value) -> String {
     let capitalized = text(body, "Message");
     if capitalized.is_empty() {
         text(body, "message")
@@ -58,7 +58,7 @@ fn message(body: &Value) -> String {
 }
 
 /// Ask `ListTagsForResource` for `arn`, signed for `region`.
-async fn list_tags_in(
+pub(crate) async fn list_tags_in(
     router: &MultiServiceRouter,
     region: &str,
     arn: &str,
@@ -73,7 +73,7 @@ async fn list_tags_in(
 }
 
 /// Ask `ListTagsForResource` for `arn`, signed for [`SIGNING_REGION`].
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     list_tags_in(router, SIGNING_REGION, arn).await
 }
 
@@ -85,19 +85,21 @@ type TagCase<'a> = (&'a str, Kind, Option<&'a [(&'a str, &'a str)]>);
 /// and the tags it carries.
 type RegionCase<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
-/// Which of this service's taggable resources a row creates.
+/// Which of this service's taggable resources a row creates. AWS: tags apply to
+/// "capabilities, partnerships, profiles and transformers" (`com.amazonaws.b2bi#Tag`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Profile,
     Capability,
     Partnership,
+    Transformer,
 }
 
 /// Create a resource of `kind` carrying `tags`, and return its ARN.
 ///
 /// `profile_id` / `capability_id` are the references a partnership needs; they are
 /// created once by the caller so every row shares them.
-async fn given_tagged_resource(
+pub(crate) async fn given_tagged_resource(
     router: &MultiServiceRouter,
     kind: Kind,
     name: &str,
@@ -105,6 +107,18 @@ async fn given_tagged_resource(
     profile_id: &str,
     capability_id: &str,
 ) -> String {
+    // `TransformerName` is `^[a-zA-Z0-9_-]{1,512}$`, so a case label is reduced to the
+    // characters that constraint accepts before it is used as a transformer's name.
+    let modelled_name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
     let (operation, mut request, arn_member) = match kind {
         Kind::Profile => (
             "CreateProfile",
@@ -140,6 +154,19 @@ async fn given_tagged_resource(
                 "capabilities": [capability_id]
             }),
             "partnershipArn",
+        ),
+        Kind::Transformer => (
+            "CreateTransformer",
+            json!({
+                "name": modelled_name,
+                "inputConversion": {
+                    "fromFormat": "X12",
+                    "formatOptions": {
+                        "x12": { "transactionSet": "X12_850", "version": "VERSION_4010" }
+                    }
+                }
+            }),
+            "transformerArn",
         ),
     };
     if let Some(tags) = tags {

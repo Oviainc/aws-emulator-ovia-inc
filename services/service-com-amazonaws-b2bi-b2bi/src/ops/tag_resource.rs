@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches key-value pairs to the resource an ARN names: a key the resource does not
+//! carry yet is ADDED, a key it already carries has its value REPLACED, and every other
+//! tag on the resource is left as it was. The call is therefore idempotent — replaying it
+//! leaves the same tag set — and an empty `Tags` list (the modelled `len 0..200` allows
+//! one) changes nothing. There is no response body.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An ARN that does not satisfy the ARN grammar is refused with the modelled
+//! `ValidationException` (400) without any lookup; a well-formed ARN that names no
+//! resource this service holds answers the modelled `ResourceNotFoundException` (404).
+//! A call that would carry a resource past [`crate::state::MAX_TAGS_PER_RESOURCE`] tags
+//! is refused with `ValidationException` and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +177,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The tags belong to the resource the ARN names, so neither the caller nor the
+        // request's signing scope takes part in this.
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // Syntax first, and without touching the store: something that is not an ARN at
+        // all cannot name a resource, so it is a client-side mistake (400) rather than a
+        // resource that is missing (404) — the same split `ListTagsForResource` makes.
+        // The modelled `len 1..1011` bound on `ResourceARN` is already enforced before
+        // this handler runs; the grammar is not.
+        if !crate::state::is_arn(&input.resource_arn) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!("Invalid ARN {}", input.resource_arn),
+            })
+            .into());
+        }
+
+        let mut state = store.lock();
+        let resource_arn = input.resource_arn;
+        let Some(stored) = state.tags_by_arn_mut(&resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Could not find resource with ARN {resource_arn}"),
+                },
+            )
+            .into());
+        };
+
+        // How many keys this call ADDS: a key the resource already carries has its value
+        // replaced in place, so only the new keys can push the resource past the ceiling,
+        // and a key named twice in one request counts once. Counted (and refused) BEFORE
+        // anything is written, so a refused call leaves the tag set exactly as it was
+        // rather than half-applied.
+        let mut added: Vec<&str> = Vec::new();
+        for tag in &input.tags {
+            let held = stored.iter().any(|existing| existing.key == tag.key)
+                || added.contains(&tag.key.as_str());
+            if !held {
+                added.push(tag.key.as_str());
+            }
+        }
+        let total = stored.len() + added.len();
+        if total > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Resource {resource_arn} would hold {total} tags, more than the maximum of {} tags per resource",
+                    crate::state::MAX_TAGS_PER_RESOURCE
+                ),
+            })
+            .into());
+        }
+
+        // Upsert in request order, so a request naming one key twice leaves the LAST
+        // value it gave for that key — the same answer as sending those two calls in turn.
+        for tag in input.tags {
+            match stored.iter_mut().find(|existing| existing.key == tag.key) {
+                Some(existing) => existing.value = tag.value,
+                None => stored.push(tag),
+            }
+        }
+
+        Ok(TagResourceOutput)
     }
 }
