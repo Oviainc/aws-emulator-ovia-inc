@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRecordBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRecordBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRecordBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends every record of the batch to the target stream's buffer and answers one
+//! response entry per input record, positionally aligned with it.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +189,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRecordBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRecordBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRecordBatch"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router: it mounts every service on one shared
+            // `InMemoryEngine`. A store this operation cannot reach is a server-side
+            // failure, which is what this operation's 503 says.
+            return Err(PutRecordBatchErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(
+                        "the Firehose stream store is not reachable from this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialise_due(now);
+
+        // One lookup resolves the stream, refuses it if it is not accepting data, and
+        // mints one id per record IN INPUT ORDER — so the response entries line up
+        // positionally with the records the caller sent, and no id is handed out for a
+        // record that was not stored. A record the buffer had no room for comes back as
+        // `None` and is reported in its own entry below, which is what
+        // `RequestResponses`/`FailedPutCount` are for.
+        let records: Vec<Vec<u8>> = input
+            .records
+            .into_iter()
+            .map(|record| record.data)
+            .collect();
+        let (record_ids, encrypted) =
+            match store.ingest_records(&input.delivery_stream_name, records, now) {
+                Ok(stored) => stored,
+                Err(crate::state::StreamRefusal::NoSuchStream) => {
+                    return Err(no_such_stream(&input.delivery_stream_name))
+                }
+                Err(crate::state::StreamRefusal::NotActive(status)) => {
+                    return Err(stream_not_active(&input.delivery_stream_name, status))
+                }
+            };
+
+        // "If the record is successfully added to your Firehose stream, it receives a
+        // record ID. If the record fails to be added, the result includes an error code
+        // and an error message" — and `FailedPutCount` counts those.
+        let request_responses: Vec<PutRecordBatchResponseEntry> = record_ids
+            .into_iter()
+            .map(|record_id| match record_id {
+                Some(record_id) => PutRecordBatchResponseEntry {
+                    record_id: Some(record_id),
+                    error_code: None,
+                    error_message: None,
+                },
+                None => PutRecordBatchResponseEntry {
+                    record_id: None,
+                    error_code: Some(AT_CAPACITY_ERROR_CODE.to_string()),
+                    error_message: Some(AT_CAPACITY_ERROR_MESSAGE.to_string()),
+                },
+            })
+            .collect();
+        let failed_put_count = request_responses
+            .iter()
+            .filter(|entry| entry.error_code.is_some())
+            .count();
+
+        Ok(PutRecordBatchOutput {
+            failed_put_count: i32::try_from(failed_put_count).unwrap_or(i32::MAX),
+            encrypted: Some(encrypted),
+            request_responses,
+        })
     }
 }
+
+/// No stream of that name exists.
+fn no_such_stream(name: &str) -> PutRecordBatchError {
+    PutRecordBatchErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Firehose stream {name} not found")),
+    })
+    .into()
+}
+
+/// The stream exists but is not accepting data.
+///
+/// The model does not say WHICH exception a put to a non-`ACTIVE` stream raises; of the
+/// ones this operation declares, `ResourceNotFoundException` is the client error for a
+/// stream that is not available to the caller, so the status is named in the message.
+fn stream_not_active(name: &str, status: &str) -> PutRecordBatchError {
+    PutRecordBatchErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "Firehose stream {name} is in status {status}; it accepts data only in status ACTIVE"
+        )),
+    })
+    .into()
+}
+
+/// The stream's buffer had no room for a record of a batch — the `ErrorCode` /
+/// `ErrorMessage` that record's own `PutRecordBatchResponseEntry` carries.
+///
+/// This is what the modelled 503 says: "The service is unavailable. Back off and retry
+/// the operation. If you continue to see the exception, throughput limits for the Firehose
+/// stream may have been exceeded." The emulator holds buffered records in its own heap,
+/// so its budget (`crate::state::MAX_BUFFERED_BYTES_PER_STREAM` and friends) is the limit
+/// a caller runs into here, and this is the answer the real service gives for one.
+const AT_CAPACITY_ERROR_CODE: &str = "ServiceUnavailableException";
+const AT_CAPACITY_ERROR_MESSAGE: &str =
+    "the Firehose stream cannot buffer more data; back off and retry";

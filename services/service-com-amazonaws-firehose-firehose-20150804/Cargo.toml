@@ -16,7 +16,9 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time` beyond the workspace default: the tests await the clock-owed
+# CREATING -> ACTIVE / DELETING -> removed spans with `tokio::time::sleep`.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
