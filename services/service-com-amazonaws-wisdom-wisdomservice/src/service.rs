@@ -45,6 +45,74 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The key THIS service answers under, which is NOT the `wisdom` key its model's
+/// `aws.auth#sigv4` name resolves to.
+///
+/// This model is Amazon Connect Wisdom: `smithy_query(query="service_info")` gives it
+/// sdkId `Wisdom`, sigv4Name `wisdom`, arnNamespace `wisdom`, service shape
+/// `WisdomService` version 2020-10-19, protocol `restJson1`, 41 operations. The repo
+/// carries a SECOND model of that same endpoint,
+/// `services/service-com-amazonaws-qconnect-wisdomservice` (sdkId `QConnect` — Amazon Q
+/// in Connect, the endpoint's current API), whose `service_info` differs ONLY in sdkId:
+/// the same service shape and version, the same protocol, the same signing name, the same
+/// endpoint templates `https://wisdom.{Region}.{dnsSuffix}`, and 94 operations that
+/// INCLUDE all 41 of this model's at the identical method+URI routes. restJson1 carries
+/// no `X-Amz-Target`, so a request is dispatched by method+URI — and those routes are the
+/// same here as there, which means no signal in a request can tell the two models apart.
+/// The `wisdom` key therefore has to be served by exactly ONE of them, or the router
+/// (which requires exactly one claimant) answers `500 AmbiguousService` for every request
+/// to the endpoint, a code that exists in no AWS model.
+///
+/// The QConnect crate serves it, because it is the endpoint's current API and the
+/// superset: a client signing `wisdom` reaches every operation EITHER model declares,
+/// which is also what AWS does — one service answers both APIs on `wisdom.{region}`.
+/// Claiming `wisdom` here as well would reinstate the ambiguity.
+///
+/// This service therefore answers under its own REGISTRATION identity: this model's shape
+/// id `com.amazonaws.wisdom#WisdomService` in the key form the project names its service
+/// crates by (`service-com-amazonaws-wisdom-wisdomservice`). It is unique per registered
+/// service by construction and is no AWS signing name, endpoint prefix or sdkId — which
+/// is exactly why it cannot collide with the shared endpoint identity. The legacy model
+/// stays mounted, reachable and exercised by its own suite without ever contending for
+/// `wisdom`.
+///
+/// Read this key as ADMINISTRATIVE, not as a wire identity: no AWS SDK or CLI ever signs
+/// or addresses `com-amazonaws-wisdom-wisdomservice`, because AWS publishes exactly one
+/// identity for this endpoint and the QConnect model above serves it. Only a caller that
+/// names this registered model deliberately — this crate's own suite, or an operator
+/// probing one mounted service — reaches these handlers, and nothing is lost by that: all
+/// 41 routes of this model are bound in the QConnect crate, which answers the endpoint's
+/// real traffic.
+const OWN_REGISTRATION_KEY: &str = "com-amazonaws-wisdom-wisdomservice";
+
+/// Whether the request these `parts` came from resolves to [`OWN_REGISTRATION_KEY`] AND a
+/// first URI path segment this model publishes (`crate::ROUTE_PATH_SEGMENTS`).
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable owner
+/// of that rule, and it is CALLED here rather than re-implemented, with this service's
+/// own key in place of the signing name. It takes a whole `http::Request` while
+/// [`Service::can_handle`] is handed only the request's parts, so the two things it reads
+/// — the URI and the headers — are re-presented to it as a bodiless request. It reads
+/// neither the body nor the method, so nothing it decides on is missing.
+/// (`services/common`'s `claims_request` states the same rule over `Parts`; it is not
+/// used here only because depending on it edits `Cargo.lock`, which this repository's
+/// serialized squash merge refuses whenever another change lands against it — migrating
+/// these two crates onto it is a one-line follow-up.)
+fn claims_own_registration_key(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        OWN_REGISTRATION_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-wisdom-wisdomservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +142,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // Delegated to the framework's own predicate — see
+        // [`claims_own_registration_key`]: this model is the Amazon Connect Wisdom view of
+        // the endpoint Amazon Q in Connect now serves, publishing the very same wire
+        // identity (signing name, endpoint, service shape, version, protocol) and a
+        // strict subset of its routes, so the generated `wisdom` route key cannot tell
+        // the two apart. It is claimed by the QConnect crate — the endpoint's current API
+        // and the superset — and this service answers under its own registration key
+        // instead, so exactly one service claims every request.
+        claims_own_registration_key(parts)
     }
 
     fn override_operation(

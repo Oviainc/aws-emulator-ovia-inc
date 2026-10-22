@@ -146,15 +146,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // hands it to every service.
             crate::scaffolded::Scaffolded::not_implemented("GetAssistant")
         })?;
-        let mut store = state.lock();
+        let store = state.lock();
 
         let Some(assistant) = store.assistant(&input.assistant_id) else {
             return Err(GetAssistantErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No assistant {} exists in this account.",
-                        input.assistant_id
-                    )),
+                    // The service's own fixed text for the condition; the label the
+                    // request used travels in `resourceName`.
+                    message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
                     resource_name: Some(input.assistant_id.clone()),
                 },
             )

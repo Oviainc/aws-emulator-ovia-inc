@@ -15,23 +15,18 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_qconnect_wisdomservice::state::{
-    ASSISTANT_STATUS_ACTIVE, ASSISTANT_STATUS_CREATE_IN_PROGRESS, CREATE_TRANSITION,
-    MAX_ASSISTANTS, MAX_SESSIONS_PER_ASSISTANT, SESSION_ORIGIN_CUSTOMER,
+    ASSISTANT_CAPABILITY_V2, ASSISTANT_STATUS_ACTIVE, DEFAULT_AI_AGENT_TYPES, MAX_ASSISTANTS,
+    MAX_SESSIONS_PER_ASSISTANT, SESSION_ORIGIN_CUSTOMER,
 };
 use service_com_amazonaws_qconnect_wisdomservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every test signs with unless it is exercising the region rule itself.
 const REGION: &str = "us-east-1";
-
-/// Comfortably past [`CREATE_TRANSITION`], so the `CREATE_IN_PROGRESS` -> `ACTIVE`
-/// move the clock owes a fresh assistant has come due.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
 /// `maxResults` is `range 1..100` on `ListAssistants`
 /// (`smithy_query(query="operation",operation="ListAssistants")`).
@@ -45,6 +40,13 @@ const AI_AGENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 
 /// A UUID no create ever mints, for the not-found assertions.
 const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// The service's fixed sentence for each refusal condition these tests reach, written
+/// out here rather than imported from `state.rs` so the assertion states the text
+/// instead of restating the implementation's constant.
+const MESSAGE_ASSISTANT_NOT_FOUND: &str = "Assistant does not exist.";
+const MESSAGE_NAME_IN_USE: &str = "Name is already in use";
+const MESSAGE_UNAUTHORIZED: &str = "Unauthorized";
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
@@ -303,16 +305,15 @@ fn assistant_cases() -> Vec<AssistantCase> {
 
 /// Assert a reply reports exactly the assistant `expected` was created with.
 ///
-/// `allowed_statuses` is a SET, not one value: a read that may have landed after the
-/// `CREATE_IN_PROGRESS` -> `ACTIVE` transition fell due must accept either, or the
-/// assertion would be a race with the clock rather than a statement about the record.
+/// The status is pinned to the one terminal value: the service answers a create with the
+/// assistant already `ACTIVE`, so there is no transition to race with and every read
+/// reports the same status as the create.
 fn assert_reported_assistant(
     label: &str,
     reply: &Reply,
     expected: &AssistantCase,
     assistant_id: &str,
     region: &str,
-    allowed_statuses: &[&str],
 ) {
     assert_eq!(
         reply.status, 200,
@@ -344,11 +345,10 @@ fn assert_reported_assistant(
         reply.string("/assistant/type")
     );
     let status = reply.string("/assistant/status");
-    assert!(
-        status
-            .as_deref()
-            .is_some_and(|status| allowed_statuses.contains(&status)),
-        "case {label:?}: expected one of {allowed_statuses:?}, got {status:?}"
+    assert_eq!(
+        status.as_deref(),
+        Some(ASSISTANT_STATUS_ACTIVE),
+        "case {label:?}: expected {ASSISTANT_STATUS_ACTIVE}, got {status:?}"
     );
     assert_eq!(
         reply.string("/assistant/description"),
@@ -357,10 +357,11 @@ fn assert_reported_assistant(
         reply.string("/assistant/description")
     );
     let reported_tags = reply.field("/assistant/tags").cloned();
-    let expected_tags = (!expected.tags.is_empty()).then(|| json!(expected.tags));
+    let expected_tags = Some(json!(expected.tags));
     assert_eq!(
         reported_tags, expected_tags,
-        "case {label:?}: expected the stored tags {expected_tags:?}, got {reported_tags:?}"
+        "case {label:?}: expected the stored tags {expected_tags:?} (the `tags` member is \
+         reported for every assistant, empty when it carries none), got {reported_tags:?}"
     );
     let reported_key = reply.string("/assistant/serverSideEncryptionConfiguration/kmsKeyId");
     assert_eq!(
@@ -368,19 +369,51 @@ fn assert_reported_assistant(
         "case {label:?}: expected the stored kmsKeyId {:?}, got {reported_key:?}",
         expected.kms_key_id
     );
+    assert_reported_assistant_configuration(label, reply);
 }
 
-/// The statuses an assistant created at `started` may legally report right now: only
-/// the transient one while the transition is not yet due, either once it is. Keeps the
-/// round-trip assertions a statement about the record rather than a race with the clock;
-/// `a_fresh_assistant_settles_to_active_when_the_clock_owes_it` is where the transition
-/// itself is pinned.
-fn settling_statuses(started: std::time::Instant) -> &'static [&'static str] {
-    if started.elapsed() < CREATE_TRANSITION {
-        &[ASSISTANT_STATUS_CREATE_IN_PROGRESS]
-    } else {
-        &[ASSISTANT_STATUS_CREATE_IN_PROGRESS, ASSISTANT_STATUS_ACTIVE]
-    }
+/// The configuration members of the reported assistant: the capability it was
+/// provisioned with, the topic it streams through, a binding per default AI agent type
+/// and an (empty) orchestrator list. `tests/all/assistant_configuration.rs` is where
+/// each of those values is pinned; here they are only shown to be reported by every
+/// operation that reports an assistant.
+fn assert_reported_assistant_configuration(label: &str, reply: &Reply) {
+    let capability = reply.string("/assistant/capabilityConfiguration/type");
+    assert_eq!(
+        capability.as_deref(),
+        Some(ASSISTANT_CAPABILITY_V2),
+        "case {label:?}: expected capabilityConfiguration.type {ASSISTANT_CAPABILITY_V2}, \
+         got {capability:?}"
+    );
+    let topic = reply.string("/assistant/integrationConfiguration/topicIntegrationArn");
+    assert!(
+        topic
+            .as_deref()
+            .is_some_and(|arn| arn.starts_with("arn:aws:sns:")),
+        "case {label:?}: expected the assistant's SNS topic ARN, got {topic:?}"
+    );
+    let agents = reply
+        .body
+        .pointer("/assistant/aiAgentConfiguration")
+        .and_then(Value::as_object)
+        .map(|bound| bound.len());
+    assert_eq!(
+        agents,
+        Some(DEFAULT_AI_AGENT_TYPES.len()),
+        "case {label:?}: expected a binding for each of the {} default AI agent types, \
+         got {agents:?}",
+        DEFAULT_AI_AGENT_TYPES.len()
+    );
+    let orchestrators = reply
+        .body
+        .pointer("/assistant/orchestratorConfigurationList")
+        .cloned();
+    assert_eq!(
+        orchestrators,
+        Some(json!([])),
+        "case {label:?}: expected orchestratorConfigurationList reported empty, \
+         got {orchestrators:?}"
+    );
 }
 
 /// A create is observable: the assistant every read reports is the one the create
@@ -391,7 +424,6 @@ async fn an_assistant_round_trips_through_every_read() {
 
     for case in assistant_cases() {
         let label = case.label;
-        let started = std::time::Instant::now();
         let created = emulator.create_assistant(REGION, case.create_body()).await;
         let assistant_id = created
             .string("/assistant/assistantId")
@@ -400,36 +432,15 @@ async fn an_assistant_round_trips_through_every_read() {
             is_modelled_uuid(&assistant_id),
             "case {label:?}: expected a lowercase-hex UUID assistantId, got {assistant_id:?}"
         );
-        assert_reported_assistant(
-            label,
-            &created,
-            &case,
-            &assistant_id,
-            REGION,
-            settling_statuses(started),
-        );
+        assert_reported_assistant(label, &created, &case, &assistant_id, REGION);
 
         // Read back by the bare id, and by the full ARN the create returned: the
         // modelled `UuidOrArn` label admits both and they name the same record.
         let by_id = emulator.get_assistant(REGION, &assistant_id).await;
-        assert_reported_assistant(
-            label,
-            &by_id,
-            &case,
-            &assistant_id,
-            REGION,
-            settling_statuses(started),
-        );
+        assert_reported_assistant(label, &by_id, &case, &assistant_id, REGION);
         let arn = expected_assistant_arn(REGION, &assistant_id);
         let by_arn = emulator.get_assistant(REGION, &arn).await;
-        assert_reported_assistant(
-            label,
-            &by_arn,
-            &case,
-            &assistant_id,
-            REGION,
-            settling_statuses(started),
-        );
+        assert_reported_assistant(label, &by_arn, &case, &assistant_id, REGION);
 
         // And the same values appear in the list, whose summaries are built from the
         // same stored record.
@@ -447,14 +458,7 @@ async fn an_assistant_round_trips_through_every_read() {
             error_type: String::new(),
             body: json!({ "assistant": summary }),
         };
-        assert_reported_assistant(
-            label,
-            &as_reply,
-            &case,
-            &assistant_id,
-            REGION,
-            settling_statuses(started),
-        );
+        assert_reported_assistant(label, &as_reply, &case, &assistant_id, REGION);
     }
 }
 
@@ -491,13 +495,12 @@ async fn an_assistant_arn_names_the_signed_region() {
     }
 }
 
-/// Creation is asynchronous: a fresh assistant reports the transient
-/// `CREATE_IN_PROGRESS` and the clock owes it `ACTIVE`. The span is never zero, so a
-/// caller reading straight after the create still sees the transient status.
+/// The service answers a create with the assistant already in its terminal `ACTIVE`
+/// status, so a resource it returns ready stays ready: the create, every read and the
+/// list all report the same status, with no transition in between.
 #[tokio::test]
-async fn a_fresh_assistant_settles_to_active_when_the_clock_owes_it() {
+async fn a_created_assistant_is_active_and_stays_active() {
     let emulator = Emulator::new();
-    let started = std::time::Instant::now();
 
     let created = emulator
         .create_assistant(REGION, json!({ "name": "settling", "type": "AGENT" }))
@@ -505,29 +508,25 @@ async fn a_fresh_assistant_settles_to_active_when_the_clock_owes_it() {
     let assistant_id = created
         .string("/assistant/assistantId")
         .unwrap_or_else(|| panic!("no assistantId in {}", created.body));
+    assert_eq!(
+        created.string("/assistant/status").as_deref(),
+        Some(ASSISTANT_STATUS_ACTIVE),
+        "case {:?}: expected {ASSISTANT_STATUS_ACTIVE} in the create's own answer, got {:?}",
+        "the create's answer",
+        created.string("/assistant/status")
+    );
 
-    if started.elapsed() < CREATE_TRANSITION {
-        let early = emulator.get_assistant(REGION, &assistant_id).await;
+    for case in ["first read", "second read"] {
+        let read = emulator.get_assistant(REGION, &assistant_id).await;
         assert_eq!(
-            early.string("/assistant/status").as_deref(),
-            Some(ASSISTANT_STATUS_CREATE_IN_PROGRESS),
-            "case {:?}: expected {ASSISTANT_STATUS_CREATE_IN_PROGRESS} before the \
-             {CREATE_TRANSITION:?} span elapsed, got {:?}",
-            "read within the transition span",
-            early.string("/assistant/status")
+            read.string("/assistant/status").as_deref(),
+            Some(ASSISTANT_STATUS_ACTIVE),
+            "case {case:?}: expected {ASSISTANT_STATUS_ACTIVE}, got {:?}",
+            read.string("/assistant/status")
         );
     }
 
-    std::thread::sleep(PAST_TRANSITION);
-    let settled = emulator.get_assistant(REGION, &assistant_id).await;
-    assert_eq!(
-        settled.string("/assistant/status").as_deref(),
-        Some(ASSISTANT_STATUS_ACTIVE),
-        "case {:?}: expected {ASSISTANT_STATUS_ACTIVE} once the transition fell due, got {:?}",
-        "read past the transition span",
-        settled.string("/assistant/status")
-    );
-    // The terminal status is stable, and the list reports the same one as the read.
+    // The list reports the same status as the read, out of the same record.
     let listed = emulator.list_assistants(REGION, "").await;
     let status = listed
         .field("/assistantSummaries")
@@ -539,8 +538,8 @@ async fn a_fresh_assistant_settles_to_active_when_the_clock_owes_it() {
     assert_eq!(
         status.as_deref(),
         Some(ASSISTANT_STATUS_ACTIVE),
-        "case {:?}: expected the list to report the settled status, got {status:?}",
-        "list past the transition span"
+        "case {:?}: expected the list to report the stored status, got {status:?}",
+        "the list"
     );
 }
 
@@ -677,10 +676,11 @@ fn assert_reported_session(
         reply.string("/session/origin")
     );
     let reported_tags = reply.field("/session/tags").cloned();
-    let expected_tags = (!expected.tags.is_empty()).then(|| json!(expected.tags));
+    let expected_tags = Some(json!(expected.tags));
     assert_eq!(
         reported_tags, expected_tags,
-        "case {label:?}: expected the stored tags {expected_tags:?}, got {reported_tags:?}"
+        "case {label:?}: expected the stored tags {expected_tags:?} (the `tags` member is \
+         reported for every session, empty when it carries none), got {reported_tags:?}"
     );
     let reported_filter = reply.field("/session/tagFilter").cloned();
     assert_eq!(
@@ -858,6 +858,21 @@ async fn an_unknown_assistant_is_not_found() {
                 reply.error_type,
                 reply.body
             );
+            // The service's fixed text for the condition, naming nothing from the
+            // request; the label the request used travels in `resourceName`.
+            assert_eq!(
+                reply.string("/message").as_deref(),
+                Some(MESSAGE_ASSISTANT_NOT_FOUND),
+                "case {label:?}/{op}: expected {MESSAGE_ASSISTANT_NOT_FOUND:?}, got {:?}",
+                reply.string("/message")
+            );
+            assert_eq!(
+                reply.string("/resourceName").as_deref(),
+                Some(addressed.as_str()),
+                "case {label:?}/{op}: expected resourceName to name the addressed label, \
+                 got {:?}",
+                reply.string("/resourceName")
+            );
         }
     }
 
@@ -1002,6 +1017,12 @@ async fn a_duplicate_assistant_name_conflicts() {
             "case {label:?}: expected HTTP 409 for a duplicate name, got {} with body {}",
             again.status, again.body
         );
+        assert_eq!(
+            again.string("/message").as_deref(),
+            Some(MESSAGE_NAME_IN_USE),
+            "case {label:?}: expected the service's fixed text {MESSAGE_NAME_IN_USE:?}, got {:?}",
+            again.string("/message")
+        );
         assert!(
             again.error_type.contains("ConflictException"),
             "case {label:?}: expected ConflictException, got {:?} with body {}",
@@ -1102,31 +1123,72 @@ async fn a_replayed_client_token_answers_with_the_first_resource() {
     }
 }
 
-/// Creating a session under an assistant that does not exist is reported before
-/// anything is minted.
+/// Creating a session under an assistant this account does not hold is refused before
+/// anything is minted — with the modelled `UnauthorizedException` (HTTP 401), which is
+/// what this path answers for a parent it cannot resolve, whichever legal label form
+/// names that parent, including an ARN this emulator could not have minted (another
+/// account, another partition), which names no resource of this account.
 #[tokio::test]
-async fn creating_a_session_under_an_unknown_assistant_is_not_found() {
+async fn creating_a_session_under_an_unknown_assistant_is_refused() {
     let emulator = Emulator::new();
+    // A live assistant, so a foreign-account ARN carrying a REAL assistant id is covered
+    // too: the ARN names no assistant of this account, so the create is refused the same
+    // way as one naming an id nothing holds.
+    let live = emulator
+        .create_assistant(REGION, json!({ "name": "live-parent", "type": "AGENT" }))
+        .await;
+    let live_id = live
+        .string("/assistant/assistantId")
+        .unwrap_or_else(|| panic!("no assistantId in {}", live.body));
 
     for (label, parent) in [
-        ("bare uuid", ABSENT_UUID.to_string()),
-        ("full arn", expected_assistant_arn(REGION, ABSENT_UUID)),
+        ("bare uuid nothing holds", ABSENT_UUID.to_string()),
+        (
+            "this account's arn for an absent id",
+            expected_assistant_arn(REGION, ABSENT_UUID),
+        ),
+        (
+            "another account's arn for a live id",
+            format!("arn:aws:wisdom:{REGION}:123456789012:assistant/{live_id}"),
+        ),
+        (
+            "another partition's arn for a live id",
+            format!(
+                "arn:aws-cn:wisdom:{REGION}:{}:assistant/{live_id}",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+        ),
     ] {
         let reply = emulator
             .create_session(REGION, &parent, json!({ "name": "orphan" }))
             .await;
         assert_eq!(
-            reply.status, 404,
-            "case {label:?}: expected HTTP 404, got {} with body {}",
+            reply.status, 401,
+            "case {label:?}: expected HTTP 401, got {} with body {}",
             reply.status, reply.body
         );
         assert!(
-            reply.error_type.contains("ResourceNotFoundException"),
-            "case {label:?}: expected ResourceNotFoundException, got {:?} with body {}",
+            reply.error_type.contains("UnauthorizedException"),
+            "case {label:?}: expected UnauthorizedException, got {:?} with body {}",
             reply.error_type,
             reply.body
         );
+        assert_eq!(
+            reply.string("/message").as_deref(),
+            Some(MESSAGE_UNAUTHORIZED),
+            "case {label:?}: expected the service's fixed text {MESSAGE_UNAUTHORIZED:?}, \
+             got {:?}",
+            reply.string("/message")
+        );
     }
+
+    // And the assistant those foreign ARNs named survives the refusals.
+    let sessions_parent = emulator.get_assistant(REGION, &live_id).await;
+    assert_eq!(
+        sessions_parent.status, 200,
+        "case \"live parent after the refusals\": expected HTTP 200, got {} with body {}",
+        sessions_parent.status, sessions_parent.body
+    );
 }
 
 /// `ListAssistants` pages over every stored assistant exactly once at any page size,

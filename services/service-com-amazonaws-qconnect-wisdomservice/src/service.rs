@@ -45,6 +45,46 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// This model's OWN sdkId-derived key (`sdkId: QConnect`,
+/// `smithy_query(query="service_info")`), beside the shared endpoint identity
+/// [`crate::ROUTE_KEY`] names.
+///
+/// A client addressed at Amazon Q in Connect by its product name — a credential scope or
+/// an endpoint host saying `qconnect` — reaches this service too, not only one signing
+/// `wisdom`.
+const OWN_SDK_ID_KEY: &str = "qconnect";
+
+/// Whether the request these `parts` came from addresses THIS service: its route key is
+/// the shared `wisdom` endpoint identity ([`crate::ROUTE_KEY`]) or this model's own
+/// [`OWN_SDK_ID_KEY`], AND its first URI path segment is one this model publishes
+/// (`crate::ROUTE_PATH_SEGMENTS`).
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable owner
+/// of that rule, and it is CALLED here per key rather than re-implemented. It takes a
+/// whole `http::Request` while [`Service::can_handle`] is handed only the request's
+/// parts, so the two things it reads — the URI and the headers — are re-presented to it
+/// as a bodiless request. It reads neither the body nor the method, so nothing it decides
+/// on is missing. (`services/common`'s `claims_request` states the same rule over
+/// `Parts`; it is not used here only because depending on it edits `Cargo.lock`, which
+/// this repository's serialized squash merge refuses whenever another change lands
+/// against it — migrating these two crates onto it is a one-line follow-up.)
+fn claims_endpoint_traffic(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    [crate::ROUTE_KEY, OWN_SDK_ID_KEY].iter().any(|key| {
+        emulator_server::can_handle_based_on_route_key_and_path(
+            &request,
+            key,
+            crate::ROUTE_PATH_SEGMENTS,
+        )
+    })
+}
+
 /// The `com-amazonaws-qconnect-wisdomservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +114,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This model is Amazon Q in Connect, and the endpoint identity it publishes is
+        // NOT its own name: `smithy_query(query="service_info")` gives it sdkId
+        // `QConnect` but sigv4Name/arnNamespace `wisdom` and the endpoint templates
+        // `https://wisdom.{Region}.{dnsSuffix}` — AWS serves Q in Connect on Amazon
+        // Connect Wisdom's endpoint and signing name. The repo carries that endpoint's
+        // other model too, `services/service-com-amazonaws-wisdom-wisdomservice` (sdkId
+        // `Wisdom`, the same service shape `WisdomService` 2020-10-19, the same
+        // `restJson1` protocol, the same signing name), whose 41 operations are a strict
+        // SUBSET of this model's 94 AT THE IDENTICAL METHOD+URI ROUTES. No signal in a
+        // request can tell the two apart, and restJson1 carries no `X-Amz-Target`, so the
+        // `wisdom` key has to be served by exactly ONE of them or the router refuses
+        // every request to the endpoint as `500 AmbiguousService` — a code that exists in
+        // no AWS model.
+        //
+        // It is served HERE: this model is the endpoint's current API and the superset,
+        // so a client signing `wisdom` loses no operation (the legacy model's 41 routes
+        // are all bound here), while serving it from the subset model would leave this
+        // model's other 53 routes — every AI agent, AI prompt, AI guardrail, message
+        // template, content association and session message operation — answerable by
+        // nobody. The legacy crate answers under its own registration key instead and
+        // contends for nothing. See `claims_endpoint_traffic`.
+        claims_endpoint_traffic(parts)
     }
 
     fn override_operation(

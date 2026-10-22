@@ -161,14 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // hands it to every service.
             crate::scaffolded::Scaffolded::not_implemented("GetSession")
         })?;
-        let mut store = state.lock();
+        let store = state.lock();
 
         let Some(assistant) = store.assistant(&input.assistant_id) else {
             return Err(not_found(
-                &format!(
-                    "No assistant {} exists in this account.",
-                    input.assistant_id
-                ),
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
                 &input.assistant_id,
             ));
         };
@@ -177,10 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(crate::state::resolve_id(&input.session_id))
         else {
             return Err(not_found(
-                &format!(
-                    "No session {} exists under assistant {}.",
-                    input.session_id, input.assistant_id
-                ),
+                crate::state::MESSAGE_SESSION_NOT_FOUND,
                 &input.session_id,
             ));
         };

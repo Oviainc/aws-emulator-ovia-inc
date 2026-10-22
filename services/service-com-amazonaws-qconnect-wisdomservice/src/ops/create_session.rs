@@ -2,11 +2,12 @@
 
 //! @op CreateSession
 //!
-//! Resolves the parent assistant first (unknown parent -> `ResourceNotFoundException`),
-//! then mints a session, stores it UNDER that assistant, and answers out of the stored
-//! record. A session created through this API carries `origin` = `CUSTOMER`, which is
-//! what the model documents for it. A replayed `clientToken` answers with the session
-//! that token already created.
+//! Resolves the parent assistant first — a parent this account does not hold is the
+//! modelled `UnauthorizedException` (401), which is what this path answers for an
+//! assistant it cannot resolve — then mints a session, stores it UNDER that assistant,
+//! and answers out of the stored record. A session created through this API carries
+//! `origin` = `CUSTOMER`, which is what the model documents for it. A replayed
+//! `clientToken` answers with the session that token already created.
 //!
 //! ## Shape of an operation
 //!
@@ -182,19 +183,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // The parent is resolved first: a session exists only inside an assistant, so an
-        // unknown parent is reported before anything is minted.
+        // The parent is resolved first: a session exists only inside an assistant. The
+        // recorded wire answer for a session create whose assistant this account does
+        // not hold is the modelled `UnauthorizedException` (HTTP 401), not a not-found:
+        // this path authorizes the caller against the parent assistant before resolving
+        // it, so an assistant that is not there is a caller that may not act on it. The
+        // read paths (`GetAssistant`, `GetSession`) resolve the resource first and
+        // answer `ResourceNotFoundException` (404).
         let Some(assistant_id) = store
             .assistant(&input.assistant_id)
             .map(|assistant| assistant.assistant_id.clone())
         else {
-            return Err(CreateSessionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "No assistant {} exists in this account.",
-                        input.assistant_id
-                    )),
-                    resource_name: Some(input.assistant_id.clone()),
+            return Err(CreateSessionErrorModeled::UnauthorizedException(
+                UnauthorizedException {
+                    message: Some(crate::state::MESSAGE_UNAUTHORIZED.to_string()),
                 },
             )
             .into());

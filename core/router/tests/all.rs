@@ -87,6 +87,8 @@ mod shared_signing_name_routing;
 mod transcribe_signing_name_routing;
 #[path = "all/transfer_user_with_iam_role.rs"]
 mod transfer_user_with_iam_role;
+#[path = "all/wisdom_qconnect_signing_name_routing.rs"]
+mod wisdom_qconnect_signing_name_routing;
 
 // Declared last, out of the sorted order above, on purpose: every new router suite adds
 // a line to this file, and a line inserted in the middle of the list conflicts with
