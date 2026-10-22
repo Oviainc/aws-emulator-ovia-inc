@@ -2,11 +2,14 @@
 
 //! Engine state for the com-amazonaws-ivschat-amazoninteractivevideoservicechat service.
 //!
-//! The chat `Room` is this service's one persisted resource: `CreateRoom` mints it,
+//! This service persists two resources. The chat `Room`: `CreateRoom` mints it,
 //! `GetRoom`/`ListRooms` report it, `UpdateRoom` mutates it and `DeleteRoom` removes it
-//! together with every chat token issued against it. Every response field an operation
-//! returns is read back out of the record stored here, so a create followed by a get
-//! answers exactly what was created.
+//! together with every chat token issued against it. The `LoggingConfiguration`:
+//! `CreateLoggingConfiguration` mints it, `GetLoggingConfiguration` and
+//! `ListLoggingConfigurations` report it, `UpdateLoggingConfiguration` mutates it and
+//! `DeleteLoggingConfiguration` removes it. Every response field an operation returns is
+//! read back out of the record stored here, so a create followed by a get answers exactly
+//! what was created.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -18,8 +21,9 @@ use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrai
 use ::aws_smithy_schema_server::envelope;
 
 use crate::ops::types::{
-    MessageReviewHandler, ResourceNotFoundException, ValidationException, ValidationExceptionField,
-    RESOURCE_TYPE_VALUES,
+    DestinationConfiguration, MessageReviewHandler, ResourceNotFoundException, ValidationException,
+    ValidationExceptionField, CREATE_LOGGING_CONFIGURATION_STATE_VALUES, RESOURCE_TYPE_VALUES,
+    UPDATE_LOGGING_CONFIGURATION_STATE_VALUES,
 };
 
 /// `CreateRoom`/`UpdateRoom` default for `maximumMessageRatePerSecond`, from the model's
@@ -108,6 +112,58 @@ pub const CHAT_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 /// `^[a-zA-Z0-9]+$`.
 pub const ROOM_ID_LEN: usize = 12;
 
+/// Length of a `LoggingConfigurationID`: the model constrains it to `len 12..12`, pattern
+/// `^[a-zA-Z0-9]+$`.
+pub const LOGGING_CONFIGURATION_ID_LEN: usize = 12;
+
+/// `ListLoggingConfigurations` default page size, from the model's own documentation of
+/// `maxResults` ("Maximum number of logging configurations to return. Default: 50.").
+pub const DEFAULT_MAX_LOGGING_CONFIGURATION_RESULTS: i32 = 50;
+
+/// The largest page `ListLoggingConfigurations` answers, from the modelled
+/// `MaxLoggingConfigurationResults` range 1..50.
+pub const MAX_LOGGING_CONFIGURATION_RESULTS: i32 = 50;
+
+/// How many logging configurations this store holds for one account in one Region.
+///
+/// The model carries no quota figure for this resource — only the per-room attachment
+/// limit (`LoggingConfigurationIdentifierList`, len 0..3) — so this is the emulator's own
+/// bound rather than a value read off the model: it is what keeps a repeated create from
+/// growing the process without limit, and `ServiceQuotaExceededException` (HTTP 402) is
+/// `CreateLoggingConfiguration`'s modelled refusal past it.
+pub const LOGGING_CONFIGURATIONS_PER_REGION: usize = 50;
+
+/// The ARN infix that names a logging configuration, from the modelled
+/// `LoggingConfigurationArn` pattern
+/// (`^arn:aws:ivschat:[a-z0-9-]+:[0-9]+:logging-configuration/[a-zA-Z0-9-]+$`).
+pub const LOGGING_CONFIGURATION_ARN_INFIX: &str = ":logging-configuration/";
+
+/// The state `CreateLoggingConfiguration` reports a configuration it just minted in.
+///
+/// `CreateLoggingConfigurationState` carries exactly one value, so a configuration that
+/// call answers is already ready to log: the transient members of
+/// `LoggingConfigurationState` (`CREATING`, `UPDATING`, `DELETING`, the `*_FAILED` ones)
+/// are states this operation never returns, and the clock owes the resource no transition.
+pub fn created_logging_configuration_state() -> &'static str {
+    CREATE_LOGGING_CONFIGURATION_STATE_VALUES
+        .first()
+        .copied()
+        .unwrap_or("ACTIVE")
+}
+
+/// The state `UpdateLoggingConfiguration` reports a configuration it just updated in.
+///
+/// Read off `UpdateLoggingConfigurationState`'s own catalog rather than the create one, so
+/// each operation reports the enum the model binds to IT even if the two ever diverge.
+/// That enum also carries exactly one value, so an update answers a configuration that is
+/// ready to log again.
+pub fn updated_logging_configuration_state() -> &'static str {
+    UPDATE_LOGGING_CONFIGURATION_STATE_VALUES
+        .first()
+        .copied()
+        .unwrap_or("ACTIVE")
+}
+
 /// The alphabet room ids and chat tokens are rendered in — exactly the character set
 /// `RoomID`'s `^[a-zA-Z0-9]+$` pattern admits.
 const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -115,6 +171,7 @@ const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop
 /// Domain separators mixed into the mint counter, so a room id and a chat token minted at
 /// the same counter value are different strings.
 const ROOM_ID_DOMAIN: u64 = 0x524f_4f4d_5f49_4400; // "ROOM_ID"
+const LOGGING_CONFIGURATION_ID_DOMAIN: u64 = 0x4c4f_4747_5f49_4400; // "LOG_ID"
 const CHAT_TOKEN_DOMAIN: u64 = 0x544f_4b45_4e5f_3031; // "TOKEN_01"
 const CHAT_TOKEN_DOMAIN_HI: u64 = 0x544f_4b45_4e5f_3032; // "TOKEN_02"
 
@@ -157,6 +214,26 @@ pub struct Room {
     pub tags: BTreeMap<String, String>,
 }
 
+/// A logging configuration, as `CreateLoggingConfiguration` persisted it and the
+/// reporting operations render it.
+#[derive(Debug, Clone)]
+pub struct LoggingConfiguration {
+    /// System-generated `LoggingConfigurationID`: 12 characters, `^[a-zA-Z0-9]+$`.
+    pub id: String,
+    /// `arn:aws:ivschat:<region>:<account>:logging-configuration/<id>`, built through
+    /// `engine::emulator_arn`.
+    pub arn: String,
+    pub name: Option<String>,
+    pub create_time: SystemTime,
+    pub update_time: SystemTime,
+    /// The one destination chat content is logged to: the modelled
+    /// `DestinationConfiguration` union, so exactly one of s3/cloudWatchLogs/firehose.
+    pub destination_configuration: DestinationConfiguration,
+    /// A member of the modelled `LoggingConfigurationState` enum.
+    pub state: String,
+    pub tags: BTreeMap<String, String>,
+}
+
 /// A chat token minted by `CreateChatToken` against a room.
 #[derive(Debug, Clone)]
 pub struct ChatToken {
@@ -177,6 +254,9 @@ pub struct ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
     pub rooms: BTreeMap<String, Room>,
     /// Chat tokens keyed by the token string itself.
     pub chat_tokens: BTreeMap<String, ChatToken>,
+    /// Logging configurations keyed by `LoggingConfigurationID`, so a lookup by id or ARN
+    /// is one map hit.
+    pub logging_configurations: BTreeMap<String, LoggingConfiguration>,
     /// Monotonic mint counter. Never decreases, so an id is never reused after a delete.
     minted: u64,
 }
@@ -241,6 +321,87 @@ impl ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
         self.rooms.len() >= ROOMS_PER_REGION
     }
 
+    /// Mint a fresh `LoggingConfigurationID`: 12 characters from `^[a-zA-Z0-9]+$`, unique
+    /// within this store.
+    pub fn mint_logging_configuration_id(&mut self) -> String {
+        self.minted = self.minted.wrapping_add(1);
+        base62_fixed(
+            mix64(self.minted ^ LOGGING_CONFIGURATION_ID_DOMAIN),
+            LOGGING_CONFIGURATION_ID_LEN,
+        )
+    }
+
+    /// The `LoggingConfigurationID` a logging-configuration identifier names: the part
+    /// after `:logging-configuration/` of an ARN, or a bare id. Does NOT say whether that
+    /// configuration exists.
+    ///
+    /// The modelled `LoggingConfigurationIdentifier` pattern makes the boundary validator
+    /// refuse anything but an ARN before a handler runs, so the bare-id arm only serves
+    /// callers inside the emulator; an identifier this cannot read at all answers `None`.
+    pub fn logging_configuration_id_of(identifier: &str) -> Option<&str> {
+        if let Some((_, id)) = identifier.split_once(LOGGING_CONFIGURATION_ARN_INFIX) {
+            return (!id.is_empty()).then_some(id);
+        }
+        if !identifier.is_empty() && identifier.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Some(identifier);
+        }
+        None
+    }
+
+    /// The stored logging configuration an identifier names, if any.
+    pub fn logging_configuration(&self, identifier: &str) -> Option<&LoggingConfiguration> {
+        self.logging_configurations
+            .get(Self::logging_configuration_id_of(identifier)?)
+    }
+
+    /// The stored logging configuration an identifier names, for in-place mutation.
+    pub fn logging_configuration_mut(
+        &mut self,
+        identifier: &str,
+    ) -> Option<&mut LoggingConfiguration> {
+        let id = Self::logging_configuration_id_of(identifier)?.to_string();
+        self.logging_configurations.get_mut(&id)
+    }
+
+    /// Remove a logging configuration.
+    pub fn remove_logging_configuration(
+        &mut self,
+        identifier: &str,
+    ) -> Option<LoggingConfiguration> {
+        let id = Self::logging_configuration_id_of(identifier)?.to_string();
+        self.logging_configurations.remove(&id)
+    }
+
+    /// The ids of the rooms this logging configuration is currently attached to, in the
+    /// store's room order.
+    ///
+    /// A room holds its attachments as `LoggingConfigurationIdentifier` values, so the
+    /// comparison is on the id each identifier names rather than on the raw string: a room
+    /// attached by ARN and one attached by bare id name the same configuration.
+    pub fn rooms_attached_to_logging_configuration(&self, identifier: &str) -> Vec<String> {
+        let Some(wanted) = Self::logging_configuration_id_of(identifier) else {
+            return Vec::new();
+        };
+        self.rooms
+            .values()
+            .filter(|room| {
+                room.logging_configuration_identifiers
+                    .iter()
+                    .any(|attached| {
+                        Self::logging_configuration_id_of(attached) == Some(wanted)
+                    })
+            })
+            .map(|room| room.id.clone())
+            .collect()
+    }
+
+    /// Whether the store already holds this Region's bound of logging configurations, so
+    /// `CreateLoggingConfiguration` must answer the modelled
+    /// `ServiceQuotaExceededException` instead of minting another.
+    pub fn logging_configurations_at_quota(&self) -> bool {
+        self.logging_configurations.len() >= LOGGING_CONFIGURATIONS_PER_REGION
+    }
+
     /// Make room for one more chat-token record, keeping the set bounded.
     ///
     /// First drops every record whose session `now` has already ended — a change the clock
@@ -295,6 +456,63 @@ pub fn resource_not_found(identifier: &str) -> ResourceNotFoundException {
             .unwrap_or("ROOM")
             .to_string(),
     }
+}
+
+/// The modelled `ResourceNotFoundException` for a logging-configuration identifier that
+/// names no stored logging configuration.
+///
+/// `resourceId` is the `LoggingConfigurationID` the identifier named, which matches that
+/// member's `^[a-zA-Z0-9]+$` pattern. `resourceType` is the modelled `ResourceType`
+/// enum's only member — the enum carries exactly one value, so it is the only one the
+/// shape admits. The message is built from the request, so it names the identifier the
+/// caller has to fix.
+pub fn logging_configuration_not_found(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("Logging configuration not found for identifier {identifier}."),
+        resource_id: ComAmazonawsIvschatAmazoninteractivevideoservicechatState::logging_configuration_id_of(
+            identifier,
+        )
+        .unwrap_or_default()
+        .to_string(),
+        resource_type: RESOURCE_TYPE_VALUES
+            .first()
+            .copied()
+            .unwrap_or("ROOM")
+            .to_string(),
+    }
+}
+
+/// Render a page position as the opaque `nextToken` a paginated operation carries.
+///
+/// Hex-encoded so a caller cannot read or hand-build one: the only thing a client may do
+/// with a token is pass it back, which is what `@paginated` means. Each paginator chooses
+/// what its position string holds; this is only the codec they share.
+pub fn encode_pagination_token(position: &str) -> String {
+    hex::encode(position)
+}
+
+/// The page position an opaque `nextToken` names, or `None` when the value is not a token
+/// this service issued.
+pub fn decode_pagination_token(token: &str) -> Option<String> {
+    let position = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    (!position.is_empty()).then_some(position)
+}
+
+/// The region a resource a request creates lives in: the one the caller signed for, since
+/// an ARN names the region the request was addressed to. Falls back to the emulator's
+/// default region for a request that carries no SigV4 credential scope, and for a scope
+/// region the modelled ARN patterns (`[a-z0-9-]+`) would not admit.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    const DEFAULT_REGION: &str = "us-east-1";
+    emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| {
+            !region.is_empty()
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
 /// The modelled `ValidationException` for a request member this service refuses, with the

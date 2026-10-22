@@ -99,18 +99,16 @@ fn page_order(room: &crate::state::Room) -> PageKey {
     (::std::cmp::Reverse(millis), room.id.clone())
 }
 
-/// Render a page position as the opaque `nextToken` the response carries.
-///
-/// Hex-encoded so a caller cannot read or hand-build one: the only thing a client may do
-/// with a token is pass it back, which is what `@paginated` means.
+/// Render a page position as the opaque `nextToken` the response carries, through the
+/// codec in [`crate::state`] that every paginator in this crate shares.
 fn encode_page_token(key: &PageKey) -> String {
-    hex::encode(format!("{}:{}", key.0 .0, key.1))
+    crate::state::encode_pagination_token(&format!("{}:{}", key.0 .0, key.1))
 }
 
 /// The page position an opaque `nextToken` names, or `None` when the value is not a token
 /// this service issued.
 fn decode_page_token(token: &str) -> Option<PageKey> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let decoded = crate::state::decode_pagination_token(token)?;
     let (millis, id) = decoded.split_once(':')?;
     Some((::std::cmp::Reverse(millis.parse().ok()?), id.to_string()))
 }

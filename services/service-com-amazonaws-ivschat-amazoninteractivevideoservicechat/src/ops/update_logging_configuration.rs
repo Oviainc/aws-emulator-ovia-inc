@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members the request carries to the stored logging
+//! configuration in [`crate::state`] — a member the request omits is left unchanged —
+//! bumps its `updateTime` and reports the record as stored. Answers the modelled
+//! `ResourceNotFoundException` when `identifier` names no stored configuration.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A 501 from this operation would mean "nobody has written it yet"; it no longer
+//! answers one.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLoggingConfiguration"))
+        let _ = ctx;
+        // Modeled constraints are already refused BEFORE this handler runs, so reaching
+        // here means `identifier` satisfies the modelled `LoggingConfigurationIdentifier`
+        // pattern and `name` its length and pattern.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service. An engine this service cannot read its state
+            // from means the operation cannot be served at all, which is what 501 says.
+            crate::scaffolded::Scaffolded::not_implemented("UpdateLoggingConfiguration")
+        })?;
+
+        if crate::state::ComAmazonawsIvschatAmazoninteractivevideoservicechatState::logging_configuration_id_of(
+            &input.identifier,
+        )
+        .is_none()
+        {
+            return Err(UpdateLoggingConfigurationErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "identifier",
+                    format!(
+                        "identifier {} does not name a logging configuration: it must be a \
+                         logging-configuration ARN.",
+                        input.identifier
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(configuration) = store.logging_configuration_mut(&input.identifier) else {
+            return Err(
+                UpdateLoggingConfigurationErrorModeled::ResourceNotFoundException(
+                    crate::state::logging_configuration_not_found(&input.identifier),
+                )
+                .into(),
+            );
+        };
+
+        // A partial update: each member the request carries replaces the stored one, and
+        // one it omits leaves the stored value as it was.
+        if let Some(name) = input.name {
+            configuration.name = Some(name);
+        }
+        if let Some(destination) = input.destination_configuration {
+            configuration.destination_configuration = destination;
+        }
+        configuration.update_time = now;
+        // `UpdateLoggingConfigurationState` carries exactly one value, read off that
+        // operation's own catalog: the configuration this call answers is ready to log
+        // chat content. The modelled `ConflictException` is unreachable here for the same
+        // reason — no stored configuration is ever in a state that refuses an update, so
+        // this assignment never overwrites a state some other transition owed.
+        configuration.state = crate::state::updated_logging_configuration_state().to_string();
+
+        // Rendered out of the STORED record, so what this call answers is what a later
+        // `GetLoggingConfiguration` answers.
+        Ok(UpdateLoggingConfigurationOutput {
+            arn: Some(configuration.arn.clone()),
+            id: Some(configuration.id.clone()),
+            name: configuration.name.clone(),
+            create_time: Some(crate::state::as_date_time(configuration.create_time)),
+            update_time: Some(crate::state::as_date_time(configuration.update_time)),
+            destination_configuration: Some(configuration.destination_configuration.clone()),
+            state: Some(configuration.state.clone()),
+            tags: Some(
+                configuration
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+        })
     }
 }
