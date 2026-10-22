@@ -21,13 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Digests a request so a replayed @idempotencyToken can be told from the same token
+# reused for a different request.
+sha2 = { workspace = true }
+# Renders that digest, and the opaque pagination tokens the @paginated list operations
+# emit, as hex text.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

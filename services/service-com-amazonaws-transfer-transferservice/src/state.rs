@@ -2,9 +2,10 @@
 
 //! Engine state for the com-amazonaws-transfer-transferservice service.
 //!
-//! Everything AWS Transfer Family's server + user + AS2 profile lifecycle needs to
-//! answer a read from stored state lives here: the resource maps (servers, their users,
-//! the AS2 profiles, and the workflows a server's `WorkflowDetails` attach), the
+//! Everything AWS Transfer Family's server + user + AS2 profile + connector lifecycle
+//! needs to answer a read from stored state lives here: the resource maps (servers,
+//! their users, the AS2 profiles, the connectors, and the workflows a server's
+//! `WorkflowDetails` attach), the
 //! id-minting counter, the
 //! documented create-time defaults and the clock-due server state transitions (the
 //! `ServerTransition` rule `StartServer`/`StopServer` share), the ARN shapes, and the
@@ -173,6 +174,19 @@ pub const MAX_STORED_SERVERS: usize = 200;
 /// `len 1..50`), which the framework's boundary validator enforces before a handler
 /// runs. `DeleteUser` releases one record; `DeleteServer` releases all of a server's.
 pub const MAX_USERS_PER_SERVER: usize = 1_000;
+
+/// How many connectors the store holds before a connector create refuses with the
+/// modelled `ServiceUnavailableException` instead of growing.
+///
+/// Chosen on the same basis as [`MAX_STORED_SERVERS`] — the emulator's OWN bound on
+/// the store, not a claim about any account's quota. It is what stops `connectors`
+/// growing without end: every write consults
+/// [`ComAmazonawsTransferTransferserviceState::has_connector_capacity`] before it
+/// inserts, and `DeleteConnector` releases a record again. Each stored record is
+/// itself bounded by the modelled lengths of the members it holds (`Url`
+/// `len 0..255`), which the framework's boundary validator enforces before a handler
+/// runs, so the bound caps the map in bytes as well as in count.
+pub const MAX_STORED_CONNECTORS: usize = 200;
 
 /// How many AS2 profiles the store holds before `CreateProfile` refuses with the
 /// modelled `ServiceUnavailableException` instead of growing.
@@ -1165,6 +1179,29 @@ fn resolve_workflow_step(mut step: WorkflowStep) -> WorkflowStep {
     step
 }
 
+/// One stored AS2 or SFTP connector, keyed by its `ConnectorId`.
+///
+/// Holds the members a LISTING reports — `ListedConnector` is `{Arn, ConnectorId,
+/// Url}` — each RESOLVED when the connector is written, so no reader re-derives one.
+/// A write operation that reports more of a connector than a listing does
+/// (`DescribeConnector`'s `AccessRole`, `SftpConfig`, `Status`, …) extends THIS record
+/// rather than adding a second map beside it.
+#[derive(Debug, Clone)]
+pub struct Connector {
+    /// The minted `"c-" + 17 hex` identifier (`ConnectorId` is `^c-([0-9a-f]{17})$`).
+    pub connector_id: String,
+    /// `arn:aws:transfer:<region>:<account>:connector/<ConnectorId>`, as
+    /// [`connector_arn`] builds it.
+    pub arn: String,
+    /// The partner's AS2 or SFTP endpoint, exactly as the write supplied it.
+    ///
+    /// `Option` because `Url`'s own documentation makes it absent for one class of
+    /// connector: "For VPC Lattice type connectors, the URL must be null." Its
+    /// modelled `len 0..255` also admits the empty string, which is a PRESENT url and
+    /// stays distinct from an absent one.
+    pub url: Option<String>,
+}
+
 /// Per-service state for com-amazonaws-transfer-transferservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsTransferTransferserviceState {
@@ -1174,6 +1211,11 @@ pub struct ComAmazonawsTransferTransferserviceState {
     /// Users by `(ServerId, UserName)`, so one server's users are a contiguous,
     /// ordered range for `ListUsers`.
     pub users: BTreeMap<(String, String), User>,
+    /// Connectors by `ConnectorId` (`"c-" + 17 hex`). `BTreeMap` for the same reason
+    /// as [`Self::servers`]: `ListConnectors` pages it in a stable, resumable order.
+    /// BOUNDED by [`MAX_STORED_CONNECTORS`], which
+    /// [`Self::has_connector_capacity`] is the predicate for.
+    pub connectors: BTreeMap<String, Connector>,
     /// AS2 profiles by `ProfileId` (`"p-" + 17 hex`). `BTreeMap` so `ListProfiles`
     /// pages in a stable, resumable order, like [`Self::servers`].
     pub profiles: BTreeMap<String, Profile>,
@@ -1231,6 +1273,17 @@ impl ComAmazonawsTransferTransferserviceState {
     /// [`MAX_STORED_SERVERS`].
     pub fn has_server_capacity(&self) -> bool {
         self.servers.len() < MAX_STORED_SERVERS
+    }
+
+    /// Whether the store can take another connector, i.e. is below
+    /// [`MAX_STORED_CONNECTORS`].
+    ///
+    /// The connector counterpart of [`Self::has_server_capacity`]: a connector write
+    /// consults this BEFORE inserting and refuses with the modelled
+    /// `ServiceUnavailableException` when it answers `false`, so no caller can grow the
+    /// map without end.
+    pub fn has_connector_capacity(&self) -> bool {
+        self.connectors.len() < MAX_STORED_CONNECTORS
     }
 
     /// Whether the store can take another AS2 profile, i.e. is below
@@ -1302,6 +1355,11 @@ pub fn user_arn(region: &str, server_id: &str, user_name: &str) -> String {
         region,
         &format!("user/{server_id}/{user_name}"),
     )
+}
+
+/// `arn:aws:transfer:<region>:<account>:connector/<ConnectorId>`.
+pub fn connector_arn(region: &str, connector_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("connector/{connector_id}"))
 }
 
 /// `arn:aws:transfer:<region>:<account>:workflow/<WorkflowId>`.

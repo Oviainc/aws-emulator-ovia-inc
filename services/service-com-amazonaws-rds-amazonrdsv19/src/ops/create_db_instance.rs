@@ -393,6 +393,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A value this service can resolve for itself is resolved BEFORE anything is
+        // stored, and before the duplicate-identifier check below: a request that is
+        // wrong in its parameters is refused for the parameter, not for a conflict the
+        // caller cannot see and cannot fix. `Engine` is resolved against the value list
+        // its member publishes and `DBInstanceClass` against the published DB instance
+        // class form; `EngineVersion` is resolved against the engine-version report
+        // below, where the entry it resolves to is also what the record stores.
+        crate::state::check_engine(&input.engine)
+            .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+        crate::state::check_db_instance_class(&input.db_instance_class)
+            .map_err(CreateDBInstanceError::invalid_parameter_value)?;
+        // Resolved here, before the store is touched, so a request naming a version
+        // this service cannot provision is refused for the version and leaves no
+        // instance behind.
+        let resolved_version = crate::ops::describe_db_engine_versions::resolve_version(
+            &input.engine,
+            input.engine_version.as_deref(),
+        )
+        .map_err(CreateDBInstanceError::invalid_parameter_combination)?;
+
         // No store means this service was mounted on an engine it has no state in,
         // so it cannot serve the operation at all. Unreachable with the engine the
         // router builds; 501 is the honest answer, never a fabricated success.
@@ -401,6 +421,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
         store.settle_due_transitions(&region);
+
+        // Every resource this request REFERENCES by name is resolved in the store
+        // before the instance is inserted, and a name that resolves to nothing is that
+        // resource type's modelled not-found fault: a create AWS would never have
+        // accepted must leave no instance behind for a later call to find.
+        //
+        // `DBSubnetGroupName`: "This value is stored as a lowercase string", so it is
+        // folded the way `CreateDBSubnetGroup` stores it.
+        let db_subnet_group_name = input
+            .db_subnet_group_name
+            .as_ref()
+            .map(|name| name.to_ascii_lowercase());
+        if let Some(name) = &db_subnet_group_name {
+            if store.resolve_db_subnet_group(&region, name).is_none() {
+                return Err(CreateDBInstanceErrorModeled::DBSubnetGroupNotFoundFault(
+                    DBSubnetGroupNotFoundFault {
+                        message: Some(format!("DBSubnetGroup '{name}' not found.")),
+                    },
+                )
+                .into());
+            }
+        }
+        // `OptionGroupName` and `DBParameterGroupName` are NOT resolved the same way,
+        // and deliberately: alongside every engine major version AWS creates a DEFAULT
+        // option group and DB parameter group (`default:mysql-8-0`, `default.mysql8.0`)
+        // that no request creates and this service does not hold, so refusing every
+        // name it has no record of would refuse the groups AWS itself provides. They
+        // are stored as given — which is what lets `DeleteOptionGroup` see that an
+        // instance is using a group — and left to the issues that model those groups.
 
         let key = (region.clone(), identifier.clone());
         if store.db_instances.contains_key(&key) {
@@ -463,7 +512,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let publicly_accessible = input.publicly_accessible.unwrap_or_else(|| {
             crate::state::default_publicly_accessible(
                 &input.engine,
-                input.db_subnet_group_name.as_deref(),
+                db_subnet_group_name.as_deref(),
             )
         });
         // RDS picks "a random, system-chosen Availability Zone in the endpoint's
@@ -472,16 +521,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let availability_zone = input
             .availability_zone
             .unwrap_or_else(|| format!("{region}a"));
-        // The version the instance RUNS, resolved through the engine-version catalogue
-        // `DescribeDBEngineVersions` publishes — never the request's string echoed
-        // back. The resolved entry also names the DB parameter group family and the
-        // major engine version the instance's default parameter group and option group
-        // are named after, so the three cannot disagree.
-        let resolved_version = crate::ops::describe_db_engine_versions::resolve_version(
-            &input.engine,
-            input.engine_version.as_deref(),
-        )
-        .map_err(CreateDBInstanceError::validation)?;
+        // The version the instance RUNS, resolved above through the engine-version
+        // catalogue `DescribeDBEngineVersions` publishes — never the request's string
+        // echoed back. The resolved entry also names the DB parameter group family and
+        // the major engine version the instance's default parameter group and option
+        // group are named after, so the three cannot disagree.
         let engine_version = match resolved_version {
             Some(entry) => Some(entry.engine_version.to_string()),
             // An engine the catalogue publishes no available version for: there is
@@ -552,7 +596,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
             // `DeletionProtection`: "By default, deletion protection isn't enabled."
             deletion_protection: input.deletion_protection.unwrap_or(false),
-            db_subnet_group_name: input.db_subnet_group_name,
+            db_subnet_group_name,
             db_parameter_group_name,
             option_group_name,
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),

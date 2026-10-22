@@ -241,7 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|record| (record.identifier.clone(), record.to_wire()))
             .collect();
 
-        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeGlobalClustersError::invalid_parameter_value)?;
         Ok(DescribeGlobalClustersOutput {
             marker: page.next_marker,
             global_clusters: Some(page.items),
