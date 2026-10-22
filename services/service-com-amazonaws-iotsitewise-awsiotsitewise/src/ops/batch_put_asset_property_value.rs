@@ -401,7 +401,7 @@ fn resolve_entry(
             let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
                 (
                     "ResourceNotFoundException",
-                    format!("The asset {asset_label} could not be found."),
+                    crate::state::not_found_message(crate::state::RESOURCE_ASSET, asset_label),
                 )
             })?;
             (asset_id, property_id.to_string())
@@ -428,7 +428,7 @@ fn resolve_entry(
     let asset = store.assets.get(&asset_id).ok_or_else(|| {
         (
             "ResourceNotFoundException",
-            format!("The asset {asset_id} could not be found."),
+            crate::state::not_found_message(crate::state::RESOURCE_ASSET, &asset_id),
         )
     })?;
     let property = asset

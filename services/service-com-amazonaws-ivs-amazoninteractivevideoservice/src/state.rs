@@ -16,7 +16,7 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     AdConfiguration, Channel, ChannelNotBroadcasting, InternalServerException,
-    MultitrackInputConfiguration, RecordingConfiguration, RenditionConfiguration,
+    MultitrackInputConfiguration, PlaybackKeyPair, RecordingConfiguration, RenditionConfiguration,
     ResourceNotFoundException, ServiceQuotaExceededException, Stream, StreamKey,
     ThumbnailConfiguration, ValidationException,
 };
@@ -37,6 +37,11 @@ pub struct ComAmazonawsIvsAmazoninteractivevideoserviceState {
     /// a key to its channel: `ListStreamKeys` filters on it and `DeleteChannel`
     /// drops every key that names the channel it removed.
     pub stream_keys: BTreeMap<String, StreamKey>,
+    /// Every imported playback key pair, keyed by its ARN. A `BTreeMap` for the
+    /// same reason as [`Self::channels`]: one stable order for the list that reads
+    /// it. A pair's `fingerprint` is derived from the imported key material, so it
+    /// is also what identifies the key itself inside this map.
+    pub playback_key_pairs: BTreeMap<String, PlaybackKeyPair>,
     /// The stream each channel carries, keyed by the ARN of that channel: a
     /// channel ingests at most one stream at a time, so its ARN identifies the
     /// stream. A channel with no entry here — or one whose entry has left the
@@ -161,6 +166,13 @@ pub fn channel_arn(region: &str, id: &str) -> String {
 /// A `StreamKeyArn`: `arn:aws:ivs:<region>:<account>:stream-key/<id>`.
 pub fn stream_key_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("ivs", region, &format!("stream-key/{id}"))
+}
+
+/// A `PlaybackKeyPairArn`: `arn:aws:ivs:<region>:<account>:playback-key/<id>`, the
+/// form the modelled `PlaybackKeyPairArn` pattern
+/// `^arn:aws:ivs:[a-z0-9-]+:[0-9]+:playback-key/[a-zA-Z0-9-]+$` pins.
+pub fn playback_key_pair_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn("ivs", region, &format!("playback-key/{id}"))
 }
 
 /// An `AdConfigurationArn`: `arn:aws:ivs:<region>:<account>:ad-configuration/<id>`,
@@ -318,6 +330,15 @@ pub const AD_CONFIGURATION_QUOTA_RESOURCE: &str = "ad-configuration";
 /// viewer-session revocation for ([`MAX_VIEWER_SESSION_REVOCATIONS`]). Both surfaces
 /// that start a revocation state it, so neither words that refusal on its own.
 pub const VIEWER_SESSION_REVOCATION_QUOTA_RESOURCE: &str = "viewer-session-revocation";
+
+/// The ceiling on how many playback key pairs this store holds, for the reason
+/// given on [`MAX_CHANNELS`]: `ImportPlaybackKeyPair` is the only thing that adds
+/// one, it lives for the life of the process, and the operation models
+/// `ServiceQuotaExceededException` (HTTP 402) for exactly this refusal. The number
+/// is the emulator's own bound, not a published AWS default — AWS publishes the
+/// playback-key-pair quota as adjustable — and is set high enough that no ordinary
+/// workflow meets it.
+pub const MAX_PLAYBACK_KEY_PAIRS: usize = 1_000;
 
 /// The ceiling on how many `(channelArn, viewerId)` pairs this store tracks a
 /// viewer-session revocation for — a caller-driven growth path bounded for the same

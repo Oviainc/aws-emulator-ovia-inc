@@ -125,7 +125,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // sdkId-derived keys (`docdb`, `neptune`) instead of `rds`, which is what keeps
         // this claim unambiguous; before that, all three claimed `rds` and the router
         // answered `500 AmbiguousService` — a code that exists in no AWS model, in a
-        // JSON body an awsQuery client cannot parse — for every RDS request.
+        // JSON body an awsQuery client cannot parse — for every RDS request. The claim
+        // table is `core/router/tests/all/rds_docdb_neptune_signing_name_routing.rs`.
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
             None => false,
